@@ -251,7 +251,7 @@ subgroup or workitem level.
 ### Vectors
 
 In addition to `tensor` objects compiler supports operations over `vector` types.
-Vectors are immutable and statically-sized.
+Vectors are immutable, statically-sized values with no observable aliasing.
 
 
 New vector allocation:
@@ -275,6 +275,10 @@ x3 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1])).vec(shape=(W,H
 ```
 `vec()` shape must be deteminable at compile time. If shape is omitted, source
 tensor shape will be used and must be static.
+`vec()` is the only value conversion from tensor to vector in v1.
+
+There is no vector-to-tensor value conversion in v1. To materialize a vector
+into tensor or buffer storage, user must call `group.store` explicitly.
 
 
 Storing vector back into array/tensor:
@@ -290,8 +294,15 @@ masked as well.
 
 Vector operations are permitted on workgroup, subgroup and workitem level.
 
-Vectors generally support same set of Numpy ops as Tensors. Numpy-style
-broadcasting is supported. `out=` argument is not supported.
+Mixed operations between vectors and tensors, or between vectors and source
+arrays/buffers, are not allowed. Users must convert explicitly with `vec()`
+before entering vector computations.
+
+Vector operations never implicitly create tensors. For operations whose result
+is vector-shaped, the result is always a vector. Such operations are valid only
+when the compiler can determine the result shape at compile time; otherwise the
+program is ill-formed. Numpy-style broadcasting is supported only within this
+statically-shaped vector domain. `out=` argument is not supported.
 
 Supported Numpy ops on vectors: (TBD)
 
@@ -390,8 +401,9 @@ elements via indexing. However, subgroup or workitem scope must not create new
 tensor values; tensor allocation and tensor-producing operations remain
 WorkGroup-only.
 
-Vectors are immutable values. They may be captured and used in any scope, but
-mutating a vector or rebinding a captured vector name is invalid.
+Vectors are immutable values with no observable aliasing. They may be captured
+and used in any scope, but mutating a vector or rebinding a captured vector
+name is invalid.
 
 `group.load` and tensor allocation APIs create tensors and are therefore
 WorkGroup-only. `group.vload` and vector creation APIs may be used in any

@@ -84,55 +84,76 @@ def pairwise_distance_kernel(group: CurrentGroup,
 
 
 ### Launching the kernel:
+In the new API, launch geometry is determined by solving the symbols that
+appear in the kernel signature and in kernel decorator arguments. Buffer
+annotations, tuple-typed kernel arguments, literal symbols, and explicit
+`work_shape`, `group_shape`, and `subgroup_size` declarations all participate
+in the same binding step.
+
+In `pairwise_distance_kernel`, `W1` is bound from `X1.shape[0]`, `W2` is bound
+from `X2.shape[0]`, `H` is bound from the shared second dimension of `X1` and
+`X2`, and `D` must have shape `(W1, W2)`. Since the decorator declares
+`work_shape=(W1, W2)`, the global work shape is inferred as
+`(X1.shape[0], X2.shape[0])`.
+
+Kernel launch succeeds only if every required symbol has a unique value and all
+uses of the same symbol are consistent. The runtime must report an error if a
+symbol is missing, if two bindings for the same symbol disagree, or if an
+explicit launch parameter conflicts with the argument shapes.
+
 ```python
 # Current kernel API
 pairwise_distance_kernel[global_size, local_size](X1, X2, D)
 
-# In New API work/group shapes and subgroup size are bound to kernel params via
-# symbols, i.e. in previous example they are taken from input buffers
-# dimenstions.
+# New API: launch geometry is inferred from symbol bindings.
 pairwise_distance_kernel(X1, X2, D)
 ```
 While kernel function takes `CurrentGroup` as argument, it's not passed to the
-kernel invocation directly and work/group shapes are inferred from bound symbols.
+kernel invocation directly. The runtime provides it after symbol binding
+determines the launch geometry.
 
-If user wants to specify work/group shapes explicitly they may bind it
-to (tuples of) symbols passed as kernel arguments
+If user wants to specify work/group shapes explicitly they may do so by
+binding the corresponding symbols through ordinary kernel arguments:
 ```python
 @kernel(work_shape=(G1,G2,G3), group_shape=(L1,L2,L3))
 def test(gr: CurrentGroup,
          gsize: tuple[G1, G2, G3],
          lsize: tuple[L1, L2, L3]):
-    # gsize and lsize are not used inside kernel and only needed to bind
-    # work and group shape.
+    # `gsize` and `lsize` are ordinary kernel arguments whose values are used
+    # to bind launch symbols.
     ...
 
 test((1024, 1, 1), (64, 1, 1))
 ```
 
 ### Symbols
-Symbols are the way to define some relations between input buffers dimensions
-and/or work or group shape:
+Symbols express equality relationships between kernel arguments and launch
+geometry. Each occurrence of the same symbol refers to the same runtime value.
+
+During kernel launch, the runtime collects symbol values from the actual
+arguments and checks that all occurrences are consistent. A symbol may appear
+in buffer dimensions, tuple-typed kernel arguments, or launch attributes such
+as `work_shape`, `group_shape`, and `subgroup_size`:
 ```python
 W, H = sym.W, sym.H
 @kernel(work_shape=(W, H))
 def pairwise_distance_kernel(group: CurrentGroup,
                              X1: Buffer[W, H],
                              X2: Buffer[W, H]):
-    # Kernel expects 2 buffers with same shape and work size will be equal to
-    # that shape
+    # Kernel expects 2 buffers with same shape and global work shape will be
+    # equal to that shape.
     ...
 ```
 
-By default symbols are treated as dynamic values, i.e. in previous example there
-will be a single kernel for every input arrays size.
+By default symbols are treated as dynamic values, i.e. the same compiled kernel
+can be used with any runtime values that satisfy the symbol constraints.
 
 Symbols can also be declared as literals, and in this case, runtime will compile
 separate versions of the kernel for each distinct symbol value:
 ```python
 # H is usually small and won't change between kernel invocations, declaring it as
 # literal so compiler can unroll it instead of doing dynamic loop.
-@kernel(work_size=(W1, W2), literals={H})
+@kernel(work_shape=(W1, W2), literals={H})
 def pairwise_distance_kernel(group: CurrentGroup,
                              X1: Buffer[W1, H],
                              X2: Buffer[W2, H],
@@ -154,7 +175,7 @@ def test(gr: CurrentGroup,
 For buffer it's also possible to declare specific dimension as constant if it's
 known beforehead:
 ```python
-@kernel(work_size=(W1, W2))
+@kernel(work_shape=(W1, W2))
 def pairwise_distance_kernel(group: CurrentGroup,
                              X1: Buffer[W1, 3],
                              X2: Buffer[W2, 3],
@@ -183,9 +204,10 @@ group.store(D[gid[0]:, gid[1]:], tensor)
 
 If tensor is masked, only active elements will be written.
 
-Tensor data created from `group.load` can either be direct view into source
-array or local copy. Any changes made to tensor may or may not be visible to
-source array. If user wants to make make changes visible, it must call
+Tensors are workgroup-local objects stored in shared local memory (LDS).
+`group.load` copies data into tensor storage; it never returns a direct view
+into the source array. Mutating a tensor never modifies the source array
+directly. If user wants to make changes visible, it must call
 `group.store` explicitly.
 
 Allocating new tensor:
@@ -195,9 +217,12 @@ arr = group.zeros(shape=(...), dtype=dtyp)
 arr = group.ones(shape=(...), dtype=dtyp)
 arr = group.full(shape=(...), dtype=dtyp, fill_value=...)
 ```
-Tensors can be allocated either in Shared Local Memory or in Global memory,
-actual allocation placement is left to the compler.
-(Placement hints TBD)
+The implementation must not silently place tensors in global memory.
+
+If tensor storage requirements can be determined before launch, the
+implementation should reject launches that exceed the device's shared local
+memory limits. Otherwise, execution on such inputs is invalid for that device
+and may fail at execution time, including kernel termination.
 
 Tensors support usual numpy operations, including fancy indexing and
 broadcasting:
@@ -333,254 +358,3 @@ def foo(group, X1, X2, D):
 ```
 
 Programming on workitem scope is close to usual OpenCL programming.
-
-
-### Extending
-
-Free functions:
-```python
-@kernel.func
-def add(a, b):
-    return a + b
-
-@kernel
-def foo(group, ...):
-    c = add(a, b)
-```
-`@kernel.func` functions are callable from any (WG/SG/WI) scope.
-
-
-Functions overloads for specific scope:
-```python
-def foo(a, b):
-    pass
-
-@kernel.func(foo, scope=WorkGroup)
-def foo_wg(g, a, b):
-    i,j,k = g.group_id()
-    ...
-
-@kernel.func(foo, scope=SubGroup)
-def foo_wg(sg, a, b):
-    i = sg.subgroup_id()
-    ...
-
-@kernel.func(foo, scope=WorkItem)
-def foo_wg(wi, a, b):
-    i,j,k = wi.global_id()
-    ...
-
-@kernel
-def bar(group, ...):
-    # Index objects are passed implicitly
-    c1 = foo(a1, b1)
-    @group.subgroups
-    def inner1(sg):
-        c2 = foo(a2, b2)
-
-    inner1()
-
-    @group.workitems
-    def inner2(wi):
-        c3 = foo(a3, b3)
-
-    inner2()
-```
-
-Defining low level intrinsics/codegen:
-```python
-def my_intrinsic(a, b):
-    pass
-
-@kernel.intrinsic(my_intrinsic, scope=WorkGroup)
-def my_intrinsic_impl(a, b):
-    # Can query 'a' and 'b' types here
-    if is_fp16(a) and is_int8(b):
-        def func(builder, a, b):
-            # Use low level MLIR python builder API here, LLVM, SPIR-V or similar
-            c = builder.create(spirv.call)("__my_intrinsic", a, b)
-            return c
-
-        return func
-
-    # Can return None if intrinsic doesn't supported for specific data types.
-    return None
-
-@kernel
-def foo(group, ...):
-    ...
-    c = my_intrinsic(a, b)
-```
-
-Putting everything together:
-```python
-# module device_lib.py
-
-def my_hw_gemm(a, b, acc):
-    pass
-
-def my_tile_load(arr):
-    pass
-
-def my_tile_store(arr, data):
-    pass
-
-@kernel.intrinsic(my_hw_gemm, scope=SubGroup)
-def my_hw_gemm_impl(a, b, acc):
-    def func(builder, a, b, acc):
-        return builder.create(spirv.call)("__my_hw_gemm", a, b, acc)
-
-    return func
-
-@kernel.intrinsic(my_tile_load, scope=SubGroup)
-def my_tile_load_impl(arr):
-    ...
-
-@kernel.intrinsic(my_tile_store, scope=SubGroup)
-def my_tile_store_impl(arr, data):
-    ...
-
-@kernel.func(foo, scope=WorkGroup)
-def my_gemm(group, a, b, acc):
-    i, j = group.id()
-    @group.subgroups
-    def inner(sg):
-        M, N = 8, 16 # Or from autotuning
-        tile_acc = my_tile_load(...)
-        for k in range(0, K, TK):
-            tile_a = my_tile_load(a[i * group.shape[0]:, k:])
-            tile_b = my_tile_load(b[k:, j * group.shape[1]:])
-            my_hw_gemm(tile_a, tile_b, tile_acc)
-
-        my_tile_store(acc[...], tile_acc)
-
-    inner()
-
-
-# module main.py
-import device_lib
-
-@kernel
-def my_kernel(group, a, b, res, device_lib)
-    acc = group.zeros(a.shape[0], b.shape[1])
-    device_lib.my_gemm(a, b, acc)
-    group.store(res, acc)
-```
-
-
-### Autotuning
-
-When developing a kernel, there are often kernel hyperparameters that need to be fine-tuned to get better performance.
-The simplest examples of such hyperparameters are the size of the workgroup or size of a tile to work with.
-In more complex kernels there may be several such parameters.
-Such hyperparameters usually hardware depended and should be tuned for specific device.
-
-Let's look at an example of reduction:
-
-```python
-
-WS, GS, N = sym.WS, sym.GS, sym.N
-
-@kernel(work_shape=ceil_div(WS, N), group_shape=GS)
-def reduction(group: CurrentGroup, a: Buffer[WS], result: Buffer[1], n: N, gshape: GS):
-    temp_result = group.zeros(group.size)
-    for i in range(n):
-        work_offset = group.work_offset[0]*n + i*group.size
-        a_view = group.load(a[work_offset:], shape=group.size)
-        temp_result += a_view
-
-    atomic_ref(result)[0] += temp_result.sum()
-
-...
-
-reduction(a, result, n, gsize)
-
-```
-
-Here we see two such hyperparameters which we need to fine-tune: workgroup size (GS) and number of iterations done by single group (N).
-In order to automate the process of parameters selection there is an autotuner API.
-
-It mainly consists of the following:
-1. TunabelParams class with following constructor params:
-    ```python
-        class TunableParam:
-            def __init__(self, sym, default, vals):
-    ```
-    Where:
-    * `sym` is a symbol to be tuned
-    * `default` is default value of the symbol without tuning
-    * `vals` set of applicable values
-
-2. `tunables` argument of `@kernel` decorator:
-    ```python
-        @kernel(..., tunables=(Tunable1, Tunable2, ...))
-    ```
-
-3. `autotune` function which accepts kernel with tunables and kernel arguments to pass:
-    ```python
-        tuned_params = autotune(my_kernel, kernel_arg1, kernel_arg2, ...)
-    ```
-
-Let's see how we can apply this to our reduction:
-
-```python
-TP = TunableParam
-
-WS, GS, N = sym.WS, sym.GS, sym.N
-
-@kernel(work_shape=ceil_div(WS, N),
-        group_shape=GS,
-        tunables=(TP(GS, 64, range(64, 1024, 64)), TP(N, 16, range(16, 256, 16))))
-def reduction(group: CurrentGroup, a: Buffer[WS], result: Buffer[1]):
-    temp_result = group.zeros(group.size)
-    for i in range(N):
-        work_offset = group.work_offset[0]*N + i*group.size
-        a_view = group.load(a[work_offset:], shape=group.size)
-        temp_result += a_view
-
-    atomic_ref(result)[0] += temp_result.sum()
-
-...
-
-tparams = autotune(reduction, a_for_tuning, result_for_tuning)
-
-tuned_reduction = reduction.parametrize(tparams)
-
-tuned_reduction(a, result)
-
-```
-
-Things to note:
-* `GS` and `N` are no longer passed as kernel arguments
-* You must use original symbols (`N` and `GS`) inside kernels, not wrapped in `TunableParams`
-* You should `parametrize` you kernel with tuned parameters.
-
-Since tuning could take significant time and usually need to be done only once for each kernel per device there is a possibility to save and load tuned parameters:
-
-```python
-tparams = autotune(reduction)
-
-tparams.save(path_to_file)
-
-...
-
-tparams = autotune.load(path_to_file)
-
-tuned_reduction = reduction.parametrize(tparams)
-
-tuned_reduction(a, result)
-
-```
-
-Tunable symbols as any other symbols could be declared as literals:
-```python
-...
-
-@kernel(work_shape=ceil_div(WS, N),
-        group_shape=GS,
-        tunables=(TP(GS, 64, range(64, 1024, 64)), TP(N, 16, range(16, 256, 16))),
-        literals={N})
-def reduction(group: CurrentGroup, a: Buffer[WS], result: Buffer[1]):
-    ...
-
-```

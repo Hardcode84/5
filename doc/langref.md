@@ -281,8 +281,9 @@ Storing vector back into array/tensor:
 ```python
 group.store(D[gid[0]:, gid[1]:], vector)
 ```
-Note: we don't distinguish between tensor/vector store and they have the same
-semantics.
+Note: tensor and vector stores have the same data movement and masking
+semantics. Scope restrictions on where `group.store` may be called are defined
+by the execution model.
 
 Vectors can be masked. If source tensor was masked, resulting vector will be
 masked as well.
@@ -331,8 +332,81 @@ Numpy masked arrays convention).
 
 ### Switching to SubGroup or WorkItem scope
 
-While the main execution model is WorkGroup scope execution, it's possible to
-swihch to subgroup or workitem scope for convenience.
+The default execution scope is WorkGroup: the kernel body executes once per
+workgroup.
+
+Let `group_shape = (L0, L1, ..., Ln-1)`, where dimension `0` is the
+fastest-varying workgroup dimension. Workitems in the workgroup have local ids
+`(i0, i1, ..., in-1)` with `0 <= ik < Lk`.
+
+If `subgroup_size = SG`, then the workgroup is partitioned into subgroups by
+splitting dimension `0` into contiguous blocks of size `SG`. For each fixed
+tuple `(i1, ..., in-1)`, the workitems
+`(k*SG : (k+1)*SG, i1, ..., in-1)` belong to one subgroup.
+
+This requires `L0 % SG == 0`. If not, kernel launch is invalid and the runtime
+must report an error before execution.
+
+`@group.subgroups` executes its body once per subgroup. `sg.subgroup_id()`
+returns the subgroup index within the current workgroup, in the ordering
+induced by the partition above, and `sg.size()` returns `subgroup_size`.
+
+`@group.workitems` executes its body once per workitem.
+
+Entering `@group.subgroups` or `@group.workitems` is a collective operation on
+the enclosing scope, and returning from the inner function implies a join back
+to the enclosing scope. After `inner()` returns, all subgroups or workitems in
+that region have completed.
+
+The only explicit barrier in v1 is `group.barrier()`. It is permitted only
+inside `@group.workitems` and synchronizes all workitems in the current
+workgroup. `group.barrier()` also orders accesses to workgroup-local tensor
+storage, making writes performed before the barrier visible to reads performed
+after the barrier.
+
+Every workitem in the workgroup must execute the same `group.barrier()` calls
+in the same order. A barrier in non-uniform control flow is invalid. The
+implementation should reject such kernels when it can prove the violation;
+otherwise execution is invalid and may fail at execution time.
+
+No explicit barrier is provided at WorkGroup or SubGroup scope, because those
+scopes are collective by construction.
+
+Inner `@group.subgroups` and `@group.workitems` functions may capture kernel
+arguments, `group`, workgroup-local tensors, vectors, scalar locals, tuples,
+and symbol-bound values from the enclosing scope.
+
+Scalars, tuples, symbol values, and other immutable values are captured by
+value and are read-only inside the inner scope. Rebinding a captured outer name
+is invalid.
+
+Buffer arguments and `group` are captured as handles to the same underlying
+objects. Buffer arguments may be accessed directly from subgroup or workitem
+scope.
+
+Workgroup-local tensors are captured as references to the same tensor storage.
+Subgroup or workitem scope may read from a captured tensor and may update its
+elements via indexing. However, subgroup or workitem scope must not create new
+tensor values; tensor allocation and tensor-producing operations remain
+WorkGroup-only.
+
+Vectors are immutable values. They may be captured and used in any scope, but
+mutating a vector or rebinding a captured vector name is invalid.
+
+`group.load` and tensor allocation APIs create tensors and are therefore
+WorkGroup-only. `group.vload` and vector creation APIs may be used in any
+scope. `group.store` with a tensor source is WorkGroup-only; `group.store`
+with a vector source may be used in any scope.
+
+Writes performed by subgroup or workitem regions to captured tensors or buffer
+arguments become visible to the enclosing WorkGroup scope when the region
+returns. Within `@group.workitems`, `group.barrier()` only adds ordering
+guarantees for workgroup-local tensor storage.
+
+Conflicting unordered accesses to the same tensor or buffer location from
+different subgroups or workitems are invalid. In particular, overlapping writes
+or a read racing with a write are invalid unless the accesses occur in
+different ordered phases of execution.
 
 SG Level:
 ```python

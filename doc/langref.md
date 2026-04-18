@@ -638,3 +638,82 @@ def foo(group, X1, X2, D):
 ```
 
 Programming on workitem scope is close to usual OpenCL programming.
+
+
+### Extension intrinsics
+
+The language provides an intrinsic extension API for operations that are most
+naturally expressed as target-specific IR rather than as built-in Numpy-style
+tensor/vector operations. Intrinsics are called from kernels as ordinary
+functions:
+```python
+@kernel.intrinsic(scope=SubGroup, effects="pure", const_attrs={"blocksz"})
+def mfma(a, b, acc, *, blocksz):
+    # Fallback semantics
+    return acc + (a @ b)
+
+@mfma.lower(target="amdgpu")
+def _(ctx, a, b, acc, *, blocksz):
+    op = ctx.builder.create(
+        "amdgpu.mfma",
+        results=[ctx.result_type(0)],
+        operands=[a, b, acc],
+        attrs={"blocksz": blocksz},
+        loc=ctx.loc,
+    )
+    return op.result(0)
+```
+
+`@kernel.intrinsic(...)` declares a callable symbol that may be used in kernel
+code like any other function. The declaration specifies the scope in which the
+intrinsic is legal, and may additionally declare effect information and a set
+of keyword attributes that must be compile-time or specialization-time
+constants.
+
+The intrinsic body defines fallback semantics. If no target-specific lowering
+matches the current compilation target, the compiler lowers the intrinsic body
+as ordinary kernel code. The intrinsic body must therefore itself be valid
+kernel code in the declared scope.
+
+Target-specific lowerings are attached with `@name.lower(target=...)`. A
+matching lowering overrides the fallback body for that target and may emit
+arbitrary MLIR directly through `ctx.builder`. Lowerings must preserve the
+observable semantics of the fallback body, including result type, logical
+shape, masking, and layout behavior.
+
+An intrinsic body may also be empty:
+```python
+@kernel.intrinsic(scope=SubGroup)
+def vendor_only(a, b):
+    pass
+```
+If no matching lowering is available for such an intrinsic, the launch fails
+before execution.
+
+Implementations may additionally provide optional verification and inference
+hooks for intrinsics. Verification hooks may reject invalid target/type/layout
+combinations before execution. Inference hooks may define result type, mask, or
+layout behavior when body analysis is insufficient or when the intrinsic has no
+fallback body.
+```python
+@mfma.verify
+def _(sig, target):
+    require(target.backend == "amdgpu")
+    require(sig.scope == SubGroup)
+    require(sig.kwarg("blocksz") in {16, 32})
+    require(sig.arg(0).is_vector())
+    require(sig.arg(1).is_vector())
+    require(sig.arg(2).is_vector())
+
+@mfma.infer
+def _(sig):
+    return Result(
+        type=sig.arg(2).type,
+        mask=sig.arg(2).mask,
+        layout=sig.arg(2).layout,
+    )
+```
+
+In this example, `verify` enforces target- and signature-specific constraints
+before execution, while `infer` states that the intrinsic returns a value with
+the same type, mask, and layout as the accumulator argument.

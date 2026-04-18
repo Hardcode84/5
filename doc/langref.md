@@ -7,16 +7,28 @@ Alexander Kalistratov, Ivan Butygin
 We propose a new workgroup-first GPU kernel API with symbol-solved launch
 geometry, workgroup-local tensors, and statically-sized vectors.
 
+## Minimal glossary
+
+* `sym`: namespace for symbolic values used in kernel signatures and launch
+  geometry. The same symbol name denotes the same runtime value across buffer
+  dimensions, tuple arguments, and launch attributes.
+* `Buffer[...]`: kernel parameter type for externally visible storage supplied
+  by the caller. Its annotated dimensions participate in symbol binding and
+  launch validation.
+* `CurrentGroup`: runtime object representing the current `WorkGroup`
+  invocation. It provides launch-derived geometry, workgroup-local allocation
+  and load/store APIs, and access to nested `SubGroup` / `WorkItem` scopes.
+
 ## Motivation
 
-Current low-level Kernel API is too verbose and not very convenient for fast
+Current low-level kernel API is too verbose and not very convenient for fast
 prototyping.
 Current high-level APIs (array API and prange), on the other hand, provide too
-little low level control over GPU execution.
+little low-level control over GPU execution.
 
 ## Proposal
 
-We propose a new Workgroup-level API, with direct access to NumPy-style array
+We propose a new workgroup-level API, with direct access to NumPy-style array
 operations and the ability to access workitem-level API directly.
 
 
@@ -36,7 +48,7 @@ def pairwise_distance_kernel(X1, X2, D):
             d += tmp * tmp
         D[i, j] = np.sqrt(d)
 
-# New API, immediately switching to workitem level.
+# New API, immediately switching to WorkItem scope.
 W1 = sym.W1
 W2 = sym.W2
 H = sym.H
@@ -45,7 +57,7 @@ def pairwise_distance_workitem_kernel(group: CurrentGroup,
                                       X1: Buffer[W1, H],
                                       X2: Buffer[W2, H],
                                       D: Buffer[W1, W2]):
-    # switch to workitem level
+    # switch to WorkItem scope
     # parallel loop over work items
     @group.workitems
     def inner(wi):
@@ -69,7 +81,7 @@ def pairwise_distance_wg_kernel(group: CurrentGroup,
     x1 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1]))
     x2 = group.load(X2[gid[1]:], shape=(group.shape[1], X2.shape[1]))
 
-    # calculating pairwise distance with numpy-style broadcasting
+    # calculating pairwise distance with NumPy-style broadcasting
     diff = ((x1[None, :, :] - x2[:, None, :])**2).sum(axis=2)
 
     # store result to D, but with boundary checks
@@ -431,7 +443,7 @@ by the execution model.
 Vectors can be masked. If source tensor was masked, resulting vector will be
 masked as well.
 
-Vector operations are permitted on workgroup, subgroup and workitem level.
+Vector operations are permitted in WorkGroup, SubGroup, and WorkItem scope.
 
 Mixed operations between vectors and tensors, or between vectors and source
 arrays/buffers, are not allowed. Users must convert explicitly with `vec()`

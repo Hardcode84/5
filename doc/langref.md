@@ -270,6 +270,47 @@ arr = group.zeros(shape=(...), dtype=dtyp)
 arr = group.ones(shape=(...), dtype=dtyp)
 arr = group.full(shape=(...), dtype=dtyp, fill_value=...)
 ```
+WG-local tensor storage may optionally specify `layout=` on `group.load`,
+`group.empty`, `group.zeros`, `group.ones`, and `group.full`. Vectors may also
+carry `layout=` when created by `group.vload`, vector allocation, `vec(...)`,
+or `as_layout(...)`. Layout affects only physical placement or carrier order;
+logical shape, indexing, masking, and store semantics remain unchanged. If
+`layout` is omitted, the default layout is dense C-contiguous storage for
+tensors and flat contiguous carrier order for vectors.
+
+Layouts are described by `index_map(...)`, which maps logical tensor/vector
+indices to flat storage:
+```python
+layout = index_map(
+    params=lambda w, h: {"row_stride": h + PAD},
+    storage_size=lambda w, h, p: w * p["row_stride"],
+    offset=lambda i, j, w, h, p: i * p["row_stride"] + j,
+)
+
+x = group.load(X[gid[0]:], shape=(W, H), layout=layout)
+```
+
+`params(...)` is optional. It derives a dictionary of additional layout
+parameters from the logical tensor shape. Returning `None` or `{}` means there
+are no additional parameters.
+
+`storage_size(...)` computes the flat storage footprint or carrier size.
+`offset(...)` maps logical coordinates to flat storage indices.
+
+Layout functions must be pure integer expressions that depend only on logical
+shape values, constants, literal symbols, and other launch-determined values.
+For tensors, launch-determined values are allowed. For vectors, layout
+functions and derived parameters must be fully statically known after
+specialization and must not depend on dynamic runtime values.
+`storage_size(...)` must be computable before launch, and `offset(...)` must be
+injective over the valid logical index domain. If the compiler cannot prove
+these properties, the program is ill-formed.
+
+Semantically, a tensor value is defined by a base pointer, a logical shape, a
+storage layout descriptor, and an optional logical view transform. Slices and
+other view operations compose over the underlying storage layout rather than
+redefining it.
+
 The implementation must not silently place tensors in global memory.
 
 Tensor-producing operations have value semantics. Semantically, each such
@@ -344,6 +385,8 @@ subgroup or workitem level.
 
 In addition to `tensor` objects compiler supports operations over `vector` types.
 Vectors are immutable, statically-sized values with no observable aliasing.
+Vectors may also carry a persistent layout descriptor, interpreted with the
+same `index_map(...)` machinery as tensors.
 
 
 New vector allocation:
@@ -357,7 +400,9 @@ Creating vector from array:
 ```python
 x1 = group.vload(X1[gid[0]:], shape=(W, H))
 ```
-Vector allocation shape must be deteminable at compile time.
+Vector allocation shape must be deteminable at compile time. If `layout=` is
+provided for a vector, all derived layout parameters and storage size must also
+be statically known in the specialized kernel variant.
 
 Creating vector from tensor:
 ```python
@@ -368,6 +413,10 @@ x3 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1])).vec(shape=(W,H
 `vec()` shape must be deteminable at compile time. If shape is omitted, source
 tensor shape will be used and must be static.
 `vec()` is the only value conversion from tensor to vector in v1.
+
+`as_layout(...)` explicitly changes the layout of a vector while preserving its
+logical contents. It returns a vector with the same logical shape and dtype but
+with the requested layout descriptor.
 
 There is no vector-to-tensor value conversion in v1. To materialize a vector
 into tensor or buffer storage, user must call `group.store` explicitly.
@@ -395,6 +444,11 @@ is vector-shaped, the result is always a vector. Such operations are valid only
 when the compiler can determine the result shape at compile time; otherwise the
 program is ill-formed. Numpy-style broadcasting is supported only within this
 statically-shaped vector domain. `out=` argument is not supported.
+
+Vector operations are defined over logical vector contents, not physical carrier
+order. If all operands have the same layout and the operation preserves logical
+shape, the result preserves that layout. Otherwise the user must convert
+explicitly with `as_layout(...)`.
 
 Supported Numpy ops on vectors in v1:
 * Elementwise arithmetic: `+`, `-`, `*`, `/`, unary `-`

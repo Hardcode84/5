@@ -159,8 +159,40 @@ def pairwise_distance_kernel(group: CurrentGroup,
                              X2: Buffer[W2, H],
                              D: Buffer[W1, W2]):
 ```
+
+Literal symbols define specialization points. Only literal symbols create
+specialized kernel variants; launch-determined values that are not literal do
+not.
+
+A specialized kernel variant is identified by:
+* the kernel definition
+* the target device or backend-specific compilation target
+* the bound values of all literal symbols for that launch
+
+Declaring a symbol literal changes only compilation policy, not semantics:
+different bound values of that symbol require distinct specialized variants.
+
+The runtime may compile specialized variants lazily on the first launch that
+requires a new specialization key, or eagerly before launch. In either case,
+all required specialization, validation, and compilation must complete before
+device execution begins.
+
+If a launch requires a new specialized variant and the implementation cannot
+create it, the launch fails before execution.
+
+Implementations may cache specialized variants and may evict cached variants.
+Cache persistence, residency, and eviction policy are implementation-defined.
+Eviction must not change program semantics; it may only cause recompilation on
+a later launch.
+
+Implementations may impose implementation-defined limits on the number of
+cached specialized variants and may provide configurable diagnostics when many
+distinct literal specializations are created. However, an implementation must
+not silently stop specializing a symbol that was declared literal.
+
 Literal symbols can be used in context where constant is expected (e.g. vector
-dimensions).
+dimensions). Using a non-literal symbol in such a context is ill-formed, even
+if that symbol is otherwise launch-determined.
 
 Subgroup size must always be a constant or literal symbol:
 ```python

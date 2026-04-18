@@ -1,8 +1,8 @@
-# RFC: Host-side Python simulator for high level GPU kernel API
+# RFC: Host-side Python simulator for high-level GPU kernel API
 
 ## Summary
 
-This document describes a pure Python simulator for the high level kernel API
+This document describes a pure Python simulator for the high-level kernel API
 defined in `doc/langref.md`.
 
 The simulator runs kernels on the host in the Python interpreter without MLIR
@@ -17,8 +17,8 @@ The recommended initial path is:
 3. execute kernel, helper, and intrinsic fallback bodies directly as ordinary
    Python code,
 4. map `@group.subgroups` and `@group.workitems` to host-side region runners,
-5. emulate `group.barrier()` with coroutine scheduling, for example via
-   `greenlet`.
+5. emulate `group.barrier()` with cooperative fiber/coroutine scheduling, for
+   example via `greenlet`.
 
 This simulator is intentionally not a second compiler. It should model the
 language semantics directly and stay entirely in Python.
@@ -90,6 +90,13 @@ Both paths should agree on:
 The two paths need not use the same frontend mechanism. The compiled path may
 parse and lower source, while the simulator may execute Python bodies directly.
 
+For programs that are legal under `doc/langref.md` and within the supported
+simulator subset, the simulator and compiled path should agree on observable
+results and launch failures.
+
+The project should maintain a shared conformance corpus of kernels, inputs, and
+expected outputs or failures to keep the two paths aligned.
+
 ## Portability Boundary
 
 The simulator does not need AST parsing as part of its core design.
@@ -99,20 +106,26 @@ functions against simulator runtime objects. This keeps the simulator small and
 avoids building a second frontend.
 
 As a consequence, the simulator may successfully run some Python constructs that
-the compiled path does not support or that `langref.md` treats as ill-formed.
+the compiled path does not support or that `doc/langref.md` treats as
+ill-formed.
 Such cases are non-portable. The portability contract is:
 
-* programs that are legal under `langref.md` should behave consistently in the
-  simulator and in the compiled path,
+* programs that are legal under `doc/langref.md` should behave consistently in
+  the simulator and in the compiled path,
 * programs that only happen to run in the simulator are outside the portable
   language contract.
+
+Some invalid programs may also fail at different times in the simulator and the
+compiled path. In particular, the simulator does not perform whole-program
+analysis before launch, so some errors are detected only when execution reaches
+the offending operation.
 
 If a project wants stricter portability checking, that should be provided by a
 separate validator or compiler-side diagnostic pass, not by the simulator core.
 
 ## Launch and Target Model
 
-The simulator should follow the same launch contract as `langref.md`.
+The simulator should follow the same launch contract as `doc/langref.md`.
 
 ### Symbol Binding
 
@@ -146,6 +159,9 @@ be observable as specialization.
 
 ### Launch Geometry
 
+Let `group_shape = (L0, L1, ..., Ln-1)`, where dimension `0` is the
+fastest-varying workgroup dimension.
+
 The simulator must enforce the same launch rules:
 
 * launch-shape values must be non-negative integers,
@@ -153,8 +169,11 @@ The simulator must enforce the same launch rules:
 * zero-sized `work_shape` is legal and results in a no-op launch,
 * non-divisible `work_shape / group_shape` is legal and rounds up the number of
   workgroups,
+* each `group_shape` dimension must be a positive integer,
 * `subgroup_size` must be constant or literal,
-* `L0 % subgroup_size == 0` is required when subgroup execution is used.
+* `subgroup_size` must be a positive integer when specified,
+* `L0 % subgroup_size == 0` is required whenever `subgroup_size` is part of the
+  launch contract.
 
 ### Simulator Target
 
@@ -185,7 +204,7 @@ Kernel buffer arguments should initially be backed by `numpy.ndarray`.
 
 Buffers are persistent storage owned by the caller. They are not workgroup-local
 and are not copied on kernel entry. Buffer slicing and indexing should follow
-the same logical rules as in `langref.md`.
+the same logical rules as in `doc/langref.md`.
 
 ### Tensors
 
@@ -251,8 +270,13 @@ This means:
 * using poison in Python arithmetic, comparisons, indexing, or control flow
   should raise a simulator error with a clear diagnostic.
 
+These guarantees apply to operations routed through simulator value objects and
+their documented APIs. Arbitrary raw NumPy operations on live simulator values
+are not generally guaranteed in Milestone 0 unless explicitly documented by the
+simulator implementation.
+
 `with_inactive(value=...)` should resolve inactive elements exactly as specified
-in `langref.md` and produce a fully active result.
+in `doc/langref.md` and produce a fully active result.
 
 `.mask` should return a fully active bool tensor/vector view. The simulator may
 materialize it lazily and does not need to allocate dedicated backing storage
@@ -261,7 +285,11 @@ when that is unnecessary.
 ### Layouts
 
 Layouts should be represented directly by host layout descriptors using the
-same `index_map(...)` contract as `langref.md`.
+same `index_map(...)` contract as `doc/langref.md`.
+
+Milestone 0 supports only the default dense tensor layout and flat contiguous
+vector layout. Non-trivial `index_map(...)` and `as_layout(...)` support arrive
+in Milestone 1.
 
 The simulator should preserve layout semantics rather than silently normalizing
 everything to dense contiguous storage. In particular:
@@ -325,8 +353,8 @@ rewriting.
 
 The kernel body executes once per workgroup.
 
-For each workgroup, the simulator constructs a `CurrentGroup`-like host object
-containing at least:
+For each workgroup, the simulator constructs a host object implementing the
+`CurrentGroup` surface and containing at least:
 
 * `group_id`,
 * `group_shape`,
@@ -343,7 +371,7 @@ Workgroups should be executed in a deterministic lexicographic order.
 workgroup.
 
 The simulator should partition the workgroup exactly as described in
-`langref.md`: dimension `0` is fastest-varying, and subgroups split that
+`doc/langref.md`: dimension `0` is fastest-varying, and subgroups split that
 dimension into contiguous blocks of size `subgroup_size`.
 
 Each subgroup execution receives a host `SubGroup` object providing subgroup id
@@ -351,6 +379,10 @@ and size queries. Subgroups should execute in deterministic subgroup-id order.
 
 Returning from the subgroup region implies a join back to the enclosing
 WorkGroup scope.
+
+Deterministic serial subgroup scheduling is only a host execution strategy. It
+must not be interpreted as making conflicting unordered subgroup accesses
+well-defined under the language contract.
 
 ### WorkItem Scope
 
@@ -366,7 +398,7 @@ Each workitem receives:
 * its own local environment for names defined inside the region,
 * a host `WorkItem` object providing local/global id queries,
 * access to captured outer values according to the capture rules in
-  `langref.md`.
+  `doc/langref.md`.
 
 ### Barrier Semantics
 
@@ -391,6 +423,11 @@ barrier use.
 The simulator should model the language guarantee that `group.barrier()`
 orders accesses to workgroup-local tensor storage, including masks.
 
+If any workitem raises an exception before the region completes, the simulator
+must abort the whole workitem region, cancel or discard the remaining
+workitems, and surface a single workgroup-level failure rather than deadlocking
+at a barrier.
+
 ### Captures and Mutability
 
 The simulator must implement the same capture and mutation rules as the
@@ -411,11 +448,12 @@ when practical.
 ### Conflicting Accesses
 
 Conflicting unordered accesses from different subgroups or workitems are
-invalid according to `langref.md`.
+invalid according to `doc/langref.md`.
 
-The simulator should aim to diagnose obvious conflicts in strict mode,
-especially within workitem regions separated by barriers. Full dynamic race
-detection is optional, but the design should leave room for it.
+The simulator should aim to diagnose obvious conflicts with optional dynamic
+conflict checking, especially within workitem regions separated by barriers.
+Full dynamic race detection is optional, but the design should leave room for
+it.
 
 ## Functions, Intrinsics, and Libraries
 
@@ -439,11 +477,15 @@ Therefore:
 * `@name.lower(target=...)` hooks are ignored by the simulator,
 * the intrinsic fallback body is the executable definition,
 * if an intrinsic has an empty body and no host fallback semantics, simulator
-  execution fails before the intrinsic is used.
+  execution raises when control reaches that intrinsic call.
+
+This lazy failure is an intentional simulator-side consequence of direct
+execution. The compiled path may reject the same program earlier.
 
 Optional `verify` hooks may still run as host-side validation if present and if
-doing so is useful. `infer` hooks are generally unnecessary for execution,
-because the simulator obtains result values directly from the fallback body.
+doing so is useful. `infer` hooks are not needed for ordinary fallback-body
+execution, but may still be relevant for explicit simulator-side host
+implementations or later extensions.
 
 ### Device Libraries
 
@@ -456,7 +498,7 @@ through the defining module environment.
 
 ## Validation and Diagnostics
 
-The simulator should be strict by default.
+The simulator should prefer deterministic diagnostics by default.
 
 It should reject or report:
 
@@ -488,6 +530,9 @@ Implement:
 * tensor and vector v1 operations,
 * mask and poison behavior.
 
+Milestone 0 excludes `@group.subgroups`, `@group.workitems`,
+`group.barrier()`, and non-trivial layouts.
+
 ### Milestone 1: Helper functions and layouts
 
 Add:
@@ -513,7 +558,7 @@ Add:
 * intrinsic fallback execution,
 * optional verify-hook support,
 * clearer poison diagnostics,
-* optional conflict/race detection in strict mode.
+* optional dynamic conflict checking.
 
 ## Rationale
 

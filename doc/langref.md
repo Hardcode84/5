@@ -717,3 +717,83 @@ def _(sig):
 In this example, `verify` enforces target- and signature-specific constraints
 before execution, while `infer` states that the intrinsic returns a value with
 the same type, mask, and layout as the accumulator argument.
+
+
+### Helper functions and device libraries
+
+Reusable kernel logic may be packaged as helper functions. Helper functions are
+declared with `@kernel.func` and may be defined in the same file as a kernel or
+in an imported device library module.
+
+```python
+# device_lib.py
+@kernel.func
+def gelu(x):
+    return 0.5 * x * (1.0 + erf(x / np.sqrt(2.0)))
+
+@kernel.func(scope=SubGroup)
+def tile_mma(a, b, acc):
+    return mfma(a, b, acc, blocksz=32)
+```
+
+`@kernel.func` declares a callable symbol for use in kernel code. There is no
+scope-based overloading: each helper function has exactly one definition. If
+`scope` is omitted, the function is generic and may be called from any scope in
+which its body is valid. If `scope` is specified, the function may only be
+called from that scope.
+
+The helper function body is ordinary kernel code and defines the function's
+semantics. Helper functions may call other helper functions, intrinsics, and
+supported tensor/vector operations. There is no implicit passing of current
+scope objects; if a helper needs `group`, `sg`, or `wi`, it must accept them as
+ordinary parameters.
+
+A helper function may accept ordinary kernel values, including tensors,
+vectors, buffers, index objects, and symbol-bound scalars, subject to the same
+scope and validation rules as kernels.
+
+Implementations may inline helper functions or lower them as internal device
+functions. This choice is not observable.
+
+Device libraries are ordinary Python modules that export `@kernel.func`,
+`@kernel.intrinsic`, layout descriptors, and constants for use by kernels.
+Imported library symbols are resolved statically at compilation or
+specialization time; they are not runtime kernel arguments.
+
+```python
+# device_lib.py
+A_LAYOUT = index_map(
+    params=lambda m, k: {"row_stride": k + PAD},
+    storage_size=lambda m, k, p: m * p["row_stride"],
+    offset=lambda i, j, m, k, p: i * p["row_stride"] + j,
+)
+
+@kernel.func(scope=SubGroup)
+def tile_mma(a, b, acc):
+    return mfma(a, b, acc, blocksz=32)
+
+@kernel.func(scope=WorkGroup)
+def gemm_tile(group, a_tile, b_tile, c_tile):
+    @group.subgroups
+    def inner(sg):
+        va = group.vload(a_tile, shape=(M, K), layout=A_LAYOUT)
+        vb = group.vload(b_tile, shape=(K, N))
+        vc = group.vload(c_tile, shape=(M, N))
+        vc = tile_mma(va, vb, vc)
+        group.store(c_tile, vc)
+
+    inner()
+
+# main.py
+import device_lib
+
+@kernel(work_shape=(...))
+def my_kernel(group: CurrentGroup, A, B, C):
+    c_tile = group.zeros(shape=(...), dtype=np.float32)
+    device_lib.gemm_tile(group, A[...], B[...], c_tile)
+    group.store(C[...], c_tile)
+```
+
+If a device library helper calls intrinsics whose target-specific lowerings are
+unavailable, the same intrinsic rules apply: a fallback body is used when
+present, otherwise launch fails before execution.

@@ -30,6 +30,11 @@ repos:
         args: [--config-file=pyproject.toml]
         pass_filenames: false
 
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: v6.2.0
+    hooks:
+      - id: reuse
+
   - repo: local
     hooks:
       - id: lizard

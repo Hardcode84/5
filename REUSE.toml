@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 hc contributors
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+version = 1
+
+[[annotations]]
+path = ".gitignore"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = ".pre-commit-config.yaml"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = "*.md"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = "*.toml"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = "doc/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
+
+[[annotations]]
+path = "LICENSE.TXT"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 hc contributors"
+SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"

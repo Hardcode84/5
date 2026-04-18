@@ -1,10 +1,3 @@
-<!--
-SPDX-FileCopyrightText: 2024 The HC Authors
-SPDX-FileCopyrightText: 2025 The HC Authors
-
-SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
--->
-
 # RFC: High level GPU kernel API
 
 Alexander Kalistratov, Ivan Butygin

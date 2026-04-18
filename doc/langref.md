@@ -334,36 +334,70 @@ Supported Numpy ops on vectors: (TBD)
 
 ### Masking
 
-Tensors and vectors are masked, i.e. individual elements can be marked active or
-inactive.
+Tensors and vectors carry an activity mask. An element is active iff its
+corresponding mask element is `True`; inactive iff it is `False`.
 
-`group.load/vload` will mark elements which are outside of requested shape as
-inactive.
+The payload of an inactive element is poison. Mask-aware tensor/vector
+operations do not directly observe the payload of inactive elements, but
+directly reading an inactive element yields poison.
 
-`group.store` will only update destination elements which have source mask
+`group.load/vload` accept either `shape=` or `mask=` argument, but not both.
+
+When `shape=` is used, the result has the requested shape and elements whose
+source access falls outside source bounds become inactive.
+
+When `mask=` is used, the mask argument must be a `bool` tensor/vector. The
+result shape is `mask.shape`. Result element `i` is active iff `mask[i]` is
+active, `mask[i] == True`, and the corresponding source access is in bounds.
+Otherwise result element `i` is inactive.
+
+Comparison operations on tensors/vectors (e.g. `a < b`) return `bool`
+tensors/vectors and follow the same mask propagation rules as other
+tensor/vector operations.
+
+`group.store` and tensor element assignment via `[]` only update destination
+elements whose source elements are active. Updated destination elements become
+active. Source elements that are inactive leave destination payload and
+destination activity unchanged. Scalar source values are treated as fully
 active.
 
-Assigning tensor elements via `[]` will mark them as active.
+There is intentionally no API to mutate activity bits in place. New inactive
+elements arise only by creating new tensors/vectors, e.g. through masked or
+out-of-bounds loads or through ordinary tensor/vector operations with mask
+propagation.
 
-There is intentionally no way to mark element as inactive other than creating
-new tensor/vector.
+For tensor/vector operations, an output element is active only if all source
+elements it semantically depends on are active, unless operation-specific rules
+say otherwise.
 
-For numpy functions operating on tensors/vectors, specific element will be
-marked as active only if all source elements it accesses are marked as active.
+Reduction functions only consider active elements. For reductions that produce
+a shaped tensor/vector, each output element is active iff its reduction domain
+has at least one active contributor; otherwise that output element is inactive.
+If a reduction returns a scalar and there are no active contributors, the
+scalar result is poison.
 
-Reduction functions will only consider active elements.
+Allocation functions `group.(v)zeros`,`group.(v)ones`,`group.(v)full` mark all
+elements as active. `group.empty` marks all elements as inactive and leaves
+their payload poison.
 
-Allocation functions `group.(v)zeros`,`group.(v)ones`,`group.(v)full` will mark
-all elements as active, `group.empty` will ask all elements as inactive.
+`with_inactive(value=...)` returns a tensor/vector of the same shape and dtype
+as the source. Active elements preserve their original value. Inactive elements
+are replaced with `value` converted to the source dtype. The result is always
+fully active.
 
-Mask is allocated in the same storage type as tensor/vector data. In some cases
-(allocation function) compiler can elide mask allocation and return pseudo-mask,
-always active.
+Mask storage is allocated in the same storage type as tensor/vector data and
+contributes to storage requirements unless elided. The compiler may elide mask
+storage when it can prove that the value is fully active.
 
-Mask can be accessed directly via `tensor.mask` property. Returned mask will
-have same shape as the original array and has dtype of `bool`. Returned mask is
-read-only. Active elements are marked as `False` as the returned mask (following
-Numpy masked arrays convention).
+`tensor.mask` and `vector.mask` return read-only `bool` tensors/vectors of the
+same shape. A mask element is `True` iff the corresponding source element is
+active.
+
+The result of `.mask` is always fully active, regardless of the activity of the
+source value, so reading `.mask` never yields poison. `.mask` follows the same
+tensor/vector rules and has its own `.mask` property, but implementations must
+always elide dedicated storage for `.mask` values. `x.mask.mask` is therefore
+well-defined and yields a fully-active all-`True` bool tensor/vector.
 
 
 ### Switching to SubGroup or WorkItem scope
@@ -397,8 +431,8 @@ that region have completed.
 The only explicit barrier in v1 is `group.barrier()`. It is permitted only
 inside `@group.workitems` and synchronizes all workitems in the current
 workgroup. `group.barrier()` also orders accesses to workgroup-local tensor
-storage, making writes performed before the barrier visible to reads performed
-after the barrier.
+storage, including activity masks, making writes performed before the barrier
+visible to reads performed after the barrier.
 
 Every workitem in the workgroup must execute the same `group.barrier()` calls
 in the same order. A barrier in non-uniform control flow is invalid. The
@@ -438,7 +472,7 @@ with a vector source may be used in any scope.
 Writes performed by subgroup or workitem regions to captured tensors or buffer
 arguments become visible to the enclosing WorkGroup scope when the region
 returns. Within `@group.workitems`, `group.barrier()` only adds ordering
-guarantees for workgroup-local tensor storage.
+guarantees for workgroup-local tensor storage, including activity masks.
 
 Conflicting unordered accesses to the same tensor or buffer location from
 different subgroups or workitems are invalid. In particular, overlapping writes

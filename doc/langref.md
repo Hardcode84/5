@@ -292,8 +292,9 @@ For legal tensor materializations, the runtime computes the required LDS usage
 before kernel launch and rejects launches that exceed the device's shared local
 memory limits.
 
-Tensors support usual numpy operations, including fancy indexing and
-broadcasting:
+The v1 tensor surface is intended to cover the Numpy-style operations required
+for common GEMM and attention variants. It supports broadcasting together with
+basic indexing and shape manipulation:
 ```python
 diff = ((x1[None, :, :] - x2[:, None, :])**2).sum(axis=2)
 ```
@@ -311,7 +312,20 @@ depends on launch-determined values rather than being compile-time constant.
 This diagnostic may be suppressed if optimization proves that no such dynamic
 materialization remains.
 
-Supported Numpy ops on tensors: (TBD)
+Supported Numpy ops on tensors in v1:
+* Elementwise arithmetic: `+`, `-`, `*`, `/`, unary `-`
+* Elementwise math: `exp`, `sqrt`, `maximum`, `minimum`
+* Elementwise comparisons: `<`, `<=`, `>`, `>=`, `==`, `!=`
+* Broadcasting for supported elementwise ops
+* Reductions: `sum`, `max`, `min` with `axis=` and `keepdims=`
+* Shape/index ops: integer indexing, basic slicing, `None` axis insertion,
+  `reshape`, `transpose` / `permute`, and `.T` for 2D tensors
+* Matrix multiplication: `@` / `matmul`
+* Type conversion: `astype`
+
+The v1 tensor surface does not include general fancy indexing, boolean
+indexing, `where`, `concatenate`, `stack`, sorting/top-k operations, advanced
+linear algebra, or quantized/low-bit dtypes.
 
 User also can pass output tensor explicitly:
 ```python
@@ -382,7 +396,19 @@ when the compiler can determine the result shape at compile time; otherwise the
 program is ill-formed. Numpy-style broadcasting is supported only within this
 statically-shaped vector domain. `out=` argument is not supported.
 
-Supported Numpy ops on vectors: (TBD)
+Supported Numpy ops on vectors in v1:
+* Elementwise arithmetic: `+`, `-`, `*`, `/`, unary `-`
+* Elementwise math: `exp`, `sqrt`, `maximum`, `minimum`
+* Elementwise comparisons: `<`, `<=`, `>`, `>=`, `==`, `!=`
+* Broadcasting within the statically-shaped vector domain
+* Reductions: `sum`, `max`, `min`
+* Shape/index ops: integer indexing, basic slicing, `reshape`, `transpose` /
+  `permute`, and `.T` for 2D vectors
+* Matrix multiplication: `@` / `matmul`
+* Type conversion: `astype`
+
+The minimum v1 dtype set is `bool`, `int32`, `float16`, `bfloat16`, and
+`float32`. Quantized variants are left for later revisions.
 
 
 ### Masking

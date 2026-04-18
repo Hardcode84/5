@@ -101,6 +101,27 @@ uses of the same symbol are consistent. The runtime must report an error if a
 symbol is missing, if two bindings for the same symbol disagree, or if an
 explicit launch parameter conflicts with the argument shapes.
 
+Launch-shape values must be non-negative integers. Negative launch-shape values
+are launch-time errors. Zero-sized `work_shape` is allowed and results in a
+no-op launch, but all other launch constraints must still be satisfied.
+
+If `group_shape` is omitted, the implementation chooses a single target-specific
+default `group_shape` before execution. This choice may take an explicit
+`subgroup_size` into account, but otherwise does not perform multi-option
+search or expensive analysis. The chosen `group_shape` is then validated like
+an explicit one. If it violates LDS limits, subgroup constraints, device
+workgroup limits, or any other launch constraint, the launch fails before
+execution. The implementation does not retry with alternate `group_shape`
+values.
+
+The logical launch domain is `work_shape`. The physical workgroup shape is
+`group_shape`. If `work_shape` is not divisible by `group_shape`, launch is
+still legal: the number of workgroups in each dimension is rounded up with
+`ceil_div(work_shape[d], group_shape[d])`. Boundary workgroups still use the
+same full `group_shape`; workitems whose global ids fall outside `work_shape`
+are logically out of bounds and are handled by ordinary masking or explicit
+bounds checks inside the kernel.
+
 ```python
 # Current kernel API
 pairwise_distance_kernel[global_size, local_size](X1, X2, D)
@@ -438,8 +459,10 @@ The default execution scope is WorkGroup: the kernel body executes once per
 workgroup.
 
 Let `group_shape = (L0, L1, ..., Ln-1)`, where dimension `0` is the
-fastest-varying workgroup dimension. Workitems in the workgroup have local ids
-`(i0, i1, ..., in-1)` with `0 <= ik < Lk`.
+fastest-varying workgroup dimension. `group_shape` is uniform for all
+workgroups in a launch, including boundary workgroups created by rounded-up
+dispatch. Workitems in the workgroup have local ids `(i0, i1, ..., in-1)` with
+`0 <= ik < Lk`.
 
 If `subgroup_size = SG`, then the workgroup is partitioned into subgroups by
 splitting dimension `0` into contiguous blocks of size `SG`. For each fixed

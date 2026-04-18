@@ -1,10 +1,11 @@
-# RFC: High level GPU kernel API
+# RFC: High-level GPU kernel API
 
 Alexander Kalistratov, Ivan Butygin
 
 ## Summary
 
-We propose new high-level kernel API (TBD)
+We propose a new workgroup-first GPU kernel API with symbol-solved launch
+geometry, workgroup-local tensors, and statically-sized vectors.
 
 ## Motivation
 
@@ -15,12 +16,12 @@ little low level control over GPU execution.
 
 ## Proposal
 
-We propose a new Workgroup-level API, with direct access to Numpy array
-operations and ability to acess workitem level API directly.
+We propose a new Workgroup-level API, with direct access to NumPy-style array
+operations and the ability to access workitem-level API directly.
 
 
 ### Kernel definition
-Simple example of pairwise distance kernel:
+Simple examples of pairwise distance kernels:
 ```python
 # Current OpenCL/SYCL style kernel
 @kernel
@@ -35,33 +36,33 @@ def pairwise_distance_kernel(X1, X2, D):
             d += tmp * tmp
         D[i, j] = np.sqrt(d)
 
-# New api, immediately switching to workitem level.
+# New API, immediately switching to workitem level.
 W1 = sym.W1
 W2 = sym.W2
 H = sym.H
 @kernel(work_shape=(W1, W2))
-def pairwise_distance_kernel(group: CurrentGroup,
-                             X1: Buffer[W1, H],
-                             X2: Buffer[W2, H],
-                             D: Buffer[W1, W2]):
+def pairwise_distance_workitem_kernel(group: CurrentGroup,
+                                      X1: Buffer[W1, H],
+                                      X2: Buffer[W2, H],
+                                      D: Buffer[W1, W2]):
     # switch to workitem level
     # parallel loop over work items
     @group.workitems
-    def inner(ind):
-        i, j = ind.global_id()
+    def inner(wi):
+        i, j = wi.global_id()
         if i < X1.shape[0] and j < X2.shape[0]:
-            # using high-level array api to calculate distance
+            # using high-level array API to calculate distance
             d = ((X1[i] - X2[j])**2).sum()
             D[i, j] = np.sqrt(d)
 
     inner()
 
-# Using WG level api
+# Using WorkGroup-level API
 @kernel(work_shape=(W1, W2))
-def pairwise_distance_kernel(group: CurrentGroup,
-                             X1: Buffer[W1, H],
-                             X2: Buffer[W2, H],
-                             D: Buffer[W1, W2]):
+def pairwise_distance_wg_kernel(group: CurrentGroup,
+                                X1: Buffer[W1, H],
+                                X2: Buffer[W2, H],
+                                D: Buffer[W1, W2]):
     gid = group.work_offset # global offset to current WG (i.e. group_size * group_id)
 
     # Create tensor of specified shape, but with boundary checks of X1 and X2
@@ -83,9 +84,9 @@ annotations, tuple-typed kernel arguments, literal symbols, and explicit
 `work_shape`, `group_shape`, and `subgroup_size` declarations all participate
 in the same binding step.
 
-In `pairwise_distance_kernel`, `W1` is bound from `X1.shape[0]`, `W2` is bound
-from `X2.shape[0]`, `H` is bound from the shared second dimension of `X1` and
-`X2`, and `D` must have shape `(W1, W2)`. Since the decorator declares
+In `pairwise_distance_wg_kernel`, `W1` is bound from `X1.shape[0]`, `W2` is
+bound from `X2.shape[0]`, `H` is bound from the shared second dimension of
+`X1` and `X2`, and `D` must have shape `(W1, W2)`. Since the decorator declares
 `work_shape=(W1, W2)`, the global work shape is inferred as
 `(X1.shape[0], X2.shape[0])`.
 
@@ -110,23 +111,24 @@ values.
 The logical launch domain is `work_shape`. The physical workgroup shape is
 `group_shape`. If `work_shape` is not divisible by `group_shape`, launch is
 still legal: the number of workgroups in each dimension is rounded up with
-`ceil_div(work_shape[d], group_shape[d])`. Boundary workgroups still use the
-same full `group_shape`; workitems whose global ids fall outside `work_shape`
-are logically out of bounds and are handled by ordinary masking or explicit
-bounds checks inside the kernel.
+`ceil_div(work_shape[d], group_shape[d]) =
+(work_shape[d] + group_shape[d] - 1) // group_shape[d]`. Boundary workgroups
+still use the same full `group_shape`; workitems whose global ids fall outside
+`work_shape` are logically out of bounds and are handled by ordinary masking or
+explicit bounds checks inside the kernel.
 
 ```python
 # Current kernel API
 pairwise_distance_kernel[global_size, local_size](X1, X2, D)
 
 # New API: launch geometry is inferred from symbol bindings.
-pairwise_distance_kernel(X1, X2, D)
+pairwise_distance_wg_kernel(X1, X2, D)
 ```
-While kernel function takes `CurrentGroup` as argument, it's not passed to the
-kernel invocation directly. The runtime provides it after symbol binding
+While the kernel function takes `CurrentGroup` as argument, it is not passed to
+the kernel invocation directly. The runtime provides it after symbol binding
 determines the launch geometry.
 
-If user wants to specify work/group shapes explicitly they may do so by
+If the user wants to specify work/group shapes explicitly they may do so by
 binding the corresponding symbols through ordinary kernel arguments:
 ```python
 @kernel(work_shape=(G1,G2,G3), group_shape=(L1,L2,L3))
@@ -218,8 +220,8 @@ def test(gr: CurrentGroup,
     ...
 ```
 
-For buffer it's also possible to declare specific dimension as constant if it's
-known beforehead:
+For buffers it is also possible to declare a specific dimension as constant if
+it is known beforehand:
 ```python
 @kernel(work_shape=(W1, W2))
 def pairwise_distance_kernel(group: CurrentGroup,
@@ -229,11 +231,12 @@ def pairwise_distance_kernel(group: CurrentGroup,
 ```
 
 ### Tensors and arrays
-Numpy arrays passed as arguments to the kernel can be accessed directly inside
-but we also provide `tensor` object as a convenient way to access data inside
-the kernel.
+NumPy arrays passed as arguments to the kernel can be accessed directly, but we
+also provide a `tensor` object as a convenient way to access data inside the
+kernel.
 
 Tensors can be of arbitrary, possibly dynamic, shape and support masking access.
+In the examples below, assume `gid = group.work_offset`.
 
 Creating tensor from array
 ```python
@@ -253,7 +256,7 @@ If tensor is masked, only active elements will be written.
 Tensors are workgroup-local objects stored in shared local memory (LDS).
 `group.load` copies data into tensor storage; it never returns a direct view
 into the source array. Mutating a tensor never modifies the source array
-directly. If user wants to make changes visible, it must call
+directly. If the user wants to make changes visible, it must call
 `group.store` explicitly.
 
 Allocating new tensor:
@@ -296,8 +299,8 @@ For tensors, launch-determined values are allowed. For vectors, layout
 functions and derived parameters must be fully statically known after
 specialization and must not depend on dynamic runtime values.
 `storage_size(...)` must be computable before launch, and `offset(...)` must be
-injective over the valid logical index domain. If the compiler cannot prove
-these properties, the program is ill-formed.
+injective over the valid logical index domain. Implementations may
+conservatively reject layouts they cannot validate.
 
 Semantically, a tensor value is defined by a base pointer, a logical shape, a
 storage layout descriptor, and an optional logical view transform. Slices and
@@ -308,7 +311,8 @@ The implementation must not silently place tensors in global memory.
 
 Tensor-producing operations have value semantics. Semantically, each such
 operation creates a fresh tensor in workgroup-local storage unless an `out=`
-argument is provided.
+argument is provided. Tensor-producing operations are permitted only in
+WorkGroup scope.
 
 The shape of any tensor materialization must be determined entirely from
 launch-determined values: constants, literal symbols, kernel argument shapes,
@@ -318,22 +322,22 @@ including pure integer expressions over these values.
 
 Tensor materialization must not depend on values computed during kernel
 execution, including values loaded from tensors, vectors, or buffers, or values
-derived from workgroup, subgroup, or workitem indices. If the compiler cannot
-prove that a tensor materialization is launch-determined, the program is
-ill-formed.
+derived from workgroup, subgroup, or workitem indices. Implementations may
+conservatively reject tensor materializations they cannot validate as
+launch-determined.
 
 For legal tensor materializations, the runtime computes the required LDS usage
 before kernel launch and rejects launches that exceed the device's shared local
 memory limits.
 
-The v1 tensor surface is intended to cover the Numpy-style operations required
+The v1 tensor surface is intended to cover the NumPy-style operations required
 for common GEMM and attention variants. It supports broadcasting together with
 basic indexing and shape manipulation:
 ```python
 diff = ((x1[None, :, :] - x2[:, None, :])**2).sum(axis=2)
 ```
-Numpy ops follows usual Numpy semantics by returning newly allocated tensor as
-result unless an `out=` argument is provided.
+NumPy ops follow usual NumPy semantics by returning a newly allocated tensor as
+the result unless an `out=` argument is provided.
 
 An implementation may eliminate, fuse, or reuse tensor storage when this does
 not change observable behavior. In particular, it may remove storage for unused
@@ -346,7 +350,7 @@ depends on launch-determined values rather than being compile-time constant.
 This diagnostic may be suppressed if optimization proves that no such dynamic
 materialization remains.
 
-Supported Numpy ops on tensors in v1:
+Supported NumPy ops on tensors in v1:
 * Elementwise arithmetic: `+`, `-`, `*`, `/`, unary `-`
 * Elementwise math: `exp`, `sqrt`, `maximum`, `minimum`
 * Elementwise comparisons: `<`, `<=`, `>`, `>=`, `==`, `!=`
@@ -370,13 +374,14 @@ Passing `out=` suppresses the logical fresh allocation for that operation,
 though the compiler may still remove or reuse storage when this is
 unobservable.
 
-Tensor allocation is only allowed on workgroup level, they are not allowed on
-subgroup or workitem level.
+Tensor allocation is only allowed on WorkGroup level; it is not allowed on
+SubGroup or WorkItem level.
 
 
 ### Vectors
 
-In addition to `tensor` objects compiler supports operations over `vector` types.
+In addition to `tensor` objects the compiler supports operations over `vector`
+types.
 Vectors are immutable, statically-sized values with no observable aliasing.
 Vectors may also carry a persistent layout descriptor, interpreted with the
 same `index_map(...)` machinery as tensors.
@@ -393,9 +398,9 @@ Creating vector from array:
 ```python
 x1 = group.vload(X1[gid[0]:], shape=(W, H))
 ```
-Vector allocation shape must be deteminable at compile time. If `layout=` is
-provided for a vector, all derived layout parameters and storage size must also
-be statically known in the specialized kernel variant.
+Vector allocation shape must be statically known after literal binding. If
+`layout=` is provided for a vector, all derived layout parameters and storage
+size must also be statically known in the specialized kernel variant.
 
 Creating vector from tensor:
 ```python
@@ -403,8 +408,8 @@ x1 = group.load(X1[gid[0]:], shape=(W, H)).vec()
 x2 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1]))[x:x+W,y:y+W].vec()
 x3 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1])).vec(shape=(W,H))
 ```
-`vec()` shape must be deteminable at compile time. If shape is omitted, source
-tensor shape will be used and must be static.
+`vec()` shape must be statically known after literal binding. If shape is
+omitted, source tensor shape will be used and must be static.
 `vec()` is the only value conversion from tensor to vector in v1.
 
 `as_layout(...)` explicitly changes the layout of a vector while preserving its
@@ -434,8 +439,8 @@ before entering vector computations.
 
 Vector operations never implicitly create tensors. For operations whose result
 is vector-shaped, the result is always a vector. Such operations are valid only
-when the compiler can determine the result shape at compile time; otherwise the
-program is ill-formed. Numpy-style broadcasting is supported only within this
+when the result shape is statically known after literal binding; otherwise the
+program is ill-formed. NumPy-style broadcasting is supported only within this
 statically-shaped vector domain. `out=` argument is not supported.
 
 Vector operations are defined over logical vector contents, not physical carrier
@@ -443,7 +448,7 @@ order. If all operands have the same layout and the operation preserves logical
 shape, the result preserves that layout. Otherwise the user must convert
 explicitly with `as_layout(...)`.
 
-Supported Numpy ops on vectors in v1:
+Supported NumPy ops on vectors in v1:
 * Elementwise arithmetic: `+`, `-`, `*`, `/`, unary `-`
 * Elementwise math: `exp`, `sqrt`, `maximum`, `minimum`
 * Elementwise comparisons: `<`, `<=`, `>`, `>=`, `==`, `!=`
@@ -536,6 +541,8 @@ fastest-varying workgroup dimension. `group_shape` is uniform for all
 workgroups in a launch, including boundary workgroups created by rounded-up
 dispatch. Workitems in the workgroup have local ids `(i0, i1, ..., in-1)` with
 `0 <= ik < Lk`.
+`group.shape` is `(L0, L1, ..., Ln-1)` and `group.size` is
+`L0 * L1 * ... * Ln-1`.
 
 If `subgroup_size = SG`, then the workgroup is partitioned into subgroups by
 splitting dimension `0` into contiguous blocks of size `SG`. For each fixed
@@ -563,9 +570,9 @@ storage, including activity masks, making writes performed before the barrier
 visible to reads performed after the barrier.
 
 Every workitem in the workgroup must execute the same `group.barrier()` calls
-in the same order. A barrier in non-uniform control flow is invalid. The
-implementation should reject such kernels when it can prove the violation;
-otherwise execution is invalid and may fail at execution time.
+in the same order. A barrier in non-uniform control flow has undefined
+behavior. Implementations may diagnose provable violations, but are not
+required to.
 
 No explicit barrier is provided at WorkGroup or SubGroup scope, because those
 scopes are collective by construction.
@@ -585,8 +592,8 @@ scope.
 Workgroup-local tensors are captured as references to the same tensor storage.
 Subgroup or workitem scope may read from a captured tensor and may update its
 elements via indexing. However, subgroup or workitem scope must not create new
-tensor values; tensor allocation and tensor-producing operations remain
-WorkGroup-only.
+tensor values. Tensor allocation and all other tensor-producing operations
+remain WorkGroup-only.
 
 Vectors are immutable values with no observable aliasing. They may be captured
 and used in any scope, but mutating a vector or rebinding a captured vector
@@ -603,11 +610,14 @@ returns. Within `@group.workitems`, `group.barrier()` only adds ordering
 guarantees for workgroup-local tensor storage, including activity masks.
 
 Conflicting unordered accesses to the same tensor or buffer location from
-different subgroups or workitems are invalid. In particular, overlapping writes
-or a read racing with a write are invalid unless the accesses occur in
-different ordered phases of execution.
+different subgroups or workitems have undefined behavior. In particular,
+overlapping writes or a read racing with a write have undefined behavior unless
+the accesses occur in different ordered phases of execution.
 
-SG Level:
+The following snippets omit buffer annotations and launch decorators for
+brevity.
+
+SubGroup scope:
 ```python
 @kernel
 def foo(group, X1, X2, D):
@@ -619,7 +629,7 @@ def foo(group, X1, X2, D):
     inner()
 ```
 
-Workitem scope:
+WorkItem scope:
 ```python
 @kernel
 def foo(group, X1, X2, D):
@@ -630,13 +640,13 @@ def foo(group, X1, X2, D):
     inner()
 ```
 
-Programming on workitem scope is close to usual OpenCL programming.
+Programming on WorkItem scope is close to usual OpenCL programming.
 
 
 ### Extension intrinsics
 
 The language provides an intrinsic extension API for operations that are most
-naturally expressed as target-specific IR rather than as built-in Numpy-style
+naturally expressed as target-specific IR rather than as built-in NumPy-style
 tensor/vector operations. Intrinsics are called from kernels as ordinary
 functions:
 ```python
@@ -687,7 +697,7 @@ Implementations may additionally provide optional verification and inference
 hooks for intrinsics. Verification hooks may reject invalid target/type/layout
 combinations before execution. Inference hooks may define result type, mask, or
 layout behavior when body analysis is insufficient or when the intrinsic has no
-fallback body.
+fallback body. For example, in pseudocode:
 ```python
 @mfma.verify
 def _(sig, target):
@@ -721,8 +731,8 @@ in an imported device library module.
 ```python
 # device_lib.py
 @kernel.func
-def gelu(x):
-    return 0.5 * x * (1.0 + erf(x / np.sqrt(2.0)))
+def relu(x):
+    return np.maximum(x, 0.0)
 
 @kernel.func(scope=SubGroup)
 def tile_mma(a, b, acc):

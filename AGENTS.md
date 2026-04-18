@@ -75,6 +75,12 @@ After running reviewers (multi-perspective or external), go through every findin
 
 Code comments, docstrings, and commit messages share the same voice: terse, dry, informative. Wit is welcome, fluff is not. Say what the thing does, not what you wish it did. If a comment doesn't earn its line, delete it.
 
+## Testing
+
+- Use `pytest` for Python tests.
+- Write tests in free-function style with plain `assert`, not `unittest.TestCase`.
+- Keep test modules importable by `pytest` without special runners or `if __name__ == "__main__"` blocks.
+
 ## Commits
 
 - Small, focused commits. One logical change per commit. If you're wondering whether to split — split.

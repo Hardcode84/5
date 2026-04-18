@@ -219,10 +219,25 @@ arr = group.full(shape=(...), dtype=dtyp, fill_value=...)
 ```
 The implementation must not silently place tensors in global memory.
 
-If tensor storage requirements can be determined before launch, the
-implementation should reject launches that exceed the device's shared local
-memory limits. Otherwise, execution on such inputs is invalid for that device
-and may fail at execution time, including kernel termination.
+Tensor-producing operations have value semantics. Semantically, each such
+operation creates a fresh tensor in workgroup-local storage unless an `out=`
+argument is provided.
+
+The shape of any tensor materialization must be determined entirely from
+launch-determined values: constants, literal symbols, kernel argument shapes,
+symbol-bound kernel arguments, and launch geometry values such as
+`work_shape`, `group_shape`, `subgroup_size`, `group.shape`, and `group.size`,
+including pure integer expressions over these values.
+
+Tensor materialization must not depend on values computed during kernel
+execution, including values loaded from tensors, vectors, or buffers, or values
+derived from workgroup, subgroup, or workitem indices. If the compiler cannot
+prove that a tensor materialization is launch-determined, the program is
+ill-formed.
+
+For legal tensor materializations, the runtime computes the required LDS usage
+before kernel launch and rejects launches that exceed the device's shared local
+memory limits.
 
 Tensors support usual numpy operations, including fancy indexing and
 broadcasting:
@@ -230,19 +245,29 @@ broadcasting:
 diff = ((x1[None, :, :] - x2[:, None, :])**2).sum(axis=2)
 ```
 Numpy ops follows usual Numpy semantics by returning newly allocated tensor as
-result, but compiler is heavily rely on ops fusion to remove intermedialte
-allocations. If some of the intermediate allocation wasn't removed it will
-result in compiler warning.
+result unless an `out=` argument is provided.
+
+An implementation may eliminate, fuse, or reuse tensor storage when this does
+not change observable behavior. In particular, it may remove storage for unused
+results, merge allocations with non-overlapping lifetimes, or eliminate
+temporary tensors created by fused computations. However, these optimizations
+must preserve the semantics of fresh non-aliasing tensor results.
+
+An implementation may provide a configurable diagnostic when required LDS usage
+depends on launch-determined values rather than being compile-time constant.
+This diagnostic may be suppressed if optimization proves that no such dynamic
+materialization remains.
 
 Supported Numpy ops on tensors: (TBD)
 
-User also can pass out buffer explcitly:
+User also can pass output tensor explicitly:
 ```python
 arr = group.zeros(shape=(...), dtype=dtyp)
 res = np.subtract(x1, x2, out=arr)
 ```
-Explicit allocations won't generate such warnings, but still can be removed by
-compiler due ops fusion and/or DCE.
+Passing `out=` suppresses the logical fresh allocation for that operation,
+though the compiler may still remove or reuse storage when this is
+unobservable.
 
 Tensor allocation is only allowed on workgroup level, they are not allowed on
 subgroup or workitem level.

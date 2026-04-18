@@ -1,8 +1,8 @@
-# RFC: Lowering pipeline for high level GPU kernel API
+# RFC: Lowering pipeline for high-level GPU kernel API
 
 ## Summary
 
-This document describes an MLIR-first lowering path for the high level kernel
+This document describes an MLIR-first lowering path for the high-level kernel
 API defined in `doc/langref.md`.
 
 The main design goal is to get a useful end-to-end compiler running quickly
@@ -16,16 +16,17 @@ The recommended initial path is:
 2. emit textual MLIR in a source-faithful frontend dialect,
 3. run MLIR passes to legalize that frontend dialect into a typed kernel
    dialect,
-4. perform type inference, scope/layout/mask verification, specialization, and
-   launch/resource validation in MLIR,
-5. lower to standard MLIR dialects and backend-specific IR.
+4. perform type inference, scope/layout/mask verification, and specialization
+   in MLIR,
+5. use a launcher-driven launch-validation step and lower to standard MLIR
+   dialects and backend-specific IR.
 
 ## Goals
 
 The lowering path should:
 
 * preserve source structure well enough to support useful diagnostics,
-* handle the structured control-flow model from `langref.md`,
+* handle the structured control-flow model from `doc/langref.md`,
 * support masks, layouts, specialization, helper functions, and intrinsics,
 * make MLIR the home of non-trivial compiler logic,
 * reuse standard MLIR dialects where practical,
@@ -47,13 +48,19 @@ The initial lowering path does not try to:
 This document assumes an AST-first frontend, but only for a restricted Python
 subset. The intention is not to compile full Python, only the kernel DSL.
 
-Frontend capture may be implemented with:
+Frontend capture may initially be implemented with:
 
 * `inspect.getsource(fn)` to recover the source of kernel/helper/intrinsic
   functions,
 * `ast.parse(...)` to build a Python AST,
 * a structured AST visitor that accepts only the supported subset and emits
   frontend MLIR.
+
+Milestone 0 should assume kernels, helpers, and intrinsic fallback bodies are
+defined in importable `.py` files where source recovery succeeds.
+REPL/notebook/lambda/generated-function cases may be rejected in Milestone 0
+with a stable frontend error. Alternative registration paths may be added
+later.
 
 Unsupported constructs are compile errors.
 
@@ -134,13 +141,18 @@ The exact set can evolve, but an initial frontend dialect may include:
 ### Frontend type strategy
 
 To keep the AST translation layer dumb, `hc.front` may use a very small set of
-opaque carrier types such as:
+opaque placeholder types such as:
 
 * `!hc.front.value` for expression results,
 * `!hc.front.typeexpr` for annotation/type syntax when needed.
 
 Names, decorators, annotations, and literal syntax can remain as attributes or
 frontend ops until MLIR legalization resolves them.
+
+Region ops such as `hc.front.subgroup_region` and `hc.front.workitem_region`
+should also carry explicit syntactic capture lists naming outer bindings
+referenced in the nested body. Recording lexical captures is still frontend
+serialization, not semantic capture analysis.
 
 ## Semantic dialect
 
@@ -187,6 +199,27 @@ An initial set may include:
 * `hc.workitem_region`
 * `hc.intrinsic.call`
 
+## Compile-time and launch-time ownership
+
+The lowering stack has three authority layers:
+
+* the Python frontend, which recovers source, preserves syntax, and emits
+  `hc.front`,
+* compile-time MLIR, which builds and verifies symbolic `hc`,
+* a launcher/specialization driver, which binds literal symbols and concrete
+  launch values, chooses default `group_shape`, and drives launch-time
+  validation before execution.
+
+Compile-time MLIR should operate primarily on symbolic launch parameters and
+kernel structure. Concrete buffer shapes, launch shapes, and device limits
+enter only when the launcher supplies them to specialization or launch
+validation.
+
+MLIR may still own most of the validation logic, but launch-time checks are not
+ordinary ahead-of-time `mlir-opt` passes. They are driven by the
+launcher/specialization driver after it supplies concrete bindings and target
+limits to the validation pipeline.
+
 ## MLIR pass pipeline
 
 The current language has multiple classes of validation and transformation.
@@ -200,38 +233,83 @@ The Python side should only:
 * preserve source structure,
 * emit `hc.front` IR.
 
+Postcondition: the module contains only `hc.front` syntax plus builtin/module
+attributes needed to preserve source structure.
+
 ### `hc.front` to `hc` legalization
 
 The first real compiler stage should:
 
 * resolve decorators and annotations into semantic form,
-* translate name-based frontend ops into SSA-based semantic ops,
 * recognize DSL constructs such as `group.load`, `group.vload`,
   `with_inactive`, `as_layout`, and region declarations,
-* build semantic `hc` operations.
+* materialize subgroup/workitem regions together with their explicit syntactic
+  capture lists,
+* build semantic `hc` operations while preserving symbolic launch parameters.
 
-### Type, shape, and scope inference
+Postcondition: semantic `hc` operations and explicit region structure exist, but
+name-based bindings, partially unknown types, and symbolic launch parameters may
+still remain.
+
+### SSA construction
 
 These MLIR passes should:
 
+* eliminate name-based frontend bindings in favor of SSA values,
+* lower reassignment, conditional results, and loop-carried state into explicit
+  SSA/block-argument/yield structure or equivalent state-carrying ops,
+* make captured and region-carried values explicit enough for later scope and
+  barrier verification.
+
+Postcondition: no unresolved `hc.front.name`-style bindings remain in semantic
+IR, and loop/region-carried state is explicit.
+
+### Semantic inference and verification
+
+These compile-time MLIR passes should:
+
 * infer tensor/vector/scalar result types,
-* resolve symbol and shape relationships,
+* resolve symbol and shape relationships that depend only on symbolic
+  compile-time facts,
+* classify captures according to the language rules,
 * verify scope legality, capture rules, and barrier placement,
 * diagnose non-static vector requirements where required.
 
-### Mask, layout, and specialization passes
+Postcondition: the compiler has a semantically well-formed symbolic `hc`
+module, but concrete launch values and device caps may still be unknown.
+
+### Specialization
+
+Specialization is driven by the launcher/specialization driver when a concrete
+kernel variant is requested. It supplies bound literal symbols and other
+specialization-time constants to MLIR.
 
 These MLIR passes should:
 
+* bind literal symbols into specialized variants,
+* enforce static vector and layout requirements that become concrete only after
+  literal binding,
 * infer and verify mask behavior,
 * attach and validate layout descriptors,
-* bind literal symbols into specialized variants,
 * run intrinsic verify/infer hooks.
 
-### Launch and resource validation
+Postcondition: the compiler has a variant-specific `hc` module in which all
+literal-dependent requirements are concrete.
 
-These MLIR passes should happen after symbol binding and default `group_shape`
-selection but before execution:
+### Launch binding and validation
+
+Launch binding and validation are driven by the launcher/specialization driver,
+not by a standalone ahead-of-time pass pipeline.
+
+The launcher should:
+
+* bind concrete symbol values from runtime arguments,
+* choose the default `group_shape` when omitted,
+* provide device limits, capabilities, and any target-specific launch metadata,
+* invoke launch validators over the specialized `hc` module plus those
+  concrete bindings.
+
+These validators should check:
 
 * symbol consistency checks,
 * launch-shape legality,
@@ -240,9 +318,13 @@ selection but before execution:
 * device workgroup and LDS limit checks,
 * any target-specific constraints tied to the chosen launch configuration.
 
+Postcondition: the launch is either rejected before execution or a fully bound,
+validated kernel instance is ready to lower/execute.
+
 ### Lowering to standard and target dialects
 
-After semantic verification, `hc` should lower to a mix of:
+After semantic verification, and after any specialization or launch facts
+required by a given backend have been supplied, `hc` should lower to a mix of:
 
 * `func.func`
 * `arith.*`
@@ -265,6 +347,19 @@ However, the generated MLIR should now be treated as the primary compiler IR,
 not as a serialization target for a Python semantic IR. The Python frontend may
 emit textual `hc.front`, and all substantial compiler work starts once that IR
 is parsed by MLIR.
+
+Textual emission is the bootstrap path, not a forever constraint. Later
+implementations may switch to builder-based or bytecode-backed construction
+without changing the phase boundaries described here.
+
+## Minimum test strategy
+
+Milestone 0 should be backed by:
+
+* golden `hc.front` and `hc` textual MLIR tests that parse and verify in CI,
+* a small shared corpus of kernels cross-checked against the simulator in
+  `doc/simulator.md` for defined inputs and launch failures,
+* explicit tests for source-capture failures and unsupported environments.
 
 ## Dialect strategy
 
@@ -295,7 +390,7 @@ passes infer vector types and verify the stronger static requirements:
 
 * logical vector shape must be static,
 * layout parameters must be static after specialization,
-* vector layout affects carrier order, not logical semantics.
+* vector layout affects physical storage order, not logical semantics.
 
 ### Layouts
 
@@ -318,7 +413,7 @@ of:
 
 The current structured execution model maps naturally to region-bearing ops:
 
-* WorkGroup remains the enclosing kernel body,
+* the enclosing `WorkGroup` body remains the top-level kernel region,
 * `@group.subgroups` should first lower to `hc.front.subgroup_region` and then
   to `hc.subgroup_region`,
 * `@group.workitems` should first lower to `hc.front.workitem_region` and then
@@ -327,11 +422,15 @@ The current structured execution model maps naturally to region-bearing ops:
 This keeps AST translation dumb while still preserving the structure needed for
 later scope verification and lowering.
 
+The `hc.front` region ops should preserve lexical capture lists so later passes
+do not need to rediscover closure structure from arbitrary name use.
+
 ### Helper functions
 
 `@kernel.func` definitions should first lower to `hc.front.func`. MLIR passes
 may then turn them into `hc.func` symbols, inline them, or eventually lower
-them to internal `func.func` symbols. This choice should not be observable.
+them to internal `func.func` symbols. This choice must preserve language
+semantics, though compile time, debug information, and diagnostics may differ.
 
 ### Intrinsics
 
@@ -341,19 +440,28 @@ Later MLIR passes should:
 * apply verify/infer hooks,
 * lower intrinsic calls to `hc.intrinsic.call` or directly to target-specific
   IR when appropriate,
+* preserve the language-visible semantics of the intrinsic contract and
+  fallback body when one is present,
 * otherwise lower the fallback body as ordinary kernel code.
 
 ## Recommended first implementation order
 
-### Milestone 0: straight-line workgroup kernels
+### Milestone 0: fixed-shape straight-line WorkGroup kernels
 
 Implement:
 
+* source capture for supported `.py`-defined kernels,
 * AST parsing for straight-line kernels,
 * textual `hc.front` emission,
 * parsing/verifying that frontend MLIR,
 * `hc.front` to `hc` legalization for assignments, calls, and returns,
-* minimal `hc` typing plus tensor/vector loads and stores.
+* SSA construction for straight-line blocks,
+* minimal `hc` typing plus explicit loads/stores and simple arithmetic on a
+  narrow kernel family.
+
+Milestone 0 is intentionally smaller than the pairwise-distance example below.
+It does not yet require reductions, rich broadcasting, or the full NumPy
+surface from `doc/langref.md`.
 
 ### Milestone 1: structured control flow
 
@@ -361,6 +469,7 @@ Add:
 
 * `if`
 * `for range(...)`
+* block arguments / yields or equivalent explicit state-carrying structure,
 * `hc.subgroup_region`
 * `hc.workitem_region`
 
@@ -368,6 +477,8 @@ Add:
 
 Add:
 
+* reductions and richer NumPy surface needed by the motivating workgroup
+  examples,
 * explicit mask propagation,
 * `with_inactive`,
 * `tensor.mask` / `vector.mask`,
@@ -385,7 +496,7 @@ Add:
 
 ## Example lowering shape
 
-For a source like:
+For a source like the workgroup pairwise-distance kernel from `doc/langref.md`:
 
 ```python
 @kernel(work_shape=(W1, W2))
@@ -400,7 +511,10 @@ def pairwise_distance_kernel(group: CurrentGroup,
     group.store(D[gid[0]:, gid[1]:], np.sqrt(diff))
 ```
 
-the initial compiler should aim to produce:
+This example is intentionally beyond Milestone 0. It becomes a target once
+reductions and a richer NumPy surface are available.
+
+The initial compiler should aim to produce:
 
 * an `hc.front` form that preserves source structure, names, and unresolved
   calls closely,
@@ -412,9 +526,9 @@ the initial compiler should aim to produce:
   * explicit store,
   * enough shape/layout metadata for later lowering.
 
-The first milestone does not require immediate lowering to the final target
-dialect, but it does require a working `hc.front` to `hc` path and a correct
-and inspectable semantic MLIR representation.
+Milestone 0 does not require immediate lowering to the final target dialect,
+but it does require a working `hc.front` to `hc` path and a correct and
+inspectable semantic MLIR representation.
 
 ## Rationale
 
@@ -445,10 +559,12 @@ Compared to a pure tracer-first design, this approach:
 
 This document intentionally leaves a few issues open for later refinement:
 
-* exact split of responsibility between `hc.front` and `hc`,
 * how much mask/layout information should eventually live in `hc` types versus
-  attributes or dedicated ops,
-* which validations should be verifier logic versus dedicated analysis passes,
-* whether helper functions should lower as internal functions or always inline,
+  attributes or dedicated ops once the initial phase boundaries stabilize,
+* whether helper functions should lower as internal functions or always inline
+  once debug and ABI requirements are clearer,
 * whether some structured region ops should eventually lower directly to
-  standard dialect regions.
+  standard dialect regions,
+* whether production implementations should eventually replace textual emission
+  with builder-based or bytecode-backed construction while preserving the same
+  phase structure.

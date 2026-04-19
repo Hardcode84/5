@@ -56,6 +56,16 @@ Frontend capture may initially be implemented with:
 * a structured AST visitor that accepts only the supported subset and emits
   frontend MLIR.
 
+The frontend implementation may still be split internally into:
+
+* source recovery and AST parsing,
+* a restricted AST visitor,
+* a tiny emitter interface whose real implementation constructs `hc.front`.
+
+This split is about code structure and testability, not about introducing a
+third compiler IR. The emitter boundary should be designed around the intended
+`hc.front` operation set and should stay close to it.
+
 Milestone 0 should assume kernels, helpers, and intrinsic fallback bodies are
 defined in importable `.py` files where source recovery succeeds.
 REPL/notebook/lambda/generated-function cases may be rejected in Milestone 0
@@ -74,6 +84,10 @@ The Python frontend should stay as dumb as practical. Its job is to:
 It should not do type inference, shape inference, mask/layout reasoning,
 specialization, capture analysis, resource checks, or any other non-trivial
 compiler transformation.
+
+In particular, the frontend should not grow a durable Python-side semantic tree
+or pseudo-IR. A small fake emitter is acceptable for unit testing the visitor,
+but it must remain an ephemeral test harness rather than a new compiler layer.
 
 ## Supported AST subset
 
@@ -117,6 +131,17 @@ form that feeds the real MLIR compiler pipeline.
 * preserve unresolved names and calls where possible,
 * avoid doing semantic interpretation in Python,
 * be easy to emit as textual MLIR.
+
+The recommended frontend boundary is therefore:
+
+* the AST visitor targets a tiny emitter protocol,
+* the real emitter builds textual or builder-based `hc.front`,
+* test emitters may record the same boundary for unit tests.
+
+That protocol should expose only operations that closely mirror `hc.front`
+construction, such as beginning a kernel/function, emitting constants/calls,
+opening structured regions, and emitting returns. It should not become a rich
+Python IR with independent semantics.
 
 ### Suggested `hc.front` operation set
 
@@ -343,6 +368,12 @@ Reasons:
 * easy to feed into the normal MLIR parser/verifier,
 * avoids large Python builder boilerplate for the initial compiler.
 
+The recommended implementation pattern is to keep the AST visitor independent of
+the final emission format by targeting a very small emitter interface. The
+initial real emitter may still produce textual `hc.front` directly, while test
+emitters record visitor actions without needing the real MLIR dialect
+implementation.
+
 However, the generated MLIR should now be treated as the primary compiler IR,
 not as a serialization target for a Python semantic IR. The Python frontend may
 emit textual `hc.front`, and all substantial compiler work starts once that IR
@@ -356,10 +387,27 @@ without changing the phase boundaries described here.
 
 Milestone 0 should be backed by:
 
+* unit tests for the AST visitor using a tiny fake recording emitter that
+  mirrors the `hc.front` boundary closely enough to validate syntax handling,
+  scoping, decorator capture, unsupported-construct diagnostics, and region
+  structure,
 * golden `hc.front` and `hc` textual MLIR tests that parse and verify in CI,
 * a small shared corpus of kernels cross-checked against the simulator in
   `doc/simulator.md` for defined inputs and launch failures,
 * explicit tests for source-capture failures and unsupported environments.
+
+The fake emitter should record only frontend-structural events, for example:
+
+* begin/end kernel or helper,
+* emit constant/name/call/subscript,
+* begin/end `if` or `for_range`,
+* begin/end subgroup/workitem region,
+* emit return / tuple construction.
+
+It must not become a separately designed frontend IR with its own invariants.
+Its purpose is only to test that the AST visitor walks and classifies the
+supported Python subset correctly before the real `hc.front` dialect exists or
+while its builder/textual APIs are still in flux.
 
 ## Dialect strategy
 

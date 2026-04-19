@@ -23,7 +23,7 @@ from .core import (
 )
 
 if TYPE_CHECKING:
-    from . import symbols
+    from . import simulator, symbols
     from .symbols import Symbol
 
 __all__ = [
@@ -39,11 +39,13 @@ __all__ = [
     "WorkItem",
     "index_map",
     "kernel",
+    "simulator",
     "symbols",
     "sym",
 ]
 
 _SYMBOLS_MODULE: ModuleType | None = None
+_SIMULATOR_MODULE: ModuleType | None = None
 
 
 def _load_symbols_module() -> ModuleType:
@@ -53,6 +55,13 @@ def _load_symbols_module() -> ModuleType:
     return _SYMBOLS_MODULE
 
 
+def _load_simulator_module() -> ModuleType:
+    global _SIMULATOR_MODULE
+    if _SIMULATOR_MODULE is None:
+        _SIMULATOR_MODULE = importlib.import_module(".simulator", __name__)
+    return _SIMULATOR_MODULE
+
+
 def __getattr__(name: str) -> Any:
     if name in {"Symbol", "sym", "symbols"}:
         _symbols = _load_symbols_module()
@@ -60,6 +69,8 @@ def __getattr__(name: str) -> Any:
         if name == "symbols":
             return _symbols
         return getattr(_symbols, name)
+    if name == "simulator":
+        return _load_simulator_module()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

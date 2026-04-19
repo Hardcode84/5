@@ -347,6 +347,14 @@ Python body multiple times under the appropriate subgroup or workitem contexts.
 This allows collective regions to be expressed in normal Python without AST
 rewriting.
 
+Region objects may also return values. If every participant returns `None`, the
+region call returns `None` in the enclosing WorkGroup scope. If participants
+return a scalar, vector, or flat tuple of scalar/vector values, the region call
+returns the lifted WorkGroup-scope value described in `doc/langref.md`.
+Uniformity of return structure, dtype, logical shape, and vector layout over
+the non-collective prefix must be validated at the join point, and the
+simulator must raise a deterministic runtime error on mismatch.
+
 ## Execution Scopes
 
 ### WorkGroup Scope
@@ -380,6 +388,12 @@ and size queries. Subgroups should execute in deterministic subgroup-id order.
 Returning from the subgroup region implies a join back to the enclosing
 WorkGroup scope.
 
+If subgroup executions return values, the simulator must collect them in
+subgroup-id order. Scalar/vector returns from subgroup scope lift to shape
+`S + (num_subgroups,)`, and tuple returns lift elementwise. For vector returns,
+payload and activity mask must be stacked elementwise along the appended
+subgroup axis.
+
 Deterministic serial subgroup scheduling is only a host execution strategy. It
 must not be interpreted as making conflicting unordered subgroup accesses
 well-defined under the language contract.
@@ -399,6 +413,17 @@ Each workitem receives:
 * a host `WorkItem` object providing local/global id queries,
 * access to captured outer values according to the capture rules in
   `doc/langref.md`.
+
+If workitem executions return values, the simulator must collect them into the
+logical suffix indexed by the components of `wi.local_id()` in order.
+Scalar/vector returns from workitem scope lift to shape `S + group.shape`, and
+tuple returns lift elementwise. For vector returns, payload and activity mask
+must be stacked elementwise along the appended workitem axes. Any concrete
+dense materialization must use ordinary vector dense order over that appended
+workitem suffix, so the rightmost appended workitem axis is fastest in carrier
+order. Because `doc/langref.md` specifies no automatic projection on re-entry,
+re-entered subgroup/workitem regions should see the same full lifted value and
+rely on ordinary slicing to extract local slices.
 
 ### Barrier Semantics
 

@@ -5,7 +5,7 @@ Alexander Kalistratov, Ivan Butygin
 ## Summary
 
 We propose a new workgroup-first GPU kernel API with symbol-solved launch
-geometry, workgroup-local tensors, and statically-sized vectors.
+geometry, workgroup-local tensors, and fixed-size vectors.
 
 ## Minimal glossary
 
@@ -309,7 +309,15 @@ Layout functions must be pure integer expressions that depend only on logical
 shape values, constants, literal symbols, and other launch-determined values.
 For tensors, launch-determined values are allowed. For vectors, layout
 functions and derived parameters must be fully statically known after
-specialization and must not depend on dynamic runtime values.
+specialization and must not depend on dynamic runtime values. Collective return
+dimensions introduced by `@group.subgroups` / `@group.workitems` are excluded
+from explicit vector layout descriptors in v1. Conceptually, lifting
+concatenates participant-local flat carriers in the canonical dense order of
+the appended collective suffix and then interprets that suffix as a trivially
+dense suffix layout. This uses ordinary vector dense order over the appended
+collective suffix, so the rightmost appended collective dimension is fastest in
+carrier order. These collective return dimensions do not contribute additional
+layout parameters or `storage_size(...)` validation.
 `storage_size(...)` must be computable before launch, and `offset(...)` must be
 injective over the valid logical index domain. Implementations may
 conservatively reject layouts they cannot validate.
@@ -394,7 +402,13 @@ SubGroup or WorkItem level.
 
 In addition to `tensor` objects the compiler supports operations over `vector`
 types.
-Vectors are immutable, statically-sized values with no observable aliasing.
+Vectors are immutable, fixed-size values with no observable aliasing.
+Fixed-size means that every logical extent is determined either after literal
+binding or from current launch geometry; no vector extent may depend on values
+computed during kernel execution. Ordinary vector dimensions must be
+statically known after literal binding. Collective return dimensions may
+additionally append trailing launch-determined dimensions whose extents are
+determined by current launch geometry; see the execution model below.
 Vectors may also carry a persistent layout descriptor, interpreted with the
 same `index_map(...)` machinery as tensors.
 
@@ -451,9 +465,15 @@ before entering vector computations.
 
 Vector operations never implicitly create tensors. For operations whose result
 is vector-shaped, the result is always a vector. Such operations are valid only
-when the result shape is statically known after literal binding; otherwise the
-program is ill-formed. NumPy-style broadcasting is supported only within this
-statically-shaped vector domain. `out=` argument is not supported.
+when the result shape is statically known after literal binding. Collective
+return dimensions introduced by the execution model count as known trailing
+launch-determined dimensions for this purpose and are treated as dense logical
+trailing axes. Otherwise the program is ill-formed. NumPy-style broadcasting is
+supported only within this statically-shaped vector domain. `out=` argument is
+not supported. For binary vector operations, non-scalar operands must have
+identical collective return suffix structure. Implicit broadcasting must not
+create, drop, reorder, or partially match collective return dimensions; users
+must slice or reshape explicitly first.
 
 Vector operations are defined over logical vector contents, not physical carrier
 order. If all operands have the same layout and the operation preserves logical
@@ -575,6 +595,75 @@ the enclosing scope, and returning from the inner function implies a join back
 to the enclosing scope. After `inner()` returns, all subgroups or workitems in
 that region have completed.
 
+#### Collective returns
+
+`@group.subgroups` and `@group.workitems` may return `None`, a scalar, a
+vector, or a flat tuple of scalar/vector values. `None` is only legal as the
+whole region result, not as a tuple element. Returning a tensor, a nested
+tuple, or any other shaped aggregate is ill-formed in v1.
+
+All participants in the same collective region must return the same structure.
+For a scalar/vector result, all participants must return the same kind, dtype,
+and logical shape, and vector results must also agree on layout over their
+non-collective prefix shape. For tuple results, this requirement applies
+independently to each tuple position. If every participant returns `None`, the
+region call expression evaluates to `None` in the enclosing scope. A mismatch
+in return structure or per-position contract is ill-formed. The simulator must
+report it deterministically at the join point. Compiled implementations are
+expected to reject it during typing or lowering and need not model a runtime
+join-time validator.
+
+If `@group.workitems` returns a scalar or vector of logical shape `S` from each
+workitem, the enclosing scope receives a vector of logical shape
+`S + group.shape`. For a scalar return, `S = ()`, so the result shape is
+`group.shape`. The appended workitem dimensions are indexed by the components of
+`wi.local_id()` in order. In any concrete dense materialization, this appended
+suffix uses ordinary vector dense order, so the rightmost appended workitem
+dimension is fastest in carrier order. If
+`@group.workitems` returns a flat tuple `(v0, ..., v{n-1})`, this lifting rule
+is applied independently to each tuple element, and the enclosing scope
+receives a tuple of the same arity.
+
+If `@group.subgroups` returns a scalar or vector of logical shape `S` from each
+subgroup, the enclosing scope receives a vector of logical shape
+`S + (num_subgroups,)`, where
+`num_subgroups = (L0 // SG) * L1 * ... * Ln-1`. For a scalar return, `S = ()`,
+so the result shape is `(num_subgroups,)`. The appended subgroup dimension is
+indexed by `sg.subgroup_id()`. If `@group.subgroups` returns a flat tuple
+`(v0, ..., v{n-1})`, this lifting rule is applied independently to each tuple
+element, and the enclosing scope receives a tuple of the same arity.
+
+These appended trailing dimensions are collective return dimensions. They are
+ordinary logical vector dimensions at source level and are appended on the
+right as trailing dimensions. Returning a value that already carries collective
+return dimensions appends another trailing collective return suffix; there is
+no implicit flattening, collapsing, or projection.
+
+When a value with collective return dimensions is later captured by subgroup or
+workitem scope, the inner scope sees the same full logical vector value. There
+is no automatic projection to the current subgroup or workitem. User code must
+slice collective return dimensions explicitly. For workitem-returned values,
+fixed collective indices are the components of `wi.local_id()`. For example, in
+a 1D workgroup `acc[:, wi.local_id()[0]]` selects the current workitem slice,
+while in a 2D workgroup `i0, i1 = wi.local_id(); acc[:, i0, i1]` does so. For
+subgroup-returned values, the collective index is `sg.subgroup_id()`, e.g.
+`acc[:, sg.subgroup_id()]`.
+
+Collective lifting stacks both payload and activity mask elementwise along the
+appended collective return dimensions. For vector returns, each fixed
+collective slice preserves the returned vector's mask and non-collective
+layout. A poison scalar return yields a poison element at the corresponding
+collective index. Collective return dimensions themselves never participate in
+user-written `layout=` descriptors in v1; they are introduced by concatenating
+participant-local carriers in canonical dense suffix order and interpreting the
+appended collective suffix as a trivially dense suffix layout over that
+concatenation.
+
+The physical representation of collective return values is not observable.
+Implementations may keep them distributed across subgroup/workitem-private
+registers, replicate them, centralize them, or repack them through
+workgroup-local storage, as long as observable semantics are preserved.
+
 The only explicit barrier in v1 is `group.barrier()`. It is permitted only
 inside `@group.workitems` and synchronizes all workitems in the current
 workgroup. `group.barrier()` also orders accesses to workgroup-local tensor
@@ -653,6 +742,65 @@ def foo(group, X1, X2, D):
 ```
 
 Programming on WorkItem scope is close to usual OpenCL programming.
+
+The following examples assume a 1D workgroup shape for brevity.
+
+Returning values from WorkItem scope:
+```python
+@kernel
+def foo(group, D):
+    @group.workitems
+    def init(wi):
+        return group.vzeros(shape=(8,), dtype=np.float32)
+
+    acc = init()  # logical shape (8,) + group.shape
+
+    @group.workitems
+    def step(wi):
+        lane = wi.local_id()[0]
+        local_acc = acc[:, lane]
+        return local_acc + 1.0
+
+    acc = step()  # logical shape still (8,) + group.shape
+
+    @group.workitems
+    def finish(wi):
+        lane = wi.local_id()[0]
+        group.store(D[wi.global_id()[0]:], acc[:, lane])
+
+    finish()
+```
+
+Returning values from SubGroup scope:
+```python
+@kernel  # assume subgroup_size is declared
+def foo(group):
+    @group.subgroups
+    def init(sg):
+        return group.vzeros(shape=(8,), dtype=np.float32)
+
+    acc = init()  # logical shape (8, num_subgroups)
+
+    @group.subgroups
+    def step(sg):
+        return acc[:, sg.subgroup_id()] + 1.0
+
+    acc = step()  # logical shape still (8, num_subgroups)
+```
+
+Tuple returns are lifted elementwise:
+```python
+@kernel
+def foo(group):
+    @group.workitems
+    def init(wi):
+        lane = wi.local_id()[0]
+        return group.vzeros(shape=(8,), dtype=np.float32), np.int32(lane)
+
+    acc, lanes = init()
+    # `acc` has logical shape (8,) + group.shape
+    # `lanes` has logical shape group.shape
+```
 
 
 ### Extension intrinsics

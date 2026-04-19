@@ -8,6 +8,42 @@ import pytest
 import hc.simulator as sim
 from hc import Buffer, kernel, sym
 
+_EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
+    [
+        [1, 3],
+        [3, 5],
+        [4, 6],
+        [0, 2],
+    ],
+    dtype=np.int64,
+)
+
+
+@kernel(work_shape=(4, 2), group_shape=(4, 2), subgroup_size=2)
+def _staged_subgroups_and_workitems_kernel(group, dst: Buffer[4, 2]) -> None:
+    subgroup_tags = group.full(shape=group.shape, dtype=np.int64, fill_value=-1)
+    scratch = group.zeros(shape=group.shape, dtype=np.int64)
+
+    @group.subgroups
+    def mark(sg) -> None:
+        blocks_per_row = group.shape[0] // sg.size()
+        block = sg.subgroup_id() % blocks_per_row
+        row = sg.subgroup_id() // blocks_per_row
+        start = block * sg.size()
+        subgroup_tags[start : start + sg.size(), row] = sg.subgroup_id()
+
+    mark()
+
+    @group.workitems
+    def inner(wi) -> None:
+        lid0, lid1 = wi.local_id()
+        gid0, gid1 = wi.global_id()
+        scratch[lid0, lid1] = subgroup_tags[lid0, lid1] + gid0
+        group.barrier()
+        dst[gid0, gid1] = scratch[(lid0 + 1) % group.shape[0], lid1]
+
+    inner()
+
 
 def test_launch_runs_workgroup_pairwise_kernel() -> None:
     W1 = sym.W1
@@ -97,21 +133,28 @@ def test_poison_scalar_read_raises() -> None:
         sim.launch(bad, x)
 
 
-def test_group_workitems_is_not_supported_in_milestone_zero() -> None:
+def test_group_workitems_execute_in_deterministic_order() -> None:
+    seen: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
     W = sym.W
 
-    @kernel(work_shape=(W,), group_shape=(4,))
-    def unsupported(group, x: Buffer[W]) -> None:
+    @kernel(work_shape=(W,), group_shape=(2,))
+    def visit(group, x: Buffer[W]) -> None:
         @group.workitems
-        def inner(wi):
-            return wi
+        def inner(wi) -> None:
+            seen.append((group.group_id, wi.local_id(), wi.global_id()))
 
         inner()
 
-    x = np.arange(4, dtype=np.float32)
+    x = np.arange(3, dtype=np.float32)
 
-    with pytest.raises(sim.ScopeError, match="@group.workitems"):
-        sim.launch(unsupported, x)
+    sim.launch(visit, x)
+
+    assert seen == [
+        ((0,), (0,), (0,)),
+        ((0,), (1,), (1,)),
+        ((1,), (0,), (2,)),
+        ((1,), (1,), (3,)),
+    ]
 
 
 def test_sim_tensor_mask_and_reductions_follow_mask_rules() -> None:
@@ -124,6 +167,44 @@ def test_sim_tensor_mask_and_reductions_follow_mask_rules() -> None:
     assert tensor.mask[1] is False
     assert tensor.sum() == pytest.approx(4.0)
     assert tensor.with_inactive(value=-1.0)[1] == -1.0
+
+
+def test_group_barrier_orders_workitem_tensor_accesses() -> None:
+    out = np.zeros((4,), dtype=np.int64)
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def phased(group, dst: Buffer[4]) -> None:
+        scratch = group.zeros(shape=(4,), dtype=np.int64)
+
+        @group.workitems
+        def inner(wi) -> None:
+            lid = wi.local_id()[0]
+            gid = wi.global_id()[0]
+            scratch[lid] = gid + 1
+            group.barrier()
+            dst[gid] = scratch.sum()
+
+        inner()
+
+    sim.launch(phased, out)
+
+    assert np.array_equal(out, np.array([10, 10, 10, 10], dtype=np.int64))
+
+
+def test_divergent_barrier_use_raises_simulator_error() -> None:
+    @kernel(work_shape=(2,), group_shape=(2,))
+    def bad(group, x: Buffer[2]) -> None:
+        @group.workitems
+        def inner(wi) -> None:
+            if wi.local_id()[0] == 0:
+                group.barrier()
+
+        inner()
+
+    x = np.zeros((2,), dtype=np.float32)
+
+    with pytest.raises(sim.SimulatorError, match="divergent barrier"):
+        sim.launch(bad, x)
 
 
 def test_mask_view_is_read_only() -> None:
@@ -228,19 +309,35 @@ def test_simulator_target_enforces_group_size_limit() -> None:
         sim.launch(capture, x, target=sim.SimulatorTarget(max_group_size=4))
 
 
-def test_group_subgroups_is_not_supported_in_milestone_zero() -> None:
-    @kernel(work_shape=(1,), group_shape=(1,))
-    def unsupported(group, x: Buffer[1]) -> None:
+def test_group_subgroups_execute_in_partition_order() -> None:
+    seen: list[tuple[tuple[int, ...], int, int]] = []
+
+    @kernel(work_shape=(4, 2), group_shape=(4, 2), subgroup_size=2)
+    def visit(group, _x: Buffer[4, 2]) -> None:
         @group.subgroups
-        def inner(sg):
-            return sg
+        def inner(sg) -> None:
+            seen.append((group.group_id, sg.subgroup_id(), sg.size()))
 
         inner()
 
-    x = np.arange(1, dtype=np.float32)
+    src = np.zeros((4, 2), dtype=np.float32)
 
-    with pytest.raises(sim.ScopeError, match="@group.subgroups"):
-        sim.launch(unsupported, x)
+    sim.launch(visit, src)
+
+    assert seen == [
+        ((0, 0), 0, 2),
+        ((0, 0), 1, 2),
+        ((0, 0), 2, 2),
+        ((0, 0), 3, 2),
+    ]
+
+
+def test_subgroups_and_workitems_share_tensor_state_across_regions() -> None:
+    out = np.zeros((4, 2), dtype=np.int64)
+
+    sim.launch(_staged_subgroups_and_workitems_kernel, out)
+
+    assert np.array_equal(out, _EXPECTED_SUBGROUP_AND_WORKITEM_STATE)
 
 
 def test_scalar_reduction_returns_scalar_result() -> None:
@@ -263,6 +360,41 @@ def test_basic_indexing_subset_is_enforced() -> None:
 
     with pytest.raises(sim.SimulatorError, match="basic indexing"):
         _ = tensor[[0, 1]]
+
+
+def test_group_load_is_rejected_in_workitem_scope() -> None:
+    @kernel(work_shape=(2,), group_shape=(2,))
+    def bad(group, x: Buffer[2]) -> None:
+        @group.workitems
+        def inner(wi) -> None:
+            _ = wi
+            group.load(x, shape=(1,))
+
+        inner()
+
+    x = np.zeros((2,), dtype=np.float32)
+
+    with pytest.raises(sim.ScopeError, match="group.load"):
+        sim.launch(bad, x)
+
+
+def test_group_vload_and_vector_store_work_in_workitem_scope() -> None:
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def copy(group, src: Buffer[4], dst: Buffer[4]) -> None:
+        @group.workitems
+        def inner(wi) -> None:
+            gid = wi.global_id()[0]
+            vec = group.vload(src[gid:], shape=(1,))
+            group.store(dst[gid:], vec + 2)
+
+        inner()
+
+    src = np.arange(4, dtype=np.float32)
+    dst = np.zeros((4,), dtype=np.float32)
+
+    sim.launch(copy, src, dst)
+
+    assert np.array_equal(dst, src + 2)
 
 
 def test_non_call_ufunc_methods_are_rejected() -> None:

@@ -2,18 +2,21 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Milestone 0 host-side simulator for `hc` kernels.
+"""Host-side simulator for `hc` kernels.
 
-This module executes WorkGroup-only kernels directly in Python against masked
-host runtime objects. Catch `SimulatorError` for any simulator failure, or
-`LaunchError` specifically for pre-execution launch and binding failures.
+This module executes kernels directly in Python against masked host runtime
+objects, including collective workgroup, subgroup, and workitem regions. Catch
+`SimulatorError` for any simulator failure, or `LaunchError` specifically for
+pre-execution launch and binding failures.
 """
 
 from __future__ import annotations
 
+import importlib
 import inspect
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, cast, get_args, get_origin
 
 import numpy as np
@@ -28,11 +31,15 @@ from ._sim_types import (
     SimVector,
     poison,
 )
-from .core import BufferSpec, CurrentGroup, KernelMetadata
+from .core import BufferSpec, CurrentGroup, KernelMetadata, SubGroup, WorkItem
 from .symbols import Bindings, Env, Expr, Symbol, SymbolError, sym
 
 type FrozenEnv = Env
 type BufferValue = np.ndarray[Any, np.dtype[Any]]
+
+_SCOPE_WORKGROUP = "workgroup"
+_SCOPE_SUBGROUP = "subgroup"
+_SCOPE_WORKITEM = "workitem"
 
 
 @dataclass(frozen=True)
@@ -59,12 +66,20 @@ def launch(
     target: SimulatorTarget | None = None,
     **kwargs: Any,
 ) -> None:
-    bound, env, literal_names, work_shape, group_shape = _prepare_launch(
+    bound, env, literal_names, work_shape, group_shape, subgroup_size = _prepare_launch(
         fn, args, kwargs, target
     )
     if any(dim == 0 for dim in work_shape):
         return
-    _run_workgroups(fn, bound, env, literal_names, work_shape, group_shape)
+    _run_workgroups(
+        fn,
+        bound,
+        env,
+        literal_names,
+        work_shape,
+        group_shape,
+        subgroup_size,
+    )
 
 
 def _prepare_launch(
@@ -78,6 +93,7 @@ def _prepare_launch(
     frozenset[str],
     tuple[int, ...],
     tuple[int, ...],
+    int | None,
 ]:
     try:
         runtime_target = DEFAULT_TARGET if target is None else target
@@ -107,7 +123,7 @@ def _prepare_launch(
         _validate_launch(work_shape, group_shape, subgroup_size, runtime_target)
     except SymbolError as exc:
         raise LaunchError(str(exc)) from exc
-    return bound, env, literal_names, work_shape, group_shape
+    return bound, env, literal_names, work_shape, group_shape, subgroup_size
 
 
 run = launch
@@ -123,6 +139,7 @@ class SimCurrentGroup(CurrentGroup):
         shape: tuple[int, ...],
         work_shape: tuple[int, ...],
         work_offset: tuple[int, ...],
+        subgroup_size: int | None,
         env: FrozenEnv,
         literal_names: frozenset[str],
     ) -> None:
@@ -132,17 +149,53 @@ class SimCurrentGroup(CurrentGroup):
             work_shape=work_shape,
             work_offset=work_offset,
         )
+        self._subgroup_size = subgroup_size
         self._env = env
         self._literal_names = literal_names
+        self._scope = _SCOPE_WORKGROUP
+        self._workitem_scheduler: _WorkItemScheduler | None = None
+
+    def _set_runtime_scope(
+        self, scope: str, scheduler: _WorkItemScheduler | None = None
+    ) -> None:
+        self._scope = scope
+        self._workitem_scheduler = scheduler
+
+    def _require_workgroup_scope(self, name: str) -> None:
+        if self._scope != _SCOPE_WORKGROUP:
+            raise ScopeError(f"{name} is only supported in WorkGroup scope")
+
+    def _region_runner(
+        self, fn: Callable[..., Any], *, scope: str
+    ) -> Callable[..., Any]:
+        @wraps(fn)
+        def invoke(*args: Any, **kwargs: Any) -> None:
+            if args or kwargs:
+                raise SimulatorError(
+                    "collective region runners do not accept call-time arguments"
+                )
+            self._require_workgroup_scope(
+                "@group.subgroups" if scope == _SCOPE_SUBGROUP else "@group.workitems"
+            )
+            if scope == _SCOPE_SUBGROUP:
+                self._run_subgroups(fn)
+                return
+            self._run_workitems(fn)
+
+        return invoke
 
     def subgroups(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        raise ScopeError("Milestone 0 simulator does not support @group.subgroups")
+        return self._region_runner(fn, scope=_SCOPE_SUBGROUP)
 
     def workitems(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        raise ScopeError("Milestone 0 simulator does not support @group.workitems")
+        return self._region_runner(fn, scope=_SCOPE_WORKITEM)
 
     def barrier(self) -> None:
-        raise ScopeError("Milestone 0 simulator does not support group.barrier()")
+        if self._scope != _SCOPE_WORKITEM or self._workitem_scheduler is None:
+            raise ScopeError(
+                "group.barrier() is only supported inside @group.workitems"
+            )
+        self._workitem_scheduler.barrier()
 
     def load(
         self,
@@ -157,6 +210,7 @@ class SimCurrentGroup(CurrentGroup):
         `shape=` requests an explicit logical tile. If the source slice is
         larger than that tile, the extra source region is ignored.
         """
+        self._require_workgroup_scope("group.load()")
         return cast(
             SimTensor,
             _load_value(
@@ -195,11 +249,14 @@ class SimCurrentGroup(CurrentGroup):
         )
 
     def store(self, target: Any, value: Any) -> None:
+        if isinstance(value, SimTensor):
+            self._require_workgroup_scope("group.store() with a tensor source")
         _store_value(target, value)
 
     def empty(
         self, *, shape: Sequence[Any], dtype: Any, layout: Any = None
     ) -> SimTensor:
+        self._require_workgroup_scope("group.empty()")
         return cast(
             SimTensor,
             _allocate_value(
@@ -218,6 +275,7 @@ class SimCurrentGroup(CurrentGroup):
     def zeros(
         self, *, shape: Sequence[Any], dtype: Any, layout: Any = None
     ) -> SimTensor:
+        self._require_workgroup_scope("group.zeros()")
         return cast(
             SimTensor,
             _allocate_value(
@@ -236,6 +294,7 @@ class SimCurrentGroup(CurrentGroup):
     def ones(
         self, *, shape: Sequence[Any], dtype: Any, layout: Any = None
     ) -> SimTensor:
+        self._require_workgroup_scope("group.ones()")
         return cast(
             SimTensor,
             _allocate_value(
@@ -254,6 +313,7 @@ class SimCurrentGroup(CurrentGroup):
     def full(
         self, *, shape: Sequence[Any], dtype: Any, fill_value: Any, layout: Any = None
     ) -> SimTensor:
+        self._require_workgroup_scope("group.full()")
         return cast(
             SimTensor,
             _allocate_value(
@@ -322,6 +382,160 @@ class SimCurrentGroup(CurrentGroup):
                 fill_value=fill_value,
             ),
         )
+
+    def _run_subgroups(self, fn: Callable[..., Any]) -> None:
+        subgroup_size = self._subgroup_size
+        if subgroup_size is None:
+            raise ScopeError("@group.subgroups requires subgroup_size")
+        subgroup_grid = (self.shape[0] // subgroup_size, *self.shape[1:])
+        for subgroup_id, _ in enumerate(_iterate_indices(subgroup_grid)):
+            subgroup = SimSubGroup(subgroup_id=subgroup_id, size=subgroup_size)
+            self._set_runtime_scope(_SCOPE_SUBGROUP)
+            try:
+                fn(subgroup)
+            finally:
+                self._set_runtime_scope(_SCOPE_WORKGROUP)
+
+    def _run_workitems(self, fn: Callable[..., Any]) -> None:
+        scheduler = _WorkItemScheduler(self, fn)
+        self._set_runtime_scope(_SCOPE_WORKGROUP)
+        scheduler.run()
+
+
+class SimSubGroup(SubGroup):
+    """Runtime `SubGroup` object used by collective subgroup regions."""
+
+    def __init__(self, *, subgroup_id: int, size: int) -> None:
+        self._subgroup_id = subgroup_id
+        self._size = size
+
+    def subgroup_id(self) -> int:
+        return self._subgroup_id
+
+    def size(self) -> int:
+        return self._size
+
+
+class SimWorkItem(WorkItem):
+    """Runtime `WorkItem` object used by collective workitem regions."""
+
+    def __init__(
+        self, *, local_id: tuple[int, ...], global_id: tuple[int, ...]
+    ) -> None:
+        self._local_id = local_id
+        self._global_id = global_id
+
+    def global_id(self) -> tuple[int, ...]:
+        return self._global_id
+
+    def local_id(self) -> tuple[int, ...]:
+        return self._local_id
+
+
+@dataclass(frozen=True)
+class _BarrierWait:
+    generation: int
+
+
+@dataclass
+class _WorkItemState:
+    workitem: SimWorkItem
+    runner: Any
+    started: bool = False
+    done: bool = False
+    barrier_generation: int = 0
+    waiting_generation: int | None = None
+
+
+class _WorkItemScheduler:
+    def __init__(self, group: SimCurrentGroup, fn: Callable[..., Any]) -> None:
+        self._group = group
+        self._fn = fn
+        self._greenlet = _greenlet_runtime()
+        self._scheduler_greenlet = self._greenlet.getcurrent()
+        self._states = [
+            self._make_state(local_id) for local_id in _iterate_indices(group.shape)
+        ]
+        self._current_state: _WorkItemState | None = None
+
+    def run(self) -> None:
+        while True:
+            live = [state for state in self._states if not state.done]
+            if not live:
+                self._group._set_runtime_scope(_SCOPE_WORKGROUP)
+                return
+            for state in live:
+                if state.waiting_generation is not None:
+                    continue
+                self._resume_state(state)
+            self._release_barrier(live)
+
+    def barrier(self) -> None:
+        state = self._current_state
+        if state is None:
+            raise SimulatorError(
+                "group.barrier() is only valid during workitem execution"
+            )
+        generation = state.barrier_generation + 1
+        self._scheduler_greenlet.switch(_BarrierWait(generation))
+
+    def _make_state(self, local_id: tuple[int, ...]) -> _WorkItemState:
+        global_id = tuple(
+            self._group.work_offset[idx] + local_id[idx] for idx in range(len(local_id))
+        )
+        workitem = SimWorkItem(local_id=local_id, global_id=global_id)
+        runner = self._greenlet.greenlet(self._run_workitem)
+        return _WorkItemState(workitem=workitem, runner=runner)
+
+    def _run_workitem(self, workitem: SimWorkItem) -> None:
+        self._fn(workitem)
+
+    def _resume_state(self, state: _WorkItemState) -> None:
+        self._current_state = state
+        self._group._set_runtime_scope(_SCOPE_WORKITEM, scheduler=self)
+        try:
+            if state.started:
+                outcome = state.runner.switch()
+            else:
+                state.started = True
+                outcome = state.runner.switch(state.workitem)
+        finally:
+            self._group._set_runtime_scope(_SCOPE_WORKGROUP)
+            self._current_state = None
+        if state.runner.dead:
+            state.done = True
+            return
+        if not isinstance(outcome, _BarrierWait):
+            raise SimulatorError("unexpected workitem scheduler yield")
+        state.waiting_generation = outcome.generation
+
+    def _release_barrier(self, live: list[_WorkItemState]) -> None:
+        waiting = [
+            state
+            for state in live
+            if not state.done and state.waiting_generation is not None
+        ]
+        if not waiting:
+            return
+        if len(waiting) != len(live):
+            raise SimulatorError("divergent barrier use in workitem region")
+        generation = waiting[0].waiting_generation
+        if generation is None:
+            raise SimulatorError("divergent barrier use in workitem region")
+        if any(state.waiting_generation != generation for state in waiting[1:]):
+            raise SimulatorError("divergent barrier use in workitem region")
+        for state in waiting:
+            state.barrier_generation = generation
+            state.waiting_generation = None
+
+
+def _greenlet_runtime() -> Any:
+    try:
+        return importlib.import_module("greenlet")
+    except ModuleNotFoundError as exc:
+        raise SimulatorError(
+            "@group.workitems requires the optional greenlet dependency"
+        ) from exc
 
 
 def _kernel_metadata(fn: Callable[..., Any]) -> KernelMetadata:
@@ -571,6 +785,7 @@ def _run_workgroups(
     literal_names: frozenset[str],
     work_shape: tuple[int, ...],
     group_shape: tuple[int, ...],
+    subgroup_size: int | None,
 ) -> None:
     group_counts = tuple(
         _ceil_div(work, local)
@@ -585,6 +800,7 @@ def _run_workgroups(
             shape=group_shape,
             work_shape=work_shape,
             work_offset=work_offset,
+            subgroup_size=subgroup_size,
             env=env,
             literal_names=literal_names,
         )
@@ -767,7 +983,9 @@ __all__ = [
     "Poison",
     "PoisonError",
     "ScopeError",
+    "SimSubGroup",
     "SimTensor",
+    "SimWorkItem",
     "SimVector",
     "SimulatorError",
     "SimulatorTarget",

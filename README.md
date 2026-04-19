@@ -10,7 +10,7 @@ The project currently provides:
 * package metadata and local tooling configuration in `pyproject.toml`,
 * lightweight kernel/core scaffolding in `hc/`,
 * a symbolic expression API in `hc.symbols`,
-* a Milestone 0 NumPy-backed reference executor in `hc.simulator`,
+* a NumPy-backed reference executor in `hc.simulator`,
 * pytest coverage for the public API, symbols layer, and simulator.
 
 The lowering/compiler pipeline is still TBD, but the symbols subsystem is
@@ -19,13 +19,14 @@ already backed by a real third-party engine rather than a pure stub.
 ## Optional simulator dependency
 
 The base package keeps the simulator dependency optional. Install the simulator
-extra when you want to use `hc.simulator`:
+extra when you want to use `hc.simulator`. It includes NumPy plus the
+`greenlet` dependency used for workitem scheduling and barriers:
 
 ```bash
 pip install -e ".[simulator]"
 ```
 
-The test extra includes NumPy as well:
+The test extra includes the simulator dependencies as well:
 
 ```bash
 pip install -e ".[test]"

@@ -4,7 +4,7 @@
 
 """Internal masked-value runtime primitives for `hc.simulator`.
 
-This module implements the Milestone 0 tensor/vector value model: masked
+This module implements the simulator's tensor/vector value model: masked
 payloads, poison-aware scalar reads, and a deliberately small NumPy-facing
 operator surface.
 """
@@ -340,11 +340,14 @@ class _MaskedValue:
 
 
 class SimTensor(_MaskedValue):
-    """Workgroup-local masked tensor value for the Milestone 0 simulator."""
+    """Workgroup-local masked tensor value for `hc.simulator`."""
 
     def __setitem__(self, index: Any, value: Any) -> None:
         _ensure_supported_index(index)
         _require_writable(self)
+        if np.isscalar(self._mask[index]):
+            _assign_scalar_index(self._data, self._mask, index, value)
+            return
         target_data = self._data[index]
         target_mask = self._mask[index]
         _assign_masked(target_data, target_mask, value)
@@ -359,7 +362,7 @@ class SimTensor(_MaskedValue):
 
 
 class SimVector(_MaskedValue):
-    """Immutable masked vector value for the Milestone 0 simulator."""
+    """Immutable masked vector value for `hc.simulator`."""
 
     pass
 
@@ -577,6 +580,22 @@ def _assign_masked(target_data: Array, target_mask: Array, value: Any) -> None:
         return
     target_data[...] = value
     target_mask[...] = True
+
+
+def _assign_scalar_index(
+    target_data: Array, target_mask: Array, index: Any, value: Any
+) -> None:
+    if isinstance(value, Poison):
+        _raise_poison()
+    if isinstance(value, _MaskedValue):
+        if value.shape != ():
+            raise SimulatorError("assignment source and destination shapes must match")
+        if bool(value._mask[()]):
+            target_data[index] = value._data[()]
+            target_mask[index] = True
+        return
+    target_data[index] = value
+    target_mask[index] = True
 
 
 def _assign_from_value(

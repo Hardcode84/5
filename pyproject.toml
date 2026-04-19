@@ -9,9 +9,9 @@ description = "Experimental high-level GPU kernel DSL."
 requires-python = ">=3.12"
 
 [project.optional-dependencies]
-dev = ["black", "lizard", "mypy", "numpy", "pre-commit", "pytest", "reuse", "ruff"]
-simulator = ["numpy"]
-test = ["numpy", "pytest"]
+dev = ["black", "greenlet", "lizard", "mypy", "numpy", "pre-commit", "pytest", "reuse", "ruff"]
+simulator = ["greenlet", "numpy"]
+test = ["greenlet", "numpy", "pytest"]
 
 [tool.setuptools]
 packages = ["hc"]

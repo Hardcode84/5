@@ -10,6 +10,7 @@ import re
 
 import pytest
 
+from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
 from hc import CurrentGroup, WorkItem, kernel
 from hc._frontend import (
     FrontendError,
@@ -22,12 +23,14 @@ from hc._frontend import (
 _CONTROL_FLOW_SOURCE = """
 @kernel.func(scope=WorkGroup)
 def helper(group, acc):
+    pair = (acc, acc)
     if acc[0] < 1:
         acc = acc[:, 0]
     else:
         acc = -acc
-    for i in range(2):
-        acc = acc + [i]
+    left, right = pair
+    for i, item in enumerate([left, right]):
+        acc += [i]
     return acc
 """
 
@@ -75,6 +78,13 @@ def demo(group):
     bogus = [0 for mystery in range(1)]
     return lane()
 """
+_SUBSCRIPT_TARGET_SOURCE = """
+@kernel.func(scope=WorkGroup)
+def helper(group, values, row, col):
+    values[row] = values[col]
+    values[:, col] += [row]
+    return values
+"""
 
 _PARSE_ERROR_SOURCE = "def broken(:\n    pass\n"
 _BAD_MODULE_SOURCE = """
@@ -88,6 +98,7 @@ _SAMPLE_KERNEL_SPINE = [
     "module_begin",
     "kernel_begin",
     "assign_begin",
+    "target_name",
     "assign_end",
     "workitem_region_begin",
     "workitem_region_end",
@@ -98,6 +109,24 @@ _SAMPLE_KERNEL_SPINE = [
     "kernel_end",
     "module_end",
 ]
+_CONTROL_FLOW_EXPECTED_KINDS = (
+    "func_begin",
+    "if_begin",
+    "condition_begin",
+    "then_begin",
+    "else_begin",
+    "compare_begin",
+    "subscript_begin",
+    "slice_begin",
+    "unaryop_begin",
+    "for_begin",
+    "target_begin",
+    "iter_begin",
+    "call_begin",
+    "list_begin",
+    "aug_assign_begin",
+    "target_tuple_begin",
+)
 
 _REJECTION_CASES = [
     pytest.param(
@@ -127,17 +156,6 @@ _REJECTION_CASES = [
         """,
         "nested functions must use @group.subgroups or @group.workitems",
         id="missing-region-decorator",
-    ),
-    pytest.param(
-        """
-        @kernel(work_shape=(4,), group_shape=(4,))
-        def bad(group, items):
-            for item in items:
-                return item
-            return items
-        """,
-        "only for-loops over bare range(...) are supported",
-        id="non-range-loop",
     ),
     pytest.param(
         """
@@ -212,13 +230,12 @@ _REJECTION_CASES = [
     pytest.param(
         """
         @kernel(work_shape=(4,), group_shape=(4,))
-        def bad(group, x):
-            for i, j in range(2):
-                return x
+        def bad(group, obj, x):
+            obj.attr = x
             return x
         """,
-        "for-loop targets must be simple names",
-        id="for-target-shape",
+        "unsupported assignment target",
+        id="unsupported-assignment-target",
     ),
 ]
 
@@ -268,6 +285,31 @@ def _assert_contains_subsequence(
     raise AssertionError(f"missing subsequence {expected!r} in {values!r}")
 
 
+def _assert_control_flow_trace(emitter: RecordingEmitter) -> None:
+    kinds = _event_kinds(emitter)
+    target_name_ids = {payload["id"] for payload in _payloads(emitter, "target_name")}
+
+    assert kinds[0] == "module_begin"
+    assert kinds[-1] == "module_end"
+    for kind in _CONTROL_FLOW_EXPECTED_KINDS:
+        assert kind in kinds
+    assert {"pair", "left", "right", "i", "item"} <= target_name_ids
+    assert _payloads(emitter, "aug_assign_begin")[0]["op"] == "Add"
+    assert any(
+        payload["length"] == 2 for payload in _payloads(emitter, "target_tuple_begin")
+    )
+
+
+def _assert_subscript_target_trace(emitter: RecordingEmitter) -> None:
+    kinds = _event_kinds(emitter)
+
+    assert kinds[0] == "module_begin"
+    assert kinds[-1] == "module_end"
+    assert kinds.count("target_subscript_begin") == 2
+    assert "aug_assign_begin" in kinds
+    assert "slice_begin" in kinds
+
+
 def test_lower_function_records_kernel_and_collective_region() -> None:
     emitter = RecordingEmitter()
 
@@ -282,6 +324,7 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
     assert tuple(name for name, _ in kernel_payload["parameters"]) == ("group", "x")
     assert region_payload["captures"] == ("tmp",)
     assert tuple(name for name, _ in region_payload["parameters"]) == ("wi",)
+    assert _payloads(emitter, "target_name")[0]["id"] == "tmp"
 
 
 def test_lower_source_records_structured_control_flow_and_slices() -> None:
@@ -289,23 +332,15 @@ def test_lower_source_records_structured_control_flow_and_slices() -> None:
 
     lower_source(_CONTROL_FLOW_SOURCE, emitter, filename="testcase.py")
 
-    kinds = _event_kinds(emitter)
+    _assert_control_flow_trace(emitter)
 
-    assert kinds[0] == "module_begin"
-    assert kinds[-1] == "module_end"
-    assert "func_begin" in kinds
-    assert "if_begin" in kinds
-    assert "condition_begin" in kinds
-    assert "then_begin" in kinds
-    assert "else_begin" in kinds
-    assert "compare_begin" in kinds
-    assert "subscript_begin" in kinds
-    assert "slice_begin" in kinds
-    assert "unaryop_begin" in kinds
-    assert "for_range_begin" in kinds
-    assert "iter_begin" in kinds
-    assert "call_begin" in kinds
-    assert "list_begin" in kinds
+
+def test_lower_source_records_subscript_assignment_targets() -> None:
+    emitter = RecordingEmitter()
+
+    lower_source(_SUBSCRIPT_TARGET_SOURCE, emitter, filename="subscript.py")
+
+    _assert_subscript_target_trace(emitter)
 
 
 def test_nested_region_captures_see_all_enclosing_bindings() -> None:
@@ -369,6 +404,16 @@ def test_lower_function_requires_importable_python_source() -> None:
         match="frontend source recovery requires an importable Python function",
     ):
         lower_function(len, RecordingEmitter())
+
+
+def test_lower_function_accepts_wmma_intrinsic_fallback() -> None:
+    emitter = RecordingEmitter()
+
+    lower_function(wmma_gfx11, emitter)
+
+    assert _payloads(emitter, "intrinsic_begin")[0]["name"] == "wmma_gfx11"
+    assert len(_payloads(emitter, "target_subscript_begin")) == 1
+    assert "aug_assign_begin" in _event_kinds(emitter)
 
 
 def test_lower_module_accepts_preparsed_ast() -> None:

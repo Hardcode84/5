@@ -229,6 +229,9 @@ class _FrontendLowerer:
         if isinstance(stmt, ast.Assign):
             self._lower_assign(stmt)
             return
+        if isinstance(stmt, ast.AugAssign):
+            self._lower_aug_assign(stmt)
+            return
         if isinstance(stmt, ast.Return):
             self._lower_return(stmt)
             return
@@ -255,10 +258,18 @@ class _FrontendLowerer:
     def _lower_assign(self, stmt: ast.Assign) -> None:
         if len(stmt.targets) != 1:
             raise self._error("multiple assignment targets are not supported", stmt)
-        payload = _node_payload(stmt, target=_node_text(stmt.targets[0]))
+        payload = _node_payload(stmt)
         self._emitter.begin_op("assign", **payload)
+        self._lower_target(stmt.targets[0])
         self._lower_expr(stmt.value)
         self._emitter.end_op("assign", **payload)
+
+    def _lower_aug_assign(self, stmt: ast.AugAssign) -> None:
+        payload = _node_payload(stmt, op=type(stmt.op).__name__)
+        self._emitter.begin_op("aug_assign", **payload)
+        self._lower_target(stmt.target)
+        self._lower_expr(stmt.value)
+        self._emitter.end_op("aug_assign", **payload)
 
     def _lower_return(self, stmt: ast.Return) -> None:
         payload = _node_payload(stmt, has_value=stmt.value is not None)
@@ -279,18 +290,19 @@ class _FrontendLowerer:
     def _lower_for(self, stmt: ast.For) -> None:
         if stmt.orelse:
             raise self._error("for-else is not supported", stmt)
-        if not _is_range_call(stmt.iter):
-            raise self._error(
-                "only for-loops over bare range(...) are supported",
-                stmt.iter,
-            )
-        if not isinstance(stmt.target, ast.Name):
-            raise self._error("for-loop targets must be simple names", stmt.target)
-        payload = _node_payload(stmt, target=_node_text(stmt.target))
-        self._emitter.begin_op("for_range", **payload)
+        payload = _node_payload(stmt)
+        self._emitter.begin_op("for", **payload)
+        self._emit_target(stmt.target)
         self._emit_iter(stmt)
         self._emit_body(stmt)
-        self._emitter.end_op("for_range", **payload)
+        self._emitter.end_op("for", **payload)
+
+    def _emit_target(self, target: ast.expr) -> None:
+        self._emit_control_region(
+            "target",
+            target,
+            lambda: self._lower_target(target),
+        )
 
     def _emit_condition(self, stmt: ast.If) -> None:
         self._emit_control_region(
@@ -394,11 +406,14 @@ class _FrontendLowerer:
         self._emitter.end_op("attr", **payload)
 
     def _lower_subscript(self, expr: ast.Subscript) -> None:
-        payload = _node_payload(expr)
-        self._emitter.begin_op("subscript", **payload)
-        self._lower_expr(expr.value)
-        self._lower_subscript_item(expr.slice)
-        self._emitter.end_op("subscript", **payload)
+        self._lower_subscript_like("subscript", expr)
+
+    def _lower_subscript_like(self, kind: str, node: ast.Subscript) -> None:
+        payload = _node_payload(node)
+        self._emitter.begin_op(kind, **payload)
+        self._lower_expr(node.value)
+        self._lower_subscript_item(node.slice)
+        self._emitter.end_op(kind, **payload)
 
     def _lower_subscript_item(self, node: ast.AST) -> None:
         if isinstance(node, ast.Slice):
@@ -491,6 +506,26 @@ class _FrontendLowerer:
             self._lower_expr(comparator)
         self._emitter.end_op("compare", **payload)
 
+    @singledispatchmethod
+    def _lower_target(self, target: ast.expr) -> None:
+        raise self._error("unsupported assignment target", target)
+
+    @_lower_target.register
+    def _lower_name_target(self, target: ast.Name) -> None:
+        self._emitter.emit_op("target_name", **_node_payload(target, id=target.id))
+
+    @_lower_target.register
+    def _lower_tuple_target(self, target: ast.Tuple) -> None:
+        payload = _node_payload(target, length=len(target.elts))
+        self._emitter.begin_op("target_tuple", **payload)
+        for element in target.elts:
+            self._lower_target(element)
+        self._emitter.end_op("target_tuple", **payload)
+
+    @_lower_target.register
+    def _lower_subscript_target(self, target: ast.Subscript) -> None:
+        self._lower_subscript_like("target_subscript", target)
+
     def _push_bindings(self, fn: ast.FunctionDef) -> None:
         self._binding_stack.append(_function_bindings(fn, self._source))
 
@@ -531,6 +566,9 @@ class _BindingCollector(ast.NodeVisitor):
             for target in stmt.targets:
                 self.visit_target(target)
             return
+        if isinstance(stmt, ast.AugAssign):
+            self.visit_target(stmt.target)
+            return
         if isinstance(stmt, ast.For):
             self.visit_target(stmt.target)
             self.visit_block(stmt.body)
@@ -543,6 +581,8 @@ class _BindingCollector(ast.NodeVisitor):
     def visit_target(self, target: ast.expr) -> None:
         if isinstance(target, ast.Name):
             self.bind(target.id)
+            return
+        if isinstance(target, ast.Subscript):
             return
         if isinstance(target, ast.Starred):
             self.visit_target(target.value)
@@ -911,14 +951,6 @@ def _region_captures(
     for stmt in _strip_docstring(fn.body):
         collector.visit(stmt)
     return collector.captures
-
-
-def _is_range_call(expr: ast.expr) -> bool:
-    if not isinstance(expr, ast.Call):
-        return False
-    if expr.keywords:
-        return False
-    return isinstance(expr.func, ast.Name) and expr.func.id == "range"
 
 
 def _node_payload(node: ast.AST, **payload: object) -> dict[str, object]:

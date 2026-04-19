@@ -95,14 +95,17 @@ The initial subset should include only what the current language requires:
 
 * `FunctionDef`
 * `Assign`
+* `AugAssign` where needed
 * `Return`
 * `Expr`
 * `If`
-* `For` over `range(...)`
+* `For`
 * `Call`
 * `Name`
 * `Constant`
 * `Tuple` / `List` literals where needed
+* assignment targets built from `Name`, `Subscript`, and tuple
+  destructuring where needed
 * `BinOp`, `UnaryOp`, `Compare`
 * `Subscript`
 * `Attribute`
@@ -112,6 +115,11 @@ The initial subset should include only what the current language requires:
 Everything else should be rejected explicitly.
 
 This keeps the frontend small while still covering the current language design.
+A bootstrap fake emitter may still start narrower, for example by only
+accepting `for` over `range(...)` in its first milestone. However, the real
+`hc.front` boundary should preserve source forms such as generic `For`,
+tuple-shaped or subscript assignment targets, and `AugAssign`, leaving any
+desugaring to later legalization out of `hc.front`.
 
 ## Frontend dialect
 
@@ -153,15 +161,36 @@ The exact set can evolve, but an initial frontend dialect may include:
 * `hc.front.constant`
 * `hc.front.name`
 * `hc.front.assign`
+* `hc.front.aug_assign`
+* `hc.front.target_name`
+* `hc.front.target_tuple`
+* `hc.front.target_subscript`
 * `hc.front.attr`
 * `hc.front.subscript`
+* `hc.front.slice`
 * `hc.front.call`
+* `hc.front.keyword`
 * `hc.front.tuple`
+* `hc.front.list`
+* `hc.front.binop`
+* `hc.front.unaryop`
+* `hc.front.compare`
 * `hc.front.if`
-* `hc.front.for_range`
+* `hc.front.for`
 * `hc.front.return`
 * `hc.front.subgroup_region`
 * `hc.front.workitem_region`
+
+Control ops such as `hc.front.if` and `hc.front.for` should own regions for
+their structural parts rather than introducing separate top-level ops just for
+`condition`, `then`, `else`, `target`, `iter`, or `body`.
+
+This is intentionally more source-faithful than the narrowest bootstrap fake
+emitter. For example, if a helper or intrinsic fallback spells a loop as
+`for index, row in enumerate(rows):` or uses `accum += x`, that syntax should
+survive into `hc.front` rather than being rewritten in Python. If the semantic
+dialect later wants only `for_range` or plain assignment, that rewrite should
+happen in `hc.front` to `hc` legalization.
 
 ### Frontend type strategy
 
@@ -399,10 +428,15 @@ Milestone 0 should be backed by:
 The fake emitter should record only frontend-structural events, for example:
 
 * begin/end kernel or helper,
-* emit constant/name/call/subscript,
-* begin/end `if` or `for_range`,
+* emit assign/aug-assign, constant/name/call/subscript,
+* begin/end `if` or loop structure,
 * begin/end subgroup/workitem region,
-* emit return / tuple construction.
+* emit return / tuple construction / target construction where needed.
+
+A bootstrap fake emitter may still use a narrower event vocabulary such as
+`for_range` while the visitor subset is intentionally restricted. The real
+`hc.front` dialect should remain the source of truth for the broader
+source-faithful operation set above.
 
 It must not become a separately designed frontend IR with its own invariants.
 Its purpose is only to test that the AST visitor walks and classifies the

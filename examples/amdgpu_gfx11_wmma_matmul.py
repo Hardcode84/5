@@ -144,20 +144,20 @@ def wmma_gfx11(
 ):
     """Simulator fallback for a gfx11 WMMA lane fragment.
 
-    The real instruction is workitem-local but consumes data distributed across
-    the whole wave. The simulator therefore passes the staged LDS tiles
-    explicitly and reconstructs the lane's output fragment from them rather
-    than from the explicit lane operands.
+    The simulator reconstructs each lane result from staged wave-distributed
+    LDS tiles rather than from the explicit lane operands.
     """
 
     _ = (a_frag, b_frag)
     rows = _lane_output_rows(lane, wave_size)
     col = _lane_column(lane)
     values = np.empty((len(rows),), dtype=np.float32)
-    for index, row in enumerate(rows):
+    for index in range(len(rows)):
         accum = np.float32(acc_frag[index])
         for k_idx in range(WMMA_K):
-            accum += np.float32(a_tile[row, k_idx]) * np.float32(b_tile[k_idx, col])
+            accum += np.float32(a_tile[rows[index], k_idx]) * np.float32(
+                b_tile[k_idx, col]
+            )
         values[index] = accum
     return group.vload(values, shape=(len(rows),))
 

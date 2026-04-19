@@ -30,6 +30,7 @@ from ._sim_types import (
     SimulatorError,
     SimVector,
     poison,
+    resolve_layout,
 )
 from .core import BufferSpec, CurrentGroup, KernelMetadata, SubGroup, WorkItem
 from .symbols import Bindings, Env, Expr, Symbol, SymbolError, sym
@@ -205,10 +206,12 @@ class SimCurrentGroup(CurrentGroup):
         mask: SimTensor | SimVector | None = None,
         layout: Any = None,
     ) -> SimTensor:
-        """Load a dense tensor tile.
+        """Load a logical tensor tile.
 
-        `shape=` requests an explicit logical tile. If the source slice is
-        larger than that tile, the extra source region is ignored.
+        `shape=` requests an explicit logical tile. The simulator materializes
+        that tile in dense NumPy order and carries any `layout=` as validated
+        metadata. If the source slice is larger than that tile, the extra
+        source region is ignored.
         """
         self._require_workgroup_scope("group.load()")
         return cast(
@@ -233,7 +236,7 @@ class SimCurrentGroup(CurrentGroup):
         mask: SimTensor | SimVector | None = None,
         layout: Any = None,
     ) -> SimVector:
-        """Load a dense vector tile using the same truncation rules as `load`."""
+        """Load a logical vector tile using the same rules as `load`."""
         return cast(
             SimVector,
             _load_value(
@@ -831,30 +834,41 @@ def _load_value(
     static: bool,
     layout: Any,
 ) -> SimTensor | SimVector:
-    _require_dense_layout(layout)
     if (shape is None) == (mask is None):
         raise SimulatorError("load requires exactly one of shape= or mask=")
     if mask is not None:
-        return _load_masked(kind, source, mask)
+        return _load_masked(kind, source, mask, layout=layout)
     resolved = _resolve_runtime_shape(shape, env, literal_names, static=static)
-    return _copy_loaded_value(kind, source, resolved)
+    resolved_layout = resolve_layout(layout, resolved)
+    return _copy_loaded_value(kind, source, resolved, layout=resolved_layout)
 
 
 def _load_masked(
-    kind: type[SimTensor] | type[SimVector], source: Any, mask: SimTensor | SimVector
+    kind: type[SimTensor] | type[SimVector],
+    source: Any,
+    mask: SimTensor | SimVector,
+    *,
+    layout: Any,
 ) -> SimTensor | SimVector:
     _require_bool_mask(mask)
-    copied = _copy_loaded_value(kind, source, mask.shape)
+    resolved_layout = resolve_layout(layout, mask.shape)
+    copied = _copy_loaded_value(kind, source, mask.shape, layout=resolved_layout)
     active = np.logical_and(copied._mask, np.logical_and(mask._mask, mask._data))
-    return kind(copied._data, active)
+    return kind(copied._data, active, layout=copied.layout)
 
 
 def _copy_loaded_value(
-    kind: type[SimTensor] | type[SimVector], source: Any, shape: tuple[int, ...]
+    kind: type[SimTensor] | type[SimVector],
+    source: Any,
+    shape: tuple[int, ...],
+    *,
+    layout: Any,
 ) -> SimTensor | SimVector:
     source_data, source_mask = _source_arrays(source)
     if source_data.ndim != len(shape):
         raise SimulatorError("load rank does not match the requested shape")
+    # Layout metadata is tracked separately; simulator payloads stay dense in
+    # logical shape for now.
     result_data = np.zeros(shape, dtype=source_data.dtype)
     result_mask = np.zeros(shape, dtype=bool)
     overlap = tuple(
@@ -862,7 +876,7 @@ def _copy_loaded_value(
     )
     result_data[overlap] = source_data[overlap]
     result_mask[overlap] = source_mask[overlap]
-    return kind(result_data, result_mask)
+    return kind(result_data, result_mask, layout=layout)
 
 
 def _resolve_runtime_shape(
@@ -907,16 +921,13 @@ def _allocate_value(
     active: bool,
     fill_value: Any,
 ) -> SimTensor | SimVector:
-    _require_dense_layout(layout)
     resolved = _resolve_runtime_shape(shape, env, literal_names, static=static)
+    resolved_layout = resolve_layout(layout, resolved)
+    # Allocations use dense logical storage and carry layout metadata alongside
+    # the host payload.
     data = np.full(resolved, fill_value, dtype=np.dtype(dtype))
     mask = np.full(resolved, active, dtype=bool)
-    return kind(data, mask)
-
-
-def _require_dense_layout(layout: Any) -> None:
-    if layout is not None:
-        raise SimulatorError("non-trivial layouts are not supported in Milestone 0")
+    return kind(data, mask, layout=resolved_layout)
 
 
 def _require_bool_mask(mask: SimTensor | SimVector) -> None:

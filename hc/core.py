@@ -53,6 +53,10 @@ class IndexMap:
     offset: Callable[..., Any]
 
 
+class SupportsAsLayout(Protocol):
+    def as_layout(self, layout: Any = None) -> Any: ...
+
+
 def index_map(
     *,
     params: Callable[..., Any] | None = None,
@@ -60,6 +64,14 @@ def index_map(
     offset: Callable[..., Any],
 ) -> IndexMap:
     return IndexMap(params=params, storage_size=storage_size, offset=offset)
+
+
+def as_layout(value: SupportsAsLayout, layout: Any = None) -> Any:
+    """Request an explicit layout on a layout-aware value."""
+    method = getattr(value, "as_layout", None)
+    if method is None:
+        raise TypeError("as_layout() expects a layout-aware value")
+    return method(layout)
 
 
 @dataclass(frozen=True)

@@ -5,20 +5,28 @@
 """Internal masked-value runtime primitives for `hc.simulator`.
 
 This module implements the simulator's tensor/vector value model: masked
-payloads, poison-aware scalar reads, and a deliberately small NumPy-facing
-operator surface.
+payloads, poison-aware scalar reads, a deliberately small NumPy-facing
+operator surface, and layout metadata over dense host storage.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Never
 
 import numpy as np
 from numpy.typing import NDArray
 
+from .core import IndexMap
+
 type Array = NDArray[Any]
 type ReducerIndex = tuple[int | slice, ...]
+
+_KEEP_LAYOUT = object()
+# Keep host-side validation bounded for large shapes while still checking the
+# layout's declared shape and storage size.
+_LAYOUT_VALIDATION_LIMIT = 4096
 
 _SUPPORTED_UFUNCS = frozenset(
     {
@@ -40,6 +48,14 @@ _SUPPORTED_UFUNCS = frozenset(
         np.not_equal,
     }
 )
+
+
+@dataclass(frozen=True)
+class ResolvedLayout:
+    spec: IndexMap
+    shape: tuple[int, ...]
+    params: dict[str, Any]
+    storage_size: int
 
 
 class SimulatorError(RuntimeError):
@@ -117,6 +133,96 @@ def _raise_poison() -> Never:
     raise PoisonError("attempted to observe an inactive scalar value")
 
 
+def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
+    """Resolve validated layout metadata for a concrete logical shape.
+
+    The simulator keeps dense NumPy payloads and uses the resolved layout as
+    logical-placement metadata for values that still preserve that mapping.
+    """
+    resolved_shape = tuple(int(dim) for dim in shape)
+    if layout is None:
+        return None
+    if isinstance(layout, ResolvedLayout):
+        if layout.shape != resolved_shape:
+            raise SimulatorError("layout shape does not match the requested shape")
+        return layout
+    if not isinstance(layout, IndexMap):
+        raise SimulatorError("layout must be an IndexMap or None")
+    params = _layout_params(layout, resolved_shape)
+    storage_size = _layout_storage_size(layout, resolved_shape, params)
+    _validate_layout_offsets(layout, resolved_shape, params, storage_size)
+    return ResolvedLayout(
+        spec=layout,
+        shape=resolved_shape,
+        params=params,
+        storage_size=storage_size,
+    )
+
+
+def _layout_params(layout: IndexMap, shape: tuple[int, ...]) -> dict[str, Any]:
+    if layout.params is None:
+        return {}
+    raw = layout.params(*shape)
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise SimulatorError("layout params() must return a mapping or None")
+    return dict(raw)
+
+
+def _layout_storage_size(
+    layout: IndexMap, shape: tuple[int, ...], params: dict[str, Any]
+) -> int:
+    raw = (
+        layout.storage_size(*shape)
+        if layout.params is None
+        else layout.storage_size(*shape, params)
+    )
+    size = _layout_int(raw, what="layout storage size")
+    if size < 0:
+        raise SimulatorError("layout storage size must be non-negative")
+    return size
+
+
+def _validate_layout_offsets(
+    layout: IndexMap,
+    shape: tuple[int, ...],
+    params: dict[str, Any],
+    storage_size: int,
+) -> None:
+    logical_size = int(np.prod(shape))
+    if storage_size < logical_size:
+        raise SimulatorError("layout storage size is smaller than the logical shape")
+    if logical_size == 0:
+        return
+    if logical_size > _LAYOUT_VALIDATION_LIMIT:
+        return
+    seen: set[int] = set()
+    for index in np.ndindex(shape):
+        raw = (
+            layout.offset(*index, *shape)
+            if layout.params is None
+            else layout.offset(*index, *shape, params)
+        )
+        offset = _layout_int(raw, what="layout offset")
+        if offset < 0 or offset >= storage_size:
+            raise SimulatorError("layout offset is out of bounds")
+        if offset in seen:
+            raise SimulatorError(
+                "layout offset must be injective over the logical shape"
+            )
+        seen.add(offset)
+
+
+def _layout_int(value: Any, *, what: str) -> int:
+    if isinstance(value, bool):
+        raise SimulatorError(f"{what} must be an integer")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise SimulatorError(f"{what} must be an integer") from exc
+
+
 class _MaskedValue:
     __array_priority__ = 1000
 
@@ -175,7 +281,11 @@ class _MaskedValue:
         mask = self._mask[index]
         if np.isscalar(mask):
             return _scalar_or_poison(data, bool(mask))
-        return self._new_like(np.asarray(data), np.asarray(mask, dtype=bool))
+        return self._new_like(
+            np.asarray(data),
+            np.asarray(mask, dtype=bool),
+            layout=None,
+        )
 
     def astype(self, dtype: Any) -> _MaskedValue:
         return self._new_like(self._data.astype(dtype), self._mask.copy())
@@ -184,12 +294,13 @@ class _MaskedValue:
         resolved = _reshape_args(shape)
         data = self._data.reshape(resolved)
         mask = self._mask.reshape(resolved)
-        return self._new_like(data, mask)
+        layout = self.layout if resolved == self.shape else None
+        return self._new_like(data, mask, layout=layout)
 
     def transpose(self, *axes: int) -> _MaskedValue:
         data = self._data.transpose(*axes) if axes else self._data.transpose()
         mask = self._mask.transpose(*axes) if axes else self._mask.transpose()
-        return self._new_like(data, mask)
+        return self._new_like(data, mask, layout=None)
 
     def sum(
         self, axis: int | tuple[int, ...] | None = None, keepdims: bool = False
@@ -285,19 +396,25 @@ class _MaskedValue:
         other_value = _require_same_kind(self, other)
         data = np.matmul(self._data, other_value._data)
         mask = _matmul_mask(self._mask, other_value._mask)
-        return _wrap_like(self, data, mask)
+        return _wrap_like(
+            self,
+            data,
+            mask,
+            layout=self._matmul_layout(other_value, np.shape(data)),
+        )
 
     def _new_like(
         self,
         data: Array,
         mask: Array,
         *,
+        layout: Any = _KEEP_LAYOUT,
         read_only: bool | None = None,
     ) -> _MaskedValue:
         return type(self)(
             data,
             mask,
-            layout=self.layout,
+            layout=self.layout if layout is _KEEP_LAYOUT else layout,
             read_only=self._read_only if read_only is None else read_only,
         )
 
@@ -319,10 +436,20 @@ class _MaskedValue:
             if other_mask is None
             else np.logical_and(self._mask, other_mask)
         )
-        return self._new_like(data, mask)
+        other_value = other if isinstance(other, _MaskedValue) else None
+        return self._new_like(
+            data,
+            mask,
+            layout=self._binary_layout(other_value, np.shape(data)),
+        )
 
     def _unary(self, op: Callable[[Any], Array]) -> _MaskedValue:
-        return self._new_like(op(self._data), self._mask.copy())
+        data = op(self._data)
+        return self._new_like(
+            data,
+            self._mask.copy(),
+            layout=self._unary_layout(np.shape(data)),
+        )
 
     def _reduce(
         self, name: str, *, axis: int | tuple[int, ...] | None, keepdims: bool
@@ -336,7 +463,23 @@ class _MaskedValue:
         data, mask = _reduce_arrays(self._data, self._mask, name, axes, out_shape)
         if data.shape == ():
             return _scalar_or_poison(data, bool(mask[()]))
-        return self._new_like(data, mask)
+        return self._new_like(data, mask, layout=self._reduction_layout(data.shape))
+
+    def _binary_layout(
+        self, other: _MaskedValue | None, result_shape: tuple[int, ...]
+    ) -> Any:
+        return _common_result_layout(
+            (self,) if other is None else (self, other), result_shape
+        )
+
+    def _unary_layout(self, result_shape: tuple[int, ...]) -> Any:
+        return self.layout if result_shape == self.shape else None
+
+    def _reduction_layout(self, result_shape: tuple[int, ...]) -> Any:
+        return self.layout if result_shape == self.shape else None
+
+    def _matmul_layout(self, other: _MaskedValue, result_shape: tuple[int, ...]) -> Any:
+        return _common_result_layout((self, other), result_shape)
 
 
 class SimTensor(_MaskedValue):
@@ -358,13 +501,36 @@ class SimTensor(_MaskedValue):
             raise SimulatorError("vec() shape must preserve the element count")
         data = self._data.reshape(resolved)
         mask = self._mask.reshape(resolved)
-        return SimVector(data, mask, layout=self.layout, read_only=self._read_only)
+        layout = self.layout if resolved == self.shape else None
+        return SimVector(data, mask, layout=layout, read_only=self._read_only)
 
 
 class SimVector(_MaskedValue):
     """Immutable masked vector value for `hc.simulator`."""
 
-    pass
+    def as_layout(self, layout: Any = None) -> SimVector:
+        resolved = resolve_layout(layout, self.shape)
+        return SimVector(
+            self._data.copy(),
+            self._mask.copy(),
+            layout=resolved,
+            read_only=self._read_only,
+        )
+
+    def _binary_layout(
+        self, other: _MaskedValue | None, result_shape: tuple[int, ...]
+    ) -> Any:
+        values = (self,) if other is None else (self, other)
+        return _vector_result_layout(values, result_shape)
+
+    def _unary_layout(self, result_shape: tuple[int, ...]) -> Any:
+        return _vector_result_layout((self,), result_shape)
+
+    def _reduction_layout(self, result_shape: tuple[int, ...]) -> Any:
+        return _vector_result_layout((self,), result_shape)
+
+    def _matmul_layout(self, other: _MaskedValue, result_shape: tuple[int, ...]) -> Any:
+        return _vector_result_layout((self, other), result_shape)
 
 
 def _reshape_args(shape: tuple[Any, ...]) -> tuple[int, ...]:
@@ -444,11 +610,13 @@ def _call_ufunc(
     ]
     data = ufunc(*data_inputs, **kwargs)
     mask = _combine_masks(inputs, np.shape(data))
+    layout = _ufunc_layout(kind, inputs, np.shape(data))
     if out is None:
-        return kind(data, mask)
+        return kind(data, mask, layout=layout)
     out_value = _validate_ufunc_out(kind, out)
     out_value._data[...] = data
     out_value._mask[...] = mask
+    out_value.layout = layout
     return out_value
 
 
@@ -471,6 +639,75 @@ def _validate_ufunc_out(kind: type[_MaskedValue], out: Any) -> _MaskedValue:
         raise SimulatorError("vector out= is not supported")
     _require_writable(target)
     return target
+
+
+def _ufunc_layout(
+    kind: type[_MaskedValue], inputs: tuple[Any, ...], result_shape: tuple[int, ...]
+) -> Any:
+    values = tuple(item for item in inputs if isinstance(item, _MaskedValue))
+    if not values:
+        return None
+    if kind is SimVector:
+        return _vector_result_layout(values, result_shape)
+    return _common_result_layout(values, result_shape)
+
+
+def _common_result_layout(
+    values: Sequence[_MaskedValue], result_shape: tuple[int, ...]
+) -> Any:
+    if not values or result_shape == ():
+        return None
+    first = values[0]
+    if first.layout is None:
+        return None
+    if any(
+        value.layout != first.layout or value.shape != result_shape for value in values
+    ):
+        return None
+    return first.layout
+
+
+def _vector_result_layout(
+    values: Sequence[_MaskedValue], result_shape: tuple[int, ...]
+) -> Any:
+    vectors = _vector_inputs(values)
+    if not vectors or result_shape == ():
+        return None
+    if _all_vector_layouts_none(vectors):
+        return None
+    _require_vector_shape_preservation(vectors, result_shape)
+    return _require_uniform_vector_layout(vectors)
+
+
+def _vector_inputs(values: Sequence[_MaskedValue]) -> list[SimVector]:
+    return [value for value in values if isinstance(value, SimVector)]
+
+
+def _all_vector_layouts_none(vectors: Sequence[SimVector]) -> bool:
+    return all(vector.layout is None for vector in vectors)
+
+
+def _require_vector_shape_preservation(
+    vectors: Sequence[SimVector], result_shape: tuple[int, ...]
+) -> None:
+    if any(vector.shape != result_shape for vector in vectors):
+        raise SimulatorError(
+            "vector operations that change shape require explicit as_layout()"
+        )
+
+
+def _require_uniform_vector_layout(vectors: Sequence[SimVector]) -> Any:
+    if any(vector.layout is None for vector in vectors):
+        raise SimulatorError(
+            "vector operations with mixed default and explicit layouts require "
+            "explicit as_layout()"
+        )
+    first = vectors[0].layout
+    if any(vector.layout != first for vector in vectors[1:]):
+        raise SimulatorError(
+            "vector operations with mismatched layouts require explicit as_layout()"
+        )
+    return first
 
 
 def _combine_masks(inputs: tuple[Any, ...], shape: tuple[int, ...]) -> Array:
@@ -566,10 +803,12 @@ def _reduce_active(payload: Array, active: Array, name: str) -> Any:
     return getattr(np, name)(values)
 
 
-def _wrap_like(value: _MaskedValue, data: Any, mask: Any) -> Any:
+def _wrap_like(value: _MaskedValue, data: Any, mask: Any, *, layout: Any) -> Any:
     if np.isscalar(mask):
         return _scalar_or_poison(data, bool(mask))
-    return value._new_like(np.asarray(data), np.asarray(mask, dtype=bool))
+    return value._new_like(
+        np.asarray(data), np.asarray(mask, dtype=bool), layout=layout
+    )
 
 
 def _assign_masked(target_data: Array, target_mask: Array, value: Any) -> None:

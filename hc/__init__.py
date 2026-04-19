@@ -18,6 +18,7 @@ from .core import (
     SubGroup,
     WorkGroup,
     WorkItem,
+    as_layout,
     index_map,
     kernel,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "Symbol",
     "WorkGroup",
     "WorkItem",
+    "as_layout",
     "index_map",
     "kernel",
     "simulator",

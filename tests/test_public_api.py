@@ -11,6 +11,7 @@ from hc import (
     SubGroup,
     WorkGroup,
     WorkItem,
+    as_layout,
     index_map,
     kernel,
 )
@@ -86,6 +87,16 @@ def test_index_map_records_callables() -> None:
         offset=lambda i, j, w, h, p: i * p["row_stride"] + j,
     )
     assert layout.params(2, 4) == {"row_stride": 4}
+
+
+def test_as_layout_delegates_to_value_method() -> None:
+    class Dummy:
+        def as_layout(self, layout):
+            return layout
+
+    layout = index_map(storage_size=lambda n: n, offset=lambda i, n: i)
+
+    assert as_layout(Dummy(), layout) is layout
 
 
 def test_current_group_reports_size() -> None:

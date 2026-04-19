@@ -6,7 +6,29 @@ import numpy as np
 import pytest
 
 import hc.simulator as sim
-from hc import Buffer, kernel, sym
+from hc import Buffer, as_layout, index_map, kernel, sym
+from hc._sim_types import resolve_layout
+
+_ROW_PADDED_LAYOUT = index_map(
+    params=lambda w, h: {"row_stride": h + 1},
+    storage_size=lambda w, h, p: w * p["row_stride"],
+    offset=lambda i, j, w, h, p: i * p["row_stride"] + j,
+)
+
+_CONTIGUOUS_VECTOR_LAYOUT = index_map(
+    storage_size=lambda n: n,
+    offset=lambda i, n: i,
+)
+
+_REVERSED_VECTOR_LAYOUT = index_map(
+    storage_size=lambda n: n,
+    offset=lambda i, n: n - 1 - i,
+)
+
+_INVALID_VECTOR_LAYOUT = index_map(
+    storage_size=lambda n: n,
+    offset=lambda i, n: 0,
+)
 
 _EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
     [
@@ -119,6 +141,41 @@ def test_vector_load_and_store_preserve_active_elements_only() -> None:
     assert np.array_equal(y, x + 2)
 
 
+def test_group_load_accepts_layout_and_preserves_logical_contents() -> None:
+    seen: list[tuple[int, int]] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def load_layout(group, src: Buffer[2, 3], dst: Buffer[2, 3]) -> None:
+        tile = group.load(src, shape=(2, 3), layout=_ROW_PADDED_LAYOUT)
+        seen.append((tile.layout.storage_size, tile.layout.params["row_stride"]))
+        group.store(dst, tile + 1)
+
+    src = np.arange(6, dtype=np.int64).reshape(2, 3)
+    dst = np.zeros((2, 3), dtype=np.int64)
+
+    sim.launch(load_layout, src, dst)
+
+    assert np.array_equal(dst, src + 1)
+    assert seen == [(8, 4)]
+
+
+def test_group_zeros_accepts_layout_and_carries_metadata() -> None:
+    seen: list[tuple[int, int]] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def alloc_layout(group, dst: Buffer[2, 3]) -> None:
+        tile = group.zeros(shape=(2, 3), dtype=np.int64, layout=_ROW_PADDED_LAYOUT)
+        seen.append((tile.layout.storage_size, tile.layout.params["row_stride"]))
+        group.store(dst, tile + 1)
+
+    dst = np.zeros((2, 3), dtype=np.int64)
+
+    sim.launch(alloc_layout, dst)
+
+    assert np.array_equal(dst, np.ones((2, 3), dtype=np.int64))
+    assert seen == [(8, 4)]
+
+
 def test_poison_scalar_read_raises() -> None:
     W = sym.W
 
@@ -220,6 +277,93 @@ def test_mask_view_is_read_only() -> None:
     assert tensor.mask[1] is False
 
 
+def test_as_layout_preserves_logical_vector_contents() -> None:
+    vec = sim.SimVector(
+        np.array([1, 2, 3, 4], dtype=np.int64),
+        np.array([True, True, True, True]),
+    )
+
+    relaid = as_layout(vec, layout=_REVERSED_VECTOR_LAYOUT)
+
+    assert relaid.layout.storage_size == 4
+    assert relaid[0] == 1
+    assert relaid[3] == 4
+
+
+def test_laid_out_tensor_views_drop_layout_on_shape_change() -> None:
+    layout = resolve_layout(_ROW_PADDED_LAYOUT, (2, 3))
+    tensor = sim.SimTensor(
+        np.arange(6, dtype=np.int64).reshape(2, 3),
+        np.ones((2, 3), dtype=bool),
+        layout=layout,
+    )
+
+    same_shape = tensor.reshape(2, 3)
+    sliced = tensor[:, :2]
+    reshaped = tensor.reshape(3, 2)
+    transposed = tensor.transpose()
+    flattened = tensor.vec(shape=(6,))
+
+    assert same_shape.layout == layout
+    assert sliced.layout is None
+    assert reshaped.layout is None
+    assert transposed.layout is None
+    assert flattened.layout is None
+
+
+def test_laid_out_vector_ops_preserve_compatible_layout() -> None:
+    lhs = as_layout(
+        sim.SimVector(
+            np.array([1.0, 4.0, 9.0], dtype=np.float32),
+            np.array([True, True, True]),
+        ),
+        layout=_REVERSED_VECTOR_LAYOUT,
+    )
+    rhs = as_layout(
+        sim.SimVector(
+            np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            np.array([True, True, True]),
+        ),
+        layout=_REVERSED_VECTOR_LAYOUT,
+    )
+
+    result = np.sqrt(lhs + rhs)
+
+    assert result.layout == lhs.layout
+    assert result.shape == lhs.shape
+    assert result[0] == pytest.approx(np.sqrt(2.0))
+
+
+def test_laid_out_vector_ops_reject_mismatched_layouts() -> None:
+    lhs = as_layout(
+        sim.SimVector(
+            np.array([1.0, 2.0, 3.0], dtype=np.float32),
+            np.array([True, True, True]),
+        ),
+        layout=_CONTIGUOUS_VECTOR_LAYOUT,
+    )
+    rhs = as_layout(
+        sim.SimVector(
+            np.array([4.0, 5.0, 6.0], dtype=np.float32),
+            np.array([True, True, True]),
+        ),
+        layout=_REVERSED_VECTOR_LAYOUT,
+    )
+
+    with pytest.raises(sim.SimulatorError, match="mismatched layouts"):
+        _ = lhs + rhs
+
+
+def test_invalid_layout_is_rejected() -> None:
+    vec = sim.SimVector(
+        np.array([1, 2, 3], dtype=np.int64),
+        np.array([True, True, True]),
+    )
+
+    with pytest.raises(sim.SimulatorError, match="injective"):
+        as_layout(vec, layout=_INVALID_VECTOR_LAYOUT)
+
+
 def test_masked_load_respects_mask_value_and_mask_activity() -> None:
     out = np.zeros((4,), dtype=np.int64)
 
@@ -234,6 +378,25 @@ def test_masked_load_respects_mask_value_and_mask_activity() -> None:
     sim.launch(masked, src, out)
 
     assert np.array_equal(out, np.array([-1, 20, 30, -1], dtype=np.int64))
+
+
+def test_masked_load_accepts_layout_and_preserves_metadata() -> None:
+    seen: list[int] = []
+    out = np.zeros((4,), dtype=np.int64)
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def masked(group, src: Buffer[3], dst: Buffer[4]) -> None:
+        gate = group.load(src, shape=(4,)) > 15
+        picked = group.load(src, mask=gate, layout=_CONTIGUOUS_VECTOR_LAYOUT)
+        seen.append(picked.layout.storage_size)
+        group.store(dst, picked.with_inactive(value=-1))
+
+    src = np.array([10, 20, 30], dtype=np.int64)
+
+    sim.launch(masked, src, out)
+
+    assert np.array_equal(out, np.array([-1, 20, 30, -1], dtype=np.int64))
+    assert seen == [4]
 
 
 def test_empty_tensor_reads_as_poison() -> None:
@@ -267,6 +430,31 @@ def test_ufunc_out_updates_tensor_destination() -> None:
     sim.launch(subtract, lhs, rhs, out)
 
     assert np.array_equal(out, lhs - rhs)
+
+
+def test_ufunc_out_updates_laid_out_tensor_destination() -> None:
+    layout = resolve_layout(_CONTIGUOUS_VECTOR_LAYOUT, (3,))
+    stale_layout = resolve_layout(_REVERSED_VECTOR_LAYOUT, (3,))
+    lhs = sim.SimTensor(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        np.array([True, True, True]),
+        layout=layout,
+    )
+    rhs = sim.SimTensor(
+        np.array([4.0, 5.0, 6.0], dtype=np.float32),
+        np.array([True, True, True]),
+        layout=layout,
+    )
+    out = sim.SimTensor(
+        np.zeros((3,), dtype=np.float32),
+        np.array([True, True, True]),
+        layout=stale_layout,
+    )
+
+    np.add(lhs, rhs, out=(out,))
+
+    assert out.layout == layout
+    assert np.array_equal(out.with_inactive(value=0)._data, np.array([5.0, 7.0, 9.0]))
 
 
 def test_launch_uses_local_string_annotations() -> None:

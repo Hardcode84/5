@@ -4,8 +4,13 @@
 
 from __future__ import annotations
 
+import ast
+import dis
+import inspect
+import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from types import CodeType
 from typing import Any, Protocol, cast
 
 
@@ -101,16 +106,19 @@ class _KernelFunction(Protocol):
 
 
 class _HelperFunction(Protocol):
+    __name__: str
     __hc_func__: FuncMetadata
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 class _IntrinsicFunction(Protocol):
+    __name__: str
     __hc_intrinsic__: IntrinsicMetadata
     __hc_lowerings__: dict[str, Callable[..., Any]]
     __hc_verify__: Callable[..., Any] | None
     __hc_infer__: Callable[..., Any] | None
+    __hc_has_fallback__: bool
     lower: Any
     verify: Any
     infer: Any
@@ -118,11 +126,94 @@ class _IntrinsicFunction(Protocol):
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
+_SIM_CALLABLES_BY_CODE: dict[CodeType, Callable[..., Any]] = {}
+
+
+def _sim_callable_from_code(code: CodeType) -> Callable[..., Any] | None:
+    return _SIM_CALLABLES_BY_CODE.get(code)
+
+
+def _register_sim_callable(fn: Callable[..., Any]) -> None:
+    _SIM_CALLABLES_BY_CODE[fn.__code__] = fn
+
+
+def _has_intrinsic_fallback_body(fn: Callable[..., Any]) -> bool:
+    body = _function_body(fn)
+    if body is None:
+        # Be conservative when source is unavailable: only obvious non-trivial
+        # bytecode counts as a simulator fallback body.
+        return _has_nontrivial_fallback_bytecode(fn)
+    return not _is_empty_fallback_body(body)
+
+
+def _function_body(fn: Callable[..., Any]) -> list[ast.stmt] | None:
+    try:
+        source = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError):
+        return None
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return None
+    if not module.body:
+        return None
+    node = module.body[0]
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    body = list(node.body)
+    if _starts_with_docstring(body):
+        body = body[1:]
+    return body
+
+
+def _starts_with_docstring(body: list[ast.stmt]) -> bool:
+    if not body or not isinstance(body[0], ast.Expr):
+        return False
+    value = body[0].value
+    return isinstance(value, ast.Constant) and isinstance(value.value, str)
+
+
+def _is_empty_fallback_body(body: list[ast.stmt]) -> bool:
+    if not body:
+        return True
+    return len(body) == 1 and _is_empty_fallback_stmt(body[0])
+
+
+def _is_empty_fallback_stmt(stmt: ast.stmt) -> bool:
+    if isinstance(stmt, ast.Pass):
+        return True
+    if not isinstance(stmt, ast.Expr):
+        return False
+    value = stmt.value
+    return isinstance(value, ast.Constant) and value.value is Ellipsis
+
+
+def _has_nontrivial_fallback_bytecode(fn: Callable[..., Any]) -> bool:
+    instructions = [
+        ins
+        for ins in dis.get_instructions(fn)
+        if ins.opname not in {"RESUME", "CACHE", "EXTENDED_ARG", "NOP"}
+    ]
+    if not instructions:
+        return False
+    if len(instructions) == 1:
+        ins = instructions[0]
+        return not (ins.opname == "RETURN_CONST" and ins.argval is None)
+    if len(instructions) == 2:
+        return not (
+            instructions[0].opname == "LOAD_CONST"
+            and instructions[0].argval is None
+            and instructions[1].opname == "RETURN_VALUE"
+        )
+    return True
+
+
 def _attach_intrinsic_hooks(fn: Callable[..., Any]) -> Callable[..., Any]:
     intrinsic_fn = cast(_IntrinsicFunction, fn)
     intrinsic_fn.__hc_lowerings__ = {}
     intrinsic_fn.__hc_verify__ = None
     intrinsic_fn.__hc_infer__ = None
+    intrinsic_fn.__hc_has_fallback__ = _has_intrinsic_fallback_body(fn)
 
     def lower(*, target: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def register(cb: Callable[..., Any]) -> Callable[..., Any]:
@@ -182,6 +273,7 @@ class _KernelNamespace:
         def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
             helper_target = cast(_HelperFunction, target)
             helper_target.__hc_func__ = metadata
+            _register_sim_callable(helper_target)
             return helper_target
 
         if fn is None:
@@ -205,7 +297,9 @@ class _KernelNamespace:
         def decorate(target: Callable[..., Any]) -> Callable[..., Any]:
             intrinsic_target = cast(_IntrinsicFunction, target)
             intrinsic_target.__hc_intrinsic__ = metadata
-            return _attach_intrinsic_hooks(intrinsic_target)
+            configured = _attach_intrinsic_hooks(intrinsic_target)
+            _register_sim_callable(configured)
+            return configured
 
         if fn is None:
             return decorate

@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
+import threading
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
+from types import FrameType
 from typing import Any, cast, get_args, get_origin
 
 import numpy as np
@@ -32,7 +36,17 @@ from ._sim_types import (
     poison,
     resolve_layout,
 )
-from .core import BufferSpec, CurrentGroup, KernelMetadata, SubGroup, WorkItem
+from .core import (
+    BufferSpec,
+    CurrentGroup,
+    KernelMetadata,
+    SubGroup,
+    WorkGroup,
+    WorkItem,
+    _HelperFunction,
+    _IntrinsicFunction,
+    _sim_callable_from_code,
+)
 from .symbols import Bindings, Env, Expr, Symbol, SymbolError, sym
 
 type FrozenEnv = Env
@@ -61,14 +75,69 @@ class SimulatorTarget:
 DEFAULT_TARGET = SimulatorTarget()
 
 
+@dataclass(frozen=True)
+class _ExecutionState:
+    group: SimCurrentGroup
+    target: SimulatorTarget
+
+
+@dataclass(frozen=True)
+class _CallValueSignature:
+    value: Any
+
+    @property
+    def type(self) -> Any:
+        return self.value.dtype if hasattr(self.value, "dtype") else type(self.value)
+
+    @property
+    def mask(self) -> Any:
+        return getattr(self.value, "mask", None)
+
+    @property
+    def layout(self) -> Any:
+        return getattr(self.value, "layout", None)
+
+    @property
+    def shape(self) -> tuple[int, ...] | None:
+        if not hasattr(self.value, "shape"):
+            return None
+        return tuple(int(dim) for dim in self.value.shape)
+
+    def is_tensor(self) -> bool:
+        return isinstance(self.value, SimTensor)
+
+    def is_vector(self) -> bool:
+        return isinstance(self.value, SimVector)
+
+    def is_buffer(self) -> bool:
+        return isinstance(self.value, np.ndarray)
+
+
+@dataclass(frozen=True)
+class _IntrinsicCallSignature:
+    scope: Any
+    _args: tuple[Any, ...]
+    _kwargs: dict[str, Any]
+
+    def arg(self, index: int) -> Any:
+        return _signature_value(self._args[index])
+
+    def kwarg(self, name: str) -> Any:
+        return _signature_value(self._kwargs[name])
+
+
+_THREAD_EXECUTION = threading.local()
+
+
 def launch(
     fn: Callable[..., Any],
     *args: Any,
     target: SimulatorTarget | None = None,
     **kwargs: Any,
 ) -> None:
+    runtime_target = DEFAULT_TARGET if target is None else target
     bound, env, literal_names, work_shape, group_shape, subgroup_size = _prepare_launch(
-        fn, args, kwargs, target
+        fn, args, kwargs, runtime_target
     )
     if any(dim == 0 for dim in work_shape):
         return
@@ -80,6 +149,7 @@ def launch(
         work_shape,
         group_shape,
         subgroup_size,
+        runtime_target,
     )
 
 
@@ -87,7 +157,7 @@ def _prepare_launch(
     fn: Callable[..., Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-    target: SimulatorTarget | None,
+    target: SimulatorTarget,
 ) -> tuple[
     inspect.BoundArguments,
     FrozenEnv,
@@ -97,7 +167,6 @@ def _prepare_launch(
     int | None,
 ]:
     try:
-        runtime_target = DEFAULT_TARGET if target is None else target
         metadata = _kernel_metadata(fn)
         bound = _bind_launch_arguments(fn, args, kwargs)
         bindings = _collect_bindings(fn, bound)
@@ -115,13 +184,13 @@ def _prepare_launch(
         )
         group_shape = _resolve_group_shape(
             metadata.group_shape,
-            runtime_target,
+            target,
             work_shape,
             subgroup_size,
             env,
             literal_names,
         )
-        _validate_launch(work_shape, group_shape, subgroup_size, runtime_target)
+        _validate_launch(work_shape, group_shape, subgroup_size, target)
     except SymbolError as exc:
         raise LaunchError(str(exc)) from exc
     return bound, env, literal_names, work_shape, group_shape, subgroup_size
@@ -789,6 +858,7 @@ def _run_workgroups(
     work_shape: tuple[int, ...],
     group_shape: tuple[int, ...],
     subgroup_size: int | None,
+    target: SimulatorTarget,
 ) -> None:
     group_counts = tuple(
         _ceil_div(work, local)
@@ -807,7 +877,164 @@ def _run_workgroups(
             env=env,
             literal_names=literal_names,
         )
-        fn(group, *bound.args, **bound.kwargs)
+        with _execution_state(group, target):
+            fn(group, *bound.args, **bound.kwargs)
+
+
+@contextmanager
+def _execution_state(group: SimCurrentGroup, target: SimulatorTarget) -> Iterator[None]:
+    previous_profile = sys.getprofile()
+    stack = _execution_stack()
+    stack.append(_ExecutionState(group=group, target=target))
+    # `sys.setprofile()` is thread-local in CPython. Keep a separate per-thread
+    # execution stack so concurrent launches do not share simulator state.
+    sys.setprofile(_profile_calls)
+    try:
+        yield
+    finally:
+        sys.setprofile(previous_profile)
+        stack.pop()
+
+
+def _profile_calls(frame: FrameType, event: str, arg: Any) -> Callable[..., Any] | None:
+    if event != "call":
+        return _profile_calls
+    state = _current_execution_state()
+    if state is None:
+        return _profile_calls
+    fn = _sim_callable_from_code(frame.f_code)
+    if fn is None:
+        return _profile_calls
+    if hasattr(fn, "__hc_func__"):
+        _check_helper_call(fn, state)
+        return _profile_calls
+    if hasattr(fn, "__hc_intrinsic__"):
+        _check_intrinsic_call(cast(_IntrinsicFunction, fn), state, frame)
+    return _profile_calls
+
+
+def _check_helper_call(fn: _HelperFunction, state: _ExecutionState) -> None:
+    _require_declared_scope(
+        "helper", fn.__name__, fn.__hc_func__.scope, state.group._scope
+    )
+
+
+def _check_intrinsic_call(
+    fn: _IntrinsicFunction, state: _ExecutionState, frame: FrameType
+) -> None:
+    metadata = fn.__hc_intrinsic__
+    _require_declared_scope(
+        "intrinsic", fn.__name__, metadata.scope, state.group._scope
+    )
+    if not fn.__hc_has_fallback__:
+        raise SimulatorError(
+            f"intrinsic {fn.__name__!r} has no simulator fallback semantics"
+        )
+    verify = fn.__hc_verify__
+    if verify is None:
+        return
+    args, kwargs = _call_arguments(fn, frame)
+    sig = _IntrinsicCallSignature(
+        scope=_scope_symbol(state.group._scope),
+        _args=args,
+        _kwargs=kwargs,
+    )
+    try:
+        result = verify(sig, state.target)
+    except SimulatorError:
+        raise
+    except Exception as exc:
+        raise SimulatorError(
+            f"intrinsic {fn.__name__!r} verify hook failed: {exc}"
+        ) from exc
+    if result is False:
+        raise SimulatorError(f"intrinsic {fn.__name__!r} verify hook returned False")
+
+
+def _call_arguments(
+    fn: Callable[..., Any], frame: FrameType
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    try:
+        locals_ = frame.f_locals
+        positional: list[Any] = []
+        keyword: dict[str, Any] = {}
+        for param in inspect.signature(fn).parameters.values():
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                positional.append(locals_[param.name])
+                continue
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                positional.extend(cast(tuple[Any, ...], locals_.get(param.name, ())))
+                continue
+            if param.kind is inspect.Parameter.KEYWORD_ONLY:
+                keyword[param.name] = locals_[param.name]
+                continue
+            keyword.update(cast(dict[str, Any], locals_.get(param.name, {})))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SimulatorError(
+            f"could not capture intrinsic call arguments for {fn.__name__!r}"
+        ) from exc
+    return tuple(positional), keyword
+
+
+def _execution_stack() -> list[_ExecutionState]:
+    stack = getattr(_THREAD_EXECUTION, "stack", None)
+    if stack is None:
+        stack = []
+        _THREAD_EXECUTION.stack = stack
+    return cast(list[_ExecutionState], stack)
+
+
+def _current_execution_state() -> _ExecutionState | None:
+    stack = getattr(_THREAD_EXECUTION, "stack", None)
+    if not stack:
+        return None
+    return cast(list[_ExecutionState], stack)[-1]
+
+
+def _signature_value(value: Any) -> Any:
+    if isinstance(value, (SimTensor, SimVector, np.ndarray)):
+        return _CallValueSignature(value)
+    return value
+
+
+def _require_declared_scope(
+    kind: str,
+    name: str,
+    declared_scope: Any,
+    runtime_scope: str,
+) -> None:
+    if declared_scope is None:
+        return
+    if declared_scope == _scope_symbol(runtime_scope):
+        return
+    raise ScopeError(
+        f"{kind} {name!r} is only supported in {_scope_name(declared_scope)} scope"
+    )
+
+
+def _scope_symbol(runtime_scope: str) -> Any:
+    if runtime_scope == _SCOPE_WORKGROUP:
+        return WorkGroup
+    if runtime_scope == _SCOPE_SUBGROUP:
+        return SubGroup
+    if runtime_scope == _SCOPE_WORKITEM:
+        return WorkItem
+    raise SimulatorError(f"unknown simulator scope {runtime_scope!r}")
+
+
+def _scope_name(scope: Any) -> str:
+    if scope == WorkGroup:
+        return "WorkGroup"
+    if scope is SubGroup:
+        return "SubGroup"
+    if scope is WorkItem:
+        return "WorkItem"
+    if hasattr(scope, "__name__"):
+        return cast(str, scope.__name__)
+    return str(scope)
 
 
 def _iterate_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:

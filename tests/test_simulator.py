@@ -2,11 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+import threading
+
 import numpy as np
 import pytest
 
+import hc.core as hc_core
 import hc.simulator as sim
-from hc import Buffer, as_layout, index_map, kernel, sym
+from hc import Buffer, SubGroup, WorkGroup, WorkItem, as_layout, index_map, kernel, sym
 from hc._sim_types import resolve_layout
 
 _ROW_PADDED_LAYOUT = index_map(
@@ -39,6 +42,75 @@ _EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
     ],
     dtype=np.int64,
 )
+
+
+def _wait_for_event(event: threading.Event, name: str) -> None:
+    if not event.wait(timeout=2.0):
+        raise RuntimeError(f"timed out waiting for {name}")
+
+
+def _join_thread(thread: threading.Thread, name: str) -> None:
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), f"{name} did not finish"
+
+
+def _launch_in_thread(fn, label: int, target, dst, errors: list[BaseException]) -> None:
+    try:
+        sim.launch(fn, label, dst, target=target)
+    except BaseException as exc:  # pragma: no cover - surfaced in assertions below
+        errors.append(exc)
+
+
+def _make_thread_local_launch_case(verified):
+    ready_a = threading.Event()
+    ready_b = threading.Event()
+    release_a = threading.Event()
+    release_b = threading.Event()
+
+    @kernel.intrinsic(scope=WorkGroup)
+    def capture(x: int) -> int:
+        return x
+
+    @capture.verify
+    def _verify(sig, target):
+        verified.append((sig.arg(0), target))
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def run(group, label: int, dst: Buffer[1]) -> None:
+        _ = group
+        if label == 1:
+            ready_a.set()
+            _wait_for_event(release_a, "resume thread A")
+        else:
+            ready_b.set()
+            _wait_for_event(release_b, "resume thread B")
+        dst[0] = capture(label)
+
+    return run, ready_a, ready_b, release_a, release_b
+
+
+def _run_thread_local_launch_pair(run, ready_a, ready_b, release_a, release_b):
+    errors: list[BaseException] = []
+    out_a = np.zeros((1,), dtype=np.int64)
+    out_b = np.zeros((1,), dtype=np.int64)
+    target_a = sim.SimulatorTarget(max_group_size=1)
+    target_b = sim.SimulatorTarget(max_group_size=2)
+    thread_a = threading.Thread(
+        target=_launch_in_thread, args=(run, 1, target_a, out_a, errors)
+    )
+    thread_b = threading.Thread(
+        target=_launch_in_thread, args=(run, 2, target_b, out_b, errors)
+    )
+
+    thread_a.start()
+    _wait_for_event(ready_a, "thread A to enter the kernel")
+    thread_b.start()
+    _wait_for_event(ready_b, "thread B to enter the kernel")
+    release_a.set()
+    _join_thread(thread_a, "thread A")
+    release_b.set()
+    _join_thread(thread_b, "thread B")
+    return target_a, target_b, out_a, out_b, errors
 
 
 @kernel(work_shape=(4, 2), group_shape=(4, 2), subgroup_size=2)
@@ -583,6 +655,214 @@ def test_group_vload_and_vector_store_work_in_workitem_scope() -> None:
     sim.launch(copy, src, dst)
 
     assert np.array_equal(dst, src + 2)
+
+
+def test_helper_scope_is_rejected_outside_declared_scope() -> None:
+    @kernel.func(scope=SubGroup)
+    def subgroup_only(x: int) -> int:
+        return x + 1
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        subgroup_only(1)
+
+    with pytest.raises(sim.ScopeError, match="helper 'subgroup_only'.*SubGroup"):
+        sim.launch(bad)
+
+
+def test_helper_scope_allows_declared_subgroup_calls() -> None:
+    seen: list[int] = []
+
+    @kernel.func(scope=SubGroup)
+    def subgroup_value(x: int) -> int:
+        return x + 1
+
+    @kernel(work_shape=(4,), group_shape=(4,), subgroup_size=2)
+    def ok(group) -> None:
+        @group.subgroups
+        def inner(sg) -> None:
+            seen.append(subgroup_value(sg.subgroup_id()))
+
+        inner()
+
+    sim.launch(ok)
+
+    assert seen == [1, 2]
+
+
+def test_intrinsic_scope_is_rejected_outside_declared_scope() -> None:
+    @kernel.intrinsic(scope=WorkItem)
+    def workitem_only(x: int) -> int:
+        return x + 1
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        workitem_only(1)
+
+    with pytest.raises(
+        sim.ScopeError,
+        match="intrinsic 'workitem_only'.*WorkItem",
+    ):
+        sim.launch(bad)
+
+
+def test_bodyless_intrinsic_raises_when_reached() -> None:
+    @kernel.intrinsic(scope=WorkGroup)
+    def vendor_only(x: int) -> None:
+        pass
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        vendor_only(1)
+
+    with pytest.raises(sim.SimulatorError, match="no simulator fallback"):
+        sim.launch(bad)
+
+
+def test_intrinsic_verify_hook_receives_scope_and_arguments() -> None:
+    verified: list[tuple[object, bool, int, sim.SimulatorTarget]] = []
+
+    @kernel.intrinsic(scope=WorkItem, const_attrs={"delta"})
+    def add_delta(vec, *, delta):
+        return vec + delta
+
+    @add_delta.verify
+    def _verify(sig, target):
+        verified.append((sig.scope, sig.arg(0).is_vector(), sig.kwarg("delta"), target))
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def ok(group, src: Buffer[1], dst: Buffer[1]) -> None:
+        @group.workitems
+        def inner(wi) -> None:
+            gid = wi.global_id()[0]
+            vec = group.vload(src[gid:], shape=(1,))
+            group.store(dst[gid:], add_delta(vec, delta=2))
+
+        inner()
+
+    src = np.array([3.0], dtype=np.float32)
+    dst = np.zeros((1,), dtype=np.float32)
+    target = sim.SimulatorTarget()
+
+    sim.launch(ok, src, dst, target=target)
+
+    assert np.array_equal(dst, np.array([5.0], dtype=np.float32))
+    assert verified == [(WorkItem, True, 2, target)]
+
+
+def test_intrinsic_verify_hook_can_reject_calls() -> None:
+    @kernel.intrinsic(scope=WorkGroup, const_attrs={"blocksz"})
+    def checked(x: int, *, blocksz: int) -> int:
+        return x + blocksz
+
+    @checked.verify
+    def _verify(sig, target):
+        _ = target
+        assert sig.scope == WorkGroup
+        if sig.kwarg("blocksz") != 4:
+            raise ValueError("unsupported blocksz")
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        checked(1, blocksz=8)
+
+    with pytest.raises(sim.SimulatorError, match="unsupported blocksz"):
+        sim.launch(bad)
+
+
+def test_intrinsic_verify_argument_capture_errors_are_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_signature = sim.inspect.signature
+
+    @kernel.intrinsic(scope=WorkGroup)
+    def checked(x: int) -> int:
+        return x
+
+    @checked.verify
+    def _verify(sig, target):
+        _ = (sig, target)
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        checked(1)
+
+    def signature(fn):
+        if fn is checked:
+            raise ValueError("cannot inspect intrinsic")
+        return original_signature(fn)
+
+    monkeypatch.setattr(sim.inspect, "signature", signature)
+
+    with pytest.raises(sim.SimulatorError, match="could not capture intrinsic call"):
+        sim.launch(bad)
+
+
+def test_bodyless_intrinsic_without_source_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_source(fn):
+        _ = fn
+        raise OSError("missing source")
+
+    monkeypatch.setattr(hc_core.inspect, "getsource", missing_source)
+
+    @kernel.intrinsic(scope=WorkGroup)
+    def vendor_only(x: int) -> None:
+        pass
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        _ = group
+        vendor_only(1)
+
+    with pytest.raises(sim.SimulatorError, match="no simulator fallback"):
+        sim.launch(bad)
+
+
+def test_nonempty_intrinsic_without_source_uses_bytecode_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_source(fn):
+        _ = fn
+        raise OSError("missing source")
+
+    monkeypatch.setattr(hc_core.inspect, "getsource", missing_source)
+
+    @kernel.intrinsic(scope=WorkGroup)
+    def add_one(x: int) -> int:
+        return x + 1
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def ok(group, dst: Buffer[1]) -> None:
+        _ = group
+        dst[0] = add_one(1)
+
+    out = np.zeros((1,), dtype=np.int64)
+
+    sim.launch(ok, out)
+
+    assert np.array_equal(out, np.array([2], dtype=np.int64))
+
+
+def test_launch_execution_context_is_thread_local() -> None:
+    verified: list[tuple[int, sim.SimulatorTarget]] = []
+    run, ready_a, ready_b, release_a, release_b = _make_thread_local_launch_case(
+        verified
+    )
+    target_a, target_b, out_a, out_b, errors = _run_thread_local_launch_pair(
+        run, ready_a, ready_b, release_a, release_b
+    )
+
+    assert errors == []
+    assert verified == [(1, target_a), (2, target_b)]
+    assert np.array_equal(out_a, np.array([1], dtype=np.int64))
+    assert np.array_equal(out_b, np.array([2], dtype=np.int64))
 
 
 def test_non_call_ufunc_methods_are_rejected() -> None:

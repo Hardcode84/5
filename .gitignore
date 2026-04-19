@@ -1,4 +1,5 @@
 .beads/
+.hc/
 __pycache__/
 *.py[cod]
 .venv/

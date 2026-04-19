@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 hc contributors
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+[submodule "third_party/ixsimpl"]
+	path = third_party/ixsimpl
+	url = https://github.com/Hardcode84/4.git

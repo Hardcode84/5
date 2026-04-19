@@ -10,27 +10,6 @@ from typing import Any, Protocol, cast
 
 
 @dataclass(frozen=True)
-class Symbol:
-    name: str
-
-    def __str__(self) -> str:
-        return self.name
-
-
-class _SymbolNamespace:
-    def __init__(self) -> None:
-        self._cache: dict[str, Symbol] = {}
-
-    def __getattr__(self, name: str) -> Symbol:
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return self._cache.setdefault(name, Symbol(name))
-
-
-sym = _SymbolNamespace()
-
-
-@dataclass(frozen=True)
 class BufferSpec:
     dimensions: tuple[Any, ...]
 

@@ -2,6 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from __future__ import annotations
+
+import importlib
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
+
 from .core import (
     Buffer,
     BufferSpec,
@@ -10,13 +16,15 @@ from .core import (
     Result,
     Scope,
     SubGroup,
-    Symbol,
     WorkGroup,
     WorkItem,
     index_map,
     kernel,
-    sym,
 )
+
+if TYPE_CHECKING:
+    from . import symbols
+    from .symbols import Symbol
 
 __all__ = [
     "Buffer",
@@ -31,5 +39,29 @@ __all__ = [
     "WorkItem",
     "index_map",
     "kernel",
+    "symbols",
     "sym",
 ]
+
+_SYMBOLS_MODULE: ModuleType | None = None
+
+
+def _load_symbols_module() -> ModuleType:
+    global _SYMBOLS_MODULE
+    if _SYMBOLS_MODULE is None:
+        _SYMBOLS_MODULE = importlib.import_module(".symbols", __name__)
+    return _SYMBOLS_MODULE
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"Symbol", "sym", "symbols"}:
+        _symbols = _load_symbols_module()
+
+        if name == "symbols":
+            return _symbols
+        return getattr(_symbols, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(__all__)

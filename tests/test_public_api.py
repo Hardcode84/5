@@ -13,22 +13,31 @@ from hc import (
     WorkItem,
     index_map,
     kernel,
-    sym,
 )
 
 
+def _sym():
+    from hc import sym
+
+    return sym
+
+
 def test_symbol_namespace_caches_by_name() -> None:
+    sym = _sym()
     assert sym.W is sym.W
     assert str(sym.W) == "W"
 
 
 def test_buffer_annotation_captures_dimensions() -> None:
+    sym = _sym()
     spec = Buffer[sym.W, 3]
     assert spec.dimensions == (sym.W, 3)
     assert repr(spec) == "Buffer[W, 3]"
 
 
 def test_kernel_decorator_stores_metadata() -> None:
+    sym = _sym()
+
     @kernel(work_shape=(sym.W,), literals={sym.W})
     def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
         return None

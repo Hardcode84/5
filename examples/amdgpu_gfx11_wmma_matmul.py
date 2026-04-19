@@ -9,7 +9,11 @@ Run from the repository root with:
     python -m examples.amdgpu_gfx11_wmma_matmul
 
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
-WorkItem scope. For wave32, the calculator reports:
+WorkItem scope. It also uses collective-return values to keep the WMMA
+accumulator distributed across workitems at the WorkGroup-level K loop
+boundary: `acc = init_wmma_acc(group)` before the loop,
+`acc = issue_wmma_tile(...)` inside it, and `acc[:, lane]` when a lane consumes
+its local fragment. For wave32, the calculator reports:
 
 * A[i, k] lives in lanes `i` and `i + 16`, register `floor(k / 2)`.
 * B[k, j] lives in lanes `j` and `j + 16`, register `floor(k / 2)`.
@@ -33,8 +37,8 @@ WMMA_M = 16
 WMMA_N = 16
 WMMA_K = 16
 GFX_ARCH = "gfx11"
-WMMA_ACC_ROWS = WAVE_LANES // 16
-WMMA_ACC_FRAGMENT = WMMA_M // WMMA_ACC_ROWS
+WMMA_ACC_ROW_STRIDE = WAVE_LANES // 16
+WMMA_ACC_FRAGMENT = WMMA_M // WMMA_ACC_ROW_STRIDE
 _WMMA_SIGNATURE_ARGS = (
     (1, "tensor", (WMMA_M, WMMA_K), np.float16, "A tile"),
     (2, "tensor", (WMMA_K, WMMA_N), np.float16, "B tile"),
@@ -42,6 +46,8 @@ _WMMA_SIGNATURE_ARGS = (
     (4, "vector", (WMMA_K,), np.float16, "B lane fragment"),
     (5, "vector", (WMMA_ACC_FRAGMENT,), np.float32, "accumulator fragment"),
 )
+# The intrinsic returns one updated `(WMMA_ACC_FRAGMENT,)` accumulator fragment
+# per workitem.
 
 M = sym.M
 N = sym.N
@@ -67,8 +73,17 @@ def _lane_a_row(lane: int) -> int:
 
 def _lane_output_rows(lane: int, wave_size: int) -> tuple[int, ...]:
     start = lane // 16
-    step = wave_size // 16
+    step = _lane_output_row_step(wave_size)
     return tuple(range(start, WMMA_M, step))
+
+
+def _lane_output_row_step(wave_size: int) -> int:
+    return wave_size // 16
+
+
+def _lane_output_row_slice_args(lane: int, wave_size: int) -> tuple[int, int, int]:
+    rows = _lane_output_rows(lane, wave_size)
+    return rows[0], WMMA_M, _lane_output_row_step(wave_size)
 
 
 def _tile_origin(tile_id: int, tiles_n: int) -> tuple[int, int]:
@@ -131,7 +146,8 @@ def wmma_gfx11(
 
     The real instruction is workitem-local but consumes data distributed across
     the whole wave. The simulator therefore passes the staged LDS tiles
-    explicitly so the fallback can reconstruct the lane's output fragment.
+    explicitly and reconstructs the lane's output fragment from them rather
+    than from the explicit lane operands.
     """
 
     _ = (a_frag, b_frag)
@@ -194,40 +210,49 @@ def load_wmma_b_fragment(wi, b_tile):
     return b_tile[:, _lane_column(wi.local_id()[0])].vec()
 
 
-@kernel.func(scope=WorkItem)
-def load_wmma_acc_fragment(wi, c_tile, *, wave_size):
-    lane = wi.local_id()[0]
-    rows = _lane_output_rows(lane, wave_size)
-    return c_tile[rows[0] :: wave_size // 16, _lane_column(lane)].vec()
+@kernel.func(scope=WorkGroup)
+def init_wmma_acc(group):
+    @group.workitems
+    def init(wi):
+        _ = wi
+        return group.vzeros(shape=(WMMA_ACC_FRAGMENT,), dtype=np.float32)
 
-
-@kernel.func(scope=WorkItem)
-def store_wmma_acc_fragment(group, wi, c_tile, acc_frag, *, wave_size):
-    lane = wi.local_id()[0]
-    rows = _lane_output_rows(lane, wave_size)
-    group.store(c_tile[rows[0] :: wave_size // 16, _lane_column(lane)], acc_frag)
+    return init()
 
 
 @kernel.func(scope=WorkGroup)
-def issue_wmma_tile(group, a_tile, b_tile, c_tile):
+def issue_wmma_tile(group, a_tile, b_tile, acc):
     @group.workitems
-    def wave(wi) -> None:
+    def wave(wi):
         lane = wi.local_id()[0]
         a_frag = load_wmma_a_fragment(wi, a_tile)
         b_frag = load_wmma_b_fragment(wi, b_tile)
-        acc_frag = load_wmma_acc_fragment(wi, c_tile, wave_size=WAVE_LANES)
-        acc_frag = wmma_gfx11(
+        return wmma_gfx11(
             group,
             a_tile,
             b_tile,
             a_frag,
             b_frag,
-            acc_frag,
+            acc[:, lane],
             lane=lane,
             wave_size=WAVE_LANES,
             arch=GFX_ARCH,
         )
-        store_wmma_acc_fragment(group, wi, c_tile, acc_frag, wave_size=WAVE_LANES)
+
+    return wave()
+
+
+@kernel.func(scope=WorkGroup)
+def store_wmma_tile(group, c, row0, col0, acc):
+    @group.workitems
+    def wave(wi):
+        lane = wi.local_id()[0]
+        row_start, row_stop, row_step = _lane_output_row_slice_args(lane, WAVE_LANES)
+        col = col0 + _lane_column(lane)
+        group.store(
+            c[row0 + row_start : row0 + row_stop : row_step, col],
+            acc[:, lane],
+        )
 
     wave()
 
@@ -245,7 +270,7 @@ def tiled_gfx11_wmma_matmul(
 ) -> None:
     tiles_n = _tile_div(b.shape[1], WMMA_N)
     row0, col0 = _tile_origin(group.group_id[0], tiles_n)
-    c_tile = group.zeros(shape=(WMMA_M, WMMA_N), dtype=np.float32)
+    acc = init_wmma_acc(group)
 
     for k0 in range(0, a.shape[1], WMMA_K):
         a_tile = group.load(
@@ -256,9 +281,9 @@ def tiled_gfx11_wmma_matmul(
             b[k0 : k0 + WMMA_K, col0 : col0 + WMMA_N],
             shape=(WMMA_K, WMMA_N),
         )
-        issue_wmma_tile(group, a_tile, b_tile, c_tile)
+        acc = issue_wmma_tile(group, a_tile, b_tile, acc)
 
-    group.store(c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N], c_tile)
+    store_wmma_tile(group, c, row0, col0, acc)
 
 
 def reference_blocked_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:

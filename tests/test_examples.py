@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 import numpy as np
+import pytest
 
 from examples.amdgpu_gfx11_wmma_matmul import (
     make_demo_inputs,
@@ -11,8 +12,9 @@ from examples.amdgpu_gfx11_wmma_matmul import (
 )
 
 
-def test_gfx11_wmma_example_matches_blocked_reference() -> None:
-    a, b = make_demo_inputs(m=32, n=32, k=32, seed=7)
+@pytest.mark.parametrize(("m", "n", "k"), [(16, 16, 16), (32, 32, 32)])
+def test_gfx11_wmma_example_matches_blocked_reference(m: int, n: int, k: int) -> None:
+    a, b = make_demo_inputs(m=m, n=n, k=k, seed=7)
 
     out = simulate_gfx11_wmma_matmul(a, b)
     reference = reference_blocked_matmul(a, b)

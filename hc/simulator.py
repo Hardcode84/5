@@ -126,6 +126,39 @@ class _IntrinsicCallSignature:
         return _signature_value(self._kwargs[name])
 
 
+@dataclass(frozen=True)
+class _NoneCollectiveResult:
+    pass
+
+
+@dataclass(frozen=True)
+class _ScalarCollectiveResult:
+    dtype: np.dtype[Any] | None
+
+
+@dataclass(frozen=True)
+class _VectorCollectiveResult:
+    shape: tuple[int, ...]
+    dtype: np.dtype[Any]
+    layout: Any
+    collective_suffix: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _TupleCollectiveResult:
+    elements: tuple[Any, ...]
+
+
+type _CollectiveReturnSpec = (
+    _NoneCollectiveResult
+    | _ScalarCollectiveResult
+    | _VectorCollectiveResult
+    | _TupleCollectiveResult
+)
+
+_NONE_COLLECTIVE_RESULT = _NoneCollectiveResult()
+
+
 _THREAD_EXECUTION = threading.local()
 
 
@@ -239,7 +272,7 @@ class SimCurrentGroup(CurrentGroup):
         self, fn: Callable[..., Any], *, scope: str
     ) -> Callable[..., Any]:
         @wraps(fn)
-        def invoke(*args: Any, **kwargs: Any) -> None:
+        def invoke(*args: Any, **kwargs: Any) -> Any:
             if args or kwargs:
                 raise SimulatorError(
                     "collective region runners do not accept call-time arguments"
@@ -248,9 +281,8 @@ class SimCurrentGroup(CurrentGroup):
                 "@group.subgroups" if scope == _SCOPE_SUBGROUP else "@group.workitems"
             )
             if scope == _SCOPE_SUBGROUP:
-                self._run_subgroups(fn)
-                return
-            self._run_workitems(fn)
+                return self._run_subgroups(fn)
+            return self._run_workitems(fn)
 
         return invoke
 
@@ -455,23 +487,28 @@ class SimCurrentGroup(CurrentGroup):
             ),
         )
 
-    def _run_subgroups(self, fn: Callable[..., Any]) -> None:
+    def _run_subgroups(self, fn: Callable[..., Any]) -> Any:
         subgroup_size = self._subgroup_size
         if subgroup_size is None:
             raise ScopeError("@group.subgroups requires subgroup_size")
         subgroup_grid = (self.shape[0] // subgroup_size, *self.shape[1:])
+        results: list[tuple[tuple[int, ...], Any]] = []
         for subgroup_id, _ in enumerate(_iterate_indices(subgroup_grid)):
             subgroup = SimSubGroup(subgroup_id=subgroup_id, size=subgroup_size)
             self._set_runtime_scope(_SCOPE_SUBGROUP)
             try:
-                fn(subgroup)
+                result = fn(subgroup)
             finally:
                 self._set_runtime_scope(_SCOPE_WORKGROUP)
+            results.append(((subgroup_id,), result))
+        # SubGroup lifts use a single trailing `(num_subgroups,)` axis ordered by
+        # the linear `subgroup_id()` sequence.
+        return _aggregate_collective_results(results, (len(results),))
 
-    def _run_workitems(self, fn: Callable[..., Any]) -> None:
+    def _run_workitems(self, fn: Callable[..., Any]) -> Any:
         scheduler = _WorkItemScheduler(self, fn)
         self._set_runtime_scope(_SCOPE_WORKGROUP)
-        scheduler.run()
+        return scheduler.run()
 
 
 class SimSubGroup(SubGroup):
@@ -515,6 +552,7 @@ class _WorkItemState:
     runner: Any
     started: bool = False
     done: bool = False
+    result: Any = None
     barrier_generation: int = 0
     waiting_generation: int | None = None
 
@@ -530,12 +568,14 @@ class _WorkItemScheduler:
         ]
         self._current_state: _WorkItemState | None = None
 
-    def run(self) -> None:
+    def run(self) -> Any:
         while True:
             live = [state for state in self._states if not state.done]
             if not live:
                 self._group._set_runtime_scope(_SCOPE_WORKGROUP)
-                return
+                return _aggregate_collective_results(
+                    self._participant_results(), self._group.shape
+                )
             for state in live:
                 if state.waiting_generation is not None:
                     continue
@@ -559,8 +599,8 @@ class _WorkItemScheduler:
         runner = self._greenlet.greenlet(self._run_workitem)
         return _WorkItemState(workitem=workitem, runner=runner)
 
-    def _run_workitem(self, workitem: SimWorkItem) -> None:
-        self._fn(workitem)
+    def _run_workitem(self, workitem: SimWorkItem) -> Any:
+        return self._fn(workitem)
 
     def _resume_state(self, state: _WorkItemState) -> None:
         self._current_state = state
@@ -576,6 +616,7 @@ class _WorkItemScheduler:
             self._current_state = None
         if state.runner.dead:
             state.done = True
+            state.result = outcome
             return
         if not isinstance(outcome, _BarrierWait):
             raise SimulatorError("unexpected workitem scheduler yield")
@@ -599,6 +640,9 @@ class _WorkItemScheduler:
         for state in waiting:
             state.barrier_generation = generation
             state.waiting_generation = None
+
+    def _participant_results(self) -> list[tuple[tuple[int, ...], Any]]:
+        return [(state.workitem.local_id(), state.result) for state in self._states]
 
 
 def _greenlet_runtime() -> Any:
@@ -1035,6 +1079,207 @@ def _scope_name(scope: Any) -> str:
     if hasattr(scope, "__name__"):
         return cast(str, scope.__name__)
     return str(scope)
+
+
+def _aggregate_collective_results(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+    collective_shape: tuple[int, ...],
+) -> Any:
+    spec = _collective_result_spec(participants)
+    return _materialize_collective_result(participants, spec, collective_shape)
+
+
+def _collective_result_spec(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+) -> _CollectiveReturnSpec:
+    expected: _CollectiveReturnSpec | None = None
+    for _, value in participants:
+        current = _collective_value_spec(value)
+        expected = (
+            current if expected is None else _merge_collective_specs(expected, current)
+        )
+    if expected is None:
+        raise SimulatorError("collective region had no participants")
+    return expected
+
+
+def _collective_value_spec(value: Any) -> _CollectiveReturnSpec:
+    if value is None:
+        return _NONE_COLLECTIVE_RESULT
+    if isinstance(value, tuple):
+        return _tuple_collective_spec(value)
+    if isinstance(value, SimTensor):
+        raise SimulatorError(
+            "collective returns may only be scalars, vectors, or flat tuples"
+        )
+    if isinstance(value, SimVector):
+        return _VectorCollectiveResult(
+            shape=value.shape,
+            dtype=value.dtype,
+            layout=value.layout,
+            collective_suffix=value.collective_suffix,
+        )
+    if _is_collective_scalar(value):
+        return _ScalarCollectiveResult(dtype=_collective_scalar_dtype(value))
+    raise SimulatorError(
+        "collective returns may only be scalars, vectors, or flat tuples"
+    )
+
+
+def _tuple_collective_spec(value: tuple[Any, ...]) -> _TupleCollectiveResult:
+    elements: list[_CollectiveReturnSpec] = []
+    for element in value:
+        if element is None:
+            raise SimulatorError("collective tuple returns may not contain None")
+        spec = _collective_value_spec(element)
+        if isinstance(spec, _TupleCollectiveResult):
+            raise SimulatorError("collective tuple returns must be flat")
+        elements.append(spec)
+    return _TupleCollectiveResult(elements=tuple(elements))
+
+
+def _is_collective_scalar(value: Any) -> bool:
+    return value is poison or np.isscalar(value)
+
+
+def _collective_scalar_dtype(value: Any) -> np.dtype[Any] | None:
+    if value is poison:
+        return None
+    return np.asarray(value).dtype
+
+
+def _merge_collective_specs(
+    expected: _CollectiveReturnSpec, current: _CollectiveReturnSpec
+) -> _CollectiveReturnSpec:
+    if type(expected) is not type(current):
+        raise SimulatorError(
+            "collective region return structure does not match: expected "
+            f"{_collective_spec_name(expected)}, got {_collective_spec_name(current)}"
+        )
+    if isinstance(expected, _NoneCollectiveResult):
+        return expected
+    if isinstance(expected, _ScalarCollectiveResult):
+        return _merge_scalar_specs(expected, cast(_ScalarCollectiveResult, current))
+    if isinstance(expected, _VectorCollectiveResult):
+        _require_matching_vector_spec(expected, cast(_VectorCollectiveResult, current))
+        return expected
+    return _merge_tuple_specs(expected, cast(_TupleCollectiveResult, current))
+
+
+def _collective_spec_name(spec: _CollectiveReturnSpec) -> str:
+    if isinstance(spec, _NoneCollectiveResult):
+        return "None"
+    if isinstance(spec, _ScalarCollectiveResult):
+        return "scalar"
+    if isinstance(spec, _VectorCollectiveResult):
+        return "vector"
+    return "tuple"
+
+
+def _merge_scalar_specs(
+    expected: _ScalarCollectiveResult, current: _ScalarCollectiveResult
+) -> _ScalarCollectiveResult:
+    if expected.dtype is None:
+        return current
+    if current.dtype is None or expected.dtype == current.dtype:
+        return expected
+    raise SimulatorError("collective scalar returns must have matching dtypes")
+
+
+def _require_matching_vector_spec(
+    expected: _VectorCollectiveResult, current: _VectorCollectiveResult
+) -> None:
+    if expected.shape != current.shape:
+        raise SimulatorError("collective vector returns must have matching shapes")
+    if expected.dtype != current.dtype:
+        raise SimulatorError("collective vector returns must have matching dtypes")
+    if expected.layout != current.layout:
+        raise SimulatorError("collective vector returns must have matching layouts")
+    if expected.collective_suffix != current.collective_suffix:
+        raise SimulatorError(
+            "collective vector returns must have matching collective suffixes"
+        )
+
+
+def _merge_tuple_specs(
+    expected: _TupleCollectiveResult, current: _TupleCollectiveResult
+) -> _TupleCollectiveResult:
+    if len(expected.elements) != len(current.elements):
+        raise SimulatorError("collective tuple returns must have matching arity")
+    merged = tuple(
+        _merge_collective_specs(lhs, rhs)
+        for lhs, rhs in zip(expected.elements, current.elements, strict=True)
+    )
+    return _TupleCollectiveResult(elements=merged)
+
+
+def _materialize_collective_result(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+    spec: _CollectiveReturnSpec,
+    collective_shape: tuple[int, ...],
+) -> Any:
+    if isinstance(spec, _NoneCollectiveResult):
+        return None
+    if isinstance(spec, _ScalarCollectiveResult):
+        return _materialize_scalar_collective_result(
+            participants, spec, collective_shape
+        )
+    if isinstance(spec, _VectorCollectiveResult):
+        return _materialize_vector_collective_result(
+            participants, spec, collective_shape
+        )
+    return tuple(
+        _materialize_collective_result(
+            _tuple_collective_participants(participants, position),
+            element,
+            collective_shape,
+        )
+        for position, element in enumerate(spec.elements)
+    )
+
+
+def _tuple_collective_participants(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+    position: int,
+) -> list[tuple[tuple[int, ...], Any]]:
+    return [(index, value[position]) for index, value in participants]
+
+
+def _materialize_scalar_collective_result(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+    spec: _ScalarCollectiveResult,
+    collective_shape: tuple[int, ...],
+) -> SimVector:
+    dtype = np.dtype(object) if spec.dtype is None else spec.dtype
+    data = np.zeros(collective_shape, dtype=dtype)
+    mask = np.zeros(collective_shape, dtype=bool)
+    for index, value in participants:
+        if value is poison:
+            continue
+        data[index] = value
+        mask[index] = True
+    return SimVector(data, mask, collective_suffix=collective_shape)
+
+
+def _materialize_vector_collective_result(
+    participants: Sequence[tuple[tuple[int, ...], Any]],
+    spec: _VectorCollectiveResult,
+    collective_shape: tuple[int, ...],
+) -> SimVector:
+    data = np.zeros(spec.shape + collective_shape, dtype=spec.dtype)
+    mask = np.zeros(spec.shape + collective_shape, dtype=bool)
+    prefix = (slice(None),) * len(spec.shape)
+    for index, value in participants:
+        vector = cast(SimVector, value)
+        slot = prefix + index
+        data[slot] = vector._data
+        mask[slot] = vector._mask
+    return SimVector(
+        data,
+        mask,
+        layout=spec.layout,
+        collective_suffix=spec.collective_suffix + collective_shape,
+    )
 
 
 def _iterate_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:

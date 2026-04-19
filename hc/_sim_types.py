@@ -24,6 +24,7 @@ type Array = NDArray[Any]
 type ReducerIndex = tuple[int | slice, ...]
 
 _KEEP_LAYOUT = object()
+_KEEP_COLLECTIVE_SUFFIX = object()
 # Keep host-side validation bounded for large shapes while still checking the
 # layout's declared shape and storage size.
 _LAYOUT_VALIDATION_LIMIT = 4096
@@ -232,6 +233,7 @@ class _MaskedValue:
         mask: Array,
         *,
         layout: Any = None,
+        collective_suffix: Sequence[int] = (),
         read_only: bool = False,
     ) -> None:
         self._data = np.asarray(data)
@@ -239,6 +241,9 @@ class _MaskedValue:
         if self._data.shape != self._mask.shape:
             raise SimulatorError("payload and mask shapes must match")
         self.layout = layout
+        self._collective_suffix = _validated_collective_suffix(
+            self.shape, collective_suffix
+        )
         self._read_only = read_only
 
     @property
@@ -252,6 +257,10 @@ class _MaskedValue:
     @property
     def ndim(self) -> int:
         return int(self._data.ndim)
+
+    @property
+    def collective_suffix(self) -> tuple[int, ...]:
+        return self._collective_suffix
 
     @property
     def mask(self) -> _MaskedValue:
@@ -281,10 +290,17 @@ class _MaskedValue:
         mask = self._mask[index]
         if np.isscalar(mask):
             return _scalar_or_poison(data, bool(mask))
+        collective_suffix = _indexed_collective_suffix(
+            self.shape,
+            self._collective_suffix,
+            index,
+            np.shape(data),
+        )
         return self._new_like(
             np.asarray(data),
             np.asarray(mask, dtype=bool),
             layout=None,
+            collective_suffix=collective_suffix,
         )
 
     def astype(self, dtype: Any) -> _MaskedValue:
@@ -295,12 +311,29 @@ class _MaskedValue:
         data = self._data.reshape(resolved)
         mask = self._mask.reshape(resolved)
         layout = self.layout if resolved == self.shape else None
-        return self._new_like(data, mask, layout=layout)
+        collective_suffix = _reshaped_collective_suffix(
+            self._collective_suffix,
+            resolved,
+        )
+        return self._new_like(
+            data, mask, layout=layout, collective_suffix=collective_suffix
+        )
 
     def transpose(self, *axes: int) -> _MaskedValue:
         data = self._data.transpose(*axes) if axes else self._data.transpose()
         mask = self._mask.transpose(*axes) if axes else self._mask.transpose()
-        return self._new_like(data, mask, layout=None)
+        collective_suffix = _transposed_collective_suffix(
+            self.shape,
+            self._collective_suffix,
+            axes,
+            np.shape(data),
+        )
+        return self._new_like(
+            data,
+            mask,
+            layout=None,
+            collective_suffix=collective_suffix,
+        )
 
     def sum(
         self, axis: int | tuple[int, ...] | None = None, keepdims: bool = False
@@ -401,6 +434,9 @@ class _MaskedValue:
             data,
             mask,
             layout=self._matmul_layout(other_value, np.shape(data)),
+            collective_suffix=self._matmul_collective_suffix(
+                other_value, tuple(int(dim) for dim in np.shape(data))
+            ),
         )
 
     def _new_like(
@@ -409,12 +445,18 @@ class _MaskedValue:
         mask: Array,
         *,
         layout: Any = _KEEP_LAYOUT,
+        collective_suffix: Any = _KEEP_COLLECTIVE_SUFFIX,
         read_only: bool | None = None,
     ) -> _MaskedValue:
         return type(self)(
             data,
             mask,
             layout=self.layout if layout is _KEEP_LAYOUT else layout,
+            collective_suffix=(
+                self._collective_suffix
+                if collective_suffix is _KEEP_COLLECTIVE_SUFFIX
+                else collective_suffix
+            ),
             read_only=self._read_only if read_only is None else read_only,
         )
 
@@ -441,6 +483,9 @@ class _MaskedValue:
             data,
             mask,
             layout=self._binary_layout(other_value, np.shape(data)),
+            collective_suffix=self._binary_collective_suffix(
+                other_value, tuple(int(dim) for dim in np.shape(data))
+            ),
         )
 
     def _unary(self, op: Callable[[Any], Array]) -> _MaskedValue:
@@ -449,6 +494,9 @@ class _MaskedValue:
             data,
             self._mask.copy(),
             layout=self._unary_layout(np.shape(data)),
+            collective_suffix=self._unary_collective_suffix(
+                tuple(int(dim) for dim in np.shape(data))
+            ),
         )
 
     def _reduce(
@@ -463,7 +511,12 @@ class _MaskedValue:
         data, mask = _reduce_arrays(self._data, self._mask, name, axes, out_shape)
         if data.shape == ():
             return _scalar_or_poison(data, bool(mask[()]))
-        return self._new_like(data, mask, layout=self._reduction_layout(data.shape))
+        return self._new_like(
+            data,
+            mask,
+            layout=self._reduction_layout(data.shape),
+            collective_suffix=self._reduction_collective_suffix(data.shape),
+        )
 
     def _binary_layout(
         self, other: _MaskedValue | None, result_shape: tuple[int, ...]
@@ -472,14 +525,38 @@ class _MaskedValue:
             (self,) if other is None else (self, other), result_shape
         )
 
+    def _binary_collective_suffix(
+        self, other: _MaskedValue | None, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        _ = (other, result_shape)
+        return ()
+
     def _unary_layout(self, result_shape: tuple[int, ...]) -> Any:
         return self.layout if result_shape == self.shape else None
+
+    def _unary_collective_suffix(
+        self, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        _ = result_shape
+        return ()
 
     def _reduction_layout(self, result_shape: tuple[int, ...]) -> Any:
         return self.layout if result_shape == self.shape else None
 
+    def _reduction_collective_suffix(
+        self, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        _ = result_shape
+        return ()
+
     def _matmul_layout(self, other: _MaskedValue, result_shape: tuple[int, ...]) -> Any:
         return _common_result_layout((self, other), result_shape)
+
+    def _matmul_collective_suffix(
+        self, other: _MaskedValue, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        _ = (other, result_shape)
+        return ()
 
 
 class SimTensor(_MaskedValue):
@@ -502,18 +579,29 @@ class SimTensor(_MaskedValue):
         data = self._data.reshape(resolved)
         mask = self._mask.reshape(resolved)
         layout = self.layout if resolved == self.shape else None
-        return SimVector(data, mask, layout=layout, read_only=self._read_only)
+        return SimVector(
+            data,
+            mask,
+            layout=layout,
+            collective_suffix=(),
+            read_only=self._read_only,
+        )
 
 
 class SimVector(_MaskedValue):
     """Immutable masked vector value for `hc.simulator`."""
 
     def as_layout(self, layout: Any = None) -> SimVector:
+        if self.collective_suffix and layout is not None:
+            raise SimulatorError(
+                "collective return vectors do not support explicit as_layout()"
+            )
         resolved = resolve_layout(layout, self.shape)
         return SimVector(
             self._data.copy(),
             self._mask.copy(),
             layout=resolved,
+            collective_suffix=self.collective_suffix,
             read_only=self._read_only,
         )
 
@@ -523,20 +611,193 @@ class SimVector(_MaskedValue):
         values = (self,) if other is None else (self, other)
         return _vector_result_layout(values, result_shape)
 
+    def _binary_collective_suffix(
+        self, other: _MaskedValue | None, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        values = (self,) if other is None else (self, other)
+        return _vector_collective_suffix(values, result_shape)
+
     def _unary_layout(self, result_shape: tuple[int, ...]) -> Any:
         return _vector_result_layout((self,), result_shape)
+
+    def _unary_collective_suffix(
+        self, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        return _vector_collective_suffix((self,), result_shape)
 
     def _reduction_layout(self, result_shape: tuple[int, ...]) -> Any:
         return _vector_result_layout((self,), result_shape)
 
+    def _reduction_collective_suffix(
+        self, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        return _vector_collective_suffix((self,), result_shape)
+
     def _matmul_layout(self, other: _MaskedValue, result_shape: tuple[int, ...]) -> Any:
         return _vector_result_layout((self, other), result_shape)
+
+    def _matmul_collective_suffix(
+        self, other: _MaskedValue, result_shape: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        return _vector_collective_suffix((self, other), result_shape)
 
 
 def _reshape_args(shape: tuple[Any, ...]) -> tuple[int, ...]:
     if len(shape) == 1 and isinstance(shape[0], Sequence):
         return tuple(int(dim) for dim in shape[0])
     return tuple(int(dim) for dim in shape)
+
+
+def _validated_collective_suffix(
+    shape: tuple[int, ...], collective_suffix: Sequence[int]
+) -> tuple[int, ...]:
+    suffix = tuple(int(dim) for dim in collective_suffix)
+    if len(suffix) > len(shape):
+        raise SimulatorError("collective suffix rank exceeds value rank")
+    if suffix and tuple(shape[-len(suffix) :]) != suffix:
+        raise SimulatorError("collective suffix must match trailing value dimensions")
+    return suffix
+
+
+def _reshaped_collective_suffix(
+    collective_suffix: tuple[int, ...], result_shape: tuple[int, ...]
+) -> tuple[int, ...]:
+    if not collective_suffix:
+        return ()
+    if len(result_shape) < len(collective_suffix):
+        raise SimulatorError(
+            "reshape must keep collective return dimensions as a trailing suffix"
+        )
+    if tuple(result_shape[-len(collective_suffix) :]) != collective_suffix:
+        raise SimulatorError(
+            "reshape must keep collective return dimensions as a trailing suffix"
+        )
+    return collective_suffix
+
+
+def _indexed_collective_suffix(
+    shape: tuple[int, ...],
+    collective_suffix: tuple[int, ...],
+    index: Any,
+    result_shape: tuple[int, ...],
+) -> tuple[int, ...]:
+    if not collective_suffix:
+        return ()
+    axes = _collective_axes_after_index(shape, collective_suffix, index)
+    if not axes:
+        return ()
+    expected = list(range(len(result_shape) - len(axes), len(result_shape)))
+    if axes != expected:
+        raise SimulatorError(
+            "indexing must keep collective return dimensions as a trailing suffix"
+        )
+    return tuple(int(dim) for dim in result_shape[-len(axes) :])
+
+
+def _collective_axes_after_index(
+    shape: tuple[int, ...], collective_suffix: tuple[int, ...], index: Any
+) -> list[int]:
+    expanded = _expanded_basic_index(index, len(shape))
+    collective_start = len(shape) - len(collective_suffix)
+    source_axis = 0
+    result_axis = 0
+    result: list[int] = []
+    for item in expanded:
+        if item is None:
+            result_axis += 1
+            continue
+        is_collective = source_axis >= collective_start
+        if isinstance(item, (int, np.integer)):
+            source_axis += 1
+            continue
+        if is_collective:
+            result.append(result_axis)
+        source_axis += 1
+        result_axis += 1
+    return result
+
+
+def _expanded_basic_index(index: Any, ndim: int) -> tuple[Any, ...]:
+    items = index if isinstance(index, tuple) else (index,)
+    ellipses = _count_ellipses(items)
+    if ellipses > 1:
+        raise SimulatorError("only one ellipsis is supported in simulator indexing")
+    missing = _missing_basic_index_axes(items, ndim)
+    expanded = _expand_ellipsis_items(items, missing)
+    if ellipses == 0:
+        return expanded + (slice(None),) * missing
+    return expanded
+
+
+def _count_ellipses(items: tuple[Any, ...]) -> int:
+    return sum(item is Ellipsis for item in items)
+
+
+def _missing_basic_index_axes(items: tuple[Any, ...], ndim: int) -> int:
+    consumed = sum(1 for item in items if item is not None and item is not Ellipsis)
+    if consumed > ndim:
+        raise SimulatorError("too many indices for simulator value")
+    return ndim - consumed
+
+
+def _expand_ellipsis_items(items: tuple[Any, ...], missing: int) -> tuple[Any, ...]:
+    expanded: list[Any] = []
+    for item in items:
+        if item is Ellipsis:
+            expanded.extend(slice(None) for _ in range(missing))
+            continue
+        expanded.append(item)
+    return tuple(expanded)
+
+
+def _transposed_collective_suffix(
+    shape: tuple[int, ...],
+    collective_suffix: tuple[int, ...],
+    axes: tuple[int, ...],
+    result_shape: tuple[int, ...],
+) -> tuple[int, ...]:
+    if not collective_suffix:
+        return ()
+    resolved_axes = _normalized_transpose_axes(axes, len(shape))
+    collective_start = len(shape) - len(collective_suffix)
+    positions = [
+        result_axis
+        for result_axis, source_axis in enumerate(resolved_axes)
+        if source_axis >= collective_start
+    ]
+    expected = list(range(len(result_shape) - len(positions), len(result_shape)))
+    if positions != expected:
+        raise SimulatorError(
+            "transpose must keep collective return dimensions as a trailing suffix"
+        )
+    return tuple(int(dim) for dim in result_shape[-len(positions) :])
+
+
+def _normalized_transpose_axes(axes: tuple[Any, ...], ndim: int) -> tuple[int, ...]:
+    resolved = _resolved_transpose_axes(axes, ndim)
+    if len(resolved) != ndim:
+        raise SimulatorError("transpose axes must match value rank")
+    wrapped = _wrapped_transpose_axes(resolved, ndim)
+    _validate_transpose_axes(wrapped, ndim)
+    return wrapped
+
+
+def _resolved_transpose_axes(axes: tuple[Any, ...], ndim: int) -> tuple[int, ...]:
+    if not axes:
+        return tuple(reversed(range(ndim)))
+    raw = axes[0] if len(axes) == 1 and isinstance(axes[0], Sequence) else axes
+    return tuple(int(axis) for axis in raw)
+
+
+def _wrapped_transpose_axes(axes: tuple[int, ...], ndim: int) -> tuple[int, ...]:
+    return tuple(axis + ndim if axis < 0 else axis for axis in axes)
+
+
+def _validate_transpose_axes(axes: tuple[int, ...], ndim: int) -> None:
+    if len(set(axes)) != ndim:
+        raise SimulatorError("transpose axes are out of range")
+    if any(axis < 0 or axis >= ndim for axis in axes):
+        raise SimulatorError("transpose axes are out of range")
 
 
 def _scalar_or_poison(data: Any, active: bool) -> Any:
@@ -611,12 +872,14 @@ def _call_ufunc(
     data = ufunc(*data_inputs, **kwargs)
     mask = _combine_masks(inputs, np.shape(data))
     layout = _ufunc_layout(kind, inputs, np.shape(data))
+    collective_suffix = _ufunc_collective_suffix(kind, inputs, np.shape(data))
     if out is None:
-        return kind(data, mask, layout=layout)
+        return kind(data, mask, layout=layout, collective_suffix=collective_suffix)
     out_value = _validate_ufunc_out(kind, out)
     out_value._data[...] = data
     out_value._mask[...] = mask
     out_value.layout = layout
+    out_value._collective_suffix = collective_suffix
     return out_value
 
 
@@ -652,6 +915,15 @@ def _ufunc_layout(
     return _common_result_layout(values, result_shape)
 
 
+def _ufunc_collective_suffix(
+    kind: type[_MaskedValue], inputs: tuple[Any, ...], result_shape: tuple[int, ...]
+) -> tuple[int, ...]:
+    if kind is not SimVector:
+        return ()
+    values = tuple(item for item in inputs if isinstance(item, _MaskedValue))
+    return _vector_collective_suffix(values, result_shape)
+
+
 def _common_result_layout(
     values: Sequence[_MaskedValue], result_shape: tuple[int, ...]
 ) -> Any:
@@ -679,12 +951,28 @@ def _vector_result_layout(
     return _require_uniform_vector_layout(vectors)
 
 
+def _vector_collective_suffix(
+    values: Sequence[_MaskedValue], result_shape: tuple[int, ...]
+) -> tuple[int, ...]:
+    vectors = _vector_inputs(values)
+    if not vectors or result_shape == ():
+        return ()
+    if _all_vector_collective_suffixes_empty(vectors):
+        return ()
+    _require_vector_shape_preservation(vectors, result_shape)
+    return _require_uniform_collective_suffix(vectors)
+
+
 def _vector_inputs(values: Sequence[_MaskedValue]) -> list[SimVector]:
     return [value for value in values if isinstance(value, SimVector)]
 
 
 def _all_vector_layouts_none(vectors: Sequence[SimVector]) -> bool:
     return all(vector.layout is None for vector in vectors)
+
+
+def _all_vector_collective_suffixes_empty(vectors: Sequence[SimVector]) -> bool:
+    return all(not vector.collective_suffix for vector in vectors)
 
 
 def _require_vector_shape_preservation(
@@ -706,6 +994,18 @@ def _require_uniform_vector_layout(vectors: Sequence[SimVector]) -> Any:
     if any(vector.layout != first for vector in vectors[1:]):
         raise SimulatorError(
             "vector operations with mismatched layouts require explicit as_layout()"
+        )
+    return first
+
+
+def _require_uniform_collective_suffix(
+    vectors: Sequence[SimVector],
+) -> tuple[int, ...]:
+    first = vectors[0].collective_suffix
+    if any(vector.collective_suffix != first for vector in vectors[1:]):
+        raise SimulatorError(
+            "vector operations with collective return dimensions require "
+            "matching collective suffixes"
         )
     return first
 
@@ -803,11 +1103,21 @@ def _reduce_active(payload: Array, active: Array, name: str) -> Any:
     return getattr(np, name)(values)
 
 
-def _wrap_like(value: _MaskedValue, data: Any, mask: Any, *, layout: Any) -> Any:
+def _wrap_like(
+    value: _MaskedValue,
+    data: Any,
+    mask: Any,
+    *,
+    layout: Any,
+    collective_suffix: tuple[int, ...],
+) -> Any:
     if np.isscalar(mask):
         return _scalar_or_poison(data, bool(mask))
     return value._new_like(
-        np.asarray(data), np.asarray(mask, dtype=bool), layout=layout
+        np.asarray(data),
+        np.asarray(mask, dtype=bool),
+        layout=layout,
+        collective_suffix=collective_suffix,
     )
 
 

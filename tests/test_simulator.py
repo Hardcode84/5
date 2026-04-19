@@ -592,6 +592,255 @@ def test_group_subgroups_execute_in_partition_order() -> None:
     ]
 
 
+def test_group_workitems_collect_scalar_returns_into_vectors() -> None:
+    out = np.zeros((4,), dtype=np.int64)
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def collect(group, dst: Buffer[4]) -> None:
+        @group.workitems
+        def lanes(wi):
+            return np.int64(wi.local_id()[0] + 1)
+
+        group.store(dst, lanes())
+
+    sim.launch(collect, out)
+
+    assert np.array_equal(out, np.array([1, 2, 3, 4], dtype=np.int64))
+
+
+def test_group_subgroups_collect_vector_returns_into_vectors() -> None:
+    out = np.zeros((2, 2), dtype=np.int64)
+
+    @kernel(work_shape=(4,), group_shape=(4,), subgroup_size=2)
+    def collect(group, dst: Buffer[2, 2]) -> None:
+        @group.subgroups
+        def tiles(sg):
+            return group.vfull(
+                shape=(2,), dtype=np.int64, fill_value=sg.subgroup_id() + 1
+            )
+
+        group.store(dst, tiles())
+
+    sim.launch(collect, out)
+
+    assert np.array_equal(out, np.array([[1, 2], [1, 2]], dtype=np.int64))
+
+
+def test_group_workitems_collect_tuple_returns_elementwise() -> None:
+    acc_out = np.zeros((2, 4), dtype=np.int64)
+    lane_out = np.zeros((4,), dtype=np.int32)
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def collect(group, acc_dst: Buffer[2, 4], lane_dst: Buffer[4]) -> None:
+        @group.workitems
+        def init(wi):
+            lane = wi.local_id()[0]
+            return group.vfull(shape=(2,), dtype=np.int64, fill_value=lane), np.int32(
+                lane
+            )
+
+        acc, lanes = init()
+        group.store(acc_dst, acc)
+        group.store(lane_dst, lanes)
+
+    sim.launch(collect, acc_out, lane_out)
+
+    expected_acc = np.array([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=np.int64)
+    expected_lanes = np.array([0, 1, 2, 3], dtype=np.int32)
+
+    assert np.array_equal(acc_out, expected_acc)
+    assert np.array_equal(lane_out, expected_lanes)
+
+
+def test_collective_return_values_can_be_sliced_and_returned_again() -> None:
+    out = np.zeros((2, 4), dtype=np.int64)
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def staged(group, dst: Buffer[2, 4]) -> None:
+        @group.workitems
+        def init(wi):
+            return group.vfull(shape=(2,), dtype=np.int64, fill_value=wi.local_id()[0])
+
+        acc = init()
+
+        @group.workitems
+        def step(wi):
+            lane = wi.local_id()[0]
+            return acc[:, lane] + 1
+
+        group.store(dst, step())
+
+    sim.launch(staged, out)
+
+    assert np.array_equal(out, np.array([[1, 2, 3, 4], [1, 2, 3, 4]], dtype=np.int64))
+
+
+def test_collective_return_full_slice_preserves_suffix_metadata() -> None:
+    seen: list[tuple[int, ...]] = []
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def collect(group) -> None:
+        @group.workitems
+        def lanes(wi):
+            return np.int64(wi.local_id()[0])
+
+        seen.append(lanes()[:].collective_suffix)
+
+    sim.launch(collect)
+
+    assert seen == [(4,)]
+
+
+def test_collective_return_reshape_preserves_trailing_suffix() -> None:
+    seen: list[tuple[int, ...]] = []
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def collect(group) -> None:
+        @group.workitems
+        def lanes(wi):
+            return np.int64(wi.local_id()[0])
+
+        seen.append(lanes().reshape(1, 4).collective_suffix)
+
+    sim.launch(collect)
+
+    assert seen == [(4,)]
+
+
+def test_collective_return_mismatch_raises_simulator_error() -> None:
+    @kernel(work_shape=(2,), group_shape=(2,))
+    def bad(group) -> None:
+        @group.workitems
+        def inner(wi):
+            if wi.local_id()[0] == 0:
+                return np.int32(1)
+            return group.vzeros(shape=(1,), dtype=np.int32)
+
+        inner()
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="return structure does not match: expected scalar, got vector",
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_vectors_reject_implicit_broadcasting() -> None:
+    out = np.zeros((4,), dtype=np.int64)
+
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def bad(group, dst: Buffer[4]) -> None:
+        @group.workitems
+        def lanes(wi):
+            return np.int64(wi.local_id()[0])
+
+        lifted = lanes()
+        base = group.vones(shape=(4,), dtype=np.int64)
+        group.store(dst, lifted + base)
+
+    with pytest.raises(sim.SimulatorError, match="matching collective suffixes"):
+        sim.launch(bad, out)
+
+
+def test_collective_return_nested_tuples_are_rejected() -> None:
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        @group.workitems
+        def inner(wi):
+            lane = np.int32(wi.local_id()[0])
+            return lane, (lane,)
+
+        inner()
+
+    with pytest.raises(
+        sim.SimulatorError, match="collective tuple returns must be flat"
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_tuple_elements_cannot_be_none() -> None:
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        @group.workitems
+        def inner(wi):
+            return np.int32(wi.local_id()[0]), None
+
+        inner()
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="collective tuple returns may not contain None",
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_tensors_are_rejected() -> None:
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group) -> None:
+        scratch = group.zeros(shape=(1,), dtype=np.int32)
+
+        @group.workitems
+        def inner(wi):
+            _ = wi
+            return scratch
+
+        inner()
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="collective returns may only be scalars, vectors, or flat tuples",
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_indexing_requires_trailing_suffix() -> None:
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def bad(group) -> None:
+        @group.workitems
+        def init(wi):
+            return group.vfull(shape=(2,), dtype=np.int64, fill_value=wi.local_id()[0])
+
+        _ = init()[:, :, None]
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="indexing must keep collective return dimensions as a trailing suffix",
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_transpose_requires_trailing_suffix() -> None:
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def bad(group) -> None:
+        @group.workitems
+        def init(wi):
+            return group.vfull(shape=(2,), dtype=np.int64, fill_value=wi.local_id()[0])
+
+        _ = init().transpose()
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="transpose must keep collective return dimensions as a trailing suffix",
+    ):
+        sim.launch(bad)
+
+
+def test_collective_return_reshape_requires_trailing_suffix() -> None:
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def bad(group) -> None:
+        @group.workitems
+        def lanes(wi):
+            return np.int64(wi.local_id()[0])
+
+        _ = lanes().reshape(4, 1)
+
+    with pytest.raises(
+        sim.SimulatorError,
+        match="reshape must keep collective return dimensions as a trailing suffix",
+    ):
+        sim.launch(bad)
+
+
 def test_subgroups_and_workitems_share_tensor_state_across_regions() -> None:
     out = np.zeros((4, 2), dtype=np.int64)
 

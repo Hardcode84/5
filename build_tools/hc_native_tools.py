@@ -30,6 +30,10 @@ class HcNativeToolsLayout:
     def hc_opt_path(self) -> Path:
         return self.install_root / "bin" / "hc-opt"
 
+    @property
+    def mlir_python_package_dir(self) -> Path:
+        return self.install_root / "python_packages" / "hc_front"
+
 
 def ensure_hc_native_tools_built(
     llvm_install_root: Path | None = None,
@@ -52,6 +56,9 @@ def export_hc_native_environment(
     exported = os.environ.copy() if env is None else env
     exported["HC_NATIVE_INSTALL_DIR"] = str(install_root)
     exported["HC_OPT_PATH"] = str(install_root / "bin" / "hc-opt")
+    exported["HC_MLIR_PYTHON_PACKAGE_DIR"] = str(
+        install_root / "python_packages" / "hc_front"
+    )
     return exported
 
 

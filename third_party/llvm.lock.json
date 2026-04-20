@@ -13,5 +13,5 @@
   "enable_assertions": true,
   "enable_rtti": false,
   "install_utils": true,
-  "enable_python_bindings": false
+  "enable_python_bindings": true
 }

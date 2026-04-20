@@ -42,6 +42,13 @@ The repository now carries a pinned LLVM/MLIR lock file in
 revision into the gitignored project-local cache under `.hc/toolchains/llvm/`
 before handing control to the normal Python package build.
 
+That lock now enables MLIR's Python bindings in addition to the native tools.
+This setting is part of the managed `<toolchain-key>` (for example, existing
+checkouts that previously cached a `...-nopy-...` toolchain should expect a new
+`...-py-...` install directory), so the first build after this change may
+trigger a one-time fresh LLVM/MLIR rebuild even if a previous pinned toolchain
+cache already exists.
+
 Bootstrap assumes:
 
 * `git` is available on `PATH`,
@@ -119,14 +126,43 @@ To bootstrap the native tool explicitly from a source checkout, run:
 python -m build_tools.hc_native_tools
 ```
 
+That managed native install also carries a relocatable MLIR Python package
+under:
+
+```text
+.hc/native/install/<toolchain-key>/python_packages/hc_front/hc_mlir/
+```
+
+The generated package embeds the core MLIR Python API plus the out-of-tree
+frontend dialect bindings. From a source checkout, `hc.mlir` loads that managed
+package on demand, so imports such as `from hc.mlir import ir` and
+`from hc.mlir.dialects import hc_front` use the same pinned native build as
+`hc-opt`.
+
+Advanced override: set `HC_MLIR_PYTHON_PACKAGE_DIR` to the package root that
+contains `hc_mlir/ir.py` when you need `hc.mlir` to load bindings from a
+non-default managed install. In other words, point it at
+`.hc/native/install/<toolchain-key>/python_packages/hc_front/`, not at the
+nested `hc_mlir/` directory itself. Keep that override aligned with the same
+native install as `hc-opt`.
+
+`hc.mlir` expects to manage the underlying `hc_mlir` import itself. Import
+`hc.mlir` before importing `hc_mlir` directly, and do not pre-import a
+different `hc_mlir` from elsewhere on `PYTHONPATH`; mixed installs fail fast on
+purpose instead of silently crossing runtime and native-build roots.
+
 That `hc-opt` build now registers the frontend `hc.front.*` operations and can
 parse textual frontend IR using placeholder types such as `!hc.front.value`.
+The Python bindings expose the same placeholder surface through
+`hc.mlir.dialects.hc_front.ValueType` and
+`hc.mlir.dialects.hc_front.TypeExprType`.
 
-The smoke test in `tests/test_hc_front_dialect.py` exercises that real native
-tool path. It will reuse or bootstrap the pinned LLVM/MLIR toolchain and the
-native `hc-opt` build on demand. To skip those `hc.front` native smoke tests,
-set `HC_SKIP_HC_FRONT_DIALECT_TESTS=1`. Unlike `HC_SKIP_LLVM_BOOTSTRAP`, this
-only affects that pytest module; it does not change package-build bootstrap
+The smoke tests in `tests/test_hc_front_dialect.py` and
+`tests/test_hc_front_python_bindings.py` exercise that real native tool path.
+They will reuse or bootstrap the pinned LLVM/MLIR toolchain and the native
+`hc-opt` build on demand. To skip those `hc.front` native smoke tests, set
+`HC_SKIP_HC_FRONT_DIALECT_TESTS=1`. Unlike `HC_SKIP_LLVM_BOOTSTRAP`, this only
+affects those pytest modules; it does not change package-build bootstrap
 behavior.
 
 ## Third-party symbols backend

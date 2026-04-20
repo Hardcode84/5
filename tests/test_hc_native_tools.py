@@ -26,6 +26,10 @@ def test_hc_native_tools_layout_uses_project_local_cache(tmp_path: Path) -> None
     assert layout.build_root == layout.root / "build" / llvm_install_root.name
     assert layout.install_root == layout.root / "install" / llvm_install_root.name
     assert layout.hc_opt_path == layout.install_root / "bin" / "hc-opt"
+    assert (
+        layout.mlir_python_package_dir
+        == layout.install_root / "python_packages" / "hc_front"
+    )
 
 
 def test_export_hc_native_environment_sets_tool_paths(tmp_path: Path) -> None:
@@ -34,6 +38,9 @@ def test_export_hc_native_environment_sets_tool_paths(tmp_path: Path) -> None:
 
     assert env["HC_NATIVE_INSTALL_DIR"] == str(install_root)
     assert env["HC_OPT_PATH"] == str(install_root / "bin" / "hc-opt")
+    assert env["HC_MLIR_PYTHON_PACKAGE_DIR"] == str(
+        install_root / "python_packages" / "hc_front"
+    )
 
 
 def test_ensure_hc_native_tools_runs_cmake_and_installs_hc_opt(

@@ -323,7 +323,7 @@ def _cmake_executable() -> str:
     if path is not None:
         return path
     try:
-        import cmake
+        import cmake  # type: ignore[import-not-found]
     except Exception:  # pragma: no cover - fallback only
         cmake = None
     if cmake is not None:
@@ -343,7 +343,7 @@ def _ninja_executable() -> str | None:
     if path is not None:
         return path
     try:
-        import ninja
+        import ninja  # type: ignore[import-not-found]
     except Exception:  # pragma: no cover - fallback only
         ninja = None
     if ninja is not None:

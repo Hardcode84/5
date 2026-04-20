@@ -32,7 +32,9 @@ simulator = ["greenlet", "numpy"]
 test = ["greenlet", "numpy", "pytest"]
 
 [tool.setuptools]
-packages = ["hc"]
+
+[tool.setuptools.packages.find]
+include = ["hc*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

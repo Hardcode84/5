@@ -81,8 +81,8 @@ Useful escape hatches during bring-up:
 * set `HC_LLVM_CACHE_DIR=/path/to/cache` to relocate the otherwise
   project-local cache; this is especially useful for isolated builds or CI
   jobs that should reuse one persistent toolchain cache,
-* set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip the bootstrap hook during package
-  builds.
+* set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip only the LLVM/MLIR bootstrap hook
+  during package builds; the `ixsimpl` vendor bootstrap still runs.
 
 To fully reset the managed local toolchain state, remove the cache directory
 under `.hc/toolchains/llvm/` (or the directory pointed to by
@@ -106,11 +106,17 @@ Set `HC_IXSIMPL_VENDOR_DIR` to use another empty or already hc-managed
 directory. Symbols such as `sym.W` and `Context.sym("W")` are backed by this
 engine, so they are real symbolic nodes rather than plain name-only tags.
 
-To bootstrap the backend explicitly, run:
+Wheel and editable package builds now bootstrap that vendored copy up front.
+In the normal editable-install flow, `pip install -e ".[dev]"` or
+`pip install -e ".[test]"` will build `ixsimpl` before runtime symbol use.
+Source archives and metadata-only hooks stay side-effect free.
+
+To bootstrap the backend explicitly from a source checkout, run:
 
 ```bash
-python -m hc._ixsimpl_loader
+python -m build_tools.ixsimpl_toolchain
 ```
 
-If the backend has not been bootstrapped yet, the first real symbol operation
-will build it on demand from the submodule.
+If the vendored backend is missing or stale, runtime symbol use now fails fast
+instead of building on demand. Re-run the package build or the explicit
+bootstrap command above after updating the submodule or clearing `.hc/`.

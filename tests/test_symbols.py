@@ -15,6 +15,11 @@ import pytest
 
 import hc.symbols as hs
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_MISSING_IXSIMPL_ERROR_FRAGMENTS = (
+    "Vendored ixsimpl backend is not built",
+    "hc.symbols requires the ixsimpl submodule and a built vendored copy",
+)
 _SKIP_BUILD_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_IXSIMPL_BUILD_TESTS") == "1",
     reason="build-heavy ixsimpl integration tests disabled by env",
@@ -22,7 +27,6 @@ _SKIP_BUILD_TESTS = pytest.mark.skipif(
 
 
 def _run_python(
-    repo_root: Path,
     env: dict[str, str],
     script: str,
     *,
@@ -30,7 +34,7 @@ def _run_python(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
-        cwd=repo_root,
+        cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -38,14 +42,32 @@ def _run_python(
     )
 
 
-def test_import_hc_and_lazy_sym_do_not_build_ixsimpl(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+def _run_module(
+    env: dict[str, str],
+    module: str,
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", module],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def _assert_missing_ixsimpl_error(stderr: str) -> None:
+    assert any(fragment in stderr for fragment in _MISSING_IXSIMPL_ERROR_FRAGMENTS)
+
+
+def test_import_hc_does_not_create_ixsimpl_vendor_dir(tmp_path: Path) -> None:
     vendor_dir = tmp_path / "vendor"
     env = os.environ.copy()
     env["HC_IXSIMPL_VENDOR_DIR"] = str(vendor_dir)
 
     result = _run_python(
-        repo_root,
         env,
         """
         import json
@@ -71,23 +93,78 @@ def test_import_hc_and_lazy_sym_do_not_build_ixsimpl(tmp_path: Path) -> None:
 
 
 @_SKIP_BUILD_TESTS
-def test_ixsimpl_loader_cli_bootstraps_vendor_dir(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+def test_ixsimpl_toolchain_cli_bootstraps_vendor_dir(tmp_path: Path) -> None:
     vendor_dir = tmp_path / "vendor"
     env = os.environ.copy()
     env["HC_IXSIMPL_VENDOR_DIR"] = str(vendor_dir)
 
-    result = subprocess.run(
-        [sys.executable, "-m", "hc._ixsimpl_loader"],
-        cwd=repo_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    result = _run_module(env, "build_tools.ixsimpl_toolchain")
 
     assert Path(result.stdout.strip()) == vendor_dir
     assert (vendor_dir / ".hc-ixsimpl-stamp.json").exists()
+
+    result = _run_python(
+        env,
+        """
+        import json
+
+        import hc.symbols as hs
+
+        expr = str(hs.sym.W + 1)
+
+        import ixsimpl
+
+        print(json.dumps({"expr": expr, "module": ixsimpl.__file__}))
+        """,
+    )
+    payload = json.loads(result.stdout)
+    module_path = Path(payload["module"]).resolve()
+
+    assert module_path.is_relative_to(vendor_dir.resolve())
+    assert payload["expr"] == "1 + W"
+
+
+def test_symbols_require_prebuilt_ixsimpl_vendor(tmp_path: Path) -> None:
+    vendor_dir = tmp_path / "vendor"
+    env = os.environ.copy()
+    env["HC_IXSIMPL_VENDOR_DIR"] = str(vendor_dir)
+
+    result = _run_python(
+        env,
+        """
+        import hc.symbols as hs
+
+        hs.Context()
+        """,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    _assert_missing_ixsimpl_error(result.stderr)
+
+
+def test_symbols_reject_invalid_ixsimpl_metadata(tmp_path: Path) -> None:
+    vendor_dir = tmp_path / "vendor"
+    stamp_path = vendor_dir / ".hc-ixsimpl-stamp.json"
+    env = os.environ.copy()
+    env["HC_IXSIMPL_VENDOR_DIR"] = str(vendor_dir)
+
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / ".hc-ixsimpl-root").write_text("managed\n", encoding="utf-8")
+    stamp_path.mkdir()
+
+    result = _run_python(
+        env,
+        """
+        import hc.symbols as hs
+
+        hs.Context()
+        """,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Vendored ixsimpl backend metadata is invalid" in result.stderr
 
 
 def test_default_namespace_caches_symbols() -> None:
@@ -201,12 +278,10 @@ def test_rat_rejects_zero_denominator() -> None:
 
 
 def test_preloaded_ixsimpl_from_unexpected_path_is_rejected(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["HC_IXSIMPL_VENDOR_DIR"] = str(tmp_path / "vendor")
 
     result = _run_python(
-        repo_root,
         env,
         """
         import sys
@@ -235,31 +310,3 @@ def test_module_eq_ne_build_predicates() -> None:
 
     assert hs.check(eq_pred, env={hs.sym.W: 4}) is hs.Truth.TRUE
     assert hs.check(ne_pred, env={hs.sym.W: 4}) is hs.Truth.FALSE
-
-
-@_SKIP_BUILD_TESTS
-def test_symbols_build_ixsimpl_from_submodule(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    vendor_dir = tmp_path / "vendor"
-    env = os.environ.copy()
-    env["HC_IXSIMPL_VENDOR_DIR"] = str(vendor_dir)
-
-    result = _run_python(
-        repo_root,
-        env,
-        """
-        import json
-
-        import hc.symbols as hs
-
-        expr = str(hs.sym.W + 1)
-
-        import ixsimpl
-
-        print(json.dumps({"expr": expr, "module": ixsimpl.__file__}))
-        """,
-    )
-    payload = json.loads(result.stdout)
-    module_path = Path(payload["module"]).resolve()
-    assert module_path.is_relative_to(vendor_dir.resolve())
-    assert payload["expr"] == "1 + W"

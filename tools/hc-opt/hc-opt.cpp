@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "hc/Front/IR/HCFrontDialect.h"
+
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/InitAllPasses.h"
@@ -12,8 +14,10 @@ int main(int argc, char **argv) {
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
   mlir::registerAllPasses();
+  registry.insert<mlir::hc::front::HCFrontDialect>();
 
   auto result = mlir::MlirOptMain(
-      argc, argv, "hc optimizer driver (stock MLIR only)\n", registry);
+      argc, argv, "hc optimizer driver with hc.front dialect support\n",
+      registry);
   return mlir::failed(result) ? 1 : 0;
 }

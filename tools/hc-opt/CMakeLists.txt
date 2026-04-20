@@ -7,6 +7,7 @@ llvm_update_compile_flags(hc-opt)
 target_link_libraries(
   hc-opt
   PRIVATE
+  MLIRHCFrontDialect
   MLIROptLib
   MLIRRegisterAllDialects
   MLIRRegisterAllExtensions

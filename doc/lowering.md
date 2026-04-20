@@ -124,7 +124,12 @@ desugaring to later legalization out of `hc.front`.
 ## Frontend dialect
 
 The first IR form should be MLIR, not a Python semantic IR. This document uses
-`hc.front` as the placeholder name for the frontend dialect.
+`hc.front` as the textual name of the frontend IR family.
+
+In the current native bootstrap implementation, that frontend family lives
+inside the registered MLIR dialect namespace `hc`. Textual IR therefore still
+spells frontend operations and types as `hc.front.*` and `!hc.front.*`, while
+tooling such as `--show-dialects` reports the top-level dialect name `hc`.
 
 `hc.front` should be source-faithful and intentionally low intelligence. It is
 not the semantic source of truth for the language; it is a serialized AST-like
@@ -210,8 +215,13 @@ serialization, not semantic capture analysis.
 
 ## Semantic dialect
 
-The real compiler IR should be a separate MLIR dialect. This document uses `hc`
-as the placeholder name for that dialect.
+The real compiler IR should be a separate semantic layer. This document uses
+`hc` as the placeholder name for that layer.
+
+The current bootstrap integration does not yet require a second registered MLIR
+dialect namespace for that layer. Later semantic operations may initially live
+alongside the frontend `front.*` family under the same top-level `hc`
+namespace, or move to a sibling namespace once the semantic IR stabilizes.
 
 `hc` is where the language becomes semantic rather than syntactic. It should
 own:

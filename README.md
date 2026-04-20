@@ -9,10 +9,12 @@ The project currently provides:
 
 * package metadata and local tooling configuration in `pyproject.toml`,
 * a pinned LLVM/MLIR bootstrap path plus a basic `hc-opt` native tool,
+* a first project-owned MLIR frontend IR family plus native smoke tests,
 * lightweight kernel/core scaffolding in `hc/`,
 * a symbolic expression API in `hc.symbols`,
 * a NumPy-backed reference executor in `hc.simulator`,
-* pytest coverage for the public API, symbols layer, and simulator.
+* pytest coverage for the public API, symbols layer, simulator, and native
+  frontend integration.
 
 The lowering/compiler pipeline is still TBD, but the symbols subsystem is
 already backed by a real third-party engine rather than a pure stub.
@@ -83,7 +85,9 @@ Useful escape hatches during bring-up:
   jobs that should reuse one persistent toolchain cache,
 * set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip the LLVM/MLIR bootstrap hook and the
   dependent `hc-opt` native build during package builds; the `ixsimpl` vendor
-  bootstrap still runs.
+  bootstrap still runs. This affects the package build backend only, not direct
+  toolchain bootstrap commands or pytest smoke tests that call the native
+  helpers themselves.
 
 To fully reset the managed local toolchain state, remove the cache directory
 under `.hc/toolchains/llvm/` (or the directory pointed to by
@@ -93,8 +97,13 @@ under `.hc/toolchains/llvm/` (or the directory pointed to by
 
 The repository now also carries a small CMake project that builds `hc-opt`
 against the pinned MLIR install. This initial bring-up intentionally uses only
-stock MLIR registrations: no custom dialects, conversions, or passes are added
-yet.
+stock MLIR registrations plus the first out-of-tree frontend `hc.front.*` IR
+family. No custom conversions or passes are added yet.
+
+MLIR currently registers that bootstrap family under the top-level dialect name
+`hc`, so tooling such as `hc-opt --show-dialects` reports `hc` even though the
+textual frontend operations and types are spelled `hc.front.*` and
+`!hc.front.*`.
 
 Wheel and editable package builds place the native install under the gitignored
 project-local cache at `.hc/native/install/<toolchain-key>/`. The resulting
@@ -109,6 +118,16 @@ To bootstrap the native tool explicitly from a source checkout, run:
 ```bash
 python -m build_tools.hc_native_tools
 ```
+
+That `hc-opt` build now registers the frontend `hc.front.*` operations and can
+parse textual frontend IR using placeholder types such as `!hc.front.value`.
+
+The smoke test in `tests/test_hc_front_dialect.py` exercises that real native
+tool path. It will reuse or bootstrap the pinned LLVM/MLIR toolchain and the
+native `hc-opt` build on demand. To skip those `hc.front` native smoke tests,
+set `HC_SKIP_HC_FRONT_DIALECT_TESTS=1`. Unlike `HC_SKIP_LLVM_BOOTSTRAP`, this
+only affects that pytest module; it does not change package-build bootstrap
+behavior.
 
 ## Third-party symbols backend
 

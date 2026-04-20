@@ -28,4 +28,6 @@ include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
+add_subdirectory(include)
+add_subdirectory(lib)
 add_subdirectory(tools)

@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 
 from setuptools import build_meta as _build_meta
 
+from build_tools.hc_native_tools import (
+    ensure_hc_native_tools_built,
+    export_hc_native_environment,
+)
 from build_tools.ixsimpl_toolchain import ensure_ixsimpl_built
 from build_tools.llvm_toolchain import (
     ensure_llvm_toolchain,
@@ -18,22 +23,41 @@ from build_tools.llvm_toolchain import (
 _BOOTSTRAP_LOCK = threading.Lock()
 _IXSIMPL_BOOTSTRAPPED = False
 _LLVM_BOOTSTRAPPED = False
+_HC_NATIVE_BOOTSTRAPPED = False
+_LLVM_INSTALL_ROOT: Path | None = None
+_HC_NATIVE_INSTALL_ROOT: Path | None = None
 
 
 def _ensure_build_dependencies_bootstrapped() -> None:
     global _IXSIMPL_BOOTSTRAPPED
     global _LLVM_BOOTSTRAPPED
+    global _HC_NATIVE_BOOTSTRAPPED
+    global _LLVM_INSTALL_ROOT
+    global _HC_NATIVE_INSTALL_ROOT
     need_llvm = os.environ.get("HC_SKIP_LLVM_BOOTSTRAP") != "1"
-    if _IXSIMPL_BOOTSTRAPPED and (_LLVM_BOOTSTRAPPED or not need_llvm):
+    if _IXSIMPL_BOOTSTRAPPED and not need_llvm:
         return
     with _BOOTSTRAP_LOCK:
         if not _IXSIMPL_BOOTSTRAPPED:
             ensure_ixsimpl_built()
             _IXSIMPL_BOOTSTRAPPED = True
         if need_llvm and not _LLVM_BOOTSTRAPPED:
-            install_root = ensure_llvm_toolchain()
-            export_toolchain_environment(install_root, os.environ)
+            _LLVM_INSTALL_ROOT = ensure_llvm_toolchain()
             _LLVM_BOOTSTRAPPED = True
+        if need_llvm:
+            if _LLVM_INSTALL_ROOT is None:
+                raise RuntimeError("LLVM bootstrap completed without an install root")
+            export_toolchain_environment(_LLVM_INSTALL_ROOT, os.environ)
+            if not _HC_NATIVE_BOOTSTRAPPED:
+                _HC_NATIVE_INSTALL_ROOT = ensure_hc_native_tools_built(
+                    _LLVM_INSTALL_ROOT
+                )
+                _HC_NATIVE_BOOTSTRAPPED = True
+            if _HC_NATIVE_INSTALL_ROOT is None:
+                raise RuntimeError(
+                    "hc native bootstrap completed without an install root"
+                )
+            export_hc_native_environment(_HC_NATIVE_INSTALL_ROOT, os.environ)
 
 
 def build_wheel(

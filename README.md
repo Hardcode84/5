@@ -8,7 +8,7 @@ in `doc/langref.md`.
 The project currently provides:
 
 * package metadata and local tooling configuration in `pyproject.toml`,
-* a pinned LLVM/MLIR bootstrap path for future native compiler work,
+* a pinned LLVM/MLIR bootstrap path plus a basic `hc-opt` native tool,
 * lightweight kernel/core scaffolding in `hc/`,
 * a symbolic expression API in `hc.symbols`,
 * a NumPy-backed reference executor in `hc.simulator`,
@@ -81,12 +81,34 @@ Useful escape hatches during bring-up:
 * set `HC_LLVM_CACHE_DIR=/path/to/cache` to relocate the otherwise
   project-local cache; this is especially useful for isolated builds or CI
   jobs that should reuse one persistent toolchain cache,
-* set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip only the LLVM/MLIR bootstrap hook
-  during package builds; the `ixsimpl` vendor bootstrap still runs.
+* set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip the LLVM/MLIR bootstrap hook and the
+  dependent `hc-opt` native build during package builds; the `ixsimpl` vendor
+  bootstrap still runs.
 
 To fully reset the managed local toolchain state, remove the cache directory
 under `.hc/toolchains/llvm/` (or the directory pointed to by
 `HC_LLVM_CACHE_DIR`).
+
+## Basic MLIR Integration
+
+The repository now also carries a small CMake project that builds `hc-opt`
+against the pinned MLIR install. This initial bring-up intentionally uses only
+stock MLIR registrations: no custom dialects, conversions, or passes are added
+yet.
+
+Wheel and editable package builds place the native install under the gitignored
+project-local cache at `.hc/native/install/<toolchain-key>/`. The resulting
+driver binary lives at:
+
+```text
+.hc/native/install/<toolchain-key>/bin/hc-opt
+```
+
+To bootstrap the native tool explicitly from a source checkout, run:
+
+```bash
+python -m build_tools.hc_native_tools
+```
 
 ## Third-party symbols backend
 

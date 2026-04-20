@@ -2,14 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Restricted AST lowering helpers for the fake frontend emitter.
+"""Restricted AST lowering helpers for the `hc.front` frontend boundary.
 
-This module keeps the visitor/emitter boundary close to the planned `hc.front`
-shape while the real frontend dialect is still missing. The recording emitter
-is an ephemeral test harness, not a durable Python IR, so unsupported syntax is
-rejected explicitly instead of being interpreted in Python. Collective-region
-capture lists are the only derived scope summary computed here, and they stay
-limited to naming outer bindings referenced by nested collective regions.
+This module owns source recovery, AST validation, and the shared visitor/emitter
+protocol for frontend lowering. `RecordingEmitter` remains an ephemeral test
+harness for visitor unit tests, while `lower_*_to_front_ir()` lowers the same
+restricted subset into real `hc.front` MLIR through the managed Python
+bindings. Unsupported syntax is rejected explicitly instead of being interpreted
+in Python. Collective-region capture lists are the only derived scope summary
+computed here, and they stay limited to naming outer bindings referenced by
+nested collective regions.
 """
 
 from __future__ import annotations
@@ -28,8 +30,11 @@ __all__ = [
     "RecordedEvent",
     "RecordingEmitter",
     "lower_function",
+    "lower_function_to_front_ir",
     "lower_module",
+    "lower_module_to_front_ir",
     "lower_source",
+    "lower_source_to_front_ir",
 ]
 
 _TOPLEVEL_KINDS = {
@@ -61,6 +66,20 @@ class FrontendError(SyntaxError):
             super().__init__(message)
             return
         super().__init__(message, (filename, lineno, offset, text))
+
+
+class _FrontendEmitError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        line: int | None = None,
+        column: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.line = line
+        self.column = column
 
 
 @dataclass(frozen=True)
@@ -183,12 +202,71 @@ def lower_module(
     _lower_parsed_module(module, emitter, _opaque_source_buffer(filename))
 
 
+def lower_function_to_front_ir(
+    fn: Any,
+    *,
+    context: Any | None = None,
+) -> Any:
+    """Lower a Python function directly into an `hc.front` MLIR module.
+
+    Invalid frontend input raises `FrontendError`. Internal emitter invariant
+    failures still surface as `RuntimeError`.
+    """
+
+    emitter = _new_hc_front_emitter(context=context)
+    lower_function(fn, emitter)
+    return emitter.module
+
+
+def lower_source_to_front_ir(
+    source: str,
+    *,
+    filename: str = "<memory>",
+    context: Any | None = None,
+) -> Any:
+    """Lower source text directly into an `hc.front` MLIR module.
+
+    Invalid frontend input raises `FrontendError`. Internal emitter invariant
+    failures still surface as `RuntimeError`.
+    """
+
+    emitter = _new_hc_front_emitter(context=context)
+    lower_source(source, emitter, filename=filename)
+    return emitter.module
+
+
+def lower_module_to_front_ir(
+    module: ast.Module,
+    *,
+    filename: str = "<memory>",
+    context: Any | None = None,
+) -> Any:
+    """Lower a pre-parsed AST module directly into an `hc.front` MLIR module.
+
+    Invalid frontend input raises `FrontendError`. Internal emitter invariant
+    failures still surface as `RuntimeError`.
+    """
+
+    emitter = _new_hc_front_emitter(context=context)
+    lower_module(module, emitter, filename=filename)
+    return emitter.module
+
+
+def _new_hc_front_emitter(*, context: Any | None = None) -> Any:
+    from ._frontend_mlir import HCFrontEmitter
+
+    return HCFrontEmitter(context=context)
+
+
 def _lower_parsed_module(
     module: ast.Module,
     emitter: FrontendEmitter,
     source: _SourceBuffer,
 ) -> None:
-    _FrontendLowerer(emitter=emitter, source=source).lower_module(module)
+    try:
+        _FrontendLowerer(emitter=emitter, source=source).lower_module(module)
+    except _FrontendEmitError as exc:
+        raise _frontend_emit_error(source, exc) from exc
 
 
 class _FrontendLowerer:
@@ -691,6 +769,19 @@ def _frontend_parse_error(
         text=source.display_line(lineno),
         end_lineno=source.file_lineno(exc.end_lineno),
         end_offset=source.file_offset(exc.end_lineno, exc.end_offset),
+    )
+
+
+def _frontend_emit_error(
+    source: _SourceBuffer,
+    exc: _FrontendEmitError,
+) -> FrontendError:
+    return FrontendError(
+        exc.message,
+        filename=source.filename,
+        lineno=exc.line,
+        offset=_syntax_offset(exc.column),
+        text=source.display_line(exc.line),
     )
 
 

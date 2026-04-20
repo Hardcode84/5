@@ -1,6 +1,12 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = [
+    "cmake>=3.31",
+    "ninja>=1.11",
+    "setuptools>=75",
+    "wheel",
+]
+build-backend = "build_backend"
+backend-path = ["."]
 
 [project]
 name = "hc"
@@ -9,7 +15,19 @@ description = "Experimental high-level GPU kernel DSL."
 requires-python = ">=3.12"
 
 [project.optional-dependencies]
-dev = ["black", "greenlet", "lizard", "mypy", "numpy", "pre-commit", "pytest", "reuse", "ruff"]
+dev = [
+    "black",
+    "cmake>=3.31",
+    "greenlet",
+    "lizard",
+    "mypy",
+    "ninja>=1.11",
+    "numpy",
+    "pre-commit",
+    "pytest",
+    "reuse",
+    "ruff",
+]
 simulator = ["greenlet", "numpy"]
 test = ["greenlet", "numpy", "pytest"]
 

@@ -8,6 +8,7 @@ in `doc/langref.md`.
 The project currently provides:
 
 * package metadata and local tooling configuration in `pyproject.toml`,
+* a pinned LLVM/MLIR bootstrap path for future native compiler work,
 * lightweight kernel/core scaffolding in `hc/`,
 * a symbolic expression API in `hc.symbols`,
 * a NumPy-backed reference executor in `hc.simulator`,
@@ -31,6 +32,61 @@ The test extra includes the simulator dependencies as well:
 ```bash
 pip install -e ".[test]"
 ```
+
+## Pinned LLVM/MLIR bootstrap
+
+The repository now carries a pinned LLVM/MLIR lock file in
+`third_party/llvm.lock.json`. Editable and wheel builds bootstrap that exact
+revision into the gitignored project-local cache under `.hc/toolchains/llvm/`
+before handing control to the normal Python package build.
+
+Bootstrap assumes:
+
+* `git` is available on `PATH`,
+* the host has a working native toolchain suitable for building LLVM/MLIR,
+* the first build may take a while and consume substantial disk space.
+
+On a fresh checkout, the first:
+
+```bash
+pip install -e ".[dev]"
+```
+
+will:
+
+1. clone the pinned `llvm-project` revision into
+   `.hc/toolchains/llvm/src/llvm-project-<sha-prefix>/`,
+2. configure and build it in
+   `.hc/toolchains/llvm/build/<toolchain-key>/`,
+3. stage the install in `.hc/toolchains/llvm/staging/<toolchain-key>/`,
+4. promote the staged install into
+   `.hc/toolchains/llvm/install/<toolchain-key>/`.
+
+Subsequent installs reuse the cached install as long as the lock file and
+Python minor version still match the recorded stamp.
+
+If a full rebuild is required, the keyed `build/` and `staging/` directories
+for that toolchain are recreated from scratch so stale CMake state cannot leak
+into the next attempt.
+
+To bootstrap the toolchain explicitly, run:
+
+```bash
+python -m build_tools.llvm_toolchain
+```
+
+Useful escape hatches during bring-up:
+
+* set `HC_LLVM_FORCE_REBUILD=1` to force a rebuild of the pinned toolchain,
+* set `HC_LLVM_CACHE_DIR=/path/to/cache` to relocate the otherwise
+  project-local cache; this is especially useful for isolated builds or CI
+  jobs that should reuse one persistent toolchain cache,
+* set `HC_SKIP_LLVM_BOOTSTRAP=1` to skip the bootstrap hook during package
+  builds.
+
+To fully reset the managed local toolchain state, remove the cache directory
+under `.hc/toolchains/llvm/` (or the directory pointed to by
+`HC_LLVM_CACHE_DIR`).
 
 ## Third-party symbols backend
 

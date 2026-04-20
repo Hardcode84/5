@@ -97,7 +97,8 @@ def test_hc_front_python_bindings_parse_ir_and_expose_front_types() -> None:
         """)
 
     payload = json.loads(result.stdout)
-    assert '"hc.front.kernel"' in payload["module"]
+    assert "hc.front.kernel" in payload["module"]
+    assert "hc.front.return" in payload["module"]
     assert "!hc.front.value" in payload["module"]
     assert payload["value_type"] == "!hc.front.value"
     assert payload["typeexpr_type"] == "!hc.front.typeexpr"

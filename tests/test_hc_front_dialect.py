@@ -96,7 +96,7 @@ def _run_hc_opt(
 def test_hc_opt_parses_and_prints_registered_hc_front_textual_ir() -> None:
     result = _run_hc_opt([], input_text=_HC_FRONT_MODULE_SOURCE)
 
-    assert '"hc.front.kernel"' in result.stdout
+    assert "hc.front.kernel" in result.stdout
     assert "!hc.front.value" in result.stdout
-    assert '"hc.front.if"' in result.stdout
-    assert '"hc.front.for"' in result.stdout
+    assert "hc.front.if" in result.stdout
+    assert "hc.front.for" in result.stdout

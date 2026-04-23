@@ -12,7 +12,7 @@
 // walks the body once and emits the parallel `hc` callable alongside, then
 // erases the source op.
 //
-// Scope for this bead (5-1fh):
+// What this pass handles today:
 //  * the structural rewrites for every `hc_front` op the WMMA kernel touches
 //    in v0 (kernel/func/intrinsic, workitem/subgroup regions, for-range over
 //    a `range(...)` iter, constant, binop, name dispatched on `ref`,
@@ -22,9 +22,9 @@
 //    `x.astype(...)`);
 //  * every produced value gets `!hc.undef` — type inference pins later.
 //
-// Explicitly out of scope (separate beads):
-//  * loop-carried iter_arg analysis and nested workitem-def folding (5-3jb).
-//  * intrinsic body discarding (5-uv5).
+// Explicitly deferred to later passes:
+//  * loop-carried iter_arg analysis and nested workitem-def folding.
+//  * intrinsic body discarding.
 //  * full inlining of `ref.kind = "inline"` helpers; for now we leave the
 //    `hc_front.call` pinned with a diagnostic if it survives lowering.
 
@@ -102,37 +102,51 @@ struct Scope {
 // lookups so every call site goes through the same code path.
 //===----------------------------------------------------------------------===//
 
-struct RefInfo {
-  DictionaryAttr dict;
-  StringRef kind;
-
-  static RefInfo of(Operation *op) {
+class RefInfo {
+public:
+  // Build from a defining op. Absent `ref` dict and dict-without-kind are
+  // both modeled as "no classification" (empty kind); callers compare
+  // `getKind()` against the expected string.
+  static RefInfo get(Operation *op) {
     RefInfo info;
     if (!op)
       return info;
-    info.dict = op->getAttrOfType<DictionaryAttr>("ref");
-    if (info.dict) {
-      if (auto k = info.dict.getAs<StringAttr>("kind"))
-        info.kind = k.getValue();
+    info.dict_ = op->getAttrOfType<DictionaryAttr>("ref");
+    if (info.dict_) {
+      if (auto k = info.dict_.getAs<StringAttr>("kind"))
+        info.kind_ = k.getValue();
     }
     return info;
   }
 
-  explicit operator bool() const { return static_cast<bool>(dict); }
+  // True iff a `ref` dict was present on the op.
+  explicit operator bool() const { return static_cast<bool>(dict_); }
 
-  StringRef string(StringRef key) const {
-    if (!dict)
+  // The `kind` payload. Empty when no `ref` or no `kind` string — callers
+  // that need to distinguish "missing ref" from "present but malformed"
+  // should check `bool(info) && getKind().empty()`.
+  StringRef getKind() const { return kind_; }
+
+  // String-valued key lookup. Returns empty on missing dict, missing key,
+  // or non-string value.
+  StringRef getString(StringRef key) const {
+    if (!dict_)
       return {};
-    if (auto s = dict.getAs<StringAttr>(key))
+    if (auto s = dict_.getAs<StringAttr>(key))
       return s.getValue();
     return {};
   }
 
+  // Typed attribute lookup, mirrors DictionaryAttr::getAs.
   template <typename AttrT> AttrT getAs(StringRef key) const {
-    if (!dict)
+    if (!dict_)
       return {};
-    return dict.getAs<AttrT>(key);
+    return dict_.getAs<AttrT>(key);
   }
+
+private:
+  DictionaryAttr dict_;
+  StringRef kind_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -197,12 +211,13 @@ Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
     return HCSubOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Mult")
     return HCMulOp::create(builder, loc, undef, lhs, rhs);
-  // `hc.div` is documented as "integer/float division (Python `//` for
-  // ints)", i.e. a single typed division whose semantics are pinned at
-  // type-inference time. Both Python `/` (Div) and `//` (FloorDiv) land
-  // here; for integer operands both floor, for floats both are true
-  // division. If a future bead splits truediv from floordiv, only this
-  // branch needs to change.
+  // Both Python `/` (Div) and `//` (FloorDiv) route to `hc.div`, whose
+  // ODS summary is "integer/float division (Python `//` for ints)": int
+  // operands floor, float operands do true division. That collapses
+  // Python's `/`-on-ints (true division returning float) into `//`-style
+  // floor — an intentional compromise pre-inference. If a later pass
+  // wants strict Python `/` semantics it needs a dedicated truediv op;
+  // only this branch has to change.
   if (kind == "FloorDiv" || kind == "Div")
     return HCDivOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Mod")
@@ -315,9 +330,10 @@ private:
 
   // Emit an `hc.const` for a `ref.kind = "constant"` name op. Needs the
   // python_kind / value payload because the front dialect packs it as
-  // string-for-anything-but-int.
-  Value emitConstantFromRef(Location loc, const RefInfo &ref,
-                            Operation *sourceOp);
+  // string-for-anything-but-int. `FailureOr` matches the `lowerName`
+  // idiom: parse failures diagnose-and-fail, not return null.
+  FailureOr<Value> emitConstantFromRef(Location loc, const RefInfo &ref,
+                                       Operation *sourceOp);
 
   // Consume a `hc_front.call` dispatched to a `dsl_method` callee. The
   // FailureOr<Value> return mirrors `lowerCall`: failure = error emitted,
@@ -367,15 +383,23 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // All three callable kinds share the same skeleton: build a fresh
   // entry block, bind params into a new Scope, hand (entry, fnType) to
   // the per-kind `build` lambda which creates the hc op and attaches
-  // the block, then drive `lowerRegion` against the returned hc_front
-  // body region.
+  // the block, then drive `lowerRegion` against the *hc_front* body
+  // region the lambda returns. (We lower from the front region — its
+  // ops are the source — while the entry block lives inside the new
+  // hc op; lowering is driven by the insertion point set below.)
   //
-  // Ownership rule for `entry`: if the lambda returns success, it MUST
-  // have attached the block to the hc op's body (the hc op then owns
-  // it); on failure, it MUST either not have attached the block (we
-  // delete here) or have erased the hc op (which takes the block with
-  // it). The lambdas below follow the "attach first, fail with erase"
-  // discipline to keep this obvious.
+  // Ownership rules for `entry`:
+  //   * If `materializeParameters` fails we still own `entry`; delete it.
+  //   * If `build` succeeds, the lambda MUST have attached `entry` to
+  //     the new hc op's body region; the hc op then owns the block.
+  //   * If `build` fails, the lambda MUST leave no partial IR behind —
+  //     either it never attached the block and the generic cleanup on
+  //     this path is a no-op leak of `entry`, OR (the preferred form
+  //     all three lambdas use) it attached-then-erased the hc op,
+  //     which takes the block with it.
+  // In practice every `build` below follows the same "attach first,
+  // fail-with-erase" pattern, so the only block we ever delete here is
+  // the one rejected by `materializeParameters`.
   auto runBody =
       [&](bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
@@ -511,10 +535,10 @@ Lowerer::materializeParameters(ArrayAttr params, Block &entry, Scope &scope,
     auto name = dict.getAs<StringAttr>("name");
     if (!name)
       return sourceOp->emitOpError("`parameters` entry missing `name` key");
-    // V0: every parameter is `!hc.undef`. The bead allows pinning typed
-    // annotations, but we defer that to keep this bead's scope lean — a
-    // later inference pass (or a follow-up bead) can walk the annotation
-    // records and refine.
+    // Every parameter enters as `!hc.undef`. The driver also stamps typed
+    // annotation records on each param dict, but pinning them here is a
+    // separate concern — a later inference pass walks those records and
+    // refines once the semantic shape is known.
     inputs.push_back(undef);
     BlockArgument arg = entry.addArgument(undef, sourceOp->getLoc());
     scope.bind(name.getValue(), arg);
@@ -632,6 +656,17 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
   return op->emitOpError("unsupported hc_front op");
 }
 
+// Discipline note for callers: `valueMap` stores `Value()` for ops that
+// *legitimately* have no SSA counterpart on their own — `hc_front.tuple`,
+// `hc_front.keyword`, attribute chains consumed by their parent, and
+// callee-like names (intrinsic / builtin / numpy_*). Every new consumer
+// of `lowerValueOperand` MUST either:
+//   (a) treat null as a valid "consumed by parent" sentinel (call/subscript
+//       sites that unpack via `tupleElts` / `keywordInfo`), OR
+//   (b) null-check and diagnose before use (binops, subscripts, stores,
+//       assigns — see `lowerBinop`, `lowerAssign`).
+// Binding a null into a scope or feeding it to an hc op builder is always
+// a bug: it produces malformed IR that may pass verify silently.
 Value Lowerer::lowerValueOperand(Value v) {
   auto it = valueMap.find(v);
   assert(it != valueMap.end() && "operand was not yet lowered; walk order bug");
@@ -662,9 +697,18 @@ SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
 //===----------------------------------------------------------------------===//
 
 FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
-  RefInfo ref = RefInfo::of(op);
-  StringRef kind = ref.kind;
+  RefInfo ref = RefInfo::get(op);
+  StringRef kind = ref.getKind();
   StringRef ident = op.getName();
+  // A present-but-malformed `ref` (dict without a string `kind`) is a
+  // driver bug, not a pass fallback — silently landing in the sentinel
+  // "no SSA result" path would mask the real problem downstream.
+  if (ref && kind.empty()) {
+    return op.emitOpError("hc_front.name '")
+           << ident
+           << "' has a ref dict with missing or non-string `kind`; the driver "
+              "must populate a classification before this pass runs";
+  }
   if (kind == "param" || kind == "local" || kind == "iv") {
     Value v = currentScope().lookup(ident);
     if (!v) {
@@ -675,12 +719,8 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
     }
     return v;
   }
-  if (kind == "constant") {
-    Value v = emitConstantFromRef(op.getLoc(), ref, op);
-    if (!v)
-      return failure();
-    return v;
-  }
+  if (kind == "constant")
+    return emitConstantFromRef(op.getLoc(), ref, op);
   if (kind == "symbol") {
     // `#hc.expr<"Ident">` is the pinned form for a bare symbol; the
     // resulting `!hc.idx<"Ident">` type uniquely identifies the symbol.
@@ -710,18 +750,17 @@ Value Lowerer::lowerAttr(hc_front::AttrOp op) {
   return Value();
 }
 
-Value Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
-                                   Operation *sourceOp) {
+FailureOr<Value> Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
+                                              Operation *sourceOp) {
   MLIRContext *ctx = sourceOp->getContext();
-  StringRef pyKind = ref.string("python_kind");
-  StringRef raw = ref.string("value");
+  StringRef pyKind = ref.getString("python_kind");
+  StringRef raw = ref.getString("value");
   Attribute payload;
   if (pyKind == "int") {
     int64_t v = 0;
     if (raw.getAsInteger(10, v)) {
-      sourceOp->emitOpError("constant value '")
-          << raw << "' not parseable as int";
-      return nullptr;
+      return sourceOp->emitOpError("constant value '")
+             << raw << "' not parseable as int";
     }
     payload = IntegerAttr::get(IntegerType::get(ctx, 64), v);
   } else if (pyKind == "float") {
@@ -729,9 +768,8 @@ Value Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
     auto status = f.convertFromString(raw, APFloat::rmNearestTiesToEven);
     if (!status) {
       llvm::consumeError(status.takeError());
-      sourceOp->emitOpError("constant value '")
-          << raw << "' not parseable as float";
-      return nullptr;
+      return sourceOp->emitOpError("constant value '")
+             << raw << "' not parseable as float";
     }
     payload = FloatAttr::get(Float64Type::get(ctx), f);
   } else if (pyKind == "bool") {
@@ -744,11 +782,10 @@ Value Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
       s = s.drop_front().drop_back();
     payload = StringAttr::get(ctx, s);
   } else {
-    sourceOp->emitOpError("unsupported constant python_kind '")
-        << pyKind << "'";
-    return nullptr;
+    return sourceOp->emitOpError("unsupported constant python_kind '")
+           << pyKind << "'";
   }
-  return HCConstOp::create(builder, loc, undef, payload);
+  return HCConstOp::create(builder, loc, undef, payload).getResult();
 }
 
 //===----------------------------------------------------------------------===//
@@ -763,7 +800,8 @@ Value Lowerer::lowerBinop(hc_front::BinOp op) {
   Value lhs = lowerValueOperand(op.getLhs());
   Value rhs = lowerValueOperand(op.getRhs());
   if (!lhs || !rhs) {
-    op.emitOpError("binop has unresolved operand");
+    op.emitOpError("binop operand did not lower to an hc value (")
+        << (!lhs ? "lhs" : "rhs") << "); operand may be a tuple or callee ref";
     return nullptr;
   }
   return emitBinop(builder, op.getLoc(), op.getKind(), lhs, rhs, undef, op);
@@ -786,8 +824,11 @@ Value Lowerer::lowerSlice(hc_front::SliceOp op) {
   SmallVector<Value> parts = lowerValueOperands(op.getParts());
   size_t expected = unsigned(hasLower) + unsigned(hasUpper) + unsigned(hasStep);
   if (parts.size() != expected) {
-    op.emitOpError("slice has_* flags (")
-        << expected << ") disagree with part count (" << parts.size() << ")";
+    op.emitOpError("slice operand count ")
+        << parts.size()
+        << " does not match has_lower/has_upper/has_step flags "
+           "(expected "
+        << expected << ")";
     return nullptr;
   }
 
@@ -799,7 +840,6 @@ Value Lowerer::lowerSlice(hc_front::SliceOp op) {
     hi = parts[idx++];
   if (hasStep)
     st = parts[idx++];
-  (void)idx;
 
   return HCSliceExprOp::create(builder, op.getLoc(), undef, lo, hi, st);
 }
@@ -819,7 +859,25 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   Operation *target = op.getTarget().getDefiningOp();
 
   if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
+    // `x = (a,)` / `x = f()` — both single-target. If the RHS is an
+    // `hc_front.tuple` we can't bind a Python-tuple opaque; require the
+    // driver to unpack (or an arity-1 tuple, which we fold). Anything
+    // else that lowers to null is a misclassified ref and must diagnose.
+    if (auto tupleIt = tupleElts.find(rhs); tupleIt != tupleElts.end()) {
+      const SmallVector<Value> &elts = tupleIt->second;
+      if (elts.size() == 1 && elts.front()) {
+        currentScope().bind(tn.getName(), elts.front());
+        return success();
+      }
+      return op.emitOpError("cannot bind '")
+             << tn.getName() << "' to a tuple rhs of arity " << elts.size()
+             << "; expected unpacking or a scalar value";
+    }
     Value value = lowerValueOperand(rhs);
+    if (!value)
+      return op.emitOpError("rhs for '") << tn.getName()
+                                         << "' did not lower to an hc value; "
+                                            "ref classification may be off";
     currentScope().bind(tn.getName(), value);
     return success();
   }
@@ -843,9 +901,11 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
       if (rhsOp && rhsOp->getNumResults() == arity) {
         sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
       } else {
-        return op.emitOpError(
-            "tuple-unpack rhs must be an hc_front.tuple or an arity-matching "
-            "multi-result op");
+        return op.emitOpError("tuple-unpack rhs must be a tuple literal or a "
+                              "call producing the "
+                              "same number of results as the target (got ")
+               << (rhsOp ? rhsOp->getNumResults() : 0) << " vs target arity "
+               << arity << ")";
       }
     }
     if (sources.size() != arity)
@@ -892,6 +952,8 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   Region &iter = op.getIter();
   if (iter.empty() || iter.front().empty())
     return op.emitOpError("for-iter region is empty");
+  if (!iter.hasOneBlock())
+    return op.emitOpError("for-iter must be single-block");
 
   hc_front::CallOp iterCall;
   Operation *lastOp = nullptr;
@@ -906,9 +968,9 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 
   auto calleeName = dyn_cast_if_present<hc_front::NameOp>(
       iterCall.getCallee().getDefiningOp());
-  RefInfo calleeRef = RefInfo::of(calleeName);
-  if (!calleeName || calleeRef.kind != "builtin" ||
-      calleeRef.string("builtin") != "range") {
+  RefInfo calleeRef = RefInfo::get(calleeName);
+  if (!calleeName || calleeRef.getKind() != "builtin" ||
+      calleeRef.getString("builtin") != "range") {
     return op.emitOpError("for-iter must be `range(...)`");
   }
 
@@ -943,6 +1005,8 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   Region &tgt = op.getTarget();
   if (tgt.empty() || tgt.front().empty())
     return op.emitOpError("for-target region is empty");
+  if (!tgt.hasOneBlock())
+    return op.emitOpError("for-target must be single-block");
   auto ivTarget = dyn_cast<hc_front::TargetNameOp>(&tgt.front().front());
   if (!ivTarget)
     return op.emitOpError("for-target must be a single target_name");
@@ -1104,8 +1168,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     op.emitOpError("call with non-name, non-attr callee not supported");
     return failure();
   }
-  RefInfo ref = RefInfo::of(nameOp);
-  StringRef kind = ref.kind;
+  RefInfo ref = RefInfo::get(nameOp);
+  StringRef kind = ref.getKind();
 
   FailureOr<CallArgs> argsOr = collectCallArgs(op);
   if (failed(argsOr))
@@ -1113,7 +1177,7 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
   CallArgs &args = *argsOr;
 
   if (kind == "callee" || kind == "intrinsic") {
-    StringRef callee = ref.string("callee");
+    StringRef callee = ref.getString("callee");
     if (callee.empty()) {
       op.emitOpError("`ref.callee` missing for ") << kind << " name ref";
       return failure();
@@ -1136,11 +1200,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     auto call = HCCallIntrinsicOp::create(
         builder, op.getLoc(), TypeRange{undef}, symRef, args.positional);
     if (auto constKwargs = ref.getAs<ArrayAttr>("const_kwargs")) {
-      // `const_kwargs` is the intrinsic's declared list of kwargs that must
-      // be constant-folded into attributes on the call site. Each entry we
-      // find in the call's kwargs lands as either (a) the already-folded
-      // attribute (shape fold from collectCallArgs) or (b) the payload of
-      // the `hc.const` producer.
+      // Promote declared const kwargs to call-site attributes: folded
+      // shape attr if present, else the producing `hc.const`'s payload.
       for (Attribute kw : constKwargs) {
         auto kwStr = dyn_cast<StringAttr>(kw);
         if (!kwStr)
@@ -1173,7 +1234,7 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     // Full inlining of non-decorated helpers needs a separate pass (see
     // bead note). Emit a conservative `hc.call @<qualified>` placeholder
     // and let downstream either inline it or flag the missing symbol.
-    StringRef qn = ref.string("qualified_name");
+    StringRef qn = ref.getString("qualified_name");
     if (qn.empty()) {
       op.emitOpError("inline name ref missing qualified_name");
       return failure();
@@ -1195,8 +1256,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
 
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
                                              hc_front::AttrOp attr) {
-  RefInfo ref = RefInfo::of(attr);
-  StringRef method = ref.string("method");
+  RefInfo ref = RefInfo::get(attr);
+  StringRef method = ref.getString("method");
 
   FailureOr<CallArgs> argsOr = collectCallArgs(call);
   if (failed(argsOr))
@@ -1206,9 +1267,9 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   Value base = lowerValueOperand(attr.getBase());
 
   // `x.vec()`, `x.with_inactive(value=...)`, `x.astype(target)` are the
-  // mechanical cases this bead handles. Anything requiring group/context
-  // plumbing (`wi.local_id()`, `group.load(...)`) is deferred — the
-  // acceptance synthetic test sticks to the mechanical subset.
+  // mechanical unary-base cases. Anything requiring group/context plumbing
+  // (`wi.local_id()`, `group.load(...)`) is handled downstream via the
+  // launch-geo fast path.
   // All unary-base DSL methods share the "base did not lower" guard; a
   // classification gap must not let us ship an hc op built on a null
   // operand — the later verifier error would be harder to attribute.
@@ -1379,8 +1440,8 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   // generic `hc.buffer_view` branch below.
   if (auto attr =
           dyn_cast_if_present<hc_front::AttrOp>(op.getBase().getDefiningOp())) {
-    RefInfo ref = RefInfo::of(attr);
-    StringRef method = ref.string("method");
+    RefInfo ref = RefInfo::get(attr);
+    StringRef method = ref.getString("method");
     if (!method.empty() && op.getIndices().size() == 1) {
       Value idxVal = lowerValueOperand(op.getIndices().front());
       Value baseVal = lowerValueOperand(attr.getBase());
@@ -1389,21 +1450,23 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
           constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
       if (baseVal && ax) {
         int64_t axVal = ax.getInt();
-        // Launch-geo / buffer_dim axes are small non-negative integers;
-        // anything else is either user error or a bad `ref` payload.
-        // Guard before the unsigned cast so a negative never underflows
-        // into a huge variadic-op rank below.
-        if (axVal < 0 || axVal >= kMaxLaunchAxis) {
-          op.emitOpError("axis index ")
-              << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
-          return nullptr;
-        }
-        unsigned axis = static_cast<unsigned>(axVal);
         if (method == "shape") {
+          // `hc.buffer_dim` axis is a buffer rank index, not a launch grid
+          // rank — no small-integer cap applies. Forward the driver value;
+          // bounds checking lives on the dialect verifier.
           return HCBufferDimOp::create(
               builder, op.getLoc(), undef, baseVal,
               IntegerAttr::get(IntegerType::get(op.getContext(), 64), axVal));
         }
+        // Launch-geo axes parameterize the variadic result list built by
+        // `emitMulti`; cap before the unsigned cast so a negative or huge
+        // value cannot allocate a pathological result-type vector.
+        if (axVal < 0 || axVal >= kMaxLaunchAxis) {
+          op.emitOpError("launch-geo axis ")
+              << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
+          return nullptr;
+        }
+        unsigned axis = static_cast<unsigned>(axVal);
         if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
           return v;
       }

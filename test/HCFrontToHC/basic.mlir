@@ -130,4 +130,32 @@ module {
     %one = hc_front.constant<1 : i64>
     hc_front.return %one
   }
+
+  // Boundary coverage:
+  //   * launch-geo at axis=31 (one below the pass-internal cap) must lower
+  //     cleanly — regression guard on the launch-geo bounds check.
+  //   * `a.shape[200]` must pass through as `hc.buffer_dim` with no axis
+  //     cap — buffer rank is not launch-geo and has its own verifier.
+  // CHECK-LABEL: hc.kernel @axis_bounds
+  // CHECK: hc.local_id
+  // CHECK: hc.buffer_dim %arg1, axis = 200 : !hc.undef
+  hc_front.kernel "axis_bounds" attributes {
+    parameters = [{name = "group"}, {name = "a"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %ax31 = hc_front.constant<31 : i64>
+    %lid_attr = hc_front.attr %grp, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
+    %lid = hc_front.subscript %lid_attr[%ax31]
+    %t_lid = hc_front.target_name "t_lid"
+    hc_front.assign %t_lid = %lid
+
+    %ax200 = hc_front.constant<200 : i64>
+    %sh = hc_front.attr %a, "shape" {ref = {kind = "dsl_method", method = "shape"}}
+    %dim = hc_front.subscript %sh[%ax200]
+    %t_dim = hc_front.target_name "t_dim"
+    hc_front.assign %t_dim = %dim
+
+    hc_front.return
+  }
 }

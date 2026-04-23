@@ -57,7 +57,8 @@ hc.func @helper {
 // CHECK: hc.store %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}}
 // CHECK: hc.vec %{{.*}} : !hc.undef -> !hc.undef
 // CHECK: hc.with_inactive %{{.*}} {inactive = 0.000000e+00 : f32} : !hc.undef -> !hc.undef
-// CHECK: hc.as_layout %{{.*}} {layout = "row_major"} : !hc.undef -> !hc.undef
+// CHECK: hc.as_layout %{{.*}}, layout = row_major : !hc.undef -> !hc.undef
+// CHECK: hc.as_layout %{{.*}}, layout = col_major : !hc.undef -> !hc.undef
 func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
                          %v: !hc.undef) {
   %t = hc.load %buf[%i, %j] {shape = #hc.shape<["M", "K"]>}
@@ -69,8 +70,8 @@ func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
   %vec2 = hc.vec %t : !hc.undef -> !hc.undef
   %masked = hc.with_inactive %v {inactive = 0.0 : f32}
       : !hc.undef -> !hc.undef
-  %reshaped = hc.as_layout %v {layout = "row_major"}
-      : !hc.undef -> !hc.undef
+  %reshaped = hc.as_layout %v, layout = row_major : !hc.undef -> !hc.undef
+  %transposed = hc.as_layout %v, layout = col_major : !hc.undef -> !hc.undef
   return
 }
 
@@ -98,14 +99,16 @@ func.func @allocators(%s: !hc.undef) {
 
 // CHECK-LABEL: func.func @reductions_and_matmul
 // CHECK: hc.matmul %{{.*}}, %{{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
-// CHECK: hc.reduce %{{.*}}, kind = "sum", axis = 0 : !hc.undef -> !hc.undef
-// CHECK: hc.reduce %{{.*}}, kind = "max", axis = 1, keepdims = true : !hc.undef -> !hc.undef
+// CHECK: hc.reduce %{{.*}}, kind = sum, axis = 0 : !hc.undef -> !hc.undef
+// CHECK: hc.reduce %{{.*}}, kind = max, axis = 1, keepdims = true : !hc.undef -> !hc.undef
+// CHECK: hc.reduce %{{.*}}, kind = min, axis = 0 : !hc.undef -> !hc.undef
 // CHECK: hc.astype %{{.*}}, target = f32 : !hc.undef -> !hc.undef
 func.func @reductions_and_matmul(%a: !hc.undef, %b: !hc.undef) {
   %m = hc.matmul %a, %b : (!hc.undef, !hc.undef) -> !hc.undef
-  %s = hc.reduce %a, kind = "sum", axis = 0 : !hc.undef -> !hc.undef
-  %mx = hc.reduce %a, kind = "max", axis = 1, keepdims = true
+  %s = hc.reduce %a, kind = sum, axis = 0 : !hc.undef -> !hc.undef
+  %mx = hc.reduce %a, kind = max, axis = 1, keepdims = true
       : !hc.undef -> !hc.undef
+  %mn = hc.reduce %a, kind = min, axis = 0 : !hc.undef -> !hc.undef
   %cast = hc.astype %a, target = f32 : !hc.undef -> !hc.undef
   return
 }
@@ -118,5 +121,43 @@ func.func @calls(%x: !hc.undef, %y: !hc.undef) {
   %a = hc.call @helper(%x, %y) : (!hc.undef, !hc.undef) -> !hc.undef
   %b = hc.call_intrinsic @wmma(%x, %y) {wave_size = 32 : i64}
       : (!hc.undef, !hc.undef) -> !hc.undef
+  return
+}
+
+// Declared signatures on `hc.func` / `hc.intrinsic` make the signature
+// visible to `verifySymbolUses`; call sites get arity/type parity checked.
+// `!hc.undef` on either side escapes the parity check (progressive typing).
+
+// CHECK: hc.func @typed_helper : (i32, i32) -> i32
+hc.func @typed_helper : (i32, i32) -> i32 {
+  hc.return
+}
+
+// CHECK: hc.intrinsic @typed_intrinsic : (f32) -> f32 scope = <"WorkItem">
+hc.intrinsic @typed_intrinsic : (f32) -> f32 scope = #hc.scope<"WorkItem"> {}
+
+// CHECK-LABEL: func.func @typed_calls
+// CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (i32, i32) -> i32
+// CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (!hc.undef, i32) -> !hc.undef
+// CHECK: hc.call_intrinsic @typed_intrinsic(%{{.*}}) : (f32) -> f32
+func.func @typed_calls(%a: i32, %b: i32, %c: f32, %u: !hc.undef) {
+  %r1 = hc.call @typed_helper(%a, %b) : (i32, i32) -> i32
+  %r2 = hc.call @typed_helper(%u, %b) : (!hc.undef, i32) -> !hc.undef
+  %r3 = hc.call_intrinsic @typed_intrinsic(%c) : (f32) -> f32
+  return
+}
+
+// `const_kwargs` on the declaration are a whitelist of names every call site
+// must carry as specialization attributes. Extra attributes stay allowed.
+
+// CHECK: hc.intrinsic @wave_like scope = <"SubGroup"> const_kwargs = ["wave_size"]
+hc.intrinsic @wave_like scope = #hc.scope<"SubGroup">
+    const_kwargs = ["wave_size"] {}
+
+// CHECK-LABEL: func.func @kwarg_calls
+// CHECK: hc.call_intrinsic @wave_like(%{{.*}}) {wave_size = 32 : i64}
+func.func @kwarg_calls(%x: !hc.undef) {
+  %r = hc.call_intrinsic @wave_like(%x) {wave_size = 32 : i64}
+      : (!hc.undef) -> !hc.undef
   return
 }

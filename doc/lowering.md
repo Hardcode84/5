@@ -288,7 +288,22 @@ Semantic dialect types:
   generic arithmetic ops and coexist with `hc` types without forced casting
 
 Generic ops use an `HC_ValueType` constraint defined as an `AnyOf<[…]>` over
-every type listed above — simpler than a type interface and enough for v0.
+every type listed above. Ops with clear semantic categories tighten further:
+
+* `HC_NumericValueType` — arithmetic operands (`hc.add`, `hc.sub`, `hc.mul`,
+  `hc.div`, `hc.mod`, `hc.neg`) and `hc.cmp.*` inputs; excludes `!hc.pred`,
+  `!hc.slice`, `!hc.buffer`
+* `HC_ShapedValueType` — ops that only make sense on tensors/vectors
+  (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`,
+  `hc.store`'s `$source`)
+* `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.buffer_view`,
+  `hc.load`; excludes everything non-buffer
+* `HC_BufferOrTensorValueType` — destinations/sources that accept either
+  (`hc.vload.$source`, `hc.store.$dest`)
+
+Every narrow constraint still admits `!hc.undef` so the `hc_front -> hc`
+pass stays mechanical. Further narrowings (booleans for `hc.and/or/not`)
+wait on structural support for "integer width = 1" / "tensor-of-i1".
 
 Symbolic surface attributes:
 
@@ -304,8 +319,9 @@ Symbolic surface attributes:
   class; verified similarly
 * `#hc.layout<...>` — reserved for `index_map(...)` descriptors; unused in v0
 
-`#hc.symbol<"name">` is not yet introduced; until it is, `hc.symbol` uses
-its result type `!hc.idx<"name">` to carry the bound name (see below).
+The bound name on `hc.symbol` lives in the result type (`!hc.idx<"name">`);
+type uniquing gives symbol equality for free, so a dedicated
+`#hc.symbol<"name">` attribute is not needed.
 
 ### `hc` operation set
 
@@ -324,14 +340,19 @@ refine; folders dispatch on the concrete-type combinations they recognize.
   plus symbolic launch geometry, parameter annotations, and literal-symbol
   set attributes. `Symbol` trait so references go through the symbol table.
 * `hc.func @name` — helper callable referenced by `hc.call`. Also a
-  `Symbol`; full argument/result signatures on the op itself are a follow-up
-  (signatures currently live on call sites).
+  `Symbol`. An optional inline `function_type` signature makes the op
+  self-describing; when present, `hc.call` sites get arity and type
+  parity checked at verify time (`!hc.undef` on either side is a
+  progressive-typing wildcard).
 * `hc.intrinsic @name` — intrinsic declaration carrying `scope = #hc.scope<...>`
   and an optional `effects = #hc.effects<...>`; its body region holds the
   fallback implementation (may be empty, in which case lowering patterns
-  handle the op directly). Also a `Symbol`. A required-const kwarg
-  descriptor is a follow-up; for now `hc.call_intrinsic` carries the
-  specialization kwargs itself as attributes.
+  handle the op directly). Also a `Symbol`, with the same optional
+  `function_type` signature story as `hc.func`. An optional
+  `const_kwargs = ["wave_size", "arch", ...]` list declares specialization
+  attributes every `hc.call_intrinsic` must carry; missing entries fail at
+  verify time. Extra attributes on the call site stay allowed so targets
+  can attach their own decorations without modifying the declaration.
 * `hc.subgroup_region`, `hc.workitem_region` — collective regions with
   syntactic capture lists
 
@@ -408,9 +429,10 @@ covers the symbolic domain (`!hc.idx`/`!hc.pred`), builtin scalars
 * `hc.cmp.lt`, `hc.cmp.le`, `hc.cmp.gt`, `hc.cmp.ge`, `hc.cmp.eq`, `hc.cmp.ne`
 * `hc.and`, `hc.or`, `hc.not`
 * `hc.matmul`
-* `hc.reduce %v, kind = "sum" | "max" | "min", axis = N, keepdims = bool` —
-  kind is verified against the allowed set; axis must be non-negative and,
-  once the operand type carries a concrete shape, less than the rank.
+* `hc.reduce %v, kind = sum | max | min, axis = N, keepdims = bool` —
+  kind is a typed `#hc<reduce_kind ...>` enum, so wrong spellings fail at
+  parse rather than verify. Axis must be non-negative and, once the operand
+  type carries a concrete shape, less than the rank.
 * `hc.astype %v, target = T` — explicit numeric conversion; target must be
   a builtin `int`, `index`, or `float` type and must agree with the op's
   declared result (element-wise for tensor/vector results, directly for
@@ -485,10 +507,10 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
   `inactive` payload is a typed scalar literal (int/float/bool); once
   inference pins the operand to a shaped type its numeric domain must
   match the element type.
-* `hc.as_layout %v {layout = "row_major" | "col_major"}` — change layout.
-  The `layout` payload is verified against the named whitelist for v0;
-  later schemes (`#hc.layout<...>`) will broaden the constraint without
-  changing call sites.
+* `hc.as_layout %v, layout = row_major | col_major` — change layout.
+  The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
+  spellings fail at parse. v0 admits `row_major` and `col_major`; later
+  schemes can extend the enum without changing call sites.
 * `hc.vzeros`, `hc.vones`, `hc.vfull` — vector allocators (any scope).
 * `hc.zeros`, `hc.ones`, `hc.full` — tensor allocators (`WorkGroup` scope
   only).
@@ -507,25 +529,31 @@ visibility into the enclosing region.
 
 * `hc.call @name(...)` — call into an `hc.func`. Verified as a
   `SymbolUserOp`: `verifySymbolUses` resolves `@name` against the nearest
-  symbol table and checks that the target op is actually an `hc.func`, so
-  typos and wrong-kind references fail at verify rather than at some later
-  lowering pattern.
+  symbol table, checks that the target op is actually an `hc.func`, and —
+  if the callee declares a `function_type` — checks arity and per-arg/result
+  type parity. `!hc.undef` on either side of a parity check is a wildcard,
+  so partial inference at the call site or the declaration is not a verify
+  error.
 * `hc.call_intrinsic @name(...) {const_kwarg = ...}` — call into an
-  `hc.intrinsic`, verified the same way against `hc.intrinsic`.
-  Specialization-required keyword arguments live as op attributes rather
-  than SSA operands so verify/specialize hooks see them without operand
-  bookkeeping.
+  `hc.intrinsic`, verified the same way against `hc.intrinsic` (including
+  the optional signature check). Specialization-required keyword arguments
+  live as op attributes rather than SSA operands so verify/specialize hooks
+  see them without operand bookkeeping.
 
-Both ops carry a conservative `MemRead + MemWrite` effect set. The callee
-body is opaque at verify time, so assuming anything narrower would let
-effect-aware passes (CSE, LICM, speculation) reorder opaque calls past
-loads and stores — silently broken as soon as the helper touches memory.
-A later revision will let `hc.func` / `hc.intrinsic` declare a tighter
-effect class and have the call site inherit it.
+Both ops implement `MemoryEffectOpInterface` and inherit their effect set
+from the callee's declared `effects` class — `pure | read | write |
+read_write`. Absence on the callee falls back to `MemRead + MemWrite`,
+the conservative default that keeps effect-aware passes from reordering
+opaque calls past loads and stores. Concretely:
 
-Full signature parity (argument/result type match between the call site and
-the target) is also a follow-up once `hc.func` and `hc.intrinsic` grow
-explicit argument/result signatures.
+* `effects = pure` → no effects, so CSE can merge identical calls and
+  LICM can hoist them.
+* `effects = read` / `write` → exactly one of the sides is reported.
+* `effects = read_write` (explicit or default) → both sides are
+  reported; behaves like the old hard-coded trait did.
+
+`test/HC/cse.mlir` keeps this honest: a `pure`-annotated helper collapses
+under `-cse`, an unannotated one does not.
 
 ### Example: gfx11 WMMA kernel at two pipeline stages
 

@@ -8,6 +8,7 @@
 include "hc/IR/HCDialect.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/CommonAttrConstraints.td"
+include "mlir/IR/EnumAttr.td"
 
 class HC_Attr<string name, string attrMnemonic, list<Trait> traits = []>
     : AttrDef<HC_Dialect, name, traits> {
@@ -87,16 +88,65 @@ def HC_ScopeAttr : HC_Attr<"Scope", "scope"> {
   let genVerifyDecl = 1;
 }
 
-def HC_EffectsAttr : HC_Attr<"Effects", "effects"> {
-  let summary = "Effect class advertised by an `hc.intrinsic` declaration.";
-  let description = [{
-    One of `"Pure"`, `"Read"`, `"Write"`, `"ReadWrite"`. Passes that care about
-    reordering intrinsics (e.g. `hc.wave_barrier`, a hypothetical pure dot
-    intrinsic) read this attribute instead of reasoning about op traits.
-  }];
-  let parameters = (ins StringRefParameter<"effect class">:$kind);
-  let assemblyFormat = "`<` $kind `>`";
-  let genVerifyDecl = 1;
+// `HC_EffectsAttr` used to be a stringly-typed whitelist; it is now an enum so
+// wrong spellings fail at parse time and `hc.call` / `hc.call_intrinsic`
+// can dispatch on a typed handle instead of a `StringRef` comparison.
+
+//===----------------------------------------------------------------------===//
+// Typed enum attributes for operand kinds. Using `I32EnumAttr` gates wrong
+// spellings at parse time (no `hc.reduce %v, kind = avg` making it to the
+// verifier) and gives lowerings a typed handle instead of a `StringRef`.
+//===----------------------------------------------------------------------===//
+
+def HC_ReduceKindSum : I32EnumAttrCase<"Sum", 0, "sum">;
+def HC_ReduceKindMax : I32EnumAttrCase<"Max", 1, "max">;
+def HC_ReduceKindMin : I32EnumAttrCase<"Min", 2, "min">;
+
+def HC_ReduceKind : I32EnumAttr<"ReduceKind",
+    "Reduction combinator identity (sum/max/min).",
+    [HC_ReduceKindSum, HC_ReduceKindMax, HC_ReduceKindMin]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::hc";
+}
+
+def HC_ReduceKindAttr
+    : EnumAttr<HC_Dialect, HC_ReduceKind, "reduce_kind"> {
+  let summary = "Reduction combinator identity (sum/max/min).";
+  let assemblyFormat = "$value";
+}
+
+def HC_LayoutRowMajor : I32EnumAttrCase<"RowMajor", 0, "row_major">;
+def HC_LayoutColMajor : I32EnumAttrCase<"ColMajor", 1, "col_major">;
+
+def HC_Layout : I32EnumAttr<"Layout",
+    "Named tensor/vector layout (row_major/col_major).",
+    [HC_LayoutRowMajor, HC_LayoutColMajor]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::hc";
+}
+
+def HC_LayoutAttr : EnumAttr<HC_Dialect, HC_Layout, "layout"> {
+  let summary = "Named tensor/vector layout descriptor.";
+  let assemblyFormat = "$value";
+}
+
+def HC_EffectClassPure : I32EnumAttrCase<"Pure", 0, "pure">;
+def HC_EffectClassRead : I32EnumAttrCase<"Read", 1, "read">;
+def HC_EffectClassWrite : I32EnumAttrCase<"Write", 2, "write">;
+def HC_EffectClassReadWrite
+    : I32EnumAttrCase<"ReadWrite", 3, "read_write">;
+
+def HC_EffectClass : I32EnumAttr<"EffectClass",
+    "Declared effect class for hc.func / hc.intrinsic.",
+    [HC_EffectClassPure, HC_EffectClassRead, HC_EffectClassWrite,
+     HC_EffectClassReadWrite]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::hc";
+}
+
+def HC_EffectsAttr : EnumAttr<HC_Dialect, HC_EffectClass, "effects"> {
+  let summary = "Declared effect class (pure/read/write/read_write).";
+  let assemblyFormat = "$value";
 }
 
 #endif // HC_IR_HCATTRS

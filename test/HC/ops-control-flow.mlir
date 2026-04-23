@@ -6,9 +6,9 @@
 
 // CHECK-LABEL: hc.intrinsic @wave_barrier
 // CHECK-SAME: scope = <"SubGroup">
-// CHECK-SAME: effects = <"ReadWrite">
+// CHECK-SAME: effects = read_write
 hc.intrinsic @wave_barrier scope = #hc.scope<"SubGroup">
-    effects = #hc.effects<"ReadWrite"> {}
+    effects = read_write {}
 
 // CHECK-LABEL: hc.intrinsic @subgroup_dot
 // CHECK-SAME: scope = <"SubGroup">

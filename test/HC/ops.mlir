@@ -19,7 +19,7 @@
 // CHECK-SAME: !hc.slice
 // CHECK-SAME: !hc.vector<f32, ["TileM", "TileN"]>
 // CHECK: func.func @use_scope_and_effects
-// CHECK-SAME: effects = #hc.effects<"Pure">
+// CHECK-SAME: effects = #hc<effects pure>
 // CHECK-SAME: scope = #hc.scope<"WorkItem">
 // CHECK: hc.kernel @wmma_matmul
 // CHECK: requirements = <[#hc.pred<"-1 + M >= 0">, #hc.pred<"Mod(N, 32) == 0">]> {
@@ -55,7 +55,7 @@ module {
   func.func @use_scope_and_effects()
       attributes {
         scope = #hc.scope<"WorkItem">,
-        effects = #hc.effects<"Pure">
+        effects = #hc<effects pure>
       } {
     return
   }

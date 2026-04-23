@@ -135,4 +135,42 @@ def HC_ValueType : AnyTypeOf<[
   Index,
 ]>;
 
+// Numeric/symbolic subset. Excludes `!hc.pred`, `!hc.slice`, `!hc.buffer` —
+// types that have no business flowing through arithmetic ops. `!hc.undef`
+// is kept for pre-inference compatibility.
+def HC_NumericValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_IdxType,
+  HC_TensorType,
+  HC_VectorType,
+  AnyInteger,
+  AnyFloat,
+  Index,
+]>;
+
+// Shaped values for ops that only make sense on tensors/vectors
+// (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
+// `!hc.undef` is admitted for the same pre-inference reason as above.
+def HC_ShapedValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_TensorType,
+  HC_VectorType,
+]>;
+
+// Buffer-rooted values. Used on the "handle" operand of data-movement and
+// subscript ops so a stray `!hc.pred` or scalar value cannot stand in for a
+// buffer even pre-inference.
+def HC_BufferValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_BufferType,
+]>;
+
+// Buffer or tensor root. `hc.vload` reads from either; `hc.store` writes
+// into either.
+def HC_BufferOrTensorValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_BufferType,
+  HC_TensorType,
+]>;
+
 #endif // HC_IR_HCTYPES

@@ -14,22 +14,27 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class HC_RegionOp<string mnemonic, list<Trait> traits = []>
     : HC_Op<mnemonic, !listconcat([NoTerminator, SingleBlock], traits)>;
 
-// Pure binary op whose operands and result are any `HC_ValueType`. The
-// combination is left deliberately loose: a just-lowered `hc_front` module
-// passes all `!hc.undef`, later inference narrows to `!hc.idx`, `!hc.tensor`,
-// or a builtin scalar, and folders dispatch on the observed combination.
-class HC_GenericBinaryOp<string mnemonic, list<Trait> traits = []>
+// Pure binary op parameterized on operand/result constraints. The default
+// `HC_ValueType` is deliberately loose for ops whose operand mix is open
+// (cmp, and/or, cast); narrower bases below tighten it for arithmetic /
+// shaped / boolean flavours. Folders dispatch on concrete-type combinations
+// regardless.
+class HC_GenericBinaryOp<string mnemonic, list<Trait> traits = [],
+                         TypeConstraint operand = HC_ValueType,
+                         TypeConstraint result = HC_ValueType>
     : HC_Op<mnemonic, !listconcat([Pure], traits)> {
-  let arguments = (ins HC_ValueType:$lhs, HC_ValueType:$rhs);
-  let results = (outs HC_ValueType:$result);
+  let arguments = (ins operand:$lhs, operand:$rhs);
+  let results = (outs result:$result);
   let assemblyFormat =
       "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-class HC_GenericUnaryOp<string mnemonic, list<Trait> traits = []>
+class HC_GenericUnaryOp<string mnemonic, list<Trait> traits = [],
+                        TypeConstraint operand = HC_ValueType,
+                        TypeConstraint result = HC_ValueType>
     : HC_Op<mnemonic, !listconcat([Pure], traits)> {
-  let arguments = (ins HC_ValueType:$value);
-  let results = (outs HC_ValueType:$result);
+  let arguments = (ins operand:$value);
+  let results = (outs result:$result);
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
@@ -54,18 +59,33 @@ def HCKernelOp : HC_RegionOp<"kernel", [Symbol]> {
 def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
   let summary = "Semantic helper region.";
   let description = [{
-    Helper callable referenced by `hc.call`. Carries a symbol name so symbol
-    resolution can catch typos and wrong-kind references at verify time;
-    signatures live on operand/result types of the call sites until
-    `hc.func` grows an explicit signature.
+    Helper callable referenced by `hc.call`. Carries a symbol name and an
+    optional `FunctionType` signature; when the signature is present, call
+    sites get arity and per-arg/result type parity checked at verify time
+    (`!hc.undef` on either side escapes the parity check, matching the
+    progressive-typing policy).
+
+    Legacy frontend output may omit the signature; that keeps the op
+    parseable while types are inferred. Once inference finalizes a
+    signature, the attribute is added and stricter checks kick in.
+
+    An optional `effects` enum (`pure | read | write | read_write`)
+    advertises the callee's effect class. `hc.call` sites read it via
+    `MemoryEffectOpInterface` and narrow their effects accordingly;
+    absence defaults to `read_write` — the same conservative fallback
+    that kept effect-aware passes from reordering opaque calls before.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
-    OptionalAttr<HC_ConstraintSetAttr>:$requirements
+    OptionalAttr<TypeAttrOf<FunctionType>>:$function_type,
+    OptionalAttr<HC_ConstraintSetAttr>:$requirements,
+    OptionalAttr<HC_EffectsAttr>:$effects
   );
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $sym_name (`requirements` `=` $requirements^)?
+    $sym_name (`:` $function_type^)?
+    (`requirements` `=` $requirements^)?
+    (`effects` `=` $effects^)?
     attr-dict-with-keyword $body
   }];
 }
@@ -112,17 +132,14 @@ def HCConstOp : HC_Op<"const", [Pure]> {
 def HCSymbolOp : HC_Op<"symbol", [Pure]> {
   let summary = "Introduce a symbolic capture bound to a named symbol.";
   let description = [{
-    Produces a pinned `!hc.idx<"name">`. The expression lives in the result
-    type; this op carries no operands or attributes so the bound symbol is
+    Produces a pinned `!hc.idx<"name">`. The bound name lives in the result
+    type; this op carries no operands or attributes so the binding is
     visible in one place only. The verifier rejects a bare `!hc.idx` or a
-    non-idx result type.
-
-    `HC_ValueType` rather than `HC_IdxType` is used as the result constraint
-    solely so the assembly printer keeps the full `!hc.idx<"M">` spelling
-    instead of stripping the dialect prefix for a single-type constraint.
+    non-idx result type. Uniquing on `!hc.idx<E>` gives symbol equality for
+    free.
   }];
-  let results = (outs HC_ValueType:$result);
-  let assemblyFormat = "attr-dict `:` type($result)";
+  let results = (outs HC_IdxType:$result);
+  let assemblyFormat = "attr-dict `:` qualified(type($result))";
   let hasVerifier = 1;
 }
 
@@ -152,30 +169,42 @@ def HCCastOp : HC_Op<"cast", [Pure]> {
 // tensor arith — is resolved by type inference and per-type folders.
 //===----------------------------------------------------------------------===//
 
-def HCAddOp : HC_GenericBinaryOp<"add", [Commutative]> {
+// Arithmetic ops reject anything that can't carry a number: `!hc.pred`,
+// `!hc.slice`, `!hc.buffer`. Symbolic (`!hc.idx`), scalar (int/float/index),
+// tensor/vector, and `!hc.undef` remain legal.
+def HCAddOp : HC_GenericBinaryOp<"add", [Commutative],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic addition.";
 }
 
-def HCSubOp : HC_GenericBinaryOp<"sub"> {
+def HCSubOp : HC_GenericBinaryOp<"sub", [],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic subtraction.";
 }
 
-def HCMulOp : HC_GenericBinaryOp<"mul", [Commutative]> {
+def HCMulOp : HC_GenericBinaryOp<"mul", [Commutative],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic multiplication.";
 }
 
-def HCDivOp : HC_GenericBinaryOp<"div"> {
+def HCDivOp : HC_GenericBinaryOp<"div", [],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic integer/float division (Python `//` for ints).";
 }
 
-def HCModOp : HC_GenericBinaryOp<"mod"> {
+def HCModOp : HC_GenericBinaryOp<"mod", [],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic remainder (Python `%`).";
 }
 
-def HCNegOp : HC_GenericUnaryOp<"neg"> {
+def HCNegOp : HC_GenericUnaryOp<"neg", [],
+    HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic unary minus.";
 }
 
+// Boolean ops stay on `HC_ValueType` for now: `i1` is an `AnyInteger`, and a
+// cleanly-scoped `HC_BooleanValueType` would require structural support for
+// "integer width == 1" / "tensor element is i1". File as follow-up.
 def HCAndOp : HC_GenericBinaryOp<"and", [Commutative]> {
   let summary = "Generic logical AND (Python `and`, `&` on bools).";
 }
@@ -188,8 +217,11 @@ def HCNotOp : HC_GenericUnaryOp<"not"> {
   let summary = "Generic logical NOT (Python `not`).";
 }
 
+// Comparisons take numeric operands; result stays wide (may be `!hc.pred`,
+// `i1`, `tensor<i1>`, `!hc.undef`).
 class HC_CmpOp<string suffix>
-    : HC_GenericBinaryOp<"cmp." # suffix> {
+    : HC_GenericBinaryOp<"cmp." # suffix, [],
+                         HC_NumericValueType, HC_ValueType> {
   let summary = "Generic comparison (`" # suffix # "`).";
   let description = [{
     Two symbolic index operands fold to `!hc.pred<"...">`; concrete scalars
@@ -219,15 +251,25 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
     fallback body once those settle. An empty body is legal and denotes a
     declaration-only intrinsic that later lowering patterns handle
     directly.
+
+    `const_kwargs` declares names that every `hc.call_intrinsic` for this
+    callee must carry as specialization attributes (e.g. `wave_size`,
+    `arch`). `verifySymbolUses` on the call site checks every name is
+    present — value type/shape is up to the intrinsic's own verify hook
+    because there is no universal "kwarg type" story yet.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<TypeAttrOf<FunctionType>>:$function_type,
     HC_ScopeAttr:$scope,
-    OptionalAttr<HC_EffectsAttr>:$effects
+    OptionalAttr<HC_EffectsAttr>:$effects,
+    OptionalAttr<StrArrayAttr>:$const_kwargs
   );
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $sym_name `scope` `=` $scope (`effects` `=` $effects^)?
+    $sym_name (`:` $function_type^)?
+    `scope` `=` $scope (`effects` `=` $effects^)?
+    (`const_kwargs` `=` $const_kwargs^)?
     attr-dict-with-keyword $body
   }];
 }
@@ -362,7 +404,7 @@ def HCWaveSizeOp : HC_LaunchGeoOp<"wave_size"> {
 
 def HCBufferDimOp : HC_Op<"buffer_dim", [Pure]> {
   let summary = "Symbolic dimension of a buffer (matches `a.shape[N]`).";
-  let arguments = (ins HC_ValueType:$buffer, I64Attr:$axis);
+  let arguments = (ins HC_BufferValueType:$buffer, I64Attr:$axis);
   let results = (outs HC_ValueType:$dim);
   let hasVerifier = 1;
   let assemblyFormat = [{
@@ -403,7 +445,8 @@ def HCBufferViewOp : HC_Op<"buffer_view", [Pure]> {
     operands. The variadic list carries a mix of scalar indices and
     `!hc.slice` values, matching Python-style multi-axis subscripts.
   }];
-  let arguments = (ins HC_ValueType:$buffer, Variadic<HC_ValueType>:$indices);
+  let arguments = (ins HC_BufferValueType:$buffer,
+                       Variadic<HC_ValueType>:$indices);
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{
     $buffer `[` $indices `]` attr-dict `:`
@@ -429,7 +472,7 @@ def HCLoadOp : HC_Op<"load", [MemoryEffects<[MemRead]>]> {
     effect so effect-aware passes cannot reorder it past a store.
   }];
   let arguments = (ins
-    HC_ValueType:$buffer,
+    HC_BufferValueType:$buffer,
     Variadic<HC_ValueType>:$indices,
     OptionalAttr<HC_ShapeAttr>:$shape
   );
@@ -450,7 +493,7 @@ def HCVLoadOp : HC_Op<"vload", [MemoryEffects<[MemRead]>]> {
     vector instead of a tensor.
   }];
   let arguments = (ins
-    HC_ValueType:$source,
+    HC_BufferOrTensorValueType:$source,
     Variadic<HC_ValueType>:$indices,
     OptionalAttr<HC_ShapeAttr>:$shape
   );
@@ -465,9 +508,9 @@ def HCVLoadOp : HC_Op<"vload", [MemoryEffects<[MemRead]>]> {
 def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tensor or vector into a buffer or tensor.";
   let arguments = (ins
-    HC_ValueType:$dest,
+    HC_BufferOrTensorValueType:$dest,
     Variadic<HC_ValueType>:$indices,
-    HC_ValueType:$source
+    HC_ShapedValueType:$source
   );
   let assemblyFormat = [{
     $dest `[` $indices `]` `,` $source attr-dict `:`
@@ -483,8 +526,8 @@ def HCVecOp : HC_Op<"vec", [MemoryEffects<[MemRead]>]> {
     memory; two `hc.vec` ops on the same tensor may observe different contents
     if a store is interleaved, so CSE must not collapse them blindly.
   }];
-  let arguments = (ins HC_ValueType:$value);
-  let results = (outs HC_ValueType:$result);
+  let arguments = (ins HC_ShapedValueType:$value);
+  let results = (outs HC_ShapedValueType:$result);
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
@@ -498,11 +541,11 @@ def HCWithInactiveOp : HC_Op<"with_inactive", [Pure]> {
     pre-inference `!hc.undef` operands skip the check.
   }];
   let arguments = (ins
-    HC_ValueType:$value,
+    HC_ShapedValueType:$value,
     AnyAttrOf<[I1Attr, I8Attr, I16Attr, I32Attr, I64Attr,
                F16Attr, F32Attr, F64Attr, IndexAttr, BoolAttr]>:$inactive
   );
-  let results = (outs HC_ValueType:$result);
+  let results = (outs HC_ShapedValueType:$result);
   let hasVerifier = 1;
   let assemblyFormat =
       "$value attr-dict `:` type($value) `->` type($result)";
@@ -511,16 +554,17 @@ def HCWithInactiveOp : HC_Op<"with_inactive", [Pure]> {
 def HCAsLayoutOp : HC_Op<"as_layout", [Pure]> {
   let summary = "Change the layout of a tensor or vector value.";
   let description = [{
-    `$layout` is a named layout descriptor carried in the attribute dict.
-    v0 accepts only `"row_major"` and `"col_major"`; the verifier rejects
-    any other string. Later revisions will widen the constraint to a typed
-    `#hc.layout<...>` attribute without changing call sites.
+    `$layout` is a typed `#hc<layout ...>` enum attribute. v0 admits
+    `row_major` and `col_major`; wrong spellings fail at parse, not verify.
+    Lifted out of `attr-dict` so the surface reads like the other explicit
+    keyword-argument ops (`hc.reduce`, `hc.astype`).
   }];
-  let arguments = (ins HC_ValueType:$value, StrAttr:$layout);
-  let results = (outs HC_ValueType:$result);
-  let hasVerifier = 1;
-  let assemblyFormat =
-      "$value attr-dict `:` type($value) `->` type($result)";
+  let arguments = (ins HC_ShapedValueType:$value, HC_LayoutAttr:$layout);
+  let results = (outs HC_ShapedValueType:$result);
+  let assemblyFormat = [{
+    $value `,` `layout` `=` $layout attr-dict `:`
+    type($value) `->` type($result)
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -580,8 +624,8 @@ def HCEmptyOp : HC_NullaryShapedAllocOp<"empty"> {
 
 def HCMatmulOp : HC_Op<"matmul", [Pure]> {
   let summary = "Generic matmul over tensors or vectors.";
-  let arguments = (ins HC_ValueType:$lhs, HC_ValueType:$rhs);
-  let results = (outs HC_ValueType:$result);
+  let arguments = (ins HC_ShapedValueType:$lhs, HC_ShapedValueType:$rhs);
+  let results = (outs HC_ShapedValueType:$result);
   let assemblyFormat =
       "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
@@ -589,14 +633,14 @@ def HCMatmulOp : HC_Op<"matmul", [Pure]> {
 def HCReduceOp : HC_Op<"reduce", [Pure]> {
   let summary = "Reduce `$value` along `$axis` using `$kind`.";
   let description = [{
-    `$kind` must be one of `"sum"`, `"max"`, `"min"`; the verifier rejects
-    any other spelling so typos fail at verify time rather than in some
-    later lowering pattern. `$keepdims` matches the NumPy surface and is
-    optional with default `false`. `$axis` must be non-negative.
+    `$kind` is the typed `#hc<reduce_kind ...>` enum (`sum` / `max` / `min`);
+    wrong spellings fail at parse rather than verify. `$keepdims` matches the
+    NumPy surface and is optional with default `false`. `$axis` must be
+    non-negative and, when `$value` has a concrete rank, less than that rank.
   }];
   let arguments = (ins
-    HC_ValueType:$value,
-    StrAttr:$kind,
+    HC_ShapedValueType:$value,
+    HC_ReduceKindAttr:$kind,
     I64Attr:$axis,
     DefaultValuedAttr<BoolAttr, "false">:$keepdims
   );
@@ -649,8 +693,15 @@ def HCAsTypeOp : HC_Op<"astype", [Pure]> {
 
 def HCCallOp : HC_Op<"call",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
-     MemoryEffects<[MemRead, MemWrite]>]> {
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Call into an `hc.func`.";
+  let description = [{
+    Memory effects are inherited from the callee's declared `effects`
+    class (if present) and default to `MemRead + MemWrite` otherwise —
+    an opaque helper that may read *and* write is the conservative
+    assumption, and it keeps effect-aware passes from reordering calls
+    past loads/stores until the callee opts into something narrower.
+  }];
   let arguments = (ins FlatSymbolRefAttr:$callee,
                        Variadic<HC_ValueType>:$args);
   let results = (outs Variadic<HC_ValueType>:$results);
@@ -661,12 +712,16 @@ def HCCallOp : HC_Op<"call",
 
 def HCCallIntrinsicOp : HC_Op<"call_intrinsic",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
-     MemoryEffects<[MemRead, MemWrite]>]> {
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Call into an `hc.intrinsic` declaration.";
   let description = [{
     Specialization-required keyword arguments live on this op as
     attributes (e.g. `{wave_size = 32 : i64}`), not SSA operands, so they
     are available to verify/specialize hooks without operand bookkeeping.
+
+    Memory effects are inherited from the callee intrinsic's `effects`
+    class; absence defaults to `MemRead + MemWrite`, same policy as
+    `hc.call`.
   }];
   let arguments = (ins FlatSymbolRefAttr:$callee,
                        Variadic<HC_ValueType>:$args);

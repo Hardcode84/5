@@ -52,11 +52,9 @@ module {
 
 // -----
 
-// CHECK: error: expected #hc.effects to be one of "Pure", "Read", "Write", "ReadWrite"
+// CHECK: expected ::mlir::hc::EffectClass to be one of: pure, read, write, read_write
 module {
-  func.func @bad() attributes {effects = #hc.effects<"Weird">} {
-    return
-  }
+  hc.intrinsic @bad scope = #hc.scope<"WorkItem"> effects = weird {}
 }
 
 // -----
@@ -165,10 +163,12 @@ module {
 
 // -----
 
-// CHECK: error: 'hc.reduce' op kind must be one of "sum", "max", "min", got "avg"
+// Reduce kind is a typed enum now; parser rejects garbage before the verifier
+// is invoked, which is exactly the point of the conversion (was: StrAttr).
+// CHECK: expected ::mlir::hc::ReduceKind to be one of: sum, max, min
 module {
   func.func @bad(%v: !hc.undef) -> !hc.undef {
-    %r = hc.reduce %v, kind = "avg", axis = 0 : !hc.undef -> !hc.undef
+    %r = hc.reduce %v, kind = avg, axis = 0 : !hc.undef -> !hc.undef
     return %r : !hc.undef
   }
 }
@@ -178,7 +178,7 @@ module {
 // CHECK: error: 'hc.reduce' op axis must be non-negative
 module {
   func.func @bad(%v: !hc.undef) -> !hc.undef {
-    %r = hc.reduce %v, kind = "sum", axis = -1 : !hc.undef -> !hc.undef
+    %r = hc.reduce %v, kind = sum, axis = -1 : !hc.undef -> !hc.undef
     return %r : !hc.undef
   }
 }
@@ -233,7 +233,7 @@ module {
 // CHECK: error: 'hc.reduce' op axis 5 is out of bounds for rank-2 value
 module {
   func.func @bad(%v: !hc.tensor<f32, ["M", "N"]>) -> !hc.undef {
-    %r = hc.reduce %v, kind = "sum", axis = 5
+    %r = hc.reduce %v, kind = sum, axis = 5
         : !hc.tensor<f32, ["M", "N"]> -> !hc.undef
     return %r : !hc.undef
   }
@@ -252,10 +252,11 @@ module {
 
 // -----
 
-// CHECK: error: 'hc.as_layout' op layout must be one of "row_major", "col_major", got "weird"
+// Layout is a typed enum now; parser rejects garbage (same story as `kind`).
+// CHECK: expected ::mlir::hc::Layout to be one of: row_major, col_major
 module {
   func.func @bad(%v: !hc.undef) -> !hc.undef {
-    %r = hc.as_layout %v {layout = "weird"} : !hc.undef -> !hc.undef
+    %r = hc.as_layout %v, layout = weird : !hc.undef -> !hc.undef
     return %r : !hc.undef
   }
 }
@@ -288,6 +289,103 @@ module {
   hc.func @plain_func { hc.return }
   func.func @bad(%x: !hc.undef) -> !hc.undef {
     %r = hc.call_intrinsic @plain_func(%x) : (!hc.undef) -> !hc.undef
+    return %r : !hc.undef
+  }
+}
+
+// -----
+
+// Narrowed operand constraints reject non-numeric types in arithmetic.
+// CHECK: 'hc.add' op operand #0 must be {{.*}}Placeholder type
+// CHECK-SAME: Semantic tensor type
+module {
+  func.func @bad(%p: !hc.pred, %q: !hc.pred) -> !hc.undef {
+    %r = hc.add %p, %q : (!hc.pred, !hc.pred) -> !hc.undef
+    return %r : !hc.undef
+  }
+}
+
+// -----
+
+// Buffer-rooted ops reject `!hc.tensor` handles (no buffer in sight).
+// CHECK: 'hc.buffer_dim' op operand #0 must be {{.*}}Placeholder type
+// CHECK-SAME: Semantic buffer type
+module {
+  func.func @bad(%t: !hc.tensor<f32, ["M"]>) -> !hc.undef {
+    %d = hc.buffer_dim %t, axis = 0 : !hc.tensor<f32, ["M"]> -> !hc.undef
+    return %d : !hc.undef
+  }
+}
+
+// -----
+
+// Shaped ops reject scalar/idx operands — matmul on idx is meaningless.
+// CHECK: 'hc.matmul' op operand #0 must be {{.*}}Placeholder type
+// CHECK-SAME: Semantic tensor type
+module {
+  func.func @bad(%m: !hc.idx<"M">, %n: !hc.idx<"N">) -> !hc.undef {
+    %r = hc.matmul %m, %n : (!hc.idx<"M">, !hc.idx<"N">) -> !hc.undef
+    return %r : !hc.undef
+  }
+}
+
+// -----
+
+// Signature parity: wrong arity.
+// CHECK: error: 'hc.call' op callee '@typed' expects 2 argument(s), call site provides 1
+module {
+  hc.func @typed : (i32, i32) -> i32 { hc.return }
+  func.func @bad(%a: i32) -> i32 {
+    %r = hc.call @typed(%a) : (i32) -> i32
+    return %r : i32
+  }
+}
+
+// -----
+
+// Signature parity: wrong arg type, both sides concrete.
+// CHECK: error: 'hc.call' op arg #1 type 'f32' is incompatible with callee declaration 'i32'
+module {
+  hc.func @typed : (i32, i32) -> i32 { hc.return }
+  func.func @bad(%a: i32, %b: f32) -> i32 {
+    %r = hc.call @typed(%a, %b) : (i32, f32) -> i32
+    return %r : i32
+  }
+}
+
+// -----
+
+// Signature parity: wrong result type.
+// CHECK: error: 'hc.call' op result #0 type 'f32' is incompatible with callee declaration 'i32'
+module {
+  hc.func @typed : (i32) -> i32 { hc.return }
+  func.func @bad(%a: i32) -> f32 {
+    %r = hc.call @typed(%a) : (i32) -> f32
+    return %r : f32
+  }
+}
+
+// -----
+
+// Signature parity: same story on `hc.call_intrinsic`.
+// CHECK: error: 'hc.call_intrinsic' op callee '@sized' expects 1 argument(s), call site provides 2
+module {
+  hc.intrinsic @sized : (i32) -> i32 scope = #hc.scope<"WorkItem"> {}
+  func.func @bad(%a: i32, %b: i32) -> i32 {
+    %r = hc.call_intrinsic @sized(%a, %b) : (i32, i32) -> i32
+    return %r : i32
+  }
+}
+
+// -----
+
+// const_kwargs whitelist: missing kwarg on the call site fails verify.
+// CHECK: error: 'hc.call_intrinsic' op missing required const kwarg 'wave_size' declared by callee '@wave'
+module {
+  hc.intrinsic @wave scope = #hc.scope<"SubGroup">
+      const_kwargs = ["wave_size"] {}
+  func.func @bad(%a: !hc.undef) -> !hc.undef {
+    %r = hc.call_intrinsic @wave(%a) : (!hc.undef) -> !hc.undef
     return %r : !hc.undef
   }
 }

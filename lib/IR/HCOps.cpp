@@ -5,6 +5,7 @@
 #include "hc/IR/HCOps.h"
 
 #include "hc/IR/HCDialect.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
 
@@ -32,15 +33,11 @@ static Operation *tryGetTerminator(Block &block) {
 }
 
 LogicalResult HCSymbolOp::verify() {
-  // A bare `!hc.idx` is the inferred form of an unbound capture, not a
-  // user-declared symbol; `hc.symbol` must carry a concrete expression in its
-  // result type so the bound name is visible at one place.
-  IdxType type = llvm::dyn_cast<IdxType>(getResult().getType());
-  if (!type)
-    return emitOpError("result must be an `!hc.idx` with a pinned "
-                       "expression, got ")
-           << getResult().getType();
-  if (!type.getExpr())
+  // Auto-generated type constraint enforces `!hc.idx` already; all that's
+  // left is the "must pin an expression" rule — `!hc.idx` without an
+  // expression is the inferred form of an unbound capture, not a
+  // user-declared symbol binding.
+  if (!llvm::cast<IdxType>(getResult().getType()).getExpr())
     return emitOpError("result must pin a symbolic expression "
                        "(e.g. `!hc.idx<\"M\">`)");
   return success();
@@ -170,6 +167,7 @@ ShapeAttr tryGetShape(Type t) {
     return vec.getShape();
   return nullptr;
 }
+
 } // namespace
 
 LogicalResult HCBufferDimOp::verify() {
@@ -223,11 +221,7 @@ LogicalResult HCVLoadOp::verify() {
 }
 
 LogicalResult HCReduceOp::verify() {
-  // Extensible enough for v0; later we may convert to a real enum attr.
-  llvm::StringRef kind = getKind();
-  if (kind != "sum" && kind != "max" && kind != "min")
-    return emitOpError("kind must be one of \"sum\", \"max\", \"min\", got \"")
-           << kind << "\"";
+  // Kind is a typed enum now; wrong spellings never reach the verifier.
   if (getAxisAttr().getValue().isNegative())
     return emitOpError("axis must be non-negative, got ")
            << getAxisAttr().getValue().getSExtValue();
@@ -317,29 +311,51 @@ LogicalResult HCWithInactiveOp::verify() {
   return success();
 }
 
-LogicalResult HCAsLayoutOp::verify() {
-  // v0 ships a string-keyed whitelist; later revisions will replace it with
-  // a typed `#hc.layout<...>` attribute and this guard dissolves into the
-  // attribute's own verifier. Keeping the list here means garbage strings
-  // fail at verify rather than at a lowering pattern miles downstream.
-  llvm::StringRef layout = getLayout();
-  if (layout != "row_major" && layout != "col_major")
-    return emitOpError(
-               "layout must be one of \"row_major\", \"col_major\", got \"")
-           << layout << "\"";
-  return success();
-}
-
 //===----------------------------------------------------------------------===//
 // SymbolUserOpInterface verification for call ops.
 //
-// We only verify callee *existence* and *op kind* here. Full signature
-// verification (argument/result type parity) waits for `hc.func` and
-// `hc.intrinsic` to grow explicit signatures; for now call sites carry
-// types, and inference refines them until lowering can match them up.
+// Callee existence and op kind are cheap; signature parity is also verified
+// when the callee carries a `function_type` attribute. `!hc.undef` on either
+// side of the parity check passes (progressive typing policy): a call site
+// that has not yet been inferred, or a signature that still lists `!hc.undef`
+// placeholders, should not cause spurious verify errors.
 //===----------------------------------------------------------------------===//
 
 namespace {
+// Signature compatibility with progressive-typing escape hatch.
+bool compatibleSigType(Type callSite, Type callee) {
+  if (isUndef(callSite) || isUndef(callee))
+    return true;
+  return callSite == callee;
+}
+
+template <typename CallOp>
+LogicalResult verifySignature(CallOp op, FunctionType fnType) {
+  if (fnType.getNumInputs() != op.getArgs().size())
+    return op.emitOpError("callee '@")
+           << op.getCallee() << "' expects " << fnType.getNumInputs()
+           << " argument(s), call site provides " << op.getArgs().size();
+  if (fnType.getNumResults() != op.getResults().size())
+    return op.emitOpError("callee '@")
+           << op.getCallee() << "' returns " << fnType.getNumResults()
+           << " result(s), call site declares " << op.getResults().size();
+  for (auto [i, callSite, declared] :
+       llvm::enumerate(op.getArgs().getTypes(), fnType.getInputs())) {
+    if (!compatibleSigType(callSite, declared))
+      return op.emitOpError("arg #")
+             << i << " type " << callSite
+             << " is incompatible with callee declaration " << declared;
+  }
+  for (auto [i, callSite, declared] :
+       llvm::enumerate(op.getResults().getTypes(), fnType.getResults())) {
+    if (!compatibleSigType(callSite, declared))
+      return op.emitOpError("result #")
+             << i << " type " << callSite
+             << " is incompatible with callee declaration " << declared;
+  }
+  return success();
+}
+
 template <typename CalleeOp, typename CallOp>
 LogicalResult verifyFlatSymbolUseAsOp(CallOp op,
                                       SymbolTableCollection &symbolTable,
@@ -350,6 +366,8 @@ LogicalResult verifyFlatSymbolUseAsOp(CallOp op,
     return op.emitOpError("'")
            << op.getCallee() << "' does not reference a valid "
            << expectedKindLabel;
+  if (std::optional<FunctionType> fnType = sym.getFunctionType())
+    return verifySignature(op, *fnType);
   return success();
 }
 } // namespace
@@ -358,8 +376,69 @@ LogicalResult HCCallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return verifyFlatSymbolUseAsOp<HCFuncOp>(*this, symbolTable, "hc.func");
 }
 
+namespace {
+// Translates the declared effect class into concrete side effects on the
+// default resource. The callee's body is opaque; we only know "maybe reads"
+// / "maybe writes" at this level, so `Pure` emits nothing, the one-sided
+// classes emit the matching effect, and the unknown/absent case falls back
+// to MemRead+MemWrite.
+void emitEffectsForClass(
+    std::optional<EffectClass> cls,
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  auto value = cls.value_or(EffectClass::ReadWrite);
+  if (value == EffectClass::Pure)
+    return;
+  if (value == EffectClass::Read || value == EffectClass::ReadWrite)
+    effects.emplace_back(MemoryEffects::Read::get());
+  if (value == EffectClass::Write || value == EffectClass::ReadWrite)
+    effects.emplace_back(MemoryEffects::Write::get());
+}
+
+template <typename CalleeOp, typename CallOp>
+void populateEffectsFromCallee(
+    CallOp op,
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  std::optional<EffectClass> cls;
+  if (auto mod = op->template getParentOfType<ModuleOp>()) {
+    if (auto callee = mod.template lookupSymbol<CalleeOp>(op.getCalleeAttr()))
+      cls = callee.getEffects();
+  }
+  emitEffectsForClass(cls, effects);
+}
+} // namespace
+
+void HCCallOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  populateEffectsFromCallee<HCFuncOp>(*this, effects);
+}
+
 LogicalResult
 HCCallIntrinsicOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  return verifyFlatSymbolUseAsOp<HCIntrinsicOp>(*this, symbolTable,
-                                                "hc.intrinsic");
+  if (failed(verifyFlatSymbolUseAsOp<HCIntrinsicOp>(*this, symbolTable,
+                                                    "hc.intrinsic")))
+    return failure();
+  // Callee exists and has the right kind; now enforce the const_kwarg
+  // whitelist it declared, if any. Extra attributes on the call site are
+  // allowed (forward-compatible with target-specific decorations).
+  auto intrinsic = symbolTable.lookupNearestSymbolFrom<HCIntrinsicOp>(
+      getOperation(), getCalleeAttr());
+  ArrayAttr required = intrinsic.getConstKwargsAttr();
+  if (!required)
+    return success();
+  for (Attribute entry : required) {
+    llvm::StringRef name = llvm::cast<StringAttr>(entry).getValue();
+    if (!(*this)->hasAttr(name))
+      return emitOpError("missing required const kwarg '")
+             << name << "' declared by callee '@" << getCallee() << "'";
+  }
+  return success();
+}
+
+void HCCallIntrinsicOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  populateEffectsFromCallee<HCIntrinsicOp>(*this, effects);
 }

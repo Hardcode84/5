@@ -25,9 +25,9 @@ def NameStoreRegionOpInterface : OpInterface<"NameStoreRegionOpInterface"> {
                               capture the outer binding (lazy
                               `hc.name_load` at the op's insertion
                               point); writes inside shadow and don't
-                              leak out. Out-bound propagation needs an
-                              ODS result extension (tracked in bead
-                              5-2lf).
+                              leak out. Out-bound propagation needs
+                              an ODS result extension — tracked in
+                              bead 5-2lf.
       - `hc.subgroup_region`: ditto.
 
     The interface is a marker only — the pass dispatches on op kind

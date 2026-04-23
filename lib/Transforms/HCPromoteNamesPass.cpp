@@ -25,8 +25,8 @@
 // and don't leak out, but reads **do** capture outer bindings: an
 // unbound read falls back to an outer-scope snapshot materialized
 // lazily by the pass. Plumbing a write back out (the "return acc"
-// pattern) needs an ODS-level result extension on those ops and
-// lives in a follow-up bead.
+// pattern) needs an ODS-level result extension on those ops —
+// tracked in bead 5-2lf.
 
 #include "hc/Transforms/Passes.h"
 
@@ -486,30 +486,22 @@ static LogicalResult promoteIf(HCIfOp op) {
 }
 
 // Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as a
-// Python-style nested scope. Writes inside shadow the outer name
-// store and don't leak back out; reads **do** capture outer bindings
-// — an unresolved read inside triggers a lazy `hc.name_load` at the
-// region op's insertion point, which the outer flat sweep then
-// resolves against the outer name store. Propagating a write back to
-// the outer scope needs an ODS-level result extension on these ops
-// — tracked in bead 5-2lf.
+// Python-style nested scope: writes shadow outer bindings and don't
+// leak out; reads capture them via a lazy `hc.name_load` emitted at
+// the region op's insertion point, which the outer flat sweep then
+// resolves against the outer name store. `promoteForRange` /
+// `promoteIf` are **transparent** carriers (names flow in and out
+// via iter_args / results); these are **barriers** in the write-out
+// direction, so the shape here collapses to "scan with capture
+// factory" — no rebuild, no writeback. Out-bound propagation (the
+// "return acc" pattern) needs an ODS-level result extension on
+// these ops — tracked in bead 5-2lf.
 //
-// Shape differs from `promoteForRange` / `promoteIf` on purpose:
-// those are **transparent** carriers (names flow in AND out via
-// iter_args / results), so their shape is "snapshot → scan → rebuild
-// with carriers → writeback". These are **barriers** in the
-// write-out direction (5-2lf will flip that for an explicit result
-// list), so their shape collapses to "scan with capture factory";
-// there's nothing to carry out yet, hence no rebuild and no
-// writeback. When 5-2lf lands, the shape here should converge with
-// the for/if path by reusing `writebackCarriedResults` for the new
-// result list.
-//
-// By the time we reach here, the post-order walk has already promoted
-// every inner NameStoreRegionOpInterface op; their transient
-// snap/writeback pairs sit at this body's top level and get resolved
-// by the same flat sweep, capturing upward through the region op if
-// needed.
+// By the time we reach here, the post-order walk has already
+// promoted every inner NameStoreRegionOpInterface op; their
+// transient snap/writeback pairs sit at this body's top level and
+// get resolved by the same flat sweep, capturing upward through the
+// region op if needed.
 static LogicalResult promoteNestedScope(Operation *op) {
   Region &body = op->getRegion(0);
   if (body.empty())

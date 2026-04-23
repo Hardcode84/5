@@ -115,12 +115,9 @@ module {
     hc_front.return %x
   }
 
-  // `@kernel.intrinsic` bodies are Python simulator fallbacks with no
-  // compilation meaning; the rewrite keeps the signature + metadata and
-  // drops the body entirely. The body below is intentionally non-trivial
-  // (constant + binop + return) to prove the drop is unconditional — if
-  // the pass ever regressed into walking it, the CHECK-NEXT below would
-  // fail because lowered ops would appear before the closing `}`.
+  // Simulator-fallback body is discarded unconditionally. The body
+  // below is deliberately non-trivial so a regression into walking it
+  // would emit lowered ops before the closing `}` and break CHECK-NEXT.
   // CHECK-LABEL: hc.intrinsic @intr
   // CHECK-SAME: (%arg0: !hc.undef) -> !hc.undef
   // CHECK-SAME: scope = <"WorkItem">

@@ -22,12 +22,13 @@
 //    `x.astype(...)`);
 //  * every produced value gets `!hc.undef` — type inference pins later.
 //
-// Intrinsic bodies are **discarded**. `@kernel.intrinsic`-decorated
-// Python bodies are simulator fallbacks — they exist so the kernel still
-// runs under the Python simulator when no hardware/codegen path is
-// present. They have no compilation meaning. `hc.intrinsic` therefore
-// lands as a declaration: signature + scope/effects/const_kwargs
-// metadata only, entry block with parameter args, zero ops inside.
+// Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
+// bodies are simulator fallbacks with no compilation meaning; the
+// lowered `hc.intrinsic` is a declaration (signature + scope/effects/
+// const_kwargs + empty entry block with param args, zero body ops). A
+// consequence worth spelling out: this pass does *not* validate the
+// contents of an intrinsic body. Malformed ops inside a simulator
+// fallback pass through as-is until the source op is erased.
 //
 // Explicitly deferred to later passes:
 //  * loop-carried iter_arg analysis and nested workitem-def folding.
@@ -410,18 +411,15 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // All three callable kinds share the same skeleton: build a fresh
   // entry block, bind params into a new Scope, hand (entry, fnType) to
   // the per-kind `build` lambda which creates the hc op + attaches the
-  // block, then lower the hc_front body region into that entry block.
+  // block, then (if `build` asks for it) lower the hc_front body region
+  // into that entry block. `build` returning a null `Region *` on
+  // success means "skip the walk" — the intrinsic arm uses it to land a
+  // declaration-only op, see file banner.
   //
   // Block ownership: on `materializeParameters` failure we delete `entry`
   // here; on success `build` is contractually attach-then-erase —
   // attaches `entry` to the hc op first, so any later failure can
   // `hcOp->erase()` and take the block with it.
-  //
-  // A successful `build` that returns a null `Region *` means "skip the
-  // body walk" — used by the intrinsic lowering, which discards the
-  // hc_front body (see file banner). The entry block still gets attached
-  // and the param binding still happens so the resulting hc op retains
-  // its signature, but no hc_front → hc translation runs on the body.
   auto runBody =
       [&](bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
@@ -437,7 +435,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     FailureOr<Region *> bodyRegion = build(entry, *fnType);
     if (failed(bodyRegion))
       return failure();
-    if (*bodyRegion == nullptr)
+    if (!*bodyRegion)
       return success();
     scopes.push_back(std::make_unique<Scope>(std::move(scope)));
     OpBuilder::InsertionGuard bodyGuard(builder);
@@ -537,12 +535,9 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
           }
           if (auto kw = frontOp->getAttrOfType<ArrayAttr>("const_kwargs"))
             hcIntr.setConstKwargsAttr(kw);
-          // Return null to tell `runBody` to skip the body walk.
-          // `hc_front.intrinsic`'s body is a Python simulator fallback
-          // with no compilation meaning; the resulting `hc.intrinsic`
-          // lands as a declaration (signature + metadata, empty entry
-          // block).
-          return static_cast<Region *>(nullptr);
+          // Null => skip body walk; see file banner for rationale.
+          Region *skipWalk = nullptr;
+          return skipWalk;
         });
   }
 

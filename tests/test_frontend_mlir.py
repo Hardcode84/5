@@ -28,7 +28,7 @@ from hc._frontend import (
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
-    reason="native hc.front dialect smoke tests disabled by env",
+    reason="native hc_front dialect smoke tests disabled by env",
 )
 
 _CONTROL_FLOW_SOURCE = textwrap.dedent("""\

@@ -15,39 +15,38 @@ import pytest
 from build_tools.hc_native_tools import ensure_hc_native_tools_built
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
 
-# Successful parse of real `hc.front.*` text is the stable contract that matters
-# here; MLIR only reports the registered top-level namespace (`hc`) in
-# `--show-dialects`, which is a less stable interface to assert on.
+# Successful parse of real `hc_front.*` text is the stable contract that
+# matters here.
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
-    reason="native hc.front dialect smoke tests disabled by env",
+    reason="native hc_front dialect smoke tests disabled by env",
 )
 _HC_OPT_TIMEOUT_SECONDS = 60.0
 
 _HC_FRONT_MODULE_SOURCE = textwrap.dedent("""
     module {
-      "hc.front.kernel"() <{name = "example"}> ({
-        %target = "hc.front.target_name"() <{name = "lhs"}> : () -> !hc.front.value
-        %value = "hc.front.constant"() <{value = 1 : i64}> : () -> !hc.front.value
-        "hc.front.assign"(%target, %value)
-          : (!hc.front.value, !hc.front.value) -> ()
-        "hc.front.if"() ({
-          %cond = "hc.front.name"() <{name = "pred"}> : () -> !hc.front.value
+      "hc_front.kernel"() <{name = "example"}> ({
+        %target = "hc_front.target_name"() <{name = "lhs"}> : () -> !hc_front.value
+        %value = "hc_front.constant"() <{value = 1 : i64}> : () -> !hc_front.value
+        "hc_front.assign"(%target, %value)
+          : (!hc_front.value, !hc_front.value) -> ()
+        "hc_front.if"() ({
+          %cond = "hc_front.name"() <{name = "pred"}> : () -> !hc_front.value
         }, {
-          %lhs = "hc.front.name"() <{name = "lhs"}> : () -> !hc.front.value
-          "hc.front.return"(%lhs) : (!hc.front.value) -> ()
+          %lhs = "hc_front.name"() <{name = "lhs"}> : () -> !hc_front.value
+          "hc_front.return"(%lhs) : (!hc_front.value) -> ()
         }, {
-          %fallback = "hc.front.list"() : () -> !hc.front.value
+          %fallback = "hc_front.list"() : () -> !hc_front.value
         }) : () -> ()
-        "hc.front.for"() ({
-          %i = "hc.front.target_name"() <{name = "i"}> : () -> !hc.front.value
+        "hc_front.for"() ({
+          %i = "hc_front.target_name"() <{name = "i"}> : () -> !hc_front.value
         }, {
-          %rows = "hc.front.name"() <{name = "rows"}> : () -> !hc.front.value
+          %rows = "hc_front.name"() <{name = "rows"}> : () -> !hc_front.value
         }, {
-          %callee = "hc.front.name"() <{name = "consume"}> : () -> !hc.front.value
-          %arg = "hc.front.name"() <{name = "i"}> : () -> !hc.front.value
-          %call = "hc.front.call"(%callee, %arg)
-            : (!hc.front.value, !hc.front.value) -> !hc.front.value
+          %callee = "hc_front.name"() <{name = "consume"}> : () -> !hc_front.value
+          %arg = "hc_front.name"() <{name = "i"}> : () -> !hc_front.value
+          %call = "hc_front.call"(%callee, %arg)
+            : (!hc_front.value, !hc_front.value) -> !hc_front.value
         }) : () -> ()
       }) : () -> ()
     }
@@ -96,7 +95,7 @@ def _run_hc_opt(
 def test_hc_opt_parses_and_prints_registered_hc_front_textual_ir() -> None:
     result = _run_hc_opt([], input_text=_HC_FRONT_MODULE_SOURCE)
 
-    assert "hc.front.kernel" in result.stdout
-    assert "!hc.front.value" in result.stdout
-    assert "hc.front.if" in result.stdout
-    assert "hc.front.for" in result.stdout
+    assert "hc_front.kernel" in result.stdout
+    assert "!hc_front.value" in result.stdout
+    assert "hc_front.if" in result.stdout
+    assert "hc_front.for" in result.stdout

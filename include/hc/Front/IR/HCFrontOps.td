@@ -9,13 +9,13 @@ include "hc/Front/IR/HCFrontTypes.td"
 include "mlir/IR/CommonAttrConstraints.td"
 
 class HCFront_ValueProducer<string mnemonic, list<Trait> traits = []>
-    : HCFront_Op<"front." # mnemonic, traits> {
+    : HCFront_Op<mnemonic, traits> {
   let results = (outs HCFront_ValueType:$result);
 }
 
 class HCFront_RegionOp<string mnemonic, list<Trait> traits = []>
     : HCFront_Op<
-        "front." # mnemonic,
+        mnemonic,
         !listconcat([NoTerminator, SingleBlock], traits)
       >;
 
@@ -47,13 +47,13 @@ def HCFront_NameOp : HCFront_ValueProducer<"name"> {
   let assemblyFormat = "$name attr-dict `:` type($result)";
 }
 
-def HCFront_AssignOp : HCFront_Op<"front.assign"> {
+def HCFront_AssignOp : HCFront_Op<"assign"> {
   let arguments = (ins HCFront_ValueType:$target, HCFront_ValueType:$value);
   let assemblyFormat =
       "$target `=` $value attr-dict `:` functional-type(operands, results)";
 }
 
-def HCFront_AugAssignOp : HCFront_Op<"front.aug_assign"> {
+def HCFront_AugAssignOp : HCFront_Op<"aug_assign"> {
   let arguments = (ins
     StrAttr:$kind,
     HCFront_ValueType:$target,
@@ -175,7 +175,7 @@ def HCFront_ForOp : HCFront_RegionOp<"for"> {
   let assemblyFormat = "$target `in` $iter `do` $body attr-dict";
 }
 
-def HCFront_ReturnOp : HCFront_Op<"front.return"> {
+def HCFront_ReturnOp : HCFront_Op<"return"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$values);
   let assemblyFormat = "($values^ `:` type($values))? attr-dict";
 }

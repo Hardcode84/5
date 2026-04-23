@@ -62,11 +62,11 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
   hcFrontM.def(
       "register_dialects",
       [](DefaultingPyMlirContext context, bool load) {
-        MlirDialectHandle hcDialect = mlirGetDialectHandle__hc__();
+        MlirDialectHandle hcFrontDialect = mlirGetDialectHandle__hc_front__();
         MlirContext context_ = context.get()->get();
-        mlirDialectHandleRegisterDialect(hcDialect, context_);
+        mlirDialectHandleRegisterDialect(hcFrontDialect, context_);
         if (load) {
-          mlirDialectHandleLoadDialect(hcDialect, context_);
+          mlirDialectHandleLoadDialect(hcFrontDialect, context_);
         }
       },
       nb::arg("context").none() = nb::none(), nb::arg("load") = true);

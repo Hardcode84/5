@@ -23,14 +23,14 @@ from build_tools.llvm_toolchain import ensure_llvm_toolchain
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
-    reason="native hc.front dialect smoke tests disabled by env",
+    reason="native hc_front dialect smoke tests disabled by env",
 )
 _PYTHON_BINDINGS_TIMEOUT_SECONDS = 60.0
 _HC_FRONT_MODULE_SOURCE = textwrap.dedent("""
     module {
-      "hc.front.kernel"() <{name = "example"}> ({
-        %value = "hc.front.constant"() <{value = 1 : i64}> : () -> !hc.front.value
-        "hc.front.return"(%value) : (!hc.front.value) -> ()
+      "hc_front.kernel"() <{name = "example"}> ({
+        %value = "hc_front.constant"() <{value = 1 : i64}> : () -> !hc_front.value
+        "hc_front.return"(%value) : (!hc_front.value) -> ()
       }) : () -> ()
     }
     """)
@@ -56,14 +56,14 @@ def _run_python(script: str) -> subprocess.CompletedProcess[str]:
         )
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
-            "hc.front Python bindings smoke test timed out.\n"
+            "hc_front Python bindings smoke test timed out.\n"
             f"timeout: {_PYTHON_BINDINGS_TIMEOUT_SECONDS:.0f}s\n"
             f"stdout:\n{exc.stdout or ''}\n"
             f"stderr:\n{exc.stderr or ''}"
         ) from exc
     except subprocess.CalledProcessError as exc:
         raise AssertionError(
-            "hc.front Python bindings smoke test failed.\n"
+            "hc_front Python bindings smoke test failed.\n"
             f"stdout:\n{exc.stdout}\n"
             f"stderr:\n{exc.stderr}"
         ) from exc
@@ -97,10 +97,10 @@ def test_hc_front_python_bindings_parse_ir_and_expose_front_types() -> None:
         """)
 
     payload = json.loads(result.stdout)
-    assert "hc.front.kernel" in payload["module"]
-    assert "hc.front.return" in payload["module"]
-    assert "!hc.front.value" in payload["module"]
-    assert payload["value_type"] == "!hc.front.value"
-    assert payload["typeexpr_type"] == "!hc.front.typeexpr"
+    assert "hc_front.kernel" in payload["module"]
+    assert "hc_front.return" in payload["module"]
+    assert "!hc_front.value" in payload["module"]
+    assert payload["value_type"] == "!hc_front.value"
+    assert payload["typeexpr_type"] == "!hc_front.typeexpr"
     assert payload["kernel_op"] is True
     assert payload["return_op"] is True

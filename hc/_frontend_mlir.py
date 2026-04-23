@@ -37,7 +37,7 @@ _I64_MAX = (1 << 63) - 1
 
 
 class HCFrontEmitter:
-    """Build an `hc.front` MLIR module from frontend emitter callbacks."""
+    """Build an `hc_front` MLIR module from frontend emitter callbacks."""
 
     def __init__(self, *, context: Any | None = None) -> None:
         self._context = ir.Context() if context is None else context

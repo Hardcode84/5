@@ -10,7 +10,8 @@
 #include "mlir/CAPI/Registration.h"
 #include "llvm/Support/Casting.h"
 
-MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(HC, hc, mlir::hc::front::HCFrontDialect)
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(HCFront, hc_front,
+                                      mlir::hc::front::HCFrontDialect)
 
 MlirType mlirHCFrontValueTypeGet(MlirContext ctx) {
   return wrap(mlir::hc::front::ValueType::get(unwrap(ctx)));

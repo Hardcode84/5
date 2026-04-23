@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Restricted AST lowering helpers for the `hc.front` frontend boundary.
+"""Restricted AST lowering helpers for the `hc_front` frontend boundary.
 
 This module owns source recovery, AST validation, and the shared visitor/emitter
 protocol for frontend lowering. `RecordingEmitter` remains an ephemeral test
 harness for visitor unit tests, while `lower_*_to_front_ir()` lowers the same
-restricted subset into real `hc.front` MLIR through the managed Python
+restricted subset into real `hc_front` MLIR through the managed Python
 bindings. Unsupported syntax is rejected explicitly instead of being interpreted
 in Python. Collective-region capture lists are the only derived scope summary
 computed here, and they stay limited to naming outer bindings referenced by
@@ -207,7 +207,7 @@ def lower_function_to_front_ir(
     *,
     context: Any | None = None,
 ) -> Any:
-    """Lower a Python function directly into an `hc.front` MLIR module.
+    """Lower a Python function directly into an `hc_front` MLIR module.
 
     Invalid frontend input raises `FrontendError`. Internal emitter invariant
     failures still surface as `RuntimeError`.
@@ -224,7 +224,7 @@ def lower_source_to_front_ir(
     filename: str = "<memory>",
     context: Any | None = None,
 ) -> Any:
-    """Lower source text directly into an `hc.front` MLIR module.
+    """Lower source text directly into an `hc_front` MLIR module.
 
     Invalid frontend input raises `FrontendError`. Internal emitter invariant
     failures still surface as `RuntimeError`.
@@ -241,7 +241,7 @@ def lower_module_to_front_ir(
     filename: str = "<memory>",
     context: Any | None = None,
 ) -> Any:
-    """Lower a pre-parsed AST module directly into an `hc.front` MLIR module.
+    """Lower a pre-parsed AST module directly into an `hc_front` MLIR module.
 
     Invalid frontend input raises `FrontendError`. Internal emitter invariant
     failures still surface as `RuntimeError`.

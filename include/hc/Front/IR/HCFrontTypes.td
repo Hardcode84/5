@@ -10,7 +10,7 @@ include "mlir/IR/AttrTypeBase.td"
 
 class HCFront_Type<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<HCFront_Dialect, name, traits> {
-  let mnemonic = "front." # typeMnemonic;
+  let mnemonic = typeMnemonic;
 }
 
 def HCFront_ValueType : HCFront_Type<"Value", "value"> {

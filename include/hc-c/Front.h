@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HC, hc);
+MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HCFront, hc_front);
 
 MLIR_CAPI_EXPORTED MlirType mlirHCFrontValueTypeGet(MlirContext ctx);
 MLIR_CAPI_EXPORTED bool mlirHCTypeIsAFrontValueType(MlirType type);

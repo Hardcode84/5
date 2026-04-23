@@ -7,7 +7,6 @@
 #include "hc/Front/IR/HCFrontOps.h"
 #include "hc/Front/IR/HCFrontTypes.h"
 
-using namespace mlir;
 using namespace mlir::hc::front;
 
 #include "hc/Front/IR/HCFrontOpsDialect.cpp.inc"

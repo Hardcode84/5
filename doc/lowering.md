@@ -60,11 +60,11 @@ The frontend implementation may still be split internally into:
 
 * source recovery and AST parsing,
 * a restricted AST visitor,
-* a tiny emitter interface whose real implementation constructs `hc.front`.
+* a tiny emitter interface whose real implementation constructs `hc_front`.
 
 This split is about code structure and testability, not about introducing a
 third compiler IR. The emitter boundary should be designed around the intended
-`hc.front` operation set and should stay close to it.
+`hc_front` operation set and should stay close to it.
 
 Milestone 0 should assume kernels, helpers, and intrinsic fallback bodies are
 defined in importable `.py` files where source recovery succeeds.
@@ -117,27 +117,26 @@ Everything else should be rejected explicitly.
 This keeps the frontend small while still covering the current language design.
 A bootstrap fake emitter may still start narrower, for example by only
 accepting `for` over `range(...)` in its first milestone. However, the real
-`hc.front` boundary should preserve source forms such as generic `For`,
+`hc_front` boundary should preserve source forms such as generic `For`,
 tuple-shaped or subscript assignment targets, and `AugAssign`, leaving any
-desugaring to later legalization out of `hc.front`.
+desugaring to later legalization out of `hc_front`.
 
 ## Frontend dialect
 
 The first IR form should be MLIR, not a Python semantic IR. This document uses
-`hc.front` as the textual name of the frontend IR family.
+`hc_front` as the textual name of the frontend IR family.
 
-In the current native bootstrap implementation, that frontend family lives
-inside the registered MLIR dialect namespace `hc`. Textual IR therefore still
-spells frontend operations and types as `hc.front.*` and `!hc.front.*`, while
-tooling such as `--show-dialects` reports the top-level dialect name `hc`.
+In the current native bootstrap implementation, that frontend family lives in
+its own registered MLIR dialect namespace `hc_front`. Textual IR therefore
+spells frontend operations and types as `hc_front.*` and `!hc_front.*`.
 
-`hc.front` should be source-faithful and intentionally low intelligence. It is
+`hc_front` should be source-faithful and intentionally low intelligence. It is
 not the semantic source of truth for the language; it is a serialized AST-like
 form that feeds the real MLIR compiler pipeline.
 
-### Design principles for `hc.front`
+### Design principles for `hc_front`
 
-`hc.front` should:
+`hc_front` should:
 
 * preserve source-level structure closely,
 * keep source locations on every op,
@@ -148,67 +147,67 @@ form that feeds the real MLIR compiler pipeline.
 The recommended frontend boundary is therefore:
 
 * the AST visitor targets a tiny emitter protocol,
-* the real emitter builds textual or builder-based `hc.front`,
+* the real emitter builds textual or builder-based `hc_front`,
 * test emitters may record the same boundary for unit tests.
 
-That protocol should expose only operations that closely mirror `hc.front`
+That protocol should expose only operations that closely mirror `hc_front`
 construction, such as beginning a kernel/function, emitting constants/calls,
 opening structured regions, and emitting returns. It should not become a rich
 Python IR with independent semantics.
 
-### Suggested `hc.front` operation set
+### Suggested `hc_front` operation set
 
 The exact set can evolve, but an initial frontend dialect may include:
 
-* `hc.front.kernel`
-* `hc.front.func`
-* `hc.front.intrinsic`
-* `hc.front.constant`
-* `hc.front.name`
-* `hc.front.assign`
-* `hc.front.aug_assign`
-* `hc.front.target_name`
-* `hc.front.target_tuple`
-* `hc.front.target_subscript`
-* `hc.front.attr`
-* `hc.front.subscript`
-* `hc.front.slice`
-* `hc.front.call`
-* `hc.front.keyword`
-* `hc.front.tuple`
-* `hc.front.list`
-* `hc.front.binop`
-* `hc.front.unaryop`
-* `hc.front.compare`
-* `hc.front.if`
-* `hc.front.for`
-* `hc.front.return`
-* `hc.front.subgroup_region`
-* `hc.front.workitem_region`
+* `hc_front.kernel`
+* `hc_front.func`
+* `hc_front.intrinsic`
+* `hc_front.constant`
+* `hc_front.name`
+* `hc_front.assign`
+* `hc_front.aug_assign`
+* `hc_front.target_name`
+* `hc_front.target_tuple`
+* `hc_front.target_subscript`
+* `hc_front.attr`
+* `hc_front.subscript`
+* `hc_front.slice`
+* `hc_front.call`
+* `hc_front.keyword`
+* `hc_front.tuple`
+* `hc_front.list`
+* `hc_front.binop`
+* `hc_front.unaryop`
+* `hc_front.compare`
+* `hc_front.if`
+* `hc_front.for`
+* `hc_front.return`
+* `hc_front.subgroup_region`
+* `hc_front.workitem_region`
 
-Control ops such as `hc.front.if` and `hc.front.for` should own regions for
+Control ops such as `hc_front.if` and `hc_front.for` should own regions for
 their structural parts rather than introducing separate top-level ops just for
 `condition`, `then`, `else`, `target`, `iter`, or `body`.
 
 This is intentionally more source-faithful than the narrowest bootstrap fake
 emitter. For example, if a helper or intrinsic fallback spells a loop as
 `for index, row in enumerate(rows):` or uses `accum += x`, that syntax should
-survive into `hc.front` rather than being rewritten in Python. If the semantic
+survive into `hc_front` rather than being rewritten in Python. If the semantic
 dialect later wants only `for_range` or plain assignment, that rewrite should
-happen in `hc.front` to `hc` legalization.
+happen in `hc_front` to `hc` legalization.
 
 ### Frontend type strategy
 
-To keep the AST translation layer dumb, `hc.front` may use a very small set of
-opaque placeholder types such as:
+To keep the AST translation layer dumb, `hc_front` may use a very small set of
+opaque frontend types such as:
 
-* `!hc.front.value` for expression results,
-* `!hc.front.typeexpr` for annotation/type syntax when needed.
+* `!hc_front.value` for expression results,
+* `!hc_front.typeexpr` for annotation/type syntax when needed.
 
 Names, decorators, annotations, and literal syntax can remain as attributes or
 frontend ops until MLIR legalization resolves them.
 
-Region ops such as `hc.front.subgroup_region` and `hc.front.workitem_region`
+Region ops such as `hc_front.subgroup_region` and `hc_front.workitem_region`
 should also carry explicit syntactic capture lists naming outer bindings
 referenced in the nested body. Recording lexical captures is still frontend
 serialization, not semantic capture analysis.
@@ -216,12 +215,11 @@ serialization, not semantic capture analysis.
 ## Semantic dialect
 
 The real compiler IR should be a separate semantic layer. This document uses
-`hc` as the placeholder name for that layer.
+`hc` as the semantic dialect for that layer.
 
-The current bootstrap integration does not yet require a second registered MLIR
-dialect namespace for that layer. Later semantic operations may initially live
-alongside the frontend `front.*` family under the same top-level `hc`
-namespace, or move to a sibling namespace once the semantic IR stabilizes.
+The current bootstrap integration now uses a second registered MLIR dialect
+namespace for that layer: `hc_front` stays source-faithful, while `hc` carries
+the semantic IR.
 
 `hc` is where the language becomes semantic rather than syntactic. It should
 own:
@@ -233,42 +231,41 @@ own:
 * intrinsic contracts,
 * specialization and launch/resource validation hooks.
 
-### Suggested `hc` type strategy
+### Current `hc` type strategy
 
-The initial semantic dialect may use:
+The current semantic dialect exposes:
 
 * `!hc.buffer<...>`
 * `!hc.tensor<...>`
-* `!hc.vector<...>`
 * builtin scalar/index types where appropriate
 
-Mask and layout information may initially live partly in dedicated ops and
-attributes rather than being forced fully into types.
+The current symbolic surface for those types lives in attrs such as:
 
-### Suggested `hc` operation set
+* `#hc.expr<...>`
+* `#hc.pred<...>`
+* `#hc.shape<[...]>`
+* `#hc.constraints<[...]>`
 
-An initial set may include:
+### Current `hc` operation set
+
+The current semantic dialect includes:
 
 * `hc.kernel`
 * `hc.func`
-* `hc.tensor.alloc`
-* `hc.vector.alloc`
-* `hc.load`
-* `hc.vload`
-* `hc.store`
-* `hc.mask`
-* `hc.with_inactive`
-* `hc.as_layout`
 * `hc.subgroup_region`
 * `hc.workitem_region`
-* `hc.intrinsic.call`
+* `hc.return`
+
+That is intentionally only the initial semantic shell. Data movement, layout,
+masking, intrinsic, and tensor/vector execution ops should be added later as
+the `hc_front` to `hc` legalization pipeline grows.
 
 ## Compile-time and launch-time ownership
 
 The lowering stack has three authority layers:
 
 * the Python frontend, which recovers source, preserves syntax, and emits
-  `hc.front`,
+  `hc_front`,
 * compile-time MLIR, which builds and verifies symbolic `hc`,
 * a launcher/specialization driver, which binds literal symbols and concrete
   launch values, chooses default `group_shape`, and drives launch-time
@@ -295,12 +292,12 @@ The Python side should only:
 
 * reject unsupported syntax,
 * preserve source structure,
-* emit `hc.front` IR.
+* emit `hc_front` IR.
 
-Postcondition: the module contains only `hc.front` syntax plus builtin/module
+Postcondition: the module contains only `hc_front` syntax plus builtin/module
 attributes needed to preserve source structure.
 
-### `hc.front` to `hc` legalization
+### `hc_front` to `hc` legalization
 
 The first real compiler stage should:
 
@@ -325,7 +322,7 @@ These MLIR passes should:
 * make captured and region-carried values explicit enough for later scope and
   barrier verification.
 
-Postcondition: no unresolved `hc.front.name`-style bindings remain in semantic
+Postcondition: no unresolved `hc_front.name`-style bindings remain in semantic
 IR, and loop/region-carried state is explicit.
 
 ### Semantic inference and verification
@@ -409,13 +406,13 @@ Reasons:
 
 The recommended implementation pattern is to keep the AST visitor independent of
 the final emission format by targeting a very small emitter interface. The
-initial real emitter may still produce textual `hc.front` directly, while test
+initial real emitter may still produce textual `hc_front` directly, while test
 emitters record visitor actions without needing the real MLIR dialect
 implementation.
 
 However, the generated MLIR should now be treated as the primary compiler IR,
 not as a serialization target for a Python semantic IR. The Python frontend may
-emit textual `hc.front`, and all substantial compiler work starts once that IR
+emit textual `hc_front`, and all substantial compiler work starts once that IR
 is parsed by MLIR.
 
 Textual emission is the bootstrap path, not a forever constraint. Later
@@ -427,10 +424,10 @@ without changing the phase boundaries described here.
 Milestone 0 should be backed by:
 
 * unit tests for the AST visitor using a tiny fake recording emitter that
-  mirrors the `hc.front` boundary closely enough to validate syntax handling,
+  mirrors the `hc_front` boundary closely enough to validate syntax handling,
   scoping, decorator capture, unsupported-construct diagnostics, and region
   structure,
-* golden `hc.front` and `hc` textual MLIR tests that parse and verify in CI,
+* golden `hc_front` and `hc` textual MLIR tests that parse and verify in CI,
 * a small shared corpus of kernels cross-checked against the simulator in
   `doc/simulator.md` for defined inputs and launch failures,
 * explicit tests for source-capture failures and unsupported environments.
@@ -445,19 +442,19 @@ The fake emitter should record only frontend-structural events, for example:
 
 A bootstrap fake emitter may still use a narrower event vocabulary such as
 `for_range` while the visitor subset is intentionally restricted. The real
-`hc.front` dialect should remain the source of truth for the broader
+`hc_front` dialect should remain the source of truth for the broader
 source-faithful operation set above.
 
 It must not become a separately designed frontend IR with its own invariants.
 Its purpose is only to test that the AST visitor walks and classifies the
-supported Python subset correctly before the real `hc.front` dialect exists or
+supported Python subset correctly before the real `hc_front` dialect exists or
 while its builder/textual APIs are still in flux.
 
 ## Dialect strategy
 
 The initial lowering should assume at least two custom dialects:
 
-* `hc.front` for source-faithful AST serialization,
+* `hc_front` for source-faithful AST serialization,
 * `hc` for semantic kernel IR.
 
 Standard dialects should be introduced once `hc` is semantically well-formed,
@@ -470,7 +467,7 @@ compiler logic in one place instead of splitting it between Python and MLIR.
 
 ### Tensors
 
-Tensor syntax should first be emitted as `hc.front` operations without Python
+Tensor syntax should first be emitted as `hc_front` operations without Python
 side type interpretation. MLIR legalization should then recognize tensor
 constructs and build typed `hc` tensor operations carrying shape, dtype, and
 layout semantics.
@@ -493,7 +490,7 @@ attributes and a small number of semantic ops until more structure is needed.
 
 ### Masks
 
-Mask syntax should first be preserved in `hc.front`, then inferred and verified
+Mask syntax should first be preserved in `hc_front`, then inferred and verified
 in `hc`. The initial implementation may represent mask behavior through a mix
 of:
 
@@ -506,27 +503,27 @@ of:
 The current structured execution model maps naturally to region-bearing ops:
 
 * the enclosing `WorkGroup` body remains the top-level kernel region,
-* `@group.subgroups` should first lower to `hc.front.subgroup_region` and then
+* `@group.subgroups` should first lower to `hc_front.subgroup_region` and then
   to `hc.subgroup_region`,
-* `@group.workitems` should first lower to `hc.front.workitem_region` and then
+* `@group.workitems` should first lower to `hc_front.workitem_region` and then
   to `hc.workitem_region`.
 
 This keeps AST translation dumb while still preserving the structure needed for
 later scope verification and lowering.
 
-The `hc.front` region ops should preserve lexical capture lists so later passes
+The `hc_front` region ops should preserve lexical capture lists so later passes
 do not need to rediscover closure structure from arbitrary name use.
 
 ### Helper functions
 
-`@kernel.func` definitions should first lower to `hc.front.func`. MLIR passes
+`@kernel.func` definitions should first lower to `hc_front.func`. MLIR passes
 may then turn them into `hc.func` symbols, inline them, or eventually lower
 them to internal `func.func` symbols. This choice must preserve language
 semantics, though compile time, debug information, and diagnostics may differ.
 
 ### Intrinsics
 
-`@kernel.intrinsic` definitions should first lower to `hc.front.intrinsic`.
+`@kernel.intrinsic` definitions should first lower to `hc_front.intrinsic`.
 Later MLIR passes should:
 
 * apply verify/infer hooks,
@@ -544,9 +541,9 @@ Implement:
 
 * source capture for supported `.py`-defined kernels,
 * AST parsing for straight-line kernels,
-* textual `hc.front` emission,
+* textual `hc_front` emission,
 * parsing/verifying that frontend MLIR,
-* `hc.front` to `hc` legalization for assignments, calls, and returns,
+* `hc_front` to `hc` legalization for assignments, calls, and returns,
 * SSA construction for straight-line blocks,
 * minimal `hc` typing plus explicit loads/stores and simple arithmetic on a
   narrow kernel family.
@@ -608,7 +605,7 @@ reductions and a richer NumPy surface are available.
 
 The initial compiler should aim to produce:
 
-* an `hc.front` form that preserves source structure, names, and unresolved
+* an `hc_front` form that preserves source structure, names, and unresolved
   calls closely,
 * a semantic `hc` form that still preserves:
 
@@ -619,7 +616,7 @@ The initial compiler should aim to produce:
   * enough shape/layout metadata for later lowering.
 
 Milestone 0 does not require immediate lowering to the final target dialect,
-but it does require a working `hc.front` to `hc` path and a correct and
+but it does require a working `hc_front` to `hc` path and a correct and
 inspectable semantic MLIR representation.
 
 ## Rationale

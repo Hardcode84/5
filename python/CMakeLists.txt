@@ -16,7 +16,7 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/HCFrontOps.td
   SOURCES
     dialects/hc_front.py
-  DIALECT_NAME hc
+  DIALECT_NAME hc_front
 )
 
 declare_mlir_python_extension(HCPythonSources.NanobindExtension

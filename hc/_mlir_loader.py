@@ -47,7 +47,7 @@ def _expected_package_root() -> Path:
         from build_tools import hc_native_tools, llvm_toolchain
     except ModuleNotFoundError as exc:
         raise ImportError(
-            "hc.mlir requires the managed hc.front Python bindings from a source "
+            "hc.mlir requires the managed hc_front Python bindings from a source "
             "checkout.\n"
             "Set HC_MLIR_PYTHON_PACKAGE_DIR to a built package root or run "
             f"`{_SOURCE_BOOTSTRAP_COMMAND}` from the checkout root."
@@ -121,7 +121,7 @@ def _missing_build_error(package_root: Path) -> ImportError:
             f"expected: {package_root / _PACKAGE_NAME / 'ir.py'}"
         )
     return ImportError(
-        "Managed hc.front Python bindings are not built for this checkout.\n"
+        "Managed hc_front Python bindings are not built for this checkout.\n"
         f"Run `{_SOURCE_BOOTSTRAP_COMMAND}` and restart the interpreter.\n"
         f"expected: {package_root / _PACKAGE_NAME / 'ir.py'}"
     )

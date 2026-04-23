@@ -8,18 +8,16 @@
 include "mlir/IR/OpBase.td"
 
 def HCFront_Dialect : Dialect {
-  let name = "hc";
-  let summary = "Project hc dialect hosting the source-faithful front.* IR family.";
+  let name = "hc_front";
+  let summary = "Project hc frontend dialect for source-faithful AST serialization.";
   let description = [{
-    The `hc` MLIR dialect currently hosts the `front.*` source-faithful IR
-    family used to serialize the supported Python AST subset. Textual frontend
-    IR therefore appears as operations such as `hc.front.kernel` and types such
-    as `!hc.front.value`, even though the registered dialect namespace reported
-    by MLIR tooling is `hc`.
+    The `hc_front` MLIR dialect is the source-faithful frontend IR used to
+    serialize the supported Python AST subset before semantic legalization into
+    the separate `hc` dialect.
 
-    This bootstrap layout keeps the frontend surface low-intelligence and
-    source-preserving while leaving room for later semantic hc operations to
-    live under the same top-level project dialect namespace.
+    Textual frontend IR therefore appears as operations such as
+    `hc_front.kernel` and types such as `!hc_front.value`. The generated C++
+    API remains in the `mlir::hc::front` namespace.
   }];
   let cppNamespace = "::mlir::hc::front";
   let useDefaultTypePrinterParser = 1;

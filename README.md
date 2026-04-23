@@ -104,13 +104,15 @@ under `.hc/toolchains/llvm/` (or the directory pointed to by
 
 The repository now also carries a small CMake project that builds `hc-opt`
 against the pinned MLIR install. This initial bring-up intentionally uses only
-stock MLIR registrations plus the first out-of-tree frontend `hc.front.*` IR
+stock MLIR registrations plus the first out-of-tree frontend `hc_front.*` IR
 family. No custom conversions or passes are added yet.
 
-MLIR currently registers that bootstrap family under the top-level dialect name
-`hc`, so tooling such as `hc-opt --show-dialects` reports `hc` even though the
-textual frontend operations and types are spelled `hc.front.*` and
-`!hc.front.*`.
+MLIR now registers that bootstrap frontend as its own standalone dialect, so
+textual frontend operations and types are spelled `hc_front.*` and
+`!hc_front.*`.
+
+Older textual IR that used the bootstrap `hc.front.*` / `!hc.front.*` spelling
+must be renamed to `hc_front.*` / `!hc_front.*`.
 
 Wheel and editable package builds place the native install under the gitignored
 project-local cache at `.hc/native/install/<toolchain-key>/`. The resulting
@@ -151,8 +153,8 @@ native install as `hc-opt`.
 different `hc_mlir` from elsewhere on `PYTHONPATH`; mixed installs fail fast on
 purpose instead of silently crossing runtime and native-build roots.
 
-That `hc-opt` build now registers the frontend `hc.front.*` operations and can
-parse textual frontend IR using placeholder types such as `!hc.front.value`.
+That `hc-opt` build now registers the frontend `hc_front.*` operations and can
+parse textual frontend IR using placeholder types such as `!hc_front.value`.
 The Python bindings expose the same placeholder surface through
 `hc.mlir.dialects.hc_front.ValueType` and
 `hc.mlir.dialects.hc_front.TypeExprType`.
@@ -160,7 +162,7 @@ The Python bindings expose the same placeholder surface through
 The smoke tests in `tests/test_hc_front_dialect.py` and
 `tests/test_hc_front_python_bindings.py` exercise that real native tool path.
 They will reuse or bootstrap the pinned LLVM/MLIR toolchain and the native
-`hc-opt` build on demand. To skip those `hc.front` native smoke tests, set
+`hc-opt` build on demand. To skip those `hc_front` native smoke tests, set
 `HC_SKIP_HC_FRONT_DIALECT_TESTS=1`. Unlike `HC_SKIP_LLVM_BOOTSTRAP`, this only
 affects those pytest modules; it does not change package-build bootstrap
 behavior.

@@ -21,6 +21,12 @@ def HC_Dialect : Dialect {
   let extraClassDeclaration = [{
     void registerAttributes();
     void registerTypes();
+
+    sym::Store &getSymbolStore();
+    const sym::Store &getSymbolStore() const;
+
+  private:
+    std::unique_ptr<sym::Store> symbolStore;
   }];
 }
 

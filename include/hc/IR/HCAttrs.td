@@ -14,38 +14,64 @@ class HC_Attr<string name, string attrMnemonic, list<Trait> traits = []>
   let mnemonic = attrMnemonic;
 }
 
+def HC_ExprHandleParameter
+    : AttrParameter<"::mlir::hc::sym::ExprHandle",
+                    "symbolic expression handle"> {
+  let parser = "::mlir::hc::sym::parseExprHandle($_parser)";
+  let printer = "::mlir::hc::sym::printExprHandle($_printer, $_self)";
+}
+
+def HC_PredHandleParameter
+    : AttrParameter<"::mlir::hc::sym::PredHandle",
+                    "symbolic predicate handle"> {
+  let parser = "::mlir::hc::sym::parsePredHandle($_parser)";
+  let printer = "::mlir::hc::sym::printPredHandle($_printer, $_self)";
+}
+
 def HC_ExprAttr : HC_Attr<"Expr", "expr"> {
   let summary = "Symbolic expression attribute";
   let description = [{
-    Initial attribute for semantic symbolic expressions. The current
-    implementation stores textual payload so the IR surface can stabilize before
-    the direct `ixsimpl` handle-backed implementation lands.
+    Semantic symbolic expression attribute backed by an imported `ixsimpl`
+    expression node in the dialect-owned symbolic store.
   }];
-  let parameters = (ins StringRefParameter<"expression text">:$text);
-  let assemblyFormat = "`<` $text `>`";
+  let parameters = (ins HC_ExprHandleParameter:$value);
+  let assemblyFormat = "`<` $value `>`";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    const ixs_node *getNode() const { return getValue().raw(); }
+  }];
 }
 
 def HC_PredAttr : HC_Attr<"Pred", "pred"> {
   let summary = "Symbolic predicate attribute";
   let description = [{
-    Initial attribute for semantic symbolic predicates. As with `#hc.expr`, the
-    current implementation keeps textual payload for now and is intended to be
-    replaced by direct `ixsimpl` handles in a follow-on change.
+    Semantic symbolic predicate attribute backed by an imported `ixsimpl`
+    predicate node in the dialect-owned symbolic store.
   }];
-  let parameters = (ins StringRefParameter<"predicate text">:$text);
-  let assemblyFormat = "`<` $text `>`";
+  let parameters = (ins HC_PredHandleParameter:$value);
+  let assemblyFormat = "`<` $value `>`";
+  let genVerifyDecl = 1;
+  let extraClassDeclaration = [{
+    const ixs_node *getNode() const { return getValue().raw(); }
+  }];
 }
 
 def HC_ShapeAttr : HC_Attr<"Shape", "shape"> {
-  let summary = "Shape tuple built from expression-like attributes";
+  let summary = "Shape tuple built from symbolic expression dimensions";
+  let description = [{
+    Stores `#hc.expr` dimension attributes internally while printing them as a
+    compact list of symbolic strings, for example `#hc.shape<["M", "N + 1"]>`.
+  }];
   let parameters = (ins ArrayRefParameter<"Attribute">:$dims);
-  let assemblyFormat = "`<` `[` $dims `]` `>`";
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
 }
 
 def HC_ConstraintSetAttr : HC_Attr<"ConstraintSet", "constraints"> {
-  let summary = "Set of predicate-like attributes";
+  let summary = "Set of `#hc.pred` attributes";
   let parameters = (ins ArrayRefParameter<"Attribute">:$predicates);
   let assemblyFormat = "`<` `[` $predicates `]` `>`";
+  let genVerifyDecl = 1;
 }
 
 #endif // HC_IR_HCATTRS

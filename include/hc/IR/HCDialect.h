@@ -5,7 +5,10 @@
 #ifndef HC_IR_HCDIALECT_H
 #define HC_IR_HCDIALECT_H
 
+#include "hc/IR/HCSymbols.h"
 #include "mlir/IR/Dialect.h"
+
+#include <memory>
 
 #include "hc/IR/HCOpsDialect.h.inc"
 

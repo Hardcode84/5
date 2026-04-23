@@ -6,6 +6,7 @@ add_mlir_dialect_library(MLIRHCDialect
   HCAttrs.cpp
   HCDialect.cpp
   HCOps.cpp
+  HCSymbols.cpp
   HCTypes.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -17,6 +18,7 @@ add_mlir_dialect_library(MLIRHCDialect
   MLIRHCTypesIncGen
 
   LINK_LIBS PUBLIC
+  HCIXSimpl
   MLIRIR
 )
 

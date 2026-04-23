@@ -74,4 +74,29 @@ def HC_ConstraintSetAttr : HC_Attr<"ConstraintSet", "constraints"> {
   let genVerifyDecl = 1;
 }
 
+def HC_ScopeAttr : HC_Attr<"Scope", "scope"> {
+  let summary = "Kernel execution scope.";
+  let description = [{
+    One of `"WorkGroup"`, `"SubGroup"`, or `"WorkItem"`. Used by
+    `hc.intrinsic` declarations and by the `hc.workitem_region` /
+    `hc.subgroup_region` structuring ops so later passes can dispatch per-scope
+    without string-matching mnemonics.
+  }];
+  let parameters = (ins StringRefParameter<"scope name">:$name);
+  let assemblyFormat = "`<` $name `>`";
+  let genVerifyDecl = 1;
+}
+
+def HC_EffectsAttr : HC_Attr<"Effects", "effects"> {
+  let summary = "Effect class advertised by an `hc.intrinsic` declaration.";
+  let description = [{
+    One of `"Pure"`, `"Read"`, `"Write"`, `"ReadWrite"`. Passes that care about
+    reordering intrinsics (e.g. `hc.wave_barrier`, a hypothetical pure dot
+    intrinsic) read this attribute instead of reasoning about op traits.
+  }];
+  let parameters = (ins StringRefParameter<"effect class">:$kind);
+  let assemblyFormat = "`<` $kind `>`";
+  let genVerifyDecl = 1;
+}
+
 #endif // HC_IR_HCATTRS

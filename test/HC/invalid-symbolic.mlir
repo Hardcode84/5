@@ -40,3 +40,21 @@ module {
     hc.return
   }
 }
+
+// -----
+
+// CHECK: error: expected #hc.scope to be one of "WorkGroup", "SubGroup", "WorkItem"
+module {
+  func.func @bad() attributes {scope = #hc.scope<"Lane">} {
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: expected #hc.effects to be one of "Pure", "Read", "Write", "ReadWrite"
+module {
+  func.func @bad() attributes {effects = #hc.effects<"Weird">} {
+    return
+  }
+}

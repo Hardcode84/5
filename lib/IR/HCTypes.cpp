@@ -11,7 +11,62 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
+#include <string>
+
+using namespace mlir;
 using namespace mlir::hc;
+
+namespace {
+
+// `!hc.idx` and `!hc.pred` inline their symbolic text as a quoted string.
+// Parsing routes through the dialect-owned ixsimpl store; printing reuses the
+// canonical ixsimpl-rendered form so the handle-backed attribute stays the
+// single source of truth.
+
+template <typename HandleT>
+using StoreParser = FailureOr<HandleT> (*)(sym::Store &, llvm::StringRef,
+                                           std::string *);
+
+// Accepts either the inline form (`"expr"`, the canonical printer output) or
+// the explicit attribute form (`#hc.expr<"expr">`). `parseOptionalString`
+// returns `success` iff the next token is a string literal, so we can branch
+// on it without lookahead hacks.
+template <typename AttrT, typename HandleT, StoreParser<HandleT> ParseFn>
+FailureOr<AttrT> parseInlineOrAttrForm(AsmParser &parser,
+                                       llvm::StringRef what) {
+  llvm::SMLoc loc = parser.getCurrentLocation();
+  std::string text;
+  if (succeeded(parser.parseOptionalString(&text))) {
+    std::string diagnostic;
+    auto *dialect = parser.getContext()->getOrLoadDialect<HCDialect>();
+    FailureOr<HandleT> handle =
+        ParseFn(dialect->getSymbolStore(), text, &diagnostic);
+    if (failed(handle)) {
+      parser.emitError(loc, diagnostic.empty()
+                                ? llvm::Twine("invalid ") + what + " text"
+                                : llvm::Twine(diagnostic));
+      return failure();
+    }
+    return AttrT::get(parser.getContext(), *handle);
+  }
+  Attribute raw;
+  if (parser.parseAttribute(raw))
+    return failure();
+  AttrT attr = llvm::dyn_cast<AttrT>(raw);
+  if (!attr) {
+    parser.emitError(loc) << "expected " << what << " attribute or inline text";
+    return failure();
+  }
+  return attr;
+}
+
+void printInlineNode(AsmPrinter &printer, MLIRContext *ctx,
+                     const ixs_node *node) {
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  printer.printString(store.render(node));
+}
+
+} // namespace
 
 #define GET_TYPEDEF_CLASSES
 #include "hc/IR/HCTypes.cpp.inc"
@@ -39,4 +94,55 @@ mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
   if (!shape)
     return emitError() << "expected #hc.shape attribute";
   return success();
+}
+
+mlir::LogicalResult
+mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
+                             Type elementType, ShapeAttr shape) {
+  (void)elementType;
+  if (!shape)
+    return emitError() << "expected #hc.shape attribute";
+  return success();
+}
+
+Type IdxType::parse(AsmParser &parser) {
+  if (failed(parser.parseOptionalLess()))
+    return IdxType::get(parser.getContext(), ExprAttr{});
+
+  FailureOr<ExprAttr> expr =
+      parseInlineOrAttrForm<ExprAttr, sym::ExprHandle, sym::parseExpr>(
+          parser, "hc.expr");
+  if (failed(expr) || parser.parseGreater())
+    return {};
+  return IdxType::get(parser.getContext(), *expr);
+}
+
+void IdxType::print(AsmPrinter &printer) const {
+  ExprAttr expr = getExpr();
+  if (!expr)
+    return;
+  printer << "<";
+  printInlineNode(printer, getContext(), expr.getNode());
+  printer << ">";
+}
+
+Type PredType::parse(AsmParser &parser) {
+  if (failed(parser.parseOptionalLess()))
+    return PredType::get(parser.getContext(), PredAttr{});
+
+  FailureOr<PredAttr> pred =
+      parseInlineOrAttrForm<PredAttr, sym::PredHandle, sym::parsePred>(
+          parser, "hc.pred");
+  if (failed(pred) || parser.parseGreater())
+    return {};
+  return PredType::get(parser.getContext(), *pred);
+}
+
+void PredType::print(AsmPrinter &printer) const {
+  PredAttr pred = getPred();
+  if (!pred)
+    return;
+  printer << "<";
+  printInlineNode(printer, getContext(), pred.getNode());
+  printer << ">";
 }

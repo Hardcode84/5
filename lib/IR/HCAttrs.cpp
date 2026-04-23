@@ -157,3 +157,20 @@ ConstraintSetAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   }
   return success();
 }
+
+LogicalResult ScopeAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                StringRef name) {
+  if (name != "WorkGroup" && name != "SubGroup" && name != "WorkItem")
+    return emitError() << "expected #hc.scope to be one of \"WorkGroup\", "
+                          "\"SubGroup\", \"WorkItem\"";
+  return success();
+}
+
+LogicalResult EffectsAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                  StringRef kind) {
+  if (kind != "Pure" && kind != "Read" && kind != "Write" &&
+      kind != "ReadWrite")
+    return emitError() << "expected #hc.effects to be one of \"Pure\", "
+                          "\"Read\", \"Write\", \"ReadWrite\"";
+  return success();
+}

@@ -109,3 +109,20 @@ hc.func @fail_after_valid_prefix(%a: !hc.undef) -> !hc.undef {
   %y = hc.name_load "y" : !hc.undef
   hc.return %y : !hc.undef
 }
+
+// -----
+
+// `hc.region_return` naming a binding that the body never assigns and
+// the enclosing scope doesn't carry either: the pass captures it with
+// an outer snap, but the outer flat sweep can't find a reaching
+// `hc.assign` and errors on the boundary snap load. The region ends
+// up promoted (lazy-capture path already ran), but the outer callable
+// body fails verification — the load the region emitted at its
+// insertion point is the one the error points at.
+hc.kernel @region_return_unbound() {
+  // expected-error @+1 {{read of name 'never_assigned' that has no reaching `hc.assign`}}
+  hc.workitem_region {
+    hc.region_return ["never_assigned"]
+  }
+  hc.return
+}

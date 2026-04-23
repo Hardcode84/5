@@ -24,9 +24,12 @@
 // style nested name scope — writes inside shadow any outer binding
 // and don't leak out, but reads **do** capture outer bindings: an
 // unbound read falls back to an outer-scope snapshot materialized
-// lazily by the pass. Plumbing a write back out (the "return acc"
-// pattern) needs an ODS-level result extension on those ops —
-// separate change, not in this file.
+// lazily by the pass. Explicit write-out (the "return acc" pattern)
+// is handled here too: a body terminated by `hc.region_return <names>`
+// tells the pass which in-scope bindings to surface as region
+// results — the pass rebuilds the op with matching `$results`,
+// rewrites the terminator into `hc.yield`, and writes the new
+// results back into the enclosing name store.
 
 #include "hc/Transforms/Passes.h"
 
@@ -486,37 +489,145 @@ static LogicalResult promoteIf(HCIfOp op) {
 }
 
 // Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as a
-// Python-style nested scope: writes shadow outer bindings and don't
-// leak out; reads capture them via a lazy `hc.name_load` emitted at
-// the region op's insertion point, which the outer flat sweep then
-// resolves against the outer name store. `promoteForRange` /
-// `promoteIf` are **transparent** carriers (names flow in and out
-// via iter_args / results); these are **barriers** in the write-out
-// direction, so the shape here collapses to "scan with capture
-// factory" — no rebuild, no writeback. Out-bound propagation (the
-// "return acc" pattern) needs an ODS-level result extension on
-// these ops — separate change.
+// Python-style nested scope. Two shapes, picked by inspecting the
+// body's terminator:
 //
-// By the time we reach here, the post-order walk has already
-// promoted every inner NameStoreRegionOpInterface op; their
-// transient snap/writeback pairs sit at this body's top level and
-// get resolved by the same flat sweep, capturing upward through the
-// region op if needed.
+//   * No `hc.region_return` — body is side-effect only. Scan with a
+//     lazy outer-capture factory; no rebuild, no writeback. Writes
+//     shadow locally (the `hc.assign`s are erased along with their
+//     name); reads hit local bindings first and fall back to a
+//     boundary `hc.name_load` that the outer flat sweep resolves.
+//     `promoteForRange` / `promoteIf` are transparent carriers (names
+//     flow in *and out* via iter_args / results); this shape is a
+//     **one-way barrier** — reads cross, writes don't.
+//
+//   * Body ends with `hc.region_return <names>` — the frontend's
+//     "return acc" hand-off. Rebuild the op with one `!hc.undef`
+//     result per carried name, take the old body, scan it (same lazy
+//     capture), resolve each carried name against the final binding,
+//     swap the terminator for `hc.yield`, and writeback the new
+//     results as outer-level `hc.assign`s. From the outer scope's
+//     perspective this matches the for_range / if promotion shape —
+//     the same two-phase (scan → writeback) protocol, and the same
+//     flat-sweep fusion downstream.
+//
+// By the time we reach here the post-order walk has already promoted
+// every inner `NameStoreRegionOpInterface` op; their transient snap/
+// writeback pairs sit at this body's top level and get resolved by
+// the same scan, capturing upward through the region op if needed.
 static LogicalResult promoteNestedScope(Operation *op) {
   Region &body = op->getRegion(0);
   if (body.empty())
     return success();
+  Block &bodyBlock = body.front();
 
   MLIRContext *ctx = op->getContext();
   Type undefTy = UndefType::get(ctx);
   Location loc = op->getLoc();
+
   OpBuilder outerBuilder(op);
   auto capture = [&](StringAttr name) -> Value {
     return HCNameLoadOp::create(outerBuilder, loc, undefTy, name).getResult();
   };
 
+  // Scan-only shape: no terminator or a non-return terminator means
+  // there's nothing to surface. Writes stay local, reads capture via
+  // the lazy factory, and the op stays result-less.
+  HCRegionReturnOp regionReturn;
+  if (!bodyBlock.empty())
+    regionReturn = dyn_cast<HCRegionReturnOp>(bodyBlock.back());
+  if (!regionReturn) {
+    llvm::StringMap<Value> binding;
+    return scanAndPromoteBlock(bodyBlock, binding, capture);
+  }
+
+  // "Return acc" shape. Collect the names (frontend-ordered) and
+  // rebuild the op with a matching `!hc.undef` result per name.
+  // Types stay `!hc.undef` here — type inference later narrows them
+  // via the yield operands.
+  SmallVector<StringAttr> carried;
+  carried.reserve(regionReturn.getNames().size());
+  for (Attribute a : regionReturn.getNames())
+    carried.push_back(cast<StringAttr>(a));
+
+  SmallVector<Type> newResultTypes(carried.size(), undefTy);
+  ArrayAttr captures = op->getAttrOfType<ArrayAttr>("captures");
+
+  // Only the op-kind choice needs a typed case; the rest of the
+  // surgery is type-erased through `Operation *`.
+  Operation *newOp = nullptr;
+  if (isa<HCWorkitemRegionOp>(op)) {
+    newOp =
+        HCWorkitemRegionOp::create(outerBuilder, loc, newResultTypes, captures);
+  } else if (isa<HCSubgroupRegionOp>(op)) {
+    newOp =
+        HCSubgroupRegionOp::create(outerBuilder, loc, newResultTypes, captures);
+  } else {
+    llvm::report_fatal_error(
+        "hc-promote-names: promoteNestedScope dispatched on an op kind it "
+        "doesn't know how to rebuild (pass invariant violation)");
+  }
+  newOp->getRegion(0).takeBody(body);
+  Block &newBody = newOp->getRegion(0).front();
+
+  // Rewind the outer builder so capture snaps land *before* `newOp`,
+  // not after. `create` left the builder positioned past `newOp`.
+  outerBuilder.setInsertionPoint(newOp);
+
+  // Same lazy-capture scan as the scan-only shape; reads unbound
+  // locally still reach an outer-scope snapshot.
+  //
+  // Outer IR has already been restructured here (`takeBody` moved
+  // the body out of the old op), so a soft `return failure()` would
+  // leave a torn module. Preflight guarantees no user-facing
+  // diagnostic remains — the only way the scan can fail now is a
+  // pass-invariant break, which we surface loudly.
   llvm::StringMap<Value> binding;
-  return scanAndPromoteBlock(body.front(), binding, capture);
+  if (failed(scanAndPromoteBlock(newBody, binding, capture)))
+    llvm::report_fatal_error(
+        "hc-promote-names: scan of nested-scope region body failed after "
+        "the outer IR was already restructured (pass invariant violation)");
+
+  // A carried name the body never references (no in-body assign, no
+  // in-body load) is still legal — the frontend is asking for the
+  // outer binding to be threaded through. The scan can't have seen
+  // it, so we materialize the outer snap ourselves, using the same
+  // capture factory and while `outerBuilder` is still positioned
+  // before `newOp` (scan snaps stacked there too).
+  for (StringAttr name : carried) {
+    if (binding.find(name.getValue()) == binding.end())
+      binding[name.getValue()] = capture(name);
+  }
+
+  // Terminator rewrite: `hc.region_return ["n1", "n2"]` →
+  // `hc.yield %v1, %v2`. `scanAndPromoteBlock` skipped the
+  // terminator, so it's still the original `hc.region_return`.
+  auto term = cast<HCRegionReturnOp>(newBody.back());
+  SmallVector<Value> yieldValues;
+  yieldValues.reserve(carried.size());
+  for (StringAttr name : carried) {
+    auto it = binding.find(name.getValue());
+    if (it == binding.end())
+      llvm::report_fatal_error(
+          llvm::Twine("hc-promote-names: carried name '") + name.getValue() +
+          "' missing from binding at region_return rewrite "
+          "(pass invariant violation)");
+    yieldValues.push_back(it->second);
+  }
+  OpBuilder termBuilder(term);
+  HCYieldOp::create(termBuilder, term.getLoc(), yieldValues);
+  term.erase();
+
+  // Writeback: each new result lands as `hc.assign "<name>", %result`
+  // at the enclosing scope, where the outer flat sweep fuses it into
+  // downstream reads — the same shape `promoteForRange` / `promoteIf`
+  // leave behind.
+  outerBuilder.setInsertionPointAfter(newOp);
+  writebackCarriedResults(outerBuilder, loc, newOp, carried,
+                          /*carriedResultsStart=*/0);
+
+  op->erase();
+  return success();
 }
 
 // Per-op-kind dispatch. The `NameStoreRegionOpInterface` marker is

@@ -407,3 +407,238 @@ hc.func @workitem_capturing_for(%lo: !hc.undef, %hi: !hc.undef,
   %final = hc.name_load "acc" : !hc.undef
   hc.return %final : !hc.undef
 }
+
+// -----
+
+// "Return acc" shape on `hc.workitem_region`. The body assigns `acc`
+// locally, then `hc.region_return ["acc"]` asks the pass to lift that
+// binding as the op's result. Post-promotion the region carries one
+// `!hc.undef` result, the terminator is `hc.yield %acc`, and the
+// outer scope consumes that result through the writeback assign —
+// which the flat sweep then fuses into the outer `hc.name_load "acc"`.
+// CHECK-LABEL: hc.func @workitem_return_local
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   %[[ADD:.*]] = hc.add %arg0, %arg1
+// CHECK:   hc.yield %[[ADD]] : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @workitem_return_local(%a: !hc.undef,
+                               %b: !hc.undef) -> !hc.undef {
+  hc.workitem_region {
+    %sum = hc.add %a, %b : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "acc", %sum : !hc.undef
+    hc.region_return ["acc"]
+  }
+  %v = hc.name_load "acc" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Same shape on `hc.subgroup_region` — covers the second op kind so
+// the dispatch-case hasn't bit-rotted.
+// CHECK-LABEL: hc.func @subgroup_return_local
+// CHECK: %[[R:.*]] = hc.subgroup_region -> (!hc.undef) {
+// CHECK:   hc.yield %arg0 : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @subgroup_return_local(%x: !hc.undef) -> !hc.undef {
+  hc.subgroup_region {
+    hc.assign "out", %x : !hc.undef
+    hc.region_return ["out"]
+  }
+  %v = hc.name_load "out" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Multi-name return: two bindings surface as a `(!hc.undef, !hc.undef)`
+// result pair. The frontend order in `hc.region_return` is preserved
+// result-by-result; the writeback assigns land one per name and the
+// outer reads pick up the matching result.
+// CHECK-LABEL: hc.func @workitem_return_multi
+// CHECK: %[[R:.*]]:2 = hc.workitem_region -> (!hc.undef, !hc.undef) {
+// CHECK:   hc.yield %arg0, %arg1 : !hc.undef, !hc.undef
+// CHECK: }
+// CHECK: %[[SUM:.*]] = hc.add %[[R]]#0, %[[R]]#1
+// CHECK: hc.return %[[SUM]]
+hc.func @workitem_return_multi(%a: !hc.undef,
+                               %b: !hc.undef) -> !hc.undef {
+  hc.workitem_region {
+    hc.assign "lhs", %a : !hc.undef
+    hc.assign "rhs", %b : !hc.undef
+    hc.region_return ["lhs", "rhs"]
+  }
+  %l = hc.name_load "lhs" : !hc.undef
+  %r = hc.name_load "rhs" : !hc.undef
+  %sum = hc.add %l, %r : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return %sum : !hc.undef
+}
+
+// -----
+
+// Capture-in + return-out round-trip. The body reads `seed` (bound in
+// the enclosing kernel) via the lazy outer snap, assigns `acc`, and
+// returns it. Post-promotion:
+//   - no outer snap for `seed` shows up as an `hc.name_load`
+//     *outside* the region op (the flat sweep resolves it against
+//     the outer `hc.assign "seed", %init`);
+//   - the region op has one `!hc.undef` result;
+//   - the writeback + outer load on `acc` collapses into a direct
+//     use of that result.
+// CHECK-LABEL: hc.func @workitem_capture_then_return
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   %[[SUM:.*]] = hc.add %arg0, %arg1
+// CHECK:   hc.yield %[[SUM]] : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @workitem_capture_then_return(%init: !hc.undef,
+                                      %delta: !hc.undef) -> !hc.undef {
+  hc.assign "seed", %init : !hc.undef
+  hc.workitem_region {
+    %s = hc.name_load "seed" : !hc.undef
+    %sum = hc.add %s, %delta : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "acc", %sum : !hc.undef
+    hc.region_return ["acc"]
+  }
+  %v = hc.name_load "acc" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Return shape composed with an inner `hc.for_range`. The loop promotes
+// first (post-order), leaving its snap/writeback assigns at the region
+// body's top level; the region then scans, picks up the final `acc`
+// binding (the loop's writeback), and returns it. Verifies that inner
+// and outer carrying mechanisms plumb together cleanly — the region's
+// result is the loop's accumulator, propagated through a single
+// `hc.yield` rather than a chain of intermediate assigns.
+// CHECK-LABEL: hc.func @subgroup_return_after_inner_for
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.subgroup_region -> (!hc.undef) {
+// CHECK:   %[[LOOP:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%arg3)
+// CHECK-NEXT:   ^bb0(%[[IV:.*]]: !hc.undef, %[[ACC:.*]]: !hc.undef):
+// CHECK:          %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
+// CHECK:          hc.yield %[[SUM]] : !hc.undef
+// CHECK:   hc.yield %[[LOOP]] : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @subgroup_return_after_inner_for(%lo: !hc.undef, %hi: !hc.undef,
+                                         %step: !hc.undef,
+                                         %init: !hc.undef) -> !hc.undef {
+  hc.subgroup_region {
+    hc.assign "acc", %init : !hc.undef
+    hc.for_range %lo to %hi step %step
+        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+    ^bb0(%iv: !hc.undef):
+      %cur = hc.name_load "acc" : !hc.undef
+      %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+      hc.assign "acc", %next : !hc.undef
+      hc.yield
+    }
+    hc.region_return ["acc"]
+  }
+  %v = hc.name_load "acc" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Return shape composed with an inner `hc.if`. Both branches assign
+// `acc`; the if-promotion produces an `hc.if -> (!hc.undef)` whose
+// result becomes the region's `acc` binding, which in turn surfaces
+// as the region's result.
+// CHECK-LABEL: hc.func @workitem_return_after_inner_if
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   %[[IF:.*]] = hc.if %arg0 -> (!hc.undef) : !hc.undef {
+// CHECK:     hc.yield %arg1 : !hc.undef
+// CHECK:   } else {
+// CHECK:     hc.yield %arg2 : !hc.undef
+// CHECK:   }
+// CHECK:   hc.yield %[[IF]] : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @workitem_return_after_inner_if(%cond: !hc.undef,
+                                        %a: !hc.undef,
+                                        %b: !hc.undef) -> !hc.undef {
+  hc.workitem_region {
+    hc.if %cond : !hc.undef {
+      hc.assign "acc", %a : !hc.undef
+      hc.yield
+    } else {
+      hc.assign "acc", %b : !hc.undef
+      hc.yield
+    }
+    hc.region_return ["acc"]
+  }
+  %v = hc.name_load "acc" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Writes that aren't listed in `hc.region_return` still shadow — the
+// outer `"only_outer"` binding survives the region untouched. The
+// region-level `"leaked"` assign disappears (erased with its name),
+// but the outer `hc.assign "only_outer"` is the reaching def for the
+// outer `hc.name_load "only_outer"`.
+// CHECK-LABEL: hc.func @workitem_return_shadow_other
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   hc.yield %arg1 : !hc.undef
+// CHECK: }
+// CHECK: %[[SUM:.*]] = hc.add %arg0, %[[R]]
+// CHECK: hc.return %[[SUM]]
+hc.func @workitem_return_shadow_other(%outer: !hc.undef,
+                                      %inner: !hc.undef) -> !hc.undef {
+  hc.assign "only_outer", %outer : !hc.undef
+  hc.workitem_region {
+    hc.assign "leaked", %inner : !hc.undef
+    hc.assign "returned", %inner : !hc.undef
+    hc.region_return ["returned"]
+  }
+  %o = hc.name_load "only_outer" : !hc.undef
+  %r = hc.name_load "returned" : !hc.undef
+  %sum = hc.add %o, %r : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return %sum : !hc.undef
+}
+
+// -----
+
+// `hc.region_return` names a binding the body never touches (no
+// in-region `hc.assign` or `hc.name_load` for it). The scan can't see
+// it, so the pass has to materialize the outer snap itself when
+// wiring up the yield. Behaviourally: the region op becomes a
+// pass-through for `%outer` — outer assign → snap → yield → writeback
+// → outer read, with the flat sweep collapsing the whole chain.
+// CHECK-LABEL: hc.func @workitem_return_passthrough
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK-NOT: hc.region_return
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   hc.yield %arg0 : !hc.undef
+// CHECK: }
+// CHECK: hc.return %[[R]]
+hc.func @workitem_return_passthrough(%outer: !hc.undef) -> !hc.undef {
+  hc.assign "v", %outer : !hc.undef
+  hc.workitem_region {
+    hc.region_return ["v"]
+  }
+  %v = hc.name_load "v" : !hc.undef
+  hc.return %v : !hc.undef
+}

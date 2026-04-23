@@ -20,16 +20,11 @@
 //
 // Implemented in this file: flat-body sweep, `hc.for_range` promotion,
 // `hc.if` promotion, nested-scope sweep for `hc.workitem_region` /
-// `hc.subgroup_region`. The two region ops introduce a new Python-
-// style nested name scope — writes inside shadow any outer binding
-// and don't leak out, but reads **do** capture outer bindings: an
-// unbound read falls back to an outer-scope snapshot materialized
-// lazily by the pass. Explicit write-out (the "return acc" pattern)
-// is handled here too: a body terminated by `hc.region_return <names>`
-// tells the pass which in-scope bindings to surface as region
-// results — the pass rebuilds the op with matching `$results`,
-// rewrites the terminator into `hc.yield`, and writes the new
-// results back into the enclosing name store.
+// `hc.subgroup_region`. The nested-scope sweep is Python-style —
+// writes shadow without leaking, reads capture the outer binding,
+// and an `hc.region_return` terminator lifts named bindings as
+// region results. `promoteNestedScope` documents the two body
+// shapes in detail; this banner stops at the policy level.
 
 #include "hc/Transforms/Passes.h"
 

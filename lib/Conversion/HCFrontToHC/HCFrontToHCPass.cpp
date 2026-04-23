@@ -1078,11 +1078,10 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // parameters we still bind them as block args so the body resolves,
   // but the `hc` op carries only a captures list (no formal params).
   //
-  // Results are empty at the lowering stage. The frontend communicates
-  // intent to carry a value out by emitting `hc.region_return <names>`
-  // inside the body (when it grows support for it); `-hc-promote-names`
-  // then rebuilds the op with matching `$results`. This pass doesn't
-  // pre-declare result types.
+  // Lowering always emits a results-less region. Intent to carry a
+  // value out travels through an `hc.region_return <names>`
+  // terminator in the body; `-hc-promote-names` then rebuilds the
+  // op with matching `$results`.
   auto newOp =
       HCRegionOpT::create(builder, op.getLoc(),
                           /*resultTypes=*/TypeRange{}, op.getCapturesAttr());

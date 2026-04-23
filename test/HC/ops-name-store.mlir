@@ -106,8 +106,8 @@ hc.kernel @region_body_name_store {
 
 // `hc.region_return` — pre-promotion terminator for nested-scope
 // regions. Names the imperative bindings whose current value should
-// become the enclosing region's result. The parent op stays results-
-// less at this stage; promotion rebuilds it with `-> (...)` and
+// become the enclosing region's result. The parent op declares no
+// results at this stage; promotion rebuilds it with `-> (...)` and
 // swaps the terminator for `hc.yield`.
 // CHECK-LABEL: hc.kernel @region_return_pre_promotion
 // CHECK: hc.workitem_region {

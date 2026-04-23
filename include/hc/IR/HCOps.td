@@ -109,11 +109,14 @@ def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
 // leak, reads capture outer bindings (see `NameStoreRegionOpInterface`
 // and `-hc-promote-names`). The `$results` list surfaces values that
 // the body elects to push out — pre-promotion the body terminates with
-// `hc.region_return "name", ...` naming the bindings to lift; the
+// `hc.region_return ["name", ...]` naming the bindings to lift; the
 // promoter resolves those names, rewrites the terminator into
-// `hc.yield`, and extends the op's results to match. An empty `$results`
-// list + no terminator is the legal "side-effect only" form the
-// frontend emits before promotion.
+// `hc.yield`, and extends the op's results to match. An empty
+// `$results` list plus no terminator (or a `hc.region_return`
+// terminator to be lowered) is the legal "side-effect only" /
+// "pre-promotion" form the frontend emits before promotion; the
+// verifier enforces that `$results`-declaring shape always pairs with
+// a concrete `hc.yield` of matching arity and type.
 def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
     [NameStoreRegionOpInterface]> {
   let summary = "Semantic subgroup region.";
@@ -124,6 +127,7 @@ def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
     (`captures` `=` $captures^)? (`->` `(` type($results)^ `)`)?
       attr-dict-with-keyword $body
   }];
+  let hasVerifier = 1;
 }
 
 def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
@@ -136,6 +140,7 @@ def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
     (`captures` `=` $captures^)? (`->` `(` type($results)^ `)`)?
       attr-dict-with-keyword $body
   }];
+  let hasVerifier = 1;
 }
 
 def HCReturnOp : HC_Op<"return"> {
@@ -319,13 +324,16 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
 def HCYieldOp : HC_Op<"yield",
     [Pure, Terminator,
      ParentOneOf<["HCForRangeOp", "HCIfOp",
-                  "HCWorkitemRegionOp", "HCSubgroupRegionOp"]>]> {
-  let summary = "Terminator for region ops that carry values out.";
+                  "HCSubgroupRegionOp", "HCWorkitemRegionOp"]>]> {
+  let summary =
+      "Terminator for `hc.for_range` / `hc.if` / nested-scope regions.";
   let description = [{
     Yields loop-carried, if-produced, or region-return values back to
     the enclosing op. Value count must match the parent op's result
-    count; verification of that happens on the parent op so the error
-    message references the right operation.
+    count; verification of that runs on the parent op (`hc.for_range`,
+    `hc.if`, `hc.workitem_region`, `hc.subgroup_region`) so the
+    diagnostic points at the op that declares the result signature,
+    not at the terminator.
 
     For `hc.workitem_region` / `hc.subgroup_region` the yield is the
     post-`-hc-promote-names` form — pre-promotion the body terminates
@@ -342,9 +350,9 @@ def HCYieldOp : HC_Op<"yield",
 
 def HCRegionReturnOp : HC_Op<"region_return",
     [Terminator,
-     ParentOneOf<["HCWorkitemRegionOp", "HCSubgroupRegionOp"]>]> {
+     ParentOneOf<["HCSubgroupRegionOp", "HCWorkitemRegionOp"]>]> {
   let summary =
-      "Transient terminator naming bindings a nested-scope region lifts out.";
+      "Transient terminator: names the bindings this region lifts as results.";
   let description = [{
     Pre-promotion marker emitted by the frontend. `$names` lists, in
     order, the imperative name-store slots whose current binding should
@@ -354,9 +362,16 @@ def HCRegionReturnOp : HC_Op<"region_return",
     parent region op's `$results` to match. Does not survive past
     `-hc-promote-names`; any `hc.region_return` that reaches a later
     pass is a driver bug.
+
+    Each name must appear at most once: the promoter produces one
+    result per entry and threads one writeback assign per entry into
+    the enclosing name store, so duplicates would mean two results
+    sharing a name — ambiguous writeback order, and nothing good on
+    the read side either.
   }];
   let arguments = (ins StrArrayAttr:$names);
   let assemblyFormat = "$names attr-dict";
+  let hasVerifier = 1;
 }
 
 def HCForRangeOp : HC_Op<"for_range",

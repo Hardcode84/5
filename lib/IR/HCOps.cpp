@@ -540,6 +540,86 @@ LogicalResult HCForRangeOp::verify() {
   return success();
 }
 
+// Shared verifier for `hc.workitem_region` / `hc.subgroup_region`.
+//
+// Two legal body shapes:
+//   1. `$results` empty — pre-promotion, side-effect-only, or
+//      `hc.return` fall-through. We don't care what the terminator is
+//      (or whether one exists at all: `NoTerminator` is the trait).
+//   2. `$results` non-empty — post-promotion. Body must end with
+//      `hc.yield`, arity matches `$results`, each value's type is
+//      compatible with the corresponding result type (`!hc.undef`
+//      escape applies on either side, matching progressive typing).
+//
+// A `hc.region_return` terminator combined with non-empty `$results`
+// is the frontend contradicting itself — "pre-promotion" (the
+// terminator) and "post-promotion" (declared results) simultaneously.
+// That falls out of the rule above: path 2 requires `hc.yield`, so
+// `hc.region_return` there is rejected.
+static LogicalResult verifyNestedScopeRegion(Operation *op) {
+  if (op->getNumResults() == 0)
+    return success();
+  Region &body = op->getRegion(0);
+  if (body.empty() || body.front().empty())
+    return op->emitOpError("declares ")
+           << op->getNumResults() << " result(s) but body is empty";
+  Operation *term = &body.front().back();
+  auto yield = dyn_cast<HCYieldOp>(term);
+  if (!yield)
+    return op->emitOpError("declares results; body must terminate with "
+                           "`hc.yield`, got ")
+           << term->getName();
+  if (yield.getValues().size() != op->getNumResults())
+    return op->emitOpError("body yield produces ")
+           << yield.getValues().size() << " values, expected "
+           << op->getNumResults();
+  for (auto [idx, pair] :
+       llvm::enumerate(llvm::zip_equal(yield.getValues(), op->getResults()))) {
+    auto [yielded, result] = pair;
+    Type yieldedTy = yielded.getType();
+    Type resultTy = result.getType();
+    if (yieldedTy == resultTy || isUndef(yieldedTy) || isUndef(resultTy))
+      continue;
+    return op->emitOpError("body yield[")
+           << idx << "] type " << yieldedTy << " does not match result[" << idx
+           << "] type " << resultTy;
+  }
+  return success();
+}
+
+LogicalResult HCWorkitemRegionOp::verify() {
+  return verifyNestedScopeRegion(*this);
+}
+
+LogicalResult HCSubgroupRegionOp::verify() {
+  return verifyNestedScopeRegion(*this);
+}
+
+// Each `$names` entry stands for one result + one writeback assign
+// once `-hc-promote-names` rebuilds the parent region. Two entries
+// naming the same slot would produce two results for the same name
+// and two same-named writebacks in the enclosing store — ambiguous
+// on the write side, meaningless on the read side. The
+// `StrArrayAttr` ODS constraint guarantees element types, but a
+// defensive re-check keeps the diagnostic tied to this op if a
+// future type relaxation ever changes that.
+LogicalResult HCRegionReturnOp::verify() {
+  llvm::SmallPtrSet<StringAttr, 4> seen;
+  for (auto [idx, raw] : llvm::enumerate(getNames())) {
+    auto name = llvm::dyn_cast<StringAttr>(raw);
+    if (!name)
+      return emitOpError("`names[")
+             << idx << "]` is not a StringAttr (got " << raw << ")";
+    if (!seen.insert(name).second)
+      return emitOpError("duplicate name '")
+             << name.getValue()
+             << "' in `names`; each entry surfaces as a distinct result and "
+             << "spawns one writeback assign — duplicates would alias on "
+             << "both sides";
+  }
+  return success();
+}
+
 LogicalResult HCIfOp::verify() {
   // The yield in each non-empty region must produce values matching the op's
   // result types. `!hc.undef` on either side is accepted so pre-inference IR

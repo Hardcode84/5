@@ -525,3 +525,72 @@ hc.func @bad(%a: i32, %b: f32) -> i32 {
 hc.intrinsic @bad(%a: i32) -> i32 scope = #hc.scope<"WorkItem"> {
   hc.return %a, %a : i32, i32
 }
+
+// -----
+
+// `hc.workitem_region` with declared results must terminate with
+// `hc.yield`. A `hc.region_return` terminator here is contradictory:
+// it's the pre-promotion form while the op is simultaneously claiming
+// post-promotion shape (non-empty `$results`). Most producers hit this
+// through a builder bug; the frontend emits `hc.region_return` only on
+// results-less region ops.
+// CHECK: error: 'hc.workitem_region' op declares results; body must terminate with `hc.yield`, got hc.region_return
+hc.kernel @bad {
+  hc.workitem_region -> (!hc.undef) {
+    hc.region_return ["x"]
+  }
+  hc.return
+}
+
+// -----
+
+// Yield arity must match declared results.
+// CHECK: error: 'hc.workitem_region' op body yield produces 1 values, expected 2
+hc.kernel @bad {
+  %v = hc.const<1 : i64> : !hc.undef
+  hc.workitem_region -> (!hc.undef, !hc.undef) {
+    hc.yield %v : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// Concrete yield type disagreement with declared result type is caught;
+// the `!hc.undef` escape applies on either side so pre-inference IR
+// still round-trips.
+// CHECK: error: 'hc.subgroup_region' op body yield[0] type 'i32' does not match result[0] type 'i64'
+hc.kernel @bad {
+  %v = hc.const<1 : i32> : i32
+  %r = hc.subgroup_region -> (i64) {
+    hc.yield %v : i32
+  }
+  hc.return
+}
+
+// -----
+
+// Same verifier runs on `hc.subgroup_region`. Arity-zero yield is a
+// separate case from type-mismatch so a future divergence between
+// the two region kinds fails here, not silently passes.
+// CHECK: error: 'hc.subgroup_region' op body yield produces 0 values, expected 1
+hc.kernel @bad {
+  hc.subgroup_region -> (!hc.undef) {
+    hc.yield
+  }
+  hc.return
+}
+
+// -----
+
+// `hc.region_return` with a duplicate name: two entries would spawn two
+// results and two writebacks for the same Python-level slot.
+// CHECK: error: 'hc.region_return' op duplicate name 'acc' in `names`
+hc.kernel @bad {
+  %v = hc.const<1 : i64> : !hc.undef
+  hc.workitem_region {
+    hc.assign "acc", %v : !hc.undef
+    hc.region_return ["acc", "acc"]
+  }
+  hc.return
+}

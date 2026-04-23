@@ -91,9 +91,7 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
 //   be bound (via the seeded keys, a prior in-block assign, or
 //   `capture`); every `NameStoreRegionOpInterface` op must have an
 //   assign/load-free subtree. The first violation emits a diagnostic
-//   and returns `failure()` before any IR mutation — so a failing
-//   block stays recoverable by the enclosing pipeline and no half-
-//   rewritten module escapes.
+//   and returns `failure()` before any IR mutation.
 //
 //   Phase 2 (commit): preflight proved every read resolves, so this
 //   sweep can't emit diagnostics. `hc.assign` binds, `hc.name_load`
@@ -101,6 +99,18 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
 //   `capture()` call, and residual ops get erased in one pass at the
 //   end. `NameStoreRegionOpInterface` ops are already known clean
 //   from preflight; the commit loop skips them.
+//
+// Atomicity guarantee: **within a single call**, either every
+// in-`block` mutation runs or none do. That is the guarantee the
+// callable-level flat sweep in `promoteCallable` relies on — a
+// failing user body bubbles out as a clean pass failure. It is
+// **not** a pipeline-wide guarantee: `promoteForRange` / `promoteIf`
+// restructure the outer IR (`takeBody`, result-extended clone)
+// before calling this function, so if the scan failed there, the
+// module would still be torn. Those callers sidestep the problem by
+// seeding `binding` with every reachable name and then treating any
+// scan failure as a pass-invariant break (fatal abort), not a
+// recoverable failure — see their call sites for the rationale.
 //
 // The `capture` factory is a capture-from-outer-scope hook: invoked
 // only on truly unbound reads, its returned Value seeds the binding
@@ -111,6 +121,8 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
 static LogicalResult scanAndPromoteBlock(Block &block,
                                          llvm::StringMap<Value> &binding,
                                          SnapFactory capture = nullptr) {
+  // Phase 1 (preflight): validate every reachable name has a binding
+  // without mutating any IR. Diagnostics fire here, not in phase 2.
   {
     llvm::StringSet<> bound;
     for (const auto &kv : binding)
@@ -159,6 +171,10 @@ static LogicalResult scanAndPromoteBlock(Block &block,
     }
   }
 
+  // Phase 2 (commit): preflight passed, so every load is guaranteed
+  // resolvable. The only failure mode here would be a preflight/commit
+  // desync (future-us rewrites one without the other) — handled with a
+  // loud, release-safe abort rather than a stripped-under-NDEBUG assert.
   SmallVector<Operation *> toErase;
   for (Operation &op : block.without_terminator()) {
     if (auto assign = dyn_cast<HCAssignOp>(&op)) {
@@ -172,8 +188,11 @@ static LogicalResult scanAndPromoteBlock(Block &block,
       if (it != binding.end()) {
         resolved = it->second;
       } else {
-        assert(capture && "preflight must have admitted this load via "
-                          "the capture factory");
+        if (!capture)
+          llvm::report_fatal_error(
+              llvm::Twine("hc-promote-names: load of name '") + load.getName() +
+              "' reached commit phase unbound with no capture factory "
+              "(preflight/commit desync, pass invariant violation)");
         resolved = capture(load.getNameAttr());
         binding[load.getName()] = resolved;
       }
@@ -320,10 +339,11 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   //
   // `binding` is seeded with `readSet ∪ writeSet`, which by construction
   // covers every top-level `hc.name_load` in `body`, so the scan cannot
-  // emit the reaching-def diagnostic here. A `failure()` return would
-  // indicate a post-order invariant break (inner NameStoreRegionOpInterface
-  // op not yet promoted) — `scanAndPromoteBlock`'s stale-op check is
-  // the explicit backstop for that.
+  // emit the reaching-def diagnostic here. The only remaining failure
+  // mode is the stale-NameStoreRegionOpInterface check — a pass bug,
+  // not a frontend bug. By this point we've already restructured the
+  // outer IR (new op + `takeBody`), so a soft `return failure()` would
+  // leak a torn module; abort fatally instead.
   llvm::StringMap<Value> binding;
   for (StringAttr name : snapshot)
     binding[name.getValue()] = snapValues[name];
@@ -331,7 +351,9 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
     binding[name.getValue()] = iterArgFor[name];
 
   if (failed(scanAndPromoteBlock(body, binding)))
-    return failure();
+    llvm::report_fatal_error(
+        "hc-promote-names: scan of `hc.for_range` body failed after the "
+        "outer IR was already restructured (pass invariant violation)");
 
   rewriteYieldWithCarried(body, binding, carried, loc);
 
@@ -430,26 +452,26 @@ static LogicalResult promoteIf(HCIfOp op) {
   // Per-branch scan. `binding` is seeded from the shared `snapshot`
   // set, which includes every in-branch read (see the `snapshot`
   // construction above), so `scanAndPromoteBlock` cannot hit the
-  // reaching-def diagnostic for either branch. A `failure()` here
-  // would mean a post-order invariant break — treated as a bug via
-  // the stale-op check inside the scan.
-  auto processBranch = [&](Block &block) -> LogicalResult {
+  // reaching-def diagnostic for either branch. The only remaining
+  // failure mode is the stale-NameStoreRegionOpInterface check — a
+  // pass bug, and the outer IR has already been restructured here,
+  // so any failure is treated as a fatal invariant break to avoid
+  // leaking a torn module.
+  auto processBranch = [&](Block &block) {
     llvm::StringMap<Value> binding;
     for (StringAttr name : snapshot)
       binding[name.getValue()] = snapValues[name];
     ensureYieldTerminator(block, loc);
     if (failed(scanAndPromoteBlock(block, binding)))
-      return failure();
+      llvm::report_fatal_error(
+          "hc-promote-names: scan of `hc.if` branch failed after the outer "
+          "IR was already restructured (pass invariant violation)");
     rewriteYieldWithCarried(block, binding, carried, loc);
-    return success();
   };
 
-  if (failed(processBranch(newOp.getThenRegion().front())))
-    return failure();
-  if (!newOp.getElseRegion().empty()) {
-    if (failed(processBranch(newOp.getElseRegion().front())))
-      return failure();
-  }
+  processBranch(newOp.getThenRegion().front());
+  if (!newOp.getElseRegion().empty())
+    processBranch(newOp.getElseRegion().front());
 
   builder.setInsertionPointAfter(newOp);
   writebackCarriedResults(builder, loc, newOp, carried,

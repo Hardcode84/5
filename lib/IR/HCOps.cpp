@@ -5,8 +5,11 @@
 #include "hc/IR/HCOps.h"
 
 #include "hc/IR/HCDialect.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
 
 using namespace mlir;
@@ -30,6 +33,371 @@ static Operation *tryGetTerminator(Block &block) {
   if (block.empty() || !block.mightHaveTerminator())
     return nullptr;
   return block.getTerminator();
+}
+
+//===----------------------------------------------------------------------===//
+// Shared signature parse/print/verify for `hc.kernel` / `hc.func` /
+// `hc.intrinsic`.
+//
+// All three advertise the same `@name (%a: T, ...) (-> T)?` surface so that
+// the `hc_front -> hc` lowering pass can emit kernel/func/intrinsic
+// parameters as real SSA block arguments. Block arg types mirror the
+// `function_type` inputs one-to-one. Signatures are optional: a bare
+// `hc.func @foo { ... }` keeps working while the frontend is incomplete —
+// in that case the body block must have no arguments either.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Parse an optional `(%arg0: T, %arg1: T) (-> T)?` signature. On success,
+// populates `arguments` with zero-or-more entry-block arguments and, when a
+// signature is present, stores the reconstructed `FunctionType` into
+// `functionTypeAttr`. When no leading `(` is seen, both outputs are left in
+// their default state so the caller can emit the legacy no-signature form.
+ParseResult parseOptionalFunctionSignature(
+    OpAsmParser &parser, SmallVectorImpl<OpAsmParser::Argument> &arguments,
+    TypeAttr &functionTypeAttr) {
+  if (!succeeded(parser.parseOptionalLParen()))
+    return success();
+  if (failed(parser.parseOptionalRParen())) {
+    if (failed(parser.parseArgumentList(arguments, AsmParser::Delimiter::None,
+                                        /*allowType=*/true,
+                                        /*allowAttrs=*/false)))
+      return failure();
+    if (failed(parser.parseRParen()))
+      return failure();
+  }
+  SmallVector<Type> resultTypes;
+  if (succeeded(parser.parseOptionalArrow())) {
+    // `-> T`, `-> (T0, T1)`, or `-> ()` all round-trip; drop into the
+    // parenthesised branch on an opening paren, otherwise read a single
+    // type.
+    if (succeeded(parser.parseOptionalLParen())) {
+      if (failed(parser.parseOptionalRParen())) {
+        if (failed(parser.parseTypeList(resultTypes)) ||
+            failed(parser.parseRParen()))
+          return failure();
+      }
+    } else {
+      Type ty;
+      if (failed(parser.parseType(ty)))
+        return failure();
+      resultTypes.push_back(ty);
+    }
+  }
+  SmallVector<Type> inputTypes;
+  inputTypes.reserve(arguments.size());
+  for (auto &arg : arguments)
+    inputTypes.push_back(arg.type);
+  auto fnType = FunctionType::get(parser.getContext(), inputTypes, resultTypes);
+  functionTypeAttr = TypeAttr::get(fnType);
+  return success();
+}
+
+// Print the inverse of `parseOptionalFunctionSignature`. When
+// `functionTypeAttr` is null we skip the signature entirely (legacy
+// no-args form); when it is present we pull argument names from the entry
+// block so round-trips preserve user-written `%group`/`%a`/etc.
+void printOptionalFunctionSignature(OpAsmPrinter &p, Operation *op,
+                                    TypeAttr functionTypeAttr, Region &body) {
+  if (!functionTypeAttr)
+    return;
+  auto fnType = llvm::cast<FunctionType>(functionTypeAttr.getValue());
+  p << '(';
+  // The verifier guarantees the entry block matches `function_type.inputs`
+  // whenever the op round-trips cleanly; the `size()` guard here is for
+  // pretty-printing IR that is mid-construction and still unverified (the
+  // legacy attribute-only declaration had no block args). Fall back to
+  // type-only printing in that narrow case so the printer never crashes.
+  Block &entry = body.front();
+  if (entry.getNumArguments() == fnType.getNumInputs()) {
+    llvm::interleaveComma(entry.getArguments(), p, [&](BlockArgument arg) {
+      p.printRegionArgument(arg);
+    });
+  } else {
+    llvm::interleaveComma(fnType.getInputs(), p,
+                          [&](Type t) { p.printType(t); });
+  }
+  p << ')';
+  ArrayRef<Type> results = fnType.getResults();
+  if (results.empty())
+    return;
+  p << " -> ";
+  if (results.size() == 1 && !llvm::isa<FunctionType>(results.front())) {
+    p.printType(results.front());
+  } else {
+    p << '(';
+    llvm::interleaveComma(results, p, [&](Type t) { p.printType(t); });
+    p << ')';
+  }
+}
+
+// Final glue: after the signature + any op-specific keyword pieces parse,
+// finish off the op by reading the attr-dict and body region with the
+// entry-block arguments we just parsed. Keeping this in one place keeps
+// the three callers identical.
+//
+// `SizedRegion<1>` on the op demands one block, but MLIR's region parser
+// produces an empty region for the `{}` source form — with or without a
+// declared signature. We back-fill an entry block (carrying the signature
+// arguments, when any) in that case so both the declaration form
+// (`hc.intrinsic @foo(%a: T) ... {}`) and the legacy no-signature form
+// (`hc.func @foo { ... }`) round-trip without tripping the region
+// constraint.
+ParseResult
+parseSignatureTailAndBody(OpAsmParser &parser, OperationState &result,
+                          ArrayRef<OpAsmParser::Argument> arguments) {
+  if (failed(parser.parseOptionalAttrDictWithKeyword(result.attributes)))
+    return failure();
+  Region *body = result.addRegion();
+  if (failed(parser.parseRegion(*body, arguments,
+                                /*enableNameShadowing=*/false)))
+    return failure();
+  if (body->empty()) {
+    Block &block = body->emplaceBlock();
+    for (auto &arg : arguments) {
+      Location loc =
+          arg.sourceLoc.value_or(UnknownLoc::get(parser.getContext()));
+      block.addArgument(arg.type, loc);
+    }
+  }
+  return success();
+}
+
+// Verify a region-bearing signature-carrying op: when `function_type` is
+// present, the entry block's arguments must match inputs one-for-one; when
+// it is absent, the entry block must have no arguments. Keeps verifier
+// error messages close to the op mnemonic.
+LogicalResult verifyFunctionSignature(Operation *op, TypeAttr functionTypeAttr,
+                                      Region &body) {
+  Block &entry = body.front();
+  if (!functionTypeAttr) {
+    if (entry.getNumArguments() != 0)
+      return op->emitOpError("body block has ")
+             << entry.getNumArguments()
+             << " argument(s) but no function_type is declared; add a "
+                "signature like `(%arg0 : T, ...)` or remove the block "
+                "arguments";
+    return success();
+  }
+  auto fnType = llvm::cast<FunctionType>(functionTypeAttr.getValue());
+  if (entry.getNumArguments() != fnType.getNumInputs())
+    return op->emitOpError("body block takes ")
+           << entry.getNumArguments()
+           << " argument(s) but function_type declares "
+           << fnType.getNumInputs() << " input(s)";
+  for (auto [i, blockArg, declared] :
+       llvm::enumerate(entry.getArguments(), fnType.getInputs())) {
+    if (blockArg.getType() != declared)
+      return op->emitOpError("body block argument #")
+             << i << " type " << blockArg.getType()
+             << " does not match function_type input " << declared;
+  }
+  return success();
+}
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// `hc.kernel`.
+//===----------------------------------------------------------------------===//
+
+ParseResult HCKernelOp::parse(OpAsmParser &parser, OperationState &result) {
+  StringAttr sym_nameAttr;
+  if (parser.parseSymbolName(sym_nameAttr, SymbolTable::getSymbolAttrName(),
+                             result.attributes))
+    return failure();
+
+  SmallVector<OpAsmParser::Argument> arguments;
+  TypeAttr functionTypeAttr;
+  if (parseOptionalFunctionSignature(parser, arguments, functionTypeAttr))
+    return failure();
+  if (functionTypeAttr)
+    result.addAttribute(getFunctionTypeAttrName(result.name), functionTypeAttr);
+
+  // `requirements = ...` predates the attr-dict form and reads more nicely
+  // inline, so we keep the keyword form and elide the attr from the
+  // automatic dict printing. `parseCustomAttributeWithFallback` pairs with
+  // the `printStrippedAttrOrType` in the printer so the `#hc.constraints`
+  // dialect prefix stays implicit in the textual IR.
+  if (succeeded(parser.parseOptionalKeyword("requirements"))) {
+    if (parser.parseEqual())
+      return failure();
+    ConstraintSetAttr req;
+    if (parser.parseCustomAttributeWithFallback(req, Type{}))
+      return failure();
+    result.addAttribute(getRequirementsAttrName(result.name), req);
+  }
+
+  return parseSignatureTailAndBody(parser, result, arguments);
+}
+
+void HCKernelOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printSymbolName(getSymName());
+  printOptionalFunctionSignature(p, *this, getFunctionTypeAttr(), getBody());
+  if (auto req = getRequirementsAttr()) {
+    // `printStrippedAttrOrType` matches the declarative-assembly-format
+    // convention and drops the `#hc.constraints` dialect prefix so the
+    // textual IR stays compact (`<[...]>` instead of
+    // `#hc.constraints<[...]>`).
+    p << " requirements = ";
+    p.printStrippedAttrOrType(req);
+  }
+  p.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName(),
+                       getRequirementsAttrName()});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
+LogicalResult HCKernelOp::verify() {
+  if (auto fnTypeAttr = getFunctionTypeAttr()) {
+    auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
+    if (!fnType.getResults().empty())
+      return emitOpError(
+          "kernel signatures must declare no results; kernels return via "
+          "an operand-less `hc.return`");
+  }
+  return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
+}
+
+//===----------------------------------------------------------------------===//
+// `hc.func`.
+//===----------------------------------------------------------------------===//
+
+ParseResult HCFuncOp::parse(OpAsmParser &parser, OperationState &result) {
+  StringAttr sym_nameAttr;
+  if (parser.parseSymbolName(sym_nameAttr, SymbolTable::getSymbolAttrName(),
+                             result.attributes))
+    return failure();
+
+  SmallVector<OpAsmParser::Argument> arguments;
+  TypeAttr functionTypeAttr;
+  if (parseOptionalFunctionSignature(parser, arguments, functionTypeAttr))
+    return failure();
+  if (functionTypeAttr)
+    result.addAttribute(getFunctionTypeAttrName(result.name), functionTypeAttr);
+
+  if (succeeded(parser.parseOptionalKeyword("requirements"))) {
+    if (parser.parseEqual())
+      return failure();
+    ConstraintSetAttr req;
+    if (parser.parseCustomAttributeWithFallback(req, Type{}))
+      return failure();
+    result.addAttribute(getRequirementsAttrName(result.name), req);
+  }
+  if (succeeded(parser.parseOptionalKeyword("effects"))) {
+    if (parser.parseEqual())
+      return failure();
+    EffectClassAttr eff;
+    if (parser.parseCustomAttributeWithFallback(eff, Type{}))
+      return failure();
+    result.addAttribute(getEffectsAttrName(result.name), eff);
+  }
+
+  return parseSignatureTailAndBody(parser, result, arguments);
+}
+
+void HCFuncOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printSymbolName(getSymName());
+  printOptionalFunctionSignature(p, *this, getFunctionTypeAttr(), getBody());
+  if (auto req = getRequirementsAttr()) {
+    p << " requirements = ";
+    p.printStrippedAttrOrType(req);
+  }
+  if (auto eff = getEffectsAttr()) {
+    p << " effects = ";
+    p.printStrippedAttrOrType(eff);
+  }
+  p.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName(),
+                       getRequirementsAttrName(), getEffectsAttrName()});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
+LogicalResult HCFuncOp::verify() {
+  return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
+}
+
+//===----------------------------------------------------------------------===//
+// `hc.intrinsic`.
+//===----------------------------------------------------------------------===//
+
+ParseResult HCIntrinsicOp::parse(OpAsmParser &parser, OperationState &result) {
+  StringAttr sym_nameAttr;
+  if (parser.parseSymbolName(sym_nameAttr, SymbolTable::getSymbolAttrName(),
+                             result.attributes))
+    return failure();
+
+  SmallVector<OpAsmParser::Argument> arguments;
+  TypeAttr functionTypeAttr;
+  if (parseOptionalFunctionSignature(parser, arguments, functionTypeAttr))
+    return failure();
+  if (functionTypeAttr)
+    result.addAttribute(getFunctionTypeAttrName(result.name), functionTypeAttr);
+
+  // `scope = #hc.scope<...>` is required on every intrinsic, so it is the
+  // one non-optional keyword here.
+  if (parser.parseKeyword("scope") || parser.parseEqual())
+    return failure();
+  ScopeAttr scope;
+  if (parser.parseCustomAttributeWithFallback(scope, Type{}))
+    return failure();
+  result.addAttribute(getScopeAttrName(result.name), scope);
+
+  if (succeeded(parser.parseOptionalKeyword("effects"))) {
+    if (parser.parseEqual())
+      return failure();
+    EffectClassAttr eff;
+    if (parser.parseCustomAttributeWithFallback(eff, Type{}))
+      return failure();
+    result.addAttribute(getEffectsAttrName(result.name), eff);
+  }
+  if (succeeded(parser.parseOptionalKeyword("const_kwargs"))) {
+    if (parser.parseEqual())
+      return failure();
+    ArrayAttr kwargs;
+    if (parser.parseAttribute(kwargs))
+      return failure();
+    result.addAttribute(getConstKwargsAttrName(result.name), kwargs);
+  }
+
+  return parseSignatureTailAndBody(parser, result, arguments);
+}
+
+void HCIntrinsicOp::print(OpAsmPrinter &p) {
+  p << ' ';
+  p.printSymbolName(getSymName());
+  printOptionalFunctionSignature(p, *this, getFunctionTypeAttr(), getBody());
+  p << " scope = ";
+  p.printStrippedAttrOrType(getScopeAttr());
+  if (auto eff = getEffectsAttr()) {
+    p << " effects = ";
+    p.printStrippedAttrOrType(eff);
+  }
+  if (auto kwargs = getConstKwargsAttr()) {
+    // `const_kwargs` is a plain builtin `ArrayAttr`, which has no dialect
+    // prefix to strip; `printAttribute` renders it as `["name", ...]`
+    // directly.
+    p << " const_kwargs = ";
+    p.printAttribute(kwargs);
+  }
+  p.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName(),
+                       getScopeAttrName(), getEffectsAttrName(),
+                       getConstKwargsAttrName()});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
+LogicalResult HCIntrinsicOp::verify() {
+  return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
 }
 
 LogicalResult HCSymbolOp::verify() {

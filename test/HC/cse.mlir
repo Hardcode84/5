@@ -56,7 +56,8 @@ func.func @pure_add_collapses(%a: !hc.undef, %b: !hc.undef)
 // Pure effect, so two identical calls CSE away — silent proof that the
 // interface is plumbed through and not just a label.
 
-hc.func @pure_helper : (!hc.undef, !hc.undef) -> !hc.undef effects = pure {
+hc.func @pure_helper(%a: !hc.undef, %b: !hc.undef) -> !hc.undef
+    effects = pure {
   hc.return
 }
 
@@ -75,7 +76,7 @@ func.func @pure_calls_collapse(%a: !hc.undef, %b: !hc.undef)
 // No effect class → conservative read_write default → CSE must *not* merge.
 // If this ever collapses, something removed the fallback in `getEffects`.
 
-hc.func @opaque_helper : (!hc.undef, !hc.undef) -> !hc.undef {
+hc.func @opaque_helper(%a: !hc.undef, %b: !hc.undef) -> !hc.undef {
   hc.return
 }
 

@@ -26,6 +26,12 @@
 // CHECK: hc.subgroup_region captures = ["lhs", "rhs"] {
 // CHECK: hc.workitem_region {
 // CHECK: hc.return
+// CHECK: hc.kernel @full_kernel(%arg0: !hc.buffer<f32, ["M", "N"]>, %arg1: !hc.buffer<f32, ["M", "N"]>)
+// CHECK-SAME: attributes {
+// CHECK-SAME: group_shape = #hc.shape<["32", "1"]>
+// CHECK-SAME: literals = ["WMMA_M", "WMMA_K"]
+// CHECK-SAME: subgroup_size = 32 : i32
+// CHECK-SAME: work_shape = #hc.shape<["M", "N"]>
 // CHECK: hc.func @tile_helper {
 
 module {
@@ -66,6 +72,20 @@ module {
         hc.return
       }
     }
+  }
+
+  // Launch-geometry attrs + explicit signature ride together on the same
+  // op; the attrs travel in the attr-dict so adding more of them later does
+  // not change the keyword syntax.
+  hc.kernel @full_kernel(%a: !hc.buffer<f32, ["M", "N"]>,
+                         %b: !hc.buffer<f32, ["M", "N"]>)
+      attributes {
+        work_shape = #hc.shape<["M", "N"]>,
+        group_shape = #hc.shape<["32", "1"]>,
+        subgroup_size = 32 : i32,
+        literals = ["WMMA_M", "WMMA_K"]
+      } {
+    hc.return
   }
 
   hc.func @tile_helper {

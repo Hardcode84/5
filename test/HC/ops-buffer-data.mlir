@@ -128,13 +128,13 @@ func.func @calls(%x: !hc.undef, %y: !hc.undef) {
 // visible to `verifySymbolUses`; call sites get arity/type parity checked.
 // `!hc.undef` on either side escapes the parity check (progressive typing).
 
-// CHECK: hc.func @typed_helper : (i32, i32) -> i32
-hc.func @typed_helper : (i32, i32) -> i32 {
+// CHECK: hc.func @typed_helper(%arg0: i32, %arg1: i32) -> i32
+hc.func @typed_helper(%a: i32, %b: i32) -> i32 {
   hc.return
 }
 
-// CHECK: hc.intrinsic @typed_intrinsic : (f32) -> f32 scope = <"WorkItem">
-hc.intrinsic @typed_intrinsic : (f32) -> f32 scope = #hc.scope<"WorkItem"> {}
+// CHECK: hc.intrinsic @typed_intrinsic(%arg0: f32) -> f32 scope = <"WorkItem">
+hc.intrinsic @typed_intrinsic(%x: f32) -> f32 scope = #hc.scope<"WorkItem"> {}
 
 // CHECK-LABEL: func.func @typed_calls
 // CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (i32, i32) -> i32

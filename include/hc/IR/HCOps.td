@@ -44,16 +44,30 @@ def HCKernelOp : HC_RegionOp<"kernel", [Symbol]> {
     Top-level compiled unit. Carries a module-scoped symbol name (`@name`) so
     call sites and specialization metadata can reference it by flat symbol
     ref instead of string lookup.
+
+    Kernel parameters live as SSA block arguments on the body's entry block;
+    the optional `function_type` attribute mirrors their types one-to-one
+    (when present) and declares the callable signature. Kernel result types
+    are forbidden — kernels terminate with an operand-less `hc.return`.
+
+    Decorator metadata arrives as optional attributes: symbolic `work_shape`
+    and `group_shape` as `#hc.shape`, `subgroup_size` as an `i32`, and
+    `literals` as a `StrArrayAttr` listing symbols that specialization is
+    allowed to bind. All are optional so the `hc_front -> hc` pass can fill
+    them in progressively.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
+    OptionalAttr<TypeAttrOf<FunctionType>>:$function_type,
+    OptionalAttr<HC_ShapeAttr>:$work_shape,
+    OptionalAttr<HC_ShapeAttr>:$group_shape,
+    OptionalAttr<I32Attr>:$subgroup_size,
+    OptionalAttr<StrArrayAttr>:$literals,
     OptionalAttr<HC_ConstraintSetAttr>:$requirements
   );
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = [{
-    $sym_name (`requirements` `=` $requirements^)?
-    attr-dict-with-keyword $body
-  }];
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
@@ -65,9 +79,12 @@ def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
     (`!hc.undef` on either side escapes the parity check, matching the
     progressive-typing policy).
 
-    Legacy frontend output may omit the signature; that keeps the op
-    parseable while types are inferred. Once inference finalizes a
-    signature, the attribute is added and stricter checks kick in.
+    Parameters live as block arguments of the body's entry block; their
+    types mirror `function_type` inputs one-to-one. Legacy frontend output
+    may omit the signature entirely, in which case the body block has no
+    arguments — that keeps the op parseable while types are inferred. Once
+    inference finalizes a signature, it is added and stricter checks kick
+    in.
 
     An optional `effects` enum (`pure | read | write | read_write`)
     advertises the callee's effect class. `hc.call` sites read it via
@@ -82,12 +99,8 @@ def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
     OptionalAttr<HC_EffectsAttr>:$effects
   );
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = [{
-    $sym_name (`:` $function_type^)?
-    (`requirements` `=` $requirements^)?
-    (`effects` `=` $effects^)?
-    attr-dict-with-keyword $body
-  }];
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region"> {
@@ -247,10 +260,12 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
     Analogous to `hc_front.intrinsic`; later passes dispatch on `scope` and
     `effects` without string-matching the mnemonic.
 
-    The body region holds verify/infer hooks, lowering recipes, or a
-    fallback body once those settle. An empty body is legal and denotes a
-    declaration-only intrinsic that later lowering patterns handle
-    directly.
+    Parameters — when a signature is present — live as block arguments of
+    the body's entry block; their types mirror `function_type` inputs
+    one-to-one. The body region holds verify/infer hooks, lowering
+    recipes, or a fallback body once those settle. An empty body is legal
+    and denotes a declaration-only intrinsic that later lowering patterns
+    handle directly.
 
     `const_kwargs` declares names that every `hc.call_intrinsic` for this
     callee must carry as specialization attributes (e.g. `wave_size`,
@@ -266,12 +281,8 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
     OptionalAttr<StrArrayAttr>:$const_kwargs
   );
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = [{
-    $sym_name (`:` $function_type^)?
-    `scope` `=` $scope (`effects` `=` $effects^)?
-    (`const_kwargs` `=` $const_kwargs^)?
-    attr-dict-with-keyword $body
-  }];
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def HCYieldOp : HC_Op<"yield",

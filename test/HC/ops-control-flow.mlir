@@ -15,6 +15,14 @@ hc.intrinsic @wave_barrier scope = #hc.scope<"SubGroup">
 // CHECK-NOT:  effects
 hc.intrinsic @subgroup_dot scope = #hc.scope<"SubGroup"> {}
 
+// Signature on an intrinsic declaration now shows as `(args) -> result`,
+// not the legacy `: (T) -> T` form. The body is still allowed to be empty
+// (pure declaration).
+// CHECK-LABEL: hc.intrinsic @typed_decl
+// CHECK-SAME: (%arg0: f32, %arg1: f32) -> f32 scope = <"WorkItem">
+hc.intrinsic @typed_decl(%a: f32, %b: f32) -> f32
+    scope = #hc.scope<"WorkItem"> {}
+
 // CHECK-LABEL: func.func @simple_for_range
 // CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> () {
 // CHECK: }

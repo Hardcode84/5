@@ -334,7 +334,7 @@ module {
 // Signature parity: wrong arity.
 // CHECK: error: 'hc.call' op callee '@typed' expects 2 argument(s), call site provides 1
 module {
-  hc.func @typed : (i32, i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return }
   func.func @bad(%a: i32) -> i32 {
     %r = hc.call @typed(%a) : (i32) -> i32
     return %r : i32
@@ -346,7 +346,7 @@ module {
 // Signature parity: wrong arg type, both sides concrete.
 // CHECK: error: 'hc.call' op arg #1 type 'f32' is incompatible with callee declaration 'i32'
 module {
-  hc.func @typed : (i32, i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return }
   func.func @bad(%a: i32, %b: f32) -> i32 {
     %r = hc.call @typed(%a, %b) : (i32, f32) -> i32
     return %r : i32
@@ -358,7 +358,7 @@ module {
 // Signature parity: wrong result type.
 // CHECK: error: 'hc.call' op result #0 type 'f32' is incompatible with callee declaration 'i32'
 module {
-  hc.func @typed : (i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32) -> i32 { hc.return }
   func.func @bad(%a: i32) -> f32 {
     %r = hc.call @typed(%a) : (i32) -> f32
     return %r : f32
@@ -370,7 +370,7 @@ module {
 // Signature parity: same story on `hc.call_intrinsic`.
 // CHECK: error: 'hc.call_intrinsic' op callee '@sized' expects 1 argument(s), call site provides 2
 module {
-  hc.intrinsic @sized : (i32) -> i32 scope = #hc.scope<"WorkItem"> {}
+  hc.intrinsic @sized(%a: i32) -> i32 scope = #hc.scope<"WorkItem"> {}
   func.func @bad(%a: i32, %b: i32) -> i32 {
     %r = hc.call_intrinsic @sized(%a, %b) : (i32, i32) -> i32
     return %r : i32
@@ -414,3 +414,50 @@ hc.kernel @bad {
   }
   hc.return
 }
+
+// -----
+
+// Kernels never return values; declaring results here points at a bug in
+// the frontend/legalizer, not at runtime.
+// CHECK: error: 'hc.kernel' op kernel signatures must declare no results; kernels return via an operand-less `hc.return`
+hc.kernel @bad(%a: i32) -> i32 {
+  hc.return
+}
+
+// -----
+
+// Signature-less `hc.func` with block args on the body means "frontend
+// forgot to synthesize a function_type"; we catch it rather than let the
+// op round-trip into a silently broken state.
+// CHECK: error: 'hc.func' op body block has 1 argument(s) but no function_type is declared
+hc.func @orphan_arg {
+^bb0(%a: i32):
+  hc.return
+}
+
+// -----
+
+// Signature carried via the attr-dict with no matching block args: the
+// inline form can't trigger this (parser derives function_type from args),
+// but nothing stops a builder or round-trip from attaching a stale
+// function_type on a no-arg body. Verifier catches the count mismatch.
+// CHECK: error: 'hc.func' op body block takes 0 argument(s) but function_type declares 2 input(s)
+hc.func @bad attributes {function_type = (i32, i32) -> ()} {
+  hc.return
+}
+
+// -----
+
+// Same story on `hc.kernel`.
+// CHECK: error: 'hc.kernel' op body block takes 0 argument(s) but function_type declares 1 input(s)
+hc.kernel @bad attributes {function_type = (i32) -> ()} {
+  hc.return
+}
+
+// -----
+
+// Same story on `hc.intrinsic`. The scope keyword lives before the
+// attr-dict so it has to show up here too.
+// CHECK: error: 'hc.intrinsic' op body block takes 0 argument(s) but function_type declares 1 input(s)
+hc.intrinsic @bad scope = #hc.scope<"WorkItem">
+    attributes {function_type = (i32) -> ()} {}

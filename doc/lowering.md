@@ -270,11 +270,14 @@ Boundaries between refinement levels are crossed with casts:
 Semantic dialect types:
 
 * `!hc.undef` — inference has not yet pinned this value
-* `!hc.idx` — an index-kind value; symbolic expression parameter optional
-  (`!hc.idx<#hc.expr<"_gid0 * 16">>` when pinned). Type uniquing across
-  ixsimpl-canonicalized `#hc.expr` gives free expression equality.
+* `!hc.idx` — an index-kind value; symbolic expression parameter optional.
+  Bare `!hc.idx` is the unpinned form produced by inference before the
+  expression is known; the pinned form accepts both `!hc.idx<"M + 1">`
+  (inline string) and `!hc.idx<#hc.expr<"M + 1">>` (full attribute). Type
+  uniquing across ixsimpl-canonicalized `#hc.expr` gives free expression
+  equality.
 * `!hc.pred` — a boolean-kind value; symbolic predicate parameter optional
-  (`!hc.pred<#hc.pred<"_gid0 < M">>` when pinned)
+  (`!hc.pred<"M < N">` inline or `!hc.pred<#hc.pred<"M < N">>` full form)
 * `!hc.buffer<elem, #hc.shape<...>>` — externally visible buffer
 * `!hc.tensor<elem, #hc.shape<...>>` — workgroup-local tensor
 * `!hc.vector<elem, #hc.shape<...>>` — immutable fixed-size vector, carrying
@@ -291,20 +294,25 @@ Symbolic surface attributes:
 
 * `#hc.expr<...>` — scalar symbolic expression
 * `#hc.pred<...>` — symbolic predicate
-* `#hc.shape<[...]>` — list of `#hc.expr` dims
+* `#hc.shape<[...]>` — list of `#hc.expr` dims, printed inline as a list of
+  symbolic strings
 * `#hc.constraints<[...]>` — set of `#hc.pred`
-* `#hc.symbol<"name">` — reference to a symbol by name (used by `hc.symbol`)
 * `#hc.scope<"WorkGroup" | "SubGroup" | "WorkItem">` — scope for
-  `hc.func`/`hc.intrinsic`
-* `#hc.effects<"pure" | "read" | "write" | "readwrite">` — intrinsic effect
-  class
+  `hc.func`/`hc.intrinsic`/attribute use; the verifier rejects any other
+  string
+* `#hc.effects<"Pure" | "Read" | "Write" | "ReadWrite">` — intrinsic effect
+  class; verified similarly
 * `#hc.layout<...>` — reserved for `index_map(...)` descriptors; unused in v0
+
+`#hc.symbol<"name">` is not yet introduced; until it is, `hc.symbol` uses
+its result type `!hc.idx<"name">` to carry the bound name (see below).
 
 ### `hc` operation set
 
-Only `hc.kernel`, `hc.func`, `hc.subgroup_region`, `hc.workitem_region`, and
-`hc.return` are currently implemented; the rest is the sketch the first
-non-trivial kernel (a gfx11 WMMA matmul, see below) demands.
+The initial implementation of this surface is in place as of the current
+bootstrap; what follows describes the implemented shape, not an aspirational
+one. Additional folders, type-inference passes, and target lowerings remain
+TODO and land behind this IR.
 
 Every op below accepts `!hc.undef` operands so the mechanical `hc_front → hc`
 pass can emit them without doing inference work. Verifiers tighten as types
@@ -312,11 +320,18 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 
 #### Declarations and regions
 
-* `hc.kernel` — symbolic launch geometry, parameter annotations, literal-symbol
-  set
-* `hc.func` — helper function with explicit scope
-* `hc.intrinsic` — intrinsic declaration with scope, effects, and required-const
-  kwarg set; optional region for the fallback body
+* `hc.kernel @name` — compiled kernel; carries a module-scoped symbol name
+  plus symbolic launch geometry, parameter annotations, and literal-symbol
+  set attributes. `Symbol` trait so references go through the symbol table.
+* `hc.func @name` — helper callable referenced by `hc.call`. Also a
+  `Symbol`; full argument/result signatures on the op itself are a follow-up
+  (signatures currently live on call sites).
+* `hc.intrinsic @name` — intrinsic declaration carrying `scope = #hc.scope<...>`
+  and an optional `effects = #hc.effects<...>`; its body region holds the
+  fallback implementation (may be empty, in which case lowering patterns
+  handle the op directly). Also a `Symbol`. A required-const kwarg
+  descriptor is a follow-up; for now `hc.call_intrinsic` carries the
+  specialization kwargs itself as attributes.
 * `hc.subgroup_region`, `hc.workitem_region` — collective regions with
   syntactic capture lists
 
@@ -331,27 +346,57 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 * `hc.for_range %lo to %hi step %step iter_args (...)` — semantic loop matching
   `for i in range(...)`. Induction variable is typed `!hc.undef` out of the
   frontend pass; inference pins it to `!hc.idx<_symN>` with a constraint that
-  `_symN` lies in `[lo, hi)` at step `step`.
-* `hc.if %pred ... else ...` — reserved; appears once the first kernel uses
-  conditionals. Condition is an `HC_ValueType` and may be `!hc.undef`,
-  `!hc.pred[<P>]`, `i1`, or a boolean tensor/vector.
+  `_symN` lies in `[lo, hi)` at step `step`. The verifier checks that the
+  body block has `1 + iter_args.size()` arguments, that iter-arg types line
+  up with block argument types and with result types one-to-one, and that
+  the terminating `hc.yield` produces the same number and types of values as
+  the op's results. `!hc.undef` is accepted on either side so pre-inference
+  IR round-trips.
+* `hc.if %cond -> (...) : type($cond)` — structured conditional with an
+  optional else region. The verifier matches each non-empty region's yield
+  count and types against the op's result signature, and requires an `else`
+  region when the op produces results. Conditions use any `HC_ValueType`
+  (`i1`, `!hc.pred`, `!hc.undef`, bool tensor, ...).
 
 #### Scalars, captures, and launch geometry
 
 * `hc.const <value>` — binds a literal-bound Python capture (e.g.
   `WMMA_M = 16`) to a scalar SSA value; result is `!hc.undef` from the
-  frontend pass and refines to `!hc.idx<value>` / `i64` / `f32` / … during
+  frontend pass and refines to `!hc.idx<"16">` / `i64` / `f32` / … during
   inference
-* `hc.symbol #hc.symbol<"name">` — binds a symbolic capture (e.g.
-  `M = sym.M`); refines to `!hc.idx<#hc.expr<"M">>`
+* `hc.symbol : !hc.idx<"name">` — binds a symbolic capture (e.g.
+  `M = sym.M`). The bound name lives *in the result type* so it is visible
+  at one place and type uniquing gives free equality. The verifier rejects
+  any result type other than `!hc.idx` with a pinned expression.
+* `hc.cast` — generic value-level conversion: refinement-lattice
+  transitions, symbolic-to-builtin exits, vector layout changes. Distinct
+  from `unrealized_conversion_cast` (compiler-internal, transient) and
+  from `hc.astype` (Python-surface element-type cast carrying a target
+  attribute on the op).
 * `hc.group_id`, `hc.local_id`, `hc.subgroup_id`, `hc.group_shape`,
   `hc.group_size`, `hc.work_offset`, `hc.work_shape`, `hc.wave_size` —
   multi-result where appropriate (one `!hc.undef` per dimension; refined to
-  `!hc.idx<_symN>` with fresh per-launch symbols at inference time). Marked
-  `Pure + MemoryEffects<[]>` so CSE collapses duplicate reads.
+  `!hc.idx<"_symN">` with fresh per-launch symbols at inference time).
+  Marked `Pure` under a **pipeline invariant** (see below); duplicate reads
+  of the same axis are therefore interchangeable and CSE/DCE may freely
+  collapse or drop them.
 
 There is no `!hc.index_tuple` and no `hc.getindex`; geometry ops return
 independent SSA components.
+
+##### Launch-geometry invariant
+
+Launch-geometry ops are valid only in contexts where the operand `%group`
+denotes a single launch instance. Inside one such region every axis is
+invariant, which is what makes `Pure` sound: two reads of `hc.wave_size %g`
+are observationally equal. Any pass that fuses regions across launches, or
+that introduces a second launch context into an existing region, must
+either insert fresh SSA values for the new context or weaken the effects
+on the relevant ops before running — otherwise CSE will silently merge
+values that came from different launches.
+
+`Pure` does *not* imply cross-invocation folding: different launches
+produce different launch state.
 
 #### Generic arithmetic, comparison, boolean, and reduction ops
 
@@ -363,8 +408,13 @@ covers the symbolic domain (`!hc.idx`/`!hc.pred`), builtin scalars
 * `hc.cmp.lt`, `hc.cmp.le`, `hc.cmp.gt`, `hc.cmp.ge`, `hc.cmp.eq`, `hc.cmp.ne`
 * `hc.and`, `hc.or`, `hc.not`
 * `hc.matmul`
-* `hc.reduce {kind = "sum" | "max" | "min", axis, keepdims}`
-* `hc.astype` — explicit numeric conversion; lowers via `hc.cast`
+* `hc.reduce %v, kind = "sum" | "max" | "min", axis = N, keepdims = bool` —
+  kind is verified against the allowed set; axis must be non-negative and,
+  once the operand type carries a concrete shape, less than the rank.
+* `hc.astype %v, target = T` — explicit numeric conversion; target must be
+  a builtin `int`, `index`, or `float` type and must agree with the op's
+  declared result (element-wise for tensor/vector results, directly for
+  scalars; `!hc.undef` escapes both checks). Lowers via `hc.cast`.
 
 Folders dispatch on concrete-type combinations:
 
@@ -394,10 +444,16 @@ Comparison result typing:
 #### Buffer views and subscript construction
 
 * `hc.buffer_dim %buf, axis = N` — symbolic dimension (matches `a.shape[1]`);
-  refines to `!hc.idx<dim_N_expr>`
-* `hc.slice_expr %lo?, %hi?, %step?` — builds an `!hc.slice`;
-  `has_lower`/`has_upper`/`has_step` attrs mark which operands are present,
-  mirroring `hc_front.slice`
+  refines to `!hc.idx<"dim_N_expr">`. Axis is a non-negative I64 and, once
+  the buffer type carries a concrete shape, less than the rank. Negative
+  axis indexing is a frontend-time convenience and canonicalized before
+  landing in `hc`.
+* `hc.slice_expr(lower = %lo upper = %hi step = %st)` — builds an
+  `!hc.slice`. Each keyword is optional and space-separated (no commas);
+  the printed form lists only the parts the frontend supplied, mirroring
+  Python slice syntax (`x[1:]`, `x[1:10:2]`, `x[:]`, `x[::2]`, ...).
+  Implementation: MLIR's `Optional<>` + `AttrSizedOperandSegments`, so
+  there is no flag/operand drift.
 * `hc.buffer_view %buf[%idx...]` — sub-buffer with the slice-reduced shape,
   for cases that do not require data movement
 
@@ -406,22 +462,70 @@ operands directly; there is no separate tuple-construction op.
 
 #### Data movement
 
-* `hc.load %buf[%idx...] shape = ...` — buffer → tensor
-* `hc.vload %src[%idx...] shape = ...` — buffer/tensor → vector
-* `hc.store %dst[%idx...], %src` — tensor or vector source
-* `hc.vec %t` — tensor → vector
-* `hc.with_inactive %v {value = ...}` — replace inactive elements
-* `hc.as_layout %v {layout = ...}` — change layout
-* `hc.vzeros`, `hc.vones`, `hc.vfull` — vector allocators (any scope)
-* `hc.zeros`, `hc.ones`, `hc.full`, `hc.empty` — tensor allocators
-  (`WorkGroup` scope only)
+Rule of thumb for memory effects in this dialect: n-ary tensor/vector
+**math** (`hc.matmul`, `hc.reduce`, generic arithmetic, ...) is modeled as
+value-semantic and carries no effect (`Pure`); only ops that materialize or
+observe **addressable workgroup state** — `hc.load`, `hc.vload`, `hc.store`,
+`hc.vec` — carry memory effects. Allocators carry `MemAlloc`; opaque calls
+carry the conservative `MemRead + MemWrite` pair until `hc.func` /
+`hc.intrinsic` grow per-target effect annotations.
+
+* `hc.load %buf[%idx...] {shape = #hc.shape<[...]>}` — buffer → tensor.
+  Carries a `MemRead` effect. The optional shape, when present, must have
+  the same rank as the index list.
+* `hc.vload %src[%idx...] {shape = #hc.shape<[...]>}` — buffer/tensor →
+  vector. Same effect/verifier shape as `hc.load`.
+* `hc.store %dst[%idx...], %src` — tensor or vector source; carries a
+  `MemWrite` effect.
+* `hc.vec %t` — tensor → vector materialization. Carries a `MemRead` effect
+  because the source tensor is addressable memory; an interleaved store can
+  change what two sibling `hc.vec` ops observe, so CSE must not collapse
+  them blindly.
+* `hc.with_inactive %v {inactive = T}` — replace inactive elements. The
+  `inactive` payload is a typed scalar literal (int/float/bool); once
+  inference pins the operand to a shaped type its numeric domain must
+  match the element type.
+* `hc.as_layout %v {layout = "row_major" | "col_major"}` — change layout.
+  The `layout` payload is verified against the named whitelist for v0;
+  later schemes (`#hc.layout<...>`) will broaden the constraint without
+  changing call sites.
+* `hc.vzeros`, `hc.vones`, `hc.vfull` — vector allocators (any scope).
+* `hc.zeros`, `hc.ones`, `hc.full` — tensor allocators (`WorkGroup` scope
+  only).
+* `hc.empty` — uninitialized tensor (`WorkGroup` scope).
+
+All allocators carry a `MemAlloc` effect: each op hands back a fresh,
+distinct storage slab, so CSE cannot collapse two sibling allocations into
+one even when they agree on shape (and fill operand, for the fill
+variants). This matches `memref.alloc`'s convention and gives `hc.empty`
+the right semantics uniformly with the rest — no special-casing required.
+
+Scope verification for tensor allocators is left to later passes that have
+visibility into the enclosing region.
 
 #### Calls
 
-* `hc.call @name(...)` — call into an `hc.func`
-* `hc.call_intrinsic @name(...) { const_attr = ... }` — call into an
-  `hc.intrinsic`, with specialization-required keyword arguments pinned as op
-  attributes rather than SSA operands
+* `hc.call @name(...)` — call into an `hc.func`. Verified as a
+  `SymbolUserOp`: `verifySymbolUses` resolves `@name` against the nearest
+  symbol table and checks that the target op is actually an `hc.func`, so
+  typos and wrong-kind references fail at verify rather than at some later
+  lowering pattern.
+* `hc.call_intrinsic @name(...) {const_kwarg = ...}` — call into an
+  `hc.intrinsic`, verified the same way against `hc.intrinsic`.
+  Specialization-required keyword arguments live as op attributes rather
+  than SSA operands so verify/specialize hooks see them without operand
+  bookkeeping.
+
+Both ops carry a conservative `MemRead + MemWrite` effect set. The callee
+body is opaque at verify time, so assuming anything narrower would let
+effect-aware passes (CSE, LICM, speculation) reorder opaque calls past
+loads and stores — silently broken as soon as the helper touches memory.
+A later revision will let `hc.func` / `hc.intrinsic` declare a tighter
+effect class and have the call site inherit it.
+
+Full signature parity (argument/result type match between the call site and
+the target) is also a follow-up once `hc.func` and `hc.intrinsic` grow
+explicit argument/result signatures.
 
 ### Example: gfx11 WMMA kernel at two pipeline stages
 
@@ -454,11 +558,13 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes {
                             iter_args (%acc = %acc0) : !hc.undef {
     %row_hi = hc.add %row0, %WM : !hc.undef
     %col_hi = hc.add %k0,   %WK : !hc.undef
-    %row_sl = hc.slice_expr %row0, %row_hi : !hc.undef
-    %col_sl = hc.slice_expr %k0,   %col_hi : !hc.undef
+    %row_sl = hc.slice_expr(lower = %row0 upper = %row_hi)
+                  : (!hc.undef, !hc.undef) -> !hc.undef
+    %col_sl = hc.slice_expr(lower = %k0 upper = %col_hi)
+                  : (!hc.undef, !hc.undef) -> !hc.undef
     %a_tile = hc.load %a[%row_sl, %col_sl]
-                     shape = #hc.shape<["WMMA_M", "WMMA_K"]>
-              : !hc.undef
+                     {shape = #hc.shape<["WMMA_M", "WMMA_K"]>}
+              : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
     // …analogous slice + load for b_tile…
     %acc1   = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
               : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
@@ -476,11 +582,11 @@ over `hc_front` with no per-op inference work.
 #### After type / symbol inference
 
 ```mlir
-hc.intrinsic @wmma_gfx11 attributes {
-  scope = #hc.scope<"WorkItem">, effects = #hc.effects<"pure">,
-  const_attrs = ["wave_size", "arch"]
-} (%group, %a_tile, %b_tile, %a_frag, %b_frag, %acc_frag)
-  -> !hc.vector<f32, #hc.shape<["WMMA_ACC_FRAGMENT"]>>
+hc.intrinsic @wmma_gfx11 scope = #hc.scope<"WorkItem">
+    effects = #hc.effects<"Pure"> {}
+// Specialization kwargs (`wave_size`, `arch`, ...) travel on the matching
+// `hc.call_intrinsic` sites as op attributes; a typed kwarg-descriptor
+// attribute on `hc.intrinsic` itself is a follow-up.
 
 hc.func @init_wmma_acc   attributes {scope = #hc.scope<"WorkGroup">} (...)
 hc.func @issue_wmma_tile attributes {scope = #hc.scope<"WorkGroup">} (...)
@@ -501,14 +607,14 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
                  : (!hc.buffer<f16, #hc.shape<["M","K"]>>)
                 -> !hc.vector<f32, #hc.shape<["WMMA_ACC_FRAGMENT","32","1"]>>
 
-  %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK    // %k0 : !hc.idx<_k0>
+  %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK    // %k0 : !hc.idx<"_k0">
                             iter_args (%acc = %acc0) {
-    %row_hi = hc.add %row0, %WM            // : !hc.idx<_gid0 * 16 + 16>
-    %col_hi = hc.add %k0,   %WK            // : !hc.idx<_k0 + 16>
-    %row_sl = hc.slice_expr %row0, %row_hi : !hc.slice
-    %col_sl = hc.slice_expr %k0,   %col_hi : !hc.slice
+    %row_hi = hc.add %row0, %WM            // : !hc.idx<"_gid0 * 16 + 16">
+    %col_hi = hc.add %k0,   %WK            // : !hc.idx<"_k0 + 16">
+    %row_sl = hc.slice_expr(lower = %row0 upper = %row_hi) : !hc.slice
+    %col_sl = hc.slice_expr(lower = %k0   upper = %col_hi) : !hc.slice
     %a_tile = hc.load %a[%row_sl, %col_sl]
-                shape = #hc.shape<["WMMA_M", "WMMA_K"]>
+                {shape = #hc.shape<["WMMA_M", "WMMA_K"]>}
               : !hc.tensor<f16, #hc.shape<["WMMA_M","WMMA_K"]>>
     // ...
     %acc1 = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)

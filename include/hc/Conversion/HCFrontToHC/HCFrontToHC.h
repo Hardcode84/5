@@ -11,6 +11,11 @@
 
 namespace mlir::hc::front {
 
+// `-convert-hc-front-to-hc`: lowers `hc_front` Python-shaped ops
+// (kernels, funcs, name-store placeholders, region carriers) to
+// their `hc`-dialect counterparts — the first concrete IR step off
+// the AST.
+//
 // ODS-generated pass-base declarations plus the
 // `createConvertHCFrontToHCPass()` factory. With no `let constructor` in
 // `Passes.td`, tablegen emits the factory as a friend of the CRTP base so the

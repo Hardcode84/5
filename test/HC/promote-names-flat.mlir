@@ -2,11 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Stage-1 coverage for `-hc-promote-names`: the flat-body case, where the
-// callable has no region-carrying ops and every `hc.name_load` is
-// reachable from a plain prior `hc.assign` in the same block. Nothing
-// here exercises `hc.for_range` / `hc.if` / workitem/subgroup — those
-// land in follow-up commits within bead 5-1k7.
+// Flat-body coverage for `-hc-promote-names`: the callable has no
+// region-carrying ops and every `hc.name_load` is reachable from a
+// plain prior `hc.assign` in the same block. `hc.for_range` / `hc.if`
+// / workitem/subgroup shapes live in `promote-names-regions.mlir`;
+// negative paths in `promote-names-invalid.mlir`.
 //
 // RUN: hc-opt -hc-promote-names -split-input-file %s | FileCheck %s
 

@@ -65,6 +65,9 @@ hc.kernel @workitem_assign_does_not_leak(%a: !hc.undef) {
 
 // -----
 
+// `hc.subgroup_region` mirrors `hc.workitem_region`: writes inside
+// shadow and don't leak, so the outer read of `"x"` falls through to
+// an unbound name even though the region body assigns it.
 hc.kernel @subgroup_assign_does_not_leak(%a: !hc.undef) {
   hc.subgroup_region {
     hc.assign "x", %a : !hc.undef

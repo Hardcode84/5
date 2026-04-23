@@ -27,7 +27,7 @@ def HCPromoteNames : Pass<"hc-promote-names", "::mlir::ModuleOp"> {
                           bindings (lazy outer snapshot), writes inside
                           shadow and don't leak back out. Out-bound
                           propagation needs an ODS result extension
-                          (planned bead), not here.
+                          (tracked in bead 5-2lf), not here.
 
     Post-condition (on success): no `hc.assign` / `hc.name_load` survives
     anywhere under the processed callables. Cross-kernel / cross-function

@@ -60,7 +60,7 @@ namespace {
 using NameSet = llvm::SmallSetVector<StringAttr, 4>;
 using SnapMap = llvm::SmallDenseMap<StringAttr, Value>;
 
-// Callback that materialises a capture-from-outer-scope snapshot for
+// Callback that materializes a capture-from-outer-scope snapshot for
 // `name`. Returned `Value` seeds the binding for the first in-scope
 // `hc.name_load` of `name`; subsequent reads hit the binding directly.
 // A null `SnapFactory` disables capture — the scan errors on any
@@ -548,6 +548,6 @@ struct HCPromoteNamesPass
 
 } // namespace
 
-// `createPromoteNamesPass()` is emitted by tablegen (friend of the
+// `createHCPromoteNamesPass()` is emitted by tablegen (friend of the
 // `impl::HCPromoteNamesBase` CRTP). See `Passes.td` — no `let
 // constructor`, so the generated factory is the only one.

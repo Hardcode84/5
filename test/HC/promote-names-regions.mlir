@@ -309,7 +309,7 @@ hc.func @workitem_shadows_outer_name(%outer: !hc.undef,
 
 // Outer capture: `hc.name_load` inside a `hc.workitem_region` with no
 // prior in-region write falls back to an outer snapshot. The pass
-// materialises a lazy `hc.name_load "x"` just before the region op,
+// materializes a lazy `hc.name_load "x"` just before the region op,
 // which the outer flat sweep then resolves to the outer `%a`.
 // Post-condition: no name-store ops survive anywhere.
 // CHECK-LABEL: hc.kernel @workitem_captures_outer

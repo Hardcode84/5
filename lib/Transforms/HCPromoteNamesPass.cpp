@@ -219,19 +219,29 @@ static void ensureYieldTerminator(Block &block, Location loc) {
   HCYieldOp::create(b, loc);
 }
 
+// Resolves `name` against `binding` or aborts with a consistent
+// diagnostic. Both terminator-rebuild helpers share this: a carried
+// name that isn't in the binding by the time we build the new
+// yield is always a caller-side invariant break (the caller seeded
+// the binding with every reachable name before the scan, and the
+// scan only overwrites entries). `llvm::report_fatal_error` keeps
+// the abort loud in release builds; a plain `assert` would compile
+// out and leave `it->second` dereferencing `end()`.
+static Value resolveCarriedValue(const llvm::StringMap<Value> &binding,
+                                 StringAttr name, const char *where) {
+  auto it = binding.find(name.getValue());
+  if (it == binding.end())
+    llvm::report_fatal_error(llvm::Twine("hc-promote-names: carried name '") +
+                             name.getValue() + "' missing from binding at " +
+                             where + " (pass invariant violation)");
+  return it->second;
+}
+
 // Drops `block`'s current `hc.yield` and replaces it with a new yield
 // whose operands are the existing yield's operands followed by
 // `binding[name]` for each `name` in `carried`. Callers use this to
 // extend a region-op terminator with the carried-name values produced
 // during the block's linear scan.
-//
-// Missing a carried name is a caller-side invariant break, not a user
-// input problem — `promoteForRange` / `promoteIf` both seed `binding`
-// with every carried name (snap value or iter_arg) before the scan
-// runs, and the scan only overwrites entries, never deletes them.
-// A plain `assert` would compile out under NDEBUG and leave
-// `it->second` dereferencing an end iterator, so we abort loudly
-// instead.
 static void rewriteYieldWithCarried(Block &block,
                                     const llvm::StringMap<Value> &binding,
                                     ArrayRef<StringAttr> carried,
@@ -239,18 +249,31 @@ static void rewriteYieldWithCarried(Block &block,
   auto oldYield = cast<HCYieldOp>(block.getTerminator());
   SmallVector<Value> values(oldYield.getValues().begin(),
                             oldYield.getValues().end());
-  for (StringAttr name : carried) {
-    auto it = binding.find(name.getValue());
-    if (it == binding.end())
-      llvm::report_fatal_error(llvm::Twine("hc-promote-names: carried name '") +
-                               name.getValue() +
-                               "' missing from binding at yield rebuild "
-                               "(pass invariant violation)");
-    values.push_back(it->second);
-  }
+  for (StringAttr name : carried)
+    values.push_back(resolveCarriedValue(binding, name, "yield rebuild"));
   OpBuilder b(oldYield);
   HCYieldOp::create(b, loc, values);
   oldYield.erase();
+}
+
+// Swaps `block`'s `hc.region_return <names>` terminator for an
+// `hc.yield %v1, ...` with one value per `carried` name. Mirrors
+// `rewriteYieldWithCarried`, minus the "append to existing yield"
+// step — nested-scope regions don't stack yields. Callers pre-seed
+// `binding` so every carried name resolves; `resolveCarriedValue`
+// aborts on an invariant break.
+static void rewriteRegionReturnToYield(Block &block,
+                                       const llvm::StringMap<Value> &binding,
+                                       ArrayRef<StringAttr> carried) {
+  auto term = cast<HCRegionReturnOp>(block.back());
+  SmallVector<Value> values;
+  values.reserve(carried.size());
+  for (StringAttr name : carried)
+    values.push_back(
+        resolveCarriedValue(binding, name, "region_return rewrite"));
+  OpBuilder b(term);
+  HCYieldOp::create(b, term.getLoc(), values);
+  term.erase();
 }
 
 // Inserts an `hc.name_load` for every name in `snapshot` at the current
@@ -544,24 +567,29 @@ static LogicalResult promoteNestedScope(Operation *op) {
   // "Return acc" shape. Collect the names (frontend-ordered) and
   // rebuild the op with a matching `!hc.undef` result per name.
   // Types stay `!hc.undef` here — type inference later narrows them
-  // via the yield operands.
+  // via the yield operands. `HCRegionReturnOp::verify` already
+  // checked each element is a `StringAttr`, so the cast is sound at
+  // this point; if a later non-verified producer slips in, the cast
+  // asserts, which is preferable to silently dropping entries.
   SmallVector<StringAttr> carried;
   carried.reserve(regionReturn.getNames().size());
   for (Attribute a : regionReturn.getNames())
     carried.push_back(cast<StringAttr>(a));
 
   SmallVector<Type> newResultTypes(carried.size(), undefTy);
-  ArrayAttr captures = op->getAttrOfType<ArrayAttr>("captures");
 
   // Only the op-kind choice needs a typed case; the rest of the
-  // surgery is type-erased through `Operation *`.
+  // surgery is type-erased through `Operation *`. Reading the
+  // `captures` attr through the concrete op accessor (rather than
+  // by string key) keeps the pass tied to the ODS surface — a
+  // rename in HCOps.td breaks the build here, not at runtime.
   Operation *newOp = nullptr;
-  if (isa<HCWorkitemRegionOp>(op)) {
-    newOp =
-        HCWorkitemRegionOp::create(outerBuilder, loc, newResultTypes, captures);
-  } else if (isa<HCSubgroupRegionOp>(op)) {
-    newOp =
-        HCSubgroupRegionOp::create(outerBuilder, loc, newResultTypes, captures);
+  if (auto wi = dyn_cast<HCWorkitemRegionOp>(op)) {
+    newOp = HCWorkitemRegionOp::create(outerBuilder, loc, newResultTypes,
+                                       wi.getCapturesAttr());
+  } else if (auto sg = dyn_cast<HCSubgroupRegionOp>(op)) {
+    newOp = HCSubgroupRegionOp::create(outerBuilder, loc, newResultTypes,
+                                       sg.getCapturesAttr());
   } else {
     llvm::report_fatal_error(
         "hc-promote-names: promoteNestedScope dispatched on an op kind it "
@@ -593,7 +621,9 @@ static LogicalResult promoteNestedScope(Operation *op) {
   // outer binding to be threaded through. The scan can't have seen
   // it, so we materialize the outer snap ourselves, using the same
   // capture factory and while `outerBuilder` is still positioned
-  // before `newOp` (scan snaps stacked there too).
+  // before `newOp` (scan snaps stacked there too). Post-loop
+  // invariant: every `carried` name has a `binding` entry —
+  // `rewriteRegionReturnToYield` asserts on that.
   for (StringAttr name : carried) {
     if (binding.find(name.getValue()) == binding.end())
       binding[name.getValue()] = capture(name);
@@ -601,22 +631,9 @@ static LogicalResult promoteNestedScope(Operation *op) {
 
   // Terminator rewrite: `hc.region_return ["n1", "n2"]` →
   // `hc.yield %v1, %v2`. `scanAndPromoteBlock` skipped the
-  // terminator, so it's still the original `hc.region_return`.
-  auto term = cast<HCRegionReturnOp>(newBody.back());
-  SmallVector<Value> yieldValues;
-  yieldValues.reserve(carried.size());
-  for (StringAttr name : carried) {
-    auto it = binding.find(name.getValue());
-    if (it == binding.end())
-      llvm::report_fatal_error(
-          llvm::Twine("hc-promote-names: carried name '") + name.getValue() +
-          "' missing from binding at region_return rewrite "
-          "(pass invariant violation)");
-    yieldValues.push_back(it->second);
-  }
-  OpBuilder termBuilder(term);
-  HCYieldOp::create(termBuilder, term.getLoc(), yieldValues);
-  term.erase();
+  // terminator, so the body's `back()` is still the original
+  // `hc.region_return`.
+  rewriteRegionReturnToYield(newBody, binding, carried);
 
   // Writeback: each new result lands as `hc.assign "<name>", %result`
   // at the enclosing scope, where the outer flat sweep fuses it into

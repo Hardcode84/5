@@ -115,10 +115,18 @@ module {
     hc_front.return %x
   }
 
+  // `@kernel.intrinsic` bodies are Python simulator fallbacks with no
+  // compilation meaning; the rewrite keeps the signature + metadata and
+  // drops the body entirely. The body below is intentionally non-trivial
+  // (constant + binop + return) to prove the drop is unconditional — if
+  // the pass ever regressed into walking it, the CHECK-NEXT below would
+  // fail because lowered ops would appear before the closing `}`.
   // CHECK-LABEL: hc.intrinsic @intr
+  // CHECK-SAME: (%arg0: !hc.undef) -> !hc.undef
   // CHECK-SAME: scope = <"WorkItem">
   // CHECK-SAME: effects = pure
   // CHECK-SAME: const_kwargs = ["arch"]
+  // CHECK-NEXT: }
   // CHECK-NOT: hc_front.
   hc_front.intrinsic "intr" attributes {
     const_kwargs = ["arch"],
@@ -127,8 +135,10 @@ module {
     parameters = [{name = "group"}],
     scope = "WorkItem"
   } {
+    %zero = hc_front.constant<0 : i64>
     %one = hc_front.constant<1 : i64>
-    hc_front.return %one
+    %sum = hc_front.binop "Add"(%zero, %one)
+    hc_front.return %sum
   }
 
   // Boundary coverage:

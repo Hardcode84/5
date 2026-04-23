@@ -22,9 +22,15 @@
 //    `x.astype(...)`);
 //  * every produced value gets `!hc.undef` — type inference pins later.
 //
+// Intrinsic bodies are **discarded**. `@kernel.intrinsic`-decorated
+// Python bodies are simulator fallbacks — they exist so the kernel still
+// runs under the Python simulator when no hardware/codegen path is
+// present. They have no compilation meaning. `hc.intrinsic` therefore
+// lands as a declaration: signature + scope/effects/const_kwargs
+// metadata only, entry block with parameter args, zero ops inside.
+//
 // Explicitly deferred to later passes:
 //  * loop-carried iter_arg analysis and nested workitem-def folding.
-//  * intrinsic body discarding.
 //  * full inlining of `ref.kind = "inline"` helpers; for now we leave the
 //    `hc_front.call` pinned with a diagnostic if it survives lowering.
 
@@ -410,6 +416,12 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // here; on success `build` is contractually attach-then-erase —
   // attaches `entry` to the hc op first, so any later failure can
   // `hcOp->erase()` and take the block with it.
+  //
+  // A successful `build` that returns a null `Region *` means "skip the
+  // body walk" — used by the intrinsic lowering, which discards the
+  // hc_front body (see file banner). The entry block still gets attached
+  // and the param binding still happens so the resulting hc op retains
+  // its signature, but no hc_front → hc translation runs on the body.
   auto runBody =
       [&](bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
@@ -425,6 +437,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     FailureOr<Region *> bodyRegion = build(entry, *fnType);
     if (failed(bodyRegion))
       return failure();
+    if (*bodyRegion == nullptr)
+      return success();
     scopes.push_back(std::make_unique<Scope>(std::move(scope)));
     OpBuilder::InsertionGuard bodyGuard(builder);
     builder.setInsertionPointToStart(entry);
@@ -523,7 +537,12 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
           }
           if (auto kw = frontOp->getAttrOfType<ArrayAttr>("const_kwargs"))
             hcIntr.setConstKwargsAttr(kw);
-          return &intr.getBody();
+          // Return null to tell `runBody` to skip the body walk.
+          // `hc_front.intrinsic`'s body is a Python simulator fallback
+          // with no compilation meaning; the resulting `hc.intrinsic`
+          // lands as a declaration (signature + metadata, empty entry
+          // block).
+          return static_cast<Region *>(nullptr);
         });
   }
 

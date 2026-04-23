@@ -12,7 +12,10 @@ from examples.amdgpu_gfx11_wmma_matmul import (
 )
 
 
-@pytest.mark.parametrize(("m", "n", "k"), [(16, 16, 16), (32, 32, 32)])
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [(16, 16, 16), (32, 32, 32), (17, 19, 18)],
+)
 def test_gfx11_wmma_example_matches_blocked_reference(m: int, n: int, k: int) -> None:
     a, b = make_demo_inputs(m=m, n=n, k=k, seed=7)
 

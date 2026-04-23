@@ -54,15 +54,6 @@ N = sym.N
 K = sym.K
 
 
-def _tile_div(size: int, tile: int) -> int:
-    return (size + tile - 1) // tile
-
-
-def _require_tile_multiple(name: str, value: int, tile: int) -> None:
-    if value % tile != 0:
-        raise ValueError(f"{name} must be a multiple of {tile} for this example")
-
-
 def _lane_column(lane: int) -> int:
     return lane % WMMA_N
 
@@ -86,9 +77,7 @@ def _lane_output_row_slice_args(lane: int, wave_size: int) -> tuple[int, int, in
     return rows[0], WMMA_M, _lane_output_row_step(wave_size)
 
 
-def _tile_origin(tile_id: int, tiles_n: int) -> tuple[int, int]:
-    tile_row = tile_id // tiles_n
-    tile_col = tile_id % tiles_n
+def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:
     return tile_row * WMMA_M, tile_col * WMMA_N
 
 
@@ -149,6 +138,8 @@ def wmma_gfx11(
     """
 
     _ = (a_frag, b_frag)
+    a_tile = a_tile.with_inactive(value=np.float16(0))
+    b_tile = b_tile.with_inactive(value=np.float16(0))
     rows = _lane_output_rows(lane, wave_size)
     col = _lane_column(lane)
     values = np.empty((len(rows),), dtype=np.float32)
@@ -202,12 +193,20 @@ def _lower_wmma(
 
 @kernel.func(scope=WorkItem)
 def load_wmma_a_fragment(wi, a_tile):
-    return a_tile[_lane_a_row(wi.local_id()[0]), :].vec()
+    return (
+        a_tile[_lane_a_row(wi.local_id()[0]), :]
+        .vec()
+        .with_inactive(value=np.float16(0))
+    )
 
 
 @kernel.func(scope=WorkItem)
 def load_wmma_b_fragment(wi, b_tile):
-    return b_tile[:, _lane_column(wi.local_id()[0])].vec()
+    return (
+        b_tile[:, _lane_column(wi.local_id()[0])]
+        .vec()
+        .with_inactive(value=np.float16(0))
+    )
 
 
 @kernel.func(scope=WorkGroup)
@@ -227,13 +226,16 @@ def issue_wmma_tile(group, a_tile, b_tile, acc):
         lane = wi.local_id()[0]
         a_frag = load_wmma_a_fragment(wi, a_tile)
         b_frag = load_wmma_b_fragment(wi, b_tile)
+        # A 2D launch keeps a trailing singleton collective axis from
+        # `group_shape=(WAVE_LANES, 1)`. Collapse it here so WMMA still sees the
+        # per-lane `(WMMA_ACC_FRAGMENT,)` vector it expects.
         return wmma_gfx11(
             group,
             a_tile,
             b_tile,
             a_frag,
             b_frag,
-            acc[:, lane],
+            acc[:, lane, 0],
             lane=lane,
             wave_size=WAVE_LANES,
             arch=GFX_ARCH,
@@ -249,17 +251,19 @@ def store_wmma_tile(group, c, row0, col0, acc):
         lane = wi.local_id()[0]
         row_start, row_stop, row_step = _lane_output_row_slice_args(lane, WAVE_LANES)
         col = col0 + _lane_column(lane)
+        # Keep the destination view slice-shaped so right-edge tiles degrade to
+        # empty overlap instead of forming an out-of-bounds scalar column index.
         group.store(
-            c[row0 + row_start : row0 + row_stop : row_step, col],
-            acc[:, lane],
+            c[row0 + row_start : row0 + row_stop : row_step, col : col + 1],
+            acc[:, lane, :],
         )
 
     wave()
 
 
 @kernel(
-    work_shape=(ceil_div(M, WMMA_M) * ceil_div(N, WMMA_N) * WAVE_LANES,),
-    group_shape=(WAVE_LANES,),
+    work_shape=(ceil_div(M, WMMA_M) * WAVE_LANES, ceil_div(N, WMMA_N)),
+    group_shape=(WAVE_LANES, 1),
     subgroup_size=WAVE_LANES,
 )
 def tiled_gfx11_wmma_matmul(
@@ -268,8 +272,7 @@ def tiled_gfx11_wmma_matmul(
     b: Buffer[K, N],
     c: Buffer[M, N],
 ) -> None:
-    tiles_n = _tile_div(b.shape[1], WMMA_N)
-    row0, col0 = _tile_origin(group.group_id[0], tiles_n)
+    row0, col0 = _tile_origin(group.group_id[0], group.group_id[1])
     acc = init_wmma_acc(group)
 
     for k0 in range(0, a.shape[1], WMMA_K):
@@ -303,10 +306,6 @@ def simulate_gfx11_wmma_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if a.dtype != np.float16 or b.dtype != np.float16:
         raise ValueError("this example expects float16 A and B operands")
 
-    _require_tile_multiple("A.shape[0]", a.shape[0], WMMA_M)
-    _require_tile_multiple("B.shape[1]", b.shape[1], WMMA_N)
-    _require_tile_multiple("A.shape[1]", a.shape[1], WMMA_K)
-
     c = np.zeros((a.shape[0], b.shape[1]), dtype=np.float32)
     sim.launch(tiled_gfx11_wmma_matmul, a, b, c)
     return c
@@ -319,9 +318,6 @@ def make_demo_inputs(
     k: int = 32,
     seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    _require_tile_multiple("m", m, WMMA_M)
-    _require_tile_multiple("n", n, WMMA_N)
-    _require_tile_multiple("k", k, WMMA_K)
     rng = np.random.default_rng(seed)
     a = rng.uniform(-1.0, 1.0, size=(m, k)).astype(np.float16)
     b = rng.uniform(-1.0, 1.0, size=(k, n)).astype(np.float16)

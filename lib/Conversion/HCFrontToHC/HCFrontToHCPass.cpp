@@ -43,7 +43,6 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -63,6 +62,13 @@ using namespace mlir::hc;
 namespace hc_front = mlir::hc::front;
 
 namespace {
+
+// The Python driver emits launch-geo axes as small non-negative ints
+// (0..<launch_rank). We don't know launch rank at this site, so reject
+// anything that would build a pathologically large variadic result list
+// up front — a hand-crafted IR with `axis = -1` or `axis = 2^31` should
+// diagnose, not allocate gigabytes of `!hc.undef` result types.
+constexpr int64_t kMaxLaunchAxis = 32;
 
 //===----------------------------------------------------------------------===//
 // Scope map. Each callable / region owns a string -> Value scope that the
@@ -88,25 +94,46 @@ struct Scope {
 };
 
 //===----------------------------------------------------------------------===//
-// Helpers for pulling typed fields out of the `ref` DictAttr the Python driver
-// stamps on every `hc_front.name` and most `hc_front.attr` ops.
+// The Python driver (see `hc/_resolve.py`) stamps every `hc_front.name` and
+// most `hc_front.attr` with a `ref` DictAttr of the form
+//   {kind = "<class>", ...per-class payload...}
+// `RefInfo` is the null-safe, minimally-typed view: it's cheap to construct,
+// survives a missing `ref` on hand-written IR, and centralizes attribute
+// lookups so every call site goes through the same code path.
 //===----------------------------------------------------------------------===//
 
-StringRef dictString(DictionaryAttr d, StringRef key) {
-  if (!d)
-    return {};
-  if (auto s = d.getAs<StringAttr>(key))
-    return s.getValue();
-  return {};
-}
+struct RefInfo {
+  DictionaryAttr dict;
+  StringRef kind;
 
-DictionaryAttr refDict(Operation *op) {
-  if (!op)
-    return {};
-  return op->getAttrOfType<DictionaryAttr>("ref");
-}
+  static RefInfo of(Operation *op) {
+    RefInfo info;
+    if (!op)
+      return info;
+    info.dict = op->getAttrOfType<DictionaryAttr>("ref");
+    if (info.dict) {
+      if (auto k = info.dict.getAs<StringAttr>("kind"))
+        info.kind = k.getValue();
+    }
+    return info;
+  }
 
-StringRef refKind(Operation *op) { return dictString(refDict(op), "kind"); }
+  explicit operator bool() const { return static_cast<bool>(dict); }
+
+  StringRef string(StringRef key) const {
+    if (!dict)
+      return {};
+    if (auto s = dict.getAs<StringAttr>(key))
+      return s.getValue();
+    return {};
+  }
+
+  template <typename AttrT> AttrT getAs(StringRef key) const {
+    if (!dict)
+      return {};
+    return dict.getAs<AttrT>(key);
+  }
+};
 
 //===----------------------------------------------------------------------===//
 // Attribute-conversion helpers.
@@ -170,6 +197,12 @@ Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
     return HCSubOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Mult")
     return HCMulOp::create(builder, loc, undef, lhs, rhs);
+  // `hc.div` is documented as "integer/float division (Python `//` for
+  // ints)", i.e. a single typed division whose semantics are pinned at
+  // type-inference time. Both Python `/` (Div) and `//` (FloorDiv) land
+  // here; for integer operands both floor, for floats both are true
+  // division. If a future bead splits truediv from floordiv, only this
+  // branch needs to change.
   if (kind == "FloorDiv" || kind == "Div")
     return HCDivOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Mod")
@@ -225,16 +258,27 @@ private:
   Scope &currentScope() { return *scopes.back(); }
 
   // Resolves a classified `hc_front.name` against the current scope chain
-  // and the `ref` DictAttr. Returns null if the name should be skipped
-  // (callee/intrinsic/inline/builtin/module — those are consumed at the
-  // call site; see `lowerCall`).
-  Value lowerName(hc_front::NameOp op);
+  // and the `ref` DictAttr.
+  // Returns:
+  //   * `success(Value)`  — a usable hc value for the name;
+  //   * `success(Value())` — the name is consumed at the call site and
+  //                          intentionally has no SSA counterpart (e.g.
+  //                          callee/intrinsic/inline/builtin/module refs);
+  //   * `failure()`        — a diagnostic was emitted.
+  FailureOr<Value> lowerName(hc_front::NameOp op);
 
   // Dispatches on `ref.kind = "dsl_method"`'s `method` payload, or falls
   // through to a module/attr chain the call site handles.
   Value lowerAttr(hc_front::AttrOp op);
 
   LogicalResult lowerRegion(Region &src);
+
+  // Shared body for `hc.workitem_region` / `hc.subgroup_region`. Both have
+  // identical shape (captures attr + single-block body + optional
+  // parameters stamped on the front op that become block args) so we
+  // route through one helper templated on the target `hc` op type.
+  template <typename HCRegionOpT, typename FrontRegionOpT>
+  LogicalResult lowerCapturingRegion(FrontRegionOpT op);
 
   LogicalResult lowerOp(Operation *op);
 
@@ -272,7 +316,7 @@ private:
   // Emit an `hc.const` for a `ref.kind = "constant"` name op. Needs the
   // python_kind / value payload because the front dialect packs it as
   // string-for-anything-but-int.
-  Value emitConstantFromRef(Location loc, DictionaryAttr ref,
+  Value emitConstantFromRef(Location loc, const RefInfo &ref,
                             Operation *sourceOp);
 
   // Consume a `hc_front.call` dispatched to a `dsl_method` callee. The
@@ -320,152 +364,133 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
         "missing `parameters` attribute; the hc_front driver must stamp one");
   }
 
-  // The three top-level callables share enough structure to fit one
-  // switch rather than three near-identical functions.
-  if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
+  // All three callable kinds share the same skeleton: build a fresh
+  // entry block, bind params into a new Scope, hand (entry, fnType) to
+  // the per-kind `build` lambda which creates the hc op and attaches
+  // the block, then drive `lowerRegion` against the returned hc_front
+  // body region.
+  //
+  // Ownership rule for `entry`: if the lambda returns success, it MUST
+  // have attached the block to the hc op's body (the hc op then owns
+  // it); on failure, it MUST either not have attached the block (we
+  // delete here) or have erased the hc op (which takes the block with
+  // it). The lambdas below follow the "attach first, fail with erase"
+  // discipline to keep this obvious.
+  auto runBody =
+      [&](bool returnsValue,
+          llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
+      -> LogicalResult {
     Block *entry = new Block();
     Scope scope;
-    auto fnType = materializeParameters(params, *entry, scope, frontOp,
-                                        /*returnsValue=*/false);
+    auto fnType =
+        materializeParameters(params, *entry, scope, frontOp, returnsValue);
     if (failed(fnType)) {
       delete entry;
       return failure();
     }
-
-    auto hcKernel =
-        HCKernelOp::create(builder, loc, StringAttr::get(ctx, kernel.getName()),
-                           /*function_type=*/TypeAttr::get(*fnType),
-                           /*work_shape=*/ShapeAttr(),
-                           /*group_shape=*/ShapeAttr(),
-                           /*subgroup_size=*/IntegerAttr(),
-                           /*literals=*/ArrayAttr(),
-                           /*requirements=*/ConstraintSetAttr());
-
-    // Shape-like metadata travels as string arrays in `hc_front`; convert
-    // each to `#hc.shape<...>` so the verifier downstream sees typed
-    // payloads.
-    if (auto ws = frontOp->getAttrOfType<ArrayAttr>("work_shape")) {
-      auto shape = stringArrayToShape(ctx, frontOp, ws);
-      if (failed(shape)) {
-        hcKernel->erase();
-        delete entry;
-        return failure();
-      }
-      hcKernel.setWorkShapeAttr(*shape);
-    }
-    if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
-      auto shape = stringArrayToShape(ctx, frontOp, gs);
-      if (failed(shape)) {
-        hcKernel->erase();
-        delete entry;
-        return failure();
-      }
-      hcKernel.setGroupShapeAttr(*shape);
-    }
-    if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
-      hcKernel.setSubgroupSizeAttr(sg);
-    if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
-      hcKernel.setLiteralsAttr(lits);
-
-    hcKernel.getBody().push_back(entry);
+    FailureOr<Region *> bodyRegion = build(entry, *fnType);
+    if (failed(bodyRegion))
+      return failure();
     scopes.push_back(std::make_unique<Scope>(std::move(scope)));
     OpBuilder::InsertionGuard bodyGuard(builder);
     builder.setInsertionPointToStart(entry);
-    LogicalResult r = lowerRegion(kernel.getBody());
+    LogicalResult r = lowerRegion(**bodyRegion);
     scopes.pop_back();
     return r;
+  };
+
+  if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
+    return runBody(
+        /*returnsValue=*/false,
+        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
+          auto hcKernel = HCKernelOp::create(
+              builder, loc, StringAttr::get(ctx, kernel.getName()),
+              TypeAttr::get(fnType), /*work_shape=*/ShapeAttr(),
+              /*group_shape=*/ShapeAttr(),
+              /*subgroup_size=*/IntegerAttr(), /*literals=*/ArrayAttr(),
+              /*requirements=*/ConstraintSetAttr());
+          hcKernel.getBody().push_back(entry);
+          // Shape-like metadata travels as string arrays in hc_front;
+          // convert to `#hc.shape<...>` for typed downstream consumers.
+          if (auto ws = frontOp->getAttrOfType<ArrayAttr>("work_shape")) {
+            auto shape = stringArrayToShape(ctx, frontOp, ws);
+            if (failed(shape)) {
+              hcKernel->erase();
+              return failure();
+            }
+            hcKernel.setWorkShapeAttr(*shape);
+          }
+          if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
+            auto shape = stringArrayToShape(ctx, frontOp, gs);
+            if (failed(shape)) {
+              hcKernel->erase();
+              return failure();
+            }
+            hcKernel.setGroupShapeAttr(*shape);
+          }
+          if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
+            hcKernel.setSubgroupSizeAttr(sg);
+          if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
+            hcKernel.setLiteralsAttr(lits);
+          return &kernel.getBody();
+        });
   }
 
   if (auto func = dyn_cast<hc_front::FuncOp>(frontOp)) {
-    Block *entry = new Block();
-    Scope scope;
-    // Funcs may return a value; we don't know the return arity without
-    // walking the body, so pessimistically advertise "one undef result"
-    // which the progressive-typing escape hatch tolerates at verify time.
-    auto fnType = materializeParameters(params, *entry, scope, frontOp,
-                                        /*returnsValue=*/true);
-    if (failed(fnType)) {
-      delete entry;
-      return failure();
-    }
-
-    auto hcFunc =
-        HCFuncOp::create(builder, loc, StringAttr::get(ctx, func.getName()),
-                         /*function_type=*/TypeAttr::get(*fnType),
-                         /*requirements=*/ConstraintSetAttr(),
-                         /*effects=*/EffectClassAttr());
-
-    if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
-      auto cls = parseEffectClass(effAttr.getValue());
-      if (!cls) {
-        hcFunc->emitOpError("unknown effects class '")
-            << effAttr.getValue() << "'";
-        hcFunc->erase();
-        delete entry;
-        return failure();
-      }
-      hcFunc.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
-    }
-    // `scope` has no typed field on `hc.func` — it travels as a generic
-    // discardable attr, mirroring the existing `use_scope_and_effects`
-    // round-trip test.
-    if (auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope"))
-      hcFunc->setAttr("scope", ScopeAttr::get(ctx, scopeAttr.getValue()));
-
-    hcFunc.getBody().push_back(entry);
-    scopes.push_back(std::make_unique<Scope>(std::move(scope)));
-    OpBuilder::InsertionGuard bodyGuard(builder);
-    builder.setInsertionPointToStart(entry);
-    LogicalResult r = lowerRegion(func.getBody());
-    scopes.pop_back();
-    return r;
+    return runBody(
+        /*returnsValue=*/true,
+        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
+          auto hcFunc = HCFuncOp::create(
+              builder, loc, StringAttr::get(ctx, func.getName()),
+              TypeAttr::get(fnType), /*requirements=*/ConstraintSetAttr(),
+              /*effects=*/EffectClassAttr());
+          hcFunc.getBody().push_back(entry);
+          if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
+            auto cls = parseEffectClass(effAttr.getValue());
+            if (!cls) {
+              hcFunc->emitOpError("unknown effects class '")
+                  << effAttr.getValue() << "'";
+              hcFunc->erase();
+              return failure();
+            }
+            hcFunc.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
+          }
+          // `scope` travels as a generic discardable attr on hc.func,
+          // mirroring the existing use_scope_and_effects round-trip test.
+          if (auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope"))
+            hcFunc->setAttr("scope", ScopeAttr::get(ctx, scopeAttr.getValue()));
+          return &func.getBody();
+        });
   }
 
   if (auto intr = dyn_cast<hc_front::IntrinsicOp>(frontOp)) {
-    Block *entry = new Block();
-    Scope scope;
-    auto fnType = materializeParameters(params, *entry, scope, frontOp,
-                                        /*returnsValue=*/true);
-    if (failed(fnType)) {
-      delete entry;
-      return failure();
-    }
-
     auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope");
     if (!scopeAttr) {
-      delete entry;
       return frontOp->emitOpError(
           "hc_front.intrinsic must carry a `scope` string attribute");
     }
-
-    auto hcIntr = HCIntrinsicOp::create(
-        builder, loc, StringAttr::get(ctx, intr.getName()),
-        /*function_type=*/TypeAttr::get(*fnType),
-        /*scope=*/ScopeAttr::get(ctx, scopeAttr.getValue()),
-        /*effects=*/EffectClassAttr(),
-        /*const_kwargs=*/ArrayAttr());
-
-    if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
-      auto cls = parseEffectClass(effAttr.getValue());
-      if (!cls) {
-        hcIntr->emitOpError("unknown effects class '")
-            << effAttr.getValue() << "'";
-        hcIntr->erase();
-        delete entry;
-        return failure();
-      }
-      hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
-    }
-    if (auto kw = frontOp->getAttrOfType<ArrayAttr>("const_kwargs"))
-      hcIntr.setConstKwargsAttr(kw);
-
-    hcIntr.getBody().push_back(entry);
-    scopes.push_back(std::make_unique<Scope>(std::move(scope)));
-    OpBuilder::InsertionGuard bodyGuard(builder);
-    builder.setInsertionPointToStart(entry);
-    LogicalResult r = lowerRegion(intr.getBody());
-    scopes.pop_back();
-    return r;
+    return runBody(
+        /*returnsValue=*/true,
+        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
+          auto hcIntr = HCIntrinsicOp::create(
+              builder, loc, StringAttr::get(ctx, intr.getName()),
+              TypeAttr::get(fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
+              /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr());
+          hcIntr.getBody().push_back(entry);
+          if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
+            auto cls = parseEffectClass(effAttr.getValue());
+            if (!cls) {
+              hcIntr->emitOpError("unknown effects class '")
+                  << effAttr.getValue() << "'";
+              hcIntr->erase();
+              return failure();
+            }
+            hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
+          }
+          if (auto kw = frontOp->getAttrOfType<ArrayAttr>("const_kwargs"))
+            hcIntr.setConstKwargsAttr(kw);
+          return &intr.getBody();
+        });
   }
 
   return frontOp->emitOpError("unexpected top-level hc_front op");
@@ -509,6 +534,14 @@ Lowerer::materializeParameters(ArrayAttr params, Block &entry, Scope &scope,
 LogicalResult Lowerer::lowerRegion(Region &src) {
   if (src.empty())
     return success();
+  // The Python driver always emits single-block regions; multi-block
+  // control flow would require CFG-aware scope merging we don't do yet.
+  // Fail loud rather than silently skip the trailing blocks.
+  if (!src.hasOneBlock()) {
+    return src.getParentOp()->emitOpError(
+        "hc_front regions must be single-block; multi-block lowering is not "
+        "supported");
+  }
   Block &block = src.front();
   for (Operation &op : llvm::make_early_inc_range(block)) {
     if (failed(lowerOp(&op)))
@@ -532,11 +565,14 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
   // Name / attr ops are the classification surface of the `ref` metadata.
   // Some classifications (callee/intrinsic/inline/builtin/module/numpy_*)
   // are consumed at the call site; others (param/iv/local/constant/symbol)
-  // immediately resolve to a concrete `hc` value. `lowerName` returns null
-  // for the former — we stash a null mapping so the call-site lookup can
-  // inspect the defining op directly.
+  // immediately resolve to a concrete `hc` value. `lowerName` returns
+  // success+null for the former (the call-site lookup inspects the
+  // defining op directly) and failure() for real errors.
   if (auto name = dyn_cast<hc_front::NameOp>(op)) {
-    valueMap[name.getResult()] = lowerName(name);
+    FailureOr<Value> v = lowerName(name);
+    if (failed(v))
+      return failure();
+    valueMap[name.getResult()] = *v;
     return success();
   }
   if (auto attr = dyn_cast<hc_front::AttrOp>(op)) {
@@ -553,8 +589,9 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return valueMap[b.getResult()] ? success() : failure();
   }
   if (auto s = dyn_cast<hc_front::SliceOp>(op)) {
-    valueMap[s.getResult()] = lowerSlice(s);
-    return success();
+    Value v = lowerSlice(s);
+    valueMap[s.getResult()] = v;
+    return v ? success() : failure();
   }
   if (auto r = dyn_cast<hc_front::ReturnOp>(op))
     return lowerReturn(r);
@@ -592,7 +629,7 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return success();
   }
 
-  return op->emitOpError("-convert-hc-front-to-hc: unsupported op");
+  return op->emitOpError("unsupported hc_front op");
 }
 
 Value Lowerer::lowerValueOperand(Value v) {
@@ -624,8 +661,9 @@ SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
 // Name / attr. The classification on `ref` drives everything.
 //===----------------------------------------------------------------------===//
 
-Value Lowerer::lowerName(hc_front::NameOp op) {
-  StringRef kind = refKind(op);
+FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
+  RefInfo ref = RefInfo::of(op);
+  StringRef kind = ref.kind;
   StringRef ident = op.getName();
   if (kind == "param" || kind == "local" || kind == "iv") {
     Value v = currentScope().lookup(ident);
@@ -633,11 +671,16 @@ Value Lowerer::lowerName(hc_front::NameOp op) {
       op.emitOpError("hc_front.name '")
           << ident << "' (kind=" << kind
           << ") not bound in the current scope; missing assign or bad ref";
+      return failure();
     }
     return v;
   }
-  if (kind == "constant")
-    return emitConstantFromRef(op.getLoc(), refDict(op), op);
+  if (kind == "constant") {
+    Value v = emitConstantFromRef(op.getLoc(), ref, op);
+    if (!v)
+      return failure();
+    return v;
+  }
   if (kind == "symbol") {
     // `#hc.expr<"Ident">` is the pinned form for a bare symbol; the
     // resulting `!hc.idx<"Ident">` type uniquely identifies the symbol.
@@ -647,14 +690,15 @@ Value Lowerer::lowerName(hc_front::NameOp op) {
     FailureOr<sym::ExprHandle> handle = sym::parseExpr(store, ident, &diag);
     if (failed(handle)) {
       op.emitOpError("symbol '") << ident << "' failed to parse: " << diag;
-      return nullptr;
+      return failure();
     }
     auto expr = ExprAttr::get(op.getContext(), *handle);
     Type idxTy = IdxType::get(op.getContext(), expr);
-    return HCSymbolOp::create(builder, op.getLoc(), idxTy);
+    return HCSymbolOp::create(builder, op.getLoc(), idxTy).getResult();
   }
   // callee / intrinsic / inline / builtin / module / numpy_* — the call
   // dispatcher and subscript pattern read these off the original op.
+  // Success with a null Value is the intentional "no SSA result" sentinel.
   return Value();
 }
 
@@ -666,11 +710,11 @@ Value Lowerer::lowerAttr(hc_front::AttrOp op) {
   return Value();
 }
 
-Value Lowerer::emitConstantFromRef(Location loc, DictionaryAttr ref,
+Value Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
                                    Operation *sourceOp) {
   MLIRContext *ctx = sourceOp->getContext();
-  StringRef pyKind = dictString(ref, "python_kind");
-  StringRef raw = dictString(ref, "value");
+  StringRef pyKind = ref.string("python_kind");
+  StringRef raw = ref.string("value");
   Attribute payload;
   if (pyKind == "int") {
     int64_t v = 0;
@@ -729,11 +773,24 @@ Value Lowerer::lowerSlice(hc_front::SliceOp op) {
   // `has_*` flags tell us which optional parts were syntactically present;
   // the operand list packs only the present parts, in (lower, upper, step)
   // order. `hc.slice_expr` mirrors the tri-state via `Optional<>` operands.
-  bool hasLower = op->getAttrOfType<BoolAttr>("has_lower").getValue();
-  bool hasUpper = op->getAttrOfType<BoolAttr>("has_upper").getValue();
-  bool hasStep = op->getAttrOfType<BoolAttr>("has_step").getValue();
+  // Missing attributes on hand-written IR default to false rather than a
+  // null-dereference crash.
+  auto boolAttr = [&](StringRef key) -> bool {
+    auto a = op->getAttrOfType<BoolAttr>(key);
+    return a ? a.getValue() : false;
+  };
+  bool hasLower = boolAttr("has_lower");
+  bool hasUpper = boolAttr("has_upper");
+  bool hasStep = boolAttr("has_step");
 
   SmallVector<Value> parts = lowerValueOperands(op.getParts());
+  size_t expected = unsigned(hasLower) + unsigned(hasUpper) + unsigned(hasStep);
+  if (parts.size() != expected) {
+    op.emitOpError("slice has_* flags (")
+        << expected << ") disagree with part count (" << parts.size() << ")";
+    return nullptr;
+  }
+
   Value lo = nullptr, hi = nullptr, st = nullptr;
   size_t idx = 0;
   if (hasLower)
@@ -758,44 +815,59 @@ LogicalResult Lowerer::lowerReturn(hc_front::ReturnOp op) {
 }
 
 LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
-  Value value = lowerValueOperand(op.getValue());
+  Value rhs = op.getValue();
   Operation *target = op.getTarget().getDefiningOp();
+
   if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
+    Value value = lowerValueOperand(rhs);
     currentScope().bind(tn.getName(), value);
     return success();
   }
+
   if (auto tt = dyn_cast_if_present<hc_front::TargetTupleOp>(target)) {
-    // Multi-assign idiom: `a, b = f(x)`. Expect the RHS to be an op with N
-    // results (typically an `hc.call` that the call lowering already
-    // expanded). Fall through to binding-each-to-the-same-value for the
-    // degenerate `hc_front` tuple case so we never leak an unbound name.
-    Operation *rhs = value ? value.getDefiningOp() : nullptr;
+    // Multi-assign: `a, b = <rhs>`. Two shapes we accept:
+    //   (1) RHS is an `hc_front.tuple` — destructure from `tupleElts`.
+    //       `lowerValueOperand` on a tuple returns null (tuples have no
+    //       standalone `hc` counterpart), so we must special-case before
+    //       looking at the lowered value or we'd bind every target to null.
+    //   (2) RHS lowers to a single op whose result count matches the
+    //       target arity (a call that happens to produce N results).
     size_t arity = tt.getElements().size();
-    if (rhs && rhs->getNumResults() == arity) {
-      for (auto [elem, res] : llvm::zip(tt.getElements(), rhs->getResults())) {
-        auto tn =
-            dyn_cast_if_present<hc_front::TargetNameOp>(elem.getDefiningOp());
-        if (!tn)
-          return op.emitOpError("nested target kinds are not yet supported");
-        currentScope().bind(tn.getName(), res);
+    SmallVector<Value> sources;
+    auto tupleIt = tupleElts.find(rhs);
+    if (tupleIt != tupleElts.end()) {
+      sources.assign(tupleIt->second.begin(), tupleIt->second.end());
+    } else {
+      Value value = lowerValueOperand(rhs);
+      Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
+      if (rhsOp && rhsOp->getNumResults() == arity) {
+        sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
+      } else {
+        return op.emitOpError(
+            "tuple-unpack rhs must be an hc_front.tuple or an arity-matching "
+            "multi-result op");
       }
-      return success();
     }
-    // Degenerate fallback: bind every target name to the singleton RHS.
-    // This keeps `a, b = (c, d)` (where each element was its own SSA val)
-    // from losing a binding; the pre-inference IR doesn't care about
-    // exact shape here.
-    for (Value elem : tt.getElements()) {
+    if (sources.size() != arity)
+      return op.emitOpError("tuple-unpack arity mismatch: rhs has ")
+             << sources.size() << ", target has " << arity;
+    for (auto [elem, src] : llvm::zip(tt.getElements(), sources)) {
       auto tn =
           dyn_cast_if_present<hc_front::TargetNameOp>(elem.getDefiningOp());
       if (!tn)
         return op.emitOpError("nested target kinds are not yet supported");
-      currentScope().bind(tn.getName(), value);
+      if (!src)
+        return op.emitOpError(
+            "tuple-unpack source element did not lower to an hc value");
+      currentScope().bind(tn.getName(), src);
     }
     return success();
   }
+
   if (auto ts = dyn_cast_if_present<hc_front::TargetSubscriptOp>(target)) {
-    // Subscripted write = `hc.store dest[idx...] , value`.
+    Value value = lowerValueOperand(rhs);
+    if (!value)
+      return op.emitOpError("store source did not lower to an hc value");
     Value base = lowerValueOperand(ts.getBase());
     if (!base)
       return op.emitOpError("target_subscript base is unresolved");
@@ -807,6 +879,7 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
     HCStoreOp::create(builder, op.getLoc(), base, indices, value);
     return success();
   }
+
   return op.emitOpError("unsupported assign target");
 }
 
@@ -833,8 +906,9 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 
   auto calleeName = dyn_cast_if_present<hc_front::NameOp>(
       iterCall.getCallee().getDefiningOp());
-  if (!calleeName || refKind(calleeName) != "builtin" ||
-      dictString(refDict(calleeName), "builtin") != "range") {
+  RefInfo calleeRef = RefInfo::of(calleeName);
+  if (!calleeName || calleeRef.kind != "builtin" ||
+      calleeRef.string("builtin") != "range") {
     return op.emitOpError("for-iter must be `range(...)`");
   }
 
@@ -901,23 +975,22 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   return success();
 }
 
-LogicalResult Lowerer::lowerWorkitemRegion(hc_front::WorkitemRegionOp op) {
-  // `hc.workitem_region` matches `hc_front`'s shape 1:1 (captures +
+template <typename HCRegionOpT, typename FrontRegionOpT>
+LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
+  // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
   // body). Nested-def folding is 5-3jb; if the front op declares
-  // parameters we still bind them as block args so the body resolves, but
-  // the `hc` op carries only a captures list (no formal params).
-  auto newOp =
-      HCWorkitemRegionOp::create(builder, op.getLoc(), op.getCapturesAttr());
-
+  // parameters we still bind them as block args so the body resolves,
+  // but the `hc` op carries only a captures list (no formal params).
+  auto newOp = HCRegionOpT::create(builder, op.getLoc(), op.getCapturesAttr());
   Block *body = new Block();
   Scope childScope;
   childScope.parent = scopes.back().get();
-  if (auto params = op->getAttrOfType<ArrayAttr>("parameters")) {
+  if (auto params = op->template getAttrOfType<ArrayAttr>("parameters")) {
     for (Attribute p : params) {
       auto dict = dyn_cast<DictionaryAttr>(p);
       if (!dict)
         return op.emitOpError("invalid parameters entry");
-      auto name = dict.getAs<StringAttr>("name");
+      auto name = dict.template getAs<StringAttr>("name");
       if (!name)
         return op.emitOpError("parameters entry missing `name`");
       BlockArgument arg = body->addArgument(undef, op.getLoc());
@@ -927,47 +1000,19 @@ LogicalResult Lowerer::lowerWorkitemRegion(hc_front::WorkitemRegionOp op) {
   newOp.getBody().push_back(body);
 
   scopes.push_back(std::make_unique<Scope>(std::move(childScope)));
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(body);
-    LogicalResult r = lowerRegion(op.getBody());
-    scopes.pop_back();
-    if (failed(r))
-      return failure();
-  }
-  return success();
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(body);
+  LogicalResult r = lowerRegion(op.getBody());
+  scopes.pop_back();
+  return r;
+}
+
+LogicalResult Lowerer::lowerWorkitemRegion(hc_front::WorkitemRegionOp op) {
+  return lowerCapturingRegion<HCWorkitemRegionOp>(op);
 }
 
 LogicalResult Lowerer::lowerSubgroupRegion(hc_front::SubgroupRegionOp op) {
-  auto newOp =
-      HCSubgroupRegionOp::create(builder, op.getLoc(), op.getCapturesAttr());
-  Block *body = new Block();
-  Scope childScope;
-  childScope.parent = scopes.back().get();
-  if (auto params = op->getAttrOfType<ArrayAttr>("parameters")) {
-    for (Attribute p : params) {
-      auto dict = dyn_cast<DictionaryAttr>(p);
-      if (!dict)
-        return op.emitOpError("invalid parameters entry");
-      auto name = dict.getAs<StringAttr>("name");
-      if (!name)
-        return op.emitOpError("parameters entry missing `name`");
-      BlockArgument arg = body->addArgument(undef, op.getLoc());
-      childScope.bind(name.getValue(), arg);
-    }
-  }
-  newOp.getBody().push_back(body);
-
-  scopes.push_back(std::make_unique<Scope>(std::move(childScope)));
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(body);
-    LogicalResult r = lowerRegion(op.getBody());
-    scopes.pop_back();
-    if (failed(r))
-      return failure();
-  }
-  return success();
+  return lowerCapturingRegion<HCSubgroupRegionOp>(op);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1059,8 +1104,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     op.emitOpError("call with non-name, non-attr callee not supported");
     return failure();
   }
-  StringRef kind = refKind(nameOp);
-  DictionaryAttr ref = refDict(nameOp);
+  RefInfo ref = RefInfo::of(nameOp);
+  StringRef kind = ref.kind;
 
   FailureOr<CallArgs> argsOr = collectCallArgs(op);
   if (failed(argsOr))
@@ -1068,7 +1113,7 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
   CallArgs &args = *argsOr;
 
   if (kind == "callee" || kind == "intrinsic") {
-    StringRef callee = dictString(ref, "callee");
+    StringRef callee = ref.string("callee");
     if (callee.empty()) {
       op.emitOpError("`ref.callee` missing for ") << kind << " name ref";
       return failure();
@@ -1091,6 +1136,11 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     auto call = HCCallIntrinsicOp::create(
         builder, op.getLoc(), TypeRange{undef}, symRef, args.positional);
     if (auto constKwargs = ref.getAs<ArrayAttr>("const_kwargs")) {
+      // `const_kwargs` is the intrinsic's declared list of kwargs that must
+      // be constant-folded into attributes on the call site. Each entry we
+      // find in the call's kwargs lands as either (a) the already-folded
+      // attribute (shape fold from collectCallArgs) or (b) the payload of
+      // the `hc.const` producer.
       for (Attribute kw : constKwargs) {
         auto kwStr = dyn_cast<StringAttr>(kw);
         if (!kwStr)
@@ -1123,7 +1173,7 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     // Full inlining of non-decorated helpers needs a separate pass (see
     // bead note). Emit a conservative `hc.call @<qualified>` placeholder
     // and let downstream either inline it or flag the missing symbol.
-    StringRef qn = dictString(ref, "qualified_name");
+    StringRef qn = ref.string("qualified_name");
     if (qn.empty()) {
       op.emitOpError("inline name ref missing qualified_name");
       return failure();
@@ -1145,8 +1195,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
 
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
                                              hc_front::AttrOp attr) {
-  DictionaryAttr ref = refDict(attr);
-  StringRef method = dictString(ref, "method");
+  RefInfo ref = RefInfo::of(attr);
+  StringRef method = ref.string("method");
 
   FailureOr<CallArgs> argsOr = collectCallArgs(call);
   if (failed(argsOr))
@@ -1159,14 +1209,25 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // mechanical cases this bead handles. Anything requiring group/context
   // plumbing (`wi.local_id()`, `group.load(...)`) is deferred — the
   // acceptance synthetic test sticks to the mechanical subset.
-  if (method == "vec") {
+  // All unary-base DSL methods share the "base did not lower" guard; a
+  // classification gap must not let us ship an hc op built on a null
+  // operand — the later verifier error would be harder to attribute.
+  auto requireBase = [&](StringRef m) -> LogicalResult {
     if (!base) {
-      call.emitOpError("vec: base did not lower");
+      call.emitOpError(m) << ": base did not lower";
       return failure();
     }
+    return success();
+  };
+
+  if (method == "vec") {
+    if (failed(requireBase(method)))
+      return failure();
     return {HCVecOp::create(builder, call.getLoc(), undef, base).getResult()};
   }
   if (method == "with_inactive") {
+    if (failed(requireBase(method)))
+      return failure();
     auto valIt = args.kwvalues.find("value");
     if (valIt == args.kwvalues.end()) {
       call.emitOpError("with_inactive missing `value=` kwarg");
@@ -1184,6 +1245,8 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
             .getResult()};
   }
   if (method == "astype") {
+    if (failed(requireBase(method)))
+      return failure();
     if (args.positional.empty()) {
       call.emitOpError("astype missing target type");
       return failure();
@@ -1254,7 +1317,9 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
 
   // `group.{launch_geo}()` with no args is the call form (`wi.local_id()`).
   // Emit the multi-result launch-geo op; the caller's enclosing subscript
-  // drills into a specific axis.
+  // drills into a specific axis. The property-style `group.launch_geo[N]`
+  // is handled in `lowerSubscript` — both go through `tryEmitLaunchGeo`
+  // so the supported method set stays in one place.
   if (call.getArguments().empty() && args.kwvalues.empty() &&
       args.kwattrs.empty()) {
     if (base) {
@@ -1314,8 +1379,8 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   // generic `hc.buffer_view` branch below.
   if (auto attr =
           dyn_cast_if_present<hc_front::AttrOp>(op.getBase().getDefiningOp())) {
-    DictionaryAttr ref = refDict(attr);
-    StringRef method = dictString(ref, "method");
+    RefInfo ref = RefInfo::of(attr);
+    StringRef method = ref.string("method");
     if (!method.empty() && op.getIndices().size() == 1) {
       Value idxVal = lowerValueOperand(op.getIndices().front());
       Value baseVal = lowerValueOperand(attr.getBase());
@@ -1323,14 +1388,23 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
       auto ax =
           constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
       if (baseVal && ax) {
+        int64_t axVal = ax.getInt();
+        // Launch-geo / buffer_dim axes are small non-negative integers;
+        // anything else is either user error or a bad `ref` payload.
+        // Guard before the unsigned cast so a negative never underflows
+        // into a huge variadic-op rank below.
+        if (axVal < 0 || axVal >= kMaxLaunchAxis) {
+          op.emitOpError("axis index ")
+              << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
+          return nullptr;
+        }
+        unsigned axis = static_cast<unsigned>(axVal);
         if (method == "shape") {
           return HCBufferDimOp::create(
               builder, op.getLoc(), undef, baseVal,
-              IntegerAttr::get(IntegerType::get(op.getContext(), 64),
-                               ax.getInt()));
+              IntegerAttr::get(IntegerType::get(op.getContext(), 64), axVal));
         }
-        if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(),
-                                       static_cast<unsigned>(ax.getInt())))
+        if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
           return v;
       }
     }

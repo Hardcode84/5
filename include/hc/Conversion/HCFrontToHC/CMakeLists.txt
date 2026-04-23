@@ -6,4 +6,4 @@ set(LLVM_TARGET_DEFINITIONS Passes.td)
 mlir_tablegen(Passes.h.inc -gen-pass-decls -name=HCFrontToHCConversion)
 add_public_tablegen_target(MLIRHCFrontToHCConversionPassIncGen)
 
-add_mlir_doc(Passes HCFrontToHCConversionPasses ./ -gen-pass-doc)
+add_mlir_doc(Passes HCFrontToHCConversionPasses hc/Conversion/HCFrontToHC/ -gen-pass-doc)

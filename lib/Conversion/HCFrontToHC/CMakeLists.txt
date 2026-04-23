@@ -17,7 +17,6 @@ add_mlir_library(MLIRHCFrontToHC
   MLIRIR
   MLIRPass
   MLIRSupport
-  MLIRTransforms
 )
 
 target_include_directories(

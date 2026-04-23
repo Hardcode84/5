@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// First RUN verifies the pass's direct output; the second pipes it back
+// through `hc-opt` so a round-trip parse+print catches any emitted IR
+// that's accepted by the pass but fails the hc dialect's verifier.
 // RUN: hc-opt --convert-hc-front-to-hc %s | FileCheck %s
 // RUN: hc-opt --convert-hc-front-to-hc %s | hc-opt | FileCheck %s
 

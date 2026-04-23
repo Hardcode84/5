@@ -19,10 +19,13 @@
 // into direct SSA edges.
 //
 // Implemented in this file: flat-body sweep, `hc.for_range` promotion,
-// `hc.if` promotion. `hc.workitem_region` / `hc.subgroup_region` still
-// need an ODS-level result-plumbing extension; the pass diagnoses them
-// when their bodies hold surviving name-store ops so no module ever
-// leaves the pass half-lowered.
+// `hc.if` promotion, isolated-scope sweep for `hc.workitem_region` /
+// `hc.subgroup_region`. The two region ops introduce their own name
+// scope — assigns inside shadow outer bindings and don't leak out;
+// reads don't capture in either — so we promote each body in
+// isolation and skip outer-scope snap/writeback entirely. Plumbing a
+// value back out (the "return acc" pattern) needs an ODS-level result
+// extension on those ops and lives in a follow-up bead.
 
 #include "hc/Transforms/Passes.h"
 
@@ -71,16 +74,15 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
 
 // Linear scan over `block`'s non-terminator ops: every `hc.assign`
 // updates `binding`, every `hc.name_load` is rewritten to the current
-// binding (failing the pass if no reaching definition exists). Ops that
-// aren't name-store ops are left alone — including already-promoted
-// region ops, whose inner IR has already been cleaned up by recursive
-// calls.
+// binding (failing the pass if no reaching definition exists). Ops
+// that aren't name-store ops are left alone — including already-
+// promoted region ops, whose inner IR has been cleaned up by the
+// post-order walk.
 //
-// A residual `NameStoreRegionOpInterface` op with surviving `hc.assign`
-// / `hc.name_load` inside is a cue that its op kind is one promotion
-// doesn't yet handle (`hc.workitem_region` / `hc.subgroup_region` until
-// the follow-up ODS extension lands). Diagnose loudly rather than leave
-// a half-lowered module.
+// A residual `NameStoreRegionOpInterface` op whose body still carries
+// `hc.assign` / `hc.name_load` means a new op kind has claimed the
+// interface without getting a matching promoter here; diagnose rather
+// than leave the module half-lowered.
 static LogicalResult scanAndPromoteBlock(Block &block,
                                          llvm::StringMap<Value> &binding) {
   SmallVector<Operation *> toErase;
@@ -96,9 +98,9 @@ static LogicalResult scanAndPromoteBlock(Block &block,
         return load.emitOpError("read of name '")
                << load.getName()
                << "' that has no reaching `hc.assign` in the enclosing "
-                  "function body; the frontend must emit an assign before "
-                  "every read, or the promotion must see a prior iter_arg "
-                  "/ region result";
+                  "scope; the frontend must emit an assign before every "
+                  "read, or the promotion must see a prior iter_arg / "
+                  "region result";
       load.getResult().replaceAllUsesWith(it->second);
       toErase.push_back(&op);
       continue;
@@ -115,8 +117,8 @@ static LogicalResult scanAndPromoteBlock(Block &block,
       if (stale)
         return op.emitOpError(
             "region-carrying op still contains `hc.assign` / `hc.name_load` "
-            "after promotion; region-level promotion is not yet implemented "
-            "for this op kind");
+            "after promotion; a new NameStoreRegionOpInterface op claimed "
+            "the interface without a matching promoter in this pass");
     }
   }
   for (Operation *o : toErase)
@@ -376,15 +378,30 @@ static LogicalResult promoteIf(HCIfOp op) {
   return success();
 }
 
+// Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as an
+// isolated scope. These ops introduce a scope barrier: assigns inside
+// shadow outer bindings and don't leak out, reads don't capture in.
+// The post-order walk has already promoted every inner
+// NameStoreRegionOpInterface op (leaving transient snap/writeback
+// pairs at this body's top level), so a flat sweep of the body with
+// an empty initial binding resolves everything locally. Propagating a
+// value back to the outer scope needs an ODS-level result extension
+// on these ops — tracked as a follow-up bead.
+static LogicalResult promoteIsolatedScope(Operation *op) {
+  Region &body = op->getRegion(0);
+  if (body.empty())
+    return success();
+  llvm::StringMap<Value> binding;
+  return scanAndPromoteBlock(body.front(), binding);
+}
+
 static LogicalResult promoteRegionOp(Operation *op) {
   if (auto forOp = dyn_cast<HCForRangeOp>(op))
     return promoteForRange(forOp);
   if (auto ifOp = dyn_cast<HCIfOp>(op))
     return promoteIf(ifOp);
-  // `hc.workitem_region` / `hc.subgroup_region` still need an
-  // ODS-extension to grow results before promotion can plumb values out;
-  // until then, leaving them untouched is correct — the flat-sweep
-  // defensive check will flag any surviving name-store ops inside.
+  if (isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
+    return promoteIsolatedScope(op);
   return success();
 }
 

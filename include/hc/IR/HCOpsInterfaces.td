@@ -13,12 +13,19 @@ def NameStoreRegionOpInterface : OpInterface<"NameStoreRegionOpInterface"> {
     promotion. `-hc-promote-names` walks a function region tree bottom-up
     and rebuilds every op with this interface so that `hc.assign` /
     `hc.name_load` inside its region(s) get replaced by a structured SSA
-    carrier:
+    carrier, with semantics split along the scope-barrier axis:
 
-      - `hc.for_range`:       iter_args + `hc.yield`
-      - `hc.if`:              results + yields in both branches
-      - `hc.workitem_region`: captures + results (via ODS extension, TBD)
-      - `hc.subgroup_region`: captures + results (via ODS extension, TBD)
+      - `hc.for_range`:       transparent. Carried names become
+                              iter_args + `hc.yield` values, threaded
+                              across iterations.
+      - `hc.if`:              transparent. Carried names become op
+                              results + yields in both branches;
+                              silent-branch fallback = outer snapshot.
+      - `hc.workitem_region`: isolated scope. Assigns inside shadow
+                              outer bindings and don't leak out; reads
+                              don't capture in. Out-bound propagation
+                              needs an ODS result extension (TBD).
+      - `hc.subgroup_region`: ditto.
 
     The interface is a marker only — the pass dispatches on op kind
     internally. Keeping the opt-in in ODS (rather than a hard-coded

@@ -31,24 +31,26 @@ hc.func @different_name(%a: !hc.undef) -> !hc.undef {
 
 // -----
 
-// `hc.workitem_region` doesn't yet carry results; any `hc.assign` /
-// `hc.name_load` inside it survives region promotion, and the flat
-// sweep that follows must refuse to leave a half-lowered module.
-hc.kernel @workitem_region_unsupported(%a: !hc.undef) {
-  // expected-error @+1 {{region-carrying op still contains `hc.assign` / `hc.name_load`}}
+// `hc.workitem_region` and `hc.subgroup_region` are isolated scopes:
+// reads inside can't capture the outer name store, so a load of a
+// non-locally-assigned name errors even if the enclosing kernel has
+// a matching `hc.assign`.
+hc.kernel @workitem_region_read_outer(%a: !hc.undef) {
+  hc.assign "x", %a : !hc.undef
   hc.workitem_region {
-    hc.assign "x", %a : !hc.undef
+    // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
+    %v = hc.name_load "x" : !hc.undef
   }
   hc.return
 }
 
 // -----
 
-// Same defensive diagnostic for `hc.subgroup_region`.
-hc.kernel @subgroup_region_unsupported(%a: !hc.undef) {
-  // expected-error @+1 {{region-carrying op still contains `hc.assign` / `hc.name_load`}}
+hc.kernel @subgroup_region_read_outer(%a: !hc.undef) {
+  hc.assign "x", %a : !hc.undef
   hc.subgroup_region {
-    hc.assign "x", %a : !hc.undef
+    // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
+    %v = hc.name_load "x" : !hc.undef
   }
   hc.return
 }
@@ -56,7 +58,7 @@ hc.kernel @subgroup_region_unsupported(%a: !hc.undef) {
 // -----
 
 // A body-read of a name that has no reaching outer `hc.assign` must
-// fail with the same reaching-def diagnostic. The error is reported on
+// fail with the reaching-def diagnostic. The error is reported on
 // the transient outer-scope snap load the pass emits at the
 // `hc.for_range`'s location — that load is what fails to resolve.
 hc.func @for_body_read_before_write(%lo: !hc.undef, %hi: !hc.undef,
@@ -69,4 +71,18 @@ hc.func @for_body_read_before_write(%lo: !hc.undef, %hi: !hc.undef,
   }
   %v = hc.name_load "acc" : !hc.undef
   hc.return %v : !hc.undef
+}
+
+// -----
+
+// Assigns inside an isolated scope are LOCAL: they don't contribute
+// to the outer name store. A subsequent outer `hc.name_load` of that
+// name must fail (isolated scope = barrier, not shadow then fall-through).
+hc.kernel @workitem_assign_does_not_leak(%a: !hc.undef) {
+  hc.workitem_region {
+    hc.assign "x", %a : !hc.undef
+  }
+  // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
+  %v = hc.name_load "x" : !hc.undef
+  hc.return
 }

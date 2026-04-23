@@ -21,10 +21,12 @@ def NameStoreRegionOpInterface : OpInterface<"NameStoreRegionOpInterface"> {
       - `hc.if`:              transparent. Carried names become op
                               results + yields in both branches;
                               silent-branch fallback = outer snapshot.
-      - `hc.workitem_region`: isolated scope. Assigns inside shadow
-                              outer bindings and don't leak out; reads
-                              don't capture in. Out-bound propagation
-                              needs an ODS result extension (TBD).
+      - `hc.workitem_region`: Python-style nested scope. Reads inside
+                              capture the outer binding (lazy
+                              `hc.name_load` at the op's insertion
+                              point); writes inside shadow and don't
+                              leak out. Out-bound propagation needs an
+                              ODS result extension (TBD).
       - `hc.subgroup_region`: ditto.
 
     The interface is a marker only — the pass dispatches on op kind

@@ -19,13 +19,14 @@
 // into direct SSA edges.
 //
 // Implemented in this file: flat-body sweep, `hc.for_range` promotion,
-// `hc.if` promotion, isolated-scope sweep for `hc.workitem_region` /
-// `hc.subgroup_region`. The two region ops introduce their own name
-// scope — assigns inside shadow outer bindings and don't leak out;
-// reads don't capture in either — so we promote each body in
-// isolation and skip outer-scope snap/writeback entirely. Plumbing a
-// value back out (the "return acc" pattern) needs an ODS-level result
-// extension on those ops and lives in a follow-up bead.
+// `hc.if` promotion, nested-scope sweep for `hc.workitem_region` /
+// `hc.subgroup_region`. The two region ops introduce a new Python-
+// style nested name scope — writes inside shadow any outer binding
+// and don't leak out, but reads **do** capture outer bindings: an
+// unbound read falls back to an outer-scope snapshot materialized
+// lazily by the pass. Plumbing a write back out (the "return acc"
+// pattern) needs an ODS-level result extension on those ops and
+// lives in a follow-up bead.
 
 #include "hc/Transforms/Passes.h"
 
@@ -44,6 +45,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <functional>
+
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCPROMOTENAMES
 #include "hc/Transforms/Passes.h.inc"
@@ -56,6 +59,15 @@ namespace {
 
 using NameSet = llvm::SmallSetVector<StringAttr, 4>;
 using SnapMap = llvm::SmallDenseMap<StringAttr, Value>;
+
+// Callback that materialises a capture-from-outer-scope snapshot for
+// `name`. Returned `Value` seeds the binding for the first in-scope
+// `hc.name_load` of `name`; subsequent reads hit the binding directly.
+// A null `SnapFactory` disables capture — the scan errors on any
+// unresolved read, which is what we want at the top level of a
+// callable body (nothing to capture from) and inside `hc.for_range` /
+// `hc.if` scans where the caller pre-seeds the binding.
+using SnapFactory = llvm::function_ref<Value(StringAttr)>;
 
 // Gathers the top-level `hc.assign` / `hc.name_load` ops in `block`.
 // "Top-level" = direct children only; nested region ops at this point
@@ -74,17 +86,23 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
 
 // Linear scan over `block`'s non-terminator ops: every `hc.assign`
 // updates `binding`, every `hc.name_load` is rewritten to the current
-// binding (failing the pass if no reaching definition exists). Ops
-// that aren't name-store ops are left alone — including already-
-// promoted region ops, whose inner IR has been cleaned up by the
-// post-order walk.
+// binding. Ops that aren't name-store ops are left alone — including
+// already-promoted region ops, whose inner IR has been cleaned up by
+// the post-order walk.
+//
+// An `hc.name_load` whose name has no entry in `binding` is either
+// passed to `capture` (for nested-scope bodies that capture outer
+// bindings) or diagnosed (everywhere else). `capture` is called at
+// most once per missing name — its return value gets stored in
+// `binding` so repeated reads share the same snapshot.
 //
 // A residual `NameStoreRegionOpInterface` op whose body still carries
 // `hc.assign` / `hc.name_load` means a new op kind has claimed the
 // interface without getting a matching promoter here; diagnose rather
 // than leave the module half-lowered.
 static LogicalResult scanAndPromoteBlock(Block &block,
-                                         llvm::StringMap<Value> &binding) {
+                                         llvm::StringMap<Value> &binding,
+                                         SnapFactory capture = nullptr) {
   SmallVector<Operation *> toErase;
   for (Operation &op : block.without_terminator()) {
     if (auto assign = dyn_cast<HCAssignOp>(&op)) {
@@ -94,14 +112,21 @@ static LogicalResult scanAndPromoteBlock(Block &block,
     }
     if (auto load = dyn_cast<HCNameLoadOp>(&op)) {
       auto it = binding.find(load.getName());
-      if (it == binding.end())
+      Value resolved;
+      if (it != binding.end()) {
+        resolved = it->second;
+      } else if (capture) {
+        resolved = capture(load.getNameAttr());
+        binding[load.getName()] = resolved;
+      } else {
         return load.emitOpError("read of name '")
                << load.getName()
                << "' that has no reaching `hc.assign` in the enclosing "
                   "scope; the frontend must emit an assign before every "
                   "read, or the promotion must see a prior iter_arg / "
                   "region result";
-      load.getResult().replaceAllUsesWith(it->second);
+      }
+      load.getResult().replaceAllUsesWith(resolved);
       toErase.push_back(&op);
       continue;
     }
@@ -378,21 +403,35 @@ static LogicalResult promoteIf(HCIfOp op) {
   return success();
 }
 
-// Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as an
-// isolated scope. These ops introduce a scope barrier: assigns inside
-// shadow outer bindings and don't leak out, reads don't capture in.
-// The post-order walk has already promoted every inner
-// NameStoreRegionOpInterface op (leaving transient snap/writeback
-// pairs at this body's top level), so a flat sweep of the body with
-// an empty initial binding resolves everything locally. Propagating a
-// value back to the outer scope needs an ODS-level result extension
-// on these ops — tracked as a follow-up bead.
-static LogicalResult promoteIsolatedScope(Operation *op) {
+// Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as a
+// Python-style nested scope. Writes inside shadow the outer name
+// store and don't leak back out; reads **do** capture outer bindings
+// — an unresolved read inside triggers a lazy `hc.name_load` at the
+// region op's insertion point, which the outer flat sweep then
+// resolves against the outer name store. Propagating a write back to
+// the outer scope needs an ODS-level result extension on these ops
+// — tracked as a follow-up bead.
+//
+// By the time we reach here, the post-order walk has already promoted
+// every inner NameStoreRegionOpInterface op; their transient
+// snap/writeback pairs sit at this body's top level and get resolved
+// by the same flat sweep, capturing upward through the region op if
+// needed.
+static LogicalResult promoteNestedScope(Operation *op) {
   Region &body = op->getRegion(0);
   if (body.empty())
     return success();
+
+  MLIRContext *ctx = op->getContext();
+  Type undefTy = UndefType::get(ctx);
+  Location loc = op->getLoc();
+  OpBuilder outerBuilder(op);
+  auto capture = [&](StringAttr name) -> Value {
+    return HCNameLoadOp::create(outerBuilder, loc, undefTy, name).getResult();
+  };
+
   llvm::StringMap<Value> binding;
-  return scanAndPromoteBlock(body.front(), binding);
+  return scanAndPromoteBlock(body.front(), binding, capture);
 }
 
 static LogicalResult promoteRegionOp(Operation *op) {
@@ -401,7 +440,7 @@ static LogicalResult promoteRegionOp(Operation *op) {
   if (auto ifOp = dyn_cast<HCIfOp>(op))
     return promoteIf(ifOp);
   if (isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
-    return promoteIsolatedScope(op);
+    return promoteNestedScope(op);
   return success();
 }
 

@@ -31,32 +31,6 @@ hc.func @different_name(%a: !hc.undef) -> !hc.undef {
 
 // -----
 
-// `hc.workitem_region` and `hc.subgroup_region` are isolated scopes:
-// reads inside can't capture the outer name store, so a load of a
-// non-locally-assigned name errors even if the enclosing kernel has
-// a matching `hc.assign`.
-hc.kernel @workitem_region_read_outer(%a: !hc.undef) {
-  hc.assign "x", %a : !hc.undef
-  hc.workitem_region {
-    // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
-    %v = hc.name_load "x" : !hc.undef
-  }
-  hc.return
-}
-
-// -----
-
-hc.kernel @subgroup_region_read_outer(%a: !hc.undef) {
-  hc.assign "x", %a : !hc.undef
-  hc.subgroup_region {
-    // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
-    %v = hc.name_load "x" : !hc.undef
-  }
-  hc.return
-}
-
-// -----
-
 // A body-read of a name that has no reaching outer `hc.assign` must
 // fail with the reaching-def diagnostic. The error is reported on
 // the transient outer-scope snap load the pass emits at the
@@ -75,14 +49,42 @@ hc.func @for_body_read_before_write(%lo: !hc.undef, %hi: !hc.undef,
 
 // -----
 
-// Assigns inside an isolated scope are LOCAL: they don't contribute
-// to the outer name store. A subsequent outer `hc.name_load` of that
-// name must fail (isolated scope = barrier, not shadow then fall-through).
+// Writes inside `hc.workitem_region` / `hc.subgroup_region` shadow and
+// don't leak out: the enclosing scope's read can't see them. Reads
+// capture, writes don't — so an outer `hc.name_load` without any
+// outer-level `hc.assign` still fails, even though the region body
+// assigns the same name.
 hc.kernel @workitem_assign_does_not_leak(%a: !hc.undef) {
   hc.workitem_region {
     hc.assign "x", %a : !hc.undef
   }
   // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
   %v = hc.name_load "x" : !hc.undef
+  hc.return
+}
+
+// -----
+
+hc.kernel @subgroup_assign_does_not_leak(%a: !hc.undef) {
+  hc.subgroup_region {
+    hc.assign "x", %a : !hc.undef
+  }
+  // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
+  %v = hc.name_load "x" : !hc.undef
+  hc.return
+}
+
+// -----
+
+// Reads inside a nested scope capture via a lazy outer snapshot —
+// but the snapshot itself still needs a reaching outer assign. An
+// inner read of an entirely unbound name therefore still errors,
+// reported on the pass-emitted outer snap load (which inherits the
+// region op's source location).
+hc.kernel @workitem_read_unbound_outer() {
+  // expected-error @+1 {{read of name 'x' that has no reaching `hc.assign`}}
+  hc.workitem_region {
+    %v = hc.name_load "x" : !hc.undef
+  }
   hc.return
 }

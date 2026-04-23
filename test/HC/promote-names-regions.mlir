@@ -228,18 +228,17 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
 
 // -----
 
-// `hc.workitem_region` is an isolated scope: assigns inside are local
-// to the region and don't leak out. With no outbound mechanism yet,
-// a body that only binds internally leaves no observable trace —
-// every name-store op should be erased and nothing should flow to
-// the enclosing kernel.
-// CHECK-LABEL: hc.kernel @workitem_isolated_local_only
+// `hc.workitem_region` is a nested scope: reads capture outer
+// bindings, writes shadow. A body that only writes and then reads
+// its own writes needs no outer capture — local binding wins — and
+// every name-store op erases cleanly, leaving an empty region.
+// CHECK-LABEL: hc.kernel @workitem_nested_local_only
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
 // CHECK: hc.workitem_region {
 // CHECK-NEXT: }
 // CHECK: hc.return
-hc.kernel @workitem_isolated_local_only(%v: !hc.undef) {
+hc.kernel @workitem_nested_local_only(%v: !hc.undef) {
   hc.workitem_region {
     hc.assign "x", %v : !hc.undef
     %cur = hc.name_load "x" : !hc.undef
@@ -250,12 +249,11 @@ hc.kernel @workitem_isolated_local_only(%v: !hc.undef) {
 
 // -----
 
-// `hc.subgroup_region` with a nested `hc.for_range`: the inner
-// accumulator is seeded *inside* the region (isolated scope forbids
-// capturing outer bindings), and its name-store plumbing promotes
-// against the region's own local store. Outer kernel state is
-// untouched.
-// CHECK-LABEL: hc.kernel @subgroup_isolated_local_for
+// `hc.subgroup_region` with a nested `hc.for_range`: the accumulator
+// is seeded *inside* the region, so no outer capture is materialized;
+// the for-range snapshot resolves against the region's own local
+// store, and nothing leaks back to the enclosing kernel.
+// CHECK-LABEL: hc.kernel @subgroup_nested_local_for
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
 // CHECK: hc.subgroup_region {
@@ -264,9 +262,9 @@ hc.kernel @workitem_isolated_local_only(%v: !hc.undef) {
 // CHECK:          %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
 // CHECK:          hc.yield %[[SUM]]
 // CHECK: hc.return
-hc.kernel @subgroup_isolated_local_for(%lo: !hc.undef, %hi: !hc.undef,
-                                       %step: !hc.undef,
-                                       %init: !hc.undef) {
+hc.kernel @subgroup_nested_local_for(%lo: !hc.undef, %hi: !hc.undef,
+                                     %step: !hc.undef,
+                                     %init: !hc.undef) {
   hc.subgroup_region {
     hc.assign "acc", %init : !hc.undef
     hc.for_range %lo to %hi step %step
@@ -284,9 +282,11 @@ hc.kernel @subgroup_isolated_local_for(%lo: !hc.undef, %hi: !hc.undef,
 // -----
 
 // Shadowing: the same name bound in the outer scope AND inside a
-// `hc.workitem_region` are independent. The outer binding remains
-// untouched by the in-region assign; a subsequent outer
-// `hc.name_load` sees the outer value, never the region's local one.
+// `hc.workitem_region`. The in-region write is local; it doesn't
+// leak back to the outer name store, so the outer `hc.name_load`
+// resolves to `%outer`. The in-region read sees the local write
+// (which arrived first lexically), never the captured outer — so no
+// outer snapshot is materialized for this body.
 // CHECK-LABEL: hc.func @workitem_shadows_outer_name
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
@@ -303,4 +303,107 @@ hc.func @workitem_shadows_outer_name(%outer: !hc.undef,
   }
   %v = hc.name_load "x" : !hc.undef
   hc.return %v : !hc.undef
+}
+
+// -----
+
+// Outer capture: `hc.name_load` inside a `hc.workitem_region` with no
+// prior in-region write falls back to an outer snapshot. The pass
+// materialises a lazy `hc.name_load "x"` just before the region op,
+// which the outer flat sweep then resolves to the outer `%a`.
+// Post-condition: no name-store ops survive anywhere.
+// CHECK-LABEL: hc.kernel @workitem_captures_outer
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: hc.workitem_region {
+// CHECK-NEXT: }
+// CHECK: hc.return
+hc.kernel @workitem_captures_outer(%a: !hc.undef) {
+  hc.assign "x", %a : !hc.undef
+  hc.workitem_region {
+    %v = hc.name_load "x" : !hc.undef
+    hc.assign "used", %v : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// Same capture mechanism for `hc.subgroup_region`: an in-region read
+// with no prior local write resolves to the outer binding via a
+// lazy outer snapshot.
+// CHECK-LABEL: hc.kernel @subgroup_captures_outer
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: hc.subgroup_region {
+// CHECK-NEXT: }
+// CHECK: hc.return
+hc.kernel @subgroup_captures_outer(%a: !hc.undef) {
+  hc.assign "x", %a : !hc.undef
+  hc.subgroup_region {
+    %v = hc.name_load "x" : !hc.undef
+    hc.assign "used", %v : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// Capture-then-shadow: a read of an outer-bound name followed by a
+// local write followed by another read. The first read captures
+// `%outer`; the local write flips the binding; the second read sees
+// the local value. The outer binding stays `%outer` throughout — the
+// shadowing write never leaks back.
+// CHECK-LABEL: hc.func @workitem_capture_then_shadow
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: hc.workitem_region {
+// CHECK-NEXT: }
+// CHECK: hc.return %arg0
+hc.func @workitem_capture_then_shadow(%outer: !hc.undef,
+                                      %local: !hc.undef) -> !hc.undef {
+  hc.assign "x", %outer : !hc.undef
+  hc.workitem_region {
+    %first = hc.name_load "x" : !hc.undef
+    hc.assign "captured", %first : !hc.undef
+    hc.assign "x", %local : !hc.undef
+    %second = hc.name_load "x" : !hc.undef
+    hc.assign "local", %second : !hc.undef
+  }
+  %v = hc.name_load "x" : !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// `hc.for_range` inside a `hc.workitem_region` whose accumulator is
+// bound in the enclosing scope: the for-range snap resolves against
+// the region body, which in turn captures upward from the outer
+// `hc.assign "acc", %init`. The whole chain threads cleanly and the
+// outer binding is never rewritten (no out-of-region leak).
+// CHECK-LABEL: hc.func @workitem_capturing_for
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: hc.workitem_region {
+// CHECK:   hc.for_range %arg0 to %arg1 step %arg2 iter_args(%arg3)
+// CHECK-NEXT:   ^bb0(%[[IV:.*]]: !hc.undef, %[[ACC:.*]]: !hc.undef):
+// CHECK:          %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
+// CHECK:          hc.yield %[[SUM]]
+// CHECK: hc.return %arg3
+hc.func @workitem_capturing_for(%lo: !hc.undef, %hi: !hc.undef,
+                                %step: !hc.undef,
+                                %init: !hc.undef) -> !hc.undef {
+  hc.assign "acc", %init : !hc.undef
+  hc.workitem_region {
+    hc.for_range %lo to %hi step %step
+        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+    ^bb0(%iv: !hc.undef):
+      %cur = hc.name_load "acc" : !hc.undef
+      %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+      hc.assign "acc", %next : !hc.undef
+      hc.yield
+    }
+  }
+  %final = hc.name_load "acc" : !hc.undef
+  hc.return %final : !hc.undef
 }

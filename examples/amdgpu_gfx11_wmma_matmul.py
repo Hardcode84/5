@@ -8,6 +8,9 @@ Run from the repository root with:
 
     python -m examples.amdgpu_gfx11_wmma_matmul
 
+Pass ``--dump-front-ir`` to lower the kernel through the Python frontend and
+print the resulting ``hc_front`` textual MLIR instead of running the simulator.
+
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
 accumulator distributed across workitems at the WorkGroup-level K loop
@@ -25,6 +28,9 @@ output rows for one output column.
 """
 
 from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -324,7 +330,44 @@ def make_demo_inputs(
     return a, b
 
 
-def main() -> None:
+def dump_front_ir() -> None:
+    """Lower the top-level kernel to ``hc_front`` MLIR and print it to stdout.
+
+    Imports the frontend lazily so the simulator path stays independent of the
+    managed ``hc_mlir`` native bindings.
+    """
+
+    from hc._frontend import lower_function_to_front_ir
+    from hc.mlir import ir
+
+    with ir.Context() as context:
+        module = lower_function_to_front_ir(tiled_gfx11_wmma_matmul, context=context)
+        print(str(module))
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="gfx11 WMMA tiled matmul example.",
+    )
+    parser.add_argument(
+        "--dump-front-ir",
+        action="store_true",
+        help=(
+            "lower the kernel through the Python frontend and print the "
+            "resulting hc_front MLIR module to stdout instead of running the "
+            "simulator"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_args(argv)
+
+    if args.dump_front_ir:
+        dump_front_ir()
+        return
+
     a, b = make_demo_inputs()
     out = simulate_gfx11_wmma_matmul(a, b)
     reference = reference_blocked_matmul(a, b)

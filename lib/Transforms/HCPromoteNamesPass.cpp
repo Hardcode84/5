@@ -43,9 +43,9 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringRef.h"
-
-#include <functional>
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCPROMOTENAMES
@@ -84,25 +84,81 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
   }
 }
 
-// Linear scan over `block`'s non-terminator ops: every `hc.assign`
-// updates `binding`, every `hc.name_load` is rewritten to the current
-// binding. Ops that aren't name-store ops are left alone — including
-// already-promoted region ops, whose inner IR has been cleaned up by
-// the post-order walk.
+// Two-phase linear scan over `block`'s non-terminator ops:
 //
-// An `hc.name_load` whose name has no entry in `binding` is either
-// passed to `capture` (for nested-scope bodies that capture outer
-// bindings) or diagnosed (everywhere else). `capture` is called at
-// most once per missing name — its return value gets stored in
-// `binding` so repeated reads share the same snapshot.
+//   Phase 1 (preflight): walk the block with a presence-only binding
+//   set. Every `hc.assign` adds its name; every `hc.name_load` must
+//   be bound (via the seeded keys, a prior in-block assign, or
+//   `capture`); every `NameStoreRegionOpInterface` op must have an
+//   assign/load-free subtree. The first violation emits a diagnostic
+//   and returns `failure()` before any IR mutation — so a failing
+//   block stays recoverable by the enclosing pipeline and no half-
+//   rewritten module escapes.
 //
-// A residual `NameStoreRegionOpInterface` op whose body still carries
-// `hc.assign` / `hc.name_load` means a new op kind has claimed the
-// interface without getting a matching promoter here; diagnose rather
-// than leave the module half-lowered.
+//   Phase 2 (commit): preflight proved every read resolves, so this
+//   sweep can't emit diagnostics. `hc.assign` binds, `hc.name_load`
+//   either resolves from `binding` or triggers a real (IR-mutating)
+//   `capture()` call, and residual ops get erased in one pass at the
+//   end. `NameStoreRegionOpInterface` ops are already known clean
+//   from preflight; the commit loop skips them.
+//
+// The `capture` factory is a capture-from-outer-scope hook: invoked
+// only on truly unbound reads, its returned Value seeds the binding
+// so repeated reads share the same snapshot. `capture = nullptr`
+// disables outer capture — used at the callable top level (no outer
+// to reach for) and inside the `hc.for_range` / `hc.if` scans (the
+// caller pre-seeds `binding` for every reachable name).
 static LogicalResult scanAndPromoteBlock(Block &block,
                                          llvm::StringMap<Value> &binding,
                                          SnapFactory capture = nullptr) {
+  {
+    llvm::StringSet<> bound;
+    for (const auto &kv : binding)
+      bound.insert(kv.getKey());
+    for (Operation &op : block.without_terminator()) {
+      if (auto assign = dyn_cast<HCAssignOp>(&op)) {
+        bound.insert(assign.getName());
+        continue;
+      }
+      if (auto load = dyn_cast<HCNameLoadOp>(&op)) {
+        if (bound.contains(load.getName()))
+          continue;
+        if (capture) {
+          bound.insert(load.getName());
+          continue;
+        }
+        return load.emitOpError("read of name '")
+               << load.getName()
+               << "' that has no reaching `hc.assign` in the enclosing "
+                  "scope; the frontend must emit an assign before every "
+                  "read, or the promotion must see a prior iter_arg / "
+                  "region result";
+      }
+      if (isa<NameStoreRegionOpInterface>(&op)) {
+        bool stale = false;
+        op.walk([&](Operation *inner) {
+          if (isa<HCAssignOp, HCNameLoadOp>(inner)) {
+            stale = true;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        // Two failure modes produce this: (a) a new op kind joined the
+        // `NameStoreRegionOpInterface` without a matching case in
+        // `promoteRegionOp`'s dispatch, or (b) an existing promoter
+        // left residual name-store ops in the body. Both are pass
+        // bugs, not frontend bugs — diagnose, don't silently lower.
+        if (stale)
+          return op.emitOpError(
+              "region-carrying op still contains `hc.assign` / "
+              "`hc.name_load` after promotion; either a new "
+              "NameStoreRegionOpInterface op kind joined the interface "
+              "without a matching case in `promoteRegionOp`, or a "
+              "promoter left residual name-store ops in the body");
+      }
+    }
+  }
+
   SmallVector<Operation *> toErase;
   for (Operation &op : block.without_terminator()) {
     if (auto assign = dyn_cast<HCAssignOp>(&op)) {
@@ -115,35 +171,14 @@ static LogicalResult scanAndPromoteBlock(Block &block,
       Value resolved;
       if (it != binding.end()) {
         resolved = it->second;
-      } else if (capture) {
+      } else {
+        assert(capture && "preflight must have admitted this load via "
+                          "the capture factory");
         resolved = capture(load.getNameAttr());
         binding[load.getName()] = resolved;
-      } else {
-        return load.emitOpError("read of name '")
-               << load.getName()
-               << "' that has no reaching `hc.assign` in the enclosing "
-                  "scope; the frontend must emit an assign before every "
-                  "read, or the promotion must see a prior iter_arg / "
-                  "region result";
       }
       load.getResult().replaceAllUsesWith(resolved);
       toErase.push_back(&op);
-      continue;
-    }
-    if (isa<NameStoreRegionOpInterface>(&op)) {
-      bool stale = false;
-      op.walk([&](Operation *inner) {
-        if (isa<HCAssignOp, HCNameLoadOp>(inner)) {
-          stale = true;
-          return WalkResult::interrupt();
-        }
-        return WalkResult::advance();
-      });
-      if (stale)
-        return op.emitOpError(
-            "region-carrying op still contains `hc.assign` / `hc.name_load` "
-            "after promotion; a new NameStoreRegionOpInterface op claimed "
-            "the interface without a matching promoter in this pass");
     }
   }
   for (Operation *o : toErase)
@@ -167,6 +202,14 @@ static void ensureYieldTerminator(Block &block, Location loc) {
 // `binding[name]` for each `name` in `carried`. Callers use this to
 // extend a region-op terminator with the carried-name values produced
 // during the block's linear scan.
+//
+// Missing a carried name is a caller-side invariant break, not a user
+// input problem — `promoteForRange` / `promoteIf` both seed `binding`
+// with every carried name (snap value or iter_arg) before the scan
+// runs, and the scan only overwrites entries, never deletes them.
+// A plain `assert` would compile out under NDEBUG and leave
+// `it->second` dereferencing an end iterator, so we abort loudly
+// instead.
 static void rewriteYieldWithCarried(Block &block,
                                     const llvm::StringMap<Value> &binding,
                                     ArrayRef<StringAttr> carried,
@@ -176,7 +219,11 @@ static void rewriteYieldWithCarried(Block &block,
                             oldYield.getValues().end());
   for (StringAttr name : carried) {
     auto it = binding.find(name.getValue());
-    assert(it != binding.end() && "carried name must be in binding");
+    if (it == binding.end())
+      llvm::report_fatal_error(llvm::Twine("hc-promote-names: carried name '") +
+                               name.getValue() +
+                               "' missing from binding at yield rebuild "
+                               "(pass invariant violation)");
     values.push_back(it->second);
   }
   OpBuilder b(oldYield);

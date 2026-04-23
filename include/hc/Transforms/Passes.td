@@ -22,15 +22,17 @@ def HCPromoteNames : Pass<"hc-promote-names", "::mlir::ModuleOp"> {
       - `hc.for_range`  : carried names become iter_args + yielded values.
       - `hc.if`         : carried names become op results + two-branch
                           yields; branches must agree on the write set.
-      - `hc.workitem_region` / `hc.subgroup_region` : planned, pending
-        ODS extension for result types (not in this pass yet).
+      - `hc.workitem_region` / `hc.subgroup_region` : isolated scopes —
+                          assigns inside shadow outer bindings and don't
+                          leak out; promotion resolves the body in
+                          isolation. Out-bound propagation needs an ODS
+                          result extension (planned bead), not here.
 
     Post-condition (on success): no `hc.assign` / `hc.name_load` survives
     anywhere under the processed callables. Cross-kernel / cross-function
     name capture is out of scope; each callable is its own promotion
     root.
   }];
-  let constructor = "::mlir::hc::createPromoteNamesPass()";
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 

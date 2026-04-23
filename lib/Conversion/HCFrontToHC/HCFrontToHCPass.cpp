@@ -1551,6 +1551,6 @@ struct ConvertHCFrontToHCPass
 
 } // namespace
 
-std::unique_ptr<Pass> hc_front::createConvertHCFrontToHCPass() {
-  return std::make_unique<ConvertHCFrontToHCPass>();
-}
+// `createConvertHCFrontToHCPass()` is emitted by tablegen (friend of
+// the impl::ConvertHCFrontToHCBase CRTP). See `Passes.td` — no `let
+// constructor`, so the generated factory is the only one.

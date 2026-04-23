@@ -11,12 +11,10 @@
 
 namespace mlir::hc {
 
-// -hc-promote-names: rebuilds the IR so every `hc.assign` / `hc.name_load`
-// becomes a real SSA edge, threading region-carrying ops with iter_args /
-// results / yields as needed. See `Passes.td` for the full contract.
-std::unique_ptr<Pass> createPromoteNamesPass();
-
-// Forward declarations for the ODS-generated pass bases.
+// ODS-generated pass-base declarations plus free `createXxxPass()`
+// factories. With no `let constructor` in `Passes.td`, tablegen emits
+// the factory as a friend of the CRTP base so the DerivedT is the one
+// we `std::make_unique<>` here.
 #define GEN_PASS_DECL
 #include "hc/Transforms/Passes.h.inc"
 

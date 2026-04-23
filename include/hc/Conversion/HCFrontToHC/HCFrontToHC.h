@@ -11,14 +11,11 @@
 
 namespace mlir::hc::front {
 
-// The mechanical `hc_front` -> `hc` lowering. Walks a module of
-// `hc_front.kernel` / `hc_front.func` / `hc_front.intrinsic` ops and emits
-// the parallel `hc` callables in place. Types are emitted as `!hc.undef`
-// (except where annotations on parameters let us pin something stricter);
-// a later inference pass narrows them.
-std::unique_ptr<Pass> createConvertHCFrontToHCPass();
-
-// Forward declarations for the ODS-generated pass bases.
+// ODS-generated pass-base declarations plus the
+// `createConvertHCFrontToHCPass()` factory. With no `let constructor` in
+// `Passes.td`, tablegen emits the factory as a friend of the CRTP base so the
+// DerivedT is the one we `std::make_unique<>` here — see `Passes.td` for the
+// pass contract.
 #define GEN_PASS_DECL
 #include "hc/Conversion/HCFrontToHC/Passes.h.inc"
 

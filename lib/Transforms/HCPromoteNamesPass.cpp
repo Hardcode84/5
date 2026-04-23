@@ -445,6 +445,6 @@ struct HCPromoteNamesPass
 
 } // namespace
 
-std::unique_ptr<Pass> mlir::hc::createPromoteNamesPass() {
-  return std::make_unique<HCPromoteNamesPass>();
-}
+// `createPromoteNamesPass()` is emitted by tablegen (friend of the
+// `impl::HCPromoteNamesBase` CRTP). See `Passes.td` — no `let
+// constructor`, so the generated factory is the only one.

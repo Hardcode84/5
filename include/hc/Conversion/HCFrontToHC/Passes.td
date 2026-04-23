@@ -16,7 +16,6 @@ def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
     `hc_front.attr`. Every produced value has `!hc.undef`; a later inference
     pass pins concrete types.
   }];
-  let constructor = "::mlir::hc::front::createConvertHCFrontToHCPass()";
   let dependentDialects = [
     "::mlir::hc::HCDialect",
     "::mlir::hc::front::HCFrontDialect",

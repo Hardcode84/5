@@ -24,6 +24,14 @@ using namespace mlir::hc;
 // pre-inference IR to round-trip.
 static bool isUndef(Type t) { return llvm::isa<UndefType>(t); }
 
+// Signature-compat check with the progressive-typing escape. Kept near
+// `isUndef` so every verifier that walks op↔signature pairs can share it.
+static bool compatibleSigType(Type callSite, Type callee) {
+  if (isUndef(callSite) || isUndef(callee))
+    return true;
+  return callSite == callee;
+}
+
 // Guarded terminator accessor for verifiers. An otherwise-invalid IR (e.g.
 // a round-trip bug or a bad builder) could leave a non-empty block with no
 // terminator at all; `Block::getTerminator()` asserts in that case, so we
@@ -45,16 +53,21 @@ static Operation *tryGetTerminator(Block &block) {
 // `function_type` inputs one-to-one. Signatures are optional: a bare
 // `hc.func @foo { ... }` keeps working while the frontend is incomplete —
 // in that case the body block must have no arguments either.
+//
+// MLIR's region parser for the `{}` source form produces an empty region
+// regardless of whether a signature was declared, so
+// `parseSignatureTailAndBody` back-fills an entry block below to keep
+// `SizedRegion<1>` happy. The printer and verifier guard on `body.empty()` so a
+// malformed in-memory op emits a diagnostic instead of crashing on
+// `body.front()`.
 //===----------------------------------------------------------------------===//
-
-namespace {
 
 // Parse an optional `(%arg0: T, %arg1: T) (-> T)?` signature. On success,
 // populates `arguments` with zero-or-more entry-block arguments and, when a
 // signature is present, stores the reconstructed `FunctionType` into
 // `functionTypeAttr`. When no leading `(` is seen, both outputs are left in
 // their default state so the caller can emit the legacy no-signature form.
-ParseResult parseOptionalFunctionSignature(
+static ParseResult parseOptionalFunctionSignature(
     OpAsmParser &parser, SmallVectorImpl<OpAsmParser::Argument> &arguments,
     TypeAttr &functionTypeAttr) {
   if (!succeeded(parser.parseOptionalLParen()))
@@ -98,22 +111,23 @@ ParseResult parseOptionalFunctionSignature(
 // `functionTypeAttr` is null we skip the signature entirely (legacy
 // no-args form); when it is present we pull argument names from the entry
 // block so round-trips preserve user-written `%group`/`%a`/etc.
-void printOptionalFunctionSignature(OpAsmPrinter &p, Operation *op,
-                                    TypeAttr functionTypeAttr, Region &body) {
+static void printOptionalFunctionSignature(OpAsmPrinter &p, Operation *op,
+                                           TypeAttr functionTypeAttr,
+                                           Region &body) {
   if (!functionTypeAttr)
     return;
   auto fnType = llvm::cast<FunctionType>(functionTypeAttr.getValue());
   p << '(';
-  // The verifier guarantees the entry block matches `function_type.inputs`
-  // whenever the op round-trips cleanly; the `size()` guard here is for
-  // pretty-printing IR that is mid-construction and still unverified (the
-  // legacy attribute-only declaration had no block args). Fall back to
-  // type-only printing in that narrow case so the printer never crashes.
-  Block &entry = body.front();
-  if (entry.getNumArguments() == fnType.getNumInputs()) {
-    llvm::interleaveComma(entry.getArguments(), p, [&](BlockArgument arg) {
-      p.printRegionArgument(arg);
-    });
+  // The verifier guarantees a non-empty entry block whose args match
+  // `function_type.inputs` whenever the op round-trips cleanly. Mid-
+  // construction IR can violate either invariant; fall back to type-only
+  // printing in that narrow case so the printer never dereferences a
+  // missing block.
+  if (!body.empty() &&
+      body.front().getNumArguments() == fnType.getNumInputs()) {
+    llvm::interleaveComma(
+        body.front().getArguments(), p,
+        [&](BlockArgument arg) { p.printRegionArgument(arg); });
   } else {
     llvm::interleaveComma(fnType.getInputs(), p,
                           [&](Type t) { p.printType(t); });
@@ -132,19 +146,10 @@ void printOptionalFunctionSignature(OpAsmPrinter &p, Operation *op,
   }
 }
 
-// Final glue: after the signature + any op-specific keyword pieces parse,
-// finish off the op by reading the attr-dict and body region with the
-// entry-block arguments we just parsed. Keeping this in one place keeps
-// the three callers identical.
-//
-// `SizedRegion<1>` on the op demands one block, but MLIR's region parser
-// produces an empty region for the `{}` source form — with or without a
-// declared signature. We back-fill an entry block (carrying the signature
-// arguments, when any) in that case so both the declaration form
-// (`hc.intrinsic @foo(%a: T) ... {}`) and the legacy no-signature form
-// (`hc.func @foo { ... }`) round-trip without tripping the region
-// constraint.
-ParseResult
+// Glue for kernel/func/intrinsic parsers: read attr-dict + body region with
+// the entry-block arguments the caller already parsed. See file-level
+// rationale above for the back-fill on empty-region `{}` bodies.
+static ParseResult
 parseSignatureTailAndBody(OpAsmParser &parser, OperationState &result,
                           ArrayRef<OpAsmParser::Argument> arguments) {
   if (failed(parser.parseOptionalAttrDictWithKeyword(result.attributes)))
@@ -168,12 +173,18 @@ parseSignatureTailAndBody(OpAsmParser &parser, OperationState &result,
 // present, the entry block's arguments must match inputs one-for-one; when
 // it is absent, the entry block must have no arguments. Keeps verifier
 // error messages close to the op mnemonic.
-LogicalResult verifyFunctionSignature(Operation *op, TypeAttr functionTypeAttr,
-                                      Region &body) {
+static LogicalResult verifyFunctionSignature(Operation *op,
+                                             TypeAttr functionTypeAttr,
+                                             Region &body) {
+  // `SizedRegion<1>` is enforced by ODS before custom verify fires, but a
+  // badly built in-memory op could still land here with an empty region;
+  // emit a diagnostic rather than let `body.front()` fire an assertion.
+  if (body.empty())
+    return op->emitOpError("expected a body region with an entry block");
   Block &entry = body.front();
   if (!functionTypeAttr) {
     if (entry.getNumArguments() != 0)
-      return op->emitOpError("body block has ")
+      return op->emitOpError("body block takes ")
              << entry.getNumArguments()
              << " argument(s) but no function_type is declared; add a "
                 "signature like `(%arg0 : T, ...)` or remove the block "
@@ -195,8 +206,6 @@ LogicalResult verifyFunctionSignature(Operation *op, TypeAttr functionTypeAttr,
   }
   return success();
 }
-
-} // namespace
 
 //===----------------------------------------------------------------------===//
 // `hc.kernel`.
@@ -400,6 +409,61 @@ LogicalResult HCIntrinsicOp::verify() {
   return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
 }
 
+//===----------------------------------------------------------------------===//
+// `hc.return`.
+//
+// `hc.return` is not a required terminator (its callee-like parents carry
+// `NoTerminator`), but when it appears it must be consistent with the
+// enclosing callable's signature: kernels never return a value, and
+// funcs/intrinsics with a declared `function_type` must return operands that
+// match the declared result types.
+//===----------------------------------------------------------------------===//
+
+LogicalResult HCReturnOp::verify() {
+  // Walk outward through control-flow / scope regions until we hit a
+  // callable parent. `hc.subgroup_region`, `hc.workitem_region`,
+  // `hc.for_range`, and `hc.if` are transparent to `hc.return`: the return
+  // terminates the enclosing kernel/func/intrinsic, not the structured
+  // region it textually sits in.
+  Operation *callee = (*this)->getParentOp();
+  while (callee && !isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(callee))
+    callee = callee->getParentOp();
+  if (!callee)
+    return success();
+
+  // Kernels never return values, irrespective of whether a signature was
+  // declared. `HCKernelOp::verify` rejects result types in the signature;
+  // this enforces the symmetric rule on the terminator side.
+  if (isa<HCKernelOp>(callee)) {
+    if (!getValues().empty())
+      return emitOpError("`hc.return` inside `hc.kernel` must be operand-less; "
+                         "kernels never produce a value");
+    return success();
+  }
+
+  TypeAttr fnTypeAttr;
+  if (auto f = dyn_cast<HCFuncOp>(callee))
+    fnTypeAttr = f.getFunctionTypeAttr();
+  else if (auto i = dyn_cast<HCIntrinsicOp>(callee))
+    fnTypeAttr = i.getFunctionTypeAttr();
+  if (!fnTypeAttr)
+    return success();
+  auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
+  if (getValues().size() != fnType.getNumResults())
+    return emitOpError("returns ")
+           << getValues().size() << " value(s) but enclosing "
+           << callee->getName() << " declares " << fnType.getNumResults()
+           << " result(s)";
+  for (auto [i, returned, declared] :
+       llvm::enumerate(getValues().getTypes(), fnType.getResults())) {
+    if (!compatibleSigType(returned, declared))
+      return emitOpError("returned value #")
+             << i << " type " << returned << " does not match enclosing "
+             << callee->getName() << " result type " << declared;
+  }
+  return success();
+}
+
 LogicalResult HCSymbolOp::verify() {
   // Auto-generated type constraint enforces `!hc.idx` already; all that's
   // left is the "must pin an expression" rule — `!hc.idx` without an
@@ -518,7 +582,6 @@ LogicalResult HCIfOp::verify() {
   return success();
 }
 
-namespace {
 /// Extract a concrete shape attribute from a shaped `hc` type, or `nullptr`
 /// if the type does not (yet) carry one. Pre-inference IR is typically
 /// `!hc.undef`, in which case rank is unknown and axis range cannot be
@@ -526,7 +589,7 @@ namespace {
 ///
 /// Fully-qualified `mlir::hc::{Buffer,Tensor,Vector}Type` are required to
 /// avoid colliding with MLIR's builtin `VectorType`/`TensorType`.
-ShapeAttr tryGetShape(Type t) {
+static ShapeAttr tryGetShape(Type t) {
   if (auto buf = llvm::dyn_cast<mlir::hc::BufferType>(t))
     return buf.getShape();
   if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(t))
@@ -540,7 +603,7 @@ ShapeAttr tryGetShape(Type t) {
 /// op found, or null if the op sits in the default workgroup scope. Stops
 /// at the nearest `hc.kernel` / `hc.func` / `hc.intrinsic` / module-like op
 /// because nested kernels/funcs re-baseline the enclosing scope.
-Operation *findNarrowingScope(Operation *op) {
+static Operation *findNarrowingScope(Operation *op) {
   Operation *cur = op->getParentOp();
   while (cur) {
     if (llvm::isa<HCSubgroupRegionOp, HCWorkitemRegionOp>(cur))
@@ -558,15 +621,13 @@ Operation *findNarrowingScope(Operation *op) {
 /// a tensor inside a subgroup or workitem region is a scope error, not a
 /// shape error, and calling it out at verify time keeps the diagnostic
 /// close to the source instead of surfacing deep in a lowering.
-LogicalResult verifyTensorAllocScope(Operation *op) {
+static LogicalResult verifyTensorAllocScope(Operation *op) {
   if (Operation *narrowing = findNarrowingScope(op))
     return op->emitOpError("tensor allocator is workgroup scope only; "
                            "enclosed by ")
            << narrowing->getName() << " which narrows the scope";
   return success();
 }
-
-} // namespace
 
 LogicalResult HCBufferDimOp::verify() {
   // Python/NumPy semantics allow negative axis indexing, but that is a
@@ -591,13 +652,12 @@ LogicalResult HCBufferDimOp::verify() {
   return success();
 }
 
-namespace {
 /// Verify that an optional `#hc.shape` on a load/vload op matches the
 /// number of index operands one-to-one. Without a shape attr, we cannot
 /// check rank — leave that to inference-stage checks.
 template <typename OpT>
-LogicalResult verifyLoadShapeRank(OpT op,
-                                  mlir::Operation::operand_range indices) {
+static LogicalResult
+verifyLoadShapeRank(OpT op, mlir::Operation::operand_range indices) {
   auto shape = op.getShapeAttr();
   if (!shape)
     return success();
@@ -608,7 +668,6 @@ LogicalResult verifyLoadShapeRank(OpT op,
            << expected << ") does not match index count (" << actual << ")";
   return success();
 }
-} // namespace
 
 LogicalResult HCLoadOp::verify() {
   return verifyLoadShapeRank(*this, getIndices());
@@ -724,16 +783,8 @@ LogicalResult HCEmptyOp::verify() { return verifyTensorAllocScope(*this); }
 // placeholders, should not cause spurious verify errors.
 //===----------------------------------------------------------------------===//
 
-namespace {
-// Signature compatibility with progressive-typing escape hatch.
-bool compatibleSigType(Type callSite, Type callee) {
-  if (isUndef(callSite) || isUndef(callee))
-    return true;
-  return callSite == callee;
-}
-
 template <typename CallOp>
-LogicalResult verifySignature(CallOp op, FunctionType fnType) {
+static LogicalResult verifySignature(CallOp op, FunctionType fnType) {
   if (fnType.getNumInputs() != op.getArgs().size())
     return op.emitOpError("callee '@")
            << op.getCallee() << "' expects " << fnType.getNumInputs()
@@ -760,9 +811,9 @@ LogicalResult verifySignature(CallOp op, FunctionType fnType) {
 }
 
 template <typename CalleeOp, typename CallOp>
-LogicalResult verifyFlatSymbolUseAsOp(CallOp op,
-                                      SymbolTableCollection &symbolTable,
-                                      llvm::StringRef expectedKindLabel) {
+static LogicalResult
+verifyFlatSymbolUseAsOp(CallOp op, SymbolTableCollection &symbolTable,
+                        llvm::StringRef expectedKindLabel) {
   auto sym = symbolTable.lookupNearestSymbolFrom<CalleeOp>(op.getOperation(),
                                                            op.getCalleeAttr());
   if (!sym)
@@ -773,19 +824,17 @@ LogicalResult verifyFlatSymbolUseAsOp(CallOp op,
     return verifySignature(op, *fnType);
   return success();
 }
-} // namespace
 
 LogicalResult HCCallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return verifyFlatSymbolUseAsOp<HCFuncOp>(*this, symbolTable, "hc.func");
 }
 
-namespace {
 // Translates the declared effect class into concrete side effects on the
 // default resource. The callee's body is opaque; we only know "maybe reads"
 // / "maybe writes" at this level, so `Pure` emits nothing, the one-sided
 // classes emit the matching effect, and the unknown/absent case falls back
 // to MemRead+MemWrite.
-void emitEffectsForClass(
+static void emitEffectsForClass(
     std::optional<EffectClass> cls,
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
@@ -799,7 +848,7 @@ void emitEffectsForClass(
 }
 
 template <typename CalleeOp, typename CallOp>
-void populateEffectsFromCallee(
+static void populateEffectsFromCallee(
     CallOp op,
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
@@ -810,7 +859,6 @@ void populateEffectsFromCallee(
   }
   emitEffectsForClass(cls, effects);
 }
-} // namespace
 
 void HCCallOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>

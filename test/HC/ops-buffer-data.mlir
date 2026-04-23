@@ -130,7 +130,7 @@ func.func @calls(%x: !hc.undef, %y: !hc.undef) {
 
 // CHECK: hc.func @typed_helper(%arg0: i32, %arg1: i32) -> i32
 hc.func @typed_helper(%a: i32, %b: i32) -> i32 {
-  hc.return
+  hc.return %a : i32
 }
 
 // CHECK: hc.intrinsic @typed_intrinsic(%arg0: f32) -> f32 scope = <"WorkItem">

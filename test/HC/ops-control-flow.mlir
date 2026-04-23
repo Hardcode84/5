@@ -12,7 +12,7 @@ hc.intrinsic @wave_barrier scope = #hc.scope<"SubGroup">
 
 // CHECK-LABEL: hc.intrinsic @subgroup_dot
 // CHECK-SAME: scope = <"SubGroup">
-// CHECK-NOT:  effects
+// CHECK-NOT: effects
 hc.intrinsic @subgroup_dot scope = #hc.scope<"SubGroup"> {}
 
 // Signature on an intrinsic declaration now shows as `(args) -> result`,

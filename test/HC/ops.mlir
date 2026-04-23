@@ -32,7 +32,13 @@
 // CHECK-SAME: literals = ["WMMA_M", "WMMA_K"]
 // CHECK-SAME: subgroup_size = 32 : i32
 // CHECK-SAME: work_shape = #hc.shape<["M", "N"]>
+// Launch-geometry-only kernel (no signature): confirms the two are orthogonal.
+// CHECK: hc.kernel @geometry_only attributes {
+// CHECK-SAME: subgroup_size = 64 : i32
+// CHECK-SAME: work_shape = #hc.shape<["M"]>
 // CHECK: hc.func @tile_helper {
+// CHECK: hc.func @typed_with_return(%arg0: i32) -> i32 {
+// CHECK-NEXT: hc.return %arg0 : i32
 
 module {
   func.func @use_types(
@@ -88,7 +94,22 @@ module {
     hc.return
   }
 
+  // Launch geometry without a signature: the two are independent attr groups,
+  // so a signature-less kernel can still carry `work_shape`/`subgroup_size`.
+  hc.kernel @geometry_only attributes {
+    work_shape = #hc.shape<["M"]>,
+    subgroup_size = 64 : i32
+  } {
+    hc.return
+  }
+
   hc.func @tile_helper {
     hc.return
+  }
+
+  // Signatured func with a matching `hc.return`: the legal round-trip for
+  // the return-parity verifier.
+  hc.func @typed_with_return(%a: i32) -> i32 {
+    hc.return %a : i32
   }
 }

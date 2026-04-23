@@ -334,7 +334,7 @@ module {
 // Signature parity: wrong arity.
 // CHECK: error: 'hc.call' op callee '@typed' expects 2 argument(s), call site provides 1
 module {
-  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return %a : i32 }
   func.func @bad(%a: i32) -> i32 {
     %r = hc.call @typed(%a) : (i32) -> i32
     return %r : i32
@@ -346,7 +346,7 @@ module {
 // Signature parity: wrong arg type, both sides concrete.
 // CHECK: error: 'hc.call' op arg #1 type 'f32' is incompatible with callee declaration 'i32'
 module {
-  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32, %b: i32) -> i32 { hc.return %a : i32 }
   func.func @bad(%a: i32, %b: f32) -> i32 {
     %r = hc.call @typed(%a, %b) : (i32, f32) -> i32
     return %r : i32
@@ -358,7 +358,7 @@ module {
 // Signature parity: wrong result type.
 // CHECK: error: 'hc.call' op result #0 type 'f32' is incompatible with callee declaration 'i32'
 module {
-  hc.func @typed(%a: i32) -> i32 { hc.return }
+  hc.func @typed(%a: i32) -> i32 { hc.return %a : i32 }
   func.func @bad(%a: i32) -> f32 {
     %r = hc.call @typed(%a) : (i32) -> f32
     return %r : f32
@@ -429,7 +429,7 @@ hc.kernel @bad(%a: i32) -> i32 {
 // Signature-less `hc.func` with block args on the body means "frontend
 // forgot to synthesize a function_type"; we catch it rather than let the
 // op round-trip into a silently broken state.
-// CHECK: error: 'hc.func' op body block has 1 argument(s) but no function_type is declared
+// CHECK: error: 'hc.func' op body block takes 1 argument(s) but no function_type is declared
 hc.func @orphan_arg {
 ^bb0(%a: i32):
   hc.return
@@ -461,3 +461,67 @@ hc.kernel @bad attributes {function_type = (i32) -> ()} {
 // CHECK: error: 'hc.intrinsic' op body block takes 0 argument(s) but function_type declares 1 input(s)
 hc.intrinsic @bad scope = #hc.scope<"WorkItem">
     attributes {function_type = (i32) -> ()} {}
+
+// -----
+
+// Per-argument type mismatch: arity matches, but the block arg type
+// disagrees with the declared function_type input. Needs attr-dict form
+// (the inline-signature parser derives function_type from the block args,
+// so the two can't disagree).
+// CHECK: error: 'hc.func' op body block argument #1 type 'f32' does not match function_type input 'i32'
+hc.func @type_mismatch attributes {function_type = (i32, i32) -> ()} {
+^bb0(%a: i32, %b: f32):
+  hc.return
+}
+
+// -----
+
+// `hc.return` inside a kernel must be operand-less — kernels never produce
+// a value. The parity check runs whether or not a signature is declared.
+// CHECK: error: 'hc.return' op `hc.return` inside `hc.kernel` must be operand-less
+hc.kernel @bad {
+  %c = hc.const<0 : i32> : i32
+  hc.return %c : i32
+}
+
+// -----
+
+// Kernels reject returned values even through nested scope regions —
+// `hc.return` falls through `hc.subgroup_region`/`hc.workitem_region` and
+// terminates the kernel.
+// CHECK: error: 'hc.return' op `hc.return` inside `hc.kernel` must be operand-less
+hc.kernel @bad {
+  hc.subgroup_region {
+    hc.workitem_region {
+      %c = hc.const<0 : i32> : i32
+      hc.return %c : i32
+    }
+  }
+}
+
+// -----
+
+// `hc.return` in a signatured func with the wrong arity is caught against
+// the enclosing function_type's result list.
+// CHECK: error: 'hc.return' op returns 0 value(s) but enclosing hc.func declares 1 result(s)
+hc.func @bad(%a: i32) -> i32 {
+  hc.return
+}
+
+// -----
+
+// `hc.return` in a signatured func with a concrete mismatching type.
+// CHECK: error: 'hc.return' op returned value #0 type 'f32' does not match enclosing hc.func result type 'i32'
+hc.func @bad(%a: i32, %b: f32) -> i32 {
+  hc.return %b : f32
+}
+
+// -----
+
+// Same parity check on `hc.intrinsic`. Intrinsics are usually body-less
+// declarations, but when they do carry a body, the terminator is checked
+// like `hc.func`.
+// CHECK: error: 'hc.return' op returns 2 value(s) but enclosing hc.intrinsic declares 1 result(s)
+hc.intrinsic @bad(%a: i32) -> i32 scope = #hc.scope<"WorkItem"> {
+  hc.return %a, %a : i32, i32
+}

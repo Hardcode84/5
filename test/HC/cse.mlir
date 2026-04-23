@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Behavioural proof for the MemAlloc / Pure rule of thumb in doc/lowering.md:
+// Behavioral proof for the MemAlloc / Pure rule of thumb in doc/lowering.md:
 // allocators carry `MemAlloc` precisely so CSE cannot merge sibling allocs
 // (each call produces a fresh, independently-writable value); Pure ops fold
 // normally. Without this, later patterns would collapse two `hc.vzeros`
@@ -58,7 +58,7 @@ func.func @pure_add_collapses(%a: !hc.undef, %b: !hc.undef)
 
 hc.func @pure_helper(%a: !hc.undef, %b: !hc.undef) -> !hc.undef
     effects = pure {
-  hc.return
+  hc.return %a : !hc.undef
 }
 
 // CHECK-LABEL: func.func @pure_calls_collapse
@@ -77,7 +77,7 @@ func.func @pure_calls_collapse(%a: !hc.undef, %b: !hc.undef)
 // If this ever collapses, something removed the fallback in `getEffects`.
 
 hc.func @opaque_helper(%a: !hc.undef, %b: !hc.undef) -> !hc.undef {
-  hc.return
+  hc.return %a : !hc.undef
 }
 
 // CHECK-LABEL: func.func @opaque_calls_stay

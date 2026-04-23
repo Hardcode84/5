@@ -121,8 +121,20 @@ def HCWorkitemRegionOp : HC_RegionOp<"workitem_region"> {
 
 def HCReturnOp : HC_Op<"return"> {
   let summary = "Semantic return.";
+  let description = [{
+    Terminator for the nearest enclosing `hc.kernel` / `hc.func` /
+    `hc.intrinsic`. `hc.subgroup_region`, `hc.workitem_region`, and the
+    structured control-flow ops are transparent — `hc.return` falls through
+    them and terminates the callable.
+
+    Kernels never produce a value: `hc.return` inside a `hc.kernel` must be
+    operand-less. Funcs and intrinsics with a declared `function_type` must
+    return operands matching the declared result types (the `!hc.undef`
+    escape still applies for progressive typing).
+  }];
   let arguments = (ins Variadic<AnyType>:$values);
   let assemblyFormat = "($values^ `:` type($values))? attr-dict";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -691,19 +703,16 @@ def HCAsTypeOp : HC_Op<"astype", [Pure]> {
 //
 // Both ops carry a `FlatSymbolRefAttr` callee and verify symbol uses
 // through `SymbolUserOpInterface`. `verifySymbolUses` resolves the callee
-// against the nearest symbol table and checks the target op *kind*:
-// `hc.call` must point at an `hc.func`, `hc.call_intrinsic` at an
-// `hc.intrinsic`. Full signature matching waits for `hc.func` /
-// `hc.intrinsic` to grow explicit arg/result signatures; wrong-kind
-// references and typos are already caught.
+// against the nearest symbol table, checks the target op *kind* (`hc.call`
+// → `hc.func`, `hc.call_intrinsic` → `hc.intrinsic`), and — when the
+// callee carries a `function_type` — checks arity and per-arg/result
+// parity with `!hc.undef` as the progressive-typing escape hatch.
 //
-// Memory effects: conservative `MemRead + MemWrite` by default because the
-// callee body is opaque at verify time. Without an effect declaration,
-// effect-aware passes (CSE/LICM/speculation) treat opaque calls as
-// reorderable with loads/stores, which is unsound as soon as a helper does
-// anything beyond `Pure` compute. Once `hc.func` / `hc.intrinsic` carry
-// explicit effect class attrs, the narrower effect can be picked up from
-// the target op; for now the pessimistic default is the safe choice.
+// Memory effects are read from the callee's declared `effects` enum when
+// present and default to `MemRead + MemWrite` otherwise — an opaque helper
+// that may read *and* write is the conservative assumption, and it keeps
+// effect-aware passes (CSE/LICM/speculation) from reordering calls past
+// loads/stores until the callee opts into something narrower.
 //===----------------------------------------------------------------------===//
 
 def HCCallOp : HC_Op<"call",

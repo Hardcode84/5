@@ -19,7 +19,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from typing import Any, Protocol
@@ -45,6 +45,13 @@ _TOPLEVEL_KINDS = {
 _REGION_KINDS = {
     "group.subgroups": "subgroup_region",
     "group.workitems": "workitem_region",
+}
+_SCALAR_ANNOTATION_NAMES: dict[type, str] = {
+    bool: "bool",
+    int: "int",
+    float: "float",
+    str: "str",
+    bytes: "bytes",
 }
 
 
@@ -170,7 +177,9 @@ def lower_function(fn: Any, emitter: FrontendEmitter) -> None:
 
     source = _source_buffer_from_function(fn)
     module = _parse_source(source)
-    _lower_parsed_module(module, emitter, source)
+    _lower_parsed_module(
+        module, emitter, source, toplevel_overrides=_function_overrides(fn)
+    )
 
 
 def lower_source(
@@ -262,18 +271,35 @@ def _lower_parsed_module(
     module: ast.Module,
     emitter: FrontendEmitter,
     source: _SourceBuffer,
+    *,
+    toplevel_overrides: Mapping[str, Mapping[str, object]] | None = None,
 ) -> None:
     try:
-        _FrontendLowerer(emitter=emitter, source=source).lower_module(module)
+        _FrontendLowerer(
+            emitter=emitter,
+            source=source,
+            toplevel_overrides=toplevel_overrides,
+        ).lower_module(module)
     except _FrontendEmitError as exc:
         raise _frontend_emit_error(source, exc) from exc
 
 
 class _FrontendLowerer:
-    def __init__(self, *, emitter: FrontendEmitter, source: _SourceBuffer) -> None:
+    def __init__(
+        self,
+        *,
+        emitter: FrontendEmitter,
+        source: _SourceBuffer,
+        toplevel_overrides: Mapping[str, Mapping[str, object]] | None = None,
+    ) -> None:
         self._emitter = emitter
         self._source = source
         self._binding_stack: list[frozenset[str]] = []
+        # ``lower_function`` threads decorator metadata + resolved annotations
+        # here; source-only entry points pass ``None``.
+        self._toplevel_overrides: Mapping[str, Mapping[str, object]] = (
+            toplevel_overrides or {}
+        )
 
     def lower_module(self, module: ast.Module) -> None:
         self._emitter.begin_module(filename=self._source.filename)
@@ -288,6 +314,9 @@ class _FrontendLowerer:
             raise self._error("unsupported top-level statement", stmt)
         kind = _toplevel_kind(stmt, self._source)
         payload = _function_payload(stmt, self._source)
+        overrides = self._toplevel_overrides.get(stmt.name)
+        if overrides:
+            payload.update(overrides)
         self._emitter.begin_op(kind, **payload)
         self._push_bindings(stmt)
         self._lower_statements(stmt.body)
@@ -957,6 +986,145 @@ def _function_payload(
         parameters=_parameter_records(fn.args, source),
         returns=_annotation_text(fn.returns),
     )
+
+
+def _function_overrides(fn: Any) -> dict[str, dict[str, object]]:
+    """Collect decorator metadata + resolved parameter annotations for ``fn``.
+
+    Keyed by the function's ``__name__`` so the lowerer can match against the
+    top-level AST it re-parses from source. Empty mapping when nothing worth
+    overriding is available — this lets callers unconditionally forward the
+    result without the lowerer having to special-case source-only paths.
+    """
+
+    name = getattr(fn, "__name__", None)
+    if not isinstance(name, str):
+        return {}
+    extras: dict[str, object] = {}
+    metadata = _collect_toplevel_metadata(fn)
+    if metadata:
+        extras["metadata"] = metadata
+    annotations = _collect_parameter_annotations(fn)
+    if annotations:
+        extras["parameter_annotations"] = annotations
+    if not extras:
+        return {}
+    return {name: extras}
+
+
+def _collect_toplevel_metadata(fn: Any) -> dict[str, object]:
+    kernel_meta = getattr(fn, "__hc_kernel__", None)
+    if kernel_meta is not None:
+        return _serialize_kernel_metadata(kernel_meta)
+    func_meta = getattr(fn, "__hc_func__", None)
+    if func_meta is not None:
+        return _serialize_func_metadata(func_meta)
+    intrinsic_meta = getattr(fn, "__hc_intrinsic__", None)
+    if intrinsic_meta is not None:
+        return _serialize_intrinsic_metadata(intrinsic_meta)
+    return {}
+
+
+def _serialize_kernel_metadata(meta: Any) -> dict[str, object]:
+    result: dict[str, object] = {}
+    if meta.work_shape is not None:
+        result["work_shape"] = _shape_tuple(meta.work_shape)
+    if meta.group_shape is not None:
+        result["group_shape"] = _shape_tuple(meta.group_shape)
+    if meta.subgroup_size is not None:
+        result["subgroup_size"] = int(meta.subgroup_size)
+    if meta.literals:
+        # Sort for stable round-trip; `frozenset` iteration order is nondeterministic.
+        result["literals"] = tuple(
+            sorted(_literal_name(item) for item in meta.literals)
+        )
+    return result
+
+
+def _serialize_func_metadata(meta: Any) -> dict[str, object]:
+    result: dict[str, object] = {}
+    scope = _scope_text(meta.scope)
+    if scope is not None:
+        result["scope"] = scope
+    return result
+
+
+def _serialize_intrinsic_metadata(meta: Any) -> dict[str, object]:
+    result: dict[str, object] = {}
+    scope = _scope_text(meta.scope)
+    if scope is not None:
+        result["scope"] = scope
+    if meta.effects is not None:
+        result["effects"] = str(meta.effects)
+    if meta.const_attrs:
+        result["const_kwargs"] = tuple(sorted(str(name) for name in meta.const_attrs))
+    return result
+
+
+def _shape_tuple(values: Iterable[Any]) -> tuple[str, ...]:
+    return tuple(str(value) for value in values)
+
+
+def _literal_name(value: Any) -> str:
+    # `@kernel(literals=...)` accepts either `Symbol` objects (exposing `.name`)
+    # or already-textual symbol names; normalize both to the textual form.
+    name = getattr(value, "name", None)
+    if isinstance(name, str):
+        return name
+    return str(value)
+
+
+def _scope_text(scope: Any) -> str | None:
+    if scope is None:
+        return None
+    from .core import Scope
+
+    if isinstance(scope, Scope):
+        return scope.name
+    # `WorkItem` / `SubGroup` are bare classes in `hc.core`; we key on their
+    # Python name rather than introducing a dedicated `Scope`-valued singleton
+    # so user code can keep writing `scope=WorkItem`.
+    name = getattr(scope, "__name__", None)
+    if isinstance(name, str):
+        return name
+    return str(scope)
+
+
+def _collect_parameter_annotations(fn: Any) -> dict[str, dict[str, object]]:
+    raw = getattr(fn, "__annotations__", None) or {}
+    try:
+        hints = inspect.get_annotations(fn, eval_str=True)
+    except (NameError, AttributeError, SyntaxError, TypeError):
+        # PEP 563 strings can reference names not in scope at parse time
+        # (forward refs, missing helpers). Fall back to the raw mapping;
+        # string entries will fail the isinstance check below and be dropped.
+        hints = raw
+    result: dict[str, dict[str, object]] = {}
+    for name, value in hints.items():
+        if name == "return":
+            continue
+        record = _serialize_parameter_annotation(value)
+        if record is not None:
+            result[name] = record
+    return result
+
+
+def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
+    from .core import BufferSpec
+    from .symbols import Symbol
+
+    if isinstance(value, BufferSpec):
+        return {
+            "kind": "buffer",
+            "shape": tuple(str(dim) for dim in value.dimensions),
+        }
+    if isinstance(value, Symbol):
+        return {"kind": "symbol"}
+    if isinstance(value, type):
+        dtype = _SCALAR_ANNOTATION_NAMES.get(value)
+        if dtype is not None:
+            return {"kind": "scalar", "dtype": dtype}
+    return None
 
 
 def _region_payload(

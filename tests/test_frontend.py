@@ -322,9 +322,46 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
     _assert_contains_subsequence(kinds, _SAMPLE_KERNEL_SPINE)
     assert kernel_payload["name"] == "_sample_kernel"
     assert tuple(name for name, _ in kernel_payload["parameters"]) == ("group", "x")
+    assert kernel_payload["metadata"] == {
+        "work_shape": ("4",),
+        "group_shape": ("4",),
+    }
+    assert kernel_payload["parameter_annotations"] == {
+        "x": {"kind": "scalar", "dtype": "int"},
+    }
     assert region_payload["captures"] == ("tmp",)
     assert tuple(name for name, _ in region_payload["parameters"]) == ("wi",)
     assert _payloads(emitter, "target_name")[0]["id"] == "tmp"
+
+
+def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> None:
+    emitter = RecordingEmitter()
+
+    lower_function(wmma_gfx11, emitter)
+
+    intrinsic_payload = _payloads(emitter, "intrinsic_begin")[0]
+    metadata = intrinsic_payload["metadata"]
+
+    assert metadata["scope"] == "WorkItem"
+    assert metadata["effects"] == "pure"
+    assert metadata["const_kwargs"] == ("arch", "wave_size")
+    # The intrinsic has no typed parameter annotations worth surfacing
+    # structurally; the emitter should omit the key rather than emit an
+    # empty mapping.
+    assert "parameter_annotations" not in intrinsic_payload
+
+
+def test_lower_source_does_not_fabricate_toplevel_metadata() -> None:
+    emitter = RecordingEmitter()
+
+    lower_source(_CONTROL_FLOW_SOURCE, emitter, filename="control.py")
+
+    func_payload = _payloads(emitter, "func_begin")[0]
+    # Source-only lowering has no Python function object to query for
+    # decorator kwargs or resolved annotations, so these keys must stay
+    # absent rather than leak stale values from a previous run.
+    assert "metadata" not in func_payload
+    assert "parameter_annotations" not in func_payload
 
 
 def test_lower_source_records_structured_control_flow_and_slices() -> None:

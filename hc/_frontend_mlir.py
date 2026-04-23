@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -548,8 +548,13 @@ class HCFrontEmitter:
             "decorators",
             payload.get("decorators"),
         )
-        self._set_optional_parameters_attr(op, payload.get("parameters"))
+        self._set_optional_parameters_attr(
+            op,
+            payload.get("parameters"),
+            payload.get("parameter_annotations"),
+        )
         self._set_optional_string_attr(op, "returns", payload.get("returns"))
+        self._set_optional_toplevel_metadata_attrs(op, payload.get("metadata"))
 
     def _set_region_metadata_attrs(
         self,
@@ -561,13 +566,23 @@ class HCFrontEmitter:
             "decorators",
             payload.get("decorators"),
         )
-        self._set_optional_parameters_attr(op, payload.get("parameters"))
+        self._set_optional_parameters_attr(
+            op,
+            payload.get("parameters"),
+            payload.get("parameter_annotations"),
+        )
 
-    def _set_optional_parameters_attr(self, op: Any, value: object) -> None:
+    def _set_optional_parameters_attr(
+        self,
+        op: Any,
+        value: object,
+        annotations: object = None,
+    ) -> None:
         if value is None:
             return
         if isinstance(value, str | bytes) or not isinstance(value, Sequence):
             raise RuntimeError(f"invalid frontend parameter records: {value!r}")
+        annotation_records = self._coerce_parameter_annotations(annotations)
         parameters = []
         for item in value:
             if not isinstance(item, tuple) or len(item) != 2:
@@ -578,10 +593,85 @@ class HCFrontEmitter:
             parameter = {"name": self._string_attr(name)}
             if isinstance(annotation, str):
                 parameter["annotation"] = self._string_attr(annotation)
+            record = annotation_records.get(name)
+            if record is not None:
+                self._apply_structural_annotation(parameter, record)
             parameters.append(ir.DictAttr.get(parameter, context=self._context))
         op.operation.attributes["parameters"] = ir.ArrayAttr.get(
             parameters,
             context=self._context,
+        )
+
+    def _coerce_parameter_annotations(
+        self,
+        annotations: object,
+    ) -> dict[str, dict[str, object]]:
+        if annotations is None:
+            return {}
+        if not isinstance(annotations, Mapping):
+            raise RuntimeError(
+                f"invalid frontend parameter annotation mapping: {annotations!r}"
+            )
+        return {str(key): dict(value) for key, value in annotations.items()}
+
+    def _apply_structural_annotation(
+        self,
+        parameter: dict[str, Any],
+        record: Mapping[str, object],
+    ) -> None:
+        kind = record.get("kind")
+        if isinstance(kind, str):
+            parameter["kind"] = self._string_attr(kind)
+        dtype = record.get("dtype")
+        if isinstance(dtype, str):
+            parameter["dtype"] = self._string_attr(dtype)
+        shape = record.get("shape")
+        if shape is not None:
+            parameter["shape"] = self._string_array_attr(self._string_sequence(shape))
+
+    def _set_optional_toplevel_metadata_attrs(
+        self,
+        op: Any,
+        metadata: object,
+    ) -> None:
+        if metadata is None:
+            return
+        if not isinstance(metadata, Mapping):
+            raise RuntimeError(
+                f"invalid frontend toplevel metadata payload: {metadata!r}"
+            )
+        if "work_shape" in metadata:
+            self._set_optional_string_array_attr(
+                op, "work_shape", metadata["work_shape"]
+            )
+        if "group_shape" in metadata:
+            self._set_optional_string_array_attr(
+                op, "group_shape", metadata["group_shape"]
+            )
+        if "subgroup_size" in metadata:
+            self._set_optional_i32_attr(op, "subgroup_size", metadata["subgroup_size"])
+        if "literals" in metadata:
+            self._set_optional_string_array_attr(op, "literals", metadata["literals"])
+        if "scope" in metadata:
+            self._set_optional_string_attr(op, "scope", metadata["scope"])
+        if "effects" in metadata:
+            self._set_optional_string_attr(op, "effects", metadata["effects"])
+        if "const_kwargs" in metadata:
+            self._set_optional_string_array_attr(
+                op, "const_kwargs", metadata["const_kwargs"]
+            )
+
+    def _set_optional_i32_attr(self, op: Any, name: str, value: object) -> None:
+        # Symmetrical with sibling _set_optional_* helpers: loud on bad
+        # payload so a serializer regression is caught at emit time, not
+        # in the eventual hc_front -> hc pass.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RuntimeError(
+                f"frontend metadata '{name}' must be a non-bool int, got {value!r}"
+            )
+        op.operation.attributes[name] = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(32, context=self._context),
+            value,
         )
 
     def _set_optional_string_attr(self, op: Any, name: str, value: object) -> None:

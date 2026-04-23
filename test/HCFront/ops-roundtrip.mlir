@@ -5,7 +5,16 @@
 // RUN: hc-opt %s | hc-opt | FileCheck %s
 
 // CHECK: module {
-// CHECK: hc_front.kernel "kernel_demo" attributes {decorators = ["kernel"], parameters = [{name = "group"}], returns = "None"} {
+// CHECK: hc_front.kernel "kernel_demo"
+// CHECK-SAME: decorators = ["kernel"]
+// CHECK-SAME: group_shape = ["32", "1"]
+// CHECK-SAME: literals = ["WAVE_LANES", "WMMA_M"]
+// CHECK-SAME: parameters =
+// CHECK-SAME: {annotation = "Buffer[M, K]", kind = "buffer", name = "a", shape = ["M", "K"]}
+// CHECK-SAME: {dtype = "int", kind = "scalar", name = "x"}
+// CHECK-SAME: returns = "None"
+// CHECK-SAME: subgroup_size = 32 : i32
+// CHECK-SAME: work_shape = ["32*ceiling(1/16*M)", "ceiling(1/16*N)"]
 // CHECK: hc_front.constant<0 : i64>
 // CHECK: hc_front.constant<1 : i64>
 // CHECK: hc_front.name "x" {ctx = "load"}
@@ -32,11 +41,29 @@
 // CHECK: hc_front.for
 // CHECK: hc_front.subgroup_region captures = ["outer"] {
 // CHECK: hc_front.workitem_region captures = ["outer", "tmp"] {
-// CHECK: hc_front.func "helper" attributes {decorators = ["kernel.func"], parameters = [{name = "group"}, {name = "x"}]} {
-// CHECK: hc_front.intrinsic "intrinsic_demo" attributes {decorators = ["kernel.intrinsic"], parameters = [{name = "group"}]} {
+// CHECK: hc_front.func "helper"
+// CHECK-SAME: decorators = ["kernel.func"]
+// CHECK-SAME: scope = "WorkGroup"
+// CHECK: hc_front.intrinsic "intrinsic_demo"
+// CHECK-SAME: const_kwargs = ["arch", "wave_size"]
+// CHECK-SAME: decorators = ["kernel.intrinsic"]
+// CHECK-SAME: effects = "pure"
+// CHECK-SAME: scope = "WorkItem"
 
 module {
-  hc_front.kernel "kernel_demo" attributes {decorators = ["kernel"], parameters = [{name = "group"}], returns = "None"} {
+  hc_front.kernel "kernel_demo" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32", "1"],
+    literals = ["WAVE_LANES", "WMMA_M"],
+    parameters = [
+      {name = "group"},
+      {annotation = "Buffer[M, K]", kind = "buffer", name = "a", shape = ["M", "K"]},
+      {dtype = "int", kind = "scalar", name = "x"}
+    ],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["32*ceiling(1/16*M)", "ceiling(1/16*N)"]
+  } {
     %c0 = hc_front.constant <0>
     %c1 = hc_front.constant <1>
     %name = hc_front.name "x" {ctx = "load"}
@@ -79,12 +106,22 @@ module {
     hc_front.return %call
   }
 
-  hc_front.func "helper" attributes {decorators = ["kernel.func"], parameters = [{name = "group"}, {name = "x"}]} {
+  hc_front.func "helper" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}, {name = "x"}],
+    scope = "WorkGroup"
+  } {
     %x = hc_front.name "x"
     hc_front.return %x
   }
 
-  hc_front.intrinsic "intrinsic_demo" attributes {decorators = ["kernel.intrinsic"], parameters = [{name = "group"}]} {
+  hc_front.intrinsic "intrinsic_demo" attributes {
+    const_kwargs = ["arch", "wave_size"],
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "group"}],
+    scope = "WorkItem"
+  } {
     %one = hc_front.constant <1>
     hc_front.return %one
   }

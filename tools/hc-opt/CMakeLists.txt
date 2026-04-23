@@ -9,6 +9,7 @@ target_link_libraries(
   PRIVATE
   MLIRHCDialect
   MLIRHCFrontDialect
+  MLIRHCFrontToHC
   MLIROptLib
   MLIRRegisterAllDialects
   MLIRRegisterAllExtensions

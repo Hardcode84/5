@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "hc/Conversion/HCFrontToHC/HCFrontToHC.h"
 #include "hc/Front/IR/HCFrontDialect.h"
 #include "hc/IR/HCDialect.h"
 
@@ -15,6 +16,7 @@ int main(int argc, char **argv) {
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
   mlir::registerAllPasses();
+  mlir::hc::front::registerHCFrontToHCConversionPasses();
   registry.insert<mlir::hc::HCDialect>();
   registry.insert<mlir::hc::front::HCFrontDialect>();
 

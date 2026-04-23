@@ -8,8 +8,8 @@
 // RUN: hc-opt --convert-hc-front-to-hc %s | FileCheck %s
 // RUN: hc-opt --convert-hc-front-to-hc %s | hc-opt | FileCheck %s
 
-// Exercises the mechanical hc_front -> hc rewrite patterns this bead
-// handles: top-level kernel/func/intrinsic, return/constant/binop,
+// Exercises the mechanical hc_front -> hc rewrite patterns this pass
+// covers: top-level kernel/func/intrinsic, return/constant/binop,
 // target_name + target_tuple + target_subscript via assign, name dispatch
 // (param / iv / local / constant / symbol / callee / intrinsic /
 // dsl_method), attr+subscript for launch geometry and buffer.shape, the
@@ -137,7 +137,7 @@ module {
   //   * `a.shape[200]` must pass through as `hc.buffer_dim` with no axis
   //     cap — buffer rank is not launch-geo and has its own verifier.
   // CHECK-LABEL: hc.kernel @axis_bounds
-  // CHECK: hc.local_id
+  // CHECK: %{{.*}}:32 = hc.local_id %arg0
   // CHECK: hc.buffer_dim %arg1, axis = 200 : !hc.undef
   hc_front.kernel "axis_bounds" attributes {
     parameters = [{name = "group"}, {name = "a"}]

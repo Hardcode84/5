@@ -12,7 +12,7 @@
 // so a bare kernel op without it surfaces a hard error.
 module {
   // expected-error@+1 {{missing `parameters` attribute}}
-  hc_front.kernel "no_params" {
+  hc_front.kernel "bad_no_params" {
     hc_front.return
   }
 }
@@ -23,7 +23,7 @@ module {
 // to populate parameters). The diagnostic names the identifier so the
 // classification can be debugged.
 module {
-  hc_front.kernel "unbound_param" attributes {parameters = []} {
+  hc_front.kernel "bad_unbound_param" attributes {parameters = []} {
     // expected-error@+1 {{hc_front.name 'x' (kind=param) not bound}}
     %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
     hc_front.return
@@ -102,10 +102,32 @@ module {
 
 // -----
 
+// Tuple-unpack against a non-tuple, single-result RHS with multi-target:
+// exercises the "must be tuple literal, or a call producing one result per
+// target" branch (a binop returns a single hc value — not an arity-2
+// multi-result op, and not a tuple).
+module {
+  hc_front.kernel "bad_unpack_scalar_rhs" attributes {
+    parameters = [{name = "a"}, {name = "b"}]
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %scalar = hc_front.binop "Add"(%a, %b)
+    %ta = hc_front.target_name "x"
+    %tb = hc_front.target_name "y"
+    %tgt = hc_front.target_tuple (%ta, %tb)
+    // expected-error@+1 {{tuple-unpack rhs must be a tuple literal, or a call producing one result per target}}
+    hc_front.assign %tgt = %scalar
+    hc_front.return
+  }
+}
+
+// -----
+
 // Single-target tuple binding: `x = (a,)` with arity > 1 is rejected, not
 // silently null-bound. Arity 2+ has no single-target meaning.
 module {
-  hc_front.kernel "single_target_tuple" attributes {
+  hc_front.kernel "bad_single_target_tuple" attributes {
     parameters = [{name = "a"}, {name = "b"}]
   } {
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
@@ -142,7 +164,7 @@ module {
 // callee-classified name, so `lowerValueOperand` returns null). `requireBase`
 // must catch this and diagnose rather than build a null-operand hc op.
 module {
-  hc_front.kernel "null_base_dsl" attributes {parameters = []} {
+  hc_front.kernel "bad_null_base_dsl" attributes {parameters = []} {
     // A name with `kind = "builtin"` lowers to null (consumed by parent).
     // Feeding it to `x.vec()` exercises the requireBase guard.
     %n = hc_front.name "some_builtin" {ctx = "load", ref = {kind = "builtin", builtin = "some_builtin"}}
@@ -161,9 +183,23 @@ module {
 // The diagnostic fingers the driver rather than silently returning a
 // sentinel null.
 module {
-  hc_front.kernel "bad_ref" attributes {parameters = []} {
-    // expected-error@+1 {{ref dict with missing or non-string `kind`}}
+  hc_front.kernel "bad_ref_name" attributes {parameters = []} {
+    // expected-error@+1 {{hc_front.name' op hc_front.name has a `ref` dict with missing or non-string `kind`}}
     %n = hc_front.name "x" {ctx = "load", ref = {notkind = "oops"}}
+    hc_front.return
+  }
+}
+
+// -----
+
+// Same malformed-ref guardrail on an attr op: a dict without a string
+// `kind` must blame the attr at source, not the downstream call or
+// subscript trying to read `method`.
+module {
+  hc_front.kernel "bad_ref_attr" attributes {parameters = [{name = "x"}]} {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    // expected-error@+1 {{hc_front.attr' op hc_front.attr has a `ref` dict with missing or non-string `kind`}}
+    %m = hc_front.attr %x, "foo" {ref = {method = "foo"}}
     hc_front.return
   }
 }

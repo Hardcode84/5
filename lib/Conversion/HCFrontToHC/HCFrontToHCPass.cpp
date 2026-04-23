@@ -137,11 +137,28 @@ public:
     return {};
   }
 
-  // Typed attribute lookup, mirrors DictionaryAttr::getAs.
+  // Typed attribute lookup. Returns a default-constructed (null) `AttrT`
+  // when the dict is absent, the key is missing, or the value is not of
+  // the requested type — mirrors `DictionaryAttr::getAs` exactly.
   template <typename AttrT> AttrT getAs(StringRef key) const {
     if (!dict_)
       return {};
     return dict_.getAs<AttrT>(key);
+  }
+
+  // Driver-contract check: `ref` is how the Python driver tells the pass
+  // "this name/attr is a <kind>". A dict with no string `kind` is a
+  // driver bug, not a fallback — return failure so every call site that
+  // consumes `ref` can stop short rather than dropping into a misleading
+  // "unsupported" path downstream. Absent `ref` is fine: hand-written IR
+  // uses that to mean "no classification" and different consumers handle
+  // it differently.
+  LogicalResult diagnoseIfMalformed(Operation *op, StringRef role) const {
+    if (!dict_ || !kind_.empty())
+      return success();
+    return op->emitOpError(role)
+           << " has a `ref` dict with missing or non-string `kind`; the "
+              "driver must populate a classification before this pass runs";
   }
 
 private:
@@ -283,8 +300,11 @@ private:
   FailureOr<Value> lowerName(hc_front::NameOp op);
 
   // Dispatches on `ref.kind = "dsl_method"`'s `method` payload, or falls
-  // through to a module/attr chain the call site handles.
-  Value lowerAttr(hc_front::AttrOp op);
+  // through to a module/attr chain the call site handles. Returns a null
+  // `Value` on success (attrs never produce stand-alone SSA results — they
+  // are consumed by the parent call or subscript), and `failure` only if
+  // the `ref` dict on the op is present-but-malformed.
+  FailureOr<Value> lowerAttr(hc_front::AttrOp op);
 
   LogicalResult lowerRegion(Region &src);
 
@@ -382,24 +402,13 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
 
   // All three callable kinds share the same skeleton: build a fresh
   // entry block, bind params into a new Scope, hand (entry, fnType) to
-  // the per-kind `build` lambda which creates the hc op and attaches
-  // the block, then drive `lowerRegion` against the *hc_front* body
-  // region the lambda returns. (We lower from the front region — its
-  // ops are the source — while the entry block lives inside the new
-  // hc op; lowering is driven by the insertion point set below.)
+  // the per-kind `build` lambda which creates the hc op + attaches the
+  // block, then lower the hc_front body region into that entry block.
   //
-  // Ownership rules for `entry`:
-  //   * If `materializeParameters` fails we still own `entry`; delete it.
-  //   * If `build` succeeds, the lambda MUST have attached `entry` to
-  //     the new hc op's body region; the hc op then owns the block.
-  //   * If `build` fails, the lambda MUST leave no partial IR behind —
-  //     either it never attached the block and the generic cleanup on
-  //     this path is a no-op leak of `entry`, OR (the preferred form
-  //     all three lambdas use) it attached-then-erased the hc op,
-  //     which takes the block with it.
-  // In practice every `build` below follows the same "attach first,
-  // fail-with-erase" pattern, so the only block we ever delete here is
-  // the one rejected by `materializeParameters`.
+  // Block ownership: on `materializeParameters` failure we delete `entry`
+  // here; on success `build` is contractually attach-then-erase —
+  // attaches `entry` to the hc op first, so any later failure can
+  // `hcOp->erase()` and take the block with it.
   auto runBody =
       [&](bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
@@ -558,14 +567,12 @@ Lowerer::materializeParameters(ArrayAttr params, Block &entry, Scope &scope,
 LogicalResult Lowerer::lowerRegion(Region &src) {
   if (src.empty())
     return success();
-  // The Python driver always emits single-block regions; multi-block
-  // control flow would require CFG-aware scope merging we don't do yet.
-  // Fail loud rather than silently skip the trailing blocks.
-  if (!src.hasOneBlock()) {
-    return src.getParentOp()->emitOpError(
-        "hc_front regions must be single-block; multi-block lowering is not "
-        "supported");
-  }
+  // Every `hc_front` region-carrying op declares its regions as
+  // `SizedRegion<1>` (see HCFrontOps.td), so multi-block input is rejected
+  // by the dialect verifier before this pass runs. `src.front()` is thus
+  // the only block we ever need to walk.
+  assert(src.hasOneBlock() && "hc_front dialect guarantees single-block; "
+                              "SizedRegion<1> was bypassed?");
   Block &block = src.front();
   for (Operation &op : llvm::make_early_inc_range(block)) {
     if (failed(lowerOp(&op)))
@@ -600,7 +607,10 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return success();
   }
   if (auto attr = dyn_cast<hc_front::AttrOp>(op)) {
-    valueMap[attr.getResult()] = lowerAttr(attr);
+    FailureOr<Value> v = lowerAttr(attr);
+    if (failed(v))
+      return failure();
+    valueMap[attr.getResult()] = *v;
     return success();
   }
 
@@ -656,17 +666,11 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
   return op->emitOpError("unsupported hc_front op");
 }
 
-// Discipline note for callers: `valueMap` stores `Value()` for ops that
-// *legitimately* have no SSA counterpart on their own — `hc_front.tuple`,
-// `hc_front.keyword`, attribute chains consumed by their parent, and
-// callee-like names (intrinsic / builtin / numpy_*). Every new consumer
-// of `lowerValueOperand` MUST either:
-//   (a) treat null as a valid "consumed by parent" sentinel (call/subscript
-//       sites that unpack via `tupleElts` / `keywordInfo`), OR
-//   (b) null-check and diagnose before use (binops, subscripts, stores,
-//       assigns — see `lowerBinop`, `lowerAssign`).
-// Binding a null into a scope or feeding it to an hc op builder is always
-// a bug: it produces malformed IR that may pass verify silently.
+// Returns the lowered hc value for an hc_front SSA operand. Null is a
+// deliberate sentinel meaning "no SSA counterpart" (tuples, keywords,
+// callee-like names, attr chains) — new consumers must either treat it
+// as consumed-by-parent or null-check and diagnose; binding it into a
+// scope or handing it to an hc op builder silently produces bad IR.
 Value Lowerer::lowerValueOperand(Value v) {
   auto it = valueMap.find(v);
   assert(it != valueMap.end() && "operand was not yet lowered; walk order bug");
@@ -698,17 +702,10 @@ SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
 
 FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   RefInfo ref = RefInfo::get(op);
+  if (failed(ref.diagnoseIfMalformed(op, "hc_front.name")))
+    return failure();
   StringRef kind = ref.getKind();
   StringRef ident = op.getName();
-  // A present-but-malformed `ref` (dict without a string `kind`) is a
-  // driver bug, not a pass fallback — silently landing in the sentinel
-  // "no SSA result" path would mask the real problem downstream.
-  if (ref && kind.empty()) {
-    return op.emitOpError("hc_front.name '")
-           << ident
-           << "' has a ref dict with missing or non-string `kind`; the driver "
-              "must populate a classification before this pass runs";
-  }
   if (kind == "param" || kind == "local" || kind == "iv") {
     Value v = currentScope().lookup(ident);
     if (!v) {
@@ -742,11 +739,16 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   return Value();
 }
 
-Value Lowerer::lowerAttr(hc_front::AttrOp op) {
+FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
   // Attribute chains like `np.float32` or `group.load` are either folded
   // into a parent call (dsl_method, numpy_dtype_type), or don't produce a
   // value at all. Leave nothing in the value map — consumers inspect the
-  // original op.
+  // original op. A present-but-malformed `ref` (dict without a string
+  // `kind`) is diagnosed here so the error fingers the attr rather than
+  // the downstream call/subscript that was trying to read `method`.
+  RefInfo ref = RefInfo::get(op);
+  if (failed(ref.diagnoseIfMalformed(op, "hc_front.attr")))
+    return failure();
   return Value();
 }
 
@@ -800,8 +802,10 @@ Value Lowerer::lowerBinop(hc_front::BinOp op) {
   Value lhs = lowerValueOperand(op.getLhs());
   Value rhs = lowerValueOperand(op.getRhs());
   if (!lhs || !rhs) {
+    StringRef which =
+        !lhs && !rhs ? StringRef("lhs+rhs") : (!lhs ? "lhs" : "rhs");
     op.emitOpError("binop operand did not lower to an hc value (")
-        << (!lhs ? "lhs" : "rhs") << "); operand may be a tuple or callee ref";
+        << which << "); operand may be a tuple or callee ref";
     return nullptr;
   }
   return emitBinop(builder, op.getLoc(), op.getKind(), lhs, rhs, undef, op);
@@ -901,9 +905,9 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
       if (rhsOp && rhsOp->getNumResults() == arity) {
         sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
       } else {
-        return op.emitOpError("tuple-unpack rhs must be a tuple literal or a "
-                              "call producing the "
-                              "same number of results as the target (got ")
+        return op.emitOpError(
+                   "tuple-unpack rhs must be a tuple literal, or a call "
+                   "producing one result per target (got ")
                << (rhsOp ? rhsOp->getNumResults() : 0) << " vs target arity "
                << arity << ")";
       }
@@ -952,8 +956,9 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   Region &iter = op.getIter();
   if (iter.empty() || iter.front().empty())
     return op.emitOpError("for-iter region is empty");
-  if (!iter.hasOneBlock())
-    return op.emitOpError("for-iter must be single-block");
+  // `hc_front.for` declares all three sub-regions as `SizedRegion<1>`, so
+  // multi-block bodies cannot reach this pass.
+  assert(iter.hasOneBlock() && "SizedRegion<1> bypassed?");
 
   hc_front::CallOp iterCall;
   Operation *lastOp = nullptr;
@@ -1001,19 +1006,20 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
     return op.emitOpError("range(...) must have 1, 2, or 3 args");
   }
 
-  // Pull the IV name out of the target region.
+  // Pull the IV name out of the target region. Same SizedRegion<1>
+  // guarantee as above.
   Region &tgt = op.getTarget();
   if (tgt.empty() || tgt.front().empty())
     return op.emitOpError("for-target region is empty");
-  if (!tgt.hasOneBlock())
-    return op.emitOpError("for-target must be single-block");
+  assert(tgt.hasOneBlock() && "SizedRegion<1> bypassed?");
   auto ivTarget = dyn_cast<hc_front::TargetNameOp>(&tgt.front().front());
   if (!ivTarget)
     return op.emitOpError("for-target must be a single target_name");
 
-  // Build the `hc.for_range` with no iter_args (loop-carried analysis is
-  // 5-3jb). The entry block owns the IV block argument that we bind into
-  // the child scope so name lookups inside the body resolve.
+  // Build the `hc.for_range` with no iter_args — loop-carried value
+  // analysis is a later pass. The entry block owns the IV block argument
+  // that we bind into the child scope so name lookups inside the body
+  // resolve.
   auto forOp = HCForRangeOp::create(builder, op.getLoc(),
                                     /*resultTypes=*/TypeRange{}, lo, hi, step,
                                     /*iter_inits=*/ValueRange{});
@@ -1042,7 +1048,7 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 template <typename HCRegionOpT, typename FrontRegionOpT>
 LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
-  // body). Nested-def folding is 5-3jb; if the front op declares
+  // body). Nested-def folding is a later pass; if the front op declares
   // parameters we still bind them as block args so the body resolves,
   // but the `hc` op carries only a captures list (no formal params).
   auto newOp = HCRegionOpT::create(builder, op.getLoc(), op.getCapturesAttr());
@@ -1231,9 +1237,9 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     return Value();
   }
   if (kind == "inline") {
-    // Full inlining of non-decorated helpers needs a separate pass (see
-    // bead note). Emit a conservative `hc.call @<qualified>` placeholder
-    // and let downstream either inline it or flag the missing symbol.
+    // Full inlining of non-decorated helpers is a separate pass. For now
+    // emit a conservative `hc.call @<qualified>` placeholder and let
+    // downstream either inline it or flag the missing symbol.
     StringRef qn = ref.getString("qualified_name");
     if (qn.empty()) {
       op.emitOpError("inline name ref missing qualified_name");

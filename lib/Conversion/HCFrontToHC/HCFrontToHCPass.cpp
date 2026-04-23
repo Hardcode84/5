@@ -152,12 +152,13 @@ public:
   // consumes `ref` can stop short rather than dropping into a misleading
   // "unsupported" path downstream. Absent `ref` is fine: hand-written IR
   // uses that to mean "no classification" and different consumers handle
-  // it differently.
-  LogicalResult diagnoseIfMalformed(Operation *op, StringRef role) const {
+  // it differently. The op mnemonic is already prepended by `emitOpError`,
+  // so the caller doesn't need to pass a role string.
+  LogicalResult diagnoseIfMalformed(Operation *op) const {
     if (!dict_ || !kind_.empty())
       return success();
-    return op->emitOpError(role)
-           << " has a `ref` dict with missing or non-string `kind`; the "
+    return op->emitOpError()
+           << "has a `ref` dict with missing or non-string `kind`; the "
               "driver must populate a classification before this pass runs";
   }
 
@@ -569,10 +570,16 @@ LogicalResult Lowerer::lowerRegion(Region &src) {
     return success();
   // Every `hc_front` region-carrying op declares its regions as
   // `SizedRegion<1>` (see HCFrontOps.td), so multi-block input is rejected
-  // by the dialect verifier before this pass runs. `src.front()` is thus
-  // the only block we ever need to walk.
-  assert(src.hasOneBlock() && "hc_front dialect guarantees single-block; "
-                              "SizedRegion<1> was bypassed?");
+  // by the dialect verifier before this pass runs. We still keep a runtime
+  // guard (not just `assert`) so a pipeline that bypasses verification —
+  // fuzzing, hand-built IR, a buggy upstream transform — fails loud
+  // instead of silently lowering only `front()` under NDEBUG.
+  if (!src.hasOneBlock()) {
+    Operation *parent = src.getParentOp();
+    return (parent ? parent->emitOpError() : mlir::emitError(src.getLoc()))
+           << "hc_front region must be single-block (dialect verifier was "
+              "bypassed?)";
+  }
   Block &block = src.front();
   for (Operation &op : llvm::make_early_inc_range(block)) {
     if (failed(lowerOp(&op)))
@@ -702,7 +709,7 @@ SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
 
 FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   RefInfo ref = RefInfo::get(op);
-  if (failed(ref.diagnoseIfMalformed(op, "hc_front.name")))
+  if (failed(ref.diagnoseIfMalformed(op)))
     return failure();
   StringRef kind = ref.getKind();
   StringRef ident = op.getName();
@@ -746,8 +753,7 @@ FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
   // original op. A present-but-malformed `ref` (dict without a string
   // `kind`) is diagnosed here so the error fingers the attr rather than
   // the downstream call/subscript that was trying to read `method`.
-  RefInfo ref = RefInfo::get(op);
-  if (failed(ref.diagnoseIfMalformed(op, "hc_front.attr")))
+  if (failed(RefInfo::get(op).diagnoseIfMalformed(op)))
     return failure();
   return Value();
 }
@@ -957,8 +963,12 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   if (iter.empty() || iter.front().empty())
     return op.emitOpError("for-iter region is empty");
   // `hc_front.for` declares all three sub-regions as `SizedRegion<1>`, so
-  // multi-block bodies cannot reach this pass.
-  assert(iter.hasOneBlock() && "SizedRegion<1> bypassed?");
+  // multi-block bodies cannot reach this pass — but keep a runtime check
+  // so a verifier-bypass doesn't silently walk only the first block under
+  // NDEBUG.
+  if (!iter.hasOneBlock())
+    return op.emitOpError(
+        "for-iter must be single-block (dialect verifier bypassed?)");
 
   hc_front::CallOp iterCall;
   Operation *lastOp = nullptr;
@@ -1011,7 +1021,9 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   Region &tgt = op.getTarget();
   if (tgt.empty() || tgt.front().empty())
     return op.emitOpError("for-target region is empty");
-  assert(tgt.hasOneBlock() && "SizedRegion<1> bypassed?");
+  if (!tgt.hasOneBlock())
+    return op.emitOpError(
+        "for-target must be single-block (dialect verifier bypassed?)");
   auto ivTarget = dyn_cast<hc_front::TargetNameOp>(&tgt.front().front());
   if (!ivTarget)
     return op.emitOpError("for-target must be a single target_name");
@@ -1175,6 +1187,11 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     return failure();
   }
   RefInfo ref = RefInfo::get(nameOp);
+  // `lowerName` already diagnosed a malformed `ref` on `nameOp` before we
+  // got here (SSA: def visited before use). Re-check anyway so this
+  // function's preconditions don't quietly rely on traversal order.
+  if (failed(ref.diagnoseIfMalformed(nameOp)))
+    return failure();
   StringRef kind = ref.getKind();
 
   FailureOr<CallArgs> argsOr = collectCallArgs(op);
@@ -1263,6 +1280,11 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
                                              hc_front::AttrOp attr) {
   RefInfo ref = RefInfo::get(attr);
+  // Same defense-in-depth as `lowerCall`: `lowerAttr` has already run on
+  // `attr` in a well-formed walk, but this re-check keeps the dispatch
+  // independent of traversal order.
+  if (failed(ref.diagnoseIfMalformed(attr)))
+    return failure();
   StringRef method = ref.getString("method");
 
   FailureOr<CallArgs> argsOr = collectCallArgs(call);

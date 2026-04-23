@@ -184,7 +184,7 @@ module {
 // sentinel null.
 module {
   hc_front.kernel "bad_ref_name" attributes {parameters = []} {
-    // expected-error@+1 {{hc_front.name' op hc_front.name has a `ref` dict with missing or non-string `kind`}}
+    // expected-error@+1 {{`ref` dict with missing or non-string `kind`}}
     %n = hc_front.name "x" {ctx = "load", ref = {notkind = "oops"}}
     hc_front.return
   }
@@ -198,7 +198,7 @@ module {
 module {
   hc_front.kernel "bad_ref_attr" attributes {parameters = [{name = "x"}]} {
     %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
-    // expected-error@+1 {{hc_front.attr' op hc_front.attr has a `ref` dict with missing or non-string `kind`}}
+    // expected-error@+1 {{`ref` dict with missing or non-string `kind`}}
     %m = hc_front.attr %x, "foo" {ref = {method = "foo"}}
     hc_front.return
   }

@@ -137,6 +137,8 @@ module {
   //   * `a.shape[200]` must pass through as `hc.buffer_dim` with no axis
   //     cap — buffer rank is not launch-geo and has its own verifier.
   // CHECK-LABEL: hc.kernel @axis_bounds
+  // The `:32` pins the hc.local_id result arity to kMaxLaunchAxis (32
+  // variadic results, one per potential launch axis), *not* a bit-width.
   // CHECK: %{{.*}}:32 = hc.local_id %arg0
   // CHECK: hc.buffer_dim %arg1, axis = 200 : !hc.undef
   hc_front.kernel "axis_bounds" attributes {

@@ -96,6 +96,8 @@ def test_hc_opt_parses_and_prints_registered_hc_front_textual_ir() -> None:
     result = _run_hc_opt([], input_text=_HC_FRONT_MODULE_SOURCE)
 
     assert "hc_front.kernel" in result.stdout
-    assert "!hc_front.value" in result.stdout
     assert "hc_front.if" in result.stdout
     assert "hc_front.for" in result.stdout
+    # The declarative assembly format infers `!hc_front.value` from the
+    # parameterless, buildable `HCFront_ValueType`, so the pretty-printed
+    # form never spells the type out — hence no string check for it here.

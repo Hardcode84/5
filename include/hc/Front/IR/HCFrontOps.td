@@ -37,20 +37,25 @@ def HCFront_IntrinsicOp : HCFront_RegionOp<"intrinsic"> {
   let assemblyFormat = "$name attr-dict-with-keyword $body";
 }
 
+// Operands and results across this dialect are uniformly `!hc_front.value`
+// (or, occasionally, `!hc_front.typeexpr`). Both are parameterless and therefore
+// buildable, so the declarative assembly format synthesizes the types without
+// needing explicit `type($x)` / `functional-type(...)` directives in the
+// spellings below.
+
 def HCFront_ConstantOp : HCFront_ValueProducer<"constant"> {
   let arguments = (ins AnyAttr:$value);
-  let assemblyFormat = "`<` $value `>` attr-dict `:` type($result)";
+  let assemblyFormat = "`<` $value `>` attr-dict";
 }
 
 def HCFront_NameOp : HCFront_ValueProducer<"name"> {
   let arguments = (ins StrAttr:$name);
-  let assemblyFormat = "$name attr-dict `:` type($result)";
+  let assemblyFormat = "$name attr-dict";
 }
 
 def HCFront_AssignOp : HCFront_Op<"assign"> {
   let arguments = (ins HCFront_ValueType:$target, HCFront_ValueType:$value);
-  let assemblyFormat =
-      "$target `=` $value attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$target `=` $value attr-dict";
 }
 
 def HCFront_AugAssignOp : HCFront_Op<"aug_assign"> {
@@ -59,19 +64,17 @@ def HCFront_AugAssignOp : HCFront_Op<"aug_assign"> {
     HCFront_ValueType:$target,
     HCFront_ValueType:$value
   );
-  let assemblyFormat =
-      "$kind $target `=` $value attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$kind $target `=` $value attr-dict";
 }
 
 def HCFront_TargetNameOp : HCFront_ValueProducer<"target_name"> {
   let arguments = (ins StrAttr:$name);
-  let assemblyFormat = "$name attr-dict `:` type($result)";
+  let assemblyFormat = "$name attr-dict";
 }
 
 def HCFront_TargetTupleOp : HCFront_ValueProducer<"target_tuple"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$elements);
-  let assemblyFormat =
-      "`(` $elements `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "`(` $elements `)` attr-dict";
 }
 
 def HCFront_TargetSubscriptOp : HCFront_ValueProducer<"target_subscript"> {
@@ -79,14 +82,12 @@ def HCFront_TargetSubscriptOp : HCFront_ValueProducer<"target_subscript"> {
     HCFront_ValueType:$base,
     Variadic<HCFront_ValueType>:$indices
   );
-  let assemblyFormat =
-      "$base `[` $indices `]` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$base `[` $indices `]` attr-dict";
 }
 
 def HCFront_AttrOp : HCFront_ValueProducer<"attr"> {
   let arguments = (ins HCFront_ValueType:$base, StrAttr:$name);
-  let assemblyFormat =
-      "$base `,` $name attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$base `,` $name attr-dict";
 }
 
 def HCFront_SubscriptOp : HCFront_ValueProducer<"subscript"> {
@@ -94,14 +95,12 @@ def HCFront_SubscriptOp : HCFront_ValueProducer<"subscript"> {
     HCFront_ValueType:$base,
     Variadic<HCFront_ValueType>:$indices
   );
-  let assemblyFormat =
-      "$base `[` $indices `]` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$base `[` $indices `]` attr-dict";
 }
 
 def HCFront_SliceOp : HCFront_ValueProducer<"slice"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$parts);
-  let assemblyFormat =
-      "`(` $parts `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "`(` $parts `)` attr-dict";
 }
 
 def HCFront_CallOp : HCFront_ValueProducer<"call"> {
@@ -109,26 +108,22 @@ def HCFront_CallOp : HCFront_ValueProducer<"call"> {
     HCFront_ValueType:$callee,
     Variadic<HCFront_ValueType>:$arguments
   );
-  let assemblyFormat =
-      "$callee `(` $arguments `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$callee `(` $arguments `)` attr-dict";
 }
 
 def HCFront_KeywordOp : HCFront_ValueProducer<"keyword"> {
   let arguments = (ins StrAttr:$name, HCFront_ValueType:$value);
-  let assemblyFormat =
-      "$name `=` $value attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$name `=` $value attr-dict";
 }
 
 def HCFront_TupleOp : HCFront_ValueProducer<"tuple"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$elements);
-  let assemblyFormat =
-      "`(` $elements `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "`(` $elements `)` attr-dict";
 }
 
 def HCFront_ListOp : HCFront_ValueProducer<"list"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$elements);
-  let assemblyFormat =
-      "`[` $elements `]` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "`[` $elements `]` attr-dict";
 }
 
 def HCFront_BinOp : HCFront_ValueProducer<"binop"> {
@@ -137,14 +132,12 @@ def HCFront_BinOp : HCFront_ValueProducer<"binop"> {
     HCFront_ValueType:$lhs,
     HCFront_ValueType:$rhs
   );
-  let assemblyFormat =
-      "$kind `(` $lhs `,` $rhs `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$kind `(` $lhs `,` $rhs `)` attr-dict";
 }
 
 def HCFront_UnaryOp : HCFront_ValueProducer<"unaryop"> {
   let arguments = (ins StrAttr:$kind, HCFront_ValueType:$operand);
-  let assemblyFormat =
-      "$kind `(` $operand `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$kind `(` $operand `)` attr-dict";
 }
 
 def HCFront_CompareOp : HCFront_ValueProducer<"compare"> {
@@ -152,8 +145,7 @@ def HCFront_CompareOp : HCFront_ValueProducer<"compare"> {
     ArrayAttr:$predicates,
     Variadic<HCFront_ValueType>:$operands
   );
-  let assemblyFormat =
-      "$predicates `(` $operands `)` attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$predicates `(` $operands `)` attr-dict";
 }
 
 def HCFront_IfOp : HCFront_RegionOp<"if"> {
@@ -177,7 +169,7 @@ def HCFront_ForOp : HCFront_RegionOp<"for"> {
 
 def HCFront_ReturnOp : HCFront_Op<"return"> {
   let arguments = (ins Variadic<HCFront_ValueType>:$values);
-  let assemblyFormat = "($values^ `:` type($values))? attr-dict";
+  let assemblyFormat = "($values^)? attr-dict";
 }
 
 def HCFront_SubgroupRegionOp : HCFront_RegionOp<"subgroup_region"> {

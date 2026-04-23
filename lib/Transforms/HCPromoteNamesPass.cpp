@@ -317,6 +317,13 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   // read-only snapshot name as its outer-scope snap value. A `hc.assign`
   // encountered during the scan overwrites the binding; the yield
   // rebuild picks up whatever the last write left.
+  //
+  // `binding` is seeded with `readSet ∪ writeSet`, which by construction
+  // covers every top-level `hc.name_load` in `body`, so the scan cannot
+  // emit the reaching-def diagnostic here. A `failure()` return would
+  // indicate a post-order invariant break (inner NameStoreRegionOpInterface
+  // op not yet promoted) — `scanAndPromoteBlock`'s stale-op check is
+  // the explicit backstop for that.
   llvm::StringMap<Value> binding;
   for (StringAttr name : snapshot)
     binding[name.getValue()] = snapValues[name];
@@ -420,6 +427,12 @@ static LogicalResult promoteIf(HCIfOp op) {
   else if (!carried.empty())
     newOp.getElseRegion().emplaceBlock();
 
+  // Per-branch scan. `binding` is seeded from the shared `snapshot`
+  // set, which includes every in-branch read (see the `snapshot`
+  // construction above), so `scanAndPromoteBlock` cannot hit the
+  // reaching-def diagnostic for either branch. A `failure()` here
+  // would mean a post-order invariant break — treated as a bug via
+  // the stale-op check inside the scan.
   auto processBranch = [&](Block &block) -> LogicalResult {
     llvm::StringMap<Value> binding;
     for (StringAttr name : snapshot)
@@ -457,7 +470,18 @@ static LogicalResult promoteIf(HCIfOp op) {
 // region op's insertion point, which the outer flat sweep then
 // resolves against the outer name store. Propagating a write back to
 // the outer scope needs an ODS-level result extension on these ops
-// — tracked as a follow-up bead.
+// — tracked in bead 5-2lf.
+//
+// Shape differs from `promoteForRange` / `promoteIf` on purpose:
+// those are **transparent** carriers (names flow in AND out via
+// iter_args / results), so their shape is "snapshot → scan → rebuild
+// with carriers → writeback". These are **barriers** in the
+// write-out direction (5-2lf will flip that for an explicit result
+// list), so their shape collapses to "scan with capture factory";
+// there's nothing to carry out yet, hence no rebuild and no
+// writeback. When 5-2lf lands, the shape here should converge with
+// the for/if path by reusing `writebackCarriedResults` for the new
+// result list.
 //
 // By the time we reach here, the post-order walk has already promoted
 // every inner NameStoreRegionOpInterface op; their transient
@@ -481,6 +505,15 @@ static LogicalResult promoteNestedScope(Operation *op) {
   return scanAndPromoteBlock(body.front(), binding, capture);
 }
 
+// Per-op-kind dispatch. The `NameStoreRegionOpInterface` marker is
+// deliberately method-free: each op kind has a genuinely distinct
+// promotion shape (iter_args for `for_range`, results for `if`,
+// capture-only for the nested scopes), so hoisting the policy into
+// interface methods would fragment the algorithm across ODS. Policy
+// lives here; the interface just lists who opts in. A new op joining
+// the interface needs a matching `promoteXxx` helper plus one more
+// case below — the stale-interface diagnostic in `scanAndPromoteBlock`
+// exists to catch anyone who forgets the second half.
 static LogicalResult promoteRegionOp(Operation *op) {
   if (auto forOp = dyn_cast<HCForRangeOp>(op))
     return promoteForRange(forOp);

@@ -6,6 +6,7 @@
 #define HC_IR_HCOPS_H
 
 #include "hc/IR/HCAttrs.h"
+#include "hc/IR/HCOpsInterfaces.h"
 #include "hc/IR/HCTypes.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"

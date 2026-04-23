@@ -2,29 +2,24 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-add_mlir_dialect_library(MLIRHCDialect
-  HCAttrs.cpp
-  HCDialect.cpp
-  HCOps.cpp
-  HCSymbols.cpp
-  HCTypes.cpp
+add_mlir_library(MLIRHCTransforms
+  HCPromoteNamesPass.cpp
 
   ADDITIONAL_HEADER_DIRS
-  ${PROJECT_SOURCE_DIR}/include/hc/IR
+  ${PROJECT_SOURCE_DIR}/include/hc/Transforms
 
   DEPENDS
-  MLIRHCAttrsIncGen
-  MLIRHCOpsIncGen
-  MLIRHCOpsInterfacesIncGen
-  MLIRHCTypesIncGen
+  MLIRHCTransformsPassIncGen
 
   LINK_LIBS PUBLIC
-  HCIXSimpl
+  MLIRHCDialect
   MLIRIR
+  MLIRPass
+  MLIRSupport
 )
 
 target_include_directories(
-  MLIRHCDialect
+  MLIRHCTransforms
   PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>

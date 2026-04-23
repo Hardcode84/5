@@ -5,6 +5,7 @@
 #ifndef HC_IR_HCOPS
 #define HC_IR_HCOPS
 
+include "hc/IR/HCOpsInterfaces.td"
 include "hc/IR/HCTypes.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/CommonTypeConstraints.td"
@@ -103,7 +104,8 @@ def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
   let hasVerifier = 1;
 }
 
-def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region"> {
+def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
+    [NameStoreRegionOpInterface]> {
   let summary = "Semantic subgroup region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
   let regions = (region SizedRegion<1>:$body);
@@ -111,7 +113,8 @@ def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region"> {
       "(`captures` `=` $captures^)? attr-dict-with-keyword $body";
 }
 
-def HCWorkitemRegionOp : HC_RegionOp<"workitem_region"> {
+def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
+    [NameStoreRegionOpInterface]> {
   let summary = "Semantic workitem region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
   let regions = (region SizedRegion<1>:$body);
@@ -316,7 +319,8 @@ def HCYieldOp : HC_Op<"yield",
 }
 
 def HCForRangeOp : HC_Op<"for_range",
-    [SingleBlockImplicitTerminator<"HCYieldOp">]> {
+    [SingleBlockImplicitTerminator<"HCYieldOp">,
+     NameStoreRegionOpInterface]> {
   let summary = "Structured for-range loop over symbolic bounds.";
   let description = [{
     Parallels `scf.for`. Operands are typed `HC_ValueType` so the op is
@@ -346,7 +350,8 @@ def HCForRangeOp : HC_Op<"for_range",
 }
 
 def HCIfOp : HC_Op<"if",
-    [SingleBlockImplicitTerminator<"HCYieldOp">]> {
+    [SingleBlockImplicitTerminator<"HCYieldOp">,
+     NameStoreRegionOpInterface]> {
   let summary = "Structured conditional with optional else region.";
   let description = [{
     Parallels `scf.if`. The condition is any `HC_ValueType` (typically an

@@ -15,6 +15,8 @@
 using namespace mlir;
 using namespace mlir::hc;
 
+#include "hc/IR/HCOpsInterfaces.cpp.inc"
+
 #define GET_OP_CLASSES
 #include "hc/IR/HCOps.cpp.inc"
 

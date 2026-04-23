@@ -2,6 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+set(LLVM_TARGET_DEFINITIONS HCOpsInterfaces.td)
+mlir_tablegen(HCOpsInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(HCOpsInterfaces.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(MLIRHCOpsInterfacesIncGen)
+
 add_mlir_dialect(HCOps hc)
 
 set(LLVM_TARGET_DEFINITIONS HCAttrs.td)

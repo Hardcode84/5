@@ -231,34 +231,313 @@ own:
 * intrinsic contracts,
 * specialization and launch/resource validation hooks.
 
-### Current `hc` type strategy
+### Progressive typing in `hc`
 
-The current semantic dialect exposes:
+`hc_front → hc` is a mechanical structural rewrite. It does not perform type,
+shape, dtype, or symbol inference. Every SSA value it produces is typed
+`!hc.undef` unless a concrete type is trivially evident (e.g. from a buffer
+parameter annotation).
 
-* `!hc.buffer<...>`
-* `!hc.tensor<...>`
-* builtin scalar/index types where appropriate
+A later inference pipeline — type propagation through control flow, symbol
+synthesis for launch-geometry outputs and loop induction variables, constraint
+binding — refines `!hc.undef` into concrete semantic types. Types form a
+refinement lattice:
 
-The current symbolic surface for those types lives in attrs such as:
+```
+!hc.undef
+  → !hc.idx                                                   (is an index)
+  → !hc.idx<#hc.expr<"...">>                                  (index + expression)
+  → !hc.pred                                                  (is a boolean)
+  → !hc.pred<#hc.pred<"...">>                                 (boolean + expression)
+  → !hc.tensor<elem, #hc.shape<...>>                          (tensor, possibly partial)
+  → !hc.vector<elem, #hc.shape<...>>                          (vector, possibly partial)
+  → !hc.buffer<elem, #hc.shape<...>>                          (buffer)
+  → builtin index / i* / f* / tensor<…> / vector<…>           (post-lowering)
+```
 
-* `#hc.expr<...>`
-* `#hc.pred<...>`
-* `#hc.shape<[...]>`
-* `#hc.constraints<[...]>`
+Boundaries between refinement levels are crossed with casts:
 
-### Current `hc` operation set
+* **`unrealized_conversion_cast`** (MLIR builtin) — used by compiler-internal
+  progressive-conversion passes to bridge type changes that later passes are
+  expected to resolve. These casts are transient scaffolding.
+* **`hc.cast`** — user-visible type conversion matching source-level constructs
+  like `astype(np.float32)`, explicit layout changes, and the occasional
+  `!hc.idx → index` materialization at the boundary where the symbolic domain
+  ends. These casts persist until a lowering pattern consumes them.
 
-The current semantic dialect includes:
+### `hc` type strategy
 
-* `hc.kernel`
-* `hc.func`
-* `hc.subgroup_region`
-* `hc.workitem_region`
-* `hc.return`
+Semantic dialect types:
 
-That is intentionally only the initial semantic shell. Data movement, layout,
-masking, intrinsic, and tensor/vector execution ops should be added later as
-the `hc_front` to `hc` legalization pipeline grows.
+* `!hc.undef` — inference has not yet pinned this value
+* `!hc.idx` — an index-kind value; symbolic expression parameter optional
+  (`!hc.idx<#hc.expr<"_gid0 * 16">>` when pinned). Type uniquing across
+  ixsimpl-canonicalized `#hc.expr` gives free expression equality.
+* `!hc.pred` — a boolean-kind value; symbolic predicate parameter optional
+  (`!hc.pred<#hc.pred<"_gid0 < M">>` when pinned)
+* `!hc.buffer<elem, #hc.shape<...>>` — externally visible buffer
+* `!hc.tensor<elem, #hc.shape<...>>` — workgroup-local tensor
+* `!hc.vector<elem, #hc.shape<...>>` — immutable fixed-size vector, carrying
+  activity mask semantics and an optional collective-return suffix
+* `!hc.slice` — first-class slice value with optional low/high/step, built by
+  `hc.slice_expr` and consumed by load/store/subscript
+* builtin `index`, `i*`, `f*` are first-class operand/result types of the
+  generic arithmetic ops and coexist with `hc` types without forced casting
+
+Generic ops use an `HC_ValueType` constraint defined as an `AnyOf<[…]>` over
+every type listed above — simpler than a type interface and enough for v0.
+
+Symbolic surface attributes:
+
+* `#hc.expr<...>` — scalar symbolic expression
+* `#hc.pred<...>` — symbolic predicate
+* `#hc.shape<[...]>` — list of `#hc.expr` dims
+* `#hc.constraints<[...]>` — set of `#hc.pred`
+* `#hc.symbol<"name">` — reference to a symbol by name (used by `hc.symbol`)
+* `#hc.scope<"WorkGroup" | "SubGroup" | "WorkItem">` — scope for
+  `hc.func`/`hc.intrinsic`
+* `#hc.effects<"pure" | "read" | "write" | "readwrite">` — intrinsic effect
+  class
+* `#hc.layout<...>` — reserved for `index_map(...)` descriptors; unused in v0
+
+### `hc` operation set
+
+Only `hc.kernel`, `hc.func`, `hc.subgroup_region`, `hc.workitem_region`, and
+`hc.return` are currently implemented; the rest is the sketch the first
+non-trivial kernel (a gfx11 WMMA matmul, see below) demands.
+
+Every op below accepts `!hc.undef` operands so the mechanical `hc_front → hc`
+pass can emit them without doing inference work. Verifiers tighten as types
+refine; folders dispatch on the concrete-type combinations they recognize.
+
+#### Declarations and regions
+
+* `hc.kernel` — symbolic launch geometry, parameter annotations, literal-symbol
+  set
+* `hc.func` — helper function with explicit scope
+* `hc.intrinsic` — intrinsic declaration with scope, effects, and required-const
+  kwarg set; optional region for the fallback body
+* `hc.subgroup_region`, `hc.workitem_region` — collective regions with
+  syntactic capture lists
+
+#### Terminators
+
+* `hc.return` — kernel/func/intrinsic terminator
+* `hc.yield` — block terminator for `hc.for_range` / `hc.if` and other
+  structured-value ops
+
+#### Structured control flow
+
+* `hc.for_range %lo to %hi step %step iter_args (...)` — semantic loop matching
+  `for i in range(...)`. Induction variable is typed `!hc.undef` out of the
+  frontend pass; inference pins it to `!hc.idx<_symN>` with a constraint that
+  `_symN` lies in `[lo, hi)` at step `step`.
+* `hc.if %pred ... else ...` — reserved; appears once the first kernel uses
+  conditionals. Condition is an `HC_ValueType` and may be `!hc.undef`,
+  `!hc.pred[<P>]`, `i1`, or a boolean tensor/vector.
+
+#### Scalars, captures, and launch geometry
+
+* `hc.const <value>` — binds a literal-bound Python capture (e.g.
+  `WMMA_M = 16`) to a scalar SSA value; result is `!hc.undef` from the
+  frontend pass and refines to `!hc.idx<value>` / `i64` / `f32` / … during
+  inference
+* `hc.symbol #hc.symbol<"name">` — binds a symbolic capture (e.g.
+  `M = sym.M`); refines to `!hc.idx<#hc.expr<"M">>`
+* `hc.group_id`, `hc.local_id`, `hc.subgroup_id`, `hc.group_shape`,
+  `hc.group_size`, `hc.work_offset`, `hc.work_shape`, `hc.wave_size` —
+  multi-result where appropriate (one `!hc.undef` per dimension; refined to
+  `!hc.idx<_symN>` with fresh per-launch symbols at inference time). Marked
+  `Pure + MemoryEffects<[]>` so CSE collapses duplicate reads.
+
+There is no `!hc.index_tuple` and no `hc.getindex`; geometry ops return
+independent SSA components.
+
+#### Generic arithmetic, comparison, boolean, and reduction ops
+
+One op per semantic notion; operand and result types are open. The same op
+covers the symbolic domain (`!hc.idx`/`!hc.pred`), builtin scalars
+(`i*`/`f*`/`index`), and tensor/vector values.
+
+* `hc.add`, `hc.sub`, `hc.mul`, `hc.div`, `hc.mod`, `hc.neg`
+* `hc.cmp.lt`, `hc.cmp.le`, `hc.cmp.gt`, `hc.cmp.ge`, `hc.cmp.eq`, `hc.cmp.ne`
+* `hc.and`, `hc.or`, `hc.not`
+* `hc.matmul`
+* `hc.reduce {kind = "sum" | "max" | "min", axis, keepdims}`
+* `hc.astype` — explicit numeric conversion; lowers via `hc.cast`
+
+Folders dispatch on concrete-type combinations:
+
+* both operands `!hc.idx<E1>` / `!hc.idx<E2>` → result `!hc.idx<simplify(op(E1, E2))>`
+  computed via ixsimpl at op construction time
+* both operands constant builtin scalars → constant fold
+* otherwise no fold
+
+Comparison result typing:
+
+* `!hc.idx<A> cmp.lt !hc.idx<B>` → `!hc.pred<#hc.pred<"A < B">>` when ixsimpl
+  can form the predicate
+* builtin scalar operands → `i1`
+* tensor/vector operands → `!hc.tensor<i1, S>` / `!hc.vector<i1, S>` with
+  ordinary broadcast rules
+* any `!hc.undef` operand → `!hc.undef`
+
+#### Casts
+
+* `hc.cast %x : SrcT -> DstT` — user-visible conversion. Covers `astype`,
+  layout changes on vectors, and the symbolic-to-builtin exit
+  (`!hc.idx<E> -> index`). Canonicalization drops identity and
+  refinement-erasing casts; lowering patterns consume the rest.
+* `unrealized_conversion_cast` (MLIR builtin) — compiler-internal boundary
+  between progressive-conversion passes; always transient.
+
+#### Buffer views and subscript construction
+
+* `hc.buffer_dim %buf, axis = N` — symbolic dimension (matches `a.shape[1]`);
+  refines to `!hc.idx<dim_N_expr>`
+* `hc.slice_expr %lo?, %hi?, %step?` — builds an `!hc.slice`;
+  `has_lower`/`has_upper`/`has_step` attrs mark which operands are present,
+  mirroring `hc_front.slice`
+* `hc.buffer_view %buf[%idx...]` — sub-buffer with the slice-reduced shape,
+  for cases that do not require data movement
+
+Multi-axis subscripts on `hc.load`/`hc.store`/`hc.buffer_view` take variadic
+operands directly; there is no separate tuple-construction op.
+
+#### Data movement
+
+* `hc.load %buf[%idx...] shape = ...` — buffer → tensor
+* `hc.vload %src[%idx...] shape = ...` — buffer/tensor → vector
+* `hc.store %dst[%idx...], %src` — tensor or vector source
+* `hc.vec %t` — tensor → vector
+* `hc.with_inactive %v {value = ...}` — replace inactive elements
+* `hc.as_layout %v {layout = ...}` — change layout
+* `hc.vzeros`, `hc.vones`, `hc.vfull` — vector allocators (any scope)
+* `hc.zeros`, `hc.ones`, `hc.full`, `hc.empty` — tensor allocators
+  (`WorkGroup` scope only)
+
+#### Calls
+
+* `hc.call @name(...)` — call into an `hc.func`
+* `hc.call_intrinsic @name(...) { const_attr = ... }` — call into an
+  `hc.intrinsic`, with specialization-required keyword arguments pinned as op
+  attributes rather than SSA operands
+
+### Example: gfx11 WMMA kernel at two pipeline stages
+
+The example `examples/amdgpu_gfx11_wmma_matmul.py` is the shape-first
+integration target. Two snapshots are shown: immediately after `hc_front → hc`
+(all `!hc.undef`, generic ops, no inference), and after type / symbol
+inference.
+
+#### After `hc_front → hc` (mechanical, all `!hc.undef`)
+
+```mlir
+hc.kernel @tiled_gfx11_wmma_matmul attributes {
+  work_shape    = #hc.shape<["ceil_div(M, 16) * 32", "ceil_div(N, 16)"]>,
+  group_shape   = #hc.shape<["32", "1"]>,
+  subgroup_size = 32 : i32,
+  literals      = ["WMMA_M", "WMMA_N", "WMMA_K", "WAVE_LANES"]
+} (%group, %a, %b, %c) {
+  %c0 = hc.const <0 : i64>  : !hc.undef
+  %WM = hc.const <16 : i64> : !hc.undef
+  %WK = hc.const <16 : i64> : !hc.undef
+
+  %gr, %gc = hc.group_id %group       : (!hc.undef, !hc.undef)
+  %row0    = hc.mul %gr, %WM           : !hc.undef
+  %col0    = hc.mul %gc, %WM           : !hc.undef
+
+  %a_k     = hc.buffer_dim %a, axis = 1 : !hc.undef
+  %acc0    = hc.call @init_wmma_acc(%group) : (!hc.undef) -> !hc.undef
+
+  %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK
+                            iter_args (%acc = %acc0) : !hc.undef {
+    %row_hi = hc.add %row0, %WM : !hc.undef
+    %col_hi = hc.add %k0,   %WK : !hc.undef
+    %row_sl = hc.slice_expr %row0, %row_hi : !hc.undef
+    %col_sl = hc.slice_expr %k0,   %col_hi : !hc.undef
+    %a_tile = hc.load %a[%row_sl, %col_sl]
+                     shape = #hc.shape<["WMMA_M", "WMMA_K"]>
+              : !hc.undef
+    // …analogous slice + load for b_tile…
+    %acc1   = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
+              : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+    hc.yield %acc1 : !hc.undef
+  }
+
+  hc.call @store_wmma_tile(%group, %c, %row0, %col0, %acc_final)
+      : (!hc.undef, !hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
+}
+```
+
+Every op is structural, no semantic checks yet. The pass is a tree rewrite
+over `hc_front` with no per-op inference work.
+
+#### After type / symbol inference
+
+```mlir
+hc.intrinsic @wmma_gfx11 attributes {
+  scope = #hc.scope<"WorkItem">, effects = #hc.effects<"pure">,
+  const_attrs = ["wave_size", "arch"]
+} (%group, %a_tile, %b_tile, %a_frag, %b_frag, %acc_frag)
+  -> !hc.vector<f32, #hc.shape<["WMMA_ACC_FRAGMENT"]>>
+
+hc.func @init_wmma_acc   attributes {scope = #hc.scope<"WorkGroup">} (...)
+hc.func @issue_wmma_tile attributes {scope = #hc.scope<"WorkGroup">} (...)
+hc.func @store_wmma_tile attributes {scope = #hc.scope<"WorkGroup">} (...)
+
+hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
+          (%group, %a, %b, %c) {
+  %c0  = hc.const <0>  : !hc.idx<0>
+  %WM  = hc.const <16> : !hc.idx<16>
+  %WK  = hc.const <16> : !hc.idx<16>
+
+  %gr, %gc = hc.group_id %group            // : (!hc.idx<_gid0>, !hc.idx<_gid1>)
+  %row0    = hc.mul %gr, %WM               // : !hc.idx<_gid0 * 16>
+  %col0    = hc.mul %gc, %WM               // : !hc.idx<_gid1 * 16>
+
+  %a_k     = hc.buffer_dim %a, axis = 1    // : !hc.idx<K>
+  %acc0    = hc.call @init_wmma_acc(%group)
+                 : (!hc.buffer<f16, #hc.shape<["M","K"]>>)
+                -> !hc.vector<f32, #hc.shape<["WMMA_ACC_FRAGMENT","32","1"]>>
+
+  %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK    // %k0 : !hc.idx<_k0>
+                            iter_args (%acc = %acc0) {
+    %row_hi = hc.add %row0, %WM            // : !hc.idx<_gid0 * 16 + 16>
+    %col_hi = hc.add %k0,   %WK            // : !hc.idx<_k0 + 16>
+    %row_sl = hc.slice_expr %row0, %row_hi : !hc.slice
+    %col_sl = hc.slice_expr %k0,   %col_hi : !hc.slice
+    %a_tile = hc.load %a[%row_sl, %col_sl]
+                shape = #hc.shape<["WMMA_M", "WMMA_K"]>
+              : !hc.tensor<f16, #hc.shape<["WMMA_M","WMMA_K"]>>
+    // ...
+    %acc1 = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
+    hc.yield %acc1
+  }
+
+  hc.call @store_wmma_tile(%group, %c, %row0, %col0, %acc_final)
+}
+```
+
+Same op shape, refined types. The `%row_hi - %row0 = 16` kind of derivation
+used by `hc.load` shape verification is now a plain ixsimpl query on the
+typed expressions.
+
+Notes on the legalization contract these sketches assume:
+
+* Python helpers that are not decorated with `@kernel.func`/`@kernel.intrinsic`
+  (e.g. `_tile_origin`) must be resolved during legalization — either inlined
+  against their captured constants or rejected. They never become `hc.call`s.
+* `range(lo, hi, step)` is matched into the operands of `hc.for_range` rather
+  than becoming a first-class `hc.range` op.
+* `ceil_div(M, WMMA_M) * WAVE_LANES` in `work_shape=` lives on the decorator;
+  the resolved symbolic expression becomes a `#hc.shape` attribute on
+  `hc.kernel`, not an SSA chain.
+* All names from `hc_front.name` are eliminated during SSA construction.
+  Literal-bound captures become `hc.const`, symbolic captures become
+  `hc.symbol`, loop-carried state becomes `hc.for_range` iter args, and
+  region-captured values become explicit captures on `hc.subgroup_region` /
+  `hc.workitem_region`.
 
 ## Compile-time and launch-time ownership
 

@@ -783,14 +783,21 @@ def HCAssignOp : HC_Op<"assign", [MemoryEffects<[MemWrite]>]> {
     a direct SSA use (or into an iter_arg / block arg manufactured for
     the enclosing region op).
 
-    Carries `MemWrite` on `DefaultResource` to match `hc.store`'s shape
-    and to block CSE / reorder with sibling `hc.assign` / `hc.name_load`
-    / side-effecting ops. DCE leaves it alone because writes with no
-    uses are still observable. Aliasing is necessarily pessimistic
-    against real memory ops — a dedicated `NameStoreResource` would
-    tighten that if a later pass ever wants the precision, but these
-    ops are transient (erased by `-hc-promote-names`) so it is not
-    worth paying for today.
+    Carries `MemWrite` on `DefaultResource`. The effect pairs with
+    `hc.name_load`'s `MemRead` so that effect-aware passes (`-cse`,
+    speculation, LICM) see a read/write pair on the same resource and
+    keep same-name reads in program order around the assign. `MemWrite`
+    does not drive DCE — writes are never trivially dead even with no
+    SSA result — so as far as DCE is concerned the trait is bookkeeping;
+    the symmetry with `hc.store` is cosmetic but keeps the pair easy
+    to pattern on.
+
+    Aliasing against real buffer traffic (`hc.load` / `hc.store`) is
+    necessarily pessimistic: we reuse `DefaultResource` rather than
+    declaring a dedicated name-store resource kind. That is safe for
+    these transient ops; if a later pass wants to hoist across
+    name-store boundaries, a dedicated resource is the documented
+    escape hatch.
 
     Cross-kernel / cross-function name capture is out of scope: each
     `hc.kernel` / `hc.func` owns its own name store, and promotion
@@ -810,14 +817,18 @@ def HCNameLoadOp : HC_Op<"name_load", [MemoryEffects<[MemRead]>]> {
     (the nearest dominating `hc.assign`, or a new block/iter arg when
     the reach crosses a region boundary) and erases the load.
 
-    Carries `MemRead` on `DefaultResource`. The effect is load-bearing:
-    CSE skips the op (two loads of the same name straddling an
-    `hc.assign` can observe different values), but MLIR's
-    `wouldOpBeTriviallyDead` treats a read-only op with no uses as dead,
-    so an unused `hc.name_load` is DCE'd without waiting on promotion.
-    Aliasing against real memory ops is pessimistic for the same reason
-    as `hc.assign`; same `NameStoreResource` escape hatch applies if it
-    ever matters.
+    Carries `MemRead` on `DefaultResource`. Two generic passes key off
+    this effect. Standard `-cse` skips ops whose effect list is
+    non-empty, so two `hc.name_load` ops of the same name — with or
+    without an intervening `hc.assign` — are never merged. MLIR's
+    `wouldOpBeTriviallyDead` treats a read-only op with no uses as
+    dead, so `-canonicalize` erases unused loads without waiting on
+    `-hc-promote-names`. `test/HC/name-store-effects.mlir` pins both
+    behaviours against the pinned MLIR revision.
+
+    Aliasing is pessimistic against real buffer traffic for the same
+    reason as `hc.assign`; the same escape hatch (a dedicated
+    name-store resource kind) applies if it ever matters.
   }];
   let arguments = (ins StrAttr:$name);
   let results = (outs HC_ValueType:$result);

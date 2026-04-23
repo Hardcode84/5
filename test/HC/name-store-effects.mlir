@@ -2,17 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Effect-trait behavioural coverage for `hc.assign` / `hc.name_load`.
+// Behavioral coverage for the `MemoryEffects` traits on `hc.assign` and
+// `hc.name_load`. Roundtrip / region coverage lives in
+// `test/HC/ops-name-store.mlir`; this file only asserts what the effects
+// buy us under the standard MLIR infrastructure passes.
 //
 // `hc.name_load` carries `MemRead`: loads with no uses are trivially dead
-// (MLIR's `wouldOpBeTriviallyDead` deletes read-only ops with no uses) but
-// two loads that straddle an `hc.assign` must not be CSE'd.
+// (MLIR's `wouldOpBeTriviallyDead` deletes read-only ops with no uses),
+// but standard `-cse` skips ops with non-empty effects, so two loads of
+// the same name — between or around an `hc.assign` — are never collapsed.
 //
 // `hc.assign` carries `MemWrite`: writes are never considered trivially
 // dead even when the op has no SSA result, so an assign with no follow-up
 // load still survives canonicalization.
 //
-// RUN: hc-opt -canonicalize -split-input-file %s | FileCheck %s
+// RUN: hc-opt -canonicalize -cse -split-input-file %s | FileCheck %s
 
 // An unused `hc.name_load` is deleted by canonicalize; the preceding
 // `hc.assign` stays because writes are observable.
@@ -29,10 +33,12 @@ func.func @dce_unused_load(%arg0: !hc.undef) {
 // -----
 
 // Two loads of the same name across an intervening `hc.assign` must not
-// be collapsed by CSE — they can observe different bindings. The function
-// returns both so the loads are unambiguously live.
+// be collapsed by `-cse` — they can observe different bindings. The
+// function returns both so the loads are unambiguously live.
 // CHECK-LABEL: func.func @no_cse_across_assign
-// CHECK-COUNT-2: hc.name_load "x"
+// CHECK: hc.name_load "x"
+// CHECK: hc.assign "x"
+// CHECK: hc.name_load "x"
 // CHECK: return
 func.func @no_cse_across_assign(%arg0: !hc.undef, %arg1: !hc.undef)
     -> (!hc.undef, !hc.undef) {

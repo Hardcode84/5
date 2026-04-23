@@ -17,7 +17,11 @@
 // CHECK-SAME: work_shape = ["32*ceiling(1/16*M)", "ceiling(1/16*N)"]
 // CHECK: hc_front.constant<0 : i64>
 // CHECK: hc_front.constant<1 : i64>
-// CHECK: hc_front.name "x" {ctx = "load"}
+// CHECK: hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+// CHECK: hc_front.name "k"
+// CHECK-SAME: ref = {kind = "iv"}
+// CHECK: hc_front.name "tmp"
+// CHECK-SAME: ref = {callee = "@foo", kind = "callee", scope = "WorkGroup"}
 // CHECK: hc_front.target_name "lhs"
 // CHECK: hc_front.assign
 // CHECK: hc_front.aug_assign "Add"
@@ -66,7 +70,9 @@ module {
   } {
     %c0 = hc_front.constant <0>
     %c1 = hc_front.constant <1>
-    %name = hc_front.name "x" {ctx = "load"}
+    %name = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %iv = hc_front.name "k" {ctx = "load", ref = {kind = "iv"}}
+    %callee = hc_front.name "tmp" {ctx = "load", ref = {kind = "callee", callee = "@foo", scope = "WorkGroup"}}
     %target = hc_front.target_name "lhs"
     hc_front.assign %target = %c1
     hc_front.aug_assign "Add" %target = %c1

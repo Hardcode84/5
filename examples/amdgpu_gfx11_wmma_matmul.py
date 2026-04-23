@@ -8,8 +8,9 @@ Run from the repository root with:
 
     python -m examples.amdgpu_gfx11_wmma_matmul
 
-Pass ``--dump-front-ir`` to lower the kernel through the Python frontend and
-print the resulting ``hc_front`` textual MLIR instead of running the simulator.
+Pass ``--dump-front-ir`` to lower the kernel plus its transitive decorated
+helpers through the Python frontend and print the resulting combined
+``hc_front`` textual MLIR instead of running the simulator.
 
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
@@ -331,18 +332,22 @@ def make_demo_inputs(
 
 
 def dump_front_ir() -> None:
-    """Lower the top-level kernel to ``hc_front`` MLIR and print it to stdout.
+    """Lower the kernel + its transitive deps to ``hc_front`` and print it.
 
-    Imports the frontend lazily so the simulator path stays independent of the
-    managed ``hc_mlir`` native bindings.
+    Uses the same resolver that ``hc.compile`` does so the dumped module
+    matches what downstream lowering will see — one combined module with
+    every `hc_front.name` load carrying a ``ref`` classification.
+
+    Imports the resolver lazily so the simulator path stays independent of
+    the managed ``hc_mlir`` native bindings.
     """
 
-    from hc._frontend import lower_function_to_front_ir
+    from hc._resolve import resolve_front_ir
     from hc.mlir import ir
 
     with ir.Context() as context:
-        module = lower_function_to_front_ir(tiled_gfx11_wmma_matmul, context=context)
-        print(str(module))
+        resolved = resolve_front_ir(tiled_gfx11_wmma_matmul, context=context)
+        print(str(resolved.module))
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -353,9 +358,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--dump-front-ir",
         action="store_true",
         help=(
-            "lower the kernel through the Python frontend and print the "
-            "resulting hc_front MLIR module to stdout instead of running the "
-            "simulator"
+            "lower the kernel + its transitive @kernel.func / @kernel.intrinsic "
+            "helpers into one hc_front module, resolve every name reference, "
+            "and print the MLIR to stdout instead of running the simulator"
         ),
     )
     return parser.parse_args(argv)

@@ -165,6 +165,7 @@ class HCFrontEmitter:
                 payload,
             )
             self._set_optional_string_attr(op, "ctx", payload.get("ctx"))
+            self._set_optional_ref_attr(op, payload.get("ref"))
             self._append_value(op.result)
             return
         if kind == "target_name":
@@ -684,6 +685,39 @@ class HCFrontEmitter:
                 value,
                 context=self._context,
             )
+
+    def _set_optional_ref_attr(self, op: Any, value: object) -> None:
+        # `ref` keys are always strings; values are the JSON-like leaves
+        # accepted by ``_ref_value_attr`` (str / int / bool / sequence[str]).
+        # Kinds are disambiguated by their payload shape during the
+        # hc_front -> hc pass, not inside hc_front itself.
+        if value is None:
+            return
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"expected ref dict, got {value!r}")
+        entries: list[tuple[str, Any]] = []
+        for raw_key, raw_val in value.items():
+            if not isinstance(raw_key, str):
+                raise RuntimeError(f"ref keys must be strings, got {raw_key!r}")
+            entries.append((raw_key, self._ref_value_attr(raw_val)))
+        op.operation.attributes["ref"] = ir.DictAttr.get(
+            {key: attr for key, attr in entries},
+            context=self._context,
+        )
+
+    def _ref_value_attr(self, value: object) -> Any:
+        if isinstance(value, str):
+            return self._string_attr(value)
+        if isinstance(value, bool) or isinstance(value, int):
+            # Drop bools together with ints — both serialize via i64 so the
+            # pass gets stable numeric payloads.
+            return ir.IntegerAttr.get(
+                ir.IntegerType.get_signless(64, context=self._context),
+                int(value),
+            )
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+            return self._string_array_attr(self._string_sequence(value))
+        raise RuntimeError(f"unsupported ref payload value {value!r}")
 
     def _set_optional_string_array_attr(
         self,

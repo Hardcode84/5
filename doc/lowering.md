@@ -700,6 +700,27 @@ unbound literals stay symbolic and later stages refine them. Bindings are
 recorded on the handle for later stages to consume; the frontend-only
 stage leaves `front_ir` purely symbolic regardless of what is passed.
 
+`hc.compile` does not lower a single function in isolation. Starting from
+`kernel_fn`, the driver transitively walks every `@kernel.func` /
+`@kernel.intrinsic` reachable through globals and closures and lowers the
+closed set into one combined `hc_front` module — kernel first, helpers and
+intrinsics in discovery order. The handle exposes the resulting symbol
+names via `front_ir_symbols` so downstream tooling can enumerate the dep
+set without re-parsing.
+
+Every load-context `hc_front.name` in that module carries a `ref` DictAttr
+classifying the identifier so the `hc_front -> hc` pass can dispatch in
+MLIR without reaching back into Python state. The kinds recognized on
+names are `param`, `iv`, `local` (stamped by the frontend from scope
+state), `constant`, `symbol` (captured `hc.symbols.Symbol`), `callee`
+(`@kernel.func` helper), `intrinsic` (`@kernel.intrinsic`), `inline`
+(undecorated Python helper), `builtin` (`range`, `len`, ...), and `module`
+(whole-module alias, currently `numpy` only). Attribute accesses
+(`hc_front.attr`) carry `dsl_method` when rooted in a param/iv/local,
+`numpy_dtype_type` when rooted in the numpy module and naming a scalar
+dtype, or `numpy_attr` for any other numpy access. Unresolvable name loads
+surface as a frontend error pointing at the file and line.
+
 Compile-time MLIR should operate primarily on symbolic launch parameters and
 kernel structure. Concrete buffer shapes, launch shapes, and device limits
 enter only when the launcher supplies them to specialization or launch

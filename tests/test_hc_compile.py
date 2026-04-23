@@ -277,3 +277,53 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 
     result = _run_compile_smoke(script)
     assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> None:
+    # End-to-end assertion that what the resolver stamps flows through
+    # ``hc.compile``: ``front_ir_symbols`` exposes the closed dep set and
+    # every load-context ``hc_front.name`` carries a ``ref`` attribute.
+    # The real WMMA example is the richest fixture we have for this check.
+    script = tmp_path / "compile_wmma.py"
+    script.write_text(
+        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
+            import re
+
+            import hc
+            from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
+
+
+            def main() -> None:
+                handle = hc.compile(tiled_gfx11_wmma_matmul)
+                expected = {
+                    "tiled_gfx11_wmma_matmul",
+                    "init_wmma_acc",
+                    "issue_wmma_tile",
+                    "store_wmma_tile",
+                    "load_wmma_a_fragment",
+                    "load_wmma_b_fragment",
+                    "wmma_gfx11",
+                }
+                assert set(handle.front_ir_symbols) == expected, (
+                    handle.front_ir_symbols
+                )
+                assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
+
+                loads = re.findall(
+                    r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',
+                    handle.front_ir_text,
+                )
+                assert loads, "expected at least one load-context name op"
+                for line in loads:
+                    assert "ref = {" in line, line
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """)
+    )
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout

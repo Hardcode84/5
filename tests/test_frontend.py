@@ -414,6 +414,65 @@ def test_region_capture_list_ignores_region_locals_and_builtins() -> None:
     assert _payloads(emitter, "workitem_region_begin")[0]["captures"] == ("acc",)
 
 
+def test_name_load_payloads_classify_param_iv_local() -> None:
+    # Covers the three frontend-owned ref kinds at once: ``x`` is a param,
+    # ``k`` is an iv, ``tmp`` is a local. Captures + builtins are left
+    # unclassified for the driver to fill in.
+    emitter = RecordingEmitter()
+    source = """
+@kernel(work_shape=(4,), group_shape=(4,))
+def demo(group, x):
+    tmp = x
+    for k in range(1):
+        tmp = tmp + k + CONST
+    return tmp
+"""
+
+    lower_source(source, emitter, filename="demo.py")
+
+    kinds_by_name: dict[str, set[str | None]] = {}
+    for event in emitter.events:
+        if event.kind != "name":
+            continue
+        if event.payload.get("ctx") != "load":
+            continue
+        ident = event.payload["id"]
+        ref = event.payload.get("ref")
+        kind = ref["kind"] if isinstance(ref, dict) else None
+        kinds_by_name.setdefault(ident, set()).add(kind)
+
+    assert kinds_by_name["x"] == {"param"}
+    assert kinds_by_name["k"] == {"iv"}
+    assert kinds_by_name["tmp"] == {"local"}
+    # Unresolved captures — the driver fills in ``builtin`` / ``constant``.
+    assert kinds_by_name["range"] == {None}
+    assert kinds_by_name["CONST"] == {None}
+
+
+def test_name_store_payloads_skip_ref() -> None:
+    # Store-context names become ``target_name`` ops; the plain ``name`` op
+    # only covers loads, so the ref classification shouldn't leak onto
+    # stores even when the identifier happens to shadow a param.
+    emitter = RecordingEmitter()
+    source = """
+@kernel(work_shape=(4,), group_shape=(4,))
+def demo(group, x):
+    x = x + 1
+    return x
+"""
+
+    lower_source(source, emitter, filename="demo.py")
+
+    name_events = [event for event in emitter.events if event.kind == "name"]
+    assert all("ref" in event.payload for event in name_events), name_events
+    # No ``ref`` leaks onto ``target_name`` events, those have their own
+    # payload shape because storing into a name doesn't resolve against the
+    # function's scope the same way a load does.
+    target_events = [event for event in emitter.events if event.kind == "target_name"]
+    assert target_events
+    assert all("ref" not in event.payload for event in target_events)
+
+
 def test_lower_function_reports_file_relative_diagnostics() -> None:
     emitter = RecordingEmitter()
 

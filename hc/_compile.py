@@ -15,7 +15,7 @@ frontend itself emits purely symbolic IR either way.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .core import KernelMetadata
@@ -29,6 +29,7 @@ class CompiledKernel:
     bindings: Mapping[str, int]
     front_ir: Any
     front_ir_text: str
+    front_ir_symbols: tuple[str, ...] = field(default=())
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
@@ -74,16 +75,18 @@ def compile(
 
     bindings = _normalise_bindings(symbols, metadata)
 
-    # Lazy import: the frontend pulls in the native MLIR bindings, which
+    # Lazy import: the resolver pulls in the native MLIR bindings, which
     # simulator-only callers should not have to install.
-    from ._frontend import lower_function_to_front_ir
+    from ._resolve import resolve_front_ir
 
-    module = lower_function_to_front_ir(kernel_fn)
+    resolved = resolve_front_ir(kernel_fn)
+    module = resolved.module
     return CompiledKernel(
         kernel=kernel_fn,
         bindings=bindings,
         front_ir=module,
         front_ir_text=str(module),
+        front_ir_symbols=resolved.symbol_names,
     )
 
 

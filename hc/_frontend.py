@@ -31,6 +31,7 @@ __all__ = [
     "RecordingEmitter",
     "lower_function",
     "lower_function_to_front_ir",
+    "lower_functions_to_front_ir",
     "lower_module",
     "lower_module_to_front_ir",
     "lower_source",
@@ -261,6 +262,42 @@ def lower_module_to_front_ir(
     return emitter.module
 
 
+def lower_functions_to_front_ir(
+    fns: Sequence[Any],
+    *,
+    context: Any | None = None,
+    filename: str | None = None,
+) -> Any:
+    """Lower several decorated Python functions into one shared `hc_front` module.
+
+    Each function is re-parsed from its source and emitted as a separate top-
+    level op (`hc_front.kernel` / `hc_front.func` / `hc_front.intrinsic`) in
+    the returned module. The driver uses this to package a kernel together
+    with every `@kernel.func` / `@kernel.intrinsic` it transitively invokes.
+    """
+
+    if not fns:
+        raise ValueError("lower_functions_to_front_ir requires at least one function")
+    emitter = _new_hc_front_emitter(context=context)
+    module_filename = filename
+    if module_filename is None:
+        module_filename = _source_buffer_from_function(fns[0]).filename
+    emitter.begin_module(filename=module_filename)
+    for fn in fns:
+        source = _source_buffer_from_function(fn)
+        module = _parse_source(source)
+        try:
+            _FrontendLowerer(
+                emitter=emitter,
+                source=source,
+                toplevel_overrides=_function_overrides(fn),
+            ).lower_module_body(module)
+        except _FrontendEmitError as exc:
+            raise _frontend_emit_error(source, exc) from exc
+    emitter.end_module()
+    return emitter.module
+
+
 def _new_hc_front_emitter(*, context: Any | None = None) -> Any:
     from ._frontend_mlir import HCFrontEmitter
 
@@ -295,6 +332,7 @@ class _FrontendLowerer:
         self._emitter = emitter
         self._source = source
         self._binding_stack: list[frozenset[str]] = []
+        self._scope_stack: list[_RegionScope] = []
         # ``lower_function`` threads decorator metadata + resolved annotations
         # here; source-only entry points pass ``None``.
         self._toplevel_overrides: Mapping[str, Mapping[str, object]] = (
@@ -303,9 +341,15 @@ class _FrontendLowerer:
 
     def lower_module(self, module: ast.Module) -> None:
         self._emitter.begin_module(filename=self._source.filename)
+        self.lower_module_body(module)
+        self._emitter.end_module()
+
+    def lower_module_body(self, module: ast.Module) -> None:
+        # Split out from ``lower_module`` so ``lower_functions_to_front_ir``
+        # can append several functions into one already-opened module
+        # without re-running begin_module/end_module per fn.
         for stmt in _strip_docstring(module.body):
             self._lower_toplevel(stmt)
-        self._emitter.end_module()
 
     def _lower_toplevel(self, stmt: ast.stmt) -> None:
         if isinstance(stmt, ast.AsyncFunctionDef):
@@ -469,10 +513,14 @@ class _FrontendLowerer:
 
     @_lower_expr.register
     def _lower_name_expr(self, expr: ast.Name) -> None:
-        self._emitter.emit_op(
-            "name",
-            **_node_payload(expr, id=expr.id, ctx=_expr_context_name(expr.ctx)),
-        )
+        payload = _node_payload(expr, id=expr.id, ctx=_expr_context_name(expr.ctx))
+        # Only stamp refs on loads; stores/deletes become `hc_front.target_name`,
+        # whose classification is implicit in the containing assignment.
+        if isinstance(expr.ctx, ast.Load):
+            ref = self._classify_name(expr.id)
+            if ref is not None:
+                payload["ref"] = ref
+        self._emitter.emit_op("name", **payload)
 
     @_lower_expr.register
     def _lower_attribute_expr(self, expr: ast.Attribute) -> None:
@@ -635,9 +683,11 @@ class _FrontendLowerer:
 
     def _push_bindings(self, fn: ast.FunctionDef) -> None:
         self._binding_stack.append(_function_bindings(fn, self._source))
+        self._scope_stack.append(_region_scope(fn, self._source))
 
     def _pop_bindings(self) -> None:
         self._binding_stack.pop()
+        self._scope_stack.pop()
 
     def _visible_bindings(self) -> frozenset[str]:
         # Nested collective regions capture against every enclosing local scope,
@@ -646,6 +696,20 @@ class _FrontendLowerer:
         for frame in self._binding_stack:
             bindings.update(frame)
         return frozenset(bindings)
+
+    def _classify_name(self, name: str) -> dict[str, object] | None:
+        # Walk innermost -> outermost: an outer ``local`` that gets captured
+        # into an inner region is still semantically "a value flowing in via
+        # SSA" to that region, but for diagnostics we want the innermost
+        # matching kind first.
+        for scope in reversed(self._scope_stack):
+            if name in scope.params:
+                return {"kind": "param"}
+            if name in scope.for_ivs:
+                return {"kind": "iv"}
+            if name in scope.locals:
+                return {"kind": "local"}
+        return None
 
     def _error(self, message: str, node: ast.AST) -> FrontendError:
         return _frontend_error(self._source, message, node)
@@ -1196,6 +1260,74 @@ def _function_bindings(
         collector.bind(name)
     collector.visit_block(fn.body)
     return frozenset(collector.names)
+
+
+@dataclass(frozen=True)
+class _RegionScope:
+    """Partitioned view of a region's own bindings, used to stamp name refs.
+
+    Outer-scope captures are intentionally not tracked here: the innermost
+    match wins during classification, and a captured name in an inner region
+    resolves against an outer ``_RegionScope`` frame.
+    """
+
+    params: frozenset[str]
+    for_ivs: frozenset[str]
+    locals: frozenset[str]
+
+
+def _region_scope(fn: ast.FunctionDef, source: _SourceBuffer) -> _RegionScope:
+    params = frozenset(name for name, _ in _parameter_records(fn.args, source))
+    iv_collector = _ForIVCollector()
+    iv_collector.visit_block(fn.body)
+    for_ivs = frozenset(iv_collector.names) - params
+    body = _BindingCollector()
+    body.visit_block(fn.body)
+    locals_ = frozenset(body.names) - params - for_ivs
+    return _RegionScope(params=params, for_ivs=for_ivs, locals=locals_)
+
+
+class _ForIVCollector(ast.NodeVisitor):
+    """Pick out names bound by ``for`` targets, skipping nested function bodies."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+        self._seen: set[str] = set()
+
+    def bind(self, name: str) -> None:
+        if name not in self._seen:
+            self._seen.add(name)
+            self.names.append(name)
+
+    def visit_block(self, body: Sequence[ast.stmt]) -> None:
+        for stmt in _strip_docstring(list(body)):
+            self.visit(stmt)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._visit_target(node.target)
+        self.visit_block(node.body)
+        self.visit_block(node.orelse)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit_block(node.body)
+        self.visit_block(node.orelse)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return  # Nested function bodies are separate regions.
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def _visit_target(self, target: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            self.bind(target.id)
+            return
+        if isinstance(target, ast.Starred):
+            self._visit_target(target.value)
+            return
+        if isinstance(target, ast.Tuple | ast.List):
+            for element in target.elts:
+                self._visit_target(element)
 
 
 def _region_captures(

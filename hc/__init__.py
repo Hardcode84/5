@@ -8,6 +8,7 @@ import importlib
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
+from ._compile import CompiledKernel, compile
 from .core import (
     Buffer,
     BufferSpec,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 __all__ = [
     "Buffer",
     "BufferSpec",
+    "CompiledKernel",
     "CurrentGroup",
     "IndexMap",
     "Result",
@@ -39,6 +41,7 @@ __all__ = [
     "WorkGroup",
     "WorkItem",
     "as_layout",
+    "compile",
     "index_map",
     "kernel",
     "simulator",

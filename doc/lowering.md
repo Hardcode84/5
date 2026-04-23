@@ -689,6 +689,15 @@ The lowering stack has three authority layers:
   launch values, chooses default `group_shape`, and drives launch-time
   validation before execution.
 
+The public entry point is `hc.compile(kernel_fn, symbols=...)`, which runs
+whichever of those layers is wired up today and returns a `CompiledKernel`
+handle. The handle carries the emitted `hc_front` module (or the result of
+the furthest pipeline stage that exists) and accepts the literal-symbol
+bindings the kernel declared. Calling the handle launches — until the
+`hc_front -> hc` lowering, specialization, and launch stages land, calling
+raises `NotImplementedError`. Partial `symbols` maps are legal; unbound
+literals stay symbolic and later stages refine them.
+
 Compile-time MLIR should operate primarily on symbolic launch parameters and
 kernel structure. Concrete buffer shapes, launch shapes, and device limits
 enter only when the launcher supplies them to specialization or launch

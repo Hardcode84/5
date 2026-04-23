@@ -755,4 +755,67 @@ def HCCallIntrinsicOp : HC_Op<"call_intrinsic",
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// Imperative name store (transient).
+//
+// Python uses names-as-slots: `acc = ...` inside a loop rebinds a name
+// that outlives the iteration. Every region-carrying op in this dialect
+// (`hc.for_range`, `hc.if`, `hc.{workitem,subgroup}_region`) has to join
+// those rebinds back into SSA — iter_args + yields, results + branch
+// yields, region captures + region results.
+//
+// Rather than doing that analysis inline in `-convert-hc-front-to-hc`
+// (and repeating it per region kind), the frontend pass emits these two
+// ops to preserve the name-store shape, and a dedicated pass
+// `-hc-promote-names` (see bead 5-1k7) reconstructs SSA uniformly.
+//
+// Both ops are transient: they must not survive past `-hc-promote-names`.
+// The verifier contract on downstream passes is added when the consumer
+// lands; this bead only defines the ops and proves they round-trip.
+//===----------------------------------------------------------------------===//
+
+def HCAssignOp : HC_Op<"assign"> {
+  let summary = "Imperative write to a named slot; pre-SSA placeholder.";
+  let description = [{
+    `hc.assign "x", %v` records a write to the Python-level name `x` at
+    this program point. Produces no SSA result — consumers read through
+    `hc.name_load` and `-hc-promote-names` rewrites each such read into
+    a direct SSA use (or into an iter_arg / block arg manufactured for
+    the enclosing region op).
+
+    Deliberately carries no `Pure` or `MemoryEffects` trait: MLIR's
+    default "unspecified effects" policy is exactly what we want here —
+    it blocks reordering with sibling `hc.assign` / `hc.name_load` /
+    side-effecting ops until the promotion pass erases them all. Adding
+    `MemoryEffects` would misrepresent the op as touching SSA memory,
+    which it does not.
+
+    Cross-kernel / cross-function name capture is out of scope: each
+    `hc.kernel` / `hc.func` owns its own name store, and promotion
+    operates on one function region tree at a time.
+  }];
+  let arguments = (ins StrAttr:$name, HC_ValueType:$value);
+  let assemblyFormat = "$name `,` $value attr-dict `:` type($value)";
+}
+
+def HCNameLoadOp : HC_Op<"name_load"> {
+  let summary = "Imperative read from a named slot; pre-SSA placeholder.";
+  let description = [{
+    `%v = hc.name_load "x"` materializes the current binding of name `x`
+    at this program point. The result type is the usual open
+    `HC_ValueType` so the op is usable pre-inference with `!hc.undef`;
+    `-hc-promote-names` replaces each use with the reaching definition
+    (the nearest dominating `hc.assign`, or a new block/iter arg when
+    the reach crosses a region boundary) and erases the load.
+
+    Not `Pure`: two loads of the same name at different program points
+    can see different values whenever an `hc.assign` sits between them,
+    so CSE must not collapse them. Promotion handles redundancy
+    correctly because it has the store graph in hand.
+  }];
+  let arguments = (ins StrAttr:$name);
+  let results = (outs HC_ValueType:$result);
+  let assemblyFormat = "$name attr-dict `:` type($result)";
+}
+
 #endif // HC_IR_HCOPS

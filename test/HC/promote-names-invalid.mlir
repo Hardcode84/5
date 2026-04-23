@@ -91,3 +91,21 @@ hc.kernel @workitem_read_unbound_outer() {
   }
   hc.return
 }
+
+// -----
+
+// Atomic-scan regression coverage. The earlier `hc.assign "x"` +
+// `hc.name_load "x"` pair would promote cleanly on its own; the
+// later `hc.name_load "y"` has no reaching assign. Under a single-
+// phase scan, the first pair would already be rewritten (RAUW'd
+// and erased) by the time the second load returns `failure()`,
+// leaving a torn body behind. The two-phase scan walks the block
+// without mutation first, so the diagnostic fires on 'y' before
+// anything is rewritten.
+hc.func @fail_after_valid_prefix(%a: !hc.undef) -> !hc.undef {
+  hc.assign "x", %a : !hc.undef
+  %x = hc.name_load "x" : !hc.undef
+  // expected-error @+1 {{read of name 'y' that has no reaching `hc.assign`}}
+  %y = hc.name_load "y" : !hc.undef
+  hc.return %y : !hc.undef
+}

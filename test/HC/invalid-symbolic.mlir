@@ -58,3 +58,13 @@ module {
     return
   }
 }
+
+// -----
+
+// CHECK: error: 'hc.symbol' op result must pin a symbolic expression
+module {
+  func.func @bad() {
+    %s = hc.symbol : !hc.idx
+    return
+  }
+}

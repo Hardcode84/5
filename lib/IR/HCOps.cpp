@@ -168,6 +168,36 @@ ShapeAttr tryGetShape(Type t) {
   return nullptr;
 }
 
+/// Walks up the parent chain and returns the first subgroup/workitem region
+/// op found, or null if the op sits in the default workgroup scope. Stops
+/// at the nearest `hc.kernel` / `hc.func` / `hc.intrinsic` / module-like op
+/// because nested kernels/funcs re-baseline the enclosing scope.
+Operation *findNarrowingScope(Operation *op) {
+  Operation *cur = op->getParentOp();
+  while (cur) {
+    if (llvm::isa<HCSubgroupRegionOp, HCWorkitemRegionOp>(cur))
+      return cur;
+    if (llvm::isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(cur))
+      return nullptr;
+    if (cur->hasTrait<OpTrait::SymbolTable>())
+      return nullptr;
+    cur = cur->getParentOp();
+  }
+  return nullptr;
+}
+
+/// Tensor allocators (`hc.zeros`/`ones`/`full`/`empty`) are workgroup-only —
+/// a tensor inside a subgroup or workitem region is a scope error, not a
+/// shape error, and calling it out at verify time keeps the diagnostic
+/// close to the source instead of surfacing deep in a lowering.
+LogicalResult verifyTensorAllocScope(Operation *op) {
+  if (Operation *narrowing = findNarrowingScope(op))
+    return op->emitOpError("tensor allocator is workgroup scope only; "
+                           "enclosed by ")
+           << narrowing->getName() << " which narrows the scope";
+  return success();
+}
+
 } // namespace
 
 LogicalResult HCBufferDimOp::verify() {
@@ -310,6 +340,11 @@ LogicalResult HCWithInactiveOp::verify() {
            << inactive << " does not match element type " << elem;
   return success();
 }
+
+LogicalResult HCZerosOp::verify() { return verifyTensorAllocScope(*this); }
+LogicalResult HCOnesOp::verify() { return verifyTensorAllocScope(*this); }
+LogicalResult HCFullOp::verify() { return verifyTensorAllocScope(*this); }
+LogicalResult HCEmptyOp::verify() { return verifyTensorAllocScope(*this); }
 
 //===----------------------------------------------------------------------===//
 // SymbolUserOpInterface verification for call ops.

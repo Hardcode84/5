@@ -604,18 +604,22 @@ def HCVFullOp : HC_FillShapedAllocOp<"vfull"> {
 
 def HCZerosOp : HC_NullaryShapedAllocOp<"zeros"> {
   let summary = "Zero-initialized tensor (workgroup scope).";
+  let hasVerifier = 1;
 }
 
 def HCOnesOp : HC_NullaryShapedAllocOp<"ones"> {
   let summary = "Ones-initialized tensor (workgroup scope).";
+  let hasVerifier = 1;
 }
 
 def HCFullOp : HC_FillShapedAllocOp<"full"> {
   let summary = "Tensor filled with a scalar value (workgroup scope).";
+  let hasVerifier = 1;
 }
 
 def HCEmptyOp : HC_NullaryShapedAllocOp<"empty"> {
   let summary = "Uninitialized tensor (workgroup scope).";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

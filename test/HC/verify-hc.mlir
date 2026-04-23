@@ -389,3 +389,28 @@ module {
     return %r : !hc.undef
   }
 }
+
+// -----
+
+// Tensor allocators are workgroup scope only; sitting inside a
+// subgroup_region is a scope error.
+// CHECK: error: 'hc.zeros' op tensor allocator is workgroup scope only; enclosed by hc.subgroup_region which narrows the scope
+hc.kernel @bad {
+  hc.subgroup_region {
+    %z = hc.zeros {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+    hc.return
+  }
+  hc.return
+}
+
+// -----
+
+// And workitem_region is equally wrong.
+// CHECK: error: 'hc.empty' op tensor allocator is workgroup scope only; enclosed by hc.workitem_region which narrows the scope
+hc.kernel @bad {
+  hc.workitem_region {
+    %z = hc.empty {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+    hc.return
+  }
+  hc.return
+}

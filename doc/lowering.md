@@ -522,8 +522,13 @@ one even when they agree on shape (and fill operand, for the fill
 variants). This matches `memref.alloc`'s convention and gives `hc.empty`
 the right semantics uniformly with the rest — no special-casing required.
 
-Scope verification for tensor allocators is left to later passes that have
-visibility into the enclosing region.
+Scope verification runs in each tensor allocator's verifier: it walks the
+parent chain, stops at the nearest `hc.kernel` / `hc.func` / `hc.intrinsic`
+(or module-like op), and rejects the op if it finds an enclosing
+`hc.subgroup_region` or `hc.workitem_region` along the way. Keeping the
+check local to the op keeps the diagnostic next to the offender; a pass
+walking the IR top-down would surface the same error much later in the
+pipeline.
 
 #### Calls
 

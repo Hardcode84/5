@@ -2,13 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Thin compile entry point for the `hc` DSL.
+"""Public `hc.compile` entry point.
 
-Only the Python frontend stage exists today; this module exists mostly to
-claim the public API surface and make the shape of things visible. A
-`CompiledKernel` handle carries the emitted `hc_front` module and refuses
-to launch until the rest of the pipeline (hc_front -> hc, specialization,
-launch) is wired up.
+Only the Python frontend stage exists today; `hc.compile` runs that stage
+and hands back a `CompiledKernel` handle carrying the emitted `hc_front`
+module. Invoking the handle raises `NotImplementedError` until the rest of
+the pipeline (`hc_front -> hc` lowering, specialization, launch) is wired
+up. `symbols=` bindings are recorded on the handle for later stages; the
+frontend itself emits purely symbolic IR either way.
 """
 
 from __future__ import annotations
@@ -17,18 +18,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from hc.core import KernelMetadata
+from .core import KernelMetadata
 
 
 @dataclass(frozen=True)
 class CompiledKernel:
-    """Handle to a kernel that has been run through the compilation pipeline.
-
-    Invoking the handle raises `NotImplementedError` until the rest of the
-    pipeline catches up. The `front_ir` / `front_ir_text` fields are there
-    so callers can already feed the frontend output into tooling (lit
-    runners, canonicalizers, visualisers) without waiting for launch.
-    """
+    """Handle returned by `hc.compile`; see the module docstring for status."""
 
     kernel: Any
     bindings: Mapping[str, int]
@@ -55,10 +50,15 @@ def compile(
     """Run the current compilation pipeline (frontend only) on a kernel.
 
     `kernel_fn` must be a `@kernel`-decorated function. `symbols` maps
-    literal symbol names (either `Symbol` instances or plain strings) to
-    integer bindings; unknown names on kernels that declared a `literals=`
-    set are rejected. Missing entries are allowed — partial specialization
-    is legal and later pipeline stages refine what is left.
+    literal symbol names (`Symbol` instances or plain strings) to integer
+    bindings. Keys must match the kernel's declared `literals=` set; a
+    kernel that did not declare a whitelist accepts any key (later stages
+    will tighten this). Missing entries are allowed — partial specialization
+    is legal and later pipeline stages refine what remains symbolic.
+
+    Bindings are stored on the returned handle but the current frontend-only
+    stage does not substitute them into the emitted IR; `front_ir` stays
+    symbolic until specialization lands.
     """
 
     metadata = getattr(kernel_fn, "__hc_kernel__", None)
@@ -67,11 +67,16 @@ def compile(
             f"hc.compile expects a @kernel-decorated function, got {kernel_fn!r}"
         )
 
-    bindings = _normalise_bindings(symbols or {}, metadata)
+    if symbols is None:
+        symbols = {}
+    elif not isinstance(symbols, Mapping):
+        raise TypeError(f"symbols must be a Mapping, got {type(symbols).__name__}")
 
-    # Import lazily: the frontend pulls in the native MLIR bindings, which
+    bindings = _normalise_bindings(symbols, metadata)
+
+    # Lazy import: the frontend pulls in the native MLIR bindings, which
     # simulator-only callers should not have to install.
-    from hc._frontend import lower_function_to_front_ir
+    from ._frontend import lower_function_to_front_ir
 
     module = lower_function_to_front_ir(kernel_fn)
     return CompiledKernel(
@@ -102,16 +107,28 @@ def _normalise_bindings(
                 f"literal symbol '{name}' must bind to an int, "
                 f"got {type(value).__name__}"
             )
+        # A Symbol and its string form collapse to the same key; refuse
+        # conflicting duplicates rather than silently last-write-wins.
+        if name in out and out[name] != value:
+            raise ValueError(
+                f"literal symbol '{name}' bound twice with conflicting "
+                f"values ({out[name]!r} and {value!r})"
+            )
         out[name] = value
     return out
 
 
 def _symbol_name(obj: Any) -> str:
-    # `Symbol` instances carry a `.name` str; tolerate bare strings so
-    # `hc.compile(k, {"M": 1024})` works without importing `sym`.
-    name = getattr(obj, "name", None)
-    if isinstance(name, str):
-        return name
+    # Plain strings resolve to themselves first so a path-like object
+    # (anything with a `.name` attribute) cannot be mistaken for a symbol
+    # key. Only real `Symbol` instances — not arbitrary duck-typed objects
+    # — are accepted via `.name`.
     if isinstance(obj, str):
         return obj
+    # Lazy import so `hc._compile` stays light for simulator-only callers;
+    # `hc.symbols` is deliberately lazy-loaded in `hc/__init__.py`.
+    from .symbols import Symbol
+
+    if isinstance(obj, Symbol):
+        return obj.name
     raise TypeError(f"cannot interpret {obj!r} as a symbol name")

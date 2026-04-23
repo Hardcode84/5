@@ -14,15 +14,19 @@ from typing import Any
 
 import pytest
 
-import hc
-from hc import Buffer, CompiledKernel, CurrentGroup, kernel
-from hc._compile import _normalise_bindings
+from build_tools.hc_native_tools import (
+    ensure_hc_native_tools_built,
+    export_hc_native_environment,
+)
+from build_tools.llvm_toolchain import ensure_llvm_toolchain
+from hc import Buffer, CompiledKernel, CurrentGroup, compile, kernel
+from hc._compile import _normalise_bindings, _symbol_name
 from hc.core import KernelMetadata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _COMPILE_SUBPROCESS_TIMEOUT_SECONDS = 60.0
 
-_SKIP_NATIVE_TESTS = pytest.mark.skipif(
+_SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
     reason="native hc_front dialect smoke tests disabled by env",
 )
@@ -30,14 +34,6 @@ _SKIP_NATIVE_TESTS = pytest.mark.skipif(
 
 @lru_cache(maxsize=1)
 def _native_env() -> dict[str, str]:
-    # Import lazily: non-native tests should not pay for bootstrapping the
-    # MLIR toolchain.
-    from build_tools.hc_native_tools import (
-        ensure_hc_native_tools_built,
-        export_hc_native_environment,
-    )
-    from build_tools.llvm_toolchain import ensure_llvm_toolchain
-
     llvm_install_root = ensure_llvm_toolchain()
     native_install_root = ensure_hc_native_tools_built(llvm_install_root)
     return export_hc_native_environment(native_install_root, os.environ.copy())
@@ -49,12 +45,56 @@ def _sym() -> Any:
     return sym
 
 
+def _run_compile_smoke(script: Path) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [sys.executable, str(script)],
+            cwd=REPO_ROOT,
+            env=_native_env(),
+            capture_output=True,
+            text=True,
+            timeout=_COMPILE_SUBPROCESS_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            "hc.compile smoke test timed out.\n"
+            f"timeout: {_COMPILE_SUBPROCESS_TIMEOUT_SECONDS:.0f}s\n"
+            f"stdout:\n{exc.stdout or ''}\n"
+            f"stderr:\n{exc.stderr or ''}"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise AssertionError(
+            "hc.compile smoke test failed.\n"
+            f"stdout:\n{exc.stdout}\n"
+            f"stderr:\n{exc.stderr}"
+        ) from exc
+
+
+# --- public hc.compile entry point ----------------------------------------
+# Validation runs before the frontend is imported, so these tests do not
+# need the native toolchain.
+
+
 def test_compile_rejects_non_kernel() -> None:
     def not_a_kernel() -> None:
         return None
 
     with pytest.raises(TypeError, match="@kernel-decorated"):
-        hc.compile(not_a_kernel)
+        compile(not_a_kernel)
+
+
+def test_compile_rejects_non_mapping_symbols() -> None:
+    sym = _sym()
+
+    @kernel(work_shape=(sym.W,), literals={sym.W})
+    def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+        return None
+
+    # A list of pairs is a classic mistake; fail early with a message
+    # that names the argument instead of a cryptic AttributeError later.
+    with pytest.raises(TypeError, match="symbols must be a Mapping"):
+        compile(foo, [("W", 16)])  # type: ignore[arg-type]
 
 
 def test_compile_rejects_unknown_literal_symbol() -> None:
@@ -65,8 +105,7 @@ def test_compile_rejects_unknown_literal_symbol() -> None:
         return None
 
     with pytest.raises(ValueError, match="not a declared literal symbol"):
-        # str key path: symbol name "H" was never declared.
-        _normalise_bindings({"H": 16}, foo.__hc_kernel__)
+        compile(foo, {"H": 16})
 
 
 def test_compile_rejects_non_int_binding() -> None:
@@ -76,36 +115,89 @@ def test_compile_rejects_non_int_binding() -> None:
     def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
         return None
 
-    # `True` is an int subclass but booleans are not intended shape values.
     with pytest.raises(TypeError, match="must bind to an int"):
-        _normalise_bindings({sym.W: True}, foo.__hc_kernel__)
-
-    with pytest.raises(TypeError, match="must bind to an int"):
-        _normalise_bindings({sym.W: "16"}, foo.__hc_kernel__)
+        compile(foo, {sym.W: "16"})
 
 
-def test_compile_allows_missing_bindings() -> None:
+# --- _normalise_bindings ---------------------------------------------------
+
+
+def test_normalise_bindings_rejects_unknown_literal() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    # Partial specialization (the empty map here) must be valid; later
-    # pipeline stages refine what is left — the doc calls this out.
+    with pytest.raises(ValueError, match="not a declared literal symbol"):
+        _normalise_bindings({"H": 16}, metadata)
+
+
+def test_normalise_bindings_rejects_bool_and_str_values() -> None:
+    sym = _sym()
+    metadata = KernelMetadata(literals=frozenset({sym.W}))
+
+    # `True` is an int subclass but booleans are not intended shape values.
+    with pytest.raises(TypeError, match="must bind to an int"):
+        _normalise_bindings({sym.W: True}, metadata)
+
+    with pytest.raises(TypeError, match="must bind to an int"):
+        _normalise_bindings({sym.W: "16"}, metadata)
+
+
+def test_normalise_bindings_allows_empty_map() -> None:
+    sym = _sym()
+    metadata = KernelMetadata(literals=frozenset({sym.W}))
+
+    # Partial specialization (empty here) must be valid; later pipeline
+    # stages refine what is left — the doc calls this out.
     assert _normalise_bindings({}, metadata) == {}
 
 
-def test_compile_allows_any_binding_when_no_literals_declared() -> None:
+def test_normalise_bindings_allows_any_key_when_no_literals_declared() -> None:
     metadata = KernelMetadata()
 
+    # Deliberate: a kernel without a `literals=` whitelist lets any key
+    # through. Doc calls this out; later stages will tighten it.
     assert _normalise_bindings({"wave_size": 32}, metadata) == {"wave_size": 32}
 
 
-def test_compile_accepts_symbol_keys_and_string_keys_equivalently() -> None:
+def test_normalise_bindings_symbol_and_string_keys_agree() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
     by_symbol = _normalise_bindings({sym.W: 8}, metadata)
     by_string = _normalise_bindings({"W": 8}, metadata)
     assert by_symbol == by_string == {"W": 8}
+
+
+def test_normalise_bindings_flags_conflicting_duplicate_keys() -> None:
+    sym = _sym()
+    metadata = KernelMetadata(literals=frozenset({sym.W}))
+
+    # Same logical key via two forms pointing at different values is
+    # ambiguous — fail loudly instead of last-write-wins.
+    with pytest.raises(ValueError, match="bound twice"):
+        _normalise_bindings({sym.W: 8, "W": 16}, metadata)
+
+
+# --- _symbol_name name resolution ------------------------------------------
+
+
+def test_symbol_name_accepts_string() -> None:
+    assert _symbol_name("W") == "W"
+
+
+def test_symbol_name_accepts_symbol_instance() -> None:
+    sym = _sym()
+    assert _symbol_name(sym.W) == "W"
+
+
+def test_symbol_name_rejects_arbitrary_dot_name_objects() -> None:
+    # A path-like object has a `.name` attribute but is not a Symbol;
+    # rejecting it prevents bindings from silently using a surprising key.
+    with pytest.raises(TypeError, match="cannot interpret"):
+        _symbol_name(Path("/tmp/W"))
+
+
+# --- CompiledKernel handle -------------------------------------------------
 
 
 def test_compiled_kernel_call_raises_until_pipeline_lands() -> None:
@@ -141,7 +233,10 @@ def test_compiled_kernel_repr_is_informative() -> None:
     assert "N=512" in text
 
 
-@_SKIP_NATIVE_TESTS
+# --- end-to-end through the real frontend ----------------------------------
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None:
     # The real frontend needs both native MLIR bindings (hence the managed
     # env, same pattern as test_hc_front_python_bindings.py) and a kernel
@@ -180,13 +275,5 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
                 main()
             """))
 
-    result = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=REPO_ROOT,
-        env=_native_env(),
-        capture_output=True,
-        text=True,
-        timeout=_COMPILE_SUBPROCESS_TIMEOUT_SECONDS,
-        check=True,
-    )
+    result = _run_compile_smoke(script)
     assert result.stdout.strip().endswith("OK"), result.stdout

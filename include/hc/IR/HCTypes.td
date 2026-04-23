@@ -60,10 +60,13 @@ def HC_PredType : HC_Type<"Pred", "pred"> {
 def HC_SliceType : HC_Type<"Slice", "slice"> {
   let summary = "First-class slice value.";
   let description = [{
-    Produced by `hc.slice_expr` with optional low/high/step operands; consumed
-    by `hc.load`, `hc.store`, `hc.buffer_view`, and friends. Which operands are
-    actually present is recorded as `has_lower`/`has_upper`/`has_step` on the
-    producer op, mirroring `hc_front.slice`.
+    Produced by `hc.slice_expr` and consumed by `hc.load`, `hc.store`,
+    `hc.buffer_view`, and friends. The type is uniform: presence of the
+    lower/upper/step parts is encoded exclusively by which optional
+    operands are supplied to the producing `hc.slice_expr`
+    (`AttrSizedOperandSegments` + `Optional<>`), not by any flags on the
+    type itself. A missing part carries Python slice semantics
+    (`None`-equivalent).
   }];
 }
 

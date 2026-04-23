@@ -21,12 +21,12 @@
 // CHECK: func.func @use_scope_and_effects
 // CHECK-SAME: effects = #hc.effects<"Pure">
 // CHECK-SAME: scope = #hc.scope<"WorkItem">
-// CHECK: hc.kernel "wmma_matmul"
+// CHECK: hc.kernel @wmma_matmul
 // CHECK: requirements = <[#hc.pred<"-1 + M >= 0">, #hc.pred<"Mod(N, 32) == 0">]> {
 // CHECK: hc.subgroup_region captures = ["lhs", "rhs"] {
 // CHECK: hc.workitem_region {
 // CHECK: hc.return
-// CHECK: hc.func "tile_helper" {
+// CHECK: hc.func @tile_helper {
 
 module {
   func.func @use_types(
@@ -60,7 +60,7 @@ module {
     return
   }
 
-  hc.kernel "wmma_matmul" requirements = #hc.constraints<[#hc.pred<"M >= 1">, #hc.pred<"Mod(N, 32) == 0">]> {
+  hc.kernel @wmma_matmul requirements = #hc.constraints<[#hc.pred<"M >= 1">, #hc.pred<"Mod(N, 32) == 0">]> {
     hc.subgroup_region captures = ["lhs", "rhs"] {
       hc.workitem_region {
         hc.return
@@ -68,7 +68,7 @@ module {
     }
   }
 
-  hc.func "tile_helper" {
+  hc.func @tile_helper {
     hc.return
   }
 }

@@ -151,8 +151,8 @@ def test_resolve_wmma_stamps_every_name_load_with_ref() -> None:
 
     resolved = resolve_front_ir(tiled_gfx11_wmma_matmul)
 
-    # Every load-context ``hc_front.name`` must carry a ref — the bead's core
-    # acceptance criterion. Stores (``target_name``) are exempt.
+    # Every load-context ``hc_front.name`` must carry a ref. Stores
+    # (``target_name``) are exempt.
     load_count = 0
     for op in _iter_ops(resolved.module):
         if op.operation.name != "hc_front.name":

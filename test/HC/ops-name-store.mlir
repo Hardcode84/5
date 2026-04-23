@@ -4,11 +4,11 @@
 //
 // Roundtrip coverage for the transient imperative name-store ops
 // `hc.assign` / `hc.name_load`. These ops are emitted by
-// -convert-hc-front-to-hc (in a later bead) and erased by
-// -hc-promote-names (in 5-1k7). This file only proves they parse,
-// print, and round-trip cleanly across every region kind they're
-// expected to show up in; behavioural coverage for their memory
-// effects lives in `test/HC/name-store-effects.mlir`.
+// `-convert-hc-front-to-hc` and erased by `-hc-promote-names`. This
+// file only proves they parse, print, and round-trip cleanly across
+// every region kind they're expected to show up in; behavioural
+// coverage for their memory effects lives in
+// `test/HC/name-store-effects.mlir`.
 //
 // RUN: hc-opt %s | hc-opt | FileCheck %s
 

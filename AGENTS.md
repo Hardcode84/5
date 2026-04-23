@@ -71,6 +71,17 @@ git push                # Push to remote
 
 After running reviewers (multi-perspective or external), go through every finding where a reviewer asked a question, expressed confusion, or had to work to understand the code. For each such finding, add a code comment at the relevant location explaining the non-obvious intent. If a reviewer misunderstood the code, the code needs a comment — the reviewer is the proxy for every future reader. Fix the confusion at the source, not in the review reply.
 
+## Code ↔ beads boundary
+
+Beads live in `.beads/`; code lives in `lib/`, `include/`, `test/`, `tests/`. Keep them apart:
+
+- No bead ids (`5-1k7`, `4-96o`, etc.) in source files, comments, docstrings, tests, or commit messages. Issue ids belong in `.beads/`, PRs, and the tracker.
+- No "this bead does X" phrasing in code — say what the *code* does.
+- For deferred work, describe the gap conceptually (e.g. "needs a separate pass", "ODS result extension") instead of naming a bead that may move, merge, or close.
+- Bead ids rot. Code comments don't get updated when a bead gets renumbered or retired. The next reader in six months won't have `br show 5-2lf` memorised — and it may not even exist.
+
+If you need to cross-link, do it in the PR description or the bead itself, not in the source.
+
 ## Tone
 
 Code comments, docstrings, and commit messages share the same voice: terse, dry, informative. Wit is welcome, fluff is not. Say what the thing does, not what you wish it did. If a comment doesn't earn its line, delete it.

@@ -26,7 +26,7 @@
 // unbound read falls back to an outer-scope snapshot materialized
 // lazily by the pass. Plumbing a write back out (the "return acc"
 // pattern) needs an ODS-level result extension on those ops —
-// tracked in bead 5-2lf.
+// separate change, not in this file.
 
 #include "hc/Transforms/Passes.h"
 
@@ -495,7 +495,7 @@ static LogicalResult promoteIf(HCIfOp op) {
 // direction, so the shape here collapses to "scan with capture
 // factory" — no rebuild, no writeback. Out-bound propagation (the
 // "return acc" pattern) needs an ODS-level result extension on
-// these ops — tracked in bead 5-2lf.
+// these ops — separate change.
 //
 // By the time we reach here, the post-order walk has already
 // promoted every inner NameStoreRegionOpInterface op; their

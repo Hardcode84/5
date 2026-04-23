@@ -772,11 +772,11 @@ def HCCallIntrinsicOp : HC_Op<"call_intrinsic",
 // Rather than doing that analysis inline in `-convert-hc-front-to-hc`
 // (and repeating it per region kind), the frontend pass emits these two
 // ops to preserve the name-store shape, and a dedicated pass
-// `-hc-promote-names` (see bead 5-1k7) reconstructs SSA uniformly.
+// `-hc-promote-names` reconstructs SSA uniformly.
 //
 // Both ops are transient: they must not survive past `-hc-promote-names`.
-// The verifier contract on downstream passes is added when the consumer
-// lands; this bead only defines the ops and proves they round-trip.
+// The verifier contract enforcing that belongs on the consumer pass, not
+// on these ops themselves.
 //===----------------------------------------------------------------------===//
 
 def HCAssignOp : HC_Op<"assign", [MemoryEffects<[MemWrite]>]> {

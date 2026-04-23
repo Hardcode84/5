@@ -103,3 +103,56 @@ hc.kernel @region_body_name_store {
   }
   hc.return
 }
+
+// `hc.region_return` — pre-promotion terminator for nested-scope
+// regions. Names the imperative bindings whose current value should
+// become the enclosing region's result. The parent op stays results-
+// less at this stage; promotion rebuilds it with `-> (...)` and
+// swaps the terminator for `hc.yield`.
+// CHECK-LABEL: hc.kernel @region_return_pre_promotion
+// CHECK: hc.workitem_region {
+// CHECK:   hc.assign "acc", %{{.*}} : !hc.undef
+// CHECK:   hc.region_return ["acc"]
+// CHECK: }
+// CHECK: hc.subgroup_region {
+// CHECK:   hc.assign "lhs", %{{.*}} : !hc.undef
+// CHECK:   hc.assign "rhs", %{{.*}} : !hc.undef
+// CHECK:   hc.region_return ["lhs", "rhs"]
+// CHECK: }
+hc.kernel @region_return_pre_promotion {
+  %v = hc.const<1 : i64> : !hc.undef
+  hc.workitem_region {
+    hc.assign "acc", %v : !hc.undef
+    hc.region_return ["acc"]
+  }
+  hc.subgroup_region {
+    hc.assign "lhs", %v : !hc.undef
+    hc.assign "rhs", %v : !hc.undef
+    hc.region_return ["lhs", "rhs"]
+  }
+  hc.return
+}
+
+// Post-promotion shape: region op carries typed results, terminator is
+// `hc.yield`, and the outer name store gets the writeback assign that
+// the flat sweep fuses with downstream reads. The test only proves the
+// new ODS surface parses and round-trips — behavioural coverage for
+// the pass lives in `promote-names-regions.mlir`.
+// CHECK-LABEL: hc.kernel @region_post_promotion_shape
+// CHECK: %[[R:.*]] = hc.workitem_region -> (!hc.undef) {
+// CHECK:   hc.yield %{{.*}} : !hc.undef
+// CHECK: }
+// CHECK: %{{.*}}:2 = hc.subgroup_region -> (!hc.undef, i32) {
+// CHECK:   hc.yield %{{.*}}, %{{.*}} : !hc.undef, i32
+// CHECK: }
+hc.kernel @region_post_promotion_shape {
+  %v = hc.const<1 : i64> : !hc.undef
+  %c = hc.const<7 : i32> : i32
+  %r = hc.workitem_region -> (!hc.undef) {
+    hc.yield %v : !hc.undef
+  }
+  %s:2 = hc.subgroup_region -> (!hc.undef, i32) {
+    hc.yield %v, %c : !hc.undef, i32
+  }
+  hc.return
+}

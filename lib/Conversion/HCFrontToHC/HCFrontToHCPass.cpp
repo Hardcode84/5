@@ -1077,7 +1077,15 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // body). Nested-def folding is a later pass; if the front op declares
   // parameters we still bind them as block args so the body resolves,
   // but the `hc` op carries only a captures list (no formal params).
-  auto newOp = HCRegionOpT::create(builder, op.getLoc(), op.getCapturesAttr());
+  //
+  // Results are empty at the lowering stage. The frontend communicates
+  // intent to carry a value out by emitting `hc.region_return <names>`
+  // inside the body (when it grows support for it); `-hc-promote-names`
+  // then rebuilds the op with matching `$results`. This pass doesn't
+  // pre-declare result types.
+  auto newOp =
+      HCRegionOpT::create(builder, op.getLoc(),
+                          /*resultTypes=*/TypeRange{}, op.getCapturesAttr());
   Block *body = new Block();
   Scope childScope;
   childScope.parent = scopes.back().get();

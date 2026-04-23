@@ -104,22 +104,38 @@ def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
   let hasVerifier = 1;
 }
 
+// `hc.subgroup_region` and `hc.workitem_region` model Python-style
+// nested name scopes: writes inside shadow outer bindings and don't
+// leak, reads capture outer bindings (see `NameStoreRegionOpInterface`
+// and `-hc-promote-names`). The `$results` list surfaces values that
+// the body elects to push out — pre-promotion the body terminates with
+// `hc.region_return "name", ...` naming the bindings to lift; the
+// promoter resolves those names, rewrites the terminator into
+// `hc.yield`, and extends the op's results to match. An empty `$results`
+// list + no terminator is the legal "side-effect only" form the
+// frontend emits before promotion.
 def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
     [NameStoreRegionOpInterface]> {
   let summary = "Semantic subgroup region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
+  let results = (outs Variadic<HC_ValueType>:$results);
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat =
-      "(`captures` `=` $captures^)? attr-dict-with-keyword $body";
+  let assemblyFormat = [{
+    (`captures` `=` $captures^)? (`->` `(` type($results)^ `)`)?
+      attr-dict-with-keyword $body
+  }];
 }
 
 def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
     [NameStoreRegionOpInterface]> {
   let summary = "Semantic workitem region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
+  let results = (outs Variadic<HC_ValueType>:$results);
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat =
-      "(`captures` `=` $captures^)? attr-dict-with-keyword $body";
+  let assemblyFormat = [{
+    (`captures` `=` $captures^)? (`->` `(` type($results)^ `)`)?
+      attr-dict-with-keyword $body
+  }];
 }
 
 def HCReturnOp : HC_Op<"return"> {
@@ -302,13 +318,19 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
 
 def HCYieldOp : HC_Op<"yield",
     [Pure, Terminator,
-     ParentOneOf<["HCForRangeOp", "HCIfOp"]>]> {
-  let summary = "Terminator for `hc.for_range` and `hc.if` regions.";
+     ParentOneOf<["HCForRangeOp", "HCIfOp",
+                  "HCWorkitemRegionOp", "HCSubgroupRegionOp"]>]> {
+  let summary = "Terminator for region ops that carry values out.";
   let description = [{
-    Yields loop-carried or if-produced values back to the enclosing op.
-    Value count must match the parent op's result count; verification of
-    that happens on the parent op so the error message references the
-    right operation.
+    Yields loop-carried, if-produced, or region-return values back to
+    the enclosing op. Value count must match the parent op's result
+    count; verification of that happens on the parent op so the error
+    message references the right operation.
+
+    For `hc.workitem_region` / `hc.subgroup_region` the yield is the
+    post-`-hc-promote-names` form — pre-promotion the body terminates
+    with `hc.region_return`, which the pass resolves and rewrites into
+    this op.
   }];
   let arguments = (ins Variadic<HC_ValueType>:$values);
   let assemblyFormat = "($values^ `:` type($values))? attr-dict";
@@ -316,6 +338,25 @@ def HCYieldOp : HC_Op<"yield",
     // Needed by `SingleBlockImplicitTerminator` on the parent ops.
     OpBuilder<(ins), [{ /* empty yield */ }]>,
   ];
+}
+
+def HCRegionReturnOp : HC_Op<"region_return",
+    [Terminator,
+     ParentOneOf<["HCWorkitemRegionOp", "HCSubgroupRegionOp"]>]> {
+  let summary =
+      "Transient terminator naming bindings a nested-scope region lifts out.";
+  let description = [{
+    Pre-promotion marker emitted by the frontend. `$names` lists, in
+    order, the imperative name-store slots whose current binding should
+    surface as the enclosing region's result. `-hc-promote-names`
+    resolves each name against the body's binding map, rewrites this op
+    into `hc.yield` with the resolved SSA values, and extends the
+    parent region op's `$results` to match. Does not survive past
+    `-hc-promote-names`; any `hc.region_return` that reaches a later
+    pass is a driver bug.
+  }];
+  let arguments = (ins StrArrayAttr:$names);
+  let assemblyFormat = "$names attr-dict";
 }
 
 def HCForRangeOp : HC_Op<"for_range",

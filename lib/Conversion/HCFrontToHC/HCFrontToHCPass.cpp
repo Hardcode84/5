@@ -12,6 +12,11 @@
 // walks the body once and emits the parallel `hc` callable alongside, then
 // erases the source op.
 //
+// Python-level name bindings are emitted as `hc.assign` / `hc.name_load`
+// placeholder ops; `-hc-promote-names` then folds them into SSA. See
+// `ConvertHCFrontToHC` in `include/hc/Conversion/HCFrontToHC/Passes.td`
+// for the canonical pipeline contract — this banner doesn't repeat it.
+//
 // What this pass handles today:
 //  * the structural rewrites for every `hc_front` op the WMMA kernel touches
 //    in v0 (kernel/func/intrinsic, workitem/subgroup regions, for-range over
@@ -25,13 +30,18 @@
 // Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
 // bodies are simulator fallbacks with no compilation meaning; the
 // lowered `hc.intrinsic` is a declaration (signature + scope/effects/
-// const_kwargs + empty entry block with param args, zero body ops). A
-// consequence worth spelling out: this pass does *not* validate the
-// contents of an intrinsic body. Malformed ops inside a simulator
-// fallback pass through as-is until the source op is erased.
+// const_kwargs + empty entry block with param args, zero body ops —
+// no `hc.assign` either, since there is no body scan downstream for
+// them to seed). A consequence worth spelling out: this pass does
+// *not* validate the contents of an intrinsic body. Malformed ops
+// inside a simulator fallback pass through as-is until the source op
+// is erased.
 //
 // Explicitly deferred to later passes:
-//  * loop-carried iter_arg analysis and nested workitem-def folding.
+//  * loop-carried iter_arg analysis (`-hc-promote-names`).
+//  * nested workitem-def folding of a `hc_front.workitem_region` +
+//    trailing `hc_front.call` producer into a single result-producing
+//    workitem region: driver-shape concern, tracked separately.
 //  * full inlining of `ref.kind = "inline"` helpers; for now we leave the
 //    `hc_front.call` pinned with a diagnostic if it survives lowering.
 
@@ -76,29 +86,6 @@ namespace {
 // up front — a hand-crafted IR with `axis = -1` or `axis = 2^31` should
 // diagnose, not allocate gigabytes of `!hc.undef` result types.
 constexpr int64_t kMaxLaunchAxis = 32;
-
-//===----------------------------------------------------------------------===//
-// Scope map. Each callable / region owns a string -> Value scope that the
-// `hc_front.name` lookup consults. Scopes chain through their parent so an
-// inner `hc_front.workitem_region` sees the enclosing callable's params and
-// locals.
-//===----------------------------------------------------------------------===//
-
-struct Scope {
-  Scope *parent = nullptr;
-  llvm::StringMap<Value> bindings;
-
-  Value lookup(StringRef name) const {
-    for (const Scope *s = this; s; s = s->parent) {
-      auto it = s->bindings.find(name);
-      if (it != s->bindings.end())
-        return it->second;
-    }
-    return nullptr;
-  }
-
-  void bind(StringRef name, Value v) { bindings[name] = v; }
-};
 
 //===----------------------------------------------------------------------===//
 // The Python driver (see `hc/_resolve.py`) stamps every `hc_front.name` and
@@ -268,9 +255,11 @@ private:
   OpBuilder &builder;
   Type undef;
 
-  // Stack of scope frames; the top frame matches the current innermost
-  // region being lowered. `lookupName` walks the chain via `Scope::parent`.
-  llvm::SmallVector<std::unique_ptr<Scope>> scopes;
+  // No scope stack: name-store placeholders carry the binding. Entry
+  // points that introduce a new Python-level name (parameter entry,
+  // for-loop IV, region parameters) emit `hc.assign` at their block
+  // entries; every `hc_front.name` read lowers to `hc.name_load`. See
+  // the `ConvertHCFrontToHC` ODS description for the full contract.
 
   // `hc_front.tuple` produces a single SSA value, but the downstream ops
   // (assign-to-target_tuple, keyword-shape, variadic subscript) need to
@@ -295,10 +284,11 @@ private:
   // by every operand lookup.
   llvm::DenseMap<Value, Value> valueMap;
 
-  Scope &currentScope() { return *scopes.back(); }
-
-  // Resolves a classified `hc_front.name` against the current scope chain
-  // and the `ref` DictAttr.
+  // Resolves a classified `hc_front.name`. Classifier kinds that name a
+  // Python-level binding (`param`/`local`/`iv`) lower to an
+  // `hc.name_load "<ident>"` — a placeholder the promotion pass replaces
+  // with a direct SSA use. Constant and symbol kinds materialize a real
+  // `hc` producer eagerly.
   // Returns:
   //   * `success(Value)`  — a usable hc value for the name;
   //   * `success(Value())` — the name is consumed at the call site and
@@ -347,14 +337,23 @@ private:
   FailureOr<Value> lowerCall(hc_front::CallOp op);
   Value lowerSubscript(hc_front::SubscriptOp op);
 
-  // Helpers for populating a fresh callable's entry block from an
-  // `hc_front` `parameters = [...]` attribute. Binds the param names into
-  // `scope` so subsequent `hc_front.name {ref.kind = "param"}` lookups
-  // resolve to the right block argument.
+  // Populates `entry`'s block arguments (one `!hc.undef` per param) and
+  // returns the matching `FunctionType`. No `hc.assign` is emitted here;
+  // param-name publishing happens in `emitParameterAssigns` once the
+  // enclosing op has attached `entry` to its body.
   FailureOr<FunctionType> materializeParameters(ArrayAttr params, Block &entry,
-                                                Scope &scope,
                                                 Operation *sourceOp,
                                                 bool returnsValue);
+
+  // Emits `hc.assign "<pname>", %arg` at the start of `entry` for each
+  // parameter in `params`. Must be called after the enclosing op has
+  // taken ownership of `entry`, since `hc.assign` needs an insertion
+  // point inside the live region. `params` is assumed pre-validated by
+  // `materializeParameters` — this helper does not re-check the dict.
+  // Positions the builder itself (caller is expected to hold an
+  // `OpBuilder::InsertionGuard` if the builder state matters past this
+  // call).
+  void emitParameterAssigns(ArrayAttr params, Block &entry, Location loc);
 
   // Emit an `hc.const` for a `ref.kind = "constant"` name op. Needs the
   // python_kind / value payload because the front dialect packs it as
@@ -409,25 +408,24 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   }
 
   // All three callable kinds share the same skeleton: build a fresh
-  // entry block, bind params into a new Scope, hand (entry, fnType) to
+  // entry block with one block arg per param, hand (entry, fnType) to
   // the per-kind `build` lambda which creates the hc op + attaches the
-  // block, then (if `build` asks for it) lower the hc_front body region
-  // into that entry block. `build` returning a null `Region *` on
-  // success means "skip the walk" — the intrinsic arm uses it to land a
-  // declaration-only op, see file banner.
+  // block, then (if `build` asks for it) emit a leading `hc.assign` per
+  // param and lower the hc_front body region into that entry block.
+  // `build` returning a null `Region *` on success means "skip the walk"
+  // — the intrinsic arm uses it to land a declaration-only op with an
+  // empty (no-assigns, no-body) entry block; see file banner.
   //
-  // Block ownership: on `materializeParameters` failure we delete `entry`
-  // here; on success `build` is contractually attach-then-erase —
-  // attaches `entry` to the hc op first, so any later failure can
+  // Block ownership: on `materializeParameters` failure we delete
+  // `entry` here; on success `build` is contractually attach-then-erase
+  // — attaches `entry` to the hc op first, so any later failure can
   // `hcOp->erase()` and take the block with it.
   auto runBody =
       [&](bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
       -> LogicalResult {
     Block *entry = new Block();
-    Scope scope;
-    auto fnType =
-        materializeParameters(params, *entry, scope, frontOp, returnsValue);
+    auto fnType = materializeParameters(params, *entry, frontOp, returnsValue);
     if (failed(fnType)) {
       delete entry;
       return failure();
@@ -437,12 +435,12 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
       return failure();
     if (!*bodyRegion)
       return success();
-    scopes.push_back(std::make_unique<Scope>(std::move(scope)));
     OpBuilder::InsertionGuard bodyGuard(builder);
-    builder.setInsertionPointToStart(entry);
-    LogicalResult r = lowerRegion(**bodyRegion);
-    scopes.pop_back();
-    return r;
+    emitParameterAssigns(params, *entry, frontOp->getLoc());
+    // `emitParameterAssigns` leaves the builder just past the last
+    // parameter `hc.assign`, which is where we want `lowerRegion` to
+    // start appending the body's converted ops.
+    return lowerRegion(**bodyRegion);
   };
 
   if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
@@ -544,9 +542,10 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   return frontOp->emitOpError("unexpected top-level hc_front op");
 }
 
-FailureOr<FunctionType>
-Lowerer::materializeParameters(ArrayAttr params, Block &entry, Scope &scope,
-                               Operation *sourceOp, bool returnsValue) {
+FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
+                                                       Block &entry,
+                                                       Operation *sourceOp,
+                                                       bool returnsValue) {
   MLIRContext *ctx = sourceOp->getContext();
   SmallVector<Type> inputs;
   inputs.reserve(params.size());
@@ -564,14 +563,37 @@ Lowerer::materializeParameters(ArrayAttr params, Block &entry, Scope &scope,
     // separate concern — a later inference pass walks those records and
     // refines once the semantic shape is known.
     inputs.push_back(undef);
-    BlockArgument arg = entry.addArgument(undef, sourceOp->getLoc());
-    scope.bind(name.getValue(), arg);
+    entry.addArgument(undef, sourceOp->getLoc());
   }
 
   SmallVector<Type> results;
   if (returnsValue)
     results.push_back(undef);
   return FunctionType::get(ctx, inputs, results);
+}
+
+void Lowerer::emitParameterAssigns(ArrayAttr params, Block &entry,
+                                   Location loc) {
+  // Preconditions set up by `materializeParameters`: the dict shape of
+  // every entry is already validated, and `entry` has exactly
+  // `params.size()` block arguments (one `!hc.undef` per param). Assert
+  // the block-arg count here so a future caller that forgets to call
+  // `materializeParameters` first trips a loud check instead of an
+  // out-of-bounds read.
+  assert(entry.getNumArguments() == params.size() &&
+         "emitParameterAssigns: entry block arg count mismatch; "
+         "caller must run materializeParameters first");
+  // Drive our own insertion point: this helper is the sole producer of
+  // parameter-entry `hc.assign` ops and the callers always want them at
+  // the top of `entry`, so owning the position here removes a whole
+  // class of subtle bug (wrong builder state after an intermediate
+  // `RewriterBase::create`).
+  builder.setInsertionPointToStart(&entry);
+  for (auto [idx, param] : llvm::enumerate(params)) {
+    auto dict = cast<DictionaryAttr>(param);
+    auto name = cast<StringAttr>(dict.get("name"));
+    HCAssignOp::create(builder, loc, name, entry.getArgument(idx));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -728,14 +750,13 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   StringRef kind = ref.getKind();
   StringRef ident = op.getName();
   if (kind == "param" || kind == "local" || kind == "iv") {
-    Value v = currentScope().lookup(ident);
-    if (!v) {
-      op.emitOpError("hc_front.name '")
-          << ident << "' (kind=" << kind
-          << ") not bound in the current scope; missing assign or bad ref";
-      return failure();
-    }
-    return v;
+    // `hc.name_load` is a placeholder the promotion pass folds into the
+    // reaching SSA definition. An unresolved read (no reaching
+    // `hc.assign`) surfaces a diagnostic there, not here — this pass
+    // does not know what names will be bound by siblings / ancestors
+    // yet to be walked.
+    auto name = StringAttr::get(op.getContext(), ident);
+    return HCNameLoadOp::create(builder, op.getLoc(), undef, name).getResult();
   }
   if (kind == "constant")
     return emitConstantFromRef(op.getLoc(), ref, op);
@@ -881,6 +902,8 @@ LogicalResult Lowerer::lowerReturn(hc_front::ReturnOp op) {
 LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   Value rhs = op.getValue();
   Operation *target = op.getTarget().getDefiningOp();
+  MLIRContext *ctx = op.getContext();
+  auto nameAttr = [&](StringRef n) { return StringAttr::get(ctx, n); };
 
   if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
     // `x = (a,)` / `x = f()` — both single-target. If the RHS is an
@@ -890,7 +913,8 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
     if (auto tupleIt = tupleElts.find(rhs); tupleIt != tupleElts.end()) {
       const SmallVector<Value> &elts = tupleIt->second;
       if (elts.size() == 1 && elts.front()) {
-        currentScope().bind(tn.getName(), elts.front());
+        HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()),
+                           elts.front());
         return success();
       }
       return op.emitOpError("cannot bind '")
@@ -902,7 +926,7 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
       return op.emitOpError("rhs for '") << tn.getName()
                                          << "' did not lower to an hc value; "
                                             "ref classification may be off";
-    currentScope().bind(tn.getName(), value);
+    HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()), value);
     return success();
   }
 
@@ -943,7 +967,7 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
       if (!src)
         return op.emitOpError(
             "tuple-unpack source element did not lower to an hc value");
-      currentScope().bind(tn.getName(), src);
+      HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()), src);
     }
     return success();
   }
@@ -1043,9 +1067,10 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
     return op.emitOpError("for-target must be a single target_name");
 
   // Build the `hc.for_range` with no iter_args — loop-carried value
-  // analysis is a later pass. The entry block owns the IV block argument
-  // that we bind into the child scope so name lookups inside the body
-  // resolve.
+  // analysis is a later pass. The `hc.assign "<iv>", %iv` emitted as
+  // the first body op is the IV self-bind placeholder documented on
+  // `hc.assign` in HCOps.td; promotion matches and folds it into
+  // direct uses of the block arg.
   auto forOp = HCForRangeOp::create(builder, op.getLoc(),
                                     /*resultTypes=*/TypeRange{}, lo, hi, step,
                                     /*iter_inits=*/ValueRange{});
@@ -1053,30 +1078,24 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   BlockArgument iv = body->addArgument(undef, op.getLoc());
   forOp.getBody().push_back(body);
 
-  Scope childScope;
-  childScope.parent = scopes.back().get();
-  childScope.bind(ivTarget.getName(), iv);
-  scopes.push_back(std::make_unique<Scope>(std::move(childScope)));
-
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(body);
-    LogicalResult r = lowerRegion(op.getBody());
-    if (succeeded(r))
-      HCYieldOp::create(builder, op.getLoc());
-    scopes.pop_back();
-    if (failed(r))
-      return failure();
-  }
-  return success();
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(body);
+  HCAssignOp::create(builder, op.getLoc(),
+                     StringAttr::get(op.getContext(), ivTarget.getName()), iv);
+  LogicalResult r = lowerRegion(op.getBody());
+  if (succeeded(r))
+    HCYieldOp::create(builder, op.getLoc());
+  return r;
 }
 
 template <typename HCRegionOpT, typename FrontRegionOpT>
 LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
   // body). Nested-def folding is a later pass; if the front op declares
-  // parameters we still bind them as block args so the body resolves,
-  // but the `hc` op carries only a captures list (no formal params).
+  // parameters we still add them as block args, plus one leading
+  // `hc.assign "<p>", %arg` per param so the body's name lookups
+  // resolve via the promotion pass. The `hc` op carries only a
+  // captures list (no formal params), matching ODS.
   //
   // Lowering always emits a results-less region. Intent to carry a
   // value out travels through an `hc.region_return <names>`
@@ -1086,9 +1105,10 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
       HCRegionOpT::create(builder, op.getLoc(),
                           /*resultTypes=*/TypeRange{}, op.getCapturesAttr());
   Block *body = new Block();
-  Scope childScope;
-  childScope.parent = scopes.back().get();
-  if (auto params = op->template getAttrOfType<ArrayAttr>("parameters")) {
+  auto params = op->template getAttrOfType<ArrayAttr>("parameters");
+  SmallVector<StringAttr> paramNames;
+  if (params) {
+    paramNames.reserve(params.size());
     for (Attribute p : params) {
       auto dict = dyn_cast<DictionaryAttr>(p);
       if (!dict)
@@ -1096,18 +1116,17 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
       auto name = dict.template getAs<StringAttr>("name");
       if (!name)
         return op.emitOpError("parameters entry missing `name`");
-      BlockArgument arg = body->addArgument(undef, op.getLoc());
-      childScope.bind(name.getValue(), arg);
+      body->addArgument(undef, op.getLoc());
+      paramNames.push_back(name);
     }
   }
   newOp.getBody().push_back(body);
 
-  scopes.push_back(std::make_unique<Scope>(std::move(childScope)));
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(body);
-  LogicalResult r = lowerRegion(op.getBody());
-  scopes.pop_back();
-  return r;
+  for (auto [idx, name] : llvm::enumerate(paramNames))
+    HCAssignOp::create(builder, op.getLoc(), name, body->getArgument(idx));
+  return lowerRegion(op.getBody());
 }
 
 LogicalResult Lowerer::lowerWorkitemRegion(hc_front::WorkitemRegionOp op) {

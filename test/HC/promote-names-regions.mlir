@@ -642,3 +642,67 @@ hc.func @workitem_return_passthrough(%outer: !hc.undef) -> !hc.undef {
   %v = hc.name_load "v" : !hc.undef
   hc.return %v : !hc.undef
 }
+
+// -----
+
+// IV self-bind, positive path. The frontend emits
+// `hc.assign "<n>", %iv-block-arg` as the first body op (pattern
+// documented on `hc.assign` in HCOps.td); promotion matches the
+// pattern and folds "i" to direct uses of `%iv`. Post-promotion:
+// no iter_arg for "i", in-body `hc.name_load "i"` resolves to
+// `%iv`, no outer `hc.name_load "i"` survives.
+// CHECK-LABEL: hc.func @for_range_iv_self_bind
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: hc.for_range %arg0 to %arg1 step %arg2 : (!hc.undef, !hc.undef, !hc.undef) -> ()
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef):
+// CHECK:        hc.store %arg3[%[[IV]]], %[[IV]]
+// CHECK:      }
+// CHECK: hc.return
+hc.func @for_range_iv_self_bind(%lo: !hc.undef, %hi: !hc.undef,
+                                %step: !hc.undef, %buf: !hc.undef) {
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    hc.assign "i", %iv : !hc.undef
+    %a = hc.name_load "i" : !hc.undef
+    %b = hc.name_load "i" : !hc.undef
+    hc.store %buf[%a], %b : (!hc.undef, !hc.undef, !hc.undef) -> ()
+    hc.yield
+  }
+  hc.return
+}
+
+// -----
+
+// IV self-bind composed with an independent carried name. "i" is
+// loop-local (erased at the pre-scan); "acc" is a real iter_arg
+// threaded through the body + yield. Flat sweep resolves the outer
+// snap for "acc" to the function's `%init` param (%arg3), so the
+// printed op reads `iter_args(%arg3)`.
+// CHECK-LABEL: hc.func @for_range_iv_self_bind_with_acc
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%arg3) :
+// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %[[ACC:.*]]: !hc.undef):
+// CHECK:        %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
+// CHECK:        hc.yield %[[SUM]]
+// CHECK: hc.return %[[R]]
+hc.func @for_range_iv_self_bind_with_acc(%lo: !hc.undef, %hi: !hc.undef,
+                                         %step: !hc.undef,
+                                         %init: !hc.undef) -> !hc.undef {
+  hc.assign "acc", %init : !hc.undef
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    hc.assign "i", %iv : !hc.undef
+    %cur = hc.name_load "acc" : !hc.undef
+    %i = hc.name_load "i" : !hc.undef
+    %next = hc.add %cur, %i : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "acc", %next : !hc.undef
+    hc.yield
+  }
+  %final = hc.name_load "acc" : !hc.undef
+  hc.return %final : !hc.undef
+}

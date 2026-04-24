@@ -19,16 +19,15 @@ module {
 
 // -----
 
-// `param` name that never got bound — caller built a bad ref (or forgot
-// to populate parameters). The diagnostic names the identifier so the
-// classification can be debugged.
-module {
-  hc_front.kernel "bad_unbound_param" attributes {parameters = []} {
-    // expected-error@+1 {{hc_front.name 'x' (kind=param) not bound}}
-    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
-    hc_front.return
-  }
-}
+// Note: a "param" name that never gets bound is no longer a
+// conversion-time error. This pass emits `hc.name_load "x"`
+// unconditionally; a name with no reaching `hc.assign` surfaces in
+// `-hc-promote-names`, which owns the diagnostic path. The exact
+// wording is pinned in `test/HC/promote-names-invalid.mlir`
+// (promote-names in isolation) and `test/HCFrontToHC/pipeline-invalid.mlir`
+// (the end-to-end conversion + promote pipeline, i.e. the supported
+// user-facing shape). Keeping the coverage split that way lets each
+// pass assert its own contract.
 
 // -----
 

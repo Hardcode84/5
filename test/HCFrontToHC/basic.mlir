@@ -2,11 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// First RUN verifies the pass's direct output; the second pipes it back
-// through `hc-opt` so a round-trip parse+print catches any emitted IR
-// that's accepted by the pass but fails the hc dialect's verifier.
-// RUN: hc-opt --convert-hc-front-to-hc %s | FileCheck %s
-// RUN: hc-opt --convert-hc-front-to-hc %s | hc-opt | FileCheck %s
+// Positive-path coverage for the two-pass pipeline. See
+// `ConvertHCFrontToHC` in `include/hc/Conversion/HCFrontToHC/Passes.td`
+// for the contract; every LIT in this directory exercises the two
+// passes together. The second RUN round-trips through a bare `hc-opt`
+// parse+print to catch any IR the conversion pass emits that the `hc`
+// verifier would reject.
+// RUN: hc-opt --convert-hc-front-to-hc --hc-promote-names %s | FileCheck %s
+// RUN: hc-opt --convert-hc-front-to-hc --hc-promote-names %s | hc-opt | FileCheck %s
 
 // Exercises the mechanical hc_front -> hc rewrite patterns this pass
 // covers: top-level kernel/func/intrinsic, return/constant/binop,

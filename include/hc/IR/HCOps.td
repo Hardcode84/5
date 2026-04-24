@@ -863,6 +863,34 @@ def HCAssignOp : HC_Op<"assign", [MemoryEffects<[MemWrite]>]> {
     Cross-kernel / cross-function name capture is out of scope: each
     `hc.kernel` / `hc.func` owns its own name store, and promotion
     operates on one function region tree at a time.
+
+    ### Induction-variable self-bind
+
+    The one shape worth calling out explicitly — because it looks
+    redundant and isn't — is the induction-variable self-assign at the
+    top of an `hc.for_range` body:
+
+    ```
+    hc.for_range %lb, %ub, %step : !hc.undef -> () {
+    ^bb0(%iv: !hc.undef):
+      hc.assign "i", %iv : !hc.undef    // <-- IV self-bind
+      ...
+      hc.region_return
+    }
+    ```
+
+    The frontend emits this pattern unconditionally so every Python
+    name has a reaching `hc.assign` before it is read, including the
+    loop-counter name, without the frontend having to reason about
+    whether the counter is used in the body. `-hc-promote-names`
+    detects the pattern (any `hc.assign "<name>", %iv` where `%iv` is
+    the `hc.for_range` block argument) and erases it, then resolves
+    reads of `"i"` directly to `%iv`. Specifically it is *not* treated
+    as a carried-name / iter_arg candidate. See
+    `extractIvSelfBinds` / `promoteForRange` in
+    `lib/Transforms/HCPromoteNamesPass.cpp` for the matcher, and
+    `test/HC/promote-names-regions.mlir`'s `@for_range_iv_self_bind*`
+    cases for the pinned behaviour.
   }];
   let arguments = (ins StrAttr:$name, HC_ValueType:$value);
   let assemblyFormat = "$name `,` $value attr-dict `:` type($value)";

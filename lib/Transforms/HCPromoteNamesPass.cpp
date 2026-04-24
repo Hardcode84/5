@@ -299,6 +299,27 @@ static void writebackCarriedResults(OpBuilder &builder, Location loc,
   }
 }
 
+// Matcher for the IV self-bind pattern described in the `hc.assign`
+// ODS description (see "Induction-variable self-bind" in HCOps.td).
+// Consumes as many leading `hc.assign "<n>", %iv` ops as match and
+// returns the captured name -> %iv map. `promoteForRange` uses the
+// map in two ways: (1) to pre-seed the in-body binding scan so reads
+// of `<n>` resolve directly to %iv; (2) to exclude those names from
+// the snapshot / carried sets so no outer snap or iter_arg is ever
+// manufactured for a counter that only exists inside the loop.
+static llvm::SmallDenseMap<StringAttr, Value>
+extractIvSelfBinds(Block &body, BlockArgument ivArg) {
+  llvm::SmallDenseMap<StringAttr, Value> binds;
+  while (!body.empty()) {
+    auto assign = dyn_cast<HCAssignOp>(&body.front());
+    if (!assign || assign.getValue() != ivArg)
+      break;
+    binds[assign.getNameAttr()] = ivArg;
+    assign.erase();
+  }
+  return binds;
+}
+
 // Promote `op`, a `hc.for_range`, so every `hc.assign` / `hc.name_load`
 // inside its body is rewritten in terms of iter_args and `hc.yield`.
 // The old op is replaced with a new one with extended iter_inits /
@@ -306,12 +327,46 @@ static void writebackCarriedResults(OpBuilder &builder, Location loc,
 // scanned. Carried-name results get flanked with outer-scope
 // snapshots (before) and writebacks (after); the enclosing flat sweep
 // fuses those into direct SSA uses.
+//
+// Leading `hc.assign "<n>", %iv-block-arg` ops are handled as a
+// separate, pre-scan step — see `extractIvSelfBinds`. They are
+// pre-seeded into the body scan's binding, kept out of
+// snapshot / carried, and erased from the body before
+// `collectTopLevelNames` sees them.
 static LogicalResult promoteForRange(HCForRangeOp op) {
   Block &oldBody = op.getBody().front();
+  BlockArgument ivArg = oldBody.getArgument(0);
+  auto ivSelfBinds = extractIvSelfBinds(oldBody, ivArg);
+
   NameSet readSet;
   NameSet writeSet;
   collectTopLevelNames(oldBody, readSet, writeSet);
-  if (readSet.empty() && writeSet.empty())
+  // IV self-bind names may still appear as reads in the body (the
+  // user's code says `for i in ...: use(i)`); drop them from both
+  // sets so snapshot / iter_init computation treats them as loop-
+  // local, not carried.
+  //
+  // writeSet membership is the IV-name-shadow case: the user wrote
+  // `for i in ...: i = expr`. The leading self-bind is already
+  // stripped by `extractIvSelfBinds`, but a remaining in-body
+  // `hc.assign "i", %expr` still lands here in writeSet. Dropping
+  // it means the shadow write is consumed by the body scan
+  // (`binding["i"]` gets overwritten and subsequent `hc.name_load
+  // "i"` reads resolve to %expr) but is *not* promoted to an
+  // iter_arg / iter_result. The shadow stays loop-local — the outer
+  // scope does not see the shadowed value after the loop.
+  //
+  // That diverges from Python's leaking-loop-variable semantics, but
+  // making it leak here would require synthesizing an outer snap for
+  // the IV name, which is not a thing that exists at this layer
+  // (the IV is a block arg, not a name in the outer store). The
+  // Python driver is expected to reject IV-name shadowing before it
+  // reaches MLIR; this block is the belt to that suspenders.
+  for (auto &kv : ivSelfBinds) {
+    readSet.remove(kv.first);
+    writeSet.remove(kv.first);
+  }
+  if (readSet.empty() && writeSet.empty() && ivSelfBinds.empty())
     return success();
 
   NameSet snapshot = readSet;
@@ -353,19 +408,23 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   for (StringAttr name : carried)
     iterArgFor[name] = body.addArgument(undefTy, loc);
 
-  // Seed the scan: every carried name starts out as its iter_arg; every
-  // read-only snapshot name as its outer-scope snap value. A `hc.assign`
+  // Seed the scan: IV self-bind names resolve to %iv directly; every
+  // carried name starts out as its iter_arg; every read-only
+  // snapshot name as its outer-scope snap value. A `hc.assign`
   // encountered during the scan overwrites the binding; the yield
   // rebuild picks up whatever the last write left.
   //
-  // `binding` is seeded with `readSet ∪ writeSet`, which by construction
-  // covers every top-level `hc.name_load` in `body`, so the scan cannot
-  // emit the reaching-def diagnostic here. The only remaining failure
-  // mode is the stale-NameStoreRegionOpInterface check — a pass bug,
-  // not a frontend bug. By this point we've already restructured the
-  // outer IR (new op + `takeBody`), so a soft `return failure()` would
-  // leak a torn module; abort fatally instead.
+  // `binding` is seeded with `readSet ∪ writeSet ∪ ivSelfBinds`,
+  // which by construction covers every top-level `hc.name_load` in
+  // `body`, so the scan cannot emit the reaching-def diagnostic
+  // here. The only remaining failure mode is the
+  // stale-NameStoreRegionOpInterface check — a pass bug, not a
+  // frontend bug. By this point we've already restructured the
+  // outer IR (new op + `takeBody`), so a soft `return failure()`
+  // would leak a torn module; abort fatally instead.
   llvm::StringMap<Value> binding;
+  for (auto &kv : ivSelfBinds)
+    binding[kv.first.getValue()] = kv.second;
   for (StringAttr name : snapshot)
     binding[name.getValue()] = snapValues[name];
   for (StringAttr name : carried)

@@ -4,7 +4,7 @@
 [transform dialect](https://mlir.llvm.org/docs/Dialects/Transform/). A
 *schedule* is a small MLIR module that exposes a named sequence
 `@__transform_main` applying `transform.apply_registered_pass` ops in
-order. The python driver builds a two-pass pipeline —
+order. The Python driver builds a two-pass pipeline —
 `transform-preload-library` followed by `transform-interpreter` — and
 hands it the schedule file, so any pass that is registered in the
 process's MLIR pass registry (upstream canonicalize / cse / ...,
@@ -44,17 +44,25 @@ fresh one, which is why the entry-block argument is not marked
 
 `hc.compile(kernel_fn, symbols, schedule=...)` accepts either:
 
-* `pathlib.Path` — read the schedule from that file,
-* `str` — treat the string as an inline transform-module body,
+* `pathlib.Path` — read the schedule from that file. The path is
+  resolved to absolute and checked for existence up front; a missing
+  file raises `FileNotFoundError` immediately rather than surfacing as
+  a far-away MLIR diagnostic. Paths with characters the MLIR option
+  parser treats as delimiters (`,`, `}`, `=`) will still break the
+  pipeline — avoid them.
+* `str` — always treated as inline transform-module text. A path that
+  happens to be stored as a string will be fed to the parser verbatim,
+  not opened; wrap it with `Path(...)` first.
 * `None` (default) — use the bundled schedule.
 
 Anything else is a `TypeError`.
 
-### Example: skip the inliner
+### Example: skip `hc-promote-names`
 
-Undecorated helper inlining is an opt-in stage — when a kernel has no
-`ref.kind = "inline"` callees, `-hc-front-inline` is a no-op and there
-is nothing to gain from running it. A custom schedule can drop it:
+`hc-promote-names` folds `hc.name_load`/`hc.assign` ops into SSA
+values. A caller interested in inspecting the name-based IR before that
+rewrite (debugging, introspection tooling) can drop it from the
+schedule:
 
 ```python
 schedule = """
@@ -62,9 +70,9 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%m: !transform.any_op) {
     %m1 = transform.apply_registered_pass "hc-front-fold-region-defs" to %m
         : (!transform.any_op) -> !transform.any_op
-    %m2 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m1
+    %m2 = transform.apply_registered_pass "hc-front-inline" to %m1
         : (!transform.any_op) -> !transform.any_op
-    %m3 = transform.apply_registered_pass "hc-promote-names" to %m2
+    %m3 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m2
         : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
@@ -72,7 +80,12 @@ module attributes {transform.with_named_sequence} {
 """
 
 handle = hc.compile(kernel_fn, {sym.W: 128}, schedule=schedule)
+assert "hc.name_load" in handle.hc_ir_text  # survives without promote
 ```
+
+A minimal variant — only `convert-hc-front-to-hc`, also a valid
+override — is what `tests/test_hc_compile.py` exercises; both shapes
+are legal so long as every pass name resolves.
 
 The handle still carries `front_ir` / `front_ir_text` unchanged; only
 `hc_ir` / `hc_ir_text` reflect the shorter pipeline.

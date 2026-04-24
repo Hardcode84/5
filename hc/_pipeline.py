@@ -75,6 +75,8 @@ def run_front_to_hc(
     context=ctx)`).
     """
 
+    from .mlir import ir
+
     context = front_module.context
     diagnostics: list[str] = []
 
@@ -92,7 +94,13 @@ def run_front_to_hc(
             try:
                 pm = _build_pass_manager(pipeline, context)
                 pm.run(front_module.operation)
-            except Exception as exc:
+            except ir.MLIRError as exc:
+                # Narrow catch on purpose: `MLIRError` is the one thing
+                # `PassManager.parse`/`.run` contract to raise on pipeline
+                # trouble (bad schedule, verifier failure, pass error).
+                # Anything else (ValueError from our own driver, bugs,
+                # KeyboardInterrupt) propagates — silently swallowing
+                # them would turn real bugs into "hc_ir came back None".
                 _capture_exception(diagnostics, exc)
                 return PipelineResult(None, None, tuple(diagnostics))
             return PipelineResult(
@@ -108,6 +116,14 @@ def prepared_context() -> Any:
     Used by both the resolver (so the hc_front module it produces is
     compatible with the pipeline) and `run_front_to_hc`. Caller owns the
     context's lifetime.
+
+    Collocates three nominally-separate concerns — context allocation,
+    dialect registration on that context, and process-wide pass
+    registration — because every caller that wants one also wants the
+    other two. Splitting them would let callers build half-initialized
+    contexts and then get surprising failures at parse or pipeline-run
+    time; bundling makes the precondition "usable for hc_front + hc
+    work" a single call.
     """
 
     _ensure_passes_registered()
@@ -163,18 +179,28 @@ def _capture_exception(diagnostics: list[str], exc: Exception) -> None:
 
 @contextmanager
 def _schedule_file(schedule: ScheduleSource) -> Iterator[Path]:
-    """Yield a filesystem path to the schedule, materialising inline text.
+    """Yield a filesystem path to the schedule, materializing inline text.
 
     `transform-preload-library` takes file paths, not inline IR. When the
     user passes a raw MLIR string we drop it into a tempfile for the
-    duration of the pass run; when they pass a `Path`, we use it
-    directly. Default is the packaged `front_to_hc.mlir` resource, which
-    on an installed wheel may live inside a zip — resources.files() +
+    duration of the pass run; when they pass a `Path`, we resolve it to
+    absolute + check it exists so the error is a clean `FileNotFoundError`
+    instead of whatever MLIR prints when it can't open the file.
+    `Path` values with characters the MLIR option parser treats as
+    delimiters (`,`, `}`, `=`) will still break the pipeline string —
+    that's a thin footgun we document rather than paper over.
+    Default is the packaged `front_to_hc.mlir` resource, which on an
+    installed wheel may live inside a zip — resources.files() +
     read_text() handles both cases.
     """
 
     if isinstance(schedule, Path):
-        yield schedule
+        resolved = schedule.resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"schedule file not found: {schedule} (resolved to {resolved})"
+            )
+        yield resolved
         return
     if isinstance(schedule, str):
         text = schedule

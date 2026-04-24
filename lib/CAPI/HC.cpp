@@ -16,20 +16,9 @@
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(HC, hc, mlir::hc::HCDialect)
 
-// Registers hc's three pass families (hc-front transforms, hc-front→hc
-// conversion, hc transforms) into the process-wide pass registry.
-//
-// We deliberately do NOT call `mlir::registerAllPasses()` here: the Python
-// bindings import `_mlirRegisterEverything` during site initialization,
-// which already registers every upstream pass and pipeline. Re-registering
-// pipelines (they use `PassPipelineRegistration` which throws on
-// duplicates) would abort with "registered multiple times". Our three
-// calls are safe because the upstream `registerHC*Passes` entry points
-// check before inserting.
-//
-// `std::call_once` guards against callers invoking this once per context
-// within the same process; the observable state — "hc pass names are
-// resolvable by `PassManager::parse`" — is fully set after the first call.
+// See HC.h for the contract around upstream pass registration
+// (`registerAllPasses` is intentionally not called here). `std::call_once`
+// guards the idempotency the header promises.
 void mlirRegisterHCAllPasses(void) {
   static std::once_flag flag;
   std::call_once(flag, []() {

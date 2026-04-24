@@ -242,6 +242,13 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
     # env, same pattern as test_hc_front_python_bindings.py) and a kernel
     # function whose source file is on disk — `inspect.getsource` is used
     # to recover the text. `python -c '...'` scripts do not satisfy that.
+    #
+    # Kernel body uses an implicit-return assignment to dodge 5-36p (the
+    # conversion pass still lowers `return None` to `hc.return %0`, which
+    # the kernel verifier rejects). The pipeline has to actually run for
+    # the `hc_ir` assertion below to mean anything — a weaker version of
+    # this test that only poked at `front_ir_text` would silently pass
+    # against a fully broken default schedule.
     script = tmp_path / "smoke.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -252,7 +259,7 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 
             @kernel(work_shape=(sym.W,), literals={sym.W})
             def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
-                return None
+                row = group.group_id[0]
 
 
             def main() -> None:
@@ -260,6 +267,8 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
                 assert isinstance(handle, CompiledKernel)
                 assert handle.bindings == {"W": 128}
                 assert "hc_front.kernel" in handle.front_ir_text
+                assert handle.hc_ir is not None, handle.pipeline_diagnostics
+                assert handle.pipeline_diagnostics == ()
                 try:
                     handle()
                 except NotImplementedError:
@@ -378,6 +387,95 @@ def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_honors_path_schedule_override(tmp_path: Path) -> None:
+    # The `str` and `None` paths through `schedule=` go through
+    # `_schedule_file`'s tempfile branch; a real `Path` goes through
+    # the resolve/exists/yield branch. Exercise that explicitly so the
+    # path branch has an actual gate, including the resolve-to-absolute
+    # behaviour (we pass a relative path via cwd and still expect a hit).
+    script = tmp_path / "compile_path_override.py"
+    schedule_file = tmp_path / "custom_schedule.mlir"
+    schedule_file.write_text(textwrap.dedent("""
+        module attributes {transform.with_named_sequence} {
+          transform.named_sequence @__transform_main(%m: !transform.any_op) {
+            %m1 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m
+                : (!transform.any_op) -> !transform.any_op
+            transform.yield
+          }
+        }
+        """))
+    script.write_text(textwrap.dedent(f"""
+            from pathlib import Path
+
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            sym = hc.sym
+
+
+            @kernel(work_shape=(sym.W,), literals={{sym.W}})
+            def bar(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                row = group.group_id[0]
+
+
+            def main() -> None:
+                schedule = Path({str(schedule_file)!r})
+                handle = hc.compile(bar, {{sym.W: 64}}, schedule=schedule)
+                assert handle.hc_ir is not None, handle.pipeline_diagnostics
+                # Same schedule shape as the inline-override test —
+                # name_load survives because promote-names is skipped.
+                assert "hc.name_load" in handle.hc_ir_text, handle.hc_ir_text
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_rejects_missing_schedule_path(tmp_path: Path) -> None:
+    # A Path that doesn't exist has to fail loudly with FileNotFoundError
+    # rather than getting silently fed into the MLIR options parser and
+    # producing a confusing diagnostic far from the source of the mistake.
+    script = tmp_path / "compile_missing_path.py"
+    missing = tmp_path / "not_a_real_schedule.mlir"
+    script.write_text(textwrap.dedent(f"""
+            from pathlib import Path
+
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            sym = hc.sym
+
+
+            @kernel(work_shape=(sym.W,), literals={{sym.W}})
+            def bar(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                row = group.group_id[0]
+
+
+            def main() -> None:
+                try:
+                    hc.compile(bar, {{sym.W: 64}}, schedule=Path({str(missing)!r}))
+                except FileNotFoundError as exc:
+                    assert {str(missing)!r} in str(exc), str(exc)
+                    print("OK")
+                else:
+                    raise AssertionError("expected FileNotFoundError")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_surfaces_pipeline_failure_non_fatal(tmp_path: Path) -> None:
     # Hand the driver an inline schedule that names a pass that doesn't
     # exist. We expect the handle to come back with hc_ir=None, the
@@ -431,6 +529,12 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
     # ``hc.compile``: ``front_ir_symbols`` exposes the closed dep set and
     # every load-context ``hc_front.name`` carries a ``ref`` attribute.
     # The real WMMA example is the richest fixture we have for this check.
+    #
+    # We deliberately do not assert on ``handle.hc_ir`` here: WMMA exercises
+    # constructs (pre-sliced buffer_view into ``group.load``) that still
+    # trip open lowering bugs (5-2fj hc.load rank mismatch, 5-36p hc.return
+    # operand). Once those land, tighten this to also gate the full
+    # pipeline on the heaviest example.
     script = tmp_path / "compile_wmma.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""

@@ -26,9 +26,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._pipeline import ScheduleSource
 from .core import KernelMetadata
 
-ScheduleSource = Any  # re-exported shape; the real alias lives in ._pipeline
+# `_pipeline` at the module top-level is cheap: it only touches stdlib at
+# import time. The MLIR-heavy imports (`hc.mlir.ir`, dialects, PassManager)
+# stay lazy inside function bodies, so simulator-only callers that never
+# invoke `hc.compile` don't load the native bindings.
+
+__all__ = ["CompiledKernel", "ScheduleSource", "compile"]
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,14 @@ def compile(
     # would end up identical after a successful pipeline run.
     front_ir_text = str(front_module)
 
+    # Round-trip through text is our "clone" primitive: the MLIR Python
+    # bindings don't expose a cheap in-memory module clone, and we need
+    # two handles to the same IR — one pinned as the pre-pipeline
+    # snapshot, one handed to the driver to be mutated. Parse + print
+    # does not round-trip every piece of metadata (some debug info, some
+    # exotic attributes); any caller that needs bit-exact lineage should
+    # keep their own copy of `front_ir_text` rather than comparing
+    # `front_ir` and `hc_ir` module objects.
     from .mlir import ir as _ir
 
     pipeline_module = _ir.Module.parse(front_ir_text, context=context)

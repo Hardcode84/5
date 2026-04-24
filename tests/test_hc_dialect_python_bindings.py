@@ -24,7 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # The hc_front smoke test already builds the native package once per session
 # via `@lru_cache`; this suite hangs off the same knob so both sets skip
 # together when the env opts out.
-_SKIP_HC_DIALECT_TESTS = pytest.mark.skipif(
+# The env knob is named `HC_SKIP_HC_FRONT_DIALECT_TESTS` across the suite;
+# keeping the mark symbol aligned with its sibling files makes grep for
+# "which tests get gated by that env" honest.
+_SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
     reason="native hc dialect smoke tests disabled by env",
 )
@@ -76,7 +79,7 @@ def _run_python(script: str) -> subprocess.CompletedProcess[str]:
         ) from exc
 
 
-@_SKIP_HC_DIALECT_TESTS
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_hc_dialect_registers_and_parses_lowered_ir() -> None:
     result = _run_python(f"""
         import json
@@ -96,7 +99,7 @@ def test_hc_dialect_registers_and_parses_lowered_ir() -> None:
     assert "hc.return" in payload["module"]
 
 
-@_SKIP_HC_DIALECT_TESTS
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
     # PassManager.parse raises if any pass name in the pipeline string is
     # unknown, so a successful parse is proof that both our hc-specific
@@ -131,7 +134,7 @@ def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
     assert payload["ok"] is True
 
 
-@_SKIP_HC_DIALECT_TESTS
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_register_passes_is_idempotent_across_contexts() -> None:
     # The CAPI shim wraps registration in a `std::once_flag`, but callers
     # invoking it from two ad-hoc contexts should still observe a coherent

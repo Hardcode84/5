@@ -2,6 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+"""Lazy re-export shim for `hc_mlir.passmanager`.
+
+Mirrors `hc.mlir.ir` / `hc.mlir.dialects.*` — call `load_hc_mlir()` to
+make sure the native package is on `sys.path`, then mirror every public
+symbol from the underlying `hc_mlir.passmanager` module onto this one.
+`hc.compile`'s pipeline driver is the only current consumer; the shim
+exists so downstream code can reach `PassManager` without caring about
+the build-tree install layout.
+"""
+
 from __future__ import annotations
 
 import importlib

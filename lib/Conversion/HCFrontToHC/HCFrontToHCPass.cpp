@@ -98,6 +98,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <cmath>
 #include <optional>
 
 namespace mlir::hc::front {
@@ -272,9 +273,20 @@ std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
 // the destination type and the positional literal supplies the value.
 // `BoolAttr` is itself an `IntegerAttr` subclass in upstream MLIR, so
 // `dyn_cast<IntegerAttr>` picks it up for the i1 case. Returns null if
-// the source attribute isn't a scalar numeric; callers fall back to the
+// the source attribute isn't a scalar numeric (or is outside the set of
+// safely-representable values for the target); callers fall back to the
 // TypeAttr form so the downstream verifier (not this helper) produces
 // the diagnostic about an unexpected payload.
+//
+// Float -> float and int -> float route through `APFloat::get(double)`
+// inside `FloatAttr::get`, which tolerates NaN/Inf at any target
+// precision. Float -> int is the tricky direction: a plain
+// `static_cast<int64_t>(double)` is UB for NaN/Inf and for values
+// outside `[INT64_MIN, INT64_MAX]` (C++ [conv.fpint]). Use hex-float
+// literals of +/-2^63 (both exactly representable as `double`) to
+// bracket the safe range, and treat i1 separately as NumPy's `bool_`
+// truthiness rather than bit-pattern truncation — `APInt(1, 2)` would
+// store 0 (low bit), flipping the user's boolean under our feet.
 Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
   if (auto ft = dyn_cast<FloatType>(targetTy)) {
     if (auto f = dyn_cast<FloatAttr>(src))
@@ -284,10 +296,20 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
     return {};
   }
   if (auto it = dyn_cast<IntegerType>(targetTy)) {
+    bool isI1 = it.getWidth() == 1;
     if (auto i = dyn_cast<IntegerAttr>(src))
-      return IntegerAttr::get(it, i.getInt());
-    if (auto f = dyn_cast<FloatAttr>(src))
-      return IntegerAttr::get(it, static_cast<int64_t>(f.getValueAsDouble()));
+      return isI1 ? IntegerAttr::get(it, i.getValue().isZero() ? 0 : 1)
+                  : IntegerAttr::get(it, i.getInt());
+    if (auto f = dyn_cast<FloatAttr>(src)) {
+      double v = f.getValueAsDouble();
+      if (isI1)
+        return IntegerAttr::get(it, v != 0.0 ? 1 : 0);
+      if (!std::isfinite(v))
+        return {};
+      if (v < -0x1.0p63 || v >= 0x1.0p63)
+        return {};
+      return IntegerAttr::get(it, static_cast<int64_t>(v));
+    }
     return {};
   }
   return {};
@@ -1652,10 +1674,10 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // surface their own diagnostic downstream rather than fail here on a
   // coercion the verifier can describe better.
   if (ref.getKind() == "numpy_dtype_type") {
+    StringRef dtype = ref.getString("dtype");
     Attribute typed;
     if (!args.positional.empty()) {
       if (auto litOp = args.positional.front().getDefiningOp<HCConstOp>()) {
-        StringRef dtype = ref.getString("dtype");
         if (auto tyOpt = resolveNumpyDtypeType(call.getContext(), dtype))
           typed = coerceNumpyLiteral(*tyOpt, litOp.getValue());
       }

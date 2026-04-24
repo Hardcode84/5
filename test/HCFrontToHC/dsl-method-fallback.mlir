@@ -85,11 +85,10 @@ module {
   }
 
   // Value-constructor with no positional arg falls back to the dtype
-  // handle (`hc.const<TypeAttr>`) emitted by `lowerAttr`. Keeping the
-  // degradation path tested means the branch doesn't silently start
+  // handle (`hc.const<TypeAttr>`) emitted by `lowerAttr`. Pins the
+  // degradation path so the coercion branch can't silently start
   // diagnosing legitimate type-only users (`.astype` et al route
-  // through the attribute position, but this guard is the cheap
-  // insurance that the fallback itself works).
+  // through the attribute position).
   // CHECK-LABEL: hc.kernel @numpy_dtype_call_bare
   hc_front.kernel "numpy_dtype_call_bare" attributes {parameters = []} {
     // CHECK: hc.const<f16> : !hc.undef
@@ -99,6 +98,63 @@ module {
     %val = hc_front.call %f16()
     %t_val = hc_front.target_name "v"
     hc_front.assign %t_val = %val
+    hc_front.return
+  }
+
+  // `np.bool_(lit)` — NumPy's `bool_` is *truthiness* semantics, not
+  // bit-pattern truncation. A naive `APInt(1, lit)` would fold the
+  // low bit, so `np.bool_(2)` would store 0 and `np.bool_(0.5)` would
+  // store 0 too. Coercion has to detect i1 targets and route through
+  // `!= 0` instead. Covers both the integer-payload (`2 → 1`) and
+  // float-payload (`0.5 → 1`, `0.0 → 0`) branches.
+  // CHECK-LABEL: hc.kernel @numpy_bool_truthiness
+  hc_front.kernel "numpy_bool_truthiness" attributes {parameters = []} {
+    // CHECK: hc.const<true> : !hc.undef
+    // CHECK: hc.const<true> : !hc.undef
+    // CHECK: hc.const<false> : !hc.undef
+    // CHECK-NOT: hc_front.
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %two_i = hc_front.constant<2 : i64>
+    %b1 = hc_front.attr %np, "bool_" {ref = {dtype = "bool_", kind = "numpy_dtype_type"}}
+    %v1 = hc_front.call %b1(%two_i)
+    %t1 = hc_front.target_name "b1"
+    hc_front.assign %t1 = %v1
+    %half = hc_front.constant<5.000000e-01 : f64>
+    %b2 = hc_front.attr %np, "bool_" {ref = {dtype = "bool_", kind = "numpy_dtype_type"}}
+    %v2 = hc_front.call %b2(%half)
+    %t2 = hc_front.target_name "b2"
+    hc_front.assign %t2 = %v2
+    %zero_f = hc_front.constant<0.000000e+00 : f64>
+    %b3 = hc_front.attr %np, "bool_" {ref = {dtype = "bool_", kind = "numpy_dtype_type"}}
+    %v3 = hc_front.call %b3(%zero_f)
+    %t3 = hc_front.target_name "b3"
+    hc_front.assign %t3 = %v3
+    hc_front.return
+  }
+
+  // Float -> int coercion: NaN/Inf and values outside `[-2^63, 2^63)`
+  // hit UB under a plain `static_cast<int64_t>(double)` (C++
+  // [conv.fpint]). The coercion rejects those silently (returns null
+  // attr) and falls back to the `hc.const<TypeAttr>` dtype handle, so
+  // downstream users either accept the dtype or diagnose themselves
+  // instead of reading a poisoned literal. Finite in-range literals
+  // still produce a typed `IntegerAttr` as before.
+  // CHECK-LABEL: hc.kernel @numpy_int_from_float
+  hc_front.kernel "numpy_int_from_float" attributes {parameters = []} {
+    // CHECK: hc.const<3 : i32> : !hc.undef
+    // CHECK: hc.const<i32> : !hc.undef
+    // CHECK-NOT: hc_front.
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %three_f = hc_front.constant<3.000000e+00 : f64>
+    %i32a = hc_front.attr %np, "int32" {ref = {dtype = "int32", kind = "numpy_dtype_type"}}
+    %va = hc_front.call %i32a(%three_f)
+    %ta = hc_front.target_name "ia"
+    hc_front.assign %ta = %va
+    %inf = hc_front.constant<0x7FF0000000000000 : f64>
+    %i32b = hc_front.attr %np, "int32" {ref = {dtype = "int32", kind = "numpy_dtype_type"}}
+    %vb = hc_front.call %i32b(%inf)
+    %tb = hc_front.target_name "ib"
+    hc_front.assign %tb = %vb
     hc_front.return
   }
 

@@ -39,13 +39,13 @@ from ._sim_types import (
 from .core import (
     BufferSpec,
     CurrentGroup,
+    HelperFunction,
+    IntrinsicFunction,
     KernelMetadata,
     SubGroup,
     WorkGroup,
     WorkItem,
-    _HelperFunction,
-    _IntrinsicFunction,
-    _sim_callable_from_code,
+    sim_callable_from_code,
 )
 from .symbols import Bindings, Env, Expr, Symbol, SymbolError, sym
 
@@ -946,25 +946,25 @@ def _profile_calls(frame: FrameType, event: str, arg: Any) -> Callable[..., Any]
     state = _current_execution_state()
     if state is None:
         return _profile_calls
-    fn = _sim_callable_from_code(frame.f_code)
+    fn = sim_callable_from_code(frame.f_code)
     if fn is None:
         return _profile_calls
     if hasattr(fn, "__hc_func__"):
         _check_helper_call(fn, state)
         return _profile_calls
     if hasattr(fn, "__hc_intrinsic__"):
-        _check_intrinsic_call(cast(_IntrinsicFunction, fn), state, frame)
+        _check_intrinsic_call(cast(IntrinsicFunction, fn), state, frame)
     return _profile_calls
 
 
-def _check_helper_call(fn: _HelperFunction, state: _ExecutionState) -> None:
+def _check_helper_call(fn: HelperFunction, state: _ExecutionState) -> None:
     _require_declared_scope(
         "helper", fn.__name__, fn.__hc_func__.scope, state.group._scope
     )
 
 
 def _check_intrinsic_call(
-    fn: _IntrinsicFunction, state: _ExecutionState, frame: FrameType
+    fn: IntrinsicFunction, state: _ExecutionState, frame: FrameType
 ) -> None:
     metadata = fn.__hc_intrinsic__
     _require_declared_scope(

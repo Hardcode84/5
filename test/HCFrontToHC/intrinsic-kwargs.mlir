@@ -41,8 +41,8 @@ module {
   // migrate to op attributes. The resulting operand count matches the
   // filtered signature on `hc.intrinsic @demo_intr`.
   // CHECK-LABEL: hc.func @caller
-  // CHECK: %[[LANE:[0-9]+]] = hc.name_load "lane"
-  // CHECK: hc.call_intrinsic @demo_intr(%{{[0-9]+}}, %{{[0-9]+}}, %[[LANE]])
+  // CHECK: %[[LANE:[^ ]+]] = hc.name_load "lane"
+  // CHECK: hc.call_intrinsic @demo_intr(%[[GROUP:[^,]+]], %[[VALUE:[^,]+]], %[[LANE]])
   // CHECK-SAME: {arch = "gfx11", wave_size = 32 : i64}
   // CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
   hc_front.func "caller" attributes {
@@ -74,8 +74,8 @@ module {
   // `lane` lands in the third slot because that is its position in
   // `demo_intr`'s declared parameters.
   // CHECK-LABEL: hc.func @shuffled_kwargs
-  // CHECK: %[[LANE2:[0-9]+]] = hc.name_load "lane"
-  // CHECK: hc.call_intrinsic @demo_intr(%{{[0-9]+}}, %{{[0-9]+}}, %[[LANE2]])
+  // CHECK: %[[LANE2:[^ ]+]] = hc.name_load "lane"
+  // CHECK: hc.call_intrinsic @demo_intr(%[[GROUP2:[^,]+]], %[[VALUE2:[^,]+]], %[[LANE2]])
   // CHECK-SAME: {arch = "gfx11", wave_size = 32 : i64}
   hc_front.func "shuffled_kwargs" attributes {
     decorators = ["kernel.func"],

@@ -151,13 +151,13 @@ struct HCFrontFoldRegionDefsPass
   using HCFrontFoldRegionDefsBase::HCFrontFoldRegionDefsBase;
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
+    ModuleOp moduleOp = getOperation();
     // Collect region ops first, fold second; mutating during the
     // walk is tempting but the fold erases sibling ops and can
     // invalidate the walker's position.
     SmallVector<hc_front::WorkitemRegionOp> witRegions;
     SmallVector<hc_front::SubgroupRegionOp> sgRegions;
-    module.walk([&](Operation *op) {
+    moduleOp.walk([&](Operation *op) {
       if (auto w = dyn_cast<hc_front::WorkitemRegionOp>(op))
         witRegions.push_back(w);
       else if (auto s = dyn_cast<hc_front::SubgroupRegionOp>(op))

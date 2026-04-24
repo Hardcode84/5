@@ -458,6 +458,33 @@ def _build_lock(lock_path: Path) -> Iterator[None]:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def cmake_generator_args() -> list[str]:
+    return _cmake_generator_args()
+
+
+def cmake_executable() -> str:
+    return _cmake_executable()
+
+
+def run_command(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return _run_command(command, cwd=cwd)
+
+
+def command_error(
+    kind: str,
+    command: list[str],
+    cwd: Path,
+    result: subprocess.CompletedProcess[str],
+) -> RuntimeError:
+    return _command_error(kind, command, cwd, result)
+
+
+@contextmanager
+def build_lock(lock_path: Path) -> Iterator[None]:
+    with _build_lock(lock_path):
+        yield
+
+
 def _force_rebuild_requested() -> bool:
     return os.environ.get("HC_LLVM_FORCE_REBUILD") == "1"
 

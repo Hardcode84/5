@@ -126,11 +126,18 @@ class _IntrinsicFunction(Protocol):
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
+HelperFunction = _HelperFunction
+IntrinsicFunction = _IntrinsicFunction
+
 _SIM_CALLABLES_BY_CODE: dict[CodeType, Callable[..., Any]] = {}
 
 
 def _sim_callable_from_code(code: CodeType) -> Callable[..., Any] | None:
     return _SIM_CALLABLES_BY_CODE.get(code)
+
+
+def sim_callable_from_code(code: CodeType) -> Callable[..., Any] | None:
+    return _sim_callable_from_code(code)
 
 
 def _register_sim_callable(fn: Callable[..., Any]) -> None:

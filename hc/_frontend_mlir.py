@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from ._frontend import _FrontendEmitError
+from ._frontend import FrontendEmitError
 from .mlir import ir
 from .mlir.dialects import hc_front
 
@@ -525,10 +525,10 @@ class HCFrontEmitter:
         self,
         payload: dict[str, object],
         message: str,
-    ) -> _FrontendEmitError:
+    ) -> FrontendEmitError:
         line = payload.get("line")
         column = payload.get("column")
-        return _FrontendEmitError(
+        return FrontendEmitError(
             message,
             line=line if isinstance(line, int) else None,
             column=column if isinstance(column, int) else None,

@@ -20,7 +20,7 @@ from build_tools.hc_native_tools import (
 )
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
 from hc import Buffer, CompiledKernel, CurrentGroup, compile, kernel
-from hc._compile import _normalise_bindings, _symbol_name
+from hc._compile import normalise_bindings, symbol_name
 from hc.core import KernelMetadata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,7 +119,7 @@ def test_compile_rejects_non_int_binding() -> None:
         compile(foo, {sym.W: "16"})
 
 
-# --- _normalise_bindings ---------------------------------------------------
+# --- normalise_bindings ----------------------------------------------------
 
 
 def test_normalise_bindings_rejects_unknown_literal() -> None:
@@ -127,7 +127,7 @@ def test_normalise_bindings_rejects_unknown_literal() -> None:
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
     with pytest.raises(ValueError, match="not a declared literal symbol"):
-        _normalise_bindings({"H": 16}, metadata)
+        normalise_bindings({"H": 16}, metadata)
 
 
 def test_normalise_bindings_rejects_bool_and_str_values() -> None:
@@ -136,10 +136,10 @@ def test_normalise_bindings_rejects_bool_and_str_values() -> None:
 
     # `True` is an int subclass but booleans are not intended shape values.
     with pytest.raises(TypeError, match="must bind to an int"):
-        _normalise_bindings({sym.W: True}, metadata)
+        normalise_bindings({sym.W: True}, metadata)
 
     with pytest.raises(TypeError, match="must bind to an int"):
-        _normalise_bindings({sym.W: "16"}, metadata)
+        normalise_bindings({sym.W: "16"}, metadata)
 
 
 def test_normalise_bindings_allows_empty_map() -> None:
@@ -148,7 +148,7 @@ def test_normalise_bindings_allows_empty_map() -> None:
 
     # Partial specialization (empty here) must be valid; later pipeline
     # stages refine what is left — the doc calls this out.
-    assert _normalise_bindings({}, metadata) == {}
+    assert normalise_bindings({}, metadata) == {}
 
 
 def test_normalise_bindings_allows_any_key_when_no_literals_declared() -> None:
@@ -156,15 +156,15 @@ def test_normalise_bindings_allows_any_key_when_no_literals_declared() -> None:
 
     # Deliberate: a kernel without a `literals=` whitelist lets any key
     # through. Doc calls this out; later stages will tighten it.
-    assert _normalise_bindings({"wave_size": 32}, metadata) == {"wave_size": 32}
+    assert normalise_bindings({"wave_size": 32}, metadata) == {"wave_size": 32}
 
 
 def test_normalise_bindings_symbol_and_string_keys_agree() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    by_symbol = _normalise_bindings({sym.W: 8}, metadata)
-    by_string = _normalise_bindings({"W": 8}, metadata)
+    by_symbol = normalise_bindings({sym.W: 8}, metadata)
+    by_string = normalise_bindings({"W": 8}, metadata)
     assert by_symbol == by_string == {"W": 8}
 
 
@@ -175,26 +175,26 @@ def test_normalise_bindings_flags_conflicting_duplicate_keys() -> None:
     # Same logical key via two forms pointing at different values is
     # ambiguous — fail loudly instead of last-write-wins.
     with pytest.raises(ValueError, match="bound twice"):
-        _normalise_bindings({sym.W: 8, "W": 16}, metadata)
+        normalise_bindings({sym.W: 8, "W": 16}, metadata)
 
 
-# --- _symbol_name name resolution ------------------------------------------
+# --- symbol_name name resolution -------------------------------------------
 
 
 def test_symbol_name_accepts_string() -> None:
-    assert _symbol_name("W") == "W"
+    assert symbol_name("W") == "W"
 
 
 def test_symbol_name_accepts_symbol_instance() -> None:
     sym = _sym()
-    assert _symbol_name(sym.W) == "W"
+    assert symbol_name(sym.W) == "W"
 
 
 def test_symbol_name_rejects_arbitrary_dot_name_objects() -> None:
     # A path-like object has a `.name` attribute but is not a Symbol;
     # rejecting it prevents bindings from silently using a surprising key.
     with pytest.raises(TypeError, match="cannot interpret"):
-        _symbol_name(Path("/tmp/W"))
+        symbol_name(Path("/tmp/W"))
 
 
 # --- CompiledKernel handle -------------------------------------------------
@@ -251,6 +251,8 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
     # against a fully broken default schedule.
     script = tmp_path / "smoke.py"
     script.write_text(textwrap.dedent("""
+            from contextlib import suppress
+
             import hc
             from hc import Buffer, CompiledKernel, CurrentGroup, kernel
 
@@ -269,11 +271,8 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
                 assert "hc_front.kernel" in handle.front_ir_text
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.pipeline_diagnostics == ()
-                try:
+                with suppress(NotImplementedError):
                     handle()
-                except NotImplementedError:
-                    pass
-                else:
                     raise AssertionError(
                         "handle() should raise NotImplementedError"
                     )

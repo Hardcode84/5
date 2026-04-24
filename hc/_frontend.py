@@ -26,6 +26,7 @@ from typing import Any, Protocol
 
 __all__ = [
     "FrontendEmitter",
+    "FrontendEmitError",
     "FrontendError",
     "RecordedEvent",
     "RecordingEmitter",
@@ -76,7 +77,7 @@ class FrontendError(SyntaxError):
         super().__init__(message, (filename, lineno, offset, text))
 
 
-class _FrontendEmitError(Exception):
+class FrontendEmitError(Exception):
     def __init__(
         self,
         message: str,
@@ -88,6 +89,9 @@ class _FrontendEmitError(Exception):
         self.message = message
         self.line = line
         self.column = column
+
+
+_FrontendEmitError = FrontendEmitError
 
 
 @dataclass(frozen=True)
@@ -326,7 +330,7 @@ def lower_functions_to_front_ir(
                 source=source,
                 toplevel_overrides=combined,
             ).lower_module_body(module)
-        except _FrontendEmitError as exc:
+        except FrontendEmitError as exc:
             raise _frontend_emit_error(source, exc) from exc
     emitter.end_module()
     return emitter.module
@@ -351,7 +355,7 @@ def _lower_parsed_module(
             source=source,
             toplevel_overrides=toplevel_overrides,
         ).lower_module(module)
-    except _FrontendEmitError as exc:
+    except FrontendEmitError as exc:
         raise _frontend_emit_error(source, exc) from exc
 
 
@@ -906,7 +910,7 @@ def _frontend_parse_error(
 
 def _frontend_emit_error(
     source: _SourceBuffer,
-    exc: _FrontendEmitError,
+    exc: FrontendEmitError,
 ) -> FrontendError:
     return FrontendError(
         exc.message,

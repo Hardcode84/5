@@ -16,6 +16,9 @@ from build_tools.llvm_toolchain import (
     toolchain_key,
 )
 
+# White-box bootstrap tests intentionally exercise private file-state helpers
+# that are not part of the runtime-facing API.
+
 
 def _sample_lock(
     *, revision: str = "0123456789abcdef0123456789abcdef01234567"

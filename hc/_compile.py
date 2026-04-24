@@ -195,3 +195,14 @@ def _symbol_name(obj: Any) -> str:
     if isinstance(obj, Symbol):
         return obj.name
     raise TypeError(f"cannot interpret {obj!r} as a symbol name")
+
+
+def normalise_bindings(
+    symbols: Mapping[Any, int],
+    metadata: KernelMetadata,
+) -> dict[str, int]:
+    return _normalise_bindings(symbols, metadata)
+
+
+def symbol_name(obj: Any) -> str:
+    return _symbol_name(obj)

@@ -109,7 +109,7 @@ def _configure_hc_native_tools(
             str(layout.project_root),
             "-B",
             str(layout.build_root),
-            *llvm_toolchain._cmake_generator_args(),
+            *llvm_toolchain.cmake_generator_args(),
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_INSTALL_PREFIX={layout.install_root}",
             f"-DLLVM_DIR={llvm_install_root / 'lib' / 'cmake' / 'llvm'}",
@@ -128,16 +128,16 @@ def _install_hc_native_tools(layout: HcNativeToolsLayout) -> None:
 
 @contextmanager
 def _build_lock(lock_path: Path) -> Iterator[None]:
-    with llvm_toolchain._build_lock(lock_path):
+    with llvm_toolchain.build_lock(lock_path):
         yield
 
 
 def _run_cmake(args: list[str], *, cwd: Path) -> None:
-    command = [llvm_toolchain._cmake_executable(), *args]
-    result = llvm_toolchain._run_command(command, cwd=cwd)
+    command = [llvm_toolchain.cmake_executable(), *args]
+    result = llvm_toolchain.run_command(command, cwd=cwd)
     if result.returncode == 0:
         return
-    raise llvm_toolchain._command_error("cmake", command, cwd, result)
+    raise llvm_toolchain.command_error("cmake", command, cwd, result)
 
 
 def _project_root(project_root: Path | None = None) -> Path:

@@ -66,9 +66,8 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
         MlirDialectHandle hcFrontDialect = mlirGetDialectHandle__hc_front__();
         MlirContext context_ = context.get()->get();
         mlirDialectHandleRegisterDialect(hcFrontDialect, context_);
-        if (load) {
+        if (load)
           mlirDialectHandleLoadDialect(hcFrontDialect, context_);
-        }
       },
       nb::arg("context").none() = nb::none(), nb::arg("load") = true);
 
@@ -88,9 +87,8 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
         MlirDialectHandle hcDialect = mlirGetDialectHandle__hc__();
         MlirContext context_ = context.get()->get();
         mlirDialectHandleRegisterDialect(hcDialect, context_);
-        if (load) {
+        if (load)
           mlirDialectHandleLoadDialect(hcDialect, context_);
-        }
       },
       nb::arg("context").none() = nb::none(), nb::arg("load") = true);
 

@@ -2171,7 +2171,7 @@ struct ConvertHCFrontToHCPass
   using ConvertHCFrontToHCBase::ConvertHCFrontToHCBase;
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
+    ModuleOp moduleOp = getOperation();
     MLIRContext *ctx = &getContext();
     UndefType undef = UndefType::get(ctx);
 
@@ -2183,7 +2183,7 @@ struct ConvertHCFrontToHCPass
     // the callee's `parameters` / `const_kwargs` after the callee op
     // itself is gone.
     llvm::StringMap<IntrinsicDecl> intrinsicDecls;
-    for (Operation &op : *module.getBody()) {
+    for (Operation &op : *moduleOp.getBody()) {
       if (isa<hc_front::KernelOp, hc_front::FuncOp, hc_front::IntrinsicOp>(op))
         frontOps.push_back(&op);
       if (auto intr = dyn_cast<hc_front::IntrinsicOp>(op)) {

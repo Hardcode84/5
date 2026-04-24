@@ -225,11 +225,11 @@ struct HCFrontInlinePass
   using HCFrontInlineBase::HCFrontInlineBase;
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
+    ModuleOp moduleOp = getOperation();
     MLIRContext *ctx = &getContext();
 
     llvm::StringMap<hc_front::FuncOp> inlinableFuncs;
-    for (Operation &topOp : *module.getBody()) {
+    for (Operation &topOp : *moduleOp.getBody()) {
       auto funcOp = dyn_cast<hc_front::FuncOp>(topOp);
       if (!funcOp)
         continue;
@@ -268,7 +268,7 @@ struct HCFrontInlinePass
     }
 
     // Inline at every real call site across the module.
-    for (Operation &topOp : *module.getBody()) {
+    for (Operation &topOp : *moduleOp.getBody()) {
       if (isa<hc_front::FuncOp>(topOp)) {
         auto refAttr = topOp.getAttrOfType<DictionaryAttr>("ref");
         auto kindAttr =

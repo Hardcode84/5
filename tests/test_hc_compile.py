@@ -280,6 +280,152 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
+    # Happy path for the transform-schedule driver: compile a trivial
+    # kernel and assert the `hc_ir_text` snapshot contains hc-dialect ops
+    # (not hc_front.*), with no captured diagnostics. This is the gate we
+    # care about for the CompiledKernel contract now that the pipeline
+    # stage actually runs.
+    #
+    # The body does an implicit-return assignment instead of `return
+    # None`: the conversion pass lowers `return None` to `hc.return %0`,
+    # which the kernel verifier rejects (kernels are operand-less). That
+    # lowering bug is tracked separately; keeping the happy-path fixture
+    # clear of it lets this test actually gate pipeline integration, not
+    # the bug.
+    script = tmp_path / "compile_pipeline.py"
+    script.write_text(textwrap.dedent("""
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            sym = hc.sym
+
+
+            @kernel(work_shape=(sym.W,), literals={sym.W})
+            def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                row = group.group_id[0]
+
+
+            def main() -> None:
+                handle = hc.compile(foo, {sym.W: 128})
+                assert isinstance(handle, CompiledKernel)
+                assert handle.hc_ir is not None, handle.pipeline_diagnostics
+                assert handle.hc_ir_text is not None
+                assert "hc.kernel" in handle.hc_ir_text, handle.hc_ir_text
+                assert "hc_front." not in handle.hc_ir_text, handle.hc_ir_text
+                # `front_ir_text` must remain the pre-pipeline snapshot
+                # even after a successful run; the module clone in
+                # hc._compile is the load-bearing mechanism.
+                assert "hc_front.kernel" in handle.front_ir_text
+                assert handle.pipeline_diagnostics == ()
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
+    # A custom schedule that only runs `-convert-hc-front-to-hc` — no
+    # fold/inline — must still produce valid hc IR for a kernel without
+    # inline helpers. Proves the override API threads inline text all the
+    # way through the transform-dialect driver, not just the default.
+    script = tmp_path / "compile_override.py"
+    script.write_text(textwrap.dedent("""
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            sym = hc.sym
+
+            SCHEDULE = \"\"\"
+            module attributes {transform.with_named_sequence} {
+              transform.named_sequence @__transform_main(%m: !transform.any_op) {
+                %m1 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m
+                    : (!transform.any_op) -> !transform.any_op
+                transform.yield
+              }
+            }
+            \"\"\"
+
+
+            @kernel(work_shape=(sym.W,), literals={sym.W})
+            def bar(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                row = group.group_id[0]
+
+
+            def main() -> None:
+                handle = hc.compile(bar, {sym.W: 64}, schedule=SCHEDULE)
+                assert handle.hc_ir is not None, handle.pipeline_diagnostics
+                assert "hc.kernel" in handle.hc_ir_text
+                # Skipping promote-names means hc.name_load/hc.assign
+                # ops stay in the output — presence of `hc.name_load`
+                # proves the override skipped that stage.
+                assert "hc.name_load" in handle.hc_ir_text, handle.hc_ir_text
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_surfaces_pipeline_failure_non_fatal(tmp_path: Path) -> None:
+    # Hand the driver an inline schedule that names a pass that doesn't
+    # exist. We expect the handle to come back with hc_ir=None, the
+    # front-IR snapshot preserved, and a non-empty diagnostics tuple —
+    # not an exception. Callers want a value they can inspect.
+    script = tmp_path / "compile_failure.py"
+    script.write_text(textwrap.dedent("""
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            sym = hc.sym
+
+            BAD_SCHEDULE = \"\"\"
+            module attributes {transform.with_named_sequence} {
+              transform.named_sequence @__transform_main(%m: !transform.any_op) {
+                %m1 = transform.apply_registered_pass "this-pass-does-not-exist" to %m
+                    : (!transform.any_op) -> !transform.any_op
+                transform.yield
+              }
+            }
+            \"\"\"
+
+
+            @kernel(work_shape=(sym.W,), literals={sym.W})
+            def baz(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                row = group.group_id[0]
+
+
+            def main() -> None:
+                handle = hc.compile(baz, {sym.W: 32}, schedule=BAD_SCHEDULE)
+                assert handle.hc_ir is None, handle.hc_ir_text
+                assert handle.hc_ir_text is None
+                assert "hc_front.kernel" in handle.front_ir_text
+                assert handle.pipeline_diagnostics, (
+                    "expected at least one captured diagnostic"
+                )
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> None:
     # End-to-end assertion that what the resolver stamps flows through
     # ``hc.compile``: ``front_ir_symbols`` exposes the closed dep set and

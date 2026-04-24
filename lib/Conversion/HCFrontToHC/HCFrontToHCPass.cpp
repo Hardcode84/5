@@ -42,8 +42,15 @@
 //  * nested workitem-def folding of a `hc_front.workitem_region` +
 //    trailing `hc_front.call` producer into a single result-producing
 //    workitem region: driver-shape concern, tracked separately.
-//  * full inlining of `ref.kind = "inline"` helpers; for now we leave the
-//    `hc_front.call` pinned with a diagnostic if it survives lowering.
+//
+// Inline-helper expansion happens upstream in `-hc-front-inline`, which
+// rewrites every `hc_front.call` dispatched to a `ref.kind = "inline"`
+// symbol into an `hc_front.inlined_region` carrying the cloned body.
+// This pass consumes that region by flattening it into the caller's
+// block with a per-site alpha-renamed prefix so nothing leaks. A
+// stray `hc_front.call` with `ref.kind = "inline"` surviving to this
+// pass is a pipeline error and diagnoses; `-hc-front-inline` must
+// always run first.
 
 #include "hc/Conversion/HCFrontToHC/HCFrontToHC.h"
 
@@ -330,6 +337,15 @@ private:
   LogicalResult lowerFor(hc_front::ForOp op);
   LogicalResult lowerWorkitemRegion(hc_front::WorkitemRegionOp op);
   LogicalResult lowerSubgroupRegion(hc_front::SubgroupRegionOp op);
+  // Flattens a `hc_front.inlined_region` into the caller's current `hc`
+  // insertion block. The region is a pure name-scope boundary stamped
+  // by `-hc-front-inline`; consuming it here keeps the `hc` output
+  // free of `hc_front` artifacts. Alpha-renames every local name in
+  // the cloned body with a per-site prefix, emits `hc.assign` for each
+  // parameter binding, walks the body through `lowerOp`, and intercepts
+  // `hc_front.return` to wire the region's results into `valueMap` /
+  // `tupleElts` (multi-value callees key into the tuple-unpack path).
+  LogicalResult lowerInlinedRegion(hc_front::InlinedRegionOp op);
   // FailureOr so a `builtin` call that is cleanly consumed by its parent
   // (`range(...)` inside `hc_front.for`) can be distinguished from a real
   // error. `FailureOr<Value>` reads as: success+Value / success+null /
@@ -385,6 +401,12 @@ private:
     llvm::StringMap<Value> kwvalues;
   };
   FailureOr<CallArgs> collectCallArgs(hc_front::CallOp op);
+
+  // Per-module counter used to mint unique prefixes for each
+  // `hc_front.inlined_region` we flatten. Must strictly monotonically
+  // increase across the full conversion so two call sites of the same
+  // helper (even nested) never collide.
+  unsigned inlineSiteCounter = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -680,6 +702,8 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return lowerWorkitemRegion(w);
   if (auto sg = dyn_cast<hc_front::SubgroupRegionOp>(op))
     return lowerSubgroupRegion(sg);
+  if (auto ir = dyn_cast<hc_front::InlinedRegionOp>(op))
+    return lowerInlinedRegion(ir);
   if (auto c = dyn_cast<hc_front::CallOp>(op)) {
     FailureOr<Value> v = lowerCall(c);
     if (failed(v))
@@ -1088,6 +1112,154 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   return r;
 }
 
+// Alpha-rename every local-identifier-bearing op in `body` by prefixing
+// its name attribute with `prefix`. Scope: `hc_front.name` ops whose
+// `ref.kind` is a local binding (`param`/`local`/`iv`) and every
+// `hc_front.target_name`. Attribute names on `hc_front.attr`,
+// `hc_front.keyword` etc. are Python syntactic tokens rather than
+// bindings, so they are deliberately untouched.
+//
+// Walks nested regions inside the same lexical scope (e.g.
+// `hc_front.for` / `hc_front.workitem_region`), but stops at any
+// nested `hc_front.inlined_region` — that one is its own name
+// boundary and gets rewritten with its own prefix when it in turn is
+// flattened. Touching a nested inlined body here would double-prefix
+// its params and break the `parameters` -> body mapping.
+static void alphaRenameInlinedBody(Region &body, StringRef prefix,
+                                   MLIRContext *ctx) {
+  SmallVector<Region *> worklist{&body};
+  while (!worklist.empty()) {
+    Region *region = worklist.pop_back_val();
+    for (Block &block : *region) {
+      for (Operation &op : block) {
+        if (auto name = dyn_cast<hc_front::NameOp>(&op)) {
+          if (auto ref = name->getAttrOfType<DictionaryAttr>("ref")) {
+            if (auto kind = ref.getAs<StringAttr>("kind")) {
+              StringRef k = kind.getValue();
+              if (k == "param" || k == "local" || k == "iv")
+                name.setName((prefix + name.getName()).str());
+            }
+          }
+          continue;
+        }
+        if (auto target = dyn_cast<hc_front::TargetNameOp>(&op)) {
+          target.setName((prefix + target.getName()).str());
+          continue;
+        }
+        // Respect nested inline name boundaries — their bodies get
+        // their own per-site prefix when flattened.
+        if (isa<hc_front::InlinedRegionOp>(&op))
+          continue;
+        for (Region &nested : op.getRegions())
+          worklist.push_back(&nested);
+      }
+    }
+  }
+}
+
+LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
+  MLIRContext *ctx = op.getContext();
+  Region &body = op.getBody();
+  if (body.empty() || !body.hasOneBlock())
+    return op.emitOpError("inlined_region body must be single-block");
+
+  auto params = op->getAttrOfType<ArrayAttr>("parameters");
+  if (!params || params.size() != op.getArguments().size()) {
+    return op.emitOpError(
+               "inlined_region parameter/argument arity mismatch (params=")
+           << (params ? params.size() : 0)
+           << ", args=" << op.getArguments().size() << ")";
+  }
+
+  // Per-site prefix. `inlineSiteCounter` is module-wide, so two sites
+  // of the same helper in the same caller still get distinct prefixes.
+  std::string prefix =
+      ("__inl_" + op.getCallee() + "_" + Twine(inlineSiteCounter) + "_").str();
+  ++inlineSiteCounter;
+
+  alphaRenameInlinedBody(body, prefix, ctx);
+
+  // Bind params at the current caller insertion point: `hc.assign
+  // @<renamed_param> = <lowered_arg>`. The body's `hc_front.name`
+  // references to the param now read the prefixed name, which the
+  // promotion pass folds against these assigns.
+  for (auto [paramAttr, arg] : llvm::zip_equal(params, op.getArguments())) {
+    auto dict = dyn_cast<DictionaryAttr>(paramAttr);
+    if (!dict)
+      return op.emitOpError("invalid parameters entry");
+    auto nameAttr = dict.getAs<StringAttr>("name");
+    if (!nameAttr)
+      return op.emitOpError("parameters entry missing `name`");
+    Value loweredArg = lowerValueOperand(arg);
+    if (!loweredArg) {
+      return op.emitOpError("inline argument for param `")
+             << nameAttr.getValue() << "' did not lower to an hc value";
+    }
+    std::string renamed = (prefix + nameAttr.getValue()).str();
+    HCAssignOp::create(builder, op.getLoc(), StringAttr::get(ctx, renamed),
+                       loweredArg);
+  }
+
+  // Walk the body ops. `hc_front.return` is the one we can't feed
+  // through `lowerOp`: the generic path would emit `hc.return` into
+  // the caller, which is wrong — the return's operands are instead
+  // the region's *result values* and must be funneled into `valueMap`
+  // / `tupleElts` so downstream consumers (`hc_front.assign`, etc.)
+  // resolve through the normal paths.
+  //
+  // The AST frontend writes `return a, b` as `hc_front.return %t`
+  // where `%t = hc_front.tuple(%a, %b)`. `expandTupleOperand`
+  // destructures the tuple handle when present and falls through to
+  // the singleton path otherwise, so scalar returns stay 1:1.
+  SmallVector<Value> resultValues;
+  bool sawReturn = false;
+  for (Operation &child : llvm::make_early_inc_range(body.front())) {
+    if (auto r = dyn_cast<hc_front::ReturnOp>(&child)) {
+      if (sawReturn)
+        return op.emitOpError("inlined_region body has multiple returns");
+      sawReturn = true;
+      if (r.getValues().size() == 1) {
+        resultValues = expandTupleOperand(r.getValues().front());
+      } else {
+        resultValues = lowerValueOperands(r.getValues());
+      }
+      continue;
+    }
+    if (failed(lowerOp(&child)))
+      return failure();
+  }
+
+  // Map region results. The inliner pass sets result arity to the
+  // callee's `hc_front.return` arity and rewrites users of the old
+  // call result to `getResult(0)`, so only the first result ever has
+  // live uses; the remaining results exist solely to carry arity for
+  // the `rhsOp->getNumResults() == arity` check in the tuple-unpack
+  // path. Populate every result's `valueMap` entry to keep operand
+  // lookups total.
+  unsigned nResults = op.getNumResults();
+  if (nResults == 0) {
+    if (!resultValues.empty()) {
+      return op.emitOpError(
+          "inlined_region declares no results but body returns values");
+    }
+    return success();
+  }
+  if (resultValues.size() != nResults) {
+    return op.emitOpError(
+               "inlined_region result arity mismatch: region declares ")
+           << nResults << ", body returns " << resultValues.size();
+  }
+  if (nResults == 1) {
+    valueMap[op.getResult(0)] = resultValues.front();
+    return success();
+  }
+  valueMap[op.getResult(0)] = Value();
+  tupleElts[op.getResult(0)] = resultValues;
+  for (unsigned i = 1; i < nResults; ++i)
+    valueMap[op.getResult(i)] = Value();
+  return success();
+}
+
 template <typename HCRegionOpT, typename FrontRegionOpT>
 LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
@@ -1294,24 +1466,14 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     return Value();
   }
   if (kind == "inline") {
-    // Full inlining of non-decorated helpers is a separate pass. For now
-    // emit a conservative `hc.call @<qualified>` placeholder and let
-    // downstream either inline it or flag the missing symbol.
-    StringRef qn = ref.getString("qualified_name");
-    if (qn.empty()) {
-      op.emitOpError("inline name ref missing qualified_name");
-      return failure();
-    }
-    // Collapse dotted paths to the short name so the symbol ref is a
-    // legal flat symbol; downstream inlining can consult the original
-    // `ref` payload if it needs the fully-qualified lookup.
-    StringRef shortName = qn;
-    if (auto pos = qn.rfind('.'); pos != StringRef::npos)
-      shortName = qn.drop_front(pos + 1);
-    auto symRef = FlatSymbolRefAttr::get(op.getContext(), shortName);
-    auto call = HCCallOp::create(builder, op.getLoc(), TypeRange{undef}, symRef,
-                                 args.positional);
-    return {call.getResult(0)};
+    // `-hc-front-inline` is responsible for consuming every inline call
+    // before we run. If one survives to here, either the pipeline was
+    // ordered wrong or the pass missed a site — in both cases the
+    // operator wants a loud, located diagnostic, not a silent
+    // placeholder.
+    op.emitOpError("`ref.kind = \"inline\"` call survived to conversion; "
+                   "run `-hc-front-inline` before `-convert-hc-front-to-hc`");
+    return failure();
   }
   op.emitOpError("unsupported callee ref.kind '") << kind << "'";
   return failure();

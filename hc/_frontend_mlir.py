@@ -556,6 +556,11 @@ class HCFrontEmitter:
         )
         self._set_optional_string_attr(op, "returns", payload.get("returns"))
         self._set_optional_toplevel_metadata_attrs(op, payload.get("metadata"))
+        # `ref` on a top-level op is used by `-hc-front-inline` to spot
+        # undecorated helpers tagged `{kind = "inline"}` — same payload
+        # shape as the per-site `ref` stamped by the resolver on name
+        # ops, just rehomed on the function itself.
+        self._set_optional_ref_attr(op, payload.get("ref"))
 
     def _set_region_metadata_attrs(
         self,

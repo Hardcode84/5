@@ -7,5 +7,6 @@ include_directories(${PROJECT_BINARY_DIR}/include)
 
 add_subdirectory(hc/IR)
 add_subdirectory(hc/Front/IR)
+add_subdirectory(hc/Front/Transforms)
 add_subdirectory(hc/Conversion/HCFrontToHC)
 add_subdirectory(hc/Transforms)

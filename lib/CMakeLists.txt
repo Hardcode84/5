@@ -13,6 +13,7 @@ target_include_directories(
 
 add_subdirectory(IR)
 add_subdirectory(Front/IR)
+add_subdirectory(Front/Transforms)
 add_subdirectory(Conversion)
 add_subdirectory(Transforms)
 add_subdirectory(CAPI)

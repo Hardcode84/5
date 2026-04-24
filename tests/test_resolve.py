@@ -129,12 +129,15 @@ def test_resolve_wmma_collects_full_dep_set() -> None:
     resolved = resolve_front_ir(tiled_gfx11_wmma_matmul)
 
     assert isinstance(resolved, ResolvedFrontIR)
-    # Order matters: the kernel emits first, then helpers/intrinsics in
-    # discovery order (BFS over globals + closurevars). Pin both the set and
-    # the relative kernel-first position so a regression that drops a dep
-    # is caught alongside one that reshuffles the module.
+    # Order matters: the kernel emits first, then helpers/intrinsics and
+    # undecorated inline helpers in BFS discovery order (globals +
+    # closurevars). Pin both the set and the relative kernel-first
+    # position so a regression that drops a dep is caught alongside one
+    # that reshuffles the module. `inline_names` separately pins the
+    # inline subset so the resolver stays honest about which top-levels
+    # were marked `ref.kind = "inline"`.
     assert resolved.symbol_names[0] == "tiled_gfx11_wmma_matmul"
-    assert set(resolved.symbol_names) == {
+    assert set(resolved.decorated_symbol_names) == {
         "tiled_gfx11_wmma_matmul",
         "init_wmma_acc",
         "issue_wmma_tile",
@@ -143,6 +146,16 @@ def test_resolve_wmma_collects_full_dep_set() -> None:
         "load_wmma_b_fragment",
         "wmma_gfx11",
     }
+    assert resolved.inline_names == frozenset(
+        {
+            "_tile_origin",
+            "_lane_a_row",
+            "_lane_column",
+            "_lane_output_rows",
+            "_lane_output_row_step",
+            "_lane_output_row_slice_args",
+        }
+    )
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

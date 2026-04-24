@@ -81,12 +81,17 @@ def compile(
 
     resolved = resolve_front_ir(kernel_fn)
     module = resolved.module
+    # Only decorated top-levels are surfaced on the public handle;
+    # undecorated inline helpers are an implementation detail of the
+    # `hc_front` pipeline (they're consumed by `-hc-front-inline`
+    # before any downstream stage sees them) so exposing them here
+    # would commit the compiler to a shape users would then depend on.
     return CompiledKernel(
         kernel=kernel_fn,
         bindings=bindings,
         front_ir=module,
         front_ir_text=str(module),
-        front_ir_symbols=resolved.symbol_names,
+        front_ir_symbols=resolved.decorated_symbol_names,
     )
 
 

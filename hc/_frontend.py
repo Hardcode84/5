@@ -267,13 +267,23 @@ def lower_functions_to_front_ir(
     *,
     context: Any | None = None,
     filename: str | None = None,
+    per_function_overrides: Mapping[int, Mapping[str, object]] | None = None,
 ) -> Any:
-    """Lower several decorated Python functions into one shared `hc_front` module.
+    """Lower several Python functions into one shared `hc_front` module.
 
-    Each function is re-parsed from its source and emitted as a separate top-
-    level op (`hc_front.kernel` / `hc_front.func` / `hc_front.intrinsic`) in
-    the returned module. The driver uses this to package a kernel together
-    with every `@kernel.func` / `@kernel.intrinsic` it transitively invokes.
+    Each function is re-parsed from its source and emitted as a separate
+    top-level op (`hc_front.kernel` / `hc_front.func` /
+    `hc_front.intrinsic`) in the returned module. The driver uses this to
+    package a kernel together with every `@kernel.func` /
+    `@kernel.intrinsic` it transitively invokes, plus any undecorated
+    inline helpers the resolver discovered.
+
+    ``per_function_overrides`` — keyed by ``id(fn)`` — lets callers attach
+    extra per-top-level metadata that `_FrontendLowerer` splices into the
+    emitted op. The resolver uses it to force ``force_kind="func"`` and
+    stamp ``ref={"kind": "inline", ...}`` on undecorated helpers, which
+    makes them targetable by `-hc-front-inline` without needing a
+    decorator.
     """
 
     if not fns:
@@ -283,14 +293,26 @@ def lower_functions_to_front_ir(
     if module_filename is None:
         module_filename = _source_buffer_from_function(fns[0]).filename
     emitter.begin_module(filename=module_filename)
+    overrides_by_id = dict(per_function_overrides or {})
     for fn in fns:
         source = _source_buffer_from_function(fn)
         module = _parse_source(source)
+        combined = _function_overrides(fn)
+        extra = overrides_by_id.get(id(fn))
+        if extra:
+            name = getattr(fn, "__name__", None)
+            if isinstance(name, str):
+                # Merge into the by-name override bag that
+                # ``_lower_toplevel`` threads through to the emitter.
+                slot = dict(combined.get(name, {}))
+                slot.update(extra)
+                combined = dict(combined)
+                combined[name] = slot
         try:
             _FrontendLowerer(
                 emitter=emitter,
                 source=source,
-                toplevel_overrides=_function_overrides(fn),
+                toplevel_overrides=combined,
             ).lower_module_body(module)
         except _FrontendEmitError as exc:
             raise _frontend_emit_error(source, exc) from exc
@@ -356,9 +378,14 @@ class _FrontendLowerer:
             raise self._error("async functions are not supported", stmt)
         if not isinstance(stmt, ast.FunctionDef):
             raise self._error("unsupported top-level statement", stmt)
-        kind = _toplevel_kind(stmt, self._source)
-        payload = _function_payload(stmt, self._source)
         overrides = self._toplevel_overrides.get(stmt.name)
+        forced = _pop_force_kind(overrides) if overrides else None
+        # ``force_kind`` bypasses the decorator sniff: undecorated inline
+        # helpers that the resolver chose to emit as `hc_front.func` use
+        # this path. Decorated top-levels never set ``force_kind``, so
+        # their decorator is still the source of truth.
+        kind = forced if forced is not None else _toplevel_kind(stmt, self._source)
+        payload = _function_payload(stmt, self._source)
         if overrides:
             payload.update(overrides)
         self._emitter.begin_op(kind, **payload)
@@ -1050,6 +1077,29 @@ def _function_payload(
         parameters=_parameter_records(fn.args, source),
         returns=_annotation_text(fn.returns),
     )
+
+
+def _pop_force_kind(overrides: Mapping[str, object]) -> str | None:
+    """Peek at a ``force_kind`` override without scrubbing the mapping.
+
+    Returns the normalized kind string (one of the `_TOPLEVEL_KINDS`
+    values) or ``None`` if unset; leaves the override mapping alone so
+    downstream payload-merging still sees any other keys it consumed.
+    ``force_kind`` itself is harmless in the merged payload — the
+    emitter ignores unknown kwargs.
+    """
+
+    value = overrides.get("force_kind")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"`force_kind` override must be a string, got {value!r}")
+    if value not in {"kernel", "func", "intrinsic"}:
+        raise RuntimeError(
+            f"`force_kind` override {value!r} is not one of the known top-level "
+            f"kinds (kernel/func/intrinsic)"
+        )
+    return value
 
 
 def _function_overrides(fn: Any) -> dict[str, dict[str, object]]:

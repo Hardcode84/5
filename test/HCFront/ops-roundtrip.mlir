@@ -53,6 +53,9 @@
 // CHECK-SAME: decorators = ["kernel.intrinsic"]
 // CHECK-SAME: effects = "pure"
 // CHECK-SAME: scope = "WorkItem"
+// CHECK: hc_front.func "inline_helper"
+// CHECK-SAME: ref = {kind = "inline"
+// CHECK: hc_front.inlined_region "inline_helper"
 
 module {
   hc_front.kernel "kernel_demo" attributes {
@@ -130,5 +133,29 @@ module {
   } {
     %one = hc_front.constant <1>
     hc_front.return %one
+  }
+
+  hc_front.func "inline_helper" attributes {
+    parameters = [{name = "a"}, {name = "b"}],
+    ref = {kind = "inline", qualified_name = "pkg.inline_helper"}
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    hc_front.return %a, %b
+  }
+
+  hc_front.func "inline_holder" attributes {
+    parameters = [{name = "x"}]
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %c = hc_front.constant <1>
+    %t:2 = hc_front.inlined_region "inline_helper"(%x, %c) -> (!hc_front.value, !hc_front.value) attributes {
+      parameters = [{name = "a"}, {name = "b"}]
+    } {
+      %aa = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+      %bb = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+      hc_front.return %aa, %bb
+    }
+    hc_front.return %t#0
   }
 }

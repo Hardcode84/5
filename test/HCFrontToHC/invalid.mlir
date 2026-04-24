@@ -202,3 +202,20 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// `ref.kind = "inline"` is the exclusive business of `-hc-front-inline`;
+// if one survives to the conversion boundary the pass ordering is wrong
+// and we want a located error rather than a silent placeholder.
+module {
+  hc_front.kernel "inline_not_inlined" attributes {parameters = [{name = "x"}]} {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %inl = hc_front.name "helper" {ctx = "load", ref = {kind = "inline", qualified_name = "pkg.helper"}}
+    // expected-error@+1 {{`ref.kind = "inline"` call survived to conversion; run `-hc-front-inline` before `-convert-hc-front-to-hc`}}
+    %v = hc_front.call %inl(%x)
+    %t = hc_front.target_name "t"
+    hc_front.assign %t = %v
+    hc_front.return
+  }
+}

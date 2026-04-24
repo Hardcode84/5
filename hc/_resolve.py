@@ -78,15 +78,30 @@ def _numpy_dtype_name(module: Any, attr: str) -> str | None:
 
 @dataclass(frozen=True)
 class ResolvedFrontIR:
-    """Output of the resolver: combined module + the dep set it describes."""
+    """Output of the resolver: combined module + the dep set it describes.
+
+    ``functions`` interleaves decorated and inline helpers in BFS
+    discovery order; ``inline_names`` exposes the set of identifiers
+    that were emitted as `hc_front.func` with `ref.kind = "inline"`
+    so tests and callers don't have to re-walk the IR to find them.
+    """
 
     module: Any
     kernel_fn: Any
     functions: tuple[Any, ...]
+    inline_names: frozenset[str]
 
     @property
     def symbol_names(self) -> tuple[str, ...]:
         return tuple(_fn_name(fn) for fn in self.functions)
+
+    @property
+    def decorated_symbol_names(self) -> tuple[str, ...]:
+        return tuple(
+            _fn_name(fn)
+            for fn in self.functions
+            if _fn_name(fn) not in self.inline_names
+        )
 
 
 def resolve_front_ir(
@@ -96,10 +111,13 @@ def resolve_front_ir(
 ) -> ResolvedFrontIR:
     """Transitively collect + lower + resolve names from ``kernel_fn``.
 
-    The returned module contains one top-level op per reachable decorated
-    function (kernel first, then helpers/intrinsics in discovery order), with
-    every `hc_front.name` load carrying a `ref` DictAttr. Raises
-    ``FrontendError`` when a captured name cannot be classified.
+    The returned module contains one top-level op per reachable function
+    (kernel first, then decorated helpers/intrinsics and undecorated
+    inline helpers in discovery order), with every `hc_front.name` load
+    carrying a `ref` DictAttr. Undecorated helpers surface as
+    `hc_front.func` ops tagged `ref.kind = "inline"` so the
+    `-hc-front-inline` pass can consume them. Raises ``FrontendError``
+    when a captured name cannot be classified.
     """
 
     if not _is_kernel(kernel_fn):
@@ -108,25 +126,45 @@ def resolve_front_ir(
             f"{kernel_fn!r}"
         )
 
-    fns = _walk_decorated_deps(kernel_fn)
-    module = lower_functions_to_front_ir(fns, context=context)
+    fns, inline_names = _walk_dep_set(kernel_fn)
+    overrides = _inline_overrides(fns, inline_names)
+    module = lower_functions_to_front_ir(
+        fns, context=context, per_function_overrides=overrides
+    )
     _classify_module(module, fns)
-    return ResolvedFrontIR(module=module, kernel_fn=kernel_fn, functions=fns)
+    return ResolvedFrontIR(
+        module=module,
+        kernel_fn=kernel_fn,
+        functions=fns,
+        inline_names=frozenset(inline_names),
+    )
 
 
 # --- Dependency walk ---------------------------------------------------------
 
 
-def _walk_decorated_deps(kernel_fn: Any) -> tuple[Any, ...]:
-    """BFS for `@kernel.func` / `@kernel.intrinsic` reachable from ``kernel_fn``.
+def _walk_dep_set(kernel_fn: Any) -> tuple[tuple[Any, ...], set[str]]:
+    """BFS for every decorated or inline helper reachable from ``kernel_fn``.
 
-    Returns a tuple with ``kernel_fn`` first, then callees in first-seen order.
-    Deduplicated on ``id(fn)`` because two decorated bindings may point at the
-    same underlying function (e.g. re-export).
+    Returns ``(ordered, inline_names)``: ``ordered`` starts with
+    ``kernel_fn`` and then interleaves `@kernel.func` /
+    `@kernel.intrinsic` callees and undecorated Python helpers (plain
+    callables with retrievable source) in first-seen order.
+    ``inline_names`` is the set of ``__name__``s that were discovered
+    as inline helpers — the caller uses it to tag those top-levels at
+    emission time.
+
+    Deduplicated on ``id(fn)`` because two bindings may point at the
+    same underlying function (re-export, alias). Inline helpers with
+    the same ``__name__`` but different identities collide at
+    emission (one top-level op per ``__name__``); this is loud by
+    design — two `_tile_origin`s in one module would be ambiguous
+    anyway, and the hc_front -> hc side keys lookups on the name.
     """
 
     seen_ids: set[int] = set()
     ordered: list[Any] = []
+    inline_names: set[str] = set()
     queue: deque[Any] = deque([kernel_fn])
     while queue:
         fn = queue.popleft()
@@ -135,25 +173,59 @@ def _walk_decorated_deps(kernel_fn: Any) -> tuple[Any, ...]:
             continue
         seen_ids.add(fn_id)
         ordered.append(fn)
-        for dep in _decorated_references(fn):
+        if fn is not kernel_fn and _is_inlinable_helper(fn):
+            inline_names.add(_fn_name(fn))
+        for dep in _reachable_references(fn):
             if id(dep) not in seen_ids:
                 queue.append(dep)
-    return tuple(ordered)
+    return tuple(ordered), inline_names
 
 
-def _decorated_references(fn: Any) -> Iterable[Any]:
+def _reachable_references(fn: Any) -> Iterable[Any]:
+    """Yield every decorated or plain-callable free reference of ``fn``.
+
+    Plain callables are what become `hc_front.func` + `ref.kind =
+    "inline"` top-levels. We yield them at the same level as decorated
+    deps so the BFS picks up helpers-of-helpers too (e.g.
+    `_lane_output_row_slice_args` references `_lane_output_row_step`).
+    """
+
     namespace = _FunctionNamespace(fn)
     yielded: set[int] = set()
     for name in _referenced_names(fn):
         value = namespace.lookup(name)
         if value is _UNDEFINED:
             continue
-        if not _is_decorated(value):
+        if not (_is_decorated(value) or _is_inlinable_helper(value)):
             continue
         if id(value) in yielded:
             continue
         yielded.add(id(value))
         yield value
+
+
+def _inline_overrides(
+    fns: tuple[Any, ...], inline_names: set[str]
+) -> dict[int, Mapping[str, object]]:
+    """Per-fn overrides pinning inline helpers to `hc_front.func` +
+    `ref.kind = "inline"`.
+
+    Keyed by ``id(fn)`` so the emitter can thread the override through
+    without relying on the helper's `__name__` (which it also uses as
+    the op's sym_name). The emitter skips the decorator sniff for any
+    fn carrying ``force_kind``.
+    """
+
+    overrides: dict[int, Mapping[str, object]] = {}
+    for fn in fns:
+        name = _fn_name(fn)
+        if name not in inline_names:
+            continue
+        overrides[id(fn)] = {
+            "force_kind": "func",
+            "ref": {"kind": "inline", "qualified_name": _qualified_name(fn)},
+        }
+    return overrides
 
 
 def _referenced_names(fn: Any) -> tuple[str, ...]:
@@ -430,7 +502,7 @@ def _classify_intrinsic(name: str, value: Any) -> Mapping[str, object] | None:
 
 def _classify_inline(name: str, value: Any) -> Mapping[str, object] | None:
     del name
-    if not _is_plain_callable(value):
+    if not _is_inlinable_helper(value):
         return None
     return {"kind": "inline", "qualified_name": _qualified_name(value)}
 
@@ -501,6 +573,29 @@ def _is_plain_callable(value: Any) -> bool:
     return callable(value) and not (
         _is_kernel_func(value) or _is_intrinsic(value) or _is_kernel(value)
     )
+
+
+def _is_inlinable_helper(value: Any) -> bool:
+    """True if ``value`` is a pure-Python helper we can re-parse from source.
+
+    Filters out the long tail of other callables (C builtins, classes,
+    bound methods, partials, numpy ufuncs, ...): the inliner frontend
+    needs a ``__code__`` object backed by real source, and only
+    ``types.FunctionType`` gives us that reliably. Decorated callables
+    are also excluded — those take the `@kernel.func` / `@kernel.intrinsic`
+    path with their own metadata.
+    """
+    import types
+
+    if not isinstance(value, types.FunctionType):
+        return False
+    if _is_kernel_func(value) or _is_intrinsic(value) or _is_kernel(value):
+        return False
+    try:
+        source_file = inspect.getsourcefile(value)
+    except TypeError:
+        return False
+    return bool(source_file)
 
 
 def _qualified_name(fn: Any) -> str:

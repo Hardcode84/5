@@ -178,6 +178,21 @@ def HCConstOp : HC_Op<"const", [Pure]> {
   let assemblyFormat = "`<` $value `>` attr-dict `:` type($result)";
 }
 
+def HCUndefValueOp : HC_Op<"undef_value", [Pure]> {
+  let summary = "Typed undefined seed for name-promotion scaffolding.";
+  let description = [{
+    Produces a `!hc.undef` value with no source operand. The name-promotion
+    pass uses it to seed `hc.for_range` iter_args for write-first names: the
+    body overwrites the carried value before any in-body read, while a
+    zero-trip loop leaves the binding undefined in the output. Keeping this
+    placeholder in the `hc` dialect makes surviving scaffolding obvious in IR
+    dumps and avoids leaking `builtin.unrealized_conversion_cast` into the
+    semantic pipeline.
+  }];
+  let results = (outs HC_UndefType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
 def HCSymbolOp : HC_Op<"symbol", [Pure]> {
   let summary = "Introduce a symbolic capture bound to a named symbol.";
   let description = [{

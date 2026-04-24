@@ -403,13 +403,11 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   SnapMap snapValues;
   materializeSnapshots(builder, loc, undefTy, facts.snapshot, snapValues);
 
-  // iter_inits: read-first carriers seed from their outer snap;
-  // write-first carriers seed from a no-operand
-  // `unrealized_conversion_cast` (a type-only placeholder — the
-  // first in-body assign overwrites the iter_arg before any load
-  // sees it, and zero-trip leaves the placeholder flowing out as
-  // the op's result, matching "name stays undefined if the loop
-  // never ran").
+  // iter_inits: read-first carriers seed from their outer snap; write-first
+  // carriers seed from `hc.undef_value`. The first in-body assign overwrites
+  // the iter_arg before any load sees it, and zero-trip leaves the placeholder
+  // flowing out as the op's result, matching "name stays undefined if the loop
+  // never ran".
   SmallVector<Value> newIterInits(op.getIterInits().begin(),
                                   op.getIterInits().end());
   for (StringAttr name : carried) {
@@ -418,9 +416,8 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
       newIterInits.push_back(it->second);
       continue;
     }
-    auto placeholder =
-        UnrealizedConversionCastOp::create(builder, loc, undefTy, ValueRange{});
-    newIterInits.push_back(placeholder.getResult(0));
+    auto placeholder = HCUndefValueOp::create(builder, loc, undefTy);
+    newIterInits.push_back(placeholder.getResult());
   }
 
   SmallVector<Type> newResultTypes(op.getIterResults().getTypes().begin(),

@@ -24,6 +24,13 @@ hc.intrinsic @subgroup_dot scope = #hc.scope<"SubGroup"> {}
 hc.intrinsic @typed_decl(%a: f32, %b: f32) -> f32
     scope = #hc.scope<"WorkItem"> parameters = ["a", "b"] {}
 
+// CHECK-LABEL: func.func @undef_value_seed
+// CHECK: %{{.*}} = hc.undef_value : !hc.undef
+func.func @undef_value_seed() -> !hc.undef {
+  %seed = hc.undef_value : !hc.undef
+  return %seed : !hc.undef
+}
+
 // CHECK-LABEL: func.func @simple_for_range
 // CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> () {
 // CHECK: }

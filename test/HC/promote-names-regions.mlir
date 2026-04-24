@@ -231,12 +231,11 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
 // Write-first loop-local: body assigns `t` before reading it and
 // no outer `hc.assign "t"` exists. Must not emit an outer
 // `hc.name_load "t"` (would fail the flat sweep with no reaching
-// def); iter_init is a type-only `unrealized_conversion_cast`
-// placeholder instead.
+// def); iter_init is an `hc.undef_value` placeholder instead.
 // CHECK-LABEL: hc.func @for_range_loop_local_temp
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
-// CHECK: %[[UNDEF:.*]] = builtin.unrealized_conversion_cast to !hc.undef
+// CHECK: %[[UNDEF:.*]] = hc.undef_value : !hc.undef
 // CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[UNDEF]])
 // CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef):
 // CHECK:        %[[T:.*]] = hc.add %[[IV]], %[[IV]]
@@ -268,7 +267,7 @@ hc.func @for_range_loop_local_temp(%lo: !hc.undef, %hi: !hc.undef,
 // `hc.name_load "tmp"`.
 // CHECK-LABEL: hc.func @for_range_mixed_local_and_accumulator
 // CHECK-NOT: hc.name_load "tmp"
-// CHECK: %[[TMP_UNDEF:.*]] = builtin.unrealized_conversion_cast to !hc.undef
+// CHECK: %[[TMP_UNDEF:.*]] = hc.undef_value : !hc.undef
 // CHECK: %[[R:.*]]:2 = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[TMP_UNDEF]], %arg3)
 // CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef, %[[ACC:.*]]: !hc.undef):
 // CHECK:        %[[DBL:.*]] = hc.add %[[IV]], %[[IV]]

@@ -1849,13 +1849,12 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // `IntegerAttr` so consumers like `hc.with_inactive` that require a
   // numeric literal (not a `TypeAttr`) verify cleanly.
   //
-  // Degradation path: if there's no positional literal, or the literal
-  // isn't a simple `hc.const` we can coerce, reuse the `hc.const
-  // <TypeAttr>` materialized by `lowerAttr`. That keeps `.astype`-style
-  // attribute-position use the same as before this branch existed, and
-  // lets call-position users that pass a non-literal (e.g. a name ref)
-  // surface their own diagnostic downstream rather than fail here on a
-  // coercion the verifier can describe better.
+  // Degradation path: no positional arg still means "the dtype handle",
+  // and an uncoercible literal (NaN/Inf or out-of-range float -> int) still
+  // falls back to the `hc.const <TypeAttr>` materialized by `lowerAttr` so
+  // downstream users diagnose their own payload expectations. A non-literal
+  // positional is different: silently returning the dtype handle hides the
+  // bad source shape, so diagnose it here and point users at `.astype`.
   if (ref.getKind() == "numpy_dtype_type") {
     StringRef dtype = ref.getString("dtype");
     Attribute typed;
@@ -1863,6 +1862,13 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
       if (auto litOp = args.positional.front().getDefiningOp<HCConstOp>()) {
         if (auto tyOpt = resolveNumpyDtypeType(call.getContext(), dtype))
           typed = coerceNumpyLiteral(*tyOpt, litOp.getValue());
+      } else {
+        call.emitOpError("numpy dtype constructor `np.")
+            << dtype
+            << "(...)` only accepts literal positional arguments in hc_front; "
+               "use `value.astype(np."
+            << dtype << ")` for SSA values";
+        return failure();
       }
     }
     if (typed)

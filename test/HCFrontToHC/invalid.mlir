@@ -257,6 +257,24 @@ module {
 
 // -----
 
+// `np.<dtype>(x)` with an SSA value is not a literal constructor. The
+// frontend should spell this as `x.astype(np.<dtype>)`; otherwise returning
+// the dtype handle hides the source mistake until a later verifier error.
+module {
+  hc_front.kernel "numpy_dtype_nonliteral" attributes {
+    parameters = [{name = "x"}]
+  } {
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %f16 = hc_front.attr %np, "float16" {ref = {dtype = "float16", kind = "numpy_dtype_type"}}
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    // expected-error@+1 {{numpy dtype constructor `np.float16(...)` only accepts literal positional arguments in hc_front; use `value.astype(np.float16)` for SSA values}}
+    %bad = hc_front.call %f16(%x)
+    hc_front.return
+  }
+}
+
+// -----
+
 // `group.load(a[i][j], ...)` — chained Python subscripts lower to
 // nested `hc.buffer_view`s whose index lists cannot be safely spliced
 // (outer slice re-indexes the already-reduced view, not the original

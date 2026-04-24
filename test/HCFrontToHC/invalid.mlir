@@ -293,3 +293,119 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// Intrinsic call missing a declared non-const kwarg: previously the
+// kwarg was dropped silently and produced an under-arity call; now
+// the lowering reads the callee's declared `parameters` and blames
+// the caller before we reach the verifier.
+module {
+  hc_front.intrinsic "needy" attributes {
+    const_kwargs = ["arch"],
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
+  hc_front.func "missing_nonconst_kwarg" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "needy" {ctx = "load", ref = {
+      callee = "@needy",
+      const_kwargs = ["arch"],
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %arch = hc_front.constant<"gfx11">
+    %kw_arch = hc_front.keyword "arch" = %arch
+    // expected-error@+1 {{intrinsic '@needy' missing required kwarg 'lane'}}
+    %r = hc_front.call %intr(%grp, %kw_arch)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Intrinsic call with a kwarg name that isn't in the callee's declared
+// parameter list (and isn't a const_kwarg either). Silent drop was the
+// previous behavior; now the unknown name surfaces at lowering.
+module {
+  hc_front.intrinsic "strict" attributes {
+    const_kwargs = ["arch"],
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
+  hc_front.func "unknown_kwarg" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}, {name = "lane"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "strict" {ctx = "load", ref = {
+      callee = "@strict",
+      const_kwargs = ["arch"],
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %lane = hc_front.name "lane" {ctx = "load", ref = {kind = "param"}}
+    %kw_lane = hc_front.keyword "lane" = %lane
+    %arch = hc_front.constant<"gfx11">
+    %kw_arch = hc_front.keyword "arch" = %arch
+    %zero = hc_front.constant<0 : i64>
+    // Typo: `typo` isn't a declared parameter or a const_kwarg.
+    %kw_typo = hc_front.keyword "typo" = %zero
+    // expected-error@+1 {{intrinsic '@strict' called with unknown kwarg 'typo'}}
+    %r = hc_front.call %intr(%grp, %kw_lane, %kw_arch, %kw_typo)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// More positional operands than the callee has parameters. The declared
+// parameter list is authoritative — over-arity is not a case the
+// verifier alone can diagnose in a useful way, because the frontend
+// knows the intended shape and can point at the call site directly.
+module {
+  hc_front.intrinsic "two_params" attributes {
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
+  hc_front.func "too_many_positional" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}, {name = "c"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "two_params" {ctx = "load", ref = {
+      callee = "@two_params",
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %c = hc_front.name "c" {ctx = "load", ref = {kind = "param"}}
+    // expected-error@+1 {{intrinsic '@two_params' declares 2 parameter(s), call site supplies 3 positional}}
+    %r = hc_front.call %intr(%a, %b, %c)
+    hc_front.return %r
+  }
+}

@@ -373,6 +373,46 @@ Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
 }
 
 //===----------------------------------------------------------------------===//
+// `hc.intrinsic`'s `function_type` represents the runtime call signature —
+// what `hc.call_intrinsic` threads through as SSA operands. `const_kwargs`
+// (e.g. `wave_size`, `arch`) live on the call as specialization attributes,
+// never as operands (see `HCCallIntrinsicOp`'s ODS description); a call
+// site that also surfaced them as operands would double-count. So before
+// building the callee's signature, drop any declared parameter whose name
+// is in the `const_kwargs` whitelist. The full `parameters` list — which
+// keeps declared order intact — lives elsewhere for the call-site lowering
+// to walk when threading non-const kwargs into operands.
+//
+// Kernel / func lowerings pass `constKwargs = null` and the list round-
+// trips unchanged.
+//===----------------------------------------------------------------------===//
+static ArrayAttr filterOutConstKwargs(ArrayAttr params, ArrayAttr constKwargs,
+                                      MLIRContext *ctx) {
+  if (!constKwargs || constKwargs.empty())
+    return params;
+  llvm::SmallDenseSet<StringRef> skip;
+  for (Attribute kw : constKwargs)
+    if (auto s = dyn_cast<StringAttr>(kw))
+      skip.insert(s.getValue());
+  if (skip.empty())
+    return params;
+  SmallVector<Attribute> filtered;
+  filtered.reserve(params.size());
+  for (Attribute p : params) {
+    auto dict = dyn_cast<DictionaryAttr>(p);
+    if (!dict) {
+      filtered.push_back(p);
+      continue;
+    }
+    auto name = dict.getAs<StringAttr>("name");
+    if (name && skip.contains(name.getValue()))
+      continue;
+    filtered.push_back(p);
+  }
+  return ArrayAttr::get(ctx, filtered);
+}
+
+//===----------------------------------------------------------------------===//
 // Lowerer. Instantiated once per top-level `hc_front` callable; walks the
 // body, threads the scope map through nested regions, and emits the
 // corresponding `hc` ops via the shared `builder`. Source ops are erased
@@ -381,13 +421,22 @@ Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
 
 class Lowerer {
 public:
-  Lowerer(OpBuilder &builder, Type undef) : builder(builder), undef(undef) {}
+  // `intrinsicParameters` maps every frontend-declared intrinsic's symbol
+  // name to its full `parameters` ArrayAttr (including names that will
+  // migrate to `const_kwargs` attributes). Populated by the pass before
+  // any lowering runs, so `lowerCall` can walk the declared parameter
+  // order regardless of which callable (caller or callee) we visit first.
+  Lowerer(OpBuilder &builder, Type undef,
+          const llvm::StringMap<ArrayAttr> &intrinsicParameters)
+      : builder(builder), undef(undef),
+        intrinsicParameters(intrinsicParameters) {}
 
   LogicalResult lowerCallable(Operation *frontOp);
 
 private:
   OpBuilder &builder;
   Type undef;
+  const llvm::StringMap<ArrayAttr> &intrinsicParameters;
 
   // No scope stack: name-store placeholders carry the binding. Entry
   // points that introduce a new Python-level name (parameter entry,
@@ -572,11 +621,12 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // — attaches `entry` to the hc op first, so any later failure can
   // `hcOp->erase()` and take the block with it.
   auto runBody =
-      [&](bool returnsValue,
+      [&](ArrayAttr runParams, bool returnsValue,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
       -> LogicalResult {
     Block *entry = new Block();
-    auto fnType = materializeParameters(params, *entry, frontOp, returnsValue);
+    auto fnType =
+        materializeParameters(runParams, *entry, frontOp, returnsValue);
     if (failed(fnType)) {
       delete entry;
       return failure();
@@ -587,7 +637,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     if (!*bodyRegion)
       return success();
     OpBuilder::InsertionGuard bodyGuard(builder);
-    emitParameterAssigns(params, *entry, frontOp->getLoc());
+    emitParameterAssigns(runParams, *entry, frontOp->getLoc());
     // `emitParameterAssigns` leaves the builder just past the last
     // parameter `hc.assign`, which is where we want `lowerRegion` to
     // start appending the body's converted ops.
@@ -596,7 +646,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
 
   if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
     return runBody(
-        /*returnsValue=*/false,
+        params, /*returnsValue=*/false,
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcKernel = HCKernelOp::create(
               builder, loc, StringAttr::get(ctx, kernel.getName()),
@@ -633,7 +683,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
 
   if (auto func = dyn_cast<hc_front::FuncOp>(frontOp)) {
     return runBody(
-        /*returnsValue=*/true,
+        params, /*returnsValue=*/true,
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcFunc = HCFuncOp::create(
               builder, loc, StringAttr::get(ctx, func.getName()),
@@ -664,8 +714,14 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
       return frontOp->emitOpError(
           "hc_front.intrinsic must carry a `scope` string attribute");
     }
+    // `const_kwargs` specialization attrs must not also appear as
+    // operands — the call site only supplies them as attributes. Trim
+    // them out of the signature and block args so verifier arity lines
+    // up with what `lowerCall`'s intrinsic branch threads through.
+    auto constKwargsAttr = frontOp->getAttrOfType<ArrayAttr>("const_kwargs");
+    ArrayAttr bodyParams = filterOutConstKwargs(params, constKwargsAttr, ctx);
     return runBody(
-        /*returnsValue=*/true,
+        bodyParams, /*returnsValue=*/true,
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcIntr = HCIntrinsicOp::create(
               builder, loc, StringAttr::get(ctx, intr.getName()),
@@ -682,8 +738,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
             }
             hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
           }
-          if (auto kw = frontOp->getAttrOfType<ArrayAttr>("const_kwargs"))
-            hcIntr.setConstKwargsAttr(kw);
+          if (constKwargsAttr)
+            hcIntr.setConstKwargsAttr(constKwargsAttr);
           // Null => skip body walk; see file banner for rationale.
           Region *skipWalk = nullptr;
           return skipWalk;
@@ -1600,12 +1656,95 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
                                    symRef, args.positional);
       return call.getResult(0);
     }
-    auto call = HCCallIntrinsicOp::create(
-        builder, op.getLoc(), TypeRange{undef}, symRef, args.positional);
-    if (auto constKwargs = ref.getAs<ArrayAttr>("const_kwargs")) {
+
+    // Declared `const_kwargs` whitelist from the resolver. Used both to
+    // promote those kwargs to call-site attributes (below) and to skip
+    // them when threading remaining kwargs as SSA operands.
+    ArrayAttr constKwargsAttr = ref.getAs<ArrayAttr>("const_kwargs");
+    llvm::SmallDenseSet<StringRef> constKwargSet;
+    if (constKwargsAttr) {
+      for (Attribute kw : constKwargsAttr)
+        if (auto s = dyn_cast<StringAttr>(kw))
+          constKwargSet.insert(s.getValue());
+    }
+
+    // Thread non-const kwargs into the operand list in the callee's
+    // declared parameter order. Without this, a call site that supplies
+    // (say) `lane=...` as a runtime keyword loses the operand entirely —
+    // verifier rejects the call as under-arity. Walking `parameters`
+    // (the full frontend-stamped list) rather than `kwvalues` is what
+    // anchors the order; mapping kwvalues -> parameters by name alone
+    // would be non-deterministic across hash iteration.
+    SmallVector<Value> operands(args.positional.begin(), args.positional.end());
+    llvm::SmallDenseSet<StringRef> consumedKwargs;
+    auto paramsIt = intrinsicParameters.find(callee);
+    if (paramsIt != intrinsicParameters.end()) {
+      ArrayAttr params = paramsIt->second;
+      if (operands.size() > params.size()) {
+        op.emitOpError("intrinsic '@")
+            << callee << "' declares " << params.size()
+            << " parameter(s), call site supplies " << operands.size()
+            << " positional";
+        return failure();
+      }
+      for (unsigned i = operands.size(), e = params.size(); i < e; ++i) {
+        auto dict = dyn_cast<DictionaryAttr>(params[i]);
+        if (!dict)
+          continue;
+        auto nameAttr = dict.getAs<StringAttr>("name");
+        if (!nameAttr)
+          continue;
+        StringRef pname = nameAttr.getValue();
+        if (constKwargSet.contains(pname))
+          // Specialization kwarg — handled below as an attribute.
+          continue;
+        auto valIt = args.kwvalues.find(pname);
+        if (valIt == args.kwvalues.end()) {
+          op.emitOpError("intrinsic '@")
+              << callee << "' missing required kwarg '" << pname << "'";
+          return failure();
+        }
+        operands.push_back(valIt->second);
+        consumedKwargs.insert(pname);
+      }
+    } else if (!args.kwvalues.empty()) {
+      // No declared parameters to match against (hand-written hc_front
+      // IR, or a resolver that never stamped the callee). Silently
+      // dropping kwargs is the prior bug; surface it instead.
+      op.emitOpError("intrinsic '@")
+          << callee
+          << "' call has keyword arguments but callee declares no "
+             "`parameters` — the hc_front driver must stamp them";
+      return failure();
+    }
+
+    // Any kwvalue the declared-parameter walk didn't consume and that
+    // isn't in the `const_kwargs` whitelist is an unknown kwarg at this
+    // call site. Diagnose to keep the lowering honest — silent drops
+    // are how the whole under-arity class of bug hid for so long.
+    for (auto &kv : args.kwvalues) {
+      StringRef name = kv.first();
+      if (consumedKwargs.contains(name) || constKwargSet.contains(name))
+        continue;
+      op.emitOpError("intrinsic '@")
+          << callee << "' called with unknown kwarg '" << name << "'";
+      return failure();
+    }
+    for (auto &kv : args.kwattrs) {
+      StringRef name = kv.first();
+      if (!constKwargSet.contains(name)) {
+        op.emitOpError("intrinsic '@")
+            << callee << "' called with unknown kwarg '" << name << "'";
+        return failure();
+      }
+    }
+
+    auto call = HCCallIntrinsicOp::create(builder, op.getLoc(),
+                                          TypeRange{undef}, symRef, operands);
+    if (constKwargsAttr) {
       // Promote declared const kwargs to call-site attributes: folded
       // shape attr if present, else the producing `hc.const`'s payload.
-      for (Attribute kw : constKwargs) {
+      for (Attribute kw : constKwargsAttr) {
         auto kwStr = dyn_cast<StringAttr>(kw);
         if (!kwStr)
           continue;
@@ -2006,14 +2145,25 @@ struct ConvertHCFrontToHCPass
     UndefType undef = UndefType::get(ctx);
 
     SmallVector<Operation *> frontOps;
+    // Pre-scan every intrinsic's declared parameter list so `lowerCall`
+    // can walk it to thread non-const kwargs onto the call site. We
+    // snapshot before the lowering loop runs because each iteration
+    // erases its source op, and a later caller in the same module may
+    // need to see the callee's parameters after the callee itself is
+    // gone.
+    llvm::StringMap<ArrayAttr> intrinsicParameters;
     for (Operation &op : *module.getBody()) {
       if (isa<hc_front::KernelOp, hc_front::FuncOp, hc_front::IntrinsicOp>(op))
         frontOps.push_back(&op);
+      if (auto intr = dyn_cast<hc_front::IntrinsicOp>(op)) {
+        if (auto params = intr->getAttrOfType<ArrayAttr>("parameters"))
+          intrinsicParameters[intr.getName()] = params;
+      }
     }
 
     OpBuilder builder(ctx);
     for (Operation *op : frontOps) {
-      Lowerer lowerer(builder, undef);
+      Lowerer lowerer(builder, undef, intrinsicParameters);
       if (failed(lowerer.lowerCallable(op))) {
         signalPassFailure();
         return;

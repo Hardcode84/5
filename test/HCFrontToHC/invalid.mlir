@@ -238,3 +238,19 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// `numpy_dtype_type` with a dtype name the converter doesn't know about
+// (`float128` isn't in `resolveNumpyDtypeType` because it's platform-
+// dependent and not part of HC's supported scalar set). The attr lowering
+// rejects it here rather than later at the call site: the diagnostic
+// should finger the attr op, which is where the offending string lives.
+module {
+  hc_front.kernel "bad_numpy_dtype" attributes {parameters = []} {
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    // expected-error@+1 {{unsupported numpy_dtype_type 'float128'}}
+    %bad = hc_front.attr %np, "float128" {ref = {dtype = "float128", kind = "numpy_dtype_type"}}
+    hc_front.return
+  }
+}

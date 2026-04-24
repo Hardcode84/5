@@ -25,6 +25,15 @@
 //    on the callee's `ref`, plus a small `dsl_method` subset that's mechanical
 //    enough to fit — `a.shape[N]`, `x.vec()`, `x.with_inactive(value=...)`,
 //    `x.astype(...)`);
+//  * DSL method dispatch reads `hc_front.attr`'s `$name` (the op-level
+//    spelling the frontend always stamps) rather than `ref.method`,
+//    which the resolver can only fill in when the attr's base was
+//    classifiable — chained attrs on subscript/call results arrive with
+//    no `ref.method` but still dispatch on the attr's name;
+//  * `numpy_dtype_type` attrs (`np.float32`, `np.float16`, ...) lower to
+//    an `hc.const` wrapping the dtype's `TypeAttr`, usable both as an
+//    argument (`x.astype(np.float32)`) and as a value-constructor
+//    callee (`np.float16(0)`);
 //  * every produced value gets `!hc.undef` — type inference pins later.
 //
 // Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
@@ -230,6 +239,33 @@ std::optional<EffectClass> parseEffectClass(StringRef text) {
 }
 
 //===----------------------------------------------------------------------===//
+// Numpy dtype strings -> MLIR builtin scalar types. The Python resolver
+// (`_numpy_dtype_name` in `hc/_resolve.py`) classifies any live numpy
+// scalar type as `ref = {kind = "numpy_dtype_type", dtype = "<name>"}`
+// using the identifier numpy itself exposes. This pass supports a
+// curated subset — the fixed-width scalars plus their common size-
+// aliases — and collapses signed/unsigned integer spellings onto the
+// same signless `i<N>`; HC ops treat signedness as a later-pass concern
+// and `hc.astype`'s target verifier only checks `isIntOrIndexOrFloat`.
+// Anything outside the set returns `nullopt` so the caller can surface
+// a located diagnostic instead of fabricating an arbitrary type.
+//===----------------------------------------------------------------------===//
+
+std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
+  return llvm::StringSwitch<std::optional<Type>>(name)
+      .Cases({"float16", "half"}, Float16Type::get(ctx))
+      .Cases({"float32", "single"}, Float32Type::get(ctx))
+      .Cases({"float64", "double"}, Float64Type::get(ctx))
+      .Cases({"int8", "uint8"}, IntegerType::get(ctx, 8))
+      .Cases({"int16", "uint16"}, IntegerType::get(ctx, 16))
+      .Cases({"int32", "uint32", "intc", "uintc"}, IntegerType::get(ctx, 32))
+      .Cases({"int64", "uint64", "intp", "uintp", "longlong", "ulonglong"},
+             IntegerType::get(ctx, 64))
+      .Cases({"bool", "bool_"}, IntegerType::get(ctx, 1))
+      .Default(std::nullopt);
+}
+
+//===----------------------------------------------------------------------===//
 // Binary-op mnemonic table. `hc_front.binop "Add"(a, b)` spells out the
 // Python AST's BinOp.op class name; the lowering picks the matching `hc`
 // op and emits it against the two already-lowered operands. All results
@@ -319,11 +355,13 @@ private:
   //   * `failure()`        — a diagnostic was emitted.
   FailureOr<Value> lowerName(hc_front::NameOp op);
 
-  // Dispatches on `ref.kind = "dsl_method"`'s `method` payload, or falls
-  // through to a module/attr chain the call site handles. Returns a null
-  // `Value` on success (attrs never produce stand-alone SSA results — they
-  // are consumed by the parent call or subscript), and `failure` only if
-  // the `ref` dict on the op is present-but-malformed.
+  // Lowers `hc_front.attr`. Most attrs produce no standalone SSA value —
+  // they are consumed by the parent call/subscript via the attr op's
+  // `$name`. The one exception is `ref.kind = "numpy_dtype_type"`: these
+  // materialize to an `hc.const` wrapping the dtype's `TypeAttr`, reused
+  // by both the argument path (`x.astype(np.<dt>)`) and the callee path
+  // (`np.<dt>(0)`). Returns `failure` only when the op's `ref` dict is
+  // present-but-malformed.
   FailureOr<Value> lowerAttr(hc_front::AttrOp op);
 
   LogicalResult lowerRegion(Region &src);
@@ -821,14 +859,33 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
 }
 
 FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
-  // Attribute chains like `np.float32` or `group.load` are either folded
-  // into a parent call (dsl_method, numpy_dtype_type), or don't produce a
-  // value at all. Leave nothing in the value map — consumers inspect the
-  // original op. A present-but-malformed `ref` (dict without a string
-  // `kind`) is diagnosed here so the error fingers the attr rather than
-  // the downstream call/subscript that was trying to read `method`.
-  if (failed(RefInfo::get(op).diagnoseIfMalformed(op)))
+  // Attribute chains like `group.load` or `buf.shape` are folded into
+  // the parent call or subscript and don't produce a standalone SSA
+  // value at this layer. The one exception is `numpy_dtype_type`: the
+  // attr itself denotes a type, which both `x.astype(np.<dtype>)` (arg
+  // position) and `np.<dtype>(0)` (callee position) want to observe as
+  // an `hc.const` carrying a `TypeAttr`. Materializing it eagerly here
+  // keeps `collectCallArgs` honest (no null-arg rejection) and lets
+  // `lowerDslMethodCall` reuse the same value when a numpy dtype is
+  // used as a value constructor.
+  //
+  // A present-but-malformed `ref` (dict without a string `kind`) is
+  // diagnosed here so the error fingers the attr rather than the
+  // downstream call/subscript that was trying to read `method`.
+  RefInfo ref = RefInfo::get(op);
+  if (failed(ref.diagnoseIfMalformed(op)))
     return failure();
+  if (ref.getKind() == "numpy_dtype_type") {
+    StringRef dtype = ref.getString("dtype");
+    std::optional<Type> dtypeTy = resolveNumpyDtypeType(op.getContext(), dtype);
+    if (!dtypeTy) {
+      op.emitOpError("unsupported numpy_dtype_type '") << dtype << "'";
+      return failure();
+    }
+    return {
+        HCConstOp::create(builder, op.getLoc(), undef, TypeAttr::get(*dtypeTy))
+            .getResult()};
+  }
   return Value();
 }
 
@@ -1535,12 +1592,34 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // independent of traversal order.
   if (failed(ref.diagnoseIfMalformed(attr)))
     return failure();
-  StringRef method = ref.getString("method");
+
+  // `hc_front.attr`'s `$name` is the authoritative method spelling. The
+  // resolver stamps `ref = {kind = "dsl_method", method = "<name>"}` only
+  // when the base was classifiable; chained attrs (`a[i].vec()`,
+  // `buf.vec().with_inactive(...)`) land on an `hc_front.subscript` or
+  // `hc_front.call` base that `_classify_attr` leaves unclassified, so no
+  // `ref.method` gets stamped. Reading the method name off the op itself
+  // makes dispatch work regardless of whether the resolver reached this
+  // site; any `ref.method` stamp is redundant and we don't cross-check.
+  StringRef method = attr.getName();
 
   FailureOr<CallArgs> argsOr = collectCallArgs(call);
   if (failed(argsOr))
     return failure();
   CallArgs &args = *argsOr;
+
+  // `np.<dtype>(...)` — Python's value-constructor form for numpy scalar
+  // types — shows up as a call whose callee is an attr classified as
+  // `numpy_dtype_type`. `lowerAttr` has already materialized an
+  // `hc.const` wrapping the dtype's `TypeAttr`; reuse that value as the
+  // call's result. The positional arg (typically `0` or `NaN` the user
+  // hands to `np.<dtype>(...)` for a typed placeholder) is discarded
+  // here. Downstream ops that need a typed scalar literal
+  // (`hc.with_inactive`'s `$inactive`) will still fail their own
+  // verifier on a `TypeAttr` payload, but dispatch no longer stalls on
+  // an empty method name.
+  if (ref.getKind() == "numpy_dtype_type")
+    return lowerValueOperand(attr.getResult());
 
   Value base = lowerValueOperand(attr.getBase());
 
@@ -1674,6 +1753,19 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   return failure();
 }
 
+// Recognize the launch-geo method spellings so callers can gate
+// launch-geo–specific preconditions (axis bounds cap in `lowerSubscript`,
+// diagnostic wording) without calling `tryEmitLaunchGeo` eagerly, which
+// would create the underlying `hc` op before the check has a chance to
+// reject the site.
+static bool isLaunchGeoMethod(StringRef method) {
+  return llvm::StringSwitch<bool>(method)
+      .Cases({"group_id", "local_id", "subgroup_id"}, true)
+      .Cases({"group_shape", "work_offset", "work_shape"}, true)
+      .Cases({"group_size", "wave_size"}, true)
+      .Default(false);
+}
+
 Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc,
                                 std::optional<unsigned> resultIdx) {
   auto emitMulti = [&](auto tag) -> Value {
@@ -1718,9 +1810,15 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   // generic `hc.buffer_view` branch below.
   if (auto attr =
           dyn_cast_if_present<hc_front::AttrOp>(op.getBase().getDefiningOp())) {
-    RefInfo ref = RefInfo::get(attr);
-    StringRef method = ref.getString("method");
-    if (!method.empty() && op.getIndices().size() == 1) {
+    // Read the method name off the attr op (`$name`) rather than
+    // `ref.method`: a `.shape[N]` or `.local_id[N]` chained off a
+    // subscript/call result reaches here without a `ref` dict on the
+    // attr, but the spelling on the op is enough — the branches below
+    // only fold on exact method strings (`"shape"` and the launch-geo
+    // set). Unknown spellings still fall through to the generic
+    // `hc.buffer_view` path.
+    StringRef method = attr.getName();
+    if (op.getIndices().size() == 1) {
       Value idxVal = lowerValueOperand(op.getIndices().front());
       Value baseVal = lowerValueOperand(attr.getBase());
       auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
@@ -1738,15 +1836,21 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
         }
         // Launch-geo axes parameterize the variadic result list built by
         // `emitMulti`; cap before the unsigned cast so a negative or huge
-        // value cannot allocate a pathological result-type vector.
-        if (axVal < 0 || axVal >= kMaxLaunchAxis) {
-          op.emitOpError("launch-geo axis ")
-              << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
-          return nullptr;
+        // value cannot allocate a pathological result-type vector. Gate
+        // on `isLaunchGeoMethod` so a non-launch-geo attr (stray
+        // `foo_bar[200]`) falls through to the generic `hc.buffer_view`
+        // path instead of surfacing a misleading "launch-geo axis …"
+        // diagnostic.
+        if (isLaunchGeoMethod(method)) {
+          if (axVal < 0 || axVal >= kMaxLaunchAxis) {
+            op.emitOpError("launch-geo axis ")
+                << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
+            return nullptr;
+          }
+          unsigned axis = static_cast<unsigned>(axVal);
+          if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
+            return v;
         }
-        unsigned axis = static_cast<unsigned>(axVal);
-        if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
-          return v;
       }
     }
   }

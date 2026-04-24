@@ -1125,8 +1125,7 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 // boundary and gets rewritten with its own prefix when it in turn is
 // flattened. Touching a nested inlined body here would double-prefix
 // its params and break the `parameters` -> body mapping.
-static void alphaRenameInlinedBody(Region &body, StringRef prefix,
-                                   MLIRContext *ctx) {
+static void alphaRenameInlinedBody(Region &body, StringRef prefix) {
   SmallVector<Region *> worklist{&body};
   while (!worklist.empty()) {
     Region *region = worklist.pop_back_val();
@@ -1177,7 +1176,7 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
       ("__inl_" + op.getCallee() + "_" + Twine(inlineSiteCounter) + "_").str();
   ++inlineSiteCounter;
 
-  alphaRenameInlinedBody(body, prefix, ctx);
+  alphaRenameInlinedBody(body, prefix);
 
   // Bind params at the current caller insertion point: `hc.assign
   // @<renamed_param> = <lowered_arg>`. The body's `hc_front.name`
@@ -1208,9 +1207,12 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
   // resolve through the normal paths.
   //
   // The AST frontend writes `return a, b` as `hc_front.return %t`
-  // where `%t = hc_front.tuple(%a, %b)`. `expandTupleOperand`
-  // destructures the tuple handle when present and falls through to
-  // the singleton path otherwise, so scalar returns stay 1:1.
+  // where `%t = hc_front.tuple(%a, %b)`. When the single return
+  // operand is a tuple handle we pull its elements out of `tupleElts`
+  // (populated by the earlier `lowerOp` on the tuple literal);
+  // otherwise we lower it as a scalar. Either way we want a *located*
+  // diagnostic on the failing op, not a downstream "result arity
+  // mismatch (0 vs N)" that hides the original lowering failure.
   SmallVector<Value> resultValues;
   bool sawReturn = false;
   for (Operation &child : llvm::make_early_inc_range(body.front())) {
@@ -1219,9 +1221,27 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
         return op.emitOpError("inlined_region body has multiple returns");
       sawReturn = true;
       if (r.getValues().size() == 1) {
-        resultValues = expandTupleOperand(r.getValues().front());
+        Value ret = r.getValues().front();
+        auto it = tupleElts.find(ret);
+        if (it != tupleElts.end()) {
+          resultValues = it->second;
+        } else {
+          Value lowered = lowerValueOperand(ret);
+          if (!lowered) {
+            return r.emitOpError("inlined_region return operand did not lower");
+          }
+          resultValues = {lowered};
+        }
       } else {
-        resultValues = lowerValueOperands(r.getValues());
+        resultValues.clear();
+        resultValues.reserve(r.getValues().size());
+        for (Value v : r.getValues()) {
+          Value lowered = lowerValueOperand(v);
+          if (!lowered) {
+            return r.emitOpError("inlined_region return operand did not lower");
+          }
+          resultValues.push_back(lowered);
+        }
       }
       continue;
     }

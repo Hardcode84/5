@@ -30,6 +30,22 @@ def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
 
         hc-opt --convert-hc-front-to-hc --hc-promote-names
 
+    Modules that carry undecorated inline helpers (`hc_front.func` ops
+    tagged `ref = {kind = "inline"}`, produced by the Python resolver
+    when it BFS-discovers plain-Python helpers) must first run
+    `-hc-front-inline`, which expands every call site into an
+    `hc_front.inlined_region` and erases the marker funcs. This pass
+    flattens those regions but refuses to lower a surviving
+    `ref.kind = "inline"` `hc_front.call` — the diagnostic tells the
+    operator the pipeline ordering is wrong. The full pipeline is
+    therefore:
+
+        hc-opt --hc-front-inline --convert-hc-front-to-hc --hc-promote-names
+
+    `--hc-front-inline` is a no-op on modules the Python driver never
+    stamped inline helpers on, so it is safe to include
+    unconditionally.
+
     Placeholder IR (the output of this pass on its own) is verifier-legal
     but round-trip-only: no consumer other than `-hc-promote-names`
     should inspect or transform it. Diagnostics for driver-side bugs

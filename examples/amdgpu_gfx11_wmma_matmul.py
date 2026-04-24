@@ -83,9 +83,13 @@ def _lane_output_row_slice_args(lane: int, wave_size: int) -> tuple[int, int, in
     # Algebraically the `(rows[0], WMMA_M, _lane_output_row_step(wave_size))`
     # triple that the simulator would derive from `_lane_output_rows`. The
     # zeroth element of `tuple(range(lane // 16, WMMA_M, wave_size // 16))`
-    # is just `lane // 16`, so we compute it directly — the compiler doesn't
-    # lower `tuple(range(...))[0]` and the helper body has to be lowerable
-    # for `hc_front` to inline it later in the pipeline.
+    # is just `lane // 16` — which holds whenever the range is non-empty,
+    # i.e. `lane // 16 < WMMA_M`. That's always true for supported waves
+    # (wave_size ∈ {32, 64} gives `lane // 16 ∈ [0, 3]`, `WMMA_M = 16`),
+    # so the algebraic shortcut matches `rows[0]` for every supported
+    # call. We can't assert it here because `hc_front` doesn't lower
+    # `ast.Assert`, and this helper's body has to be lowerable so the
+    # `-hc-front-inline` pass can splice it into the caller.
     return lane // 16, WMMA_M, _lane_output_row_step(wave_size)
 
 

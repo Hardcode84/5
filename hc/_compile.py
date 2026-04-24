@@ -91,7 +91,7 @@ def compile(
         bindings=bindings,
         front_ir=module,
         front_ir_text=str(module),
-        front_ir_symbols=resolved.decorated_symbol_names,
+        front_ir_symbols=resolved.exported_symbol_names,
     )
 
 

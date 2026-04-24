@@ -751,12 +751,25 @@ attributes needed to preserve source structure.
 
 The first real compiler stage should:
 
+* expand undecorated Python helpers that the resolver emitted as
+  `hc_front.func` with `ref = {kind = "inline", ...}` into the caller
+  (the `-hc-front-inline` pass; must precede `-convert-hc-front-to-hc`
+  because the latter refuses to lower a surviving
+  `ref.kind = "inline"` call with a located diagnostic),
 * resolve decorators and annotations into semantic form,
 * recognize DSL constructs such as `group.load`, `group.vload`,
   `with_inactive`, `as_layout`, and region declarations,
 * materialize subgroup/workitem regions together with their explicit syntactic
   capture lists,
 * build semantic `hc` operations while preserving symbolic launch parameters.
+
+The canonical hc-opt invocation for a module the resolver may have
+stamped inline helpers on is therefore:
+
+    hc-opt --hc-front-inline --convert-hc-front-to-hc --hc-promote-names
+
+`-hc-front-inline` is a no-op when nothing is marked, so it's safe to
+keep in the pipeline unconditionally.
 
 Postcondition: semantic `hc` operations and explicit region structure exist, but
 name-based bindings, partially unknown types, and symbolic launch parameters may

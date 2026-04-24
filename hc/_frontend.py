@@ -300,14 +300,26 @@ def lower_functions_to_front_ir(
         combined = _function_overrides(fn)
         extra = overrides_by_id.get(id(fn))
         if extra:
+            # `_lower_toplevel` keys the override bag on the Python
+            # name (the AST `FunctionDef.name`), so we need a string
+            # here. Callers hitting the hot path — the resolver —
+            # always pass `types.FunctionType`s, but silently dropping
+            # the payload when `__name__` is weird would leave
+            # `force_kind` unapplied and the resulting IR misclassified.
+            # Loud, not lossy.
             name = getattr(fn, "__name__", None)
-            if isinstance(name, str):
-                # Merge into the by-name override bag that
-                # ``_lower_toplevel`` threads through to the emitter.
-                slot = dict(combined.get(name, {}))
-                slot.update(extra)
-                combined = dict(combined)
-                combined[name] = slot
+            if not isinstance(name, str):
+                raise RuntimeError(
+                    f"per_function_overrides supplied for {fn!r} but "
+                    f"`__name__` is not a string (got {name!r}); override "
+                    "payload cannot be keyed into the emitter bag"
+                )
+            # Merge into the by-name override bag that
+            # ``_lower_toplevel`` threads through to the emitter.
+            slot = dict(combined.get(name, {}))
+            slot.update(extra)
+            combined = dict(combined)
+            combined[name] = slot
         try:
             _FrontendLowerer(
                 emitter=emitter,
@@ -379,7 +391,7 @@ class _FrontendLowerer:
         if not isinstance(stmt, ast.FunctionDef):
             raise self._error("unsupported top-level statement", stmt)
         overrides = self._toplevel_overrides.get(stmt.name)
-        forced = _pop_force_kind(overrides) if overrides else None
+        forced = _peek_force_kind(overrides) if overrides else None
         # ``force_kind`` bypasses the decorator sniff: undecorated inline
         # helpers that the resolver chose to emit as `hc_front.func` use
         # this path. Decorated top-levels never set ``force_kind``, so
@@ -1079,7 +1091,7 @@ def _function_payload(
     )
 
 
-def _pop_force_kind(overrides: Mapping[str, object]) -> str | None:
+def _peek_force_kind(overrides: Mapping[str, object]) -> str | None:
     """Peek at a ``force_kind`` override without scrubbing the mapping.
 
     Returns the normalized kind string (one of the `_TOPLEVEL_KINDS`

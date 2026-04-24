@@ -41,8 +41,6 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -124,7 +122,6 @@ public:
 private:
   llvm::StringMap<hc_front::FuncOp> &inlinableFuncs;
   hc_front::ValueType valueTy;
-  int siteCounter = 0;
 
   LogicalResult inlineAt(hc_front::CallOp call, ArrayRef<StringRef> chain) {
     auto nameOp = call.getCallee().getDefiningOp<hc_front::NameOp>();
@@ -156,12 +153,13 @@ private:
     FailureOr<hc_front::ReturnOp> retOr = findSingleReturn(func);
     if (failed(retOr))
       return failure();
-    // The AST frontend emits `return a, b` as `hc_front.return %t`
-    // where `%t` is a `hc_front.tuple(%a, %b)`. The converter's
-    // assign-to-tuple path looks at the defining op's result count, so
-    // we need to expose the tuple arity on the region op — not the
-    // return's 1-operand wrapper. A non-tuple single return keeps
-    // arity 1; zero operands stays zero.
+    // Region-result arity is the Python-level return arity. The AST
+    // frontend writes `return a, b` as `hc_front.return %t` with
+    // `%t = hc_front.tuple(%a, %b)`, so the wrapper hides arity 2
+    // behind a single return operand — unwrap it here so the
+    // converter's tuple-unpack path (which keys off the defining op's
+    // result count) sees two results and distributes. Scalar returns
+    // keep arity 1; zero-operand returns stay zero.
     unsigned nResults = retOr->getValues().size();
     if (nResults == 1) {
       if (auto tup =
@@ -170,12 +168,6 @@ private:
       }
     }
 
-    // The call's single result represents the Python-level return —
-    // scalar when `nResults <= 1`, a tuple handle when `nResults > 1`.
-    // The converter's assign-to-tuple path keys off the defining op's
-    // result count, so we expose the full arity on the region op here
-    // and the tuple unpack resolves through the natural
-    // `rhsOp->getNumResults() == arity` branch.
     MLIRContext *ctx = call.getContext();
     SmallVector<Type> resultTypes(nResults, valueTy);
 
@@ -224,7 +216,6 @@ private:
     if (failed(inlineReachable(regionOp, newChain)))
       return failure();
 
-    ++siteCounter;
     return success();
   }
 };

@@ -186,23 +186,10 @@ def HCFront_WorkitemRegionOp : HCFront_RegionOp<"workitem_region"> {
       "(`captures` `=` $captures^)? attr-dict-with-keyword $body";
 }
 
+// Name-scope boundary around a cloned inline callee body. Stamped by
+// `-hc-front-inline`, consumed by `-convert-hc-front-to-hc`; no runtime
+// semantics. See the `HCFrontInline` pass description for the contract.
 def HCFront_InlinedRegionOp : HCFront_RegionOp<"inlined_region"> {
-  let summary = "Name-boundary region holding a spliced inline callee body.";
-  let description = [{
-    The `-hc-front-inline` pass rewrites every `hc_front.call` whose
-    callee carries `ref.kind = "inline"` into this op. The body is a
-    clone of the callee's `hc_front.func` body; the `arguments`
-    operands are bound to the ordered `parameters` discardable
-    attribute entries via parameter-binding assigns at conversion
-    time. The body terminates in an `hc_front.return` whose values
-    map positionally onto this op's `results`.
-
-    The op is purely a name-scope boundary — it has no execution
-    semantics. At conversion the body is flattened into the caller
-    with per-site alpha-renamed locals so nothing leaks; the boundary
-    exists only in `hc_front` to keep the scoping explicit in IR and
-    avoid bookkeeping in the inliner pass.
-  }];
   let arguments = (ins
     StrAttr:$callee,
     Variadic<HCFront_ValueType>:$arguments

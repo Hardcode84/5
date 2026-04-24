@@ -137,7 +137,7 @@ def test_resolve_wmma_collects_full_dep_set() -> None:
     # inline subset so the resolver stays honest about which top-levels
     # were marked `ref.kind = "inline"`.
     assert resolved.symbol_names[0] == "tiled_gfx11_wmma_matmul"
-    assert set(resolved.decorated_symbol_names) == {
+    assert set(resolved.exported_symbol_names) == {
         "tiled_gfx11_wmma_matmul",
         "init_wmma_acc",
         "issue_wmma_tile",

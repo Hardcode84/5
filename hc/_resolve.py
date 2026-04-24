@@ -96,7 +96,15 @@ class ResolvedFrontIR:
         return tuple(_fn_name(fn) for fn in self.functions)
 
     @property
-    def decorated_symbol_names(self) -> tuple[str, ...]:
+    def exported_symbol_names(self) -> tuple[str, ...]:
+        """Names the resolver considers user-visible top-level symbols.
+
+        Every discovered function minus the ones emitted as inline
+        helpers (`ref.kind = "inline"`) — those are an implementation
+        detail of the `hc_front → hc` lowering and shouldn't leak
+        through public APIs like ``CompiledKernel.front_ir_symbols``.
+        """
+
         return tuple(
             _fn_name(fn)
             for fn in self.functions

@@ -34,8 +34,8 @@ module {
     %zero = hc_front.constant<0 : i64>
     %m = hc_front.constant<16 : i64>
     %k = hc_front.constant<16 : i64>
-    %row_sl = hc_front.slice(%zero, %m) {has_lower = true, has_step = false, has_upper = true}
-    %col_sl = hc_front.slice(%zero, %k) {has_lower = true, has_step = false, has_upper = true}
+    %row_sl = hc_front.slice (%zero, %m) {has_lower = true, has_upper = true, has_step = false}
+    %col_sl = hc_front.slice (%zero, %k) {has_lower = true, has_upper = true, has_step = false}
     %idx = hc_front.tuple(%row_sl, %col_sl)
     %sub = hc_front.subscript %a[%idx]
     %m_dim = hc_front.constant<16 : i64>
@@ -68,8 +68,8 @@ module {
     %zero = hc_front.constant<0 : i64>
     %m = hc_front.constant<16 : i64>
     %k = hc_front.constant<16 : i64>
-    %row_sl = hc_front.slice(%zero, %m) {has_lower = true, has_step = false, has_upper = true}
-    %col_sl = hc_front.slice(%zero, %k) {has_lower = true, has_step = false, has_upper = true}
+    %row_sl = hc_front.slice (%zero, %m) {has_lower = true, has_upper = true, has_step = false}
+    %col_sl = hc_front.slice (%zero, %k) {has_lower = true, has_upper = true, has_step = false}
     %idx = hc_front.tuple(%row_sl, %col_sl)
     %sub = hc_front.subscript %a[%idx]
     %m_dim = hc_front.constant<16 : i64>
@@ -77,7 +77,7 @@ module {
     %shape_tuple = hc_front.tuple(%m_dim, %k_dim)
     %shape_kw = hc_front.keyword "shape" = %shape_tuple
     %tile = hc_front.call %vload_attr(%sub, %shape_kw)
-    %t_tile = hc_front.target_name "v"
+    %t_tile = hc_front.target_name "v_tile"
     hc_front.assign %t_tile = %tile
     hc_front.return
   }
@@ -105,11 +105,56 @@ module {
     %zero = hc_front.constant<0 : i64>
     %m = hc_front.constant<16 : i64>
     %k = hc_front.constant<16 : i64>
-    %row_sl = hc_front.slice(%zero, %m) {has_lower = true, has_step = false, has_upper = true}
-    %col_sl = hc_front.slice(%zero, %k) {has_lower = true, has_step = false, has_upper = true}
+    %row_sl = hc_front.slice (%zero, %m) {has_lower = true, has_upper = true, has_step = false}
+    %col_sl = hc_front.slice (%zero, %k) {has_lower = true, has_upper = true, has_step = false}
     %idx = hc_front.tuple(%row_sl, %col_sl)
     %sub = hc_front.subscript %c[%idx]
     %call = hc_front.call %store_attr(%sub, %tile)
+    hc_front.return
+  }
+
+  // Peel only touches the immediate handle. If the subscripted base is
+  // *also* consumed by another op (`buf_view.shape[0]`, `.vec()`, a
+  // second `group.load`), the `hc.buffer_view` must remain live for
+  // those users even though `hc.load` now threads the slices through
+  // its own index list. `hc.buffer_view` is `Pure` so DCE will drop it
+  // on the no-other-users case, but here we want the op present.
+  // CHECK-LABEL: hc.kernel @multi_use_view
+  // CHECK-NOT: hc_front.
+  hc_front.kernel "multi_use_view" attributes {
+    parameters = [
+      {name = "group"},
+      {annotation = "Buffer[M,K]", kind = "buffer", name = "a", shape = ["M", "K"]}
+    ]
+  } {
+    // CHECK: %[[VIEW:.*]] = hc.buffer_view %arg1[%{{.*}}, %{{.*}}]
+    // CHECK: hc.load %arg1[%{{.*}}, %{{.*}}] {shape = #hc.shape<["16", "16"]>}
+    // CHECK: hc.buffer_dim %[[VIEW]], axis = 0
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %load_attr = hc_front.attr %grp, "load" {ref = {kind = "dsl_method", method = "load"}}
+    %zero = hc_front.constant<0 : i64>
+    %m = hc_front.constant<16 : i64>
+    %k = hc_front.constant<16 : i64>
+    %row_sl = hc_front.slice (%zero, %m) {has_lower = true, has_upper = true, has_step = false}
+    %col_sl = hc_front.slice (%zero, %k) {has_lower = true, has_upper = true, has_step = false}
+    %idx = hc_front.tuple(%row_sl, %col_sl)
+    %sub = hc_front.subscript %a[%idx]
+    %m_dim = hc_front.constant<16 : i64>
+    %k_dim = hc_front.constant<16 : i64>
+    %shape_tuple = hc_front.tuple(%m_dim, %k_dim)
+    %shape_kw = hc_front.keyword "shape" = %shape_tuple
+    %tile = hc_front.call %load_attr(%sub, %shape_kw)
+    %t_tile = hc_front.target_name "a_tile"
+    hc_front.assign %t_tile = %tile
+    // Second user: read axis-0 dim off the same pre-sliced view. If the
+    // peel had moved or deleted `%sub`, this subsequent consumer would
+    // dangle.
+    %shape_attr = hc_front.attr %sub, "shape"
+    %axis = hc_front.constant<0 : i64>
+    %dim = hc_front.subscript %shape_attr[%axis]
+    %t_dim = hc_front.target_name "d"
+    hc_front.assign %t_dim = %dim
     hc_front.return
   }
 }

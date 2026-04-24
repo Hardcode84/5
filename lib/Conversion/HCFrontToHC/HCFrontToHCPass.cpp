@@ -316,6 +316,32 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
 }
 
 //===----------------------------------------------------------------------===//
+// `group.load(a[row_sl, col_sl], shape=(M, K))` — the WMMA pattern —
+// has to land as `hc.load %a[%row_sl, %col_sl] {shape=...}`, not as a
+// chained `hc.buffer_view` + zero-index `hc.load`. This helper peels
+// the `hc.buffer_view` produced by `lowerSubscript` on the handle of
+// load/vload/store when the caller didn't supply trailing positional
+// indices of its own (mixing the view's own index list with caller-
+// supplied positionals would be ambiguous). The `hc.buffer_view` is
+// `Pure`; if it has no other users, DCE drops it later.
+//
+// Single-level peel only. Nested `hc.buffer_view`s arise from chained
+// Python subscripts (`a[i][j]`), and by `hc.buffer_view`'s Python-like
+// semantics the inner view applies to the outer-view's *leading* axis
+// — not the original buffer's next axis. Splicing two index lists
+// together would silently misaddress in the general slice/slice case,
+// so we stop at one level and let the caller diagnose.
+Value peelBufferView(Value handle, SmallVectorImpl<Value> &extraIndices) {
+  if (!extraIndices.empty())
+    return handle;
+  auto view = handle.getDefiningOp<HCBufferViewOp>();
+  if (!view)
+    return handle;
+  extraIndices.assign(view.getIndices().begin(), view.getIndices().end());
+  return view.getBuffer();
+}
+
+//===----------------------------------------------------------------------===//
 // Binary-op mnemonic table. `hc_front.binop "Add"(a, b)` spells out the
 // Python AST's BinOp.op class name; the lowering picks the matching `hc`
 // op and emits it against the two already-lowered operands. All results
@@ -1757,26 +1783,26 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // pre-sliced) handle as the first positional, remaining positionals go
   // to the indices list, and an optional `shape=` kwarg lands as the
   // attribute. We rely on `collectCallArgs`' shape-kwarg fold so no manual
-  // tuple walking is needed here.
+  // tuple walking is needed here. `peelBufferView` at file scope folds
+  // the pre-subscripted `hc.buffer_view` into the op's own index list;
+  // see its banner for the single-level rationale.
   //
-  // `group.load(a[row_sl, col_sl], shape=(M, K))` — the common WMMA
-  // pattern — arrives here as `positional = [%view]` with no inline
-  // indices and a rank-2 shape attr, because `lowerSubscript` has
-  // already folded the pre-subscripted base into an `hc.buffer_view`.
-  // The target IR in `doc/lowering.md` wants the slice ops to feed
-  // `hc.load`'s own index list instead (`hc.load %a[%row_sl, %col_sl]
-  // {shape=...}`), so peel the view here when the caller didn't supply
-  // trailing positional indices of its own. The `hc.buffer_view` is
-  // `Pure`; if it has no other users, DCE drops it later.
-  auto peelBufferView = [&](Value handle,
-                            SmallVectorImpl<Value> &extraIndices) -> Value {
-    if (!extraIndices.empty())
-      return handle;
-    auto view = handle.getDefiningOp<HCBufferViewOp>();
-    if (!view)
-      return handle;
-    extraIndices.assign(view.getIndices().begin(), view.getIndices().end());
-    return view.getBuffer();
+  // Chained-subscript guard: if after one peel the handle is *still* a
+  // `hc.buffer_view`, the user wrote `a[i][j]`-style nested subscripts.
+  // That lowers to two distinct buffer_views whose index lists can't be
+  // safely spliced (the outer slice re-indexes the already-reduced view,
+  // not the original buffer's next axis). Diagnose with the rewrite
+  // suggestion rather than emit wrong IR or let the rank verifier
+  // complain about an index count the user didn't write.
+  auto rejectNestedView = [&](Value handle) -> LogicalResult {
+    if (!handle.getDefiningOp<HCBufferViewOp>())
+      return success();
+    call.emitOpError("chained subscript into `")
+        << method
+        << "` is not supported; use a single tuple subscript instead "
+           "(e.g. `group."
+        << method << "(a[i, j], ...)` rather than `a[i][j]`)";
+    return failure();
   };
 
   if (method == "load" || method == "vload") {
@@ -1788,6 +1814,8 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     SmallVector<Value> indices(args.positional.begin() + 1,
                                args.positional.end());
     src = peelBufferView(src, indices);
+    if (failed(rejectNestedView(src)))
+      return failure();
     auto shapeAttr = dyn_cast_or_null<ShapeAttr>(args.kwattrs.lookup("shape"));
     Operation *op = method == "load"
                         ? HCLoadOp::create(builder, call.getLoc(), undef, src,
@@ -1808,6 +1836,8 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     SmallVector<Value> indices(args.positional.begin() + 1,
                                args.positional.end() - 1);
     dest = peelBufferView(dest, indices);
+    if (failed(rejectNestedView(dest)))
+      return failure();
     HCStoreOp::create(builder, call.getLoc(), dest, indices, source);
     // `hc.store` is a no-result op; success+null signals "consumed, no
     // SSA output" to `lowerCall`, distinct from the failure path below.

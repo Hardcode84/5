@@ -254,3 +254,42 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// `group.load(a[i][j], ...)` — chained Python subscripts lower to
+// nested `hc.buffer_view`s whose index lists cannot be safely spliced
+// (outer slice re-indexes the already-reduced view, not the original
+// buffer). `peelBufferView` handles the single-level case; when it
+// leaves a `buffer_view` behind, `lowerDslMethodCall` surfaces the
+// rewrite suggestion before we emit wrong IR. Store shares the path;
+// `vload` uses the same guard but covering one method variant is
+// enough to pin the diagnostic wording.
+module {
+  hc_front.kernel "chained_subscript_load" attributes {
+    parameters = [
+      {name = "group"},
+      {annotation = "Buffer[M,K]", kind = "buffer", name = "a", shape = ["M", "K"]}
+    ]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %load_attr = hc_front.attr %grp, "load" {ref = {kind = "dsl_method", method = "load"}}
+    %zero = hc_front.constant<0 : i64>
+    %m = hc_front.constant<16 : i64>
+    %k = hc_front.constant<16 : i64>
+    %row_sl = hc_front.slice (%zero, %m) {has_lower = true, has_upper = true, has_step = false}
+    %col_sl = hc_front.slice (%zero, %k) {has_lower = true, has_upper = true, has_step = false}
+    %sub1 = hc_front.subscript %a[%row_sl]
+    %sub2 = hc_front.subscript %sub1[%col_sl]
+    %m_dim = hc_front.constant<16 : i64>
+    %k_dim = hc_front.constant<16 : i64>
+    %shape_tuple = hc_front.tuple(%m_dim, %k_dim)
+    %shape_kw = hc_front.keyword "shape" = %shape_tuple
+    // expected-error@+1 {{chained subscript into `load` is not supported}}
+    %tile = hc_front.call %load_attr(%sub2, %shape_kw)
+    %t_tile = hc_front.target_name "a_tile"
+    hc_front.assign %t_tile = %tile
+    hc_front.return
+  }
+}

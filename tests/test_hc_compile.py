@@ -531,10 +531,11 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
     # The real WMMA example is the richest fixture we have for this check.
     #
     # We deliberately do not assert on ``handle.hc_ir`` here: WMMA exercises
-    # constructs (pre-sliced buffer_view into ``group.load``) that still
-    # trip open lowering bugs (5-2fj hc.load rank mismatch, 5-36p hc.return
-    # operand). Once those land, tighten this to also gate the full
-    # pipeline on the heaviest example.
+    # constructs that still trip open lowering bugs — 5-2gz
+    # (``hc.call_intrinsic`` drops non-const kwargs for the ``wmma_gfx11``
+    # call site) and 5-36p (``hc.return %val`` from ``return None``). Once
+    # both land (and 5-298 turns this test into the WMMA pipeline snapshot),
+    # tighten here to gate the full pipeline on the heaviest example.
     script = tmp_path / "compile_wmma.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""

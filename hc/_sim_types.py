@@ -371,8 +371,7 @@ class _MaskedValue:
         where = kwargs.pop("where", True)
         if where is not True:
             raise SimulatorError("ufunc where= is not supported in the simulator")
-        result = _call_ufunc(ufunc, inputs, kwargs, out)
-        return result
+        return _call_ufunc(ufunc, inputs, kwargs, out)
 
     def __neg__(self) -> _MaskedValue:
         return self._unary(np.negative)

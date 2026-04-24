@@ -231,7 +231,7 @@ class HCFrontEmitter:
             lambda loc: hc_front.AssignOp(values[0], values[1], loc=loc),
             payload,
         )
-        return None
+        return
 
     def _build_aug_assign(self, payload: dict[str, object], values: list[Any]) -> None:
         self._expect_value_count("aug_assign", values, 2)
@@ -244,14 +244,14 @@ class HCFrontEmitter:
             ),
             payload,
         )
-        return None
+        return
 
     def _build_return(self, payload: dict[str, object], values: list[Any]) -> None:
         self._insert_op(
             lambda loc: hc_front.ReturnOp(values, loc=loc),
             payload,
         )
-        return None
+        return
 
     def _build_attr(self, payload: dict[str, object], values: list[Any]) -> Any:
         self._expect_value_count("attr", values, 1)
@@ -712,14 +712,14 @@ class HCFrontEmitter:
                 raise RuntimeError(f"ref keys must be strings, got {raw_key!r}")
             entries.append((raw_key, self._ref_value_attr(raw_val)))
         op.operation.attributes["ref"] = ir.DictAttr.get(
-            {key: attr for key, attr in entries},
+            dict(entries),
             context=self._context,
         )
 
     def _ref_value_attr(self, value: object) -> Any:
         if isinstance(value, str):
             return self._string_attr(value)
-        if isinstance(value, bool) or isinstance(value, int):
+        if isinstance(value, bool | int):
             # Drop bools together with ints — both serialize via i64 so the
             # pass gets stable numeric payloads.
             return ir.IntegerAttr.get(

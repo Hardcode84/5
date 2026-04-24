@@ -99,10 +99,7 @@ def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:
 
 def _require_signature_arg(sig, index, *, kind, shape, dtype, name):
     value = sig.arg(index)
-    if kind == "tensor":
-        is_expected = value.is_tensor()
-    else:
-        is_expected = value.is_vector()
+    is_expected = value.is_tensor() if kind == "tensor" else value.is_vector()
     if not is_expected:
         raise ValueError(f"{name} must be a {kind}")
     if value.shape != shape:

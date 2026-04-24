@@ -420,7 +420,7 @@ class _OpClassifier:
         ir = self._ir
         if isinstance(value, str):
             return ir.StringAttr.get(value, context=self._ctx)
-        if isinstance(value, bool) or isinstance(value, int):
+        if isinstance(value, bool | int):
             return ir.IntegerAttr.get(
                 ir.IntegerType.get_signless(64, context=self._ctx),
                 int(value),

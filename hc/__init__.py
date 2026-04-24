@@ -45,8 +45,8 @@ __all__ = [
     "index_map",
     "kernel",
     "simulator",
-    "symbols",
     "sym",
+    "symbols",
 ]
 
 _SYMBOLS_MODULE: ModuleType | None = None

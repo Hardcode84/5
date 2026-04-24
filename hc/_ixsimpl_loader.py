@@ -60,9 +60,10 @@ def _require_local_build(vendor_root: Path) -> None:
     if state == "invalid":
         raise _invalid_build_error()
     submodule_root = _submodule_root()
-    if _submodule_available(submodule_root):
-        if stamp != _expected_stamp(submodule_root):
-            raise _stale_build_error()
+    if _submodule_available(submodule_root) and stamp != _expected_stamp(
+        submodule_root
+    ):
+        raise _stale_build_error()
 
 
 def _loaded_ixsimpl(vendor_root: Path) -> ModuleType | None:

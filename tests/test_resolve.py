@@ -273,7 +273,7 @@ def test_resolve_wmma_symbols_get_symbol_ref() -> None:
     @kernel(work_shape=(ceil_div(M, 4),), group_shape=(4,))
     def refs_symbol(group, a: Buffer[M, N]) -> None:
         _ = (M, N)
-        return None
+        return
 
     resolved = resolve_front_ir(refs_symbol)
     name_refs = _name_refs(resolved.module)
@@ -300,7 +300,7 @@ def test_resolve_recognizes_live_numpy_scalar_dtypes() -> None:
     def k(group, a: Buffer[M]) -> None:
         _ = np.intp
         _ = np.empty(1, dtype=np.intp)
-        return None
+        return
 
     resolved = resolve_front_ir(k)
     attr_refs = _attr_refs(resolved.module)

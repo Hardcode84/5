@@ -25,8 +25,8 @@ from functools import singledispatchmethod
 from typing import Any, Protocol
 
 __all__ = [
-    "FrontendEmitter",
     "FrontendEmitError",
+    "FrontendEmitter",
     "FrontendError",
     "RecordedEvent",
     "RecordingEmitter",

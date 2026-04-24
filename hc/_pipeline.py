@@ -88,26 +88,29 @@ def run_front_to_hc(
         diagnostics.append(str(diagnostic))
         return True
 
-    with context, _schedule_file(schedule) as schedule_path:
-        with context.attach_diagnostic_handler(capture):
-            pipeline = _pipeline_string(schedule_path)
-            try:
-                pm = _build_pass_manager(pipeline, context)
-                pm.run(front_module.operation)
-            except ir.MLIRError as exc:
-                # Narrow catch on purpose: `MLIRError` is the one thing
-                # `PassManager.parse`/`.run` contract to raise on pipeline
-                # trouble (bad schedule, verifier failure, pass error).
-                # Anything else (ValueError from our own driver, bugs,
-                # KeyboardInterrupt) propagates — silently swallowing
-                # them would turn real bugs into "hc_ir came back None".
-                _capture_exception(diagnostics, exc)
-                return PipelineResult(None, None, tuple(diagnostics))
-            return PipelineResult(
-                front_module,
-                str(front_module),
-                tuple(diagnostics),
-            )
+    with (
+        context,
+        _schedule_file(schedule) as schedule_path,
+        context.attach_diagnostic_handler(capture),
+    ):
+        pipeline = _pipeline_string(schedule_path)
+        try:
+            pm = _build_pass_manager(pipeline, context)
+            pm.run(front_module.operation)
+        except ir.MLIRError as exc:
+            # Narrow catch on purpose: `MLIRError` is the one thing
+            # `PassManager.parse`/`.run` contract to raise on pipeline
+            # trouble (bad schedule, verifier failure, pass error).
+            # Anything else (ValueError from our own driver, bugs,
+            # KeyboardInterrupt) propagates — silently swallowing
+            # them would turn real bugs into "hc_ir came back None".
+            _capture_exception(diagnostics, exc)
+            return PipelineResult(None, None, tuple(diagnostics))
+        return PipelineResult(
+            front_module,
+            str(front_module),
+            tuple(diagnostics),
+        )
 
 
 def prepared_context() -> Any:

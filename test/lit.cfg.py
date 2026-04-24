@@ -5,7 +5,7 @@
 # -*- Python -*-
 # ruff: noqa: F821
 
-import os
+from pathlib import Path
 
 import lit.formats
 from lit.llvm import llvm_config
@@ -13,8 +13,8 @@ from lit.llvm import llvm_config
 config.name = "HC"
 config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
 config.suffixes = [".mlir"]
-config.test_source_root = os.path.dirname(__file__)
-config.test_exec_root = os.path.join(config.hc_obj_root, "test")
+config.test_source_root = str(Path(__file__).parent)
+config.test_exec_root = str(Path(config.hc_obj_root) / "test")
 
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 llvm_config.use_default_substitutions()

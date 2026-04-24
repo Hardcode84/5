@@ -883,7 +883,7 @@ def test_group_load_is_rejected_in_workitem_scope() -> None:
 
     x = np.zeros((2,), dtype=np.float32)
 
-    with pytest.raises(sim.ScopeError, match="group.load"):
+    with pytest.raises(sim.ScopeError, match=r"group\.load"):
         sim.launch(bad, x)
 
 
@@ -916,7 +916,7 @@ def test_helper_scope_is_rejected_outside_declared_scope() -> None:
         _ = group
         subgroup_only(1)
 
-    with pytest.raises(sim.ScopeError, match="helper 'subgroup_only'.*SubGroup"):
+    with pytest.raises(sim.ScopeError, match=r"helper 'subgroup_only'.*SubGroup"):
         sim.launch(bad)
 
 
@@ -952,7 +952,7 @@ def test_intrinsic_scope_is_rejected_outside_declared_scope() -> None:
 
     with pytest.raises(
         sim.ScopeError,
-        match="intrinsic 'workitem_only'.*WorkItem",
+        match=r"intrinsic 'workitem_only'.*WorkItem",
     ):
         sim.launch(bad)
 

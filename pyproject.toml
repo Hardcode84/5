@@ -54,7 +54,7 @@ target-version = ["py312"]
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["B", "E", "F", "I", "UP"]
+select = ["B", "C4", "E", "F", "I", "PIE", "PTH", "RET", "RUF", "SIM", "UP"]
 
 [tool.mypy]
 files = ["hc"]

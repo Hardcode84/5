@@ -191,7 +191,7 @@ def test_bindings_conflict_reports_sources() -> None:
     bindings = hs.Bindings()
     bindings.bind(hs.sym.W, 32, source="X.shape[0]")
 
-    with pytest.raises(hs.SymbolConflictError, match="X.shape\\[0\\]"):
+    with pytest.raises(hs.SymbolConflictError, match=r"X.shape\[0\]"):
         bindings.bind(hs.sym.W, 64, source="Y.shape[0]")
 
 

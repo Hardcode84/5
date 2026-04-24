@@ -296,10 +296,10 @@ module {
 
 // -----
 
-// Intrinsic call missing a declared non-const kwarg: previously the
-// kwarg was dropped silently and produced an under-arity call; now
-// the lowering reads the callee's declared `parameters` and blames
-// the caller before we reach the verifier.
+// Intrinsic call missing a declared non-const kwarg. The lowering
+// reads the callee's declared `parameters` and diagnoses at the call
+// site rather than dropping the kwarg and producing an under-arity
+// `hc.call_intrinsic`.
 module {
   hc_front.intrinsic "needy" attributes {
     const_kwargs = ["arch"],
@@ -335,8 +335,8 @@ module {
 // -----
 
 // Intrinsic call with a kwarg name that isn't in the callee's declared
-// parameter list (and isn't a const_kwarg either). Silent drop was the
-// previous behavior; now the unknown name surfaces at lowering.
+// parameter list (and isn't a const_kwarg either). Unknown names
+// surface as a diagnostic at lowering time.
 module {
   hc_front.intrinsic "strict" attributes {
     const_kwargs = ["arch"],
@@ -366,9 +366,9 @@ module {
     %arch = hc_front.constant<"gfx11">
     %kw_arch = hc_front.keyword "arch" = %arch
     %zero = hc_front.constant<0 : i64>
-    // Typo: `typo` isn't a declared parameter or a const_kwarg.
+    // `typo` is neither a declared parameter nor a const_kwarg.
     %kw_typo = hc_front.keyword "typo" = %zero
-    // expected-error@+1 {{intrinsic '@strict' called with unknown kwarg 'typo'}}
+    // expected-error@+1 {{intrinsic '@strict' called with unknown keyword argument 'typo'}}
     %r = hc_front.call %intr(%grp, %kw_lane, %kw_arch, %kw_typo)
     hc_front.return %r
   }
@@ -376,10 +376,9 @@ module {
 
 // -----
 
-// More positional operands than the callee has parameters. The declared
-// parameter list is authoritative — over-arity is not a case the
-// verifier alone can diagnose in a useful way, because the frontend
-// knows the intended shape and can point at the call site directly.
+// More positional operands than the callee has parameters. Caught at
+// lowering because the frontend knows the declared shape and can
+// point at the offending call site directly.
 module {
   hc_front.intrinsic "two_params" attributes {
     decorators = ["kernel.intrinsic"],
@@ -406,6 +405,34 @@ module {
     %c = hc_front.name "c" {ctx = "load", ref = {kind = "param"}}
     // expected-error@+1 {{intrinsic '@two_params' declares 2 parameter(s), call site supplies 3 positional}}
     %r = hc_front.call %intr(%a, %b, %c)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Intrinsic call whose callee is not defined in this module (hand-
+// written IR, a cross-module reference, or a resolver path that never
+// stamped the declaration). Kwargs at the call site have no declared
+// slot to bind to, so the lowering refuses rather than silently
+// dropping them.
+module {
+  hc_front.func "no_stamped_parameters" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "unstamped" {ctx = "load", ref = {
+      callee = "@unstamped",
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %zero = hc_front.constant<0 : i64>
+    %kw = hc_front.keyword "extra" = %zero
+    // expected-error@+1 {{intrinsic '@unstamped' call has keyword arguments but callee declares no `parameters`}}
+    %r = hc_front.call %intr(%grp, %kw)
     hc_front.return %r
   }
 }

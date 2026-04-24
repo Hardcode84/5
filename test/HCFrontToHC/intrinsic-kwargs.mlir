@@ -2,18 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// `hc.call_intrinsic` lowering has to thread non-const keyword arguments
-// into the operand list in the callee's declared parameter order while
-// leaving declared `const_kwargs` behind as attributes. The bug this
-// file regresses on had non-const kwargs silently dropped, producing
-// an under-arity call site that blew up in the hc verifier.
+// Non-const keyword arguments on `hc_front.call` targeting an intrinsic
+// must land as SSA operands on `hc.call_intrinsic` in the callee's
+// declared parameter order, while declared `const_kwargs` are lifted
+// to call-site attributes. This file is scoped to the rewrite the
+// `--convert-hc-front-to-hc` pass performs; the sibling positive
+// tests chain `--hc-promote-names` because they assert against the
+// post-promotion IR, which would rewrite the `hc.name_load`s the
+// checks below anchor on.
 // RUN: hc-opt --convert-hc-front-to-hc %s | FileCheck %s
 // RUN: hc-opt --convert-hc-front-to-hc %s | hc-opt | FileCheck %s
 
 // CHECK-LABEL: hc.intrinsic @demo_intr
 // Signature filters out `const_kwargs` names — they never ride the
-// operand list, only the call-site attr dict, so including them in
-// the signature would double-count and break verify.
+// operand list, only the call-site attr dict; keeping them in the
+// signature would double-count the runtime arity.
 // CHECK-SAME: %arg0: !hc.undef, %arg1: !hc.undef, %arg2: !hc.undef
 // CHECK-SAME: const_kwargs = ["arch", "wave_size"]
 module {
@@ -33,12 +36,10 @@ module {
     hc_front.return
   }
 
-  // Positional args flow straight through; `lane` is a non-const kwarg
-  // so it lands as an SSA operand at the slot its name occupies in the
-  // declared parameter list; `arch` and `wave_size` migrate to op
-  // attributes. The resulting operand count matches the filtered
-  // `hc.intrinsic @demo_intr` signature, which is the under-arity
-  // failure mode this file guards against.
+  // Positionals flow straight through; `lane` is a non-const kwarg and
+  // lands as an SSA operand at its declared slot; `arch` and `wave_size`
+  // migrate to op attributes. The resulting operand count matches the
+  // filtered signature on `hc.intrinsic @demo_intr`.
   // CHECK-LABEL: hc.func @caller
   // CHECK: %[[LANE:[0-9]+]] = hc.name_load "lane"
   // CHECK: hc.call_intrinsic @demo_intr(%{{[0-9]+}}, %{{[0-9]+}}, %[[LANE]])
@@ -68,11 +69,10 @@ module {
     hc_front.return %r
   }
 
-  // Ordering robustness: declared-parameter order is what anchors the
-  // operand list, so call-site keyword order (`kw_arch` before
-  // `kw_lane`) must NOT reshuffle the operand list — the non-const
-  // kwarg `lane` still lands in the third slot to match its position
-  // in `demo_intr`'s declared parameter list.
+  // Declared-parameter order anchors the operand list, so call-site
+  // keyword order (`kw_arch` before `kw_lane`) must not reshuffle it;
+  // `lane` lands in the third slot because that is its position in
+  // `demo_intr`'s declared parameters.
   // CHECK-LABEL: hc.func @shuffled_kwargs
   // CHECK: %[[LANE2:[0-9]+]] = hc.name_load "lane"
   // CHECK: hc.call_intrinsic @demo_intr(%{{[0-9]+}}, %{{[0-9]+}}, %[[LANE2]])

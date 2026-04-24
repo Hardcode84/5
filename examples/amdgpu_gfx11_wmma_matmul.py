@@ -12,6 +12,9 @@ Pass ``--dump-front-ir`` to lower the kernel plus its transitive decorated
 helpers through the Python frontend and print the resulting combined
 ``hc_front`` textual MLIR instead of running the simulator.
 
+Pass ``--dump-hc-ir`` to run the current frontend-to-``hc`` pipeline and print
+the resulting ``hc`` textual MLIR instead.
+
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
 accumulator distributed across workitems at the WorkGroup-level K loop
@@ -31,6 +34,7 @@ output rows for one output column.
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 
 import numpy as np
@@ -356,17 +360,46 @@ def dump_front_ir() -> None:
         print(str(resolved.module))
 
 
+def dump_hc_ir() -> None:
+    """Run the current ``hc_front`` -> ``hc`` pipeline and print its result."""
+
+    from hc import compile as compile_kernel
+
+    handle = compile_kernel(tiled_gfx11_wmma_matmul)
+    if handle.hc_ir_text is None:
+        print("hc_front -> hc pipeline failed.", file=sys.stderr)
+        if handle.pipeline_diagnostics:
+            for diagnostic in handle.pipeline_diagnostics:
+                print(diagnostic, file=sys.stderr)
+        else:
+            print("No pipeline diagnostics were captured.", file=sys.stderr)
+        raise SystemExit(1)
+    for diagnostic in handle.pipeline_diagnostics:
+        print(diagnostic, file=sys.stderr)
+    print(handle.hc_ir_text)
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="gfx11 WMMA tiled matmul example.",
     )
-    parser.add_argument(
+    dump_group = parser.add_mutually_exclusive_group()
+    dump_group.add_argument(
         "--dump-front-ir",
         action="store_true",
         help=(
             "lower the kernel + its transitive @kernel.func / @kernel.intrinsic "
             "helpers into one hc_front module, resolve every name reference, "
             "and print the MLIR to stdout instead of running the simulator"
+        ),
+    )
+    dump_group.add_argument(
+        "--dump-hc-ir",
+        action="store_true",
+        help=(
+            "run the current hc_front -> hc pipeline over the WMMA kernel "
+            "module and print the resulting hc MLIR to stdout instead of "
+            "running the simulator"
         ),
     )
     return parser.parse_args(argv)
@@ -377,6 +410,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.dump_front_ir:
         dump_front_ir()
+        return
+    if args.dump_hc_ir:
+        dump_hc_ir()
         return
 
     a, b = make_demo_inputs()

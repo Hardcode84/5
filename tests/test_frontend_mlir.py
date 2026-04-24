@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 import pytest
+from frontend_return_fixtures import KERNEL_RETURN_NONE_SOURCE
 
 from build_tools.hc_native_tools import (
     ensure_hc_native_tools_built,
@@ -48,11 +49,6 @@ _IF_WITHOUT_ELSE_SOURCE = textwrap.dedent("""\
         if x:
             return x
         return x
-    """)
-_RETURN_NONE_SOURCE = textwrap.dedent("""\
-    @kernel(work_shape=(4,), group_shape=(4,))
-    def demo(group):
-        return None
     """)
 
 
@@ -253,7 +249,7 @@ def test_lower_source_to_front_ir_emits_bare_return_for_return_none() -> None:
 
     with ir.Context() as context:
         module = lower_source_to_front_ir(
-            _RETURN_NONE_SOURCE,
+            KERNEL_RETURN_NONE_SOURCE,
             filename="return_none.py",
             context=context,
         )

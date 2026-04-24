@@ -9,6 +9,10 @@ import inspect
 import re
 
 import pytest
+from frontend_return_fixtures import (
+    FUNC_RETURN_NONE_SOURCE,
+    KERNEL_RETURN_NONE_SOURCE,
+)
 
 from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
 from hc import CurrentGroup, WorkItem, kernel
@@ -93,16 +97,6 @@ def bad(group, x):
     while x:
         return x
     return x
-"""
-_RETURN_NONE_SOURCE = """
-@kernel(work_shape=(4,), group_shape=(4,))
-def demo(group):
-    return None
-"""
-_FUNC_RETURN_NONE_SOURCE = """
-@kernel.func(scope=WorkGroup)
-def helper(group):
-    return None
 """
 _SAMPLE_KERNEL_SPINE = [
     "module_begin",
@@ -411,7 +405,7 @@ def test_lower_source_records_structured_control_flow_and_slices() -> None:
 def test_lower_source_treats_return_none_as_operandless() -> None:
     emitter = RecordingEmitter()
 
-    lower_source(_RETURN_NONE_SOURCE, emitter, filename="return_none.py")
+    lower_source(KERNEL_RETURN_NONE_SOURCE, emitter, filename="return_none.py")
 
     assert _payloads(emitter, "return_begin")[0]["has_value"] is False
     assert "constant" not in _event_kinds(emitter)
@@ -420,7 +414,7 @@ def test_lower_source_treats_return_none_as_operandless() -> None:
 def test_lower_source_keeps_func_return_none_value_for_current_signature() -> None:
     emitter = RecordingEmitter()
 
-    lower_source(_FUNC_RETURN_NONE_SOURCE, emitter, filename="func_return_none.py")
+    lower_source(FUNC_RETURN_NONE_SOURCE, emitter, filename="func_return_none.py")
 
     assert _payloads(emitter, "return_begin")[0]["has_value"] is True
     assert "constant" in _event_kinds(emitter)

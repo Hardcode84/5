@@ -295,6 +295,125 @@ hc.func @for_range_mixed_local_and_accumulator(
 
 // -----
 
+// Write-first carrier that is never read inside the body: the assign still
+// needs to be yielded out, but no in-body `hc.name_load` should be required
+// to discover or carry it.
+// CHECK-LABEL: hc.func @for_range_write_first_assign_only
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[UNDEF:.*]] = hc.undef_value : !hc.undef
+// CHECK: %{{.*}} = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[UNDEF]])
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef):
+// CHECK:        %[[T:.*]] = hc.add %[[IV]], %[[IV]]
+// CHECK:        hc.yield %[[T]]
+// CHECK: hc.return
+hc.func @for_range_write_first_assign_only(%lo: !hc.undef, %hi: !hc.undef,
+                                           %step: !hc.undef) {
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    %t = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "t", %t : !hc.undef
+    hc.yield
+  }
+  hc.return
+}
+
+// -----
+
+// Multiple write-first locals in one loop: both get `hc.undef_value`
+// placeholders, and their iter_args / iter_results / yield operands preserve
+// first-write order.
+// CHECK-LABEL: hc.func @for_range_two_write_first_locals
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[A_UNDEF:.*]] = hc.undef_value : !hc.undef
+// CHECK: %[[B_UNDEF:.*]] = hc.undef_value : !hc.undef
+// CHECK: %[[R:.*]]:2 = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[A_UNDEF]], %[[B_UNDEF]])
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef):
+// CHECK:        %[[A:.*]] = hc.add %[[IV]], %[[IV]]
+// CHECK:        %[[B:.*]] = hc.mul %[[A]], %[[IV]]
+// CHECK:        hc.yield %[[A]], %[[B]]
+// CHECK: %[[SUM:.*]] = hc.add %[[R]]#0, %[[R]]#1
+// CHECK: hc.return %[[SUM]]
+hc.func @for_range_two_write_first_locals(%lo: !hc.undef, %hi: !hc.undef,
+                                          %step: !hc.undef) -> !hc.undef {
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    %a = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "a", %a : !hc.undef
+    %b = hc.mul %a, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "b", %b : !hc.undef
+    hc.yield
+  }
+  %a_out = hc.name_load "a" : !hc.undef
+  %b_out = hc.name_load "b" : !hc.undef
+  %sum = hc.add %a_out, %b_out : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return %sum : !hc.undef
+}
+
+// -----
+
+// IV-name shadow plus a write-first local: the leading self-bind keeps `i`
+// loop-local even though the body reassigns it, while `t` is still carried
+// through the write-first placeholder path.
+// CHECK-LABEL: hc.func @for_range_iv_shadow_with_write_first_local
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[T_UNDEF:.*]] = hc.undef_value : !hc.undef
+// CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[T_UNDEF]])
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef):
+// CHECK:        %[[SHADOW:.*]] = hc.add %[[IV]], %[[IV]]
+// CHECK:        %[[T:.*]] = hc.add %[[SHADOW]], %[[IV]]
+// CHECK:        hc.yield %[[T]]
+// CHECK: hc.return %[[R]]
+hc.func @for_range_iv_shadow_with_write_first_local(
+    %lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef) -> !hc.undef {
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    hc.assign "i", %iv : !hc.undef
+    %shadow = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "i", %shadow : !hc.undef
+    %tval = hc.add %shadow, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "t", %tval : !hc.undef
+    %t = hc.name_load "t" : !hc.undef
+    %use = hc.add %t, %shadow : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.yield
+  }
+  %t_out = hc.name_load "t" : !hc.undef
+  hc.return %t_out : !hc.undef
+}
+
+// -----
+
+// Caller-observed zero-trip shape: when a write-first name is read after the
+// loop, the outer read resolves to the loop result. If the loop never runs,
+// that result is seeded by `hc.undef_value`.
+// CHECK-LABEL: hc.func @for_range_write_first_zero_trip_observed
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[UNDEF:.*]] = hc.undef_value : !hc.undef
+// CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg0 step %arg1 iter_args(%[[UNDEF]])
+// CHECK:        hc.yield %{{.*}}
+// CHECK: hc.return %[[R]]
+hc.func @for_range_write_first_zero_trip_observed(%bound: !hc.undef,
+                                                  %step: !hc.undef)
+    -> !hc.undef {
+  hc.for_range %bound to %bound step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    %t = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "t", %t : !hc.undef
+    hc.yield
+  }
+  %final = hc.name_load "t" : !hc.undef
+  hc.return %final : !hc.undef
+}
+
+// -----
+
 // `hc.workitem_region` is a nested scope: reads capture outer
 // bindings, writes shadow. A body that only writes and then reads
 // its own writes needs no outer capture — local binding wins — and

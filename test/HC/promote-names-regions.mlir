@@ -228,6 +228,79 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
 
 // -----
 
+// Loop-local temporary: the body writes `t` before reading it, and
+// no outer `hc.assign "t"` exists. The promoter must not emit an
+// outer `hc.name_load "t"` as the iter_init (there would be no
+// reaching assign for the callable-level flat sweep to resolve);
+// instead, the iter_arg value is semantically dead on every iter
+// (the first in-body assign overwrites it), and the op carries it
+// out via a placeholder-seeded iter_result. `unrealized_conversion_cast`
+// is the expected placeholder — it's MLIR's "type-correct value with
+// no producer" scaffolding, and later inference passes drop it when
+// the type gets pinned.
+// CHECK-LABEL: hc.func @for_range_loop_local_temp
+// CHECK-NOT: hc.name_load
+// CHECK-NOT: hc.assign
+// CHECK: %[[UNDEF:.*]] = builtin.unrealized_conversion_cast to !hc.undef
+// CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[UNDEF]])
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef):
+// CHECK:        %[[T:.*]] = hc.add %[[IV]], %[[IV]]
+// CHECK:        %{{.*}} = hc.add %[[T]], %[[IV]]
+// CHECK:        hc.yield %[[T]]
+// CHECK: hc.return
+hc.func @for_range_loop_local_temp(%lo: !hc.undef, %hi: !hc.undef,
+                                   %step: !hc.undef) {
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    %x = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "t", %x : !hc.undef
+    %t = hc.name_load "t" : !hc.undef
+    %y = hc.add %t, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.yield
+  }
+  hc.return
+}
+
+// -----
+
+// Mixed shape: accumulator `acc` is read-before-written (needs outer
+// snap), loop-local `tmp` is written-before-read (no snap — the
+// assign feeds the read directly). Carried order follows the
+// frontend's in-body write order (`tmp` is assigned before `acc`),
+// so iter_args / iter_results / yield all run `[tmp, acc]`. The
+// promoter must emit an outer `hc.name_load "acc"` but not
+// `hc.name_load "tmp"`.
+// CHECK-LABEL: hc.func @for_range_mixed_local_and_accumulator
+// CHECK-NOT: hc.name_load "tmp"
+// CHECK: %[[TMP_UNDEF:.*]] = builtin.unrealized_conversion_cast to !hc.undef
+// CHECK: %[[R:.*]]:2 = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%[[TMP_UNDEF]], %arg3)
+// CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %{{.*}}: !hc.undef, %[[ACC:.*]]: !hc.undef):
+// CHECK:        %[[DBL:.*]] = hc.add %[[IV]], %[[IV]]
+// CHECK:        %[[NEW_ACC:.*]] = hc.add %[[ACC]], %[[DBL]]
+// CHECK:        hc.yield %[[DBL]], %[[NEW_ACC]]
+// CHECK: hc.return %[[R]]#1
+hc.func @for_range_mixed_local_and_accumulator(
+    %lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef,
+    %init: !hc.undef) -> !hc.undef {
+  hc.assign "acc", %init : !hc.undef
+  hc.for_range %lo to %hi step %step
+      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  ^bb0(%iv: !hc.undef):
+    %dbl = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "tmp", %dbl : !hc.undef
+    %t = hc.name_load "tmp" : !hc.undef
+    %cur = hc.name_load "acc" : !hc.undef
+    %sum = hc.add %cur, %t : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.assign "acc", %sum : !hc.undef
+    hc.yield
+  }
+  %final = hc.name_load "acc" : !hc.undef
+  hc.return %final : !hc.undef
+}
+
+// -----
+
 // `hc.workitem_region` is a nested scope: reads capture outer
 // bindings, writes shadow. A body that only writes and then reads
 // its own writes needs no outer capture — local binding wins — and

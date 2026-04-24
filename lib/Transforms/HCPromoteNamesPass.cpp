@@ -82,6 +82,30 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
   }
 }
 
+// First-top-level-use kind per name in a block. `promoteForRange`
+// uses this to split its write-set into "read-before-written"
+// (genuine accumulators — need an outer snapshot to seed iter_init)
+// and "written-before-read" (loop-local temporaries — the iter_arg
+// value is overwritten by the first assign before any read can see
+// it, so no outer snap is needed and none may exist).
+enum class FirstUseKind { Read, Write };
+using FirstUseMap = llvm::SmallDenseMap<StringAttr, FirstUseKind>;
+
+// Walks `block` linearly and records, per name, the kind of its
+// first top-level `hc.assign` / `hc.name_load`. Names that appear
+// only inside nested region ops are invisible here — consistent
+// with `collectTopLevelNames` (same "top-level only" scope).
+static FirstUseMap classifyFirstUse(Block &block) {
+  FirstUseMap out;
+  for (Operation &op : block) {
+    if (auto assign = dyn_cast<HCAssignOp>(&op))
+      out.try_emplace(assign.getNameAttr(), FirstUseKind::Write);
+    else if (auto load = dyn_cast<HCNameLoadOp>(&op))
+      out.try_emplace(load.getNameAttr(), FirstUseKind::Read);
+  }
+  return out;
+}
+
 // Two-phase linear scan over `block`'s non-terminator ops:
 //
 //   Phase 1 (preflight): walk the block with a presence-only binding
@@ -369,9 +393,36 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   if (readSet.empty() && writeSet.empty() && ivSelfBinds.empty())
     return success();
 
-  NameSet snapshot = readSet;
-  for (StringAttr n : writeSet)
-    snapshot.insert(n);
+  // First-use classification drives `snapshot` membership: a name
+  // needs an outer-scope snap iff the first top-level mention of it in
+  // the body is a read, because that read cannot be satisfied by an
+  // earlier in-body write. Three shapes fall out of this rule:
+  //
+  //   - Pure-read names (in `readSet`, not in `writeSet`): always
+  //     first-use read → always snapped.
+  //   - Read-before-written names (accumulators): snapped; the
+  //     iter_arg is the carrier, the snap seeds iteration 0.
+  //   - Written-before-read names (loop-local temporaries): skipped.
+  //     The iter_arg value is overwritten by the first assign before
+  //     any load can observe it. Including them in `snapshot` would
+  //     emit an outer `hc.name_load` above the loop with no reaching
+  //     `hc.assign` in the enclosing block — by construction, no such
+  //     outer binding exists — and the callable-level flat sweep would
+  //     fail it.
+  //
+  // IV self-binds are already stripped by `extractIvSelfBinds`, but
+  // their `firstUse` entries would still linger had any survived; drop
+  // them defensively so a future refactor of the strip order can't
+  // slip a `%iv` name into `snapshot`.
+  FirstUseMap firstUse = classifyFirstUse(oldBody);
+  for (auto &kv : ivSelfBinds)
+    firstUse.erase(kv.first);
+
+  NameSet snapshot;
+  for (auto &kv : firstUse) {
+    if (kv.second == FirstUseKind::Read)
+      snapshot.insert(kv.first);
+  }
   SmallVector<StringAttr> carried(writeSet.begin(), writeSet.end());
 
   MLIRContext *ctx = op.getContext();
@@ -382,12 +433,30 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   SnapMap snapValues;
   materializeSnapshots(builder, loc, undefTy, snapshot, snapValues);
 
-  // Build extended iter_inits / result-types; the snap value for each
-  // carried name seeds the iter_init.
+  // Build extended iter_inits / result-types. Read-first carriers
+  // take the outer snap as their seed (binding pre-seed below will
+  // overwrite with iter_arg, but the snap is what actually flows
+  // into the loop on iteration 0). Write-first carriers have no
+  // snap and no observable iter_init: the value is dead in every
+  // iteration where the body executes, and in the zero-trip case
+  // it's the op's result, which maps to Python's "name stays
+  // undefined if the loop never ran" — `!hc.undef` is the native
+  // carrier for that state. `unrealized_conversion_cast` with no
+  // operands is MLIR's standard "type-correct placeholder with no
+  // producer" scaffolding; it survives until the refinement passes
+  // fix the type, at which point DCE drops it if it's still unused.
   SmallVector<Value> newIterInits(op.getIterInits().begin(),
                                   op.getIterInits().end());
-  for (StringAttr name : carried)
-    newIterInits.push_back(snapValues[name]);
+  for (StringAttr name : carried) {
+    auto it = snapValues.find(name);
+    if (it != snapValues.end()) {
+      newIterInits.push_back(it->second);
+      continue;
+    }
+    auto placeholder =
+        UnrealizedConversionCastOp::create(builder, loc, undefTy, ValueRange{});
+    newIterInits.push_back(placeholder.getResult(0));
+  }
 
   SmallVector<Type> newResultTypes(op.getIterResults().getTypes().begin(),
                                    op.getIterResults().getTypes().end());

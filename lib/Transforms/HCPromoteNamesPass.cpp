@@ -45,7 +45,10 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
+
+#define DEBUG_TYPE "hc-promote-names"
 
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCPROMOTENAMES
@@ -416,6 +419,8 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
       newIterInits.push_back(it->second);
       continue;
     }
+    LDBG() << "write-first `hc.for_range` carrier '" << name.getValue()
+           << "' at " << op.getLoc();
     auto placeholder = HCUndefValueOp::create(builder, loc, undefTy);
     newIterInits.push_back(placeholder.getResult());
   }

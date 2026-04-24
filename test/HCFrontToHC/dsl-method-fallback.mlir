@@ -63,17 +63,40 @@ module {
     hc_front.return
   }
 
-  // `np.<dtype>(0)` as a value-constructor callee: the call's result is
-  // the same `hc.const` the attr lowers to — the positional arg is a
-  // placeholder the Python caller hands in and we discard here.
+  // `np.<dtype>(lit)` as a value-constructor callee: the call folds
+  // the `ref.dtype` from the attr with the integer/float payload of
+  // the positional literal, emitting a typed `hc.const` — `f16` zero
+  // here — so consumers that need a numeric scalar (like
+  // `hc.with_inactive`'s `$inactive`) pick up a real payload instead
+  // of a dtype handle. The dtype-only `hc.const<f16>` materialized by
+  // `lowerAttr` stays in the IR (the `np.float16` attr access may
+  // still be reused elsewhere); the call result is the typed literal.
   // CHECK-LABEL: hc.kernel @numpy_dtype_call
   hc_front.kernel "numpy_dtype_call" attributes {parameters = []} {
-    // CHECK: hc.const<f16> : !hc.undef
+    // CHECK: hc.const<0.000000e+00 : f16> : !hc.undef
     // CHECK-NOT: hc_front.
     %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
     %f16 = hc_front.attr %np, "float16" {ref = {dtype = "float16", kind = "numpy_dtype_type"}}
     %placeholder = hc_front.constant<0 : i64>
     %val = hc_front.call %f16(%placeholder)
+    %t_val = hc_front.target_name "v"
+    hc_front.assign %t_val = %val
+    hc_front.return
+  }
+
+  // Value-constructor with no positional arg falls back to the dtype
+  // handle (`hc.const<TypeAttr>`) emitted by `lowerAttr`. Keeping the
+  // degradation path tested means the branch doesn't silently start
+  // diagnosing legitimate type-only users (`.astype` et al route
+  // through the attribute position, but this guard is the cheap
+  // insurance that the fallback itself works).
+  // CHECK-LABEL: hc.kernel @numpy_dtype_call_bare
+  hc_front.kernel "numpy_dtype_call_bare" attributes {parameters = []} {
+    // CHECK: hc.const<f16> : !hc.undef
+    // CHECK-NOT: hc_front.
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %f16 = hc_front.attr %np, "float16" {ref = {dtype = "float16", kind = "numpy_dtype_type"}}
+    %val = hc_front.call %f16()
     %t_val = hc_front.target_name "v"
     hc_front.assign %t_val = %val
     hc_front.return

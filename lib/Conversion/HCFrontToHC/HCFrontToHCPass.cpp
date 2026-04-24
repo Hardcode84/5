@@ -265,6 +265,34 @@ std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
       .Default(std::nullopt);
 }
 
+// Coerce the payload of a bare numeric `hc.const` (what Python integer /
+// float literals lower to) into a typed scalar `IntegerAttr`/`FloatAttr`
+// of `targetTy`. Used by the `np.<dtype>(lit)` value-constructor path,
+// where the dtype handle picked up by `lowerAttr` is authoritative for
+// the destination type and the positional literal supplies the value.
+// `BoolAttr` is itself an `IntegerAttr` subclass in upstream MLIR, so
+// `dyn_cast<IntegerAttr>` picks it up for the i1 case. Returns null if
+// the source attribute isn't a scalar numeric; callers fall back to the
+// TypeAttr form so the downstream verifier (not this helper) produces
+// the diagnostic about an unexpected payload.
+Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
+  if (auto ft = dyn_cast<FloatType>(targetTy)) {
+    if (auto f = dyn_cast<FloatAttr>(src))
+      return FloatAttr::get(ft, f.getValueAsDouble());
+    if (auto i = dyn_cast<IntegerAttr>(src))
+      return FloatAttr::get(ft, static_cast<double>(i.getInt()));
+    return {};
+  }
+  if (auto it = dyn_cast<IntegerType>(targetTy)) {
+    if (auto i = dyn_cast<IntegerAttr>(src))
+      return IntegerAttr::get(it, i.getInt());
+    if (auto f = dyn_cast<FloatAttr>(src))
+      return IntegerAttr::get(it, static_cast<int64_t>(f.getValueAsDouble()));
+    return {};
+  }
+  return {};
+}
+
 //===----------------------------------------------------------------------===//
 // Binary-op mnemonic table. `hc_front.binop "Add"(a, b)` spells out the
 // Python AST's BinOp.op class name; the lowering picks the matching `hc`
@@ -1608,18 +1636,35 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return failure();
   CallArgs &args = *argsOr;
 
-  // `np.<dtype>(...)` — Python's value-constructor form for numpy scalar
-  // types — shows up as a call whose callee is an attr classified as
-  // `numpy_dtype_type`. `lowerAttr` has already materialized an
-  // `hc.const` wrapping the dtype's `TypeAttr`; reuse that value as the
-  // call's result. The positional arg (typically `0` or `NaN` the user
-  // hands to `np.<dtype>(...)` for a typed placeholder) is discarded
-  // here. Downstream ops that need a typed scalar literal
-  // (`hc.with_inactive`'s `$inactive`) will still fail their own
-  // verifier on a `TypeAttr` payload, but dispatch no longer stalls on
-  // an empty method name.
-  if (ref.getKind() == "numpy_dtype_type")
+  // `np.<dtype>(lit)` — Python's value-constructor form for numpy
+  // scalar types — shows up as a call whose callee is an attr
+  // classified as `numpy_dtype_type`. The attr's `ref.dtype` names
+  // the destination type; the single positional literal supplies the
+  // payload. Emit a fresh `hc.const` carrying a typed `FloatAttr` /
+  // `IntegerAttr` so consumers like `hc.with_inactive` that require a
+  // numeric literal (not a `TypeAttr`) verify cleanly.
+  //
+  // Degradation path: if there's no positional literal, or the literal
+  // isn't a simple `hc.const` we can coerce, reuse the `hc.const
+  // <TypeAttr>` materialized by `lowerAttr`. That keeps `.astype`-style
+  // attribute-position use the same as before this branch existed, and
+  // lets call-position users that pass a non-literal (e.g. a name ref)
+  // surface their own diagnostic downstream rather than fail here on a
+  // coercion the verifier can describe better.
+  if (ref.getKind() == "numpy_dtype_type") {
+    Attribute typed;
+    if (!args.positional.empty()) {
+      if (auto litOp = args.positional.front().getDefiningOp<HCConstOp>()) {
+        StringRef dtype = ref.getString("dtype");
+        if (auto tyOpt = resolveNumpyDtypeType(call.getContext(), dtype))
+          typed = coerceNumpyLiteral(*tyOpt, litOp.getValue());
+      }
+    }
+    if (typed)
+      return {
+          HCConstOp::create(builder, call.getLoc(), undef, typed).getResult()};
     return lowerValueOperand(attr.getResult());
+  }
 
   Value base = lowerValueOperand(attr.getBase());
 

@@ -5,6 +5,7 @@
 # -*- Python -*-
 # ruff: noqa: F821
 
+import sys
 from pathlib import Path
 
 import lit.formats
@@ -23,7 +24,13 @@ config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 
 config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
+config.substitutions.append(("%python", sys.executable))
 
+llvm_config.with_environment("PYTHONPATH", config.hc_src_root, append_path=True)
+llvm_config.with_environment(
+    "HC_MLIR_PYTHON_PACKAGE_DIR",
+    config.hc_mlir_python_package_dir,
+)
 llvm_config.with_environment("PATH", config.hc_tools_dir, append_path=True)
 llvm_config.with_environment("PATH", config.hc_install_tools_dir, append_path=True)
 llvm_config.with_environment("PATH", config.llvm_tools_dir, append_path=True)

@@ -23,6 +23,9 @@ configure_lit_site_cfg(
 set(HC_TEST_DEPENDS
   hc-opt
 )
+if(TARGET HCPythonModules)
+  list(APPEND HC_TEST_DEPENDS HCPythonModules)
+endif()
 
 add_lit_testsuite(check-hc "Running the hc regression tests"
   ${CMAKE_CURRENT_BINARY_DIR}

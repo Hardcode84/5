@@ -37,14 +37,25 @@ def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
     `hc_front.inlined_region` and erases the marker funcs. This pass
     flattens those regions but refuses to lower a surviving
     `ref.kind = "inline"` `hc_front.call` — the diagnostic tells the
-    operator the pipeline ordering is wrong. The full pipeline is
-    therefore:
+    operator the pipeline ordering is wrong.
 
-        hc-opt --hc-front-inline --convert-hc-front-to-hc --hc-promote-names
+    Modules that contain a nested `@group.workitems` / `@group.subgroups`
+    def followed by an immediate call (the `return inner()` or bare
+    `inner()` shape) must first run `-hc-front-fold-region-defs`. That
+    pass erases the ghost `hc_front.name {ref.kind = "local"} +
+    hc_front.call` trail the Python frontend emits for the call — the
+    region op itself is already the lowering. Without the folder a
+    `ref.kind = "local"` call reaches this pass and falls through to
+    the `unsupported callee ref.kind 'local'` diagnostic, which is
+    also how the operator learns the pipeline ordering is wrong. The
+    full pipeline is therefore:
 
-    `--hc-front-inline` is a no-op on modules the Python driver never
-    stamped inline helpers on, so it is safe to include
-    unconditionally.
+        hc-opt --hc-front-fold-region-defs --hc-front-inline \
+               --convert-hc-front-to-hc --hc-promote-names
+
+    Both `--hc-front-fold-region-defs` and `--hc-front-inline` are
+    no-ops on modules the Python driver never stamped the relevant
+    markers on, so both are safe to include unconditionally.
 
     Placeholder IR (the output of this pass on its own) is verifier-legal
     but round-trip-only: no consumer other than `-hc-promote-names`

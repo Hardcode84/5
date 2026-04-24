@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 add_mlir_library(MLIRHCFrontTransforms
+  HCFrontFoldRegionDefsPass.cpp
   HCFrontInlinePass.cpp
 
   ADDITIONAL_HEADER_DIRS

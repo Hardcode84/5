@@ -577,6 +577,11 @@ class HCFrontEmitter:
             payload.get("parameters"),
             payload.get("parameter_annotations"),
         )
+        # The region's source-level name (the inner `def`'s identifier).
+        # `-hc-front-fold-region-defs` uses it to pair a region with the
+        # ghost `name {ref.kind="local"} + call` trail emitted when Python
+        # writes `inner()` right after `def inner(...)`.
+        self._set_optional_string_attr(op, "name", payload.get("name"))
 
     def _set_optional_parameters_attr(
         self,

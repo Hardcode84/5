@@ -173,6 +173,9 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
         ]
         assert kernel_op.attributes["returns"].value == "int"
         assert _string_array_values(workitem_region.attributes["captures"]) == ["tmp"]
+        # Pinned so `-hc-front-fold-region-defs` can pair the region op
+        # with the ghost `name {ref.kind = "local"} + call` trail below.
+        assert workitem_region.attributes["name"].value == "lane"
         assert str(kernel_op.location) == f'loc("{__file__}":{def_line}:1)'
 
 

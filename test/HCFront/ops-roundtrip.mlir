@@ -43,8 +43,10 @@
 // CHECK: hc_front.if
 // CHECK: has_orelse = true
 // CHECK: hc_front.for
-// CHECK: hc_front.subgroup_region captures = ["outer"] {
-// CHECK: hc_front.workitem_region captures = ["outer", "tmp"] {
+// CHECK: hc_front.subgroup_region captures = ["outer"]
+// CHECK-SAME: name = "sg_wave"
+// CHECK: hc_front.workitem_region captures = ["outer", "tmp"]
+// CHECK-SAME: name = "wi_wave"
 // CHECK: hc_front.func "helper"
 // CHECK-SAME: decorators = ["kernel.func"]
 // CHECK-SAME: scope = "WorkGroup"
@@ -106,10 +108,10 @@ module {
       %item = hc_front.subscript %list[%c0]
       hc_front.return %item
     }
-    hc_front.subgroup_region captures = ["outer"] {
+    hc_front.subgroup_region captures = ["outer"] attributes {name = "sg_wave"} {
       %sg = hc_front.name "sg"
     }
-    hc_front.workitem_region captures = ["outer", "tmp"] {
+    hc_front.workitem_region captures = ["outer", "tmp"] attributes {name = "wi_wave"} {
       %wi = hc_front.name "wi"
     }
     hc_front.return %call

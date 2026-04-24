@@ -7,6 +7,45 @@
 
 include "mlir/Pass/PassBase.td"
 
+def HCFrontFoldRegionDefs : Pass<"hc-front-fold-region-defs", "::mlir::ModuleOp"> {
+  let summary = "Fold `@group.workitems`/`@group.subgroups` def + immediate call.";
+  let description = [{
+    Python's only way to materialize an `hc_front.workitem_region` or
+    `hc_front.subgroup_region` is
+
+        @group.workitems
+        def inner(wi):
+            ...
+        inner()            # or `return inner()`
+
+    The frontend emits that as the region op followed by three ghost
+    ops — a `hc_front.name "inner" {ref.kind = "local"}`, an
+    `hc_front.call` whose only operand is that name, and (for the
+    `return` flavour) a trailing `hc_front.return %call`. The call has
+    no meaning at `hc` level because `inner` never becomes a real
+    callable — the region op itself is the lowering, and any
+    `hc_front.return %v` inside it falls through the region to
+    terminate the enclosing func.
+
+    This pass matches the ghost triad by the region op's `name`
+    discardable attribute and erases it. After this pass the converter
+    sees only real `hc_front.call` ops (driver callees, DSL methods,
+    built-ins); a surviving `ref.kind = "local"` call is therefore
+    still an error — the operator just knows the folder didn't run.
+
+    A `hc_front.call` site whose only caller-visible use is a
+    same-block `hc_front.return` is the common `return inner()`
+    shape; an unused call is `inner()` on a line by itself. Any other
+    use of the call's result (binding through `x = inner()`,
+    threading through subscripts, etc.) is left alone — the inliner
+    contract is structural, not semantic, and a surviving
+    `ref.kind = "local"` callee is the converter's error to raise.
+  }];
+  let dependentDialects = [
+    "::mlir::hc::front::HCFrontDialect",
+  ];
+}
+
 def HCFrontInline : Pass<"hc-front-inline", "::mlir::ModuleOp"> {
   let summary = "Inline `hc_front.func`s tagged `ref.kind = \"inline\"` at every call site.";
   let description = [{

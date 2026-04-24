@@ -751,6 +751,15 @@ attributes needed to preserve source structure.
 
 The first real compiler stage should:
 
+* fold the "`@group.workitems` / `@group.subgroups` def + immediate
+  call" pattern Python uses to open a collective region. The
+  `-hc-front-fold-region-defs` pass erases the ghost
+  `hc_front.name {ref.kind = "local"} + hc_front.call` trail the
+  emitter leaves next to the region op — the region itself is
+  already the lowering, so the trail is dead code. Must precede
+  `-convert-hc-front-to-hc`; a surviving `ref.kind = "local"` call
+  otherwise fires the converter's `unsupported callee ref.kind
+  'local'` diagnostic.
 * expand undecorated Python helpers that the resolver emitted as
   `hc_front.func` with `ref = {kind = "inline", ...}` into the caller
   (the `-hc-front-inline` pass; must precede `-convert-hc-front-to-hc`
@@ -764,12 +773,14 @@ The first real compiler stage should:
 * build semantic `hc` operations while preserving symbolic launch parameters.
 
 The canonical hc-opt invocation for a module the resolver may have
-stamped inline helpers on is therefore:
+stamped folding / inline markers on is therefore:
 
-    hc-opt --hc-front-inline --convert-hc-front-to-hc --hc-promote-names
+    hc-opt --hc-front-fold-region-defs --hc-front-inline \
+           --convert-hc-front-to-hc --hc-promote-names
 
-`-hc-front-inline` is a no-op when nothing is marked, so it's safe to
-keep in the pipeline unconditionally.
+Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
+when nothing is marked, so both are safe to keep in the pipeline
+unconditionally.
 
 Postcondition: semantic `hc` operations and explicit region structure exist, but
 name-based bindings, partially unknown types, and symbolic launch parameters may

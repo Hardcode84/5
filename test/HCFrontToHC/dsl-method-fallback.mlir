@@ -141,8 +141,8 @@ module {
   // still produce a typed `IntegerAttr` as before.
   // CHECK-LABEL: hc.kernel @numpy_int_from_float
   hc_front.kernel "numpy_int_from_float" attributes {parameters = []} {
-    // CHECK: hc.const<3 : i32> : !hc.undef
-    // CHECK: hc.const<i32> : !hc.undef
+    // CHECK: hc.const<3 : si32> : !hc.undef
+    // CHECK: hc.const<si32> : !hc.undef
     // CHECK-NOT: hc_front.
     %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
     %three_f = hc_front.constant<3.000000e+00 : f64>
@@ -155,6 +155,36 @@ module {
     %vb = hc_front.call %i32b(%inf)
     %tb = hc_front.target_name "ib"
     hc_front.assign %tb = %vb
+    hc_front.return
+  }
+
+  // Unsigned dtype names lower to unsigned builtin integer types instead
+  // of collapsing onto signless `iN`, and integer constructor literals wrap
+  // to the target width.
+  // CHECK-LABEL: hc.kernel @numpy_unsigned_dtype
+  hc_front.kernel "numpy_unsigned_dtype" attributes {parameters = []} {
+    // CHECK: hc.const<ui32> : !hc.undef
+    // CHECK: hc.const<255 : ui8> : !hc.undef
+    // CHECK: hc.const<1 : ui16> : !hc.undef
+    // CHECK: hc.const<ui64> : !hc.undef
+    // CHECK-NOT: hc_front.
+    %np = hc_front.name "np" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %u32 = hc_front.attr %np, "uint32" {ref = {dtype = "uint32", kind = "numpy_dtype_type"}}
+    %t_u32 = hc_front.target_name "u32"
+    hc_front.assign %t_u32 = %u32
+    %u8 = hc_front.attr %np, "uint8" {ref = {dtype = "uint8", kind = "numpy_dtype_type"}}
+    %neg_one = hc_front.constant<-1 : i64>
+    %wrapped_neg = hc_front.call %u8(%neg_one)
+    %t_neg = hc_front.target_name "neg"
+    hc_front.assign %t_neg = %wrapped_neg
+    %u16 = hc_front.attr %np, "uint16" {ref = {dtype = "uint16", kind = "numpy_dtype_type"}}
+    %wide = hc_front.constant<65537 : i64>
+    %wrapped_wide = hc_front.call %u16(%wide)
+    %t_wide = hc_front.target_name "wide"
+    hc_front.assign %t_wide = %wrapped_wide
+    %u64 = hc_front.attr %np, "uint64" {ref = {dtype = "uint64", kind = "numpy_dtype_type"}}
+    %t_u64 = hc_front.target_name "u64"
+    hc_front.assign %t_u64 = %u64
     hc_front.return
   }
 

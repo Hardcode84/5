@@ -245,11 +245,11 @@ std::optional<EffectClass> parseEffectClass(StringRef text) {
 // scalar type as `ref = {kind = "numpy_dtype_type", dtype = "<name>"}`
 // using the identifier numpy itself exposes. This pass supports a
 // curated subset — the fixed-width scalars plus their common size-
-// aliases — and collapses signed/unsigned integer spellings onto the
-// same signless `i<N>`; HC ops treat signedness as a later-pass concern
-// and `hc.astype`'s target verifier only checks `isIntOrIndexOrFloat`.
-// Anything outside the set returns `nullopt` so the caller can surface
-// a located diagnostic instead of fabricating an arbitrary type.
+// aliases. Signed aliases land as builtin `si<N>` and unsigned aliases land
+// as builtin `ui<N>`, so downstream passes can recover the user's dtype
+// intent instead of guessing from a signless width. Anything outside the set
+// returns `nullopt` so the caller can surface a located diagnostic instead of
+// fabricating an arbitrary type.
 //===----------------------------------------------------------------------===//
 
 std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
@@ -257,11 +257,17 @@ std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
       .Cases({"float16", "half"}, Float16Type::get(ctx))
       .Cases({"float32", "single"}, Float32Type::get(ctx))
       .Cases({"float64", "double"}, Float64Type::get(ctx))
-      .Cases({"int8", "uint8"}, IntegerType::get(ctx, 8))
-      .Cases({"int16", "uint16"}, IntegerType::get(ctx, 16))
-      .Cases({"int32", "uint32", "intc", "uintc"}, IntegerType::get(ctx, 32))
-      .Cases({"int64", "uint64", "intp", "uintp", "longlong", "ulonglong"},
-             IntegerType::get(ctx, 64))
+      .Case("int8", IntegerType::get(ctx, 8, IntegerType::Signed))
+      .Case("uint8", IntegerType::get(ctx, 8, IntegerType::Unsigned))
+      .Case("int16", IntegerType::get(ctx, 16, IntegerType::Signed))
+      .Case("uint16", IntegerType::get(ctx, 16, IntegerType::Unsigned))
+      .Cases({"int32", "intc"}, IntegerType::get(ctx, 32, IntegerType::Signed))
+      .Cases({"uint32", "uintc"},
+             IntegerType::get(ctx, 32, IntegerType::Unsigned))
+      .Cases({"int64", "intp", "longlong"},
+             IntegerType::get(ctx, 64, IntegerType::Signed))
+      .Cases({"uint64", "uintp", "ulonglong"},
+             IntegerType::get(ctx, 64, IntegerType::Unsigned))
       .Cases({"bool", "bool_"}, IntegerType::get(ctx, 1))
       .Default(std::nullopt);
 }
@@ -276,7 +282,9 @@ std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
 // the source attribute isn't a scalar numeric (or is outside the set of
 // safely-representable values for the target); callers fall back to the
 // TypeAttr form so the downstream verifier (not this helper) produces
-// the diagnostic about an unexpected payload.
+// the diagnostic about an unexpected payload. Fixed-width integer targets
+// use APInt truncation so unsigned NumPy constructors retain their type and
+// Python integer literals wrap to the target width.
 //
 // Float -> float and int -> float route through `APFloat::get(double)`
 // inside `FloatAttr::get`, which tolerates NaN/Inf at any target
@@ -297,9 +305,16 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
   }
   if (auto it = dyn_cast<IntegerType>(targetTy)) {
     bool isI1 = it.getWidth() == 1;
-    if (auto i = dyn_cast<IntegerAttr>(src))
-      return isI1 ? IntegerAttr::get(it, i.getValue().isZero() ? 0 : 1)
-                  : IntegerAttr::get(it, i.getInt());
+    auto wrapInteger = [&](int64_t value) {
+      APInt bits(64, static_cast<uint64_t>(value), /*isSigned=*/true);
+      return IntegerAttr::get(it, bits.sextOrTrunc(it.getWidth()));
+    };
+    if (auto i = dyn_cast<IntegerAttr>(src)) {
+      if (isI1)
+        return IntegerAttr::get(it, i.getValue().isZero() ? 0 : 1);
+      APInt bits = i.getValue().sextOrTrunc(it.getWidth());
+      return IntegerAttr::get(it, bits);
+    }
     if (auto f = dyn_cast<FloatAttr>(src)) {
       double v = f.getValueAsDouble();
       if (isI1)
@@ -308,7 +323,7 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
         return {};
       if (v < -0x1.0p63 || v >= 0x1.0p63)
         return {};
-      return IntegerAttr::get(it, static_cast<int64_t>(v));
+      return wrapInteger(static_cast<int64_t>(v));
     }
     return {};
   }

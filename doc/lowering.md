@@ -689,16 +689,25 @@ The lowering stack has three authority layers:
   launch values, chooses default `group_shape`, and drives launch-time
   validation before execution.
 
-The public entry point is `hc.compile(kernel_fn, symbols=...)`, which runs
-whichever of those layers is wired up today and returns a `CompiledKernel`
-handle. The handle carries the emitted `hc_front` module (or the result of
-the furthest pipeline stage that exists) and records the literal-symbol
-bindings the caller supplied. Invoking the compiled handle launches — until
-the `hc_front -> hc` lowering, specialization, and launch stages land,
-invocation raises `NotImplementedError`. Partial `symbols` maps are legal;
-unbound literals stay symbolic and later stages refine them. Bindings are
-recorded on the handle for later stages to consume; the frontend-only
-stage leaves `front_ir` purely symbolic regardless of what is passed.
+The public entry point is `hc.compile(kernel_fn, symbols=..., schedule=...)`,
+which runs whichever of those layers is wired up today and returns a
+`CompiledKernel` handle. The handle carries the pre-pipeline `hc_front`
+module under `front_ir` / `front_ir_text`, the post-pipeline `hc` module
+under `hc_ir` / `hc_ir_text` (or `None` on pipeline failure), and any
+MLIR diagnostics emitted during the pipeline run under
+`pipeline_diagnostics`. Invoking the compiled handle launches — until
+specialization and launch stages land, invocation raises
+`NotImplementedError`. Partial `symbols` maps are legal; unbound literals
+stay symbolic and later stages refine them. Bindings are recorded on the
+handle for later stages to consume.
+
+The `hc_front -> hc` stage runs under a transform-dialect schedule, not
+a fixed pass list — see [`doc/schedules.md`](schedules.md). The default
+schedule lives at `hc/schedules/front_to_hc.mlir`; callers can pass
+`schedule=Path(...)` to point at an alternative schedule file, or
+`schedule="..."` to inline a transform-module string. Pipeline failures
+are non-fatal: the handle stays introspectable at the `hc_front` stage
+and the diagnostics tuple on the handle reports what went wrong.
 
 `hc.compile` does not lower a single function in isolation. Starting from
 `kernel_fn`, the driver transitively walks every `@kernel.func` /
@@ -772,15 +781,27 @@ The first real compiler stage should:
   capture lists,
 * build semantic `hc` operations while preserving symbolic launch parameters.
 
-The canonical hc-opt invocation for a module the resolver may have
-stamped folding / inline markers on is therefore:
+The canonical pipeline for a module the resolver may have stamped
+folding / inline markers on is:
 
-    hc-opt --hc-front-fold-region-defs --hc-front-inline \
-           --convert-hc-front-to-hc --hc-promote-names
+    hc-front-fold-region-defs → hc-front-inline
+                              → convert-hc-front-to-hc
+                              → hc-promote-names
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
 unconditionally.
+
+`hc.compile` drives this pipeline through a transform-dialect schedule
+shipped as `hc/schedules/front_to_hc.mlir`; `hc-opt` is the CLI handle
+on the same pass list, so
+
+    hc-opt --hc-front-fold-region-defs --hc-front-inline \
+           --convert-hc-front-to-hc --hc-promote-names
+
+and `hc.compile(...)` with the default schedule produce identical
+output. See [`doc/schedules.md`](schedules.md) for the schedule format
+and override API.
 
 Postcondition: semantic `hc` operations and explicit region structure exist, but
 name-based bindings, partially unknown types, and symbolic launch parameters may

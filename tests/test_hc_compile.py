@@ -243,12 +243,10 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
     # function whose source file is on disk — `inspect.getsource` is used
     # to recover the text. `python -c '...'` scripts do not satisfy that.
     #
-    # Kernel body uses an implicit-return assignment to dodge 5-36p (the
-    # conversion pass still lowers `return None` to `hc.return %0`, which
-    # the kernel verifier rejects). The pipeline has to actually run for
-    # the `hc_ir` assertion below to mean anything — a weaker version of
-    # this test that only poked at `front_ir_text` would silently pass
-    # against a fully broken default schedule.
+    # The pipeline has to actually run for the `hc_ir` assertion below to
+    # mean anything — a weaker version of this test that only poked at
+    # `front_ir_text` would silently pass against a fully broken default
+    # schedule.
     script = tmp_path / "smoke.py"
     script.write_text(textwrap.dedent("""
             from contextlib import suppress
@@ -261,7 +259,7 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 
             @kernel(work_shape=(sym.W,), literals={sym.W})
             def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
-                row = group.group_id[0]
+                return None
 
 
             def main() -> None:
@@ -294,13 +292,6 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
     # (not hc_front.*), with no captured diagnostics. This is the gate we
     # care about for the CompiledKernel contract now that the pipeline
     # stage actually runs.
-    #
-    # The body does an implicit-return assignment instead of `return
-    # None`: the conversion pass lowers `return None` to `hc.return %0`,
-    # which the kernel verifier rejects (kernels are operand-less). That
-    # lowering bug is tracked separately; keeping the happy-path fixture
-    # clear of it lets this test actually gate pipeline integration, not
-    # the bug.
     script = tmp_path / "compile_pipeline.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -311,7 +302,7 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
 
             @kernel(work_shape=(sym.W,), literals={sym.W})
             def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
-                row = group.group_id[0]
+                return None
 
 
             def main() -> None:
@@ -529,12 +520,9 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
     # every load-context ``hc_front.name`` carries a ``ref`` attribute.
     # The real WMMA example is the richest fixture we have for this check.
     #
-    # We deliberately do not assert on ``handle.hc_ir`` here: WMMA exercises
-    # constructs that still trip open lowering bugs — 5-2gz
-    # (``hc.call_intrinsic`` drops non-const kwargs for the ``wmma_gfx11``
-    # call site) and 5-36p (``hc.return %val`` from ``return None``). Once
-    # both land (and 5-298 turns this test into the WMMA pipeline snapshot),
-    # tighten here to gate the full pipeline on the heaviest example.
+    # We deliberately do not assert on ``handle.hc_ir`` here: WMMA still
+    # exercises lowering gaps that need dedicated pipeline snapshot coverage
+    # before this can gate the full compiler path on the heaviest example.
     script = tmp_path / "compile_wmma.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""

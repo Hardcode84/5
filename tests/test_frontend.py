@@ -94,6 +94,16 @@ def bad(group, x):
         return x
     return x
 """
+_RETURN_NONE_SOURCE = """
+@kernel(work_shape=(4,), group_shape=(4,))
+def demo(group):
+    return None
+"""
+_FUNC_RETURN_NONE_SOURCE = """
+@kernel.func(scope=WorkGroup)
+def helper(group):
+    return None
+"""
 _SAMPLE_KERNEL_SPINE = [
     "module_begin",
     "kernel_begin",
@@ -370,6 +380,24 @@ def test_lower_source_records_structured_control_flow_and_slices() -> None:
     lower_source(_CONTROL_FLOW_SOURCE, emitter, filename="testcase.py")
 
     _assert_control_flow_trace(emitter)
+
+
+def test_lower_source_treats_return_none_as_operandless() -> None:
+    emitter = RecordingEmitter()
+
+    lower_source(_RETURN_NONE_SOURCE, emitter, filename="return_none.py")
+
+    assert _payloads(emitter, "return_begin")[0]["has_value"] is False
+    assert "constant" not in _event_kinds(emitter)
+
+
+def test_lower_source_keeps_func_return_none_value_for_current_signature() -> None:
+    emitter = RecordingEmitter()
+
+    lower_source(_FUNC_RETURN_NONE_SOURCE, emitter, filename="func_return_none.py")
+
+    assert _payloads(emitter, "return_begin")[0]["has_value"] is True
+    assert "constant" in _event_kinds(emitter)
 
 
 def test_lower_source_records_subscript_assignment_targets() -> None:

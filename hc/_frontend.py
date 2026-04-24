@@ -371,6 +371,7 @@ class _FrontendLowerer:
         self._source = source
         self._binding_stack: list[frozenset[str]] = []
         self._scope_stack: list[_RegionScope] = []
+        self._callable_kind_stack: list[str] = []
         # ``lower_function`` threads decorator metadata + resolved annotations
         # here; source-only entry points pass ``None``.
         self._toplevel_overrides: Mapping[str, Mapping[str, object]] = (
@@ -405,9 +406,11 @@ class _FrontendLowerer:
         if overrides:
             payload.update(overrides)
         self._emitter.begin_op(kind, **payload)
+        self._callable_kind_stack.append(kind)
         self._push_bindings(stmt)
         self._lower_statements(stmt.body)
         self._pop_bindings()
+        self._callable_kind_stack.pop()
         self._emitter.end_op(kind, **payload)
 
     def _lower_statements(self, body: list[ast.stmt]) -> None:
@@ -466,11 +469,24 @@ class _FrontendLowerer:
         self._emitter.end_op("aug_assign", **payload)
 
     def _lower_return(self, stmt: ast.Return) -> None:
-        payload = _node_payload(stmt, has_value=stmt.value is not None)
+        # `has_value` is the emitter contract: whether `hc_front.return`
+        # receives an SSA operand. Kernels are void, so literal `None` has
+        # the same shape as a bare `return`; funcs/intrinsics keep today's
+        # value-returning contract until their signatures model `-> None`.
+        has_value = stmt.value is not None and not (
+            self._is_kernel_body() and _is_none_literal(stmt.value)
+        )
+        payload = _node_payload(stmt, has_value=has_value)
         self._emitter.begin_op("return", **payload)
-        if stmt.value is not None:
+        if has_value:
             self._lower_expr(stmt.value)
         self._emitter.end_op("return", **payload)
+
+    def _is_kernel_body(self) -> bool:
+        return (
+            bool(self._callable_kind_stack)
+            and self._callable_kind_stack[-1] == "kernel"
+        )
 
     def _lower_if(self, stmt: ast.If) -> None:
         payload = _node_payload(stmt, has_orelse=bool(stmt.orelse))
@@ -1038,6 +1054,10 @@ def _is_docstring_expr(stmt: ast.stmt) -> bool:
         return False
     value = stmt.value
     return isinstance(value, ast.Constant) and isinstance(value.value, str)
+
+
+def _is_none_literal(expr: ast.expr) -> bool:
+    return isinstance(expr, ast.Constant) and expr.value is None
 
 
 def _toplevel_kind(fn: ast.FunctionDef, source: _SourceBuffer) -> str:

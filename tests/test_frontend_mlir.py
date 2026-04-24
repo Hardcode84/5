@@ -49,6 +49,11 @@ _IF_WITHOUT_ELSE_SOURCE = textwrap.dedent("""\
             return x
         return x
     """)
+_RETURN_NONE_SOURCE = textwrap.dedent("""\
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def demo(group):
+        return None
+    """)
 
 
 @kernel(work_shape=(4,), group_shape=(4,))
@@ -231,6 +236,27 @@ def test_lower_module_to_front_ir_round_trips_if_without_else() -> None:
 
         assert isinstance(round_tripped_if, hc_front.IfOp)
         assert round_tripped_if.attributes["has_orelse"].value is False
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_lower_source_to_front_ir_emits_bare_return_for_return_none() -> None:
+    _ensure_hc_front_bindings_available()
+
+    from hc.mlir import ir
+    from hc.mlir.dialects import hc_front
+
+    with ir.Context() as context:
+        module = lower_source_to_front_ir(
+            _RETURN_NONE_SOURCE,
+            filename="return_none.py",
+            context=context,
+        )
+
+        kernel_op = module.body.operations[0]
+        body_ops = list(kernel_op.body.blocks[0].operations)
+        assert len(body_ops) == 1
+        assert isinstance(body_ops[0], hc_front.ReturnOp)
+        assert len(body_ops[0].operation.operands) == 0
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

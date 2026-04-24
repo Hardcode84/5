@@ -141,6 +141,18 @@ module {
     hc_front.return %sum
   }
 
+  // The frontend emits operand-less `hc_front.return` for Python `return None`
+  // in kernels; conversion must keep the resulting `hc.return` operand-less.
+  // CHECK-LABEL: hc.kernel @return_none
+  // CHECK: hc.return
+  // CHECK-NOT: hc.return %
+  hc_front.kernel "return_none" attributes {
+    parameters = [{name = "group"}],
+    returns = "None"
+  } {
+    hc_front.return
+  }
+
   // Boundary coverage:
   //   * launch-geo at axis=31 (one below the pass-internal cap) must lower
   //     cleanly — regression guard on the launch-geo bounds check.

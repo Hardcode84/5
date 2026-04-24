@@ -37,6 +37,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -80,30 +81,6 @@ static void collectTopLevelNames(Block &block, NameSet &reads,
     else if (auto load = dyn_cast<HCNameLoadOp>(&op))
       reads.insert(load.getNameAttr());
   }
-}
-
-// First-top-level-use kind per name in a block. `promoteForRange`
-// uses this to split its write-set into "read-before-written"
-// (genuine accumulators — need an outer snapshot to seed iter_init)
-// and "written-before-read" (loop-local temporaries — the iter_arg
-// value is overwritten by the first assign before any read can see
-// it, so no outer snap is needed and none may exist).
-enum class FirstUseKind { Read, Write };
-using FirstUseMap = llvm::SmallDenseMap<StringAttr, FirstUseKind>;
-
-// Walks `block` linearly and records, per name, the kind of its
-// first top-level `hc.assign` / `hc.name_load`. Names that appear
-// only inside nested region ops are invisible here — consistent
-// with `collectTopLevelNames` (same "top-level only" scope).
-static FirstUseMap classifyFirstUse(Block &block) {
-  FirstUseMap out;
-  for (Operation &op : block) {
-    if (auto assign = dyn_cast<HCAssignOp>(&op))
-      out.try_emplace(assign.getNameAttr(), FirstUseKind::Write);
-    else if (auto load = dyn_cast<HCNameLoadOp>(&op))
-      out.try_emplace(load.getNameAttr(), FirstUseKind::Read);
-  }
-  return out;
 }
 
 // Two-phase linear scan over `block`'s non-terminator ops:
@@ -393,35 +370,37 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   if (readSet.empty() && writeSet.empty() && ivSelfBinds.empty())
     return success();
 
-  // First-use classification drives `snapshot` membership: a name
-  // needs an outer-scope snap iff the first top-level mention of it in
-  // the body is a read, because that read cannot be satisfied by an
-  // earlier in-body write. Three shapes fall out of this rule:
+  // Snapshot = names whose first top-level mention in the body is a
+  // read. Write-first names are skipped: the iter_arg is dead once
+  // the first in-body assign fires, and emitting an outer
+  // `hc.name_load` for a loop-local temp would fail the callable-
+  // level flat sweep (no reaching `hc.assign` in the enclosing
+  // scope by construction).
   //
-  //   - Pure-read names (in `readSet`, not in `writeSet`): always
-  //     first-use read → always snapped.
-  //   - Read-before-written names (accumulators): snapped; the
-  //     iter_arg is the carrier, the snap seeds iteration 0.
-  //   - Written-before-read names (loop-local temporaries): skipped.
-  //     The iter_arg value is overwritten by the first assign before
-  //     any load can observe it. Including them in `snapshot` would
-  //     emit an outer `hc.name_load` above the loop with no reaching
-  //     `hc.assign` in the enclosing block — by construction, no such
-  //     outer binding exists — and the callable-level flat sweep would
-  //     fail it.
-  //
-  // IV self-binds are already stripped by `extractIvSelfBinds`, but
-  // their `firstUse` entries would still linger had any survived; drop
-  // them defensively so a future refactor of the strip order can't
-  // slip a `%iv` name into `snapshot`.
-  FirstUseMap firstUse = classifyFirstUse(oldBody);
-  for (auto &kv : ivSelfBinds)
-    firstUse.erase(kv.first);
-
+  // The walk runs in block order so `snapshot`'s insertion order
+  // (and thus the emitted outer-snap cluster) is deterministic.
+  // IV self-binds are stripped from the leading ops of `oldBody`
+  // above; explicitly skip their names here to keep a shadow
+  // `hc.name_load "i"` (legal; binds to `%iv` via the pre-seed)
+  // from sneaking into snapshot.
   NameSet snapshot;
-  for (auto &kv : firstUse) {
-    if (kv.second == FirstUseKind::Read)
-      snapshot.insert(kv.first);
+  llvm::SmallDenseSet<StringAttr> firstSeen;
+  for (Operation &bodyOp : oldBody) {
+    StringAttr name;
+    bool isRead;
+    if (auto assign = dyn_cast<HCAssignOp>(&bodyOp)) {
+      name = assign.getNameAttr();
+      isRead = false;
+    } else if (auto load = dyn_cast<HCNameLoadOp>(&bodyOp)) {
+      name = load.getNameAttr();
+      isRead = true;
+    } else {
+      continue;
+    }
+    if (!firstSeen.insert(name).second)
+      continue;
+    if (isRead && !ivSelfBinds.count(name))
+      snapshot.insert(name);
   }
   SmallVector<StringAttr> carried(writeSet.begin(), writeSet.end());
 
@@ -433,18 +412,13 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   SnapMap snapValues;
   materializeSnapshots(builder, loc, undefTy, snapshot, snapValues);
 
-  // Build extended iter_inits / result-types. Read-first carriers
-  // take the outer snap as their seed (binding pre-seed below will
-  // overwrite with iter_arg, but the snap is what actually flows
-  // into the loop on iteration 0). Write-first carriers have no
-  // snap and no observable iter_init: the value is dead in every
-  // iteration where the body executes, and in the zero-trip case
-  // it's the op's result, which maps to Python's "name stays
-  // undefined if the loop never ran" — `!hc.undef` is the native
-  // carrier for that state. `unrealized_conversion_cast` with no
-  // operands is MLIR's standard "type-correct placeholder with no
-  // producer" scaffolding; it survives until the refinement passes
-  // fix the type, at which point DCE drops it if it's still unused.
+  // iter_inits: read-first carriers seed from their outer snap;
+  // write-first carriers seed from a no-operand
+  // `unrealized_conversion_cast` (a type-only placeholder — the
+  // first in-body assign overwrites the iter_arg before any load
+  // sees it, and zero-trip leaves the placeholder flowing out as
+  // the op's result, matching "name stays undefined if the loop
+  // never ran").
   SmallVector<Value> newIterInits(op.getIterInits().begin(),
                                   op.getIterInits().end());
   for (StringAttr name : carried) {
@@ -483,14 +457,16 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   // encountered during the scan overwrites the binding; the yield
   // rebuild picks up whatever the last write left.
   //
-  // `binding` is seeded with `readSet ∪ writeSet ∪ ivSelfBinds`,
-  // which by construction covers every top-level `hc.name_load` in
-  // `body`, so the scan cannot emit the reaching-def diagnostic
-  // here. The only remaining failure mode is the
-  // stale-NameStoreRegionOpInterface check — a pass bug, not a
-  // frontend bug. By this point we've already restructured the
-  // outer IR (new op + `takeBody`), so a soft `return failure()`
-  // would leak a torn module; abort fatally instead.
+  // `binding` is seeded with `snapshot ∪ carried ∪ ivSelfBinds`;
+  // together these cover every top-level name that can appear in a
+  // `hc.name_load` within `body` (snapshot = read-first names,
+  // carried = write-set = every assigned name), so the scan cannot
+  // emit the reaching-def diagnostic here. The only remaining
+  // failure mode is the stale-NameStoreRegionOpInterface check — a
+  // pass bug, not a frontend bug. By this point we've already
+  // restructured the outer IR (new op + `takeBody`), so a soft
+  // `return failure()` would leak a torn module; abort fatally
+  // instead.
   llvm::StringMap<Value> binding;
   for (auto &kv : ivSelfBinds)
     binding[kv.first.getValue()] = kv.second;

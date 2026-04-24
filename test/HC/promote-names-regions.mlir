@@ -228,16 +228,11 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
 
 // -----
 
-// Loop-local temporary: the body writes `t` before reading it, and
-// no outer `hc.assign "t"` exists. The promoter must not emit an
-// outer `hc.name_load "t"` as the iter_init (there would be no
-// reaching assign for the callable-level flat sweep to resolve);
-// instead, the iter_arg value is semantically dead on every iter
-// (the first in-body assign overwrites it), and the op carries it
-// out via a placeholder-seeded iter_result. `unrealized_conversion_cast`
-// is the expected placeholder — it's MLIR's "type-correct value with
-// no producer" scaffolding, and later inference passes drop it when
-// the type gets pinned.
+// Write-first loop-local: body assigns `t` before reading it and
+// no outer `hc.assign "t"` exists. Must not emit an outer
+// `hc.name_load "t"` (would fail the flat sweep with no reaching
+// def); iter_init is a type-only `unrealized_conversion_cast`
+// placeholder instead.
 // CHECK-LABEL: hc.func @for_range_loop_local_temp
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign

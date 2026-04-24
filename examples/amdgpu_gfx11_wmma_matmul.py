@@ -80,8 +80,13 @@ def _lane_output_row_step(wave_size: int) -> int:
 
 
 def _lane_output_row_slice_args(lane: int, wave_size: int) -> tuple[int, int, int]:
-    rows = _lane_output_rows(lane, wave_size)
-    return rows[0], WMMA_M, _lane_output_row_step(wave_size)
+    # Algebraically the `(rows[0], WMMA_M, _lane_output_row_step(wave_size))`
+    # triple that the simulator would derive from `_lane_output_rows`. The
+    # zeroth element of `tuple(range(lane // 16, WMMA_M, wave_size // 16))`
+    # is just `lane // 16`, so we compute it directly — the compiler doesn't
+    # lower `tuple(range(...))[0]` and the helper body has to be lowerable
+    # for `hc_front` to inline it later in the pipeline.
+    return lane // 16, WMMA_M, _lane_output_row_step(wave_size)
 
 
 def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:

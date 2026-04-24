@@ -296,12 +296,15 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
     Analogous to `hc_front.intrinsic`; later passes dispatch on `scope` and
     `effects` without string-matching the mnemonic.
 
-    Parameters — when a signature is present — live as block arguments of
-    the body's entry block; their types mirror `function_type` inputs
-    one-to-one. The body region holds verify/infer hooks, lowering
-    recipes, or a fallback body once those settle. An empty body is legal
-    and denotes a declaration-only intrinsic that later lowering patterns
-    handle directly.
+    `parameters` records the full declared Python parameter order. When a
+    signature is present, only non-`const_kwargs` parameters live as block
+    arguments of the body's entry block; their types mirror `function_type`
+    inputs one-to-one. The body region holds verify/infer hooks, lowering
+    recipes, or a fallback body once those settle. An empty body is legal and
+    denotes a declaration-only intrinsic that later lowering patterns handle
+    directly. Intrinsics with `const_kwargs`, `parameters`, or a non-empty
+    runtime input signature must provide enough of the trio for the verifier
+    to check their agreement.
 
     `const_kwargs` declares names that every `hc.call_intrinsic` for this
     callee must carry as specialization attributes (e.g. `wave_size`,
@@ -314,7 +317,8 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
     OptionalAttr<TypeAttrOf<FunctionType>>:$function_type,
     HC_ScopeAttr:$scope,
     OptionalAttr<HC_EffectsAttr>:$effects,
-    OptionalAttr<StrArrayAttr>:$const_kwargs
+    OptionalAttr<StrArrayAttr>:$const_kwargs,
+    OptionalAttr<StrArrayAttr>:$parameters
   );
   let regions = (region SizedRegion<1>:$body);
   let hasCustomAssemblyFormat = 1;

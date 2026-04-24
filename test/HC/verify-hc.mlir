@@ -370,7 +370,8 @@ module {
 // Signature parity: same story on `hc.call_intrinsic`.
 // CHECK: error: 'hc.call_intrinsic' op callee '@sized' expects 1 argument(s), call site provides 2
 module {
-  hc.intrinsic @sized(%a: i32) -> i32 scope = #hc.scope<"WorkItem"> {}
+  hc.intrinsic @sized(%a: i32) -> i32
+      scope = #hc.scope<"WorkItem"> parameters = ["a"] {}
   func.func @bad(%a: i32, %b: i32) -> i32 {
     %r = hc.call_intrinsic @sized(%a, %b) : (i32, i32) -> i32
     return %r : i32
@@ -382,12 +383,89 @@ module {
 // const_kwargs whitelist: missing kwarg on the call site fails verify.
 // CHECK: error: 'hc.call_intrinsic' op missing required const kwarg 'wave_size' declared by callee '@wave'
 module {
-  hc.intrinsic @wave scope = #hc.scope<"SubGroup">
-      const_kwargs = ["wave_size"] {}
+  hc.intrinsic @wave(%a: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"SubGroup">
+      const_kwargs = ["wave_size"]
+      parameters = ["a", "wave_size"] {}
   func.func @bad(%a: !hc.undef) -> !hc.undef {
     %r = hc.call_intrinsic @wave(%a) : (!hc.undef) -> !hc.undef
     return %r : !hc.undef
   }
+}
+
+// -----
+
+// When an intrinsic records full parameter order, const_kwargs must be
+// drawn from that list.
+// CHECK: error: 'hc.intrinsic' op const_kwargs entry 'arch' is not listed in parameters
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      const_kwargs = ["arch"]
+      parameters = ["x"] {}
+}
+
+// -----
+
+// parameters is the full ordered list behind function_type and const_kwargs;
+// do not attach it to a legacy declaration with no signature.
+// CHECK: error: 'hc.intrinsic' op parameters requires function_type to define the runtime SSA operand signature
+module {
+  hc.intrinsic @bad scope = #hc.scope<"WorkItem">
+      parameters = ["x"] {}
+}
+
+// -----
+
+// const_kwargs without parameters has no declared universe to validate
+// against.
+// CHECK: error: 'hc.intrinsic' op const_kwargs requires parameters to declare the full intrinsic parameter order
+module {
+  hc.intrinsic @bad scope = #hc.scope<"WorkItem">
+      const_kwargs = ["wave_size"] {}
+}
+
+// -----
+
+// Non-empty intrinsic signatures must name their operand order.
+// CHECK: error: 'hc.intrinsic' op function_type with inputs requires parameters to name the intrinsic operand order
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem"> {}
+}
+
+// -----
+
+// Duplicate names make keyword binding ambiguous.
+// CHECK: error: 'hc.intrinsic' op duplicate parameter name 'x'
+module {
+  hc.intrinsic @bad(%x: !hc.undef, %y: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      parameters = ["x", "x"] {}
+}
+
+// -----
+
+// Duplicate const kwargs are never useful and obscure missing-attribute
+// diagnostics at call sites.
+// CHECK: error: 'hc.intrinsic' op duplicate const_kwargs entry 'arch'
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      const_kwargs = ["arch", "arch"]
+      parameters = ["x", "arch"] {}
+}
+
+// -----
+
+// The function_type on an intrinsic is the runtime operand signature:
+// the declared parameter list with const_kwargs filtered out.
+// CHECK: error: 'hc.intrinsic' op function_type declares 2 input(s) but non-const parameters declare 1 runtime SSA operand(s)
+module {
+  hc.intrinsic @bad(%x: !hc.undef, %arch: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      const_kwargs = ["arch"]
+      parameters = ["x", "arch"] {}
 }
 
 // -----
@@ -522,7 +600,8 @@ hc.func @bad(%a: i32, %b: f32) -> i32 {
 // declarations, but when they do carry a body, the terminator is checked
 // like `hc.func`.
 // CHECK: error: 'hc.return' op returns 2 value(s) but enclosing hc.intrinsic declares 1 result(s)
-hc.intrinsic @bad(%a: i32) -> i32 scope = #hc.scope<"WorkItem"> {
+hc.intrinsic @bad(%a: i32) -> i32 scope = #hc.scope<"WorkItem">
+    parameters = ["a"] {
   hc.return %a, %a : i32, i32
 }
 

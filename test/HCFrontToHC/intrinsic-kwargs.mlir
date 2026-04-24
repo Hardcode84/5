@@ -19,6 +19,7 @@
 // signature would double-count the runtime arity.
 // CHECK-SAME: %arg0: !hc.undef, %arg1: !hc.undef, %arg2: !hc.undef
 // CHECK-SAME: const_kwargs = ["arch", "wave_size"]
+// CHECK-SAME: parameters = ["group", "value", "lane", "wave_size", "arch"]
 module {
   hc_front.intrinsic "demo_intr" attributes {
     const_kwargs = ["arch", "wave_size"],
@@ -99,5 +100,44 @@ module {
     %kw_lane = hc_front.keyword "lane" = %lane
     %r = hc_front.call %intr(%grp, %val, %kw_arch, %kw_ws, %kw_lane)
     hc_front.return %r
+  }
+// Intrinsic declarations are materialized before caller bodies are lowered,
+// so source order does not decide whether call-site kwarg binding can see
+// the callee's full `parameters` list.
+// CHECK-LABEL: hc.func @caller_before_intrinsic
+// CHECK: hc.call_intrinsic @late_intr(%[[GROUP3:[^,]+]], %[[LANE3:[^,)]+]])
+// CHECK-SAME: {arch = "gfx11"}
+// CHECK-LABEL: hc.intrinsic @late_intr
+// CHECK-SAME: const_kwargs = ["arch"]
+// CHECK-SAME: parameters = ["group", "lane", "arch"]
+  hc_front.func "caller_before_intrinsic" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}, {name = "lane"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "late_intr" {ctx = "load", ref = {
+      callee = "@late_intr",
+      const_kwargs = ["arch"],
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %lane = hc_front.name "lane" {ctx = "load", ref = {kind = "param"}}
+    %kw_lane = hc_front.keyword "lane" = %lane
+    %arch = hc_front.constant<"gfx11">
+    %kw_arch = hc_front.keyword "arch" = %arch
+    %r = hc_front.call %intr(%grp, %kw_lane, %kw_arch)
+    hc_front.return %r
+  }
+
+  hc_front.intrinsic "late_intr" attributes {
+    const_kwargs = ["arch"],
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
   }
 }

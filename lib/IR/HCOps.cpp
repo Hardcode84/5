@@ -34,6 +34,41 @@ static bool compatibleSigType(Type callSite, Type callee) {
   return callSite == callee;
 }
 
+ArrayAttr mlir::hc::filterIntrinsicOperandParameters(ArrayAttr parameters,
+                                                     ArrayAttr constKwargs) {
+  if (!parameters || !constKwargs || constKwargs.empty())
+    return parameters;
+
+  llvm::SmallDenseSet<StringRef> skip;
+  for (Attribute kw : constKwargs) {
+    auto kwName = dyn_cast<StringAttr>(kw);
+    if (kwName)
+      skip.insert(kwName.getValue());
+  }
+
+  SmallVector<Attribute> filtered;
+  filtered.reserve(parameters.size());
+  for (Attribute parameter : parameters) {
+    auto name = dyn_cast<StringAttr>(parameter);
+    if (name && !skip.contains(name.getValue()))
+      filtered.push_back(name);
+  }
+  return ArrayAttr::get(parameters.getContext(), filtered);
+}
+
+FunctionType mlir::hc::getIntrinsicOperandFunctionType(
+    ArrayAttr parameters, ArrayAttr constKwargs, TypeRange resultTypes,
+    Type uniformOperandType) {
+  ArrayAttr operands =
+      filterIntrinsicOperandParameters(parameters, constKwargs);
+  SmallVector<Type> inputTypes;
+  if (operands) {
+    inputTypes.reserve(operands.size());
+    inputTypes.append(operands.size(), uniformOperandType);
+  }
+  return FunctionType::get(parameters.getContext(), inputTypes, resultTypes);
+}
+
 // Guarded terminator accessor for verifiers. An otherwise-invalid IR (e.g.
 // a round-trip bug or a bad builder) could leave a non-empty block with no
 // terminator at all; `Block::getTerminator()` asserts in that case, so we
@@ -377,6 +412,14 @@ ParseResult HCIntrinsicOp::parse(OpAsmParser &parser, OperationState &result) {
       return failure();
     result.addAttribute(getConstKwargsAttrName(result.name), kwargs);
   }
+  if (succeeded(parser.parseOptionalKeyword("parameters"))) {
+    if (parser.parseEqual())
+      return failure();
+    ArrayAttr parameters;
+    if (parser.parseAttribute(parameters))
+      return failure();
+    result.addAttribute(getParametersAttrName(result.name), parameters);
+  }
 
   return parseSignatureTailAndBody(parser, result, arguments);
 }
@@ -398,17 +441,79 @@ void HCIntrinsicOp::print(OpAsmPrinter &p) {
     p << " const_kwargs = ";
     p.printAttribute(kwargs);
   }
+  if (auto parameters = getParametersAttr()) {
+    p << " parameters = ";
+    p.printAttribute(parameters);
+  }
   p.printOptionalAttrDictWithKeyword(
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName(),
                        getScopeAttrName(), getEffectsAttrName(),
-                       getConstKwargsAttrName()});
+                       getConstKwargsAttrName(), getParametersAttrName()});
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
 
 LogicalResult HCIntrinsicOp::verify() {
-  return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
+  if (failed(verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody())))
+    return failure();
+
+  ArrayAttr parameters = getParametersAttr();
+  TypeAttr fnTypeAttr = getFunctionTypeAttr();
+  if (!parameters) {
+    if (ArrayAttr constKwargs = getConstKwargsAttr())
+      return emitOpError("const_kwargs requires parameters to declare the "
+                         "full intrinsic parameter order");
+    if (fnTypeAttr) {
+      auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
+      if (fnType.getNumInputs() != 0)
+        return emitOpError("function_type with inputs requires parameters to "
+                           "name the intrinsic operand order");
+    }
+    return success();
+  }
+
+  llvm::SmallDenseSet<StringRef> declared;
+  for (auto [idx, parameter] : llvm::enumerate(parameters)) {
+    auto name = dyn_cast<StringAttr>(parameter);
+    if (!name)
+      return emitOpError("parameters entry at index ")
+             << idx << " must be a StringAttr, got " << parameter;
+    if (!declared.insert(name.getValue()).second)
+      return emitOpError("duplicate parameter name '")
+             << name.getValue() << "'";
+  }
+
+  if (!fnTypeAttr)
+    return emitOpError(
+        "parameters requires function_type to define the runtime SSA "
+        "operand signature");
+
+  if (ArrayAttr constKwargs = getConstKwargsAttr()) {
+    llvm::SmallDenseSet<StringRef> seenConstKwargs;
+    for (Attribute kw : constKwargs) {
+      auto kwName = dyn_cast<StringAttr>(kw);
+      if (!kwName)
+        return emitOpError("const_kwargs entry must be a StringAttr, got ")
+               << kw;
+      StringRef name = kwName.getValue();
+      if (!seenConstKwargs.insert(name).second)
+        return emitOpError("duplicate const_kwargs entry '") << name << "'";
+      if (!declared.contains(name))
+        return emitOpError("const_kwargs entry '")
+               << name << "' is not listed in parameters";
+    }
+  }
+
+  auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
+  ArrayAttr operandParameters =
+      filterIntrinsicOperandParameters(parameters, getConstKwargsAttr());
+  if (fnType.getNumInputs() != operandParameters.size())
+    return emitOpError("function_type declares ")
+           << fnType.getNumInputs()
+           << " input(s) but non-const parameters declare "
+           << operandParameters.size() << " runtime SSA operand(s)";
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

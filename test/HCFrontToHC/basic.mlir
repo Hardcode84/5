@@ -126,13 +126,14 @@ module {
   // CHECK-SAME: scope = <"WorkItem">
   // CHECK-SAME: effects = pure
   // CHECK-SAME: const_kwargs = ["arch"]
+  // CHECK-SAME: parameters = ["group", "arch"]
   // CHECK-NEXT: }
   // CHECK-NOT: hc_front.
   hc_front.intrinsic "intr" attributes {
     const_kwargs = ["arch"],
     decorators = ["kernel.intrinsic"],
     effects = "pure",
-    parameters = [{name = "group"}],
+    parameters = [{name = "group"}, {name = "arch"}],
     scope = "WorkItem"
   } {
     %zero = hc_front.constant<0 : i64>

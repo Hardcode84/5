@@ -372,54 +372,29 @@ Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
   return nullptr;
 }
 
-//===----------------------------------------------------------------------===//
-// `hc.intrinsic`'s `function_type` is the runtime call signature — only
-// what `hc.call_intrinsic` threads through as SSA operands. `const_kwargs`
-// (e.g. `wave_size`, `arch`) live on the call as specialization attributes
-// and never as operands (see `HCCallIntrinsicOp` in `HCOps.td`). So before
-// building the callee's signature, drop any declared parameter whose name
-// is in the `const_kwargs` whitelist; the full `parameters` list is kept
-// elsewhere for the call-site lowering to walk when threading non-const
-// kwargs into operands.
-//
-// Preconditions: caller has already validated that every element of
-// `constKwargs` is a `StringAttr` (see the intrinsic branch in
-// `lowerCallable`). `constKwargs = null` leaves `params` unchanged.
-//===----------------------------------------------------------------------===//
-static ArrayAttr filterOutConstKwargs(ArrayAttr params, ArrayAttr constKwargs,
-                                      MLIRContext *ctx) {
-  if (!constKwargs || constKwargs.empty())
-    return params;
-  llvm::SmallDenseSet<StringRef> skip;
-  for (Attribute kw : constKwargs)
-    skip.insert(cast<StringAttr>(kw).getValue());
-  SmallVector<Attribute> filtered;
-  filtered.reserve(params.size());
-  for (Attribute p : params) {
-    auto dict = dyn_cast<DictionaryAttr>(p);
-    if (!dict) {
-      filtered.push_back(p);
-      continue;
-    }
+static FailureOr<ArrayAttr> parameterNamesFromDicts(ArrayAttr params,
+                                                    Operation *sourceOp) {
+  MLIRContext *ctx = sourceOp->getContext();
+  SmallVector<Attribute> names;
+  names.reserve(params.size());
+  llvm::SmallDenseSet<StringRef> seen;
+  for (auto [idx, param] : llvm::enumerate(params)) {
+    auto dict = dyn_cast<DictionaryAttr>(param);
+    if (!dict)
+      return sourceOp->emitOpError(
+                 "expected `parameters` entries to be DictAttr, got ")
+             << param;
     auto name = dict.getAs<StringAttr>("name");
-    if (name && skip.contains(name.getValue()))
-      continue;
-    filtered.push_back(p);
+    if (!name)
+      return sourceOp->emitOpError("`parameters` entry at index ")
+             << idx << " missing `name` key";
+    if (!seen.insert(name.getValue()).second)
+      return sourceOp->emitOpError("duplicate parameter name '")
+             << name.getValue() << "'";
+    names.push_back(name);
   }
-  return ArrayAttr::get(ctx, filtered);
+  return ArrayAttr::get(ctx, names);
 }
-
-// Pre-scan snapshot of a frontend `hc_front.intrinsic`'s metadata, taken
-// by the pass before any lowering runs so the call-site lowering is
-// insensitive to traversal order (each lowering erases its source op).
-// The defining intrinsic is the single source of truth for both the
-// full parameter order and the `const_kwargs` whitelist — using this
-// struct at call sites keeps the filtered signature and the
-// operand/attribute split from drifting apart.
-struct IntrinsicDecl {
-  ArrayAttr parameters;
-  ArrayAttr constKwargs;
-};
 
 //===----------------------------------------------------------------------===//
 // Lowerer. Instantiated once per top-level `hc_front` callable; walks the
@@ -430,19 +405,13 @@ struct IntrinsicDecl {
 
 class Lowerer {
 public:
-  // `intrinsicDecls` maps every frontend-declared intrinsic's symbol name
-  // to a snapshot of its `parameters` and `const_kwargs`. Populated by
-  // the pass before any lowering runs; see `IntrinsicDecl`.
-  Lowerer(OpBuilder &builder, Type undef,
-          const llvm::StringMap<IntrinsicDecl> &intrinsicDecls)
-      : builder(builder), undef(undef), intrinsicDecls(intrinsicDecls) {}
+  Lowerer(OpBuilder &builder, Type undef) : builder(builder), undef(undef) {}
 
   LogicalResult lowerCallable(Operation *frontOp);
 
 private:
   OpBuilder &builder;
   Type undef;
-  const llvm::StringMap<IntrinsicDecl> &intrinsicDecls;
 
   // No scope stack: name-store placeholders carry the binding. Entry
   // points that introduce a new Python-level name (parameter entry,
@@ -720,10 +689,6 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
       return frontOp->emitOpError(
           "hc_front.intrinsic must carry a `scope` string attribute");
     }
-    // `const_kwargs` specialization attrs must not also appear as
-    // operands — the call site only supplies them as attributes. Trim
-    // them out of the signature and block args so verifier arity lines
-    // up with what `lowerCall`'s intrinsic branch threads through.
     auto constKwargsAttr = frontOp->getAttrOfType<ArrayAttr>("const_kwargs");
     if (constKwargsAttr) {
       for (auto [idx, kw] : llvm::enumerate(constKwargsAttr)) {
@@ -732,31 +697,42 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
                  << idx << " must be a StringAttr, got " << kw;
       }
     }
-    ArrayAttr bodyParams = filterOutConstKwargs(params, constKwargsAttr, ctx);
-    return runBody(
-        bodyParams, /*returnsValue=*/true,
-        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
-          auto hcIntr = HCIntrinsicOp::create(
-              builder, loc, StringAttr::get(ctx, intr.getName()),
-              TypeAttr::get(fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
-              /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr());
-          hcIntr.getBody().push_back(entry);
-          if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
-            auto cls = parseEffectClass(effAttr.getValue());
-            if (!cls) {
-              hcIntr->emitOpError("unknown effects class '")
-                  << effAttr.getValue() << "'";
-              hcIntr->erase();
-              return failure();
-            }
-            hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
-          }
-          if (constKwargsAttr)
-            hcIntr.setConstKwargsAttr(constKwargsAttr);
-          // Null => skip body walk; see file banner for rationale.
-          Region *skipWalk = nullptr;
-          return skipWalk;
-        });
+
+    FailureOr<ArrayAttr> parameterNames =
+        parameterNamesFromDicts(params, frontOp);
+    if (failed(parameterNames))
+      return failure();
+
+    // `hc.intrinsic` owns the const-kwarg filtering rule: its
+    // `function_type` is the runtime operand signature, while
+    // `parameters` keeps the full declared order for call-site kwarg
+    // binding.
+    FunctionType fnType = getIntrinsicOperandFunctionType(
+        *parameterNames, constKwargsAttr, TypeRange{undef}, undef);
+    ArrayAttr parameterNamesAttr = *parameterNames;
+    Block *entry = new Block();
+    for (Type input : fnType.getInputs())
+      entry->addArgument(input, loc);
+
+    auto hcIntr = HCIntrinsicOp::create(
+        builder, loc, StringAttr::get(ctx, intr.getName()),
+        TypeAttr::get(fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
+        /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr(),
+        /*parameters=*/parameterNamesAttr);
+    hcIntr.getBody().push_back(entry);
+    if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
+      auto cls = parseEffectClass(effAttr.getValue());
+      if (!cls) {
+        hcIntr->emitOpError("unknown effects class '")
+            << effAttr.getValue() << "'";
+        hcIntr->erase();
+        return failure();
+      }
+      hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
+    }
+    if (constKwargsAttr)
+      hcIntr.setConstKwargsAttr(constKwargsAttr);
+    return success();
   }
 
   return frontOp->emitOpError("unexpected top-level hc_front op");
@@ -1673,18 +1649,20 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
       return call.getResult(0);
     }
 
-    // The defining `hc_front.intrinsic` is the single source of truth
-    // for `parameters` order and the `const_kwargs` whitelist (the
-    // declaration-side `filterOutConstKwargs` reads the same attr). The
-    // call-site `ref` dict the Python resolver stamps is only a fallback
-    // for cross-module or hand-authored calls where the declaration is
-    // not visible in this module.
-    auto declIt = intrinsicDecls.find(callee);
-    bool haveDecl = declIt != intrinsicDecls.end();
-    ArrayAttr declaredParameters =
-        haveDecl ? declIt->second.parameters : nullptr;
-    ArrayAttr constKwargsAttr = haveDecl ? declIt->second.constKwargs
-                                         : ref.getAs<ArrayAttr>("const_kwargs");
+    // The lowered `hc.intrinsic` symbol carries both the full declared
+    // parameter order and the const-kwarg whitelist. Intrinsic
+    // declarations are materialized before caller bodies are lowered, so
+    // this lookup is independent of source order.
+    HCIntrinsicOp intrDecl =
+        SymbolTable::lookupNearestSymbolFrom<HCIntrinsicOp>(op.getOperation(),
+                                                            symRef);
+    if (!intrDecl) {
+      op.emitOpError("intrinsic '@")
+          << callee << "' does not resolve to a lowered hc.intrinsic";
+      return failure();
+    }
+    ArrayAttr declaredParameters = intrDecl.getParametersAttr();
+    ArrayAttr constKwargsAttr = intrDecl.getConstKwargsAttr();
     llvm::SmallDenseSet<StringRef> constKwargSet;
     if (constKwargsAttr) {
       for (Attribute kw : constKwargsAttr)
@@ -1710,18 +1688,11 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
         return failure();
       }
       for (unsigned i = operands.size(), e = params.size(); i < e; ++i) {
-        auto dict = dyn_cast<DictionaryAttr>(params[i]);
-        if (!dict) {
-          op.emitOpError("intrinsic '@")
-              << callee << "' has malformed `parameters` entry at index " << i
-              << ": expected DictAttr, got " << params[i];
-          return failure();
-        }
-        auto nameAttr = dict.getAs<StringAttr>("name");
+        auto nameAttr = dyn_cast<StringAttr>(params[i]);
         if (!nameAttr) {
           op.emitOpError("intrinsic '@")
-              << callee << "' `parameters` entry at index " << i
-              << " missing `name` key";
+              << callee << "' has malformed `parameters` entry at index " << i
+              << ": expected StringAttr, got " << params[i];
           return failure();
         }
         StringRef pname = nameAttr.getValue();
@@ -1737,9 +1708,10 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
         consumedKwargs.insert(pname);
       }
     } else if (!args.kwvalues.empty()) {
-      // Unknown callee (not pre-scanned) with runtime kwargs: we have
-      // no declared order to bind them in. The `hc_front` driver must
-      // stamp `parameters` on every intrinsic callable in the module.
+      // Keyword operands need the callee's full ordered parameter list to
+      // anchor their SSA slots. Declaration-only hand-written intrinsics
+      // without `parameters` can still accept positional calls, but there is
+      // no deterministic kwarg order to recover.
       op.emitOpError("intrinsic '@")
           << callee
           << "' call has keyword arguments but callee declares no "
@@ -2175,28 +2147,26 @@ struct ConvertHCFrontToHCPass
     MLIRContext *ctx = &getContext();
     UndefType undef = UndefType::get(ctx);
 
+    SmallVector<Operation *> intrinsicOps;
     SmallVector<Operation *> frontOps;
-    // Pre-scan every intrinsic's declared metadata so `lowerCall` can
-    // walk it to thread non-const kwargs onto the call site. We snapshot
-    // before the lowering loop runs because each iteration erases its
-    // source op, and a later caller in the same module may need to see
-    // the callee's `parameters` / `const_kwargs` after the callee op
-    // itself is gone.
-    llvm::StringMap<IntrinsicDecl> intrinsicDecls;
     for (Operation &op : *moduleOp.getBody()) {
-      if (isa<hc_front::KernelOp, hc_front::FuncOp, hc_front::IntrinsicOp>(op))
+      if (isa<hc_front::KernelOp, hc_front::FuncOp>(op))
         frontOps.push_back(&op);
-      if (auto intr = dyn_cast<hc_front::IntrinsicOp>(op)) {
-        IntrinsicDecl decl;
-        decl.parameters = intr->getAttrOfType<ArrayAttr>("parameters");
-        decl.constKwargs = intr->getAttrOfType<ArrayAttr>("const_kwargs");
-        intrinsicDecls[intr.getName()] = decl;
-      }
+      else if (isa<hc_front::IntrinsicOp>(op))
+        intrinsicOps.push_back(&op);
     }
 
     OpBuilder builder(ctx);
+    for (Operation *op : intrinsicOps) {
+      Lowerer lowerer(builder, undef);
+      if (failed(lowerer.lowerCallable(op))) {
+        signalPassFailure();
+        return;
+      }
+      op->erase();
+    }
     for (Operation *op : frontOps) {
-      Lowerer lowerer(builder, undef, intrinsicDecls);
+      Lowerer lowerer(builder, undef);
       if (failed(lowerer.lowerCallable(op))) {
         signalPassFailure();
         return;

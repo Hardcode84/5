@@ -17,6 +17,22 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+namespace mlir::hc {
+
+/// Return the full parameter list with const-only kwargs removed. The
+/// remaining names are the SSA operand slots of `hc.call_intrinsic`.
+ArrayAttr filterIntrinsicOperandParameters(ArrayAttr parameters,
+                                           ArrayAttr constKwargs);
+
+/// Build the runtime operand signature for an intrinsic whose operands all
+/// currently share one staging type, usually `!hc.undef` before inference.
+FunctionType getIntrinsicOperandFunctionType(ArrayAttr parameters,
+                                             ArrayAttr constKwargs,
+                                             TypeRange resultTypes,
+                                             Type uniformOperandType);
+
+} // namespace mlir::hc
+
 #define GET_OP_CLASSES
 #include "hc/IR/HCOps.h.inc"
 

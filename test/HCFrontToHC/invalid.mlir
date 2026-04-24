@@ -411,11 +411,9 @@ module {
 
 // -----
 
-// Intrinsic call whose callee is not defined in this module (hand-
-// written IR, a cross-module reference, or a resolver path that never
-// stamped the declaration). Kwargs at the call site have no declared
-// slot to bind to, so the lowering refuses rather than silently
-// dropping them.
+// Intrinsic call whose callee is not defined in this module. Conversion
+// refuses immediately instead of reconstructing operand/const-kwarg
+// metadata from the frontend ref dict.
 module {
   hc_front.func "no_stamped_parameters" attributes {
     decorators = ["kernel.func"],
@@ -431,7 +429,7 @@ module {
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %zero = hc_front.constant<0 : i64>
     %kw = hc_front.keyword "extra" = %zero
-    // expected-error@+1 {{intrinsic '@unstamped' call has keyword arguments but callee declares no `parameters`}}
+    // expected-error@+1 {{intrinsic '@unstamped' does not resolve to a lowered hc.intrinsic}}
     %r = hc_front.call %intr(%grp, %kw)
     hc_front.return %r
   }

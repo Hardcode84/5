@@ -20,8 +20,9 @@ hc.intrinsic @subgroup_dot scope = #hc.scope<"SubGroup"> {}
 // (pure declaration).
 // CHECK-LABEL: hc.intrinsic @typed_decl
 // CHECK-SAME: (%arg0: f32, %arg1: f32) -> f32 scope = <"WorkItem">
+// CHECK-SAME: parameters = ["a", "b"]
 hc.intrinsic @typed_decl(%a: f32, %b: f32) -> f32
-    scope = #hc.scope<"WorkItem"> {}
+    scope = #hc.scope<"WorkItem"> parameters = ["a", "b"] {}
 
 // CHECK-LABEL: func.func @simple_for_range
 // CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> () {

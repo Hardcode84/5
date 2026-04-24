@@ -133,8 +133,9 @@ hc.func @typed_helper(%a: i32, %b: i32) -> i32 {
   hc.return %a : i32
 }
 
-// CHECK: hc.intrinsic @typed_intrinsic(%arg0: f32) -> f32 scope = <"WorkItem">
-hc.intrinsic @typed_intrinsic(%x: f32) -> f32 scope = #hc.scope<"WorkItem"> {}
+// CHECK: hc.intrinsic @typed_intrinsic(%arg0: f32) -> f32 scope = <"WorkItem"> parameters = ["x"]
+hc.intrinsic @typed_intrinsic(%x: f32) -> f32
+    scope = #hc.scope<"WorkItem"> parameters = ["x"] {}
 
 // CHECK-LABEL: func.func @typed_calls
 // CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (i32, i32) -> i32
@@ -150,9 +151,11 @@ func.func @typed_calls(%a: i32, %b: i32, %c: f32, %u: !hc.undef) {
 // `const_kwargs` on the declaration are a whitelist of names every call site
 // must carry as specialization attributes. Extra attributes stay allowed.
 
-// CHECK: hc.intrinsic @wave_like scope = <"SubGroup"> const_kwargs = ["wave_size"]
-hc.intrinsic @wave_like scope = #hc.scope<"SubGroup">
-    const_kwargs = ["wave_size"] {}
+// CHECK: hc.intrinsic @wave_like(%arg0: !hc.undef) -> !hc.undef scope = <"SubGroup"> const_kwargs = ["wave_size"] parameters = ["x", "wave_size"]
+hc.intrinsic @wave_like(%x: !hc.undef) -> !hc.undef
+    scope = #hc.scope<"SubGroup">
+    const_kwargs = ["wave_size"]
+    parameters = ["x", "wave_size"] {}
 
 // CHECK-LABEL: func.func @kwarg_calls
 // CHECK: hc.call_intrinsic @wave_like(%{{.*}}) {wave_size = 32 : i64}

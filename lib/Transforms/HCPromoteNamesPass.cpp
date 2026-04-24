@@ -12,11 +12,12 @@
 // mechanism (iter_args for `hc.for_range`, results for `hc.if`, etc).
 // Each promoted op is flanked with transient `hc.name_load` (before) and
 // `hc.assign` (after) ops that snapshot the outer binding in and push the
-// new binding back out; the enclosing region (or the final flat sweep on
-// the callable body) then resolves those. Once every region-carrying op
-// under a callable has been promoted, the top-level block is swept
-// linearly to collapse the remaining `hc.name_load` / `hc.assign` pairs
-// into direct SSA edges.
+// new binding back out; snapshots are driven by first use in block order
+// (read-first names only), not by `reads ∪ writes`. The enclosing region
+// (or the final flat sweep on the callable body) then resolves those. Once
+// every region-carrying op under a callable has been promoted, the top-level
+// block is swept linearly to collapse the remaining `hc.name_load` /
+// `hc.assign` pairs into direct SSA edges.
 //
 // Implemented in this file: flat-body sweep, `hc.for_range` promotion,
 // `hc.if` promotion, nested-scope sweep for `hc.workitem_region` /
@@ -68,19 +69,42 @@ using SnapMap = llvm::SmallDenseMap<StringAttr, Value>;
 // `hc.if` scans where the caller pre-seeds the binding.
 using SnapFactory = llvm::function_ref<Value(StringAttr)>;
 
-// Gathers the top-level `hc.assign` / `hc.name_load` ops in `block`.
+struct TopLevelNameFacts {
+  NameSet reads;
+  NameSet writes;
+  NameSet snapshot;
+};
+
+// Gathers the top-level `hc.assign` / `hc.name_load` facts in `block`.
 // "Top-level" = direct children only; nested region ops at this point
 // are assumed to already be promoted (bottom-up walk precondition) and
 // their inner name-store ops have either been erased or hoisted out as
 // transient snap/writeback pairs at `block`.
-static void collectTopLevelNames(Block &block, NameSet &reads,
-                                 NameSet &writes) {
+//
+// `snapshot` is deliberately not `reads`: it records only names whose
+// first top-level mention is a read, in block order. A write-first name
+// can be carried without loading an outer binding that may not exist.
+static TopLevelNameFacts collectTopLevelNameFacts(Block &block) {
+  TopLevelNameFacts facts;
+  llvm::SmallDenseSet<StringAttr> firstSeen;
   for (Operation &op : block) {
-    if (auto assign = dyn_cast<HCAssignOp>(&op))
-      writes.insert(assign.getNameAttr());
-    else if (auto load = dyn_cast<HCNameLoadOp>(&op))
-      reads.insert(load.getNameAttr());
+    StringAttr name;
+    bool isRead;
+    if (auto assign = dyn_cast<HCAssignOp>(&op)) {
+      name = assign.getNameAttr();
+      isRead = false;
+      facts.writes.insert(name);
+    } else if (auto load = dyn_cast<HCNameLoadOp>(&op)) {
+      name = load.getNameAttr();
+      isRead = true;
+      facts.reads.insert(name);
+    } else {
+      continue;
+    }
+    if (firstSeen.insert(name).second && isRead)
+      facts.snapshot.insert(name);
   }
+  return facts;
 }
 
 // Two-phase linear scan over `block`'s non-terminator ops:
@@ -333,24 +357,22 @@ extractIvSelfBinds(Block &body, BlockArgument ivArg) {
 // separate, pre-scan step — see `extractIvSelfBinds`. They are
 // pre-seeded into the body scan's binding, kept out of
 // snapshot / carried, and erased from the body before
-// `collectTopLevelNames` sees them.
+// `collectTopLevelNameFacts` sees them.
 static LogicalResult promoteForRange(HCForRangeOp op) {
   Block &oldBody = op.getBody().front();
   BlockArgument ivArg = oldBody.getArgument(0);
   auto ivSelfBinds = extractIvSelfBinds(oldBody, ivArg);
 
-  NameSet readSet;
-  NameSet writeSet;
-  collectTopLevelNames(oldBody, readSet, writeSet);
+  TopLevelNameFacts facts = collectTopLevelNameFacts(oldBody);
   // IV self-bind names may still appear as reads in the body (the
   // user's code says `for i in ...: use(i)`); drop them from both
   // sets so snapshot / iter_init computation treats them as loop-
   // local, not carried.
   //
-  // writeSet membership is the IV-name-shadow case: the user wrote
+  // `facts.writes` membership is the IV-name-shadow case: the user wrote
   // `for i in ...: i = expr`. The leading self-bind is already
   // stripped by `extractIvSelfBinds`, but a remaining in-body
-  // `hc.assign "i", %expr` still lands here in writeSet. Dropping
+  // `hc.assign "i", %expr` still lands here in `facts.writes`. Dropping
   // it means the shadow write is consumed by the body scan
   // (`binding["i"]` gets overwritten and subsequent `hc.name_load
   // "i"` reads resolve to %expr) but is *not* promoted to an
@@ -364,45 +386,14 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   // Python driver is expected to reject IV-name shadowing before it
   // reaches MLIR; this block is the belt to that suspenders.
   for (auto &kv : ivSelfBinds) {
-    readSet.remove(kv.first);
-    writeSet.remove(kv.first);
+    facts.reads.remove(kv.first);
+    facts.writes.remove(kv.first);
+    facts.snapshot.remove(kv.first);
   }
-  if (readSet.empty() && writeSet.empty() && ivSelfBinds.empty())
+  if (facts.reads.empty() && facts.writes.empty() && ivSelfBinds.empty())
     return success();
 
-  // Snapshot = names whose first top-level mention in the body is a
-  // read. Write-first names are skipped: the iter_arg is dead once
-  // the first in-body assign fires, and emitting an outer
-  // `hc.name_load` for a loop-local temp would fail the callable-
-  // level flat sweep (no reaching `hc.assign` in the enclosing
-  // scope by construction).
-  //
-  // The walk runs in block order so `snapshot`'s insertion order
-  // (and thus the emitted outer-snap cluster) is deterministic.
-  // IV self-binds are stripped from the leading ops of `oldBody`
-  // above; explicitly skip their names here to keep a shadow
-  // `hc.name_load "i"` (legal; binds to `%iv` via the pre-seed)
-  // from sneaking into snapshot.
-  NameSet snapshot;
-  llvm::SmallDenseSet<StringAttr> firstSeen;
-  for (Operation &bodyOp : oldBody) {
-    StringAttr name;
-    bool isRead;
-    if (auto assign = dyn_cast<HCAssignOp>(&bodyOp)) {
-      name = assign.getNameAttr();
-      isRead = false;
-    } else if (auto load = dyn_cast<HCNameLoadOp>(&bodyOp)) {
-      name = load.getNameAttr();
-      isRead = true;
-    } else {
-      continue;
-    }
-    if (!firstSeen.insert(name).second)
-      continue;
-    if (isRead && !ivSelfBinds.count(name))
-      snapshot.insert(name);
-  }
-  SmallVector<StringAttr> carried(writeSet.begin(), writeSet.end());
+  SmallVector<StringAttr> carried(facts.writes.begin(), facts.writes.end());
 
   MLIRContext *ctx = op.getContext();
   Type undefTy = UndefType::get(ctx);
@@ -410,7 +401,7 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
 
   OpBuilder builder(op);
   SnapMap snapValues;
-  materializeSnapshots(builder, loc, undefTy, snapshot, snapValues);
+  materializeSnapshots(builder, loc, undefTy, facts.snapshot, snapValues);
 
   // iter_inits: read-first carriers seed from their outer snap;
   // write-first carriers seed from a no-operand
@@ -457,7 +448,7 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   // encountered during the scan overwrites the binding; the yield
   // rebuild picks up whatever the last write left.
   //
-  // `binding` is seeded with `snapshot ∪ carried ∪ ivSelfBinds`;
+  // `binding` is seeded with `facts.snapshot ∪ carried ∪ ivSelfBinds`;
   // together these cover every top-level name that can appear in a
   // `hc.name_load` within `body` (snapshot = read-first names,
   // carried = write-set = every assigned name), so the scan cannot
@@ -470,7 +461,7 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   llvm::StringMap<Value> binding;
   for (auto &kv : ivSelfBinds)
     binding[kv.first.getValue()] = kv.second;
-  for (StringAttr name : snapshot)
+  for (StringAttr name : facts.snapshot)
     binding[name.getValue()] = snapValues[name];
   for (StringAttr name : carried)
     binding[name.getValue()] = iterArgFor[name];
@@ -507,25 +498,25 @@ static LogicalResult promoteIf(HCIfOp op) {
   Block &thenBlock = op.getThenRegion().front();
   Region &elseRegion = op.getElseRegion();
 
-  // Per-branch read/write sets. `hc.if` promotion needs these split
+  // Per-branch name facts. `hc.if` promotion needs these split
   // because the snapshot policy depends on branch symmetry: a name
   // written in both branches is fully redefined on every path and
   // doesn't need an outer-scope snap, while a name written in only one
   // branch still needs the outer value to fall back to on the silent
   // branch.
-  NameSet thenReads, thenWrites, elseReads, elseWrites;
-  collectTopLevelNames(thenBlock, thenReads, thenWrites);
+  TopLevelNameFacts thenFacts = collectTopLevelNameFacts(thenBlock);
+  TopLevelNameFacts elseFacts;
   bool hasElse = !elseRegion.empty();
   if (hasElse)
-    collectTopLevelNames(elseRegion.front(), elseReads, elseWrites);
-  if (thenReads.empty() && thenWrites.empty() && elseReads.empty() &&
-      elseWrites.empty())
+    elseFacts = collectTopLevelNameFacts(elseRegion.front());
+  if (thenFacts.reads.empty() && thenFacts.writes.empty() &&
+      elseFacts.reads.empty() && elseFacts.writes.empty())
     return success();
 
   NameSet carriedSet;
-  for (StringAttr n : thenWrites)
+  for (StringAttr n : thenFacts.writes)
     carriedSet.insert(n);
-  for (StringAttr n : elseWrites)
+  for (StringAttr n : elseFacts.writes)
     carriedSet.insert(n);
   SmallVector<StringAttr> carried(carriedSet.begin(), carriedSet.end());
 
@@ -539,12 +530,12 @@ static LogicalResult promoteIf(HCIfOp op) {
   // no snap — each branch's own write provides the yield value, so an
   // outer snap would be a spurious `hc.name_load` that the flat sweep
   // would then fail to resolve when no outer binding exists.
-  NameSet snapshot = thenReads;
-  for (StringAttr n : elseReads)
+  NameSet snapshot = thenFacts.reads;
+  for (StringAttr n : elseFacts.reads)
     snapshot.insert(n);
   for (StringAttr n : carriedSet) {
-    bool symmetric =
-        hasElse && thenWrites.count(n) > 0 && elseWrites.count(n) > 0;
+    bool symmetric = hasElse && thenFacts.writes.count(n) > 0 &&
+                     elseFacts.writes.count(n) > 0;
     if (!symmetric)
       snapshot.insert(n);
   }

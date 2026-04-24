@@ -75,4 +75,5 @@
 // CHECK-SAME: effects = pure
 // CHECK-SAME: const_kwargs = ["arch", "wave_size"]
 // CHECK-SAME: parameters = ["group", "a_tile", "b_tile", "a_frag", "b_frag", "acc_frag", "lane", "wave_size", "arch"]
+// CHECK-SAME: keyword_only = ["lane", "wave_size", "arch"]
 // CHECK-NEXT: }

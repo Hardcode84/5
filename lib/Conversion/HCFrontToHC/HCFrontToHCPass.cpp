@@ -411,6 +411,42 @@ static FailureOr<ArrayAttr> parameterNamesFromDicts(ArrayAttr params,
   return ArrayAttr::get(ctx, names);
 }
 
+static FailureOr<ArrayAttr>
+keywordOnlyParametersFromDicts(ArrayAttr params, Operation *sourceOp) {
+  MLIRContext *ctx = sourceOp->getContext();
+  SmallVector<Attribute> keywordOnly;
+  bool seenKeywordOnly = false;
+  for (auto [idx, param] : llvm::enumerate(params)) {
+    auto dict = dyn_cast<DictionaryAttr>(param);
+    if (!dict)
+      return sourceOp->emitOpError(
+                 "expected `parameters` entries to be DictAttr, got ")
+             << param;
+    auto name = dict.getAs<StringAttr>("name");
+    if (!name)
+      return sourceOp->emitOpError("`parameters` entry at index ")
+             << idx << " missing `name` key";
+    auto passing = dict.getAs<StringAttr>("passing");
+    if (!passing)
+      return sourceOp->emitOpError("`parameters` entry at index ")
+             << idx << " missing `passing` key";
+    StringRef mode = passing.getValue();
+    if (mode == "keyword_only") {
+      seenKeywordOnly = true;
+      keywordOnly.push_back(name);
+      continue;
+    }
+    if (mode != "positional")
+      return sourceOp->emitOpError("`parameters` entry '")
+             << name.getValue() << "' has unsupported passing mode '" << mode
+             << "'";
+    if (seenKeywordOnly)
+      return sourceOp->emitOpError("positional parameter '")
+             << name.getValue() << "' cannot follow a keyword-only parameter";
+  }
+  return ArrayAttr::get(ctx, keywordOnly);
+}
+
 //===----------------------------------------------------------------------===//
 // Lowerer. Instantiated once per top-level `hc_front` callable; walks the
 // body, threads the scope map through nested regions, and emits the
@@ -727,6 +763,21 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
         parameterNamesFromDicts(params, frontOp);
     if (failed(parameterNames))
       return failure();
+    FailureOr<ArrayAttr> keywordOnlyParameters =
+        keywordOnlyParametersFromDicts(params, frontOp);
+    if (failed(keywordOnlyParameters))
+      return failure();
+    llvm::SmallDenseSet<StringRef> keywordOnlySet;
+    for (Attribute kw : *keywordOnlyParameters)
+      keywordOnlySet.insert(cast<StringAttr>(kw).getValue());
+    if (constKwargsAttr) {
+      for (Attribute kw : constKwargsAttr) {
+        StringRef name = cast<StringAttr>(kw).getValue();
+        if (!keywordOnlySet.contains(name))
+          return frontOp->emitOpError("const kwarg '")
+                 << name << "' must be declared keyword-only";
+      }
+    }
 
     // `hc.intrinsic` owns the const-kwarg filtering rule: its
     // `function_type` is the runtime operand signature, while
@@ -735,6 +786,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     FunctionType fnType = getIntrinsicOperandFunctionType(
         *parameterNames, constKwargsAttr, TypeRange{undef}, undef);
     ArrayAttr parameterNamesAttr = *parameterNames;
+    ArrayAttr keywordOnlyParametersAttr = *keywordOnlyParameters;
     Block *entry = new Block();
     for (Type input : fnType.getInputs())
       entry->addArgument(input, loc);
@@ -743,7 +795,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
         builder, loc, StringAttr::get(ctx, intr.getName()),
         TypeAttr::get(fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
         /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr(),
-        /*parameters=*/parameterNamesAttr);
+        /*parameters=*/parameterNamesAttr,
+        /*keyword_only=*/keywordOnlyParametersAttr);
     hcIntr.getBody().push_back(entry);
     if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
       auto cls = parseEffectClass(effAttr.getValue());
@@ -1688,19 +1741,26 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     }
     ArrayAttr declaredParameters = intrDecl.getParametersAttr();
     ArrayAttr constKwargsAttr = intrDecl.getConstKwargsAttr();
+    ArrayAttr keywordOnlyAttr = intrDecl.getKeywordOnlyAttr();
     llvm::SmallDenseSet<StringRef> constKwargSet;
     if (constKwargsAttr) {
       for (Attribute kw : constKwargsAttr)
         if (auto s = dyn_cast<StringAttr>(kw))
           constKwargSet.insert(s.getValue());
     }
+    llvm::SmallDenseSet<StringRef> keywordOnlySet;
+    if (keywordOnlyAttr) {
+      for (Attribute kw : keywordOnlyAttr)
+        if (auto s = dyn_cast<StringAttr>(kw))
+          keywordOnlySet.insert(s.getValue());
+    }
 
     // Walk the callee's declared parameter list to anchor operand order:
-    // positionals bind the prefix, remaining slots consume matching
-    // kwargs by name, and const_kwargs are skipped (they land as call-
-    // site attributes below). Matching by declared-parameter index
-    // rather than `kwvalues` iteration keeps the order deterministic
-    // across hash layouts.
+    // positionals bind only the prefix before any keyword-only marker,
+    // keyword operands bind only keyword-only slots, and const_kwargs are
+    // skipped (they land as call-site attributes below). Matching by
+    // declared-parameter index rather than `kwvalues` iteration keeps the
+    // order deterministic across hash layouts.
     SmallVector<Value> operands(args.positional.begin(), args.positional.end());
     llvm::SmallDenseSet<StringRef> consumedKwargs;
     if (declaredParameters) {
@@ -1711,6 +1771,21 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
             << " parameter(s), call site supplies " << operands.size()
             << " positional";
         return failure();
+      }
+      for (unsigned i = 0, e = operands.size(); i < e; ++i) {
+        auto nameAttr = dyn_cast<StringAttr>(params[i]);
+        if (!nameAttr) {
+          op.emitOpError("intrinsic '@")
+              << callee << "' has malformed `parameters` entry at index " << i
+              << ": expected StringAttr, got " << params[i];
+          return failure();
+        }
+        if (keywordOnlySet.contains(nameAttr.getValue())) {
+          op.emitOpError("intrinsic '@")
+              << callee << "' parameter '" << nameAttr.getValue()
+              << "' is keyword-only and cannot be passed positionally";
+          return failure();
+        }
       }
       for (unsigned i = operands.size(), e = params.size(); i < e; ++i) {
         auto nameAttr = dyn_cast<StringAttr>(params[i]);
@@ -1723,6 +1798,22 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
         StringRef pname = nameAttr.getValue();
         if (constKwargSet.contains(pname))
           continue;
+        // Intrinsic IR reserves `hc_front.keyword` operands for Python
+        // keyword-only parameters. Positional-or-keyword spelling would make
+        // hand-authored IR depend on source argument order rather than the
+        // callee's declared ABI.
+        if (keywordOnlyAttr && !keywordOnlySet.contains(pname)) {
+          if (args.kwvalues.contains(pname)) {
+            op.emitOpError("intrinsic '@")
+                << callee << "' parameter '" << pname
+                << "' is positional and cannot be passed as a keyword";
+            return failure();
+          }
+          op.emitOpError("intrinsic '@")
+              << callee << "' missing required positional argument '" << pname
+              << "'";
+          return failure();
+        }
         auto valIt = args.kwvalues.find(pname);
         if (valIt == args.kwvalues.end()) {
           op.emitOpError("intrinsic '@")

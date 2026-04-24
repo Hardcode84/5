@@ -331,7 +331,11 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
 
     _assert_contains_subsequence(kinds, _SAMPLE_KERNEL_SPINE)
     assert kernel_payload["name"] == "_sample_kernel"
-    assert tuple(name for name, _ in kernel_payload["parameters"]) == ("group", "x")
+    assert tuple(name for name, *_ in kernel_payload["parameters"]) == ("group", "x")
+    assert tuple(passing for *_, passing in kernel_payload["parameters"]) == (
+        "positional",
+        "positional",
+    )
     assert kernel_payload["metadata"] == {
         "work_shape": ("4",),
         "group_shape": ("4",),
@@ -340,7 +344,7 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
         "x": {"kind": "scalar", "dtype": "int"},
     }
     assert region_payload["captures"] == ("tmp",)
-    assert tuple(name for name, _ in region_payload["parameters"]) == ("wi",)
+    assert tuple(name for name, *_ in region_payload["parameters"]) == ("wi",)
     assert _payloads(emitter, "target_name")[0]["id"] == "tmp"
 
 
@@ -355,6 +359,28 @@ def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> N
     assert metadata["scope"] == "WorkItem"
     assert metadata["effects"] == "pure"
     assert metadata["const_kwargs"] == ("arch", "wave_size")
+    assert tuple(name for name, *_ in intrinsic_payload["parameters"]) == (
+        "group",
+        "a_tile",
+        "b_tile",
+        "a_frag",
+        "b_frag",
+        "acc_frag",
+        "lane",
+        "wave_size",
+        "arch",
+    )
+    assert tuple(passing for *_, passing in intrinsic_payload["parameters"]) == (
+        "positional",
+        "positional",
+        "positional",
+        "positional",
+        "positional",
+        "positional",
+        "keyword_only",
+        "keyword_only",
+        "keyword_only",
+    )
     # The intrinsic has no typed parameter annotations worth surfacing
     # structurally; the emitter should omit the key rather than emit an
     # empty mapping.

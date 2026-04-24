@@ -386,7 +386,8 @@ module {
   hc.intrinsic @wave(%a: !hc.undef) -> !hc.undef
       scope = #hc.scope<"SubGroup">
       const_kwargs = ["wave_size"]
-      parameters = ["a", "wave_size"] {}
+      parameters = ["a", "wave_size"]
+      keyword_only = ["wave_size"] {}
   func.func @bad(%a: !hc.undef) -> !hc.undef {
     %r = hc.call_intrinsic @wave(%a) : (!hc.undef) -> !hc.undef
     return %r : !hc.undef
@@ -427,6 +428,16 @@ module {
 
 // -----
 
+// keyword_only without parameters has no declared universe to validate
+// against.
+// CHECK: error: 'hc.intrinsic' op keyword_only requires parameters to declare the full intrinsic parameter order
+module {
+  hc.intrinsic @bad scope = #hc.scope<"WorkItem">
+      keyword_only = ["lane"] {}
+}
+
+// -----
+
 // Non-empty intrinsic signatures must name their operand order.
 // CHECK: error: 'hc.intrinsic' op function_type with inputs requires parameters to name the intrinsic operand order
 module {
@@ -453,7 +464,53 @@ module {
   hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
       scope = #hc.scope<"WorkItem">
       const_kwargs = ["arch", "arch"]
-      parameters = ["x", "arch"] {}
+      parameters = ["x", "arch"]
+      keyword_only = ["arch"] {}
+}
+
+// -----
+
+// keyword_only names must be strings drawn from parameters.
+// CHECK: error: 'hc.intrinsic' op keyword_only entry 'lane' is not listed in parameters
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      parameters = ["x"]
+      keyword_only = ["lane"] {}
+}
+
+// -----
+
+// Duplicate keyword_only entries would make call-site checks ambiguous.
+// CHECK: error: 'hc.intrinsic' op duplicate keyword_only entry 'lane'
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      parameters = ["x", "lane"]
+      keyword_only = ["lane", "lane"] {}
+}
+
+// -----
+
+// keyword_only names form a suffix of the full parameter list.
+// CHECK: error: 'hc.intrinsic' op positional parameter 'x' cannot follow a keyword-only parameter
+module {
+  hc.intrinsic @bad(%x: !hc.undef, %lane: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      parameters = ["lane", "x"]
+      keyword_only = ["lane"] {}
+}
+
+// -----
+
+// const_kwargs are specialization kwargs, so they must be keyword-only.
+// CHECK: error: 'hc.intrinsic' op const_kwargs entry 'arch' must be listed in keyword_only
+module {
+  hc.intrinsic @bad(%x: !hc.undef) -> !hc.undef
+      scope = #hc.scope<"WorkItem">
+      const_kwargs = ["arch"]
+      parameters = ["x", "arch"]
+      keyword_only = [] {}
 }
 
 // -----
@@ -465,7 +522,8 @@ module {
   hc.intrinsic @bad(%x: !hc.undef, %arch: !hc.undef) -> !hc.undef
       scope = #hc.scope<"WorkItem">
       const_kwargs = ["arch"]
-      parameters = ["x", "arch"] {}
+      parameters = ["x", "arch"]
+      keyword_only = ["arch"] {}
 }
 
 // -----

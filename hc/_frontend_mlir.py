@@ -34,6 +34,8 @@ class _SyntheticRegionFrame:
 _Frame = _ValueFrame | _OwnerFrame | _SyntheticRegionFrame
 _I64_MIN = -(1 << 63)
 _I64_MAX = (1 << 63) - 1
+_PASSING_POSITIONAL = "positional"
+_PASSING_KEYWORD_ONLY = "keyword_only"
 
 
 class HCFrontEmitter:
@@ -597,12 +599,9 @@ class HCFrontEmitter:
         annotation_records = self._coerce_parameter_annotations(annotations)
         parameters = []
         for item in value:
-            if not isinstance(item, tuple) or len(item) != 2:
-                raise RuntimeError(f"invalid frontend parameter record: {item!r}")
-            name, annotation = item
-            if not isinstance(name, str):
-                raise RuntimeError(f"invalid frontend parameter name: {name!r}")
+            name, annotation, passing = self._coerce_parameter_record(item)
             parameter = {"name": self._string_attr(name)}
+            parameter["passing"] = self._string_attr(passing)
             if isinstance(annotation, str):
                 parameter["annotation"] = self._string_attr(annotation)
             record = annotation_records.get(name)
@@ -613,6 +612,16 @@ class HCFrontEmitter:
             parameters,
             context=self._context,
         )
+
+    def _coerce_parameter_record(self, item: object) -> tuple[str, object, str]:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise RuntimeError(f"invalid frontend parameter record: {item!r}")
+        name, annotation, passing = item
+        if not isinstance(name, str):
+            raise RuntimeError(f"invalid frontend parameter name: {name!r}")
+        if passing not in {_PASSING_POSITIONAL, _PASSING_KEYWORD_ONLY}:
+            raise RuntimeError(f"invalid frontend parameter passing: {passing!r}")
+        return name, annotation, passing
 
     def _coerce_parameter_annotations(
         self,

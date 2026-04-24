@@ -20,17 +20,18 @@
 // CHECK-SAME: %arg0: !hc.undef, %arg1: !hc.undef, %arg2: !hc.undef
 // CHECK-SAME: const_kwargs = ["arch", "wave_size"]
 // CHECK-SAME: parameters = ["group", "value", "lane", "wave_size", "arch"]
+// CHECK-SAME: keyword_only = ["lane", "wave_size", "arch"]
 module {
   hc_front.intrinsic "demo_intr" attributes {
     const_kwargs = ["arch", "wave_size"],
     decorators = ["kernel.intrinsic"],
     effects = "pure",
     parameters = [
-      {name = "group"},
-      {name = "value"},
-      {name = "lane"},
-      {name = "wave_size"},
-      {name = "arch"}
+      {name = "group", passing = "positional"},
+      {name = "value", passing = "positional"},
+      {name = "lane", passing = "keyword_only"},
+      {name = "wave_size", passing = "keyword_only"},
+      {name = "arch", passing = "keyword_only"}
     ],
     scope = "WorkItem"
   } {
@@ -110,6 +111,7 @@ module {
 // CHECK-LABEL: hc.intrinsic @late_intr
 // CHECK-SAME: const_kwargs = ["arch"]
 // CHECK-SAME: parameters = ["group", "lane", "arch"]
+// CHECK-SAME: keyword_only = ["lane", "arch"]
   hc_front.func "caller_before_intrinsic" attributes {
     decorators = ["kernel.func"],
     parameters = [{name = "group"}, {name = "lane"}],
@@ -135,7 +137,11 @@ module {
     const_kwargs = ["arch"],
     decorators = ["kernel.intrinsic"],
     effects = "pure",
-    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    parameters = [
+      {name = "group", passing = "positional"},
+      {name = "lane", passing = "keyword_only"},
+      {name = "arch", passing = "keyword_only"}
+    ],
     scope = "WorkItem"
   } {
     hc_front.return

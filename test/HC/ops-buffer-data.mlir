@@ -151,11 +151,12 @@ func.func @typed_calls(%a: i32, %b: i32, %c: f32, %u: !hc.undef) {
 // `const_kwargs` on the declaration are a whitelist of names every call site
 // must carry as specialization attributes. Extra attributes stay allowed.
 
-// CHECK: hc.intrinsic @wave_like(%arg0: !hc.undef) -> !hc.undef scope = <"SubGroup"> const_kwargs = ["wave_size"] parameters = ["x", "wave_size"]
+// CHECK: hc.intrinsic @wave_like(%arg0: !hc.undef) -> !hc.undef scope = <"SubGroup"> const_kwargs = ["wave_size"] parameters = ["x", "wave_size"] keyword_only = ["wave_size"]
 hc.intrinsic @wave_like(%x: !hc.undef) -> !hc.undef
     scope = #hc.scope<"SubGroup">
     const_kwargs = ["wave_size"]
-    parameters = ["x", "wave_size"] {}
+    parameters = ["x", "wave_size"]
+    keyword_only = ["wave_size"] {}
 
 // CHECK-LABEL: func.func @kwarg_calls
 // CHECK: hc.call_intrinsic @wave_like(%{{.*}}) {wave_size = 32 : i64}

@@ -420,6 +420,14 @@ ParseResult HCIntrinsicOp::parse(OpAsmParser &parser, OperationState &result) {
       return failure();
     result.addAttribute(getParametersAttrName(result.name), parameters);
   }
+  if (succeeded(parser.parseOptionalKeyword("keyword_only"))) {
+    if (parser.parseEqual())
+      return failure();
+    ArrayAttr keywordOnly;
+    if (parser.parseAttribute(keywordOnly))
+      return failure();
+    result.addAttribute(getKeywordOnlyAttrName(result.name), keywordOnly);
+  }
 
   return parseSignatureTailAndBody(parser, result, arguments);
 }
@@ -445,11 +453,16 @@ void HCIntrinsicOp::print(OpAsmPrinter &p) {
     p << " parameters = ";
     p.printAttribute(parameters);
   }
+  if (auto keywordOnly = getKeywordOnlyAttr()) {
+    p << " keyword_only = ";
+    p.printAttribute(keywordOnly);
+  }
   p.printOptionalAttrDictWithKeyword(
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName(),
                        getScopeAttrName(), getEffectsAttrName(),
-                       getConstKwargsAttrName(), getParametersAttrName()});
+                       getConstKwargsAttrName(), getParametersAttrName(),
+                       getKeywordOnlyAttrName()});
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
@@ -463,6 +476,9 @@ LogicalResult HCIntrinsicOp::verify() {
   if (!parameters) {
     if (ArrayAttr constKwargs = getConstKwargsAttr())
       return emitOpError("const_kwargs requires parameters to declare the "
+                         "full intrinsic parameter order");
+    if (ArrayAttr keywordOnly = getKeywordOnlyAttr())
+      return emitOpError("keyword_only requires parameters to declare the "
                          "full intrinsic parameter order");
     if (fnTypeAttr) {
       auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
@@ -489,6 +505,34 @@ LogicalResult HCIntrinsicOp::verify() {
         "parameters requires function_type to define the runtime SSA "
         "operand signature");
 
+  llvm::SmallDenseSet<StringRef> keywordOnlyNames;
+  if (ArrayAttr keywordOnly = getKeywordOnlyAttr()) {
+    for (Attribute kw : keywordOnly) {
+      auto kwName = dyn_cast<StringAttr>(kw);
+      if (!kwName)
+        return emitOpError("keyword_only entry must be a StringAttr, got ")
+               << kw;
+      StringRef name = kwName.getValue();
+      if (!keywordOnlyNames.insert(name).second)
+        return emitOpError("duplicate keyword_only entry '") << name << "'";
+      if (!declared.contains(name))
+        return emitOpError("keyword_only entry '")
+               << name << "' is not listed in parameters";
+    }
+  }
+
+  bool seenKeywordOnly = false;
+  for (Attribute parameter : parameters) {
+    StringRef name = cast<StringAttr>(parameter).getValue();
+    if (keywordOnlyNames.contains(name)) {
+      seenKeywordOnly = true;
+      continue;
+    }
+    if (seenKeywordOnly)
+      return emitOpError("positional parameter '")
+             << name << "' cannot follow a keyword-only parameter";
+  }
+
   if (ArrayAttr constKwargs = getConstKwargsAttr()) {
     llvm::SmallDenseSet<StringRef> seenConstKwargs;
     for (Attribute kw : constKwargs) {
@@ -502,6 +546,9 @@ LogicalResult HCIntrinsicOp::verify() {
       if (!declared.contains(name))
         return emitOpError("const_kwargs entry '")
                << name << "' is not listed in parameters";
+      if (!keywordOnlyNames.contains(name))
+        return emitOpError("const_kwargs entry '")
+               << name << "' must be listed in keyword_only";
     }
   }
 

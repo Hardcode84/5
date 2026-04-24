@@ -323,7 +323,11 @@ module {
     const_kwargs = ["arch"],
     decorators = ["kernel.intrinsic"],
     effects = "pure",
-    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    parameters = [
+      {name = "group", passing = "positional"},
+      {name = "lane", passing = "keyword_only"},
+      {name = "arch", passing = "keyword_only"}
+    ],
     scope = "WorkItem"
   } {
     hc_front.return
@@ -360,7 +364,11 @@ module {
     const_kwargs = ["arch"],
     decorators = ["kernel.intrinsic"],
     effects = "pure",
-    parameters = [{name = "group"}, {name = "lane"}, {name = "arch"}],
+    parameters = [
+      {name = "group", passing = "positional"},
+      {name = "lane", passing = "keyword_only"},
+      {name = "arch", passing = "keyword_only"}
+    ],
     scope = "WorkItem"
   } {
     hc_front.return
@@ -394,6 +402,121 @@ module {
 
 // -----
 
+// Frontend intrinsic declarations must carry the Python argument-passing
+// class for every parameter so conversion can enforce keyword-only slots.
+module {
+  // expected-error@+1 {{`parameters` entry at index 0 missing `passing` key}}
+  hc_front.intrinsic "unstamped_passing" attributes {
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [{name = "group"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+}
+
+// -----
+
+// The frontend emits all positional parameters before keyword-only
+// parameters. Hand-written IR with a positional parameter after a
+// keyword-only one cannot be projected onto the lowered ABI.
+module {
+  // expected-error@+1 {{positional parameter 'later' cannot follow a keyword-only parameter}}
+  hc_front.intrinsic "bad_parameter_order" attributes {
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [
+      {name = "first_kw", passing = "keyword_only"},
+      {name = "later", passing = "positional"}
+    ],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+}
+
+// -----
+
+// A keyword-only intrinsic parameter must not be consumed by the positional
+// prefix just because it appears in the declared order.
+module {
+  hc_front.intrinsic "kw_only_lane" attributes {
+    const_kwargs = ["arch"],
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [
+      {name = "group", passing = "positional"},
+      {name = "lane", passing = "keyword_only"},
+      {name = "arch", passing = "keyword_only"}
+    ],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
+  hc_front.func "keyword_only_passed_positionally" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}, {name = "lane"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "kw_only_lane" {ctx = "load", ref = {
+      callee = "@kw_only_lane",
+      const_kwargs = ["arch"],
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %lane = hc_front.name "lane" {ctx = "load", ref = {kind = "param"}}
+    %arch = hc_front.constant<"gfx11">
+    %kw_arch = hc_front.keyword "arch" = %arch
+    // expected-error@+1 {{intrinsic '@kw_only_lane' parameter 'lane' is keyword-only and cannot be passed positionally}}
+    %r = hc_front.call %intr(%grp, %lane, %kw_arch)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Intrinsic keyword operands are reserved for parameters declared after
+// Python's `*` marker; positional-or-keyword parameters must be passed in the
+// positional prefix so the lowered operand ABI stays source-order independent.
+module {
+  hc_front.intrinsic "two_positionals" attributes {
+    decorators = ["kernel.intrinsic"],
+    effects = "pure",
+    parameters = [
+      {name = "a", passing = "positional"},
+      {name = "b", passing = "positional"}
+    ],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
+  hc_front.func "positional_passed_as_keyword" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkItem"
+  } {
+    %intr = hc_front.name "two_positionals" {ctx = "load", ref = {
+      callee = "@two_positionals",
+      effects = "pure",
+      kind = "intrinsic",
+      scope = "WorkItem"
+    }}
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %kw_b = hc_front.keyword "b" = %b
+    // expected-error@+1 {{intrinsic '@two_positionals' parameter 'b' is positional and cannot be passed as a keyword}}
+    %r = hc_front.call %intr(%a, %kw_b)
+    hc_front.return %r
+  }
+}
+
+// -----
+
 // More positional operands than the callee has parameters. Caught at
 // lowering because the frontend knows the declared shape and can
 // point at the offending call site directly.
@@ -401,7 +524,10 @@ module {
   hc_front.intrinsic "two_params" attributes {
     decorators = ["kernel.intrinsic"],
     effects = "pure",
-    parameters = [{name = "a"}, {name = "b"}],
+    parameters = [
+      {name = "a", passing = "positional"},
+      {name = "b", passing = "positional"}
+    ],
     scope = "WorkItem"
   } {
     hc_front.return

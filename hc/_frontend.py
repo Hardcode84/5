@@ -48,6 +48,8 @@ _REGION_KINDS = {
     "group.subgroups": "subgroup_region",
     "group.workitems": "workitem_region",
 }
+_PASSING_POSITIONAL = "positional"
+_PASSING_KEYWORD_ONLY = "keyword_only"
 _SCALAR_ANNOTATION_NAMES: dict[type, str] = {
     bool: "bool",
     int: "int",
@@ -1301,10 +1303,20 @@ def _region_payload(
 def _parameter_records(
     args: ast.arguments,
     source: _SourceBuffer,
-) -> tuple[tuple[str, str | None], ...]:
+) -> tuple[tuple[str, str | None, str], ...]:
     _validate_arguments(args, source)
-    ordered_args = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-    return tuple((arg.arg, _annotation_text(arg.annotation)) for arg in ordered_args)
+    # Keep the source signature shape on every callable record. Most lowerings
+    # only need names today, but consumers that bind call operands must not
+    # rediscover Python's positional/keyword-only split from list position.
+    positional = tuple(
+        (arg.arg, _annotation_text(arg.annotation), _PASSING_POSITIONAL)
+        for arg in args.args
+    )
+    keyword_only = tuple(
+        (arg.arg, _annotation_text(arg.annotation), _PASSING_KEYWORD_ONLY)
+        for arg in args.kwonlyargs
+    )
+    return (*positional, *keyword_only)
 
 
 def _validate_arguments(args: ast.arguments, source: _SourceBuffer) -> None:
@@ -1342,7 +1354,7 @@ def _function_bindings(
     source: _SourceBuffer,
 ) -> frozenset[str]:
     collector = _BindingCollector()
-    for name, _ in _parameter_records(fn.args, source):
+    for name, *_ in _parameter_records(fn.args, source):
         collector.bind(name)
     collector.visit_block(fn.body)
     return frozenset(collector.names)
@@ -1363,7 +1375,7 @@ class _RegionScope:
 
 
 def _region_scope(fn: ast.FunctionDef, source: _SourceBuffer) -> _RegionScope:
-    params = frozenset(name for name, _ in _parameter_records(fn.args, source))
+    params = frozenset(name for name, *_ in _parameter_records(fn.args, source))
     iv_collector = _ForIVCollector()
     iv_collector.visit_block(fn.body)
     for_ivs = frozenset(iv_collector.names) - params

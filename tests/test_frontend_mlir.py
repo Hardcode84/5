@@ -124,6 +124,10 @@ def _parameter_records(op: Any) -> list[tuple[str, str | None]]:
     ]
 
 
+def _parameter_passing_records(op: Any) -> list[str]:
+    return [parameter["passing"].value for parameter in op.attributes["parameters"]]
+
+
 def _parameter_structural_records(op: Any) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for parameter in op.attributes["parameters"]:
@@ -165,6 +169,7 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
             ("group", "CurrentGroup"),
             ("x", "int"),
         ]
+        assert _parameter_passing_records(kernel_op) == ["positional", "positional"]
         # Decorator kwargs arrive as builtin attrs on the op: shape axes as
         # string arrays for later `#hc.shape` assembly, and `subgroup_size`
         # absent because the sample kernel does not declare it.
@@ -204,6 +209,7 @@ def test_lower_source_to_front_ir_preserves_control_flow_metadata() -> None:
         assert isinstance(func_op, hc_front.FuncOp)
         assert _string_array_values(func_op.attributes["decorators"]) == ["kernel.func"]
         assert _parameter_records(func_op) == [("group", None), ("acc", None)]
+        assert _parameter_passing_records(func_op) == ["positional", "positional"]
         assert any(isinstance(op, hc_front.IfOp) for op in body_ops)
         assert any(isinstance(op, hc_front.ForOp) for op in body_ops)
 
@@ -314,6 +320,11 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         assert _string_array_values(intrinsic_op.attributes["const_kwargs"]) == [
             "arch",
             "wave_size",
+        ]
+        assert _parameter_passing_records(intrinsic_op) == [
+            "positional",
+            "keyword_only",
+            "keyword_only",
         ]
 
 

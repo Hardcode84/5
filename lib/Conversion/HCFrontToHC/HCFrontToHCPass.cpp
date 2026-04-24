@@ -552,14 +552,6 @@ private:
   FailureOr<Value> lowerDslMethodCall(hc_front::CallOp call,
                                       hc_front::AttrOp attr);
 
-  // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
-  // `method` names one. `resultIdx` is the axis for the per-axis ops
-  // (group_id / local_id / …) and must be empty for the scalar ops
-  // (group_size / wave_size). Returns null when the method is not a
-  // launch-geo query; caller falls through.
-  Value tryEmitLaunchGeo(StringRef method, Value group, Location loc,
-                         std::optional<unsigned> resultIdx);
-
   // Call-site special-cased kwargs get picked out of the argument list
   // before operands are lowered to real `hc` ops, so the callee can see a
   // flat positional arg list plus a {name: attr} map.
@@ -569,6 +561,24 @@ private:
     llvm::StringMap<Value> kwvalues;
   };
   FailureOr<CallArgs> collectCallArgs(hc_front::CallOp op);
+
+  FailureOr<Value> lowerNumpyDtypeCall(hc_front::CallOp call,
+                                       const RefInfo &ref,
+                                       const CallArgs &args);
+  FailureOr<Value> lowerUnaryBaseMethod(hc_front::CallOp call, StringRef method,
+                                        Value base, const CallArgs &args);
+  FailureOr<Value> lowerMemOp(hc_front::CallOp call, StringRef method,
+                              const CallArgs &args);
+  Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
+                              Value base, const CallArgs &args);
+
+  // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
+  // `method` names one. `resultIdx` is the axis for the per-axis ops
+  // (group_id / local_id / …) and must be empty for the scalar ops
+  // (group_size / wave_size). Returns null when the method is not a
+  // launch-geo query; caller falls through.
+  Value tryEmitLaunchGeo(StringRef method, Value group, Location loc,
+                         std::optional<unsigned> resultIdx);
 
   // Per-module counter used to mint unique prefixes for each
   // `hc_front.inlined_region` we flatten. Must strictly monotonically
@@ -1841,6 +1851,26 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return failure();
   CallArgs &args = *argsOr;
 
+  if (ref.getKind() == "numpy_dtype_type")
+    return lowerNumpyDtypeCall(call, ref, args);
+
+  Value base = lowerValueOperand(attr.getBase());
+
+  if (method == "vec" || method == "with_inactive" || method == "astype")
+    return lowerUnaryBaseMethod(call, method, base, args);
+  if (method == "load" || method == "vload" || method == "store" ||
+      method == "vzeros")
+    return lowerMemOp(call, method, args);
+  if (Value lowered = tryLowerLaunchGeoCall(call, method, base, args))
+    return {lowered};
+
+  call.emitOpError("unsupported dsl_method '") << method << "'";
+  return failure();
+}
+
+FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
+                                              const RefInfo &ref,
+                                              const CallArgs &args) {
   // `np.<dtype>(lit)` — Python's value-constructor form for numpy
   // scalar types — shows up as a call whose callee is an attr
   // classified as `numpy_dtype_type`. The attr's `ref.dtype` names
@@ -1855,30 +1885,30 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // downstream users diagnose their own payload expectations. A non-literal
   // positional is different: silently returning the dtype handle hides the
   // bad source shape, so diagnose it here and point users at `.astype`.
-  if (ref.getKind() == "numpy_dtype_type") {
-    StringRef dtype = ref.getString("dtype");
-    Attribute typed;
-    if (!args.positional.empty()) {
-      if (auto litOp = args.positional.front().getDefiningOp<HCConstOp>()) {
-        if (auto tyOpt = resolveNumpyDtypeType(call.getContext(), dtype))
-          typed = coerceNumpyLiteral(*tyOpt, litOp.getValue());
-      } else {
-        call.emitOpError("numpy dtype constructor `np.")
-            << dtype
-            << "(...)` only accepts literal positional arguments in hc_front; "
-               "use `value.astype(np."
-            << dtype << ")` for SSA values";
-        return failure();
-      }
+  StringRef dtype = ref.getString("dtype");
+  Attribute typed;
+  if (!args.positional.empty()) {
+    if (auto litOp = args.positional.front().getDefiningOp<HCConstOp>()) {
+      if (auto tyOpt = resolveNumpyDtypeType(call.getContext(), dtype))
+        typed = coerceNumpyLiteral(*tyOpt, litOp.getValue());
+    } else {
+      call.emitOpError("numpy dtype constructor `np.")
+          << dtype
+          << "(...)` only accepts literal positional arguments in hc_front; "
+             "use `value.astype(np."
+          << dtype << ")` for SSA values";
+      return failure();
     }
-    if (typed)
-      return {
-          HCConstOp::create(builder, call.getLoc(), undef, typed).getResult()};
-    return lowerValueOperand(attr.getResult());
   }
+  if (typed)
+    return {
+        HCConstOp::create(builder, call.getLoc(), undef, typed).getResult()};
+  return lowerValueOperand(call.getCallee());
+}
 
-  Value base = lowerValueOperand(attr.getBase());
-
+FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
+                                               StringRef method, Value base,
+                                               const CallArgs &args) {
   // `x.vec()`, `x.with_inactive(value=...)`, `x.astype(target)` are the
   // mechanical unary-base cases. Anything requiring group/context plumbing
   // (`wi.local_id()`, `group.load(...)`) is handled downstream via the
@@ -1942,6 +1972,11 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return {HCAsTypeOp::create(builder, call.getLoc(), undef, base, targetAttr)
                 .getResult()};
   }
+  llvm_unreachable("unknown unary-base DSL method");
+}
+
+FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
+                                     const CallArgs &args) {
   // Buffer/tensor load, vload, store: the frontend passes a (possibly
   // pre-sliced) handle as the first positional, remaining positionals go
   // to the indices list, and an optional `shape=` kwarg lands as the
@@ -2015,7 +2050,11 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return {HCVZerosOp::create(builder, call.getLoc(), undef, shapeAttr)
                 .getResult()};
   }
+  llvm_unreachable("unknown memory DSL method");
+}
 
+Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
+                                     Value base, const CallArgs &args) {
   // `group.{launch_geo}()` with no args is the call form (`wi.local_id()`).
   // Emit the multi-result launch-geo op; the caller's enclosing subscript
   // drills into a specific axis. The property-style `group.launch_geo[N]`
@@ -2029,11 +2068,10 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
       // inference to widen it as needed.
       if (Value v = tryEmitLaunchGeo(method, base, call.getLoc(),
                                      /*resultIdx=*/std::nullopt))
-        return {v};
+        return v;
     }
   }
-  call.emitOpError("unsupported dsl_method '") << method << "'";
-  return failure();
+  return {};
 }
 
 // Recognize the launch-geo method spellings so callers can gate

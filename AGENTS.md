@@ -69,7 +69,13 @@ git push                # Push to remote
 
 ## Code Review Follow-up
 
-After running reviewers (multi-perspective or external), go through every finding where a reviewer asked a question, expressed confusion, or had to work to understand the code. For each such finding, add a code comment at the relevant location explaining the non-obvious intent. If a reviewer misunderstood the code, the code needs a comment — the reviewer is the proxy for every future reader. Fix the confusion at the source, not in the review reply.
+After running reviewers (multi-perspective or external):
+
+1. **Fix the confusion at the source.** Go through every finding where a reviewer asked a question, expressed confusion, or had to work to understand the code. Add a code comment at the relevant location explaining the non-obvious intent. If a reviewer misunderstood the code, the code needs a comment — the reviewer is the proxy for every future reader. Fix it in the code, not in the review reply.
+
+2. **File beads for everything not in the next action.** Any finding you aren't addressing in the immediately-following commit gets a bead: must-fix items you're deferring (rare, and only with a stated rationale), should-fix hygiene, architectural notes, speculative refactors, new test cases worth having. Include title, description, priority, type, then `br sync --flush-only`. Name the filed bead ids in the session reply so the reviewer can see nothing fell through. "I'll get to it later" without a bead means you won't.
+
+Cut-off for "immediate" is the next commit on this branch — not "this sprint", not "before merge". If a finding crosses a commit boundary, it's deferred; file the bead.
 
 ## Code ↔ beads boundary
 
@@ -95,6 +101,7 @@ Code comments, docstrings, and commit messages share the same voice: terse, dry,
 ## Commits
 
 - Small, focused commits. One logical change per commit. If you're wondering whether to split — split.
+- **Acceptance gate**: every commit lands with LIT (`ninja check-hc`) and Python tests (`pytest`) green. Pre-commit runs linters, not tests — run both suites yourself before the commit, every time. No "tests were red on master, skipping" unless you explicitly state why in the message and file a bead against the regression.
 - Stage files first, then run `pre-commit` — it only checks staged files. Fix issues and re-stage before committing.
 - Sign commits: `git commit -s`.
 - Commit messages should be descriptive, or at least funny. Not both is acceptable. Neither is not.

@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-__all__ = ["dialects", "ir"]
+__all__ = ["dialects", "ir", "passmanager"]
 
 
 def __getattr__(name: str) -> Any:

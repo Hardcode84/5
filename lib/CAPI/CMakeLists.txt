@@ -4,7 +4,19 @@
 
 add_mlir_public_c_api_library(HCFrontCAPI
   HCFront.cpp
+  PARTIAL_SOURCES_INTENDED
 
   LINK_LIBS PUBLIC
   MLIRHCFrontDialect
+)
+
+add_mlir_public_c_api_library(HCCAPI
+  HC.cpp
+  PARTIAL_SOURCES_INTENDED
+
+  LINK_LIBS PUBLIC
+  MLIRHCDialect
+  MLIRHCFrontToHC
+  MLIRHCFrontTransforms
+  MLIRHCTransforms
 )

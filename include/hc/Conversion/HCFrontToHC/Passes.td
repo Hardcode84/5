@@ -26,36 +26,35 @@ def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
     block args / region results for `hc.workitem_region` /
     `hc.subgroup_region`).
 
-    The supported invocation is the two-pass pipeline:
-
-        hc-opt --convert-hc-front-to-hc --hc-promote-names
-
-    Modules that carry undecorated inline helpers (`hc_front.func` ops
-    tagged `ref = {kind = "inline"}`, produced by the Python resolver
-    when it BFS-discovers plain-Python helpers) must first run
-    `-hc-front-inline`, which expands every call site into an
-    `hc_front.inlined_region` and erases the marker funcs. This pass
-    flattens those regions but refuses to lower a surviving
-    `ref.kind = "inline"` `hc_front.call` — the diagnostic tells the
-    operator the pipeline ordering is wrong.
-
-    Modules that contain a nested `@group.workitems` / `@group.subgroups`
-    def followed by an immediate call (the `return inner()` or bare
-    `inner()` shape) must first run `-hc-front-fold-region-defs`. That
-    pass erases the ghost `hc_front.name {ref.kind = "local"} +
-    hc_front.call` trail the Python frontend emits for the call — the
-    region op itself is already the lowering. Without the folder a
-    `ref.kind = "local"` call reaches this pass and falls through to
-    the `unsupported callee ref.kind 'local'` diagnostic, which is
-    also how the operator learns the pipeline ordering is wrong. The
-    full pipeline is therefore:
+    The canonical `hc-opt` line is:
 
         hc-opt --hc-front-fold-region-defs --hc-front-inline \
                --convert-hc-front-to-hc --hc-promote-names
 
-    Both `--hc-front-fold-region-defs` and `--hc-front-inline` are
-    no-ops on modules the Python driver never stamped the relevant
-    markers on, so both are safe to include unconditionally.
+    `--convert-hc-front-to-hc --hc-promote-names` is the irreducible
+    core. The two front passes ahead of it are frontend ghost-trail
+    scrubbers and are no-ops on modules the Python driver never
+    stamped the relevant markers on, so both are safe to include
+    unconditionally:
+
+    - `-hc-front-inline` expands every `hc_front.call` targeting a
+      `ref = {kind = "inline"}` marker func (emitted by the Python
+      resolver for undecorated plain-Python helpers) into an
+      `hc_front.inlined_region`, then erases the marker funcs. Skip
+      it and a surviving `ref.kind = "inline"` call trips this pass's
+      `run -hc-front-inline before -convert-hc-front-to-hc`
+      diagnostic.
+    - `-hc-front-fold-region-defs` erases the ghost
+      `hc_front.name {ref.kind = "local"} + hc_front.call`
+      (+ optional `hc_front.return`) trail the Python frontend emits
+      next to a nested `@group.workitems` / `@group.subgroups` def
+      with an immediate call (`inner()` / `return inner()`). The
+      region op itself is already the lowering. Skip it and the
+      `ref.kind = "local"` callee reaches this pass and trips the
+      `unsupported callee ref.kind 'local'` diagnostic.
+
+    In both cases the diagnostic at the conversion boundary is the
+    operator's signal that the pipeline was ordered wrong upstream.
 
     Placeholder IR (the output of this pass on its own) is verifier-legal
     but round-trip-only: no consumer other than `-hc-promote-names`

@@ -130,3 +130,29 @@ hc_front.func "bound_result" attributes {parameters = [], scope = "WorkItem"} {
   %t = hc_front.target_name "x"
   hc_front.assign %t = %1
 }
+
+// Mixed shape: a local-as-arg rejection must not abort the forward
+// scan; a second same-named ghost name that *is* a valid callee
+// further down still folds. This pins `continue` over `return` in the
+// arg-position guard so pathological or future IR shapes don't leak
+// ghost triads past the folder.
+// CHECK-LABEL: hc_front.func "mixed_same_name"
+// CHECK: hc_front.workitem_region
+// CHECK-SAME: name = "inner"
+// First "inner" is used as a call argument — stays verbatim.
+// CHECK: hc_front.name "inner"
+// CHECK-SAME: kind = "local"
+// CHECK: hc_front.call %{{.+}}(%{{.+}})
+// Second "inner" was the real ghost callee — must be erased.
+// CHECK-NOT: hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
+// CHECK-NOT: hc_front.call %{{.+}}()
+hc_front.func "mixed_same_name" attributes {parameters = [], scope = "WorkItem"} {
+  hc_front.workitem_region attributes {decorators = ["group.workitems"], name = "inner", parameters = [{name = "wi"}]} {
+  }
+  %0 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
+  %f = hc_front.name "consume" {ctx = "load", ref = {callee = "@consume", kind = "callee", scope = "WorkItem"}}
+  %1 = hc_front.call %f(%0)
+  %2 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
+  %3 = hc_front.call %2()
+  hc_front.return %3
+}

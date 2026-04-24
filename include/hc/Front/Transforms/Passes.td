@@ -37,9 +37,9 @@ def HCFrontFoldRegionDefs : Pass<"hc-front-fold-region-defs", "::mlir::ModuleOp"
     same-block `hc_front.return` is the common `return inner()`
     shape; an unused call is `inner()` on a line by itself. Any other
     use of the call's result (binding through `x = inner()`,
-    threading through subscripts, etc.) is left alone — the inliner
-    contract is structural, not semantic, and a surviving
-    `ref.kind = "local"` callee is the converter's error to raise.
+    threading through subscripts, etc.) is left alone — this fold is
+    structural, not semantic, and a surviving `ref.kind = "local"`
+    callee is the converter's error to raise.
   }];
   let dependentDialects = [
     "::mlir::hc::front::HCFrontDialect",

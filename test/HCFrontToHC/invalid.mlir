@@ -224,16 +224,16 @@ module {
 
 // A call whose callee is a `ref.kind = "local"` name is the ghost trail
 // Python emits for `@group.workitems def inner(...); inner()`. The
-// `-hc-front-fold-region-defs` pass erases it upstream; if one survives
-// to the converter the pipeline ordering is wrong. Diagnostic is the
-// generic callee-kind path (there's no dedicated callable at `hc` level
-// for a local identifier).
+// `-hc-front-fold-region-defs` pass erases it upstream; if one
+// survives to the converter the pipeline ordering is wrong — the
+// diagnostic points directly at the missing pass, parallel to the
+// inline case above.
 module {
   hc_front.kernel "local_callee_survives" attributes {parameters = []} {
     hc_front.workitem_region attributes {decorators = ["group.workitems"], name = "inner", parameters = [{name = "wi"}]} {
     }
     %0 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
-    // expected-error@+1 {{unsupported callee ref.kind 'local'}}
+    // expected-error@+1 {{`ref.kind = "local"` call survived to conversion; run `-hc-front-fold-region-defs` before `-convert-hc-front-to-hc`}}
     %1 = hc_front.call %0()
     hc_front.return
   }

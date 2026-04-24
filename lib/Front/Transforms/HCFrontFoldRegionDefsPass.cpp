@@ -46,8 +46,8 @@ namespace mlir::hc::front {
 #include "hc/Front/Transforms/Passes.h.inc"
 } // namespace mlir::hc::front
 
-namespace hc_front = mlir::hc::front;
 using namespace mlir;
+namespace hc_front = mlir::hc::front;
 
 namespace {
 
@@ -55,8 +55,11 @@ namespace {
 // same-block `hc_front.return`. "Bound to a local" (`x = inner()`)
 // falls through — the folder is structural, not semantic, so it
 // leaves that case to the converter (which will report the stale
-// `ref.kind = "local"`).
+// `ref.kind = "local"`). `dead` is an out-param set on every success;
+// it is initialized here so a future caller that forgets to seed it
+// still reads a defined value on any `nullptr` return.
 Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
+  dead = false;
   if (call->getUses().empty()) {
     dead = true;
     return nullptr;
@@ -72,32 +75,24 @@ Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
   if (ret.getValues().size() != 1 ||
       ret.getValues().front() != call.getResult())
     return nullptr;
-  dead = false;
   return ret;
 }
 
-// `regionName(op)` returns the discardable `name` attribute stamped
-// by the Python emitter on workitem/subgroup regions, or empty if
-// missing. Pattern-matching uses string equality so we don't fold
-// regions the frontend didn't stamp.
-StringRef regionName(Operation *regionOp) {
-  if (auto n = regionOp->getAttrOfType<StringAttr>("name"))
-    return n.getValue();
-  return {};
-}
+template <typename RegionOpT> void foldAfterRegion(RegionOpT regionOp) {
+  std::optional<StringRef> regionNameOpt = regionOp.getName();
+  if (!regionNameOpt || regionNameOpt->empty())
+    return;
+  StringRef regionN = *regionNameOpt;
 
-template <typename RegionOpT> bool foldAfterRegion(RegionOpT regionOp) {
-  StringRef regionN = regionName(regionOp);
-  if (regionN.empty())
-    return false;
-
-  // Walk forward through the same block looking for the ghost triad.
-  // The Python frontend emits the `hc_front.name` immediately after
-  // the region, but we scan forward to let other `hc_front.assign` /
-  // local binding ops sit between them (e.g. a preceding
-  // `x = group.load(...)`). The match is by exact name equality, so
-  // interleaving non-ghost ops is safe — the pattern is unique per
-  // region name within a block.
+  // Scan forward through the same block for the ghost triad. The
+  // Python frontend emits the `hc_front.name` immediately after the
+  // region, but we scan forward so unrelated sibling ops (e.g. a
+  // later `hc_front.assign` or a second region op) between the region
+  // and the ghost name don't prevent the match. The pattern is
+  // selected by full predicate, not by uniqueness: even if several
+  // `hc_front.name` ops share the region's string name, the first one
+  // that also has `ref.kind = "local"` and is the sole callee of a
+  // tail-or-unused call is the one we erase.
   Block *block = regionOp->getBlock();
   for (Operation &op : llvm::make_early_inc_range(llvm::make_range(
            std::next(Block::iterator(regionOp)), block->end()))) {
@@ -123,12 +118,19 @@ template <typename RegionOpT> bool foldAfterRegion(RegionOpT regionOp) {
       continue;
     if (call->getBlock() != block)
       continue;
-    // Don't fold if the local is passed as a call argument (some
-    // higher-order use) — callee is the canonical position.
+    // Don't fold if the local is also passed as a call argument
+    // (higher-order use); callee is the canonical position. `continue`
+    // rather than `return` so a later same-named `name` op can still
+    // match if the emitter ever produces one.
+    bool localAsArg = false;
     for (Value arg : call.getArguments()) {
-      if (arg.getDefiningOp() == nameOp.getOperation())
-        return false;
+      if (arg.getDefiningOp() == nameOp.getOperation()) {
+        localAsArg = true;
+        break;
+      }
     }
+    if (localAsArg)
+      continue;
 
     bool callResultDead = false;
     Operation *tailReturn = tailReturnOrNull(call, callResultDead);
@@ -139,9 +141,8 @@ template <typename RegionOpT> bool foldAfterRegion(RegionOpT regionOp) {
       tailReturn->erase();
     call.erase();
     nameOp.erase();
-    return true;
+    return;
   }
-  return false;
 }
 
 struct HCFrontFoldRegionDefsPass
@@ -176,3 +177,7 @@ struct HCFrontFoldRegionDefsPass
 };
 
 } // namespace
+
+// `createHCFrontFoldRegionDefsPass()` is emitted by tablegen (friend of
+// the impl::HCFrontFoldRegionDefsBase CRTP). See `Passes.td` — no
+// `let constructor`, so the generated factory is the only one.

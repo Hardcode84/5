@@ -39,18 +39,33 @@
 //
 // Explicitly deferred to later passes:
 //  * loop-carried iter_arg analysis (`-hc-promote-names`).
-//  * nested workitem-def folding of a `hc_front.workitem_region` +
-//    trailing `hc_front.call` producer into a single result-producing
-//    workitem region: driver-shape concern, tracked separately.
 //
-// Inline-helper expansion happens upstream in `-hc-front-inline`, which
-// rewrites every `hc_front.call` dispatched to a `ref.kind = "inline"`
-// symbol into an `hc_front.inlined_region` carrying the cloned body.
-// This pass consumes that region by flattening it into the caller's
-// block with a per-site alpha-renamed prefix so nothing leaks. A
-// stray `hc_front.call` with `ref.kind = "inline"` surviving to this
-// pass is a pipeline error and diagnoses; `-hc-front-inline` must
-// always run first.
+// Two upstream frontend passes scrub the `hc_front` ghost ops the
+// Python driver emits for source-level patterns that don't survive
+// to `hc`. The canonical pipeline order is:
+//
+//     -hc-front-fold-region-defs -hc-front-inline \
+//       -convert-hc-front-to-hc -hc-promote-names
+//
+// - `-hc-front-inline` expands every `hc_front.call` targeting a
+//   `ref = {kind = "inline"}` marker func into an
+//   `hc_front.inlined_region`. This pass consumes the region by
+//   flattening it into the caller's block with a per-site alpha-
+//   renamed prefix. A surviving `ref.kind = "inline"` call trips the
+//   `run -hc-front-inline before -convert-hc-front-to-hc` diagnostic
+//   in `lowerCall`.
+// - `-hc-front-fold-region-defs` erases the ghost
+//   `hc_front.name {ref.kind = "local"} + hc_front.call`
+//   (+ optional `hc_front.return`) trail the frontend emits next to
+//   a `@group.workitems` / `@group.subgroups` region for an
+//   immediate-call shape (`inner()` / `return inner()`). The region
+//   op itself is the lowering; the trail is dead. A surviving
+//   `ref.kind = "local"` callee trips the
+//   `run -hc-front-fold-region-defs before -convert-hc-front-to-hc`
+//   diagnostic in `lowerCall`.
+//
+// Both diagnostics are worded as pipeline-ordering errors rather
+// than "unsupported" so the operator's next step is obvious.
 
 #include "hc/Conversion/HCFrontToHC/HCFrontToHC.h"
 
@@ -1493,6 +1508,19 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     // placeholder.
     op.emitOpError("`ref.kind = \"inline\"` call survived to conversion; "
                    "run `-hc-front-inline` before `-convert-hc-front-to-hc`");
+    return failure();
+  }
+  if (kind == "local") {
+    // `-hc-front-fold-region-defs` owns the ghost
+    // `name{local}+call(+return)` trail Python emits for a
+    // `@group.workitems def inner(): ...; inner()` immediate-call
+    // shape. A surviving call to a local identifier means the folder
+    // didn't run — the region op itself is already the lowering, so
+    // there is no callable for us to dispatch against. Parallel
+    // ordering diagnostic to the `inline` case above.
+    op.emitOpError(
+        "`ref.kind = \"local\"` call survived to conversion; run "
+        "`-hc-front-fold-region-defs` before `-convert-hc-front-to-hc`");
     return failure();
   }
   op.emitOpError("unsupported callee ref.kind '") << kind << "'";

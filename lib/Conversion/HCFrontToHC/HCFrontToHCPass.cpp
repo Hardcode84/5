@@ -1691,6 +1691,27 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   // to the indices list, and an optional `shape=` kwarg lands as the
   // attribute. We rely on `collectCallArgs`' shape-kwarg fold so no manual
   // tuple walking is needed here.
+  //
+  // `group.load(a[row_sl, col_sl], shape=(M, K))` — the common WMMA
+  // pattern — arrives here as `positional = [%view]` with no inline
+  // indices and a rank-2 shape attr, because `lowerSubscript` has
+  // already folded the pre-subscripted base into an `hc.buffer_view`.
+  // The target IR in `doc/lowering.md` wants the slice ops to feed
+  // `hc.load`'s own index list instead (`hc.load %a[%row_sl, %col_sl]
+  // {shape=...}`), so peel the view here when the caller didn't supply
+  // trailing positional indices of its own. The `hc.buffer_view` is
+  // `Pure`; if it has no other users, DCE drops it later.
+  auto peelBufferView = [&](Value handle,
+                            SmallVectorImpl<Value> &extraIndices) -> Value {
+    if (!extraIndices.empty())
+      return handle;
+    auto view = handle.getDefiningOp<HCBufferViewOp>();
+    if (!view)
+      return handle;
+    extraIndices.assign(view.getIndices().begin(), view.getIndices().end());
+    return view.getBuffer();
+  };
+
   if (method == "load" || method == "vload") {
     if (args.positional.empty()) {
       call.emitOpError("`") << method << "` expects a buffer/tensor argument";
@@ -1699,6 +1720,7 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     Value src = args.positional.front();
     SmallVector<Value> indices(args.positional.begin() + 1,
                                args.positional.end());
+    src = peelBufferView(src, indices);
     auto shapeAttr = dyn_cast_or_null<ShapeAttr>(args.kwattrs.lookup("shape"));
     Operation *op = method == "load"
                         ? HCLoadOp::create(builder, call.getLoc(), undef, src,
@@ -1718,6 +1740,7 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     Value source = args.positional.back();
     SmallVector<Value> indices(args.positional.begin() + 1,
                                args.positional.end() - 1);
+    dest = peelBufferView(dest, indices);
     HCStoreOp::create(builder, call.getLoc(), dest, indices, source);
     // `hc.store` is a no-result op; success+null signals "consumed, no
     // SSA output" to `lowerCall`, distinct from the failure path below.

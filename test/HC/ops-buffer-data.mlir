@@ -133,6 +133,14 @@ hc.func @typed_helper(%a: i32, %b: i32) -> i32 {
   hc.return %a : i32
 }
 
+// CHECK: hc.func @callable_attrs(%arg0: i32, %arg1: i32) -> i32 attributes {arg_attrs = [{}, {}], res_attrs = [{}]}
+hc.func @callable_attrs(%a: i32, %b: i32) -> i32 attributes {
+  arg_attrs = [{}, {}],
+  res_attrs = [{}]
+} {
+  hc.return %a : i32
+}
+
 // CHECK: hc.intrinsic @typed_intrinsic(%arg0: f32) -> f32 scope = <"WorkItem"> parameters = ["x"]
 hc.intrinsic @typed_intrinsic(%x: f32) -> f32
     scope = #hc.scope<"WorkItem"> parameters = ["x"] {}
@@ -140,10 +148,14 @@ hc.intrinsic @typed_intrinsic(%x: f32) -> f32
 // CHECK-LABEL: func.func @typed_calls
 // CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (i32, i32) -> i32
 // CHECK: hc.call @typed_helper(%{{.*}}, %{{.*}}) : (!hc.undef, i32) -> !hc.undef
+// CHECK: hc.call @callable_attrs(%{{.*}}, %{{.*}}) {arg_attrs = [{}, {}], res_attrs = [{}]} : (i32, i32) -> i32
 // CHECK: hc.call_intrinsic @typed_intrinsic(%{{.*}}) : (f32) -> f32
 func.func @typed_calls(%a: i32, %b: i32, %c: f32, %u: !hc.undef) {
   %r1 = hc.call @typed_helper(%a, %b) : (i32, i32) -> i32
   %r2 = hc.call @typed_helper(%u, %b) : (!hc.undef, i32) -> !hc.undef
+  %r_attrs = hc.call @callable_attrs(%a, %b) {
+      arg_attrs = [{}, {}], res_attrs = [{}]
+    } : (i32, i32) -> i32
   %r3 = hc.call_intrinsic @typed_intrinsic(%c) : (f32) -> f32
   return
 }

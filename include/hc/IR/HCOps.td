@@ -10,6 +10,7 @@ include "hc/IR/HCTypes.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -72,7 +73,11 @@ def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
   let hasVerifier = 1;
 }
 
-def HCFuncOp : HC_RegionOp<"func", [IsolatedFromAbove, Symbol]> {
+def HCFuncOp : HC_RegionOp<"func",
+    [IsolatedFromAbove, Symbol,
+     DeclareOpInterfaceMethods<CallableOpInterface,
+                               ["getCallableRegion", "getArgumentTypes",
+                                "getResultTypes"]>]> {
   let summary = "Semantic helper region.";
   let description = [{
     Helper callable referenced by `hc.call`. Carries a symbol name and an
@@ -98,9 +103,20 @@ def HCFuncOp : HC_RegionOp<"func", [IsolatedFromAbove, Symbol]> {
     SymbolNameAttr:$sym_name,
     OptionalAttr<TypeAttrOf<FunctionType>>:$function_type,
     OptionalAttr<HC_ConstraintSetAttr>:$requirements,
-    OptionalAttr<HC_EffectsAttr>:$effects
+    OptionalAttr<HC_EffectsAttr>:$effects,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
   );
   let regions = (region SizedRegion<1>:$body);
+  let builders = [
+    OpBuilder<(ins "StringAttr":$sym_name,
+                   CArg<"TypeAttr", "{}">:$function_type,
+                   CArg<"ConstraintSetAttr", "{}">:$requirements,
+                   CArg<"EffectClassAttr", "{}">:$effects), [{
+      build($_builder, $_state, sym_name, function_type, requirements, effects,
+            /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr);
+    }]>,
+  ];
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
 }
@@ -833,7 +849,11 @@ def HCAsTypeOp : HC_Op<"astype", [Pure]> {
 //===----------------------------------------------------------------------===//
 
 def HCCallOp : HC_Op<"call",
-    [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+    [DeclareOpInterfaceMethods<CallOpInterface,
+                               ["getCallableForCallee",
+                                "setCalleeFromCallable", "getArgOperands",
+                                "getArgOperandsMutable"]>,
+     DeclareOpInterfaceMethods<SymbolUserOpInterface>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Call into an `hc.func`.";
   let description = [{
@@ -844,8 +864,17 @@ def HCCallOp : HC_Op<"call",
     past loads/stores until the callee opts into something narrower.
   }];
   let arguments = (ins FlatSymbolRefAttr:$callee,
-                       Variadic<HC_ValueType>:$args);
+                       Variadic<HC_ValueType>:$args,
+                       OptionalAttr<DictArrayAttr>:$arg_attrs,
+                       OptionalAttr<DictArrayAttr>:$res_attrs);
   let results = (outs Variadic<HC_ValueType>:$results);
+  let builders = [
+    OpBuilder<(ins "TypeRange":$results, "FlatSymbolRefAttr":$callee,
+                   CArg<"ValueRange", "{}">:$args), [{
+      build($_builder, $_state, results, callee, args,
+            /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr);
+    }]>,
+  ];
   let assemblyFormat = [{
     $callee `(` $args `)` attr-dict `:` functional-type($args, results)
   }];

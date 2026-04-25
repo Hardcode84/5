@@ -377,6 +377,20 @@ void HCFuncOp::print(OpAsmPrinter &p) {
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
 
+Region *HCFuncOp::getCallableRegion() { return &getBody(); }
+
+ArrayRef<Type> HCFuncOp::getArgumentTypes() {
+  if (std::optional<FunctionType> fnType = getFunctionType())
+    return fnType->getInputs();
+  return {};
+}
+
+ArrayRef<Type> HCFuncOp::getResultTypes() {
+  if (std::optional<FunctionType> fnType = getFunctionType())
+    return fnType->getResults();
+  return {};
+}
+
 LogicalResult HCFuncOp::verify() {
   return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
 }
@@ -1141,6 +1155,21 @@ verifyFlatSymbolUseAsOp(CallOp op, SymbolTableCollection &symbolTable,
 
 LogicalResult HCCallOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return verifyFlatSymbolUseAsOp<HCFuncOp>(*this, symbolTable, "hc.func");
+}
+
+CallInterfaceCallable HCCallOp::getCallableForCallee() {
+  return getCalleeAttr();
+}
+
+void HCCallOp::setCalleeFromCallable(CallInterfaceCallable callee) {
+  auto symbol = cast<SymbolRefAttr>(callee);
+  (*this)->setAttr(getCalleeAttrName(), cast<FlatSymbolRefAttr>(symbol));
+}
+
+Operation::operand_range HCCallOp::getArgOperands() { return getArgs(); }
+
+MutableOperandRange HCCallOp::getArgOperandsMutable() {
+  return getArgsMutable();
 }
 
 // Translates the declared effect class into concrete side effects on the

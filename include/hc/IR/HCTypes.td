@@ -137,6 +137,37 @@ def HC_GroupType : HC_Type<"Group", "group"> {
   let genVerifyDecl = 1;
 }
 
+def HC_WorkitemType : HC_Type<"Workitem", "workitem"> {
+  let summary = "Workitem launch-context token.";
+  let description = [{
+    Carries the static workgroup metadata visible from a workitem-scoped
+    Python handle. `hc.local_id` uses this type to choose arity and synthesize
+    axis-specific `!hc.idx<"$WI...">` results without falling back to an
+    unknown-rank maximum.
+  }];
+  let parameters = (ins
+    OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
+    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+  );
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+}
+
+def HC_SubgroupType : HC_Type<"Subgroup", "subgroup"> {
+  let summary = "Subgroup launch-context token.";
+  let description = [{
+    Carries the static workgroup metadata visible from a subgroup-scoped
+    Python handle. `hc.subgroup_id` uses this type to choose arity and
+    `hc.wave_size` can refine from the subgroup size metadata.
+  }];
+  let parameters = (ins
+    OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
+    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+  );
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+}
+
 // AnyOf constraint covering every type that a generic `hc` op (`hc.add`,
 // `hc.cmp.lt`, `hc.cast`, ...) is willing to see. Intentionally wide: an op
 // emitted by `hc_front` -> `hc` may see only `!hc.undef`; after inference it
@@ -151,6 +182,8 @@ def HC_ValueType : AnyTypeOf<[
   HC_TensorType,
   HC_VectorType,
   HC_GroupType,
+  HC_WorkitemType,
+  HC_SubgroupType,
   AnyInteger,
   AnyFloat,
   Index,
@@ -205,10 +238,12 @@ def HC_BufferOrTensorValueType : AnyTypeOf<[
 ]>;
 
 // Launch-context root. `!hc.undef` keeps hand-written pre-inference IR legal;
-// `!hc.group` is the seeded form produced for kernel group parameters.
+// concrete tokens are seeded from kernel/group/workitem/subgroup metadata.
 def HC_GroupValueType : AnyTypeOf<[
   HC_UndefType,
   HC_GroupType,
+  HC_WorkitemType,
+  HC_SubgroupType,
 ]>;
 
 #endif // HC_IR_HCTYPES

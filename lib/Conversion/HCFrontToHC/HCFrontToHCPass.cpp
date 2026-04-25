@@ -124,6 +124,14 @@ namespace {
 // diagnose, not allocate gigabytes of `!hc.undef` result types.
 constexpr int64_t kMaxLaunchAxis = 32;
 
+struct LaunchMetadataAttrs {
+  ArrayAttr workShape;
+  ArrayAttr groupShape;
+  IntegerAttr subgroupSize;
+
+  bool empty() const { return !workShape && !groupShape && !subgroupSize; }
+};
+
 static FailureOr<Type> launchGeometryIdxType(MLIRContext *ctx, Location loc,
                                              StringRef prefix, unsigned axis) {
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
@@ -482,31 +490,79 @@ keywordOnlyParametersFromDicts(ArrayAttr params, Operation *sourceOp) {
   return ArrayAttr::get(ctx, keywordOnly);
 }
 
-FailureOr<Type> parameterTypeFromDict(MLIRContext *ctx, Operation *sourceOp,
-                                      DictionaryAttr param, Type fallback) {
+static LaunchMetadataAttrs launchMetadataAttrsFrom(Operation *op) {
+  return {
+      op->getAttrOfType<ArrayAttr>("work_shape"),
+      op->getAttrOfType<ArrayAttr>("group_shape"),
+      op->getAttrOfType<IntegerAttr>("subgroup_size"),
+  };
+}
+
+struct LaunchMetadata {
+  ShapeAttr workShape;
+  ShapeAttr groupShape;
+  IntegerAttr subgroupSize;
+};
+
+static FailureOr<LaunchMetadata>
+parseLaunchMetadata(MLIRContext *ctx, Operation *sourceOp,
+                    LaunchMetadataAttrs attrs) {
+  LaunchMetadata metadata;
+  metadata.subgroupSize = attrs.subgroupSize;
+  if (attrs.workShape) {
+    FailureOr<ShapeAttr> parsed =
+        stringArrayToShape(ctx, sourceOp, attrs.workShape);
+    if (failed(parsed))
+      return failure();
+    metadata.workShape = *parsed;
+  }
+  if (attrs.groupShape) {
+    FailureOr<ShapeAttr> parsed =
+        stringArrayToShape(ctx, sourceOp, attrs.groupShape);
+    if (failed(parsed))
+      return failure();
+    metadata.groupShape = *parsed;
+  }
+  return metadata;
+}
+
+static FailureOr<Type> parameterTypeFromDict(
+    MLIRContext *ctx, Operation *sourceOp, DictionaryAttr param, Type fallback,
+    LaunchMetadataAttrs defaultLaunchMetadata, unsigned paramIndex) {
   auto kind = param.getAs<StringAttr>("kind");
   auto shapeAttr = param.getAs<ArrayAttr>("shape");
   auto name = param.getAs<StringAttr>("name");
   if (!name)
     return sourceOp->emitOpError("`parameters` entry missing `name` key");
-  if (name.getValue() == "group" && isa<hc_front::KernelOp>(sourceOp)) {
-    ShapeAttr workShape;
-    ShapeAttr groupShape;
-    if (auto ws = sourceOp->getAttrOfType<ArrayAttr>("work_shape")) {
-      FailureOr<ShapeAttr> parsed = stringArrayToShape(ctx, sourceOp, ws);
-      if (failed(parsed))
-        return failure();
-      workShape = *parsed;
-    }
-    if (auto gs = sourceOp->getAttrOfType<ArrayAttr>("group_shape")) {
-      FailureOr<ShapeAttr> parsed = stringArrayToShape(ctx, sourceOp, gs);
-      if (failed(parsed))
-        return failure();
-      groupShape = *parsed;
-    }
+  LaunchMetadataAttrs sourceMetadata = launchMetadataAttrsFrom(sourceOp);
+  LaunchMetadataAttrs metadataAttrs =
+      !sourceMetadata.empty() ? sourceMetadata : defaultLaunchMetadata;
+  auto scope = sourceOp->getAttrOfType<StringAttr>("scope");
+  // Scoped helper signatures follow the frontend convention that the leading
+  // parameter is the launch-context handle visible in that scope.
+  if (scope && scope.getValue() == "WorkItem" && paramIndex == 0) {
+    FailureOr<LaunchMetadata> metadata =
+        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
+    if (failed(metadata))
+      return failure();
     return Type(
-        GroupType::get(ctx, workShape, groupShape,
-                       sourceOp->getAttrOfType<IntegerAttr>("subgroup_size")));
+        WorkitemType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+  }
+  if (scope && scope.getValue() == "Subgroup" && paramIndex == 0) {
+    FailureOr<LaunchMetadata> metadata =
+        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
+    if (failed(metadata))
+      return failure();
+    return Type(
+        SubgroupType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+  }
+  if (name.getValue() == "group") {
+    FailureOr<LaunchMetadata> metadata =
+        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
+    if (failed(metadata))
+      return failure();
+    return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
+                               metadata->subgroupSize));
   }
   if (!kind) {
     if (shapeAttr)
@@ -552,13 +608,17 @@ FailureOr<Type> parameterTypeFromDict(MLIRContext *ctx, Operation *sourceOp,
 
 class Lowerer {
 public:
-  Lowerer(OpBuilder &builder, Type undef) : builder(builder), undef(undef) {}
+  Lowerer(OpBuilder &builder, Type undef,
+          LaunchMetadataAttrs defaultLaunchMetadata)
+      : builder(builder), undef(undef),
+        defaultLaunchMetadata(defaultLaunchMetadata) {}
 
   LogicalResult lowerCallable(Operation *frontOp);
 
 private:
   OpBuilder &builder;
   Type undef;
+  LaunchMetadataAttrs defaultLaunchMetadata;
 
   // No scope stack: name-store placeholders carry the binding. Entry
   // points that introduce a new Python-level name (parameter entry,
@@ -592,6 +652,9 @@ private:
 
   std::optional<unsigned> groupRank;
   std::optional<unsigned> workRank;
+  ShapeAttr launchWorkShape;
+  ShapeAttr launchGroupShape;
+  IntegerAttr launchSubgroupSize;
 
   // Resolves a classified `hc_front.name`. Classifier kinds that name a
   // Python-level binding (`param`/`local`/`iv`) lower to an
@@ -713,13 +776,13 @@ private:
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
-  unsigned getLaunchGeometryRank(StringRef method) const;
+  unsigned getLaunchGeometryRank(StringRef method, Type contextType) const;
 
   // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
   // `method` names one. Multi-axis queries return a single `hc.tuple` value
   // wrapping the full result vector; scalar queries return the scalar op
   // result directly. Returns null when the method is not a launch-geo query.
-  Value tryEmitLaunchGeo(StringRef method, Value group, Location loc);
+  Value tryEmitLaunchGeo(StringRef method, Value context, Location loc);
 
   // Per-module counter used to mint unique prefixes for each
   // `hc_front.inlined_region` we flatten. Must strictly monotonically
@@ -941,9 +1004,29 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
     if (!name)
       return sourceOp->emitOpError("`parameters` entry missing `name` key");
     FailureOr<Type> paramType =
-        parameterTypeFromDict(ctx, sourceOp, dict, undef);
+        parameterTypeFromDict(ctx, sourceOp, dict, undef, defaultLaunchMetadata,
+                              static_cast<unsigned>(inputs.size()));
     if (failed(paramType))
       return failure();
+    if (auto groupType = dyn_cast<GroupType>(*paramType)) {
+      launchWorkShape = groupType.getWorkShape();
+      launchGroupShape = groupType.getGroupShape();
+      launchSubgroupSize = groupType.getSubgroupSize();
+      if (launchWorkShape)
+        workRank = static_cast<unsigned>(launchWorkShape.getDims().size());
+      if (launchGroupShape)
+        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+    } else if (auto workitemType = dyn_cast<WorkitemType>(*paramType)) {
+      launchGroupShape = workitemType.getGroupShape();
+      launchSubgroupSize = workitemType.getSubgroupSize();
+      if (launchGroupShape)
+        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+    } else if (auto subgroupType = dyn_cast<SubgroupType>(*paramType)) {
+      launchGroupShape = subgroupType.getGroupShape();
+      launchSubgroupSize = subgroupType.getSubgroupSize();
+      if (launchGroupShape)
+        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+    }
     inputs.push_back(*paramType);
     entry.addArgument(*paramType, sourceOp->getLoc());
   }
@@ -1759,6 +1842,19 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
                                    op.getCapturesAttr());
   Block *body = new Block();
   auto params = op->template getAttrOfType<ArrayAttr>("parameters");
+  // Region parameters use the same leading launch-context convention as
+  // scoped helper functions; remaining source parameters start erased.
+  auto regionParamType = [&](unsigned index) -> Type {
+    if (index != 0)
+      return undef;
+    if (isa<HCWorkitemRegionOp>(newOp.getOperation()))
+      return WorkitemType::get(op->getContext(), launchGroupShape,
+                               launchSubgroupSize);
+    if (isa<HCSubgroupRegionOp>(newOp.getOperation()))
+      return SubgroupType::get(op->getContext(), launchGroupShape,
+                               launchSubgroupSize);
+    return undef;
+  };
   SmallVector<StringAttr> paramNames;
   if (params) {
     paramNames.reserve(params.size());
@@ -1769,7 +1865,7 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
       auto name = dict.template getAs<StringAttr>("name");
       if (!name)
         return op.emitOpError("parameters entry missing `name`");
-      body->addArgument(undef, op.getLoc());
+      body->addArgument(regionParamType(paramNames.size()), op.getLoc());
       paramNames.push_back(name);
     }
   }
@@ -2428,27 +2524,52 @@ static LogicalResult checkLaunchGeoSubscript(hc_front::SubscriptOp op,
   return success();
 }
 
-unsigned Lowerer::getLaunchGeometryRank(StringRef method) const {
+static unsigned shapeRankOrZero(ShapeAttr shape) {
+  return shape ? static_cast<unsigned>(shape.getDims().size()) : 0;
+}
+
+unsigned Lowerer::getLaunchGeometryRank(StringRef method,
+                                        Type contextType) const {
   auto fallbackRank = [] { return static_cast<unsigned>(kMaxLaunchAxis); };
+  auto groupType = dyn_cast<GroupType>(contextType);
+  auto workitemType = dyn_cast<WorkitemType>(contextType);
+  auto subgroupType = dyn_cast<SubgroupType>(contextType);
+  ShapeAttr contextWorkShape;
+  ShapeAttr contextGroupShape;
+  if (groupType) {
+    contextWorkShape = groupType.getWorkShape();
+    contextGroupShape = groupType.getGroupShape();
+  } else if (workitemType) {
+    contextGroupShape = workitemType.getGroupShape();
+  } else if (subgroupType) {
+    contextGroupShape = subgroupType.getGroupShape();
+  }
+
   if (method == "group_id")
-    return workRank.value_or(groupRank.value_or(fallbackRank()));
+    return shapeRankOrZero(contextWorkShape)
+               ? shapeRankOrZero(contextWorkShape)
+               : workRank.value_or(groupRank.value_or(fallbackRank()));
   if (method == "work_offset" || method == "work_shape")
-    return workRank.value_or(fallbackRank());
+    return shapeRankOrZero(contextWorkShape)
+               ? shapeRankOrZero(contextWorkShape)
+               : workRank.value_or(fallbackRank());
   if (method == "local_id" || method == "subgroup_id" ||
       method == "group_shape")
-    return groupRank.value_or(fallbackRank());
+    return shapeRankOrZero(contextGroupShape)
+               ? shapeRankOrZero(contextGroupShape)
+               : groupRank.value_or(fallbackRank());
   return fallbackRank();
 }
 
-Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc) {
+Value Lowerer::tryEmitLaunchGeo(StringRef method, Value context, Location loc) {
   auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
-    unsigned n = getLaunchGeometryRank(method);
+    unsigned n = getLaunchGeometryRank(method, context.getType());
     FailureOr<SmallVector<Type>> resTypes =
         launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
     if (failed(resTypes))
       return {};
-    auto op = OpT::create(builder, loc, *resTypes, group);
+    auto op = OpT::create(builder, loc, *resTypes, context);
     auto tupleType = TupleType::get(builder.getContext(), op.getResultTypes());
     return HCTupleOp::create(builder, loc, tupleType, op.getResults());
   };
@@ -2458,7 +2579,7 @@ Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc) {
         launchGeometryIdxType(builder.getContext(), loc, prefix, 0);
     if (failed(resultType))
       return {};
-    auto op = OpT::create(builder, loc, *resultType, group);
+    auto op = OpT::create(builder, loc, *resultType, context);
     return op.getResult(0);
   };
   if (method == "group_id")
@@ -2611,9 +2732,23 @@ struct ConvertHCFrontToHCPass
         intrinsicOps.push_back(&op);
     }
 
+    LaunchMetadataAttrs defaultLaunchMetadata;
+    Operation *singleKernel = nullptr;
+    for (Operation *op : frontOps) {
+      if (!isa<hc_front::KernelOp>(op))
+        continue;
+      if (singleKernel) {
+        singleKernel = nullptr;
+        break;
+      }
+      singleKernel = op;
+    }
+    if (singleKernel)
+      defaultLaunchMetadata = launchMetadataAttrsFrom(singleKernel);
+
     OpBuilder builder(ctx);
     for (Operation *op : intrinsicOps) {
-      Lowerer lowerer(builder, undef);
+      Lowerer lowerer(builder, undef, defaultLaunchMetadata);
       if (failed(lowerer.lowerCallable(op))) {
         signalPassFailure();
         return;
@@ -2621,7 +2756,7 @@ struct ConvertHCFrontToHCPass
       op->erase();
     }
     for (Operation *op : frontOps) {
-      Lowerer lowerer(builder, undef);
+      Lowerer lowerer(builder, undef, defaultLaunchMetadata);
       if (failed(lowerer.lowerCallable(op))) {
         signalPassFailure();
         return;

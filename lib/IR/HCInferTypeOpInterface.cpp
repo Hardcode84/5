@@ -11,6 +11,8 @@
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/SmallString.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::hc;
 
@@ -355,13 +357,37 @@ static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
   return Type(IdxType::get(ctx, product));
 }
 
+struct LaunchContextMetadata {
+  ShapeAttr workShape;
+  ShapeAttr groupShape;
+  IntegerAttr subgroupSize;
+};
+
+static std::optional<LaunchContextMetadata>
+getLaunchContextMetadata(Type contextType) {
+  if (auto group = dyn_cast_or_null<GroupType>(contextType))
+    return LaunchContextMetadata{group.getWorkShape(), group.getGroupShape(),
+                                 group.getSubgroupSize()};
+  // Nested launch contexts intentionally carry only workgroup-local metadata;
+  // work-grid queries must come from the enclosing group handle.
+  if (auto workitem = dyn_cast_or_null<WorkitemType>(contextType))
+    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
+                                 workitem.getGroupShape(),
+                                 workitem.getSubgroupSize()};
+  if (auto subgroup = dyn_cast_or_null<SubgroupType>(contextType))
+    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
+                                 subgroup.getGroupShape(),
+                                 subgroup.getSubgroupSize()};
+  return std::nullopt;
+}
+
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
                                               ArrayRef<Type> operandTypes,
                                               SmallVectorImpl<Type> &types) {
-  auto group = dyn_cast_or_null<GroupType>(
-      operandTypes.empty() ? Type{} : operandTypes[0]);
-  if (!group || !allResultsAreUndef(op.getOperation())) {
+  std::optional<LaunchContextMetadata> metadata =
+      getLaunchContextMetadata(operandTypes.empty() ? Type{} : operandTypes[0]);
+  if (!metadata || !allResultsAreUndef(op.getOperation())) {
     types.append(op.getResultTypes().begin(), op.getResultTypes().end());
     return success();
   }
@@ -378,22 +404,22 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
   if (isa<HCWorkOffsetOp>(raw))
     return appendPrefixedIdxTypes(ctx, raw, "$WO", count, types);
   if (isa<HCGroupShapeOp>(raw)) {
-    appendShapeIdxTypes(ctx, group.getGroupShape(), count, types);
+    appendShapeIdxTypes(ctx, metadata->groupShape, count, types);
     return success();
   }
   if (isa<HCWorkShapeOp>(raw)) {
-    appendShapeIdxTypes(ctx, group.getWorkShape(), count, types);
+    appendShapeIdxTypes(ctx, metadata->workShape, count, types);
     return success();
   }
   if (isa<HCGroupSizeOp>(raw)) {
-    FailureOr<Type> type = groupSizeType(ctx, group.getGroupShape(), raw);
+    FailureOr<Type> type = groupSizeType(ctx, metadata->groupShape, raw);
     if (failed(type))
       return failure();
     types.push_back(*type);
     return success();
   }
   if (isa<HCWaveSizeOp>(raw)) {
-    if (IntegerAttr size = group.getSubgroupSize()) {
+    if (IntegerAttr size = metadata->subgroupSize) {
       FailureOr<ExprAttr> expr = parseExprAttr(ctx, Twine(size.getInt()), raw);
       if (failed(expr))
         return failure();

@@ -95,7 +95,7 @@ module {
     hc_front.workitem_region captures = ["group"] attributes {
       parameters = [{name = "wi"}]
     } {
-      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.undef) -> !hc.idx<"$WI0">
+      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.workitem<group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>) -> !hc.idx<"$WI0">
       // CHECK: %[[LID_TUPLE:.*]] = hc.tuple(%[[LIDV]]) : (!hc.idx<"$WI0">) -> tuple<!hc.idx<"$WI0">>
       // CHECK: hc.getitem %[[LID_TUPLE]]
       %wi = hc_front.name "wi" {ctx = "load", ref = {kind = "param"}}

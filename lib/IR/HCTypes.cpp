@@ -141,6 +141,24 @@ mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
+mlir::LogicalResult
+mlir::hc::WorkitemType::verify(function_ref<InFlightDiagnostic()> emitError,
+                               ShapeAttr groupShape, IntegerAttr subgroupSize) {
+  (void)groupShape;
+  if (subgroupSize && subgroupSize.getValue().isNegative())
+    return emitError() << "subgroup_size must be non-negative";
+  return success();
+}
+
+mlir::LogicalResult
+mlir::hc::SubgroupType::verify(function_ref<InFlightDiagnostic()> emitError,
+                               ShapeAttr groupShape, IntegerAttr subgroupSize) {
+  (void)groupShape;
+  if (subgroupSize && subgroupSize.getValue().isNegative())
+    return emitError() << "subgroup_size must be non-negative";
+  return success();
+}
+
 Type IdxType::parse(AsmParser &parser) {
   if (failed(parser.parseOptionalLess()))
     return getUnpinnedIdxType(parser.getContext());
@@ -262,4 +280,79 @@ void GroupType::print(AsmPrinter &printer) const {
     printer.printAttribute(entry.second);
   });
   printer << ">";
+}
+
+template <typename TypeT>
+static Type parseNestedLaunchContextType(AsmParser &parser) {
+  MLIRContext *ctx = parser.getContext();
+  ShapeAttr groupShape;
+  IntegerAttr subgroupSize;
+  if (failed(parser.parseOptionalLess()))
+    return TypeT::get(ctx, groupShape, subgroupSize);
+
+  while (true) {
+    StringRef key;
+    if (parser.parseKeyword(&key) || parser.parseEqual())
+      return {};
+
+    if (key == "group_shape") {
+      FailureOr<ShapeAttr> parsed =
+          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
+      if (failed(parsed))
+        return {};
+      groupShape = *parsed;
+    } else if (key == "subgroup_size") {
+      FailureOr<IntegerAttr> parsed =
+          parseTypedAttr<IntegerAttr>(parser, key, "integer attribute");
+      if (failed(parsed))
+        return {};
+      subgroupSize = *parsed;
+    } else {
+      parser.emitError(parser.getCurrentLocation())
+          << "unknown launch-context parameter `" << key << "`";
+      return {};
+    }
+
+    if (failed(parser.parseOptionalComma()))
+      break;
+  }
+
+  if (parser.parseGreater())
+    return {};
+  return TypeT::get(ctx, groupShape, subgroupSize);
+}
+
+static void printNestedLaunchContextType(AsmPrinter &printer,
+                                         ShapeAttr groupShape,
+                                         IntegerAttr subgroupSize) {
+  SmallVector<std::pair<StringRef, Attribute>> attrs;
+  if (groupShape)
+    attrs.push_back({"group_shape", groupShape});
+  if (subgroupSize)
+    attrs.push_back({"subgroup_size", subgroupSize});
+  if (attrs.empty())
+    return;
+
+  printer << "<";
+  llvm::interleaveComma(attrs, printer, [&](const auto &entry) {
+    printer << entry.first << " = ";
+    printer.printAttribute(entry.second);
+  });
+  printer << ">";
+}
+
+Type WorkitemType::parse(AsmParser &parser) {
+  return parseNestedLaunchContextType<WorkitemType>(parser);
+}
+
+void WorkitemType::print(AsmPrinter &printer) const {
+  printNestedLaunchContextType(printer, getGroupShape(), getSubgroupSize());
+}
+
+Type SubgroupType::parse(AsmParser &parser) {
+  return parseNestedLaunchContextType<SubgroupType>(parser);
+}
+
+void SubgroupType::print(AsmPrinter &printer) const {
+  printNestedLaunchContextType(printer, getGroupShape(), getSubgroupSize());
 }

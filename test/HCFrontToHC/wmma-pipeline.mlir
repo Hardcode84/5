@@ -36,7 +36,7 @@
 // CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>, !hc.buffer<!hc.undef, ["M", "N"]>, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
 
 // CHECK-LABEL: hc.func @init_wmma_acc
-// CHECK-SAME: (%{{.*}}: !hc.undef) -> !hc.undef
+// CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
 // CHECK: %{{.*}} = hc.workitem_region captures = ["group"] -> (!hc.undef)
 // CHECK: hc.vzeros {shape = #hc.shape<["8"]>} : !hc.undef
@@ -46,7 +46,8 @@
 // CHECK-LABEL: hc.func @issue_wmma_tile
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
 // CHECK: %{{.*}} = hc.workitem_region captures = ["a_tile", "b_tile", "group", "acc"] -> (!hc.undef)
-// CHECK: hc.getitem {{.*}} : (!tuple{{[0-9]*}}, !hc.undef) -> !hc.undef
+// CHECK: hc.local_id {{.*}} : (!hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+// CHECK: hc.getitem {{.*}} : (tuple<{{.*}}>, !hc.undef) -> !hc.undef
 // CHECK: hc.call @load_wmma_a_fragment
 // CHECK: hc.call @load_wmma_b_fragment
 // CHECK: hc.buffer_view {{.*}} : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
@@ -63,13 +64,17 @@
 // CHECK: hc.store {{.*}} : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
 
 // CHECK-LABEL: hc.func @load_wmma_a_fragment
+// CHECK-SAME: (%{{.*}}: !hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkItem">}
+// CHECK: hc.local_id {{.*}} : (!hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
 // CHECK: hc.buffer_view
 // CHECK: hc.vec {{.*}} : !hc.undef -> !hc.undef
 // CHECK: hc.with_inactive {{.*}} {inactive = 0.000000e+00 : f16} : !hc.undef -> !hc.undef
 
 // CHECK-LABEL: hc.func @load_wmma_b_fragment
+// CHECK-SAME: (%{{.*}}: !hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkItem">}
+// CHECK: hc.local_id {{.*}} : (!hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
 // CHECK: hc.buffer_view
 // CHECK: hc.vec {{.*}} : !hc.undef -> !hc.undef
 // CHECK: hc.with_inactive {{.*}} {inactive = 0.000000e+00 : f16} : !hc.undef -> !hc.undef

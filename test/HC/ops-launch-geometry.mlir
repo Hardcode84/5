@@ -45,6 +45,15 @@ func.func @geometry_group(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, grou
   return
 }
 
+// CHECK-LABEL: func.func @geometry_nested_contexts
+// CHECK-SAME: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
+// CHECK-SAME: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
+func.func @geometry_nested_contexts(
+    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>,
+    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+  return
+}
+
 // INFER-LABEL: hc.func @geometry_group_infer
 // INFER: hc.group_id {{.*}} -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
 // INFER: hc.group_shape {{.*}} -> (!hc.idx<"16">, !hc.idx<"8">)
@@ -83,5 +92,28 @@ hc.func @geometry_tuple_getitem_infer(%g: !hc.group<work_shape = #hc.shape<["M",
       : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
   %item = hc.getitem %tuple[%one]
       : (tuple<!hc.undef, !hc.undef>, !hc.undef) -> !hc.undef
+  hc.return
+}
+
+// INFER-LABEL: hc.func @nested_context_infer
+// INFER: hc.local_id {{.*}} -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+// INFER: hc.subgroup_id {{.*}} -> (!hc.idx<"$SG0">, !hc.idx<"$SG1">)
+// INFER: hc.group_shape {{.*}} -> (!hc.idx<"16">, !hc.idx<"8">)
+// INFER: hc.wave_size {{.*}} -> !hc.idx<"32">
+hc.func @nested_context_infer(
+    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>,
+    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+  %lid:2 = hc.local_id %wi
+      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %sgid:2 = hc.subgroup_id %sg
+      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %shape:2 = hc.group_shape %wi
+      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %wave = hc.wave_size %sg
+      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> !hc.undef
   hc.return
 }

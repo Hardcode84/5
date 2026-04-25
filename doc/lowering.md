@@ -401,13 +401,14 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 * `hc.group_id`, `hc.local_id`, `hc.subgroup_id`, `hc.group_shape`,
   `hc.group_size`, `hc.work_offset`, `hc.work_shape`, `hc.wave_size` —
   multi-result where appropriate (one `!hc.undef` per dimension; refined to
-  `!hc.idx<"_symN">` with fresh per-launch symbols at inference time).
+  axis-specific `!hc.idx<...>` types from the `!hc.group` metadata).
   Marked `Pure` under a **pipeline invariant** (see below); duplicate reads
   of the same axis are therefore interchangeable and CSE/DCE may freely
   collapse or drop them.
 
-There is no `!hc.index_tuple` and no `hc.getindex`; geometry ops return
-independent SSA components.
+Source-level geometry queries such as `group.group_id` are preserved as one
+`hc.tuple` value wrapping those independent SSA components; Python indexing
+then lowers to `hc.getitem`.
 
 ##### Launch-geometry invariant
 
@@ -594,12 +595,18 @@ hc.kernel @tiled_gfx11_wmma_matmul(
   literals      = ["WMMA_M", "WMMA_N", "WMMA_K", "WAVE_LANES"]
 } {
   %c0 = hc.const <0 : i64>  : !hc.undef
+  %c1 = hc.const <1 : i64>  : !hc.undef
   %WM = hc.const <16 : i64> : !hc.undef
   %WK = hc.const <16 : i64> : !hc.undef
 
-  %gr, %gc = hc.group_id %group       : (!hc.group<...>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
-  %row0    = hc.mul %gr, %WM           : !hc.undef
-  %col0    = hc.mul %gc, %WM           : !hc.undef
+  %gid:2     = hc.group_id %group      : (!hc.group<...>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  %gid_tuple = hc.tuple(%gid#0, %gid#1)
+                 : (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+                   -> tuple<!hc.idx<"$WG0">, !hc.idx<"$WG1">>
+  %gr       = hc.getitem %gid_tuple[%c0] : (tuple<!hc.idx<"$WG0">, !hc.idx<"$WG1">>, !hc.undef) -> !hc.undef
+  %gc       = hc.getitem %gid_tuple[%c1] : (tuple<!hc.idx<"$WG0">, !hc.idx<"$WG1">>, !hc.undef) -> !hc.undef
+  %row0     = hc.mul %gr, %WM          : !hc.undef
+  %col0     = hc.mul %gc, %WM          : !hc.undef
 
   %a_k     = hc.buffer_dim %a, axis = 1 : !hc.buffer<!hc.undef, ["M", "K"]> -> !hc.undef
   %acc0    = hc.call @init_wmma_acc(%group) : (!hc.group<...>) -> !hc.undef

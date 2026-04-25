@@ -65,6 +65,43 @@ module {
 
 // -----
 
+// Scalar launch-geometry queries are values, not per-axis tuples.
+module {
+  hc_front.kernel "bad_scalar_axis" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %group_size = hc_front.attr %grp, "group_size" {ref = {kind = "dsl_method", method = "group_size"}}
+    %ax = hc_front.constant<0 : i64>
+    // expected-error@+1 {{scalar launch-geo query 'group_size' is not subscriptable}}
+    %out = hc_front.subscript %group_size[%ax]
+    %t = hc_front.target_name "t"
+    hc_front.assign %t = %out
+    hc_front.return
+  }
+}
+
+// -----
+
+// The call-style spelling must reject scalar subscripts too.
+module {
+  hc_front.kernel "bad_scalar_call_axis" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %wave_size = hc_front.attr %grp, "wave_size" {ref = {kind = "dsl_method", method = "wave_size"}}
+    %wave = hc_front.call %wave_size()
+    %ax = hc_front.constant<0 : i64>
+    // expected-error@+1 {{scalar launch-geo query 'wave_size' is not subscriptable}}
+    %out = hc_front.subscript %wave[%ax]
+    %t = hc_front.target_name "t"
+    hc_front.assign %t = %out
+    hc_front.return
+  }
+}
+
+// -----
+
 // Unsupported DSL method — spelled correctly enough to reach dsl dispatch
 // but not one we implement.
 module {

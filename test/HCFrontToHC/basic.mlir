@@ -53,6 +53,8 @@ module {
     hc_front.assign %dim_target = %dim
 
     // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>) -> !hc.idx<"$WG0">
+    // CHECK: %[[GID_TUPLE:.*]] = hc.tuple(%[[GID]]) : (!hc.idx<"$WG0">) -> tuple<!hc.idx<"$WG0">>
+    // CHECK: hc.getitem %[[GID_TUPLE]]
     %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
     %gid0 = hc_front.subscript %gid_attr[%axis]
     %gid_target = hc_front.target_name "row0"
@@ -94,6 +96,8 @@ module {
       parameters = [{name = "wi"}]
     } {
       // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.undef) -> !hc.idx<"$WI0">
+      // CHECK: %[[LID_TUPLE:.*]] = hc.tuple(%[[LIDV]]) : (!hc.idx<"$WI0">) -> tuple<!hc.idx<"$WI0">>
+      // CHECK: hc.getitem %[[LID_TUPLE]]
       %wi = hc_front.name "wi" {ctx = "load", ref = {kind = "param"}}
       %lid_attr = hc_front.attr %wi, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
       %axis0 = hc_front.constant<0 : i64>
@@ -218,12 +222,24 @@ module {
   // `-hc-infer-types`, and use `$` prefixes so they cannot collide with
   // Python-level symbols.
   // CHECK-LABEL: hc.kernel @launch_geo_symbols
-  // CHECK: hc.group_id %arg0 : (!hc.group) -> !hc.idx<"$WG0">
-  // CHECK: hc.local_id %arg0 : (!hc.group) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
-  // CHECK: hc.subgroup_id %arg0 : (!hc.group) -> !hc.idx<"$SG0">
-  // CHECK: hc.group_shape %arg0 : (!hc.group) -> !hc.idx<"$WGS0">
-  // CHECK: hc.work_offset %arg0 : (!hc.group) -> !hc.idx<"$WO0">
-  // CHECK: hc.work_shape %arg0 : (!hc.group) -> !hc.idx<"$WS0">
+  // CHECK: %[[GIDV:.*]]:32 = hc.group_id %arg0 : (!hc.group)
+  // CHECK: %[[GIDT:.*]] = hc.tuple(%[[GIDV]]#0
+  // CHECK: hc.getitem %[[GIDT]]
+  // CHECK: %[[LIDV:.*]]:32 = hc.local_id %arg0 : (!hc.group)
+  // CHECK: %[[LIDT:.*]] = hc.tuple(%[[LIDV]]#0
+  // CHECK: hc.getitem %[[LIDT]]
+  // CHECK: %[[SGV:.*]]:32 = hc.subgroup_id %arg0 : (!hc.group)
+  // CHECK: %[[SGT:.*]] = hc.tuple(%[[SGV]]#0
+  // CHECK: hc.getitem %[[SGT]]
+  // CHECK: %[[GSHV:.*]]:32 = hc.group_shape %arg0 : (!hc.group)
+  // CHECK: %[[GSHT:.*]] = hc.tuple(%[[GSHV]]#0
+  // CHECK: hc.getitem %[[GSHT]]
+  // CHECK: %[[WOV:.*]]:32 = hc.work_offset %arg0 : (!hc.group)
+  // CHECK: %[[WOT:.*]] = hc.tuple(%[[WOV]]#0
+  // CHECK: hc.getitem %[[WOT]]
+  // CHECK: %[[WSV:.*]]:32 = hc.work_shape %arg0 : (!hc.group)
+  // CHECK: %[[WST:.*]] = hc.tuple(%[[WSV]]#0
+  // CHECK: hc.getitem %[[WST]]
   // CHECK: hc.group_size %arg0 : (!hc.group) -> !hc.idx<"$GSZ0">
   // CHECK: hc.wave_size %arg0 : (!hc.group) -> !hc.idx<"$WV0">
   hc_front.kernel "launch_geo_symbols" attributes {
@@ -270,6 +286,8 @@ module {
   // variadic results, one per potential launch axis), *not* a bit-width.
   // CHECK: %{{.*}}:32 = hc.local_id %arg0
   // CHECK-SAME: !hc.idx<"$WI31">
+  // CHECK: hc.tuple
+  // CHECK: hc.getitem
   // CHECK: hc.buffer_dim %arg1, axis = 200 : !hc.undef
   hc_front.kernel "axis_bounds" attributes {
     parameters = [{name = "group"}, {name = "a"}]
@@ -293,9 +311,16 @@ module {
 
   // CHECK-LABEL: hc.kernel @launch_geo_full_rank_cse
   // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: hc.tuple
+  // CHECK: hc.getitem
   // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: hc.tuple
+  // CHECK: hc.getitem
   // CSE-LABEL: hc.kernel @launch_geo_full_rank_cse
   // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE: hc.tuple
+  // CSE: hc.getitem
+  // CSE: hc.getitem
   // CSE-NOT: hc.group_id
   hc_front.kernel "launch_geo_full_rank_cse" attributes {
     group_shape = ["16", "8"],

@@ -69,3 +69,19 @@ hc.func @geometry_group_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, 
         -> !hc.undef
   hc.return
 }
+
+// INFER-LABEL: hc.func @geometry_tuple_getitem_infer
+// INFER: hc.group_id {{.*}} -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+// INFER: hc.tuple({{.*}}) : (!hc.idx<"$WG0">, !hc.idx<"$WG1">) -> tuple<!hc.idx<"$WG0">, !hc.idx<"$WG1">>
+// INFER: hc.getitem {{.*}} -> !hc.idx<"$WG1">
+hc.func @geometry_tuple_getitem_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+  %one = hc.const<1 : i64> : !hc.undef
+  %gid:2 = hc.group_id %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %tuple = hc.tuple(%gid#0, %gid#1)
+      : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
+  %item = hc.getitem %tuple[%one]
+      : (tuple<!hc.undef, !hc.undef>, !hc.undef) -> !hc.undef
+  hc.return
+}

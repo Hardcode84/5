@@ -709,16 +709,13 @@ private:
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
-  unsigned getLaunchGeometryRank(StringRef method,
-                                 std::optional<unsigned> resultIdx) const;
+  unsigned getLaunchGeometryRank(StringRef method) const;
 
   // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
-  // `method` names one. `resultIdx` is the axis for the per-axis ops
-  // (group_id / local_id / …) and must be empty for the scalar ops
-  // (group_size / wave_size). Returns null when the method is not a
-  // launch-geo query; caller falls through.
-  Value tryEmitLaunchGeo(StringRef method, Value group, Location loc,
-                         std::optional<unsigned> resultIdx);
+  // `method` names one. Multi-axis queries return a single `hc.tuple` value
+  // wrapping the full result vector; scalar queries return the scalar op
+  // result directly. Returns null when the method is not a launch-geo query.
+  Value tryEmitLaunchGeo(StringRef method, Value group, Location loc);
 
   // Per-module counter used to mint unique prefixes for each
   // `hc_front.inlined_region` we flatten. Must strictly monotonically
@@ -2335,18 +2332,14 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
 Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                                      Value base, const CallArgs &args) {
   // `group.{launch_geo}()` with no args is the call form (`wi.local_id()`).
-  // Emit the multi-result launch-geo op; the caller's enclosing subscript
-  // drills into a specific axis. The property-style `group.launch_geo[N]`
-  // is handled in `lowerSubscript` — both go through `tryEmitLaunchGeo`
-  // so the supported method set stays in one place.
+  // Emit one tuple-valued launch-geo query; an enclosing subscript lowers to
+  // `hc.getitem`. The property-style `group.launch_geo[N]` is handled in
+  // `lowerSubscript` — both go through `tryEmitLaunchGeo` so the supported
+  // method set stays in one place.
   if (call.getArguments().empty() && args.kwvalues.empty() &&
       args.kwattrs.empty()) {
     if (base) {
-      // We do not know the launch rank at this site, so emit a single-
-      // result op for now and rely on a later canonicalizer + rank
-      // inference to widen it as needed.
-      if (Value v = tryEmitLaunchGeo(method, base, call.getLoc(),
-                                     /*resultIdx=*/std::nullopt))
+      if (Value v = tryEmitLaunchGeo(method, base, call.getLoc()))
         return v;
     }
   }
@@ -2354,7 +2347,7 @@ Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
 }
 
 // Recognize the launch-geo method spellings so callers can gate
-// launch-geo–specific preconditions (axis bounds cap in `lowerSubscript`,
+// launch-geo-specific preconditions (axis bounds cap in `lowerSubscript`,
 // diagnostic wording) without calling `tryEmitLaunchGeo` eagerly, which
 // would create the underlying `hc` op before the check has a chance to
 // reject the site.
@@ -2366,10 +2359,33 @@ static bool isLaunchGeoMethod(StringRef method) {
       .Default(false);
 }
 
-unsigned
-Lowerer::getLaunchGeometryRank(StringRef method,
-                               std::optional<unsigned> resultIdx) const {
-  auto fallbackRank = [&] { return resultIdx.value_or(0) + 1; };
+static bool isScalarLaunchGeoMethod(StringRef method) {
+  return method == "group_size" || method == "wave_size";
+}
+
+static LogicalResult checkLaunchGeoSubscript(hc_front::SubscriptOp op,
+                                             StringRef method,
+                                             IntegerAttr axis) {
+  if (isScalarLaunchGeoMethod(method))
+    return op.emitOpError("scalar launch-geo query '")
+           << method << "' is not subscriptable";
+
+  // Launch-geo axes parameterize the variadic result list built by
+  // `tryEmitLaunchGeo`; cap literal axes so a hand-written `group_id[2^31]`
+  // cannot allocate a pathological tuple. Dynamic axes are left to
+  // `hc.getitem` inference/refinement.
+  if (!axis)
+    return success();
+
+  int64_t axisValue = axis.getInt();
+  if (axisValue < 0 || axisValue >= kMaxLaunchAxis)
+    return op.emitOpError("launch-geo axis ")
+           << axisValue << " out of range [0, " << kMaxLaunchAxis << ")";
+  return success();
+}
+
+unsigned Lowerer::getLaunchGeometryRank(StringRef method) const {
+  auto fallbackRank = [] { return static_cast<unsigned>(kMaxLaunchAxis); };
   if (method == "group_id")
     return workRank.value_or(groupRank.value_or(fallbackRank()));
   if (method == "work_offset" || method == "work_shape")
@@ -2380,22 +2396,17 @@ Lowerer::getLaunchGeometryRank(StringRef method,
   return fallbackRank();
 }
 
-Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc,
-                                std::optional<unsigned> resultIdx) {
+Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc) {
   auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
-    unsigned n = getLaunchGeometryRank(method, resultIdx);
-    if (resultIdx && *resultIdx >= n) {
-      emitError(loc) << "launch-geo axis " << *resultIdx
-                     << " out of inferred rank " << n;
-      return {};
-    }
+    unsigned n = getLaunchGeometryRank(method);
     FailureOr<SmallVector<Type>> resTypes =
         launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
     if (failed(resTypes))
       return {};
     auto op = OpT::create(builder, loc, *resTypes, group);
-    return op.getResult(resultIdx.value_or(0));
+    auto tupleType = TupleType::get(builder.getContext(), op.getResultTypes());
+    return HCTupleOp::create(builder, loc, tupleType, op.getResults());
   };
   auto emitScalar = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
@@ -2427,9 +2438,9 @@ Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc,
 
 Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   // DSL-method `[]` patterns fold into dedicated hc ops when the base is an
-  // `hc_front.attr` and the index is a single integer constant:
+  // `hc_front.attr`:
   //   x.shape[N]      -> hc.buffer_dim
-  //   group.group_id[N] / local_id[N] / ... -> hc.<launch_geo>
+  //   group.group_id[N] / local_id[N] / ... -> hc.getitem(hc.tuple(...), N)
   // Property-style (no `()`) access to launch geometry lands here. The
   // call-style form (`wi.local_id()[N]`) is handled by the sibling branch below
   // so the default type-inference schedule never sees a launch-geo value as a
@@ -2460,23 +2471,12 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
               builder, op.getLoc(), undef, baseVal,
               IntegerAttr::get(IntegerType::get(op.getContext(), 64), axVal));
         }
-        // Launch-geo axes parameterize the variadic result list built by
-        // `emitMulti`; cap before the unsigned cast so a negative or huge
-        // value cannot allocate a pathological result-type vector. Gate
-        // on `isLaunchGeoMethod` so a non-launch-geo attr (stray
-        // `foo_bar[200]`) falls through to the generic `hc.buffer_view`
-        // path instead of surfacing a misleading "launch-geo axis …"
-        // diagnostic.
-        if (isLaunchGeoMethod(method)) {
-          if (axVal < 0 || axVal >= kMaxLaunchAxis) {
-            op.emitOpError("launch-geo axis ")
-                << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
-            return nullptr;
-          }
-          unsigned axis = static_cast<unsigned>(axVal);
-          if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
-            return v;
-        }
+      }
+      if (baseVal && idxVal && isLaunchGeoMethod(method)) {
+        if (failed(checkLaunchGeoSubscript(op, method, ax)))
+          return nullptr;
+        if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc()))
+          return HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal);
       }
     }
   }
@@ -2488,20 +2488,15 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
       if (isLaunchGeoMethod(method) && call.getArguments().empty() &&
           op.getIndices().size() == 1) {
         Value idxVal = lowerValueOperand(op.getIndices().front());
-        Value baseVal = lowerValueOperand(attr.getBase());
+        Value launchGeo = lowerValueOperand(call.getResult());
         auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
         auto ax =
             constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
-        if (baseVal && ax) {
-          int64_t axVal = ax.getInt();
-          if (axVal < 0 || axVal >= kMaxLaunchAxis) {
-            op.emitOpError("launch-geo axis ")
-                << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
+        if (launchGeo && idxVal) {
+          if (failed(checkLaunchGeoSubscript(op, method, ax)))
             return nullptr;
-          }
-          unsigned axis = static_cast<unsigned>(axVal);
-          if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
-            return v;
+          return HCGetItemOp::create(builder, op.getLoc(), undef, launchGeo,
+                                     idxVal);
         }
       }
     }

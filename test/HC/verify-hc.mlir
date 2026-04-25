@@ -34,6 +34,15 @@ module {
 
 // -----
 
+// CHECK: error: subgroup_size must be non-negative
+module {
+  func.func @bad(%arg0: !hc.group<subgroup_size = #hc.expr<"-1">>) {
+    return
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.getitem' op expected at least one index
 module {
   hc.func @bad(%arg0: !hc.undef) {

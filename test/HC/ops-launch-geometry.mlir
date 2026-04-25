@@ -37,20 +37,20 @@ func.func @geometry_refined(%g: !hc.undef) {
 }
 
 // CHECK-LABEL: func.func @geometry_group
-// CHECK: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
-func.func @geometry_group(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+// CHECK: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>
+func.func @geometry_group(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>) {
   %gid:2 = hc.group_id %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   return
 }
 
 // CHECK-LABEL: func.func @geometry_nested_contexts
-// CHECK-SAME: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
-// CHECK-SAME: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
+// CHECK-SAME: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>
+// CHECK-SAME: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>
 func.func @geometry_nested_contexts(
-    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>,
-    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>,
+    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>) {
   return
 }
 
@@ -60,21 +60,30 @@ func.func @geometry_nested_contexts(
 // INFER: hc.work_shape {{.*}} -> (!hc.idx<"M">, !hc.idx<"N">)
 // INFER: hc.group_size {{.*}} -> !hc.idx<"128">
 // INFER: hc.wave_size {{.*}} -> !hc.idx<"32">
-hc.func @geometry_group_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+hc.func @geometry_group_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>) {
   %gid:2 = hc.group_id %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %gs:2 = hc.group_shape %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %ws:2 = hc.work_shape %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %size = hc.group_size %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> !hc.undef
   %wave = hc.wave_size %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
+        -> !hc.undef
+  hc.return
+}
+
+// INFER-LABEL: hc.func @geometry_symbolic_wave_infer
+// INFER: hc.wave_size {{.*}} -> !hc.idx<"WAVE">
+hc.func @geometry_symbolic_wave_infer(%g: !hc.group<subgroup_size = #hc.expr<"WAVE">>) {
+  %wave = hc.wave_size %g
+      : (!hc.group<subgroup_size = #hc.expr<"WAVE">>)
         -> !hc.undef
   hc.return
 }
@@ -83,10 +92,10 @@ hc.func @geometry_group_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, 
 // INFER: hc.group_id {{.*}} -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
 // INFER: hc.tuple({{.*}}) : (!hc.idx<"$WG0">, !hc.idx<"$WG1">) -> tuple<!hc.idx<"$WG0">, !hc.idx<"$WG1">>
 // INFER: hc.getitem {{.*}} -> !hc.idx<"$WG1">
-hc.func @geometry_tuple_getitem_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+hc.func @geometry_tuple_getitem_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>) {
   %one = hc.const<1 : i64> : !hc.undef
   %gid:2 = hc.group_id %g
-      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %tuple = hc.tuple(%gid#0, %gid#1)
       : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
@@ -101,19 +110,19 @@ hc.func @geometry_tuple_getitem_infer(%g: !hc.group<work_shape = #hc.shape<["M",
 // INFER: hc.group_shape {{.*}} -> (!hc.idx<"16">, !hc.idx<"8">)
 // INFER: hc.wave_size {{.*}} -> !hc.idx<"32">
 hc.func @nested_context_infer(
-    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>,
-    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+    %wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>,
+    %sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>) {
   %lid:2 = hc.local_id %wi
-      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %sgid:2 = hc.subgroup_id %sg
-      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %shape:2 = hc.group_shape %wi
-      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> (!hc.undef, !hc.undef)
   %wave = hc.wave_size %sg
-      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+      : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>, subgroup_size = #hc.expr<"32">>)
         -> !hc.undef
   hc.return
 }

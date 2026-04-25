@@ -21,7 +21,7 @@
 // on dedicated hc ops (vec, astype, with_inactive, store).
 
 // CHECK-LABEL: hc.kernel @basic
-// CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
+// CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
 // CHECK-SAME: attributes {
 // CHECK-SAME: group_shape = #hc.shape<["32"]>
 // CHECK-SAME: literals = ["TILE"]
@@ -52,7 +52,7 @@ module {
     %dim_target = hc_front.target_name "dim"
     hc_front.assign %dim_target = %dim
 
-    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>) -> !hc.idx<"$WG0">
+    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>) -> !hc.idx<"$WG0">
     // CHECK: %[[GID_TUPLE:.*]] = hc.tuple(%[[GID]]) : (!hc.idx<"$WG0">) -> tuple<!hc.idx<"$WG0">>
     // CHECK: hc.getitem %[[GID_TUPLE]]
     %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
@@ -95,7 +95,7 @@ module {
     hc_front.workitem_region captures = ["group"] attributes {
       parameters = [{name = "wi"}]
     } {
-      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.workitem<group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>) -> !hc.idx<"$WI0">
+      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.workitem<group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>) -> !hc.idx<"$WI0">
       // CHECK: %[[LID_TUPLE:.*]] = hc.tuple(%[[LIDV]]) : (!hc.idx<"$WI0">) -> tuple<!hc.idx<"$WI0">>
       // CHECK: hc.getitem %[[LID_TUPLE]]
       %wi = hc_front.name "wi" {ctx = "load", ref = {kind = "param"}}

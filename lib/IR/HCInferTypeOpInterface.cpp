@@ -360,7 +360,7 @@ static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
 struct LaunchContextMetadata {
   ShapeAttr workShape;
   ShapeAttr groupShape;
-  IntegerAttr subgroupSize;
+  ExprAttr subgroupSize;
 };
 
 static std::optional<LaunchContextMetadata>
@@ -419,11 +419,8 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
     return success();
   }
   if (isa<HCWaveSizeOp>(raw)) {
-    if (IntegerAttr size = metadata->subgroupSize) {
-      FailureOr<ExprAttr> expr = parseExprAttr(ctx, Twine(size.getInt()), raw);
-      if (failed(expr))
-        return failure();
-      types.push_back(IdxType::get(ctx, *expr));
+    if (ExprAttr size = metadata->subgroupSize) {
+      types.push_back(IdxType::get(ctx, size));
       return success();
     }
     types.push_back(getUnpinnedIdxType(ctx));

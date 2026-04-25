@@ -500,14 +500,36 @@ static LaunchMetadataAttrs launchMetadataAttrsFrom(Operation *op) {
 struct LaunchMetadata {
   ShapeAttr workShape;
   ShapeAttr groupShape;
-  IntegerAttr subgroupSize;
+  ExprAttr subgroupSize;
 };
+
+static FailureOr<ExprAttr> subgroupSizeToExprAttr(MLIRContext *ctx,
+                                                  Operation *sourceOp,
+                                                  IntegerAttr attr) {
+  if (!attr)
+    return ExprAttr();
+  SmallString<32> text;
+  attr.getValue().toStringSigned(text);
+  std::string diagnostic;
+  FailureOr<sym::ExprHandle> handle = sym::parseExpr(
+      ctx->getOrLoadDialect<HCDialect>()->getSymbolStore(), text, &diagnostic);
+  if (failed(handle)) {
+    sourceOp->emitOpError("failed to parse subgroup_size expression: ")
+        << diagnostic;
+    return failure();
+  }
+  return ExprAttr::get(ctx, *handle);
+}
 
 static FailureOr<LaunchMetadata>
 parseLaunchMetadata(MLIRContext *ctx, Operation *sourceOp,
                     LaunchMetadataAttrs attrs) {
   LaunchMetadata metadata;
-  metadata.subgroupSize = attrs.subgroupSize;
+  FailureOr<ExprAttr> subgroupSize =
+      subgroupSizeToExprAttr(ctx, sourceOp, attrs.subgroupSize);
+  if (failed(subgroupSize))
+    return failure();
+  metadata.subgroupSize = *subgroupSize;
   if (attrs.workShape) {
     FailureOr<ShapeAttr> parsed =
         stringArrayToShape(ctx, sourceOp, attrs.workShape);
@@ -644,7 +666,7 @@ private:
   std::optional<unsigned> workRank;
   ShapeAttr launchWorkShape;
   ShapeAttr launchGroupShape;
-  IntegerAttr launchSubgroupSize;
+  ExprAttr launchSubgroupSize;
   llvm::DenseMap<Value, llvm::StringMap<unsigned>> staticLaunchGeoRanks;
 
   // Resolves a classified `hc_front.name`. Classifier kinds that name a

@@ -131,7 +131,7 @@ def HC_GroupType : HC_Type<"Group", "group"> {
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$workShape,
     OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
-    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+    OptionalParameter<"::mlir::hc::ExprAttr">:$subgroupSize
   );
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
@@ -147,7 +147,7 @@ def HC_WorkitemType : HC_Type<"Workitem", "workitem"> {
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
-    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+    OptionalParameter<"::mlir::hc::ExprAttr">:$subgroupSize
   );
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
@@ -162,7 +162,7 @@ def HC_SubgroupType : HC_Type<"Subgroup", "subgroup"> {
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
-    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+    OptionalParameter<"::mlir::hc::ExprAttr">:$subgroupSize
   );
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;

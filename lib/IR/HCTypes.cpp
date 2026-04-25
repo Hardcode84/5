@@ -9,6 +9,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
@@ -212,30 +213,69 @@ mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
 mlir::LogicalResult
 mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,
                             ShapeAttr workShape, ShapeAttr groupShape,
-                            IntegerAttr subgroupSize) {
+                            ExprAttr subgroupSize) {
   (void)workShape;
   (void)groupShape;
-  if (subgroupSize && subgroupSize.getValue().isNegative())
-    return emitError() << "subgroup_size must be non-negative";
+  if (subgroupSize) {
+    std::optional<int64_t> value =
+        sym::getIntegerLiteralValue(subgroupSize.getValue());
+    if (value && *value < 0)
+      return emitError() << "subgroup_size must be non-negative";
+  }
   return success();
 }
 
 mlir::LogicalResult
 mlir::hc::WorkitemType::verify(function_ref<InFlightDiagnostic()> emitError,
-                               ShapeAttr groupShape, IntegerAttr subgroupSize) {
+                               ShapeAttr groupShape, ExprAttr subgroupSize) {
   (void)groupShape;
-  if (subgroupSize && subgroupSize.getValue().isNegative())
-    return emitError() << "subgroup_size must be non-negative";
+  if (subgroupSize) {
+    std::optional<int64_t> value =
+        sym::getIntegerLiteralValue(subgroupSize.getValue());
+    if (value && *value < 0)
+      return emitError() << "subgroup_size must be non-negative";
+  }
   return success();
 }
 
 mlir::LogicalResult
 mlir::hc::SubgroupType::verify(function_ref<InFlightDiagnostic()> emitError,
-                               ShapeAttr groupShape, IntegerAttr subgroupSize) {
+                               ShapeAttr groupShape, ExprAttr subgroupSize) {
   (void)groupShape;
-  if (subgroupSize && subgroupSize.getValue().isNegative())
-    return emitError() << "subgroup_size must be non-negative";
+  if (subgroupSize) {
+    std::optional<int64_t> value =
+        sym::getIntegerLiteralValue(subgroupSize.getValue());
+    if (value && *value < 0)
+      return emitError() << "subgroup_size must be non-negative";
+  }
   return success();
+}
+
+static FailureOr<ExprAttr> parseSubgroupSizeAttr(AsmParser &parser,
+                                                 StringRef key) {
+  Attribute attr;
+  if (parser.parseAttribute(attr))
+    return failure();
+  if (auto expr = dyn_cast<ExprAttr>(attr))
+    return expr;
+  if (auto integer = dyn_cast<IntegerAttr>(attr)) {
+    SmallString<32> text;
+    integer.getValue().toStringSigned(text);
+    auto *dialect = parser.getContext()->getOrLoadDialect<HCDialect>();
+    std::string diagnostic;
+    FailureOr<sym::ExprHandle> handle =
+        sym::parseExpr(dialect->getSymbolStore(), text, &diagnostic);
+    if (failed(handle)) {
+      parser.emitError(parser.getCurrentLocation(),
+                       diagnostic.empty() ? "invalid subgroup_size expression"
+                                          : diagnostic);
+      return failure();
+    }
+    return ExprAttr::get(parser.getContext(), *handle);
+  }
+  parser.emitError(parser.getCurrentLocation())
+      << "expected #hc.expr or integer attribute for `" << key << "`";
+  return failure();
 }
 
 Type IdxType::parse(AsmParser &parser) {
@@ -298,9 +338,10 @@ Type PredType::joinHCType(Type other) const {
 
 Type GroupType::parse(AsmParser &parser) {
   MLIRContext *ctx = parser.getContext();
+  SMLoc typeLoc = parser.getCurrentLocation();
   ShapeAttr workShape;
   ShapeAttr groupShape;
-  IntegerAttr subgroupSize;
+  ExprAttr subgroupSize;
   if (failed(parser.parseOptionalLess()))
     return GroupType::get(ctx, workShape, groupShape, subgroupSize);
 
@@ -322,8 +363,7 @@ Type GroupType::parse(AsmParser &parser) {
         return {};
       groupShape = *parsed;
     } else if (key == "subgroup_size") {
-      FailureOr<IntegerAttr> parsed =
-          parseTypedAttr<IntegerAttr>(parser, key, "integer attribute");
+      FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
       if (failed(parsed))
         return {};
       subgroupSize = *parsed;
@@ -339,7 +379,8 @@ Type GroupType::parse(AsmParser &parser) {
 
   if (parser.parseGreater())
     return {};
-  return GroupType::get(ctx, workShape, groupShape, subgroupSize);
+  return GroupType::getChecked([&] { return parser.emitError(typeLoc); }, ctx,
+                               workShape, groupShape, subgroupSize);
 }
 
 void GroupType::print(AsmPrinter &printer) const {
@@ -348,7 +389,7 @@ void GroupType::print(AsmPrinter &printer) const {
     attrs.push_back({"work_shape", workShape});
   if (ShapeAttr groupShape = getGroupShape())
     attrs.push_back({"group_shape", groupShape});
-  if (IntegerAttr subgroupSize = getSubgroupSize())
+  if (ExprAttr subgroupSize = getSubgroupSize())
     attrs.push_back({"subgroup_size", subgroupSize});
   if (attrs.empty())
     return;
@@ -364,8 +405,9 @@ void GroupType::print(AsmPrinter &printer) const {
 template <typename TypeT>
 static Type parseNestedLaunchContextType(AsmParser &parser) {
   MLIRContext *ctx = parser.getContext();
+  SMLoc typeLoc = parser.getCurrentLocation();
   ShapeAttr groupShape;
-  IntegerAttr subgroupSize;
+  ExprAttr subgroupSize;
   if (failed(parser.parseOptionalLess()))
     return TypeT::get(ctx, groupShape, subgroupSize);
 
@@ -381,8 +423,7 @@ static Type parseNestedLaunchContextType(AsmParser &parser) {
         return {};
       groupShape = *parsed;
     } else if (key == "subgroup_size") {
-      FailureOr<IntegerAttr> parsed =
-          parseTypedAttr<IntegerAttr>(parser, key, "integer attribute");
+      FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
       if (failed(parsed))
         return {};
       subgroupSize = *parsed;
@@ -398,12 +439,13 @@ static Type parseNestedLaunchContextType(AsmParser &parser) {
 
   if (parser.parseGreater())
     return {};
-  return TypeT::get(ctx, groupShape, subgroupSize);
+  return TypeT::getChecked([&] { return parser.emitError(typeLoc); }, ctx,
+                           groupShape, subgroupSize);
 }
 
 static void printNestedLaunchContextType(AsmPrinter &printer,
                                          ShapeAttr groupShape,
-                                         IntegerAttr subgroupSize) {
+                                         ExprAttr subgroupSize) {
   SmallVector<std::pair<StringRef, Attribute>> attrs;
   if (groupShape)
     attrs.push_back({"group_shape", groupShape});

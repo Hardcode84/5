@@ -492,7 +492,10 @@ Comparison result typing:
 
 Multi-axis subscripts on `hc.getitem`/`hc.load`/`hc.store`/`hc.buffer_view`
 take variadic operands directly; `hc.tuple` is reserved for source-level tuple
-values and explicit aggregates.
+values and explicit aggregates. During `hc_front` conversion, tuple literals
+expand only at syntax sites whose target `hc` op is variadic: multi-axis
+subscript indices and `shape=(...)` keyword folding. Binding, returning, and
+passing a tuple preserves one tuple SSA value.
 
 #### Data movement
 

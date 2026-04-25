@@ -118,66 +118,6 @@ module {
 
 // -----
 
-// Tuple-unpack arity mismatch: RHS tuple has 2 elements, target has 3.
-module {
-  hc_front.kernel "bad_unpack_arity" attributes {
-    parameters = [{name = "a"}, {name = "b"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    %rhs = hc_front.tuple (%a, %b)
-    %ta = hc_front.target_name "x"
-    %tb = hc_front.target_name "y"
-    %tc = hc_front.target_name "z"
-    %tgt = hc_front.target_tuple (%ta, %tb, %tc)
-    // expected-error@+1 {{tuple-unpack arity mismatch: rhs has 2, target has 3}}
-    hc_front.assign %tgt = %rhs
-    hc_front.return
-  }
-}
-
-// -----
-
-// Tuple-unpack against a non-tuple, single-result RHS with multi-target:
-// exercises the "must be tuple literal, or a call producing one result per
-// target" branch (a binop returns a single hc value — not an arity-2
-// multi-result op, and not a tuple).
-module {
-  hc_front.kernel "bad_unpack_scalar_rhs" attributes {
-    parameters = [{name = "a"}, {name = "b"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    %scalar = hc_front.binop "Add"(%a, %b)
-    %ta = hc_front.target_name "x"
-    %tb = hc_front.target_name "y"
-    %tgt = hc_front.target_tuple (%ta, %tb)
-    // expected-error@+1 {{tuple-unpack rhs must be a tuple literal, or a call producing one result per target}}
-    hc_front.assign %tgt = %scalar
-    hc_front.return
-  }
-}
-
-// -----
-
-// Single-target tuple binding: `x = (a,)` with arity > 1 is rejected, not
-// silently null-bound. Arity 2+ has no single-target meaning.
-module {
-  hc_front.kernel "bad_single_target_tuple" attributes {
-    parameters = [{name = "a"}, {name = "b"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    %rhs = hc_front.tuple (%a, %b)
-    %t = hc_front.target_name "x"
-    // expected-error@+1 {{cannot bind 'x' to a tuple rhs of arity 2}}
-    hc_front.assign %t = %rhs
-    hc_front.return
-  }
-}
-
-// -----
-
 // Slice operand count disagrees with has_* flags — hand-crafted inconsistency.
 module {
   hc_front.kernel "bad_slice_arity" attributes {parameters = [{name = "a"}]} {

@@ -123,6 +123,26 @@ module {
     hc_front.return %x
   }
 
+  // CHECK-LABEL: hc.func @tuple_values
+  // CHECK: %[[PAIR:.*]] = hc.tuple(%arg0, %arg1) : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
+  // CHECK: %[[I0:.*]] = hc.const<0 : i64> : !hc.undef
+  // CHECK: hc.getitem %[[PAIR]][%[[I0]]]
+  // CHECK: hc.return %[[PAIR]] : tuple<!hc.undef, !hc.undef>
+  hc_front.func "tuple_values" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %pair = hc_front.tuple (%a, %b)
+    %ta = hc_front.target_name "x"
+    %tb = hc_front.target_name "y"
+    %tgt = hc_front.target_tuple (%ta, %tb)
+    hc_front.assign %tgt = %pair
+    hc_front.return %pair
+  }
+
   // `tail_return` is stamped by `-hc-front-fold-region-defs` for
   // `return inner()` nested-region calls. Conversion should make the control
   // flow explicit without relying on the larger WMMA fixture.

@@ -566,17 +566,18 @@ private:
   // entries; every `hc_front.name` read lowers to `hc.name_load`. See
   // the `ConvertHCFrontToHC` ODS description for the full contract.
 
-  // `hc_front.tuple` produces a single SSA value, but the downstream ops
-  // (assign-to-target_tuple, keyword-shape, variadic subscript) need to
-  // destructure it back into its element list. Recording the lowered
-  // operand list here avoids re-walking the tuple's source ops.
+  // `hc_front.tuple` lowers to a first-class `hc.tuple` SSA value. A few
+  // source forms are still variadic syntax, not tuple values: shape kwargs
+  // and tuple-literal subscript indices. Keep the source literal's lowered
+  // elements so those sites do not depend on whatever later happens to the
+  // materialized `hc.tuple`.
   llvm::DenseMap<Value, SmallVector<Value>> tupleElts;
 
   // `hc_front.keyword "name" = %v` is consumed at the parent call. The
   // map is keyed by the keyword op's SSA result and stores the name, the
   // original hc_front value (so shape-tuple folds can still reach into
-  // `tupleElts`), and the lowered value (may be null for tuple/attr
-  // operands that have no standalone hc counterpart).
+  // `tupleElts`), and the lowered value (may be null for attr operands that
+  // have no standalone hc counterpart).
   struct KeywordInfo {
     StringRef name;
     Value origValue;
@@ -627,7 +628,7 @@ private:
 
   Value lowerValueOperand(Value v);
   SmallVector<Value> lowerValueOperands(ValueRange vs);
-  SmallVector<Value> expandTupleOperand(Value v);
+  FailureOr<SmallVector<Value>> expandTupleOperand(Value v);
   FailureOr<SmallVector<Value>> lowerReturnValues(hc_front::ReturnOp op);
 
   // Per-op lowering entry points. `Value`-returning variants write into
@@ -647,8 +648,7 @@ private:
   // free of `hc_front` artifacts. Alpha-renames every local name in
   // the cloned body with a per-site prefix, emits `hc.assign` for each
   // parameter binding, walks the body through `lowerOp`, and intercepts
-  // `hc_front.return` to wire the region's results into `valueMap` /
-  // `tupleElts` (multi-value callees key into the tuple-unpack path).
+  // `hc_front.return` to wire the region's results into `valueMap`.
   LogicalResult lowerInlinedRegion(hc_front::InlinedRegionOp op);
   // FailureOr so a `builtin` call that is cleanly consumed by its parent
   // (`range(...)` inside `hc_front.for`) can be distinguished from a real
@@ -1074,8 +1074,16 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
   }
   if (auto t = dyn_cast<hc_front::TupleOp>(op)) {
     SmallVector<Value> elts = lowerValueOperands(t.getElements());
+    if (llvm::any_of(elts, [](Value v) { return !v; }))
+      return t.emitOpError("tuple element did not lower to an hc value");
     tupleElts[t.getResult()] = elts;
-    valueMap[t.getResult()] = Value();
+    SmallVector<Type> elementTypes;
+    elementTypes.reserve(elts.size());
+    for (Value elt : elts)
+      elementTypes.push_back(elt.getType());
+    Type tupleType = TupleType::get(op->getContext(), elementTypes);
+    valueMap[t.getResult()] =
+        HCTupleOp::create(builder, op->getLoc(), tupleType, elts);
     return success();
   }
   if (auto k = dyn_cast<hc_front::KeywordOp>(op)) {
@@ -1089,10 +1097,10 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
 }
 
 // Returns the lowered hc value for an hc_front SSA operand. Null is a
-// deliberate sentinel meaning "no SSA counterpart" (tuples, keywords,
-// callee-like names, attr chains) — new consumers must either treat it
-// as consumed-by-parent or null-check and diagnose; binding it into a
-// scope or handing it to an hc op builder silently produces bad IR.
+// deliberate sentinel meaning "no SSA counterpart" (keywords, callee-like
+// names, attr chains) — new consumers must either treat it as
+// consumed-by-parent or null-check and diagnose; binding it into a scope or
+// handing it to an hc op builder silently produces bad IR.
 Value Lowerer::lowerValueOperand(Value v) {
   auto it = valueMap.find(v);
   assert(it != valueMap.end() && "operand was not yet lowered; walk order bug");
@@ -1107,25 +1115,21 @@ SmallVector<Value> Lowerer::lowerValueOperands(ValueRange vs) {
   return out;
 }
 
-SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
-  // If the operand is an `hc_front.tuple` the operand list lives in
-  // `tupleElts`; otherwise treat it as a singleton. This lets variadic
-  // consumers (subscript indices, call args) stay uniform.
+FailureOr<SmallVector<Value>> Lowerer::expandTupleOperand(Value v) {
+  // Only source tuple literals expand here. This is for HC ops whose syntax is
+  // genuinely variadic, such as `a[i, j]`; a first-class tuple value should
+  // remain a singleton operand everywhere else.
   auto it = tupleElts.find(v);
   if (it != tupleElts.end())
     return it->second;
   Value lowered = lowerValueOperand(v);
-  return lowered ? SmallVector<Value>{lowered} : SmallVector<Value>{};
+  if (!lowered)
+    return failure();
+  return SmallVector<Value>{lowered};
 }
 
 FailureOr<SmallVector<Value>>
 Lowerer::lowerReturnValues(hc_front::ReturnOp op) {
-  if (op.getValues().size() == 1) {
-    auto it = tupleElts.find(op.getValues().front());
-    if (it != tupleElts.end())
-      return it->second;
-  }
-
   SmallVector<Value> values;
   values.reserve(op.getValues().size());
   for (Value value : op.getValues()) {
@@ -1263,7 +1267,8 @@ Value Lowerer::lowerBinop(hc_front::BinOp op) {
     StringRef which =
         !lhs && !rhs ? StringRef("lhs+rhs") : (!lhs ? "lhs" : "rhs");
     op.emitOpError("binop operand did not lower to an hc value (")
-        << which << "); operand may be a tuple or callee ref";
+        << which << "); operand may be a callee-like ref or parent-consumed "
+        << "syntax node";
     return nullptr;
   }
   return emitBinop(builder, op.getLoc(), op.getKind(), lhs, rhs, undef, op);
@@ -1311,8 +1316,10 @@ Value Lowerer::lowerSlice(hc_front::SliceOp op) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult Lowerer::lowerReturn(hc_front::ReturnOp op) {
-  SmallVector<Value> values = lowerValueOperands(op.getValues());
-  HCReturnOp::create(builder, op.getLoc(), values);
+  FailureOr<SmallVector<Value>> values = lowerReturnValues(op);
+  if (failed(values))
+    return failure();
+  HCReturnOp::create(builder, op.getLoc(), *values);
   return success();
 }
 
@@ -1323,21 +1330,6 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   auto nameAttr = [&](StringRef n) { return StringAttr::get(ctx, n); };
 
   if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
-    // `x = (a,)` / `x = f()` — both single-target. If the RHS is an
-    // `hc_front.tuple` we can't bind a Python-tuple opaque; require the
-    // driver to unpack (or an arity-1 tuple, which we fold). Anything
-    // else that lowers to null is a misclassified ref and must diagnose.
-    if (auto tupleIt = tupleElts.find(rhs); tupleIt != tupleElts.end()) {
-      const SmallVector<Value> &elts = tupleIt->second;
-      if (elts.size() == 1 && elts.front()) {
-        HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()),
-                           elts.front());
-        return success();
-      }
-      return op.emitOpError("cannot bind '")
-             << tn.getName() << "' to a tuple rhs of arity " << elts.size()
-             << "; expected unpacking or a scalar value";
-    }
     Value value = lowerValueOperand(rhs);
     if (!value)
       return op.emitOpError("rhs for '") << tn.getName()
@@ -1348,30 +1340,27 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   }
 
   if (auto tt = dyn_cast_if_present<hc_front::TargetTupleOp>(target)) {
-    // Multi-assign: `a, b = <rhs>`. Two shapes we accept:
-    //   (1) RHS is an `hc_front.tuple` — destructure from `tupleElts`.
-    //       `lowerValueOperand` on a tuple returns null (tuples have no
-    //       standalone `hc` counterpart), so we must special-case before
-    //       looking at the lowered value or we'd bind every target to null.
-    //   (2) RHS lowers to a single op whose result count matches the
-    //       target arity (a call that happens to produce N results).
+    // Multi-assign: `a, b = <rhs>`. First-class tuple SSA values are
+    // destructured with `hc.getitem`; truly multi-result front ops can still
+    // distribute their individual results. Arity-1 unpack also uses getitem so
+    // `a, = scalar` does not silently become scalar assignment.
     size_t arity = tt.getElements().size();
     SmallVector<Value> sources;
-    auto tupleIt = tupleElts.find(rhs);
-    if (tupleIt != tupleElts.end()) {
-      sources.assign(tupleIt->second.begin(), tupleIt->second.end());
-    } else {
-      Value value = lowerValueOperand(rhs);
-      Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
-      if (rhsOp && rhsOp->getNumResults() == arity) {
-        sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
-      } else {
-        return op.emitOpError(
-                   "tuple-unpack rhs must be a tuple literal, or a call "
-                   "producing one result per target (got ")
-               << (rhsOp ? rhsOp->getNumResults() : 0) << " vs target arity "
-               << arity << ")";
+    Value value = lowerValueOperand(rhs);
+    Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
+    if (rhsOp && rhsOp->getNumResults() == arity && arity != 1) {
+      sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
+    } else if (value) {
+      for (size_t i = 0; i < arity; ++i) {
+        auto index =
+            HCConstOp::create(builder, op.getLoc(), undef,
+                              IntegerAttr::get(IntegerType::get(ctx, 64),
+                                               static_cast<int64_t>(i)));
+        sources.push_back(HCGetItemOp::create(builder, op.getLoc(), undef,
+                                              value, index.getResult()));
       }
+    } else {
+      return op.emitOpError("tuple-unpack rhs did not lower to an hc value");
     }
     if (sources.size() != arity)
       return op.emitOpError("tuple-unpack arity mismatch: rhs has ")
@@ -1398,8 +1387,10 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
       return op.emitOpError("target_subscript base is unresolved");
     SmallVector<Value> indices;
     for (Value idx : ts.getIndices()) {
-      SmallVector<Value> expanded = expandTupleOperand(idx);
-      indices.append(expanded.begin(), expanded.end());
+      FailureOr<SmallVector<Value>> expanded = expandTupleOperand(idx);
+      if (failed(expanded))
+        return op.emitOpError("target_subscript index did not lower");
+      indices.append(expanded->begin(), expanded->end());
     }
     HCStoreOp::create(builder, op.getLoc(), base, indices, value);
     return success();
@@ -1595,17 +1586,10 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
   // Walk the body ops. `hc_front.return` is the one we can't feed
   // through `lowerOp`: the generic path would emit `hc.return` into
   // the caller, which is wrong — the return's operands are instead
-  // the region's *result values* and must be funneled into `valueMap`
-  // / `tupleElts` so downstream consumers (`hc_front.assign`, etc.)
-  // resolve through the normal paths.
-  //
-  // The AST frontend writes `return a, b` as `hc_front.return %t`
-  // where `%t = hc_front.tuple(%a, %b)`. When the single return
-  // operand is a tuple handle we pull its elements out of `tupleElts`
-  // (populated by the earlier `lowerOp` on the tuple literal);
-  // otherwise we lower it as a scalar. Either way we want a *located*
-  // diagnostic on the failing op, not a downstream "result arity
-  // mismatch (0 vs N)" that hides the original lowering failure.
+  // the region's *result values* and must be funneled into `valueMap` so
+  // downstream consumers (`hc_front.assign`, etc.) resolve through the normal
+  // paths. Tuple returns are first-class values; only explicit multi-operand
+  // returns create multiple region results.
   SmallVector<Value> resultValues;
   bool sawReturn = false;
   for (Operation &child : llvm::make_early_inc_range(body.front())) {
@@ -1613,28 +1597,14 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
       if (sawReturn)
         return op.emitOpError("inlined_region body has multiple returns");
       sawReturn = true;
-      if (r.getValues().size() == 1) {
-        Value ret = r.getValues().front();
-        auto it = tupleElts.find(ret);
-        if (it != tupleElts.end()) {
-          resultValues = it->second;
-        } else {
-          Value lowered = lowerValueOperand(ret);
-          if (!lowered) {
-            return r.emitOpError("inlined_region return operand did not lower");
-          }
-          resultValues = {lowered};
+      resultValues.clear();
+      resultValues.reserve(r.getValues().size());
+      for (Value v : r.getValues()) {
+        Value lowered = lowerValueOperand(v);
+        if (!lowered) {
+          return r.emitOpError("inlined_region return operand did not lower");
         }
-      } else {
-        resultValues.clear();
-        resultValues.reserve(r.getValues().size());
-        for (Value v : r.getValues()) {
-          Value lowered = lowerValueOperand(v);
-          if (!lowered) {
-            return r.emitOpError("inlined_region return operand did not lower");
-          }
-          resultValues.push_back(lowered);
-        }
+        resultValues.push_back(lowered);
       }
       continue;
     }
@@ -1642,13 +1612,10 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
       return failure();
   }
 
-  // Map region results. The inliner pass sets result arity to the
-  // callee's `hc_front.return` arity and rewrites users of the old
-  // call result to `getResult(0)`, so only the first result ever has
-  // live uses; the remaining results exist solely to carry arity for
-  // the `rhsOp->getNumResults() == arity` check in the tuple-unpack
-  // path. Populate every result's `valueMap` entry to keep operand
-  // lookups total.
+  // Map region results. `hc_front.call` has one SSA result, so inline calls
+  // with multiple explicit return operands become one tuple value at the
+  // original call site. Populate every declared region result as a fallback for
+  // hand-written IR that references them directly.
   unsigned nResults = op.getNumResults();
   if (nResults == 0) {
     if (!resultValues.empty()) {
@@ -1666,19 +1633,16 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
     valueMap[op.getResult(0)] = resultValues.front();
     return success();
   }
-  valueMap[op.getResult(0)] = Value();
-  tupleElts[op.getResult(0)] = resultValues;
+  SmallVector<Type> resultTypes;
+  resultTypes.reserve(resultValues.size());
+  for (Value result : resultValues)
+    resultTypes.push_back(result.getType());
+  Type tupleType = TupleType::get(op.getContext(), resultTypes);
+  valueMap[op.getResult(0)] =
+      HCTupleOp::create(builder, op.getLoc(), tupleType, resultValues);
   for (unsigned i = 1; i < nResults; ++i)
-    valueMap[op.getResult(i)] = Value();
+    valueMap[op.getResult(i)] = resultValues[i];
   return success();
-}
-
-static unsigned getLogicalReturnArity(hc_front::ReturnOp op) {
-  if (op.getValues().size() == 1) {
-    if (auto tuple = op.getValues().front().getDefiningOp<hc_front::TupleOp>())
-      return tuple.getElements().size();
-  }
-  return op.getValues().size();
 }
 
 template <typename HCRegionOpT, typename FrontRegionOpT>
@@ -1716,7 +1680,7 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
     if (!soleReturn)
       return op.emitOpError("tail-return region has no return");
 
-    resultTypes.assign(getLogicalReturnArity(soleReturn), undef);
+    resultTypes.assign(soleReturn.getValues().size(), undef);
   }
 
   auto newOp = HCRegionOpT::create(builder, op.getLoc(), resultTypes,
@@ -1806,9 +1770,8 @@ FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
       if (kwName == "shape") {
         // The tuple-of-constants -> `#hc.shape<...>` fold. The keyword's
         // *original* hc_front value is the tuple op; look up in
-        // `tupleElts` by that key (the lowered value is null for tuples).
-        // If the elements aren't all integer/string hc.const producers,
-        // fall back to storing the (likely null) value so a later
+        // `tupleElts` by that key. If the elements aren't all integer/string
+        // hc.const producers, fall back to storing the tuple value so a later
         // lowering can still see it.
         auto tupleIt = tupleElts.find(kwOrig);
         if (tupleIt != tupleElts.end()) {
@@ -2509,8 +2472,12 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   }
   SmallVector<Value> indices;
   for (Value idx : op.getIndices()) {
-    SmallVector<Value> expanded = expandTupleOperand(idx);
-    indices.append(expanded.begin(), expanded.end());
+    FailureOr<SmallVector<Value>> expanded = expandTupleOperand(idx);
+    if (failed(expanded)) {
+      op.emitOpError("subscript index did not lower");
+      return nullptr;
+    }
+    indices.append(expanded->begin(), expanded->end());
   }
   // `hc.buffer_view` accepts `!hc.undef`, buffers, and tensors as the root
   // value, so pre-inference subscripts and inferred tensor subscripts both

@@ -19,8 +19,8 @@
 //     lands at a real use site).
 //  3. At each call site: look up the callee, clone its body into a
 //     fresh `hc_front.inlined_region`, match the region's result
-//     types to the callee's `hc_front.return` arity, and replace the
-//     call with the region. A cycle is a hard error — inline helpers
+//     types to the callee's explicit `hc_front.return` operands, and replace
+//     the call with the region. A cycle is a hard error — inline helpers
 //     must not recurse.
 //  4. Erase every inlinable `hc_front.func`; post-condition: no
 //     `ref.kind == "inline"` symbol survives to the
@@ -153,20 +153,10 @@ private:
     FailureOr<hc_front::ReturnOp> retOr = findSingleReturn(func);
     if (failed(retOr))
       return failure();
-    // Region-result arity is the Python-level return arity. The AST
-    // frontend writes `return a, b` as `hc_front.return %t` with
-    // `%t = hc_front.tuple(%a, %b)`, so the wrapper hides arity 2
-    // behind a single return operand — unwrap it here so the
-    // converter's tuple-unpack path (which keys off the defining op's
-    // result count) sees two results and distributes. Scalar returns
-    // keep arity 1; zero-operand returns stay zero.
+    // Region-result arity follows the explicit `hc_front.return` operand
+    // list. A tuple operand is one first-class value; tuple destructuring is
+    // handled later by conversion through `hc.getitem`.
     unsigned nResults = retOr->getValues().size();
-    if (nResults == 1) {
-      if (auto tup =
-              retOr->getValues().front().getDefiningOp<hc_front::TupleOp>()) {
-        nResults = tup.getElements().size();
-      }
-    }
 
     MLIRContext *ctx = call.getContext();
     SmallVector<Type> resultTypes(nResults, valueTy);
@@ -189,10 +179,8 @@ private:
       cloneBuilder.clone(srcOp, mapping);
     }
 
-    // Replace the call's SSA users. If the callee returns multiple
-    // values, the call's single result stands for the tuple handle
-    // and downstream unpack sees `rhsOp->getNumResults() == arity`
-    // on the region op.
+    // Replace the call's SSA users. If the callee has multiple explicit
+    // return operands, the converter packages them into a tuple at result #0.
     if (nResults == 0) {
       if (!call.getResult().use_empty()) {
         return call.emitOpError("inline callee `")

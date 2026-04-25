@@ -17,8 +17,11 @@
 // CHECK-SAME: group_shape = #hc.shape<["32", "1"]>
 // CHECK-SAME: subgroup_size = 32 : i32
 // CHECK-SAME: work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>
-// CHECK: %[[ROW0:[^ ]+]] = hc.mul
-// CHECK: %[[COL0:[^ ]+]] = hc.mul
+// CHECK: hc.mul
+// CHECK: hc.mul
+// CHECK: %[[ORIGIN:[^ ]+]] = hc.tuple{{.*}} -> tuple<!hc.undef, !hc.undef>
+// CHECK: %[[ROW0:[^ ]+]] = hc.getitem %[[ORIGIN]]
+// CHECK: %[[COL0:[^ ]+]] = hc.getitem %[[ORIGIN]]
 // CHECK: %[[ACC0:[^ ]+]] = hc.call @init_wmma_acc(%[[GROUP]]) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = 32 : i32>) -> !hc.undef
 // CHECK: %[[AK:[^ ]+]] = hc.buffer_dim %[[A]], axis = 1 : !hc.buffer<!hc.undef, ["M", "K"]> -> !hc.undef
 // CHECK: %[[ACC_FINAL:[^ ]+]]:3 = hc.for_range {{.*}} to %[[AK]] step {{.*}} iter_args({{.*}}, {{.*}}, %[[ACC0]]) : {{.*}} -> (!hc.undef, !hc.undef, !hc.undef) {

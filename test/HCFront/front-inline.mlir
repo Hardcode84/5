@@ -19,9 +19,8 @@ module {
   }
 
   // Tuple-return callee: AST lowers `return a, b` as a single return
-  // operand that is itself an `hc_front.tuple`. The inliner sees the
-  // wrapper and opens up arity 2 on the region op so the caller's
-  // tuple-unpack finds two results on the defining op.
+  // operand that is itself an `hc_front.tuple`. The inliner preserves that
+  // tuple as one first-class value; tuple-unpack lowers through `hc.getitem`.
   hc_front.func "split" attributes {
     parameters = [{name = "v"}],
     ref = {kind = "inline", qualified_name = "pkg.split"}
@@ -83,9 +82,9 @@ module {
 // Scalar site: single-result region replaces the call.
 // CHECK: hc_front.inlined_region "inc"
 // CHECK-SAME: -> (!hc_front.value)
-// Tuple site: two results so the downstream tuple unpack finds both.
+// Tuple site: one result, because the tuple is a first-class value.
 // CHECK: hc_front.inlined_region "split"
-// CHECK-SAME: -> (!hc_front.value, !hc_front.value)
+// CHECK-SAME: -> (!hc_front.value)
 // Nested: outer region contains an inlined_region for `inc` too.
 // CHECK: hc_front.inlined_region "outer"
 // CHECK: hc_front.inlined_region "inc"

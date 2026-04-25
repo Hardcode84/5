@@ -487,8 +487,11 @@ Comparison result typing:
   `tuple<...>` type, preserving Python tuple structure as a single SSA value
 * `hc.getitem %base[%idx...]` — generic Python square-bracket indexing kept
   before the base kind is known. Inference can refine tuple item access when
-  the index converges to a concrete integer; later passes may specialize
-  buffer/tensor cases into view or data-movement ops.
+  the index converges to a concrete integer. Once the base is known to be a
+  tuple, failure to produce exactly one static integer index is diagnosed in
+  `hc-infer-types`; concrete non-indexable bases are rejected there too. Buffer,
+  tensor, and vector bases remain deferred for later view/element
+  specialization.
 
 Multi-axis subscripts on `hc.getitem`/`hc.load`/`hc.store`/`hc.buffer_view`
 take variadic operands directly; `hc.tuple` is reserved for source-level tuple

@@ -259,18 +259,36 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
 
 static FailureOr<Type>
 inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
-  auto tuple = dyn_cast_or_null<TupleType>(sourceType);
-  if (!tuple)
+  if (!sourceType)
     return Type{};
+  auto tuple = dyn_cast<TupleType>(sourceType);
+  if (!tuple) {
+    if (isa<UndefType, mlir::hc::BufferType, mlir::hc::TensorType,
+            mlir::hc::VectorType>(sourceType))
+      return Type{};
+    op->emitOpError("getitem base type ")
+        << sourceType
+        << " cannot be refined; expected tuple, buffer, tensor, or vector";
+    return failure();
+  }
   if (indexTypes.size() != 1) {
     op->emitOpError(
         "tuple getitem expects exactly one index after inference, got ")
         << indexTypes.size();
     return failure();
   }
+  if (!indexTypes.front()) {
+    op->emitOpError(
+        "tuple getitem index must be a static integer after inference");
+    return failure();
+  }
   std::optional<int64_t> index = staticIntegerIndex(indexTypes.front());
-  if (!index)
-    return Type{};
+  if (!index) {
+    op->emitOpError(
+        "tuple getitem index must be a static integer after inference, got ")
+        << indexTypes.front();
+    return failure();
+  }
   int64_t originalIndex = *index;
   int64_t normalizedIndex = originalIndex;
   int64_t tupleSize = static_cast<int64_t>(tuple.size());

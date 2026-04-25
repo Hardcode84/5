@@ -30,3 +30,12 @@ hc.func @getitem_tuple_infer(%tuple: tuple<!hc.idx<"A">, !hc.idx<"B">>,
       : (tuple<!hc.idx<"A">, !hc.idx<"B">>, !hc.idx<"-1">) -> !hc.undef
   hc.return
 }
+
+// INFER-LABEL: hc.func @getitem_buffer_infer_defers
+// INFER: hc.getitem {{.*}} : (!hc.buffer<f32, ["M", "N"]>, !hc.idx<"0">) -> !hc.undef
+hc.func @getitem_buffer_infer_defers(%buffer: !hc.buffer<f32, ["M", "N"]>,
+                                     %idx: !hc.idx<"0">) {
+  %view = hc.getitem %buffer[%idx]
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.idx<"0">) -> !hc.undef
+  hc.return
+}

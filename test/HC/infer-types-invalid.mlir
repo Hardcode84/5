@@ -31,3 +31,22 @@ hc.func @tuple_getitem_multi_index_after_infer {
       : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
   hc.return
 }
+
+// -----
+
+hc.func @tuple_getitem_symbolic_index(%tuple: tuple<!hc.idx<"A">, !hc.idx<"B">>,
+                                      %idx: !hc.idx<"I">) {
+  // expected-error @+1 {{tuple getitem index must be a static integer after inference, got '!hc.idx<"I">'}}
+  %item = hc.getitem %tuple[%idx]
+      : (tuple<!hc.idx<"A">, !hc.idx<"B">>, !hc.idx<"I">) -> !hc.undef
+  hc.return
+}
+
+// -----
+
+hc.func @getitem_invalid_base(%base: !hc.idx<"N">, %idx: !hc.idx<"0">) {
+  // expected-error @+1 {{getitem base type '!hc.idx<"N">' cannot be refined; expected tuple, buffer, tensor, or vector}}
+  %item = hc.getitem %base[%idx]
+      : (!hc.idx<"N">, !hc.idx<"0">) -> !hc.undef
+  hc.return
+}

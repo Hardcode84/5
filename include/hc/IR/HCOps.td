@@ -10,6 +10,7 @@ include "hc/IR/HCTypes.td"
 include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class HC_RegionOp<string mnemonic, list<Trait> traits = []>
@@ -165,7 +166,8 @@ def HCReturnOp : HC_Op<"return"> {
 // Scalar producers and casts.
 //===----------------------------------------------------------------------===//
 
-def HCConstOp : HC_Op<"const", [ConstantLike, Pure]> {
+def HCConstOp : HC_Op<"const",
+    [ConstantLike, Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Literal scalar producer (int, float, bool, string).";
   let description = [{
     Carries a builtin attribute payload lowered from `hc_front.constant`.
@@ -195,7 +197,8 @@ def HCUndefValueOp : HC_Op<"undef_value", [ConstantLike, Pure]> {
   let hasFolder = 1;
 }
 
-def HCSymbolOp : HC_Op<"symbol", [ConstantLike, Pure]> {
+def HCSymbolOp : HC_Op<"symbol",
+    [ConstantLike, Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Introduce a symbolic capture bound to a named symbol.";
   let description = [{
     Produces a pinned `!hc.idx<"name">`. The bound name lives in the result
@@ -210,7 +213,8 @@ def HCSymbolOp : HC_Op<"symbol", [ConstantLike, Pure]> {
   let hasFolder = 1;
 }
 
-def HCCastOp : HC_Op<"cast", [Pure]> {
+def HCCastOp : HC_Op<"cast",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "User-visible value-level type conversion.";
   let description = [{
     Generic value-changing cast: refinement-lattice transitions
@@ -239,32 +243,38 @@ def HCCastOp : HC_Op<"cast", [Pure]> {
 // Arithmetic ops reject anything that can't carry a number: `!hc.pred`,
 // `!hc.slice`, `!hc.buffer`. Symbolic (`!hc.idx`), scalar (int/float/index),
 // tensor/vector, and `!hc.undef` remain legal.
-def HCAddOp : HC_GenericBinaryOp<"add", [Commutative],
+def HCAddOp : HC_GenericBinaryOp<"add",
+    [Commutative, DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic addition.";
 }
 
-def HCSubOp : HC_GenericBinaryOp<"sub", [],
+def HCSubOp : HC_GenericBinaryOp<"sub",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic subtraction.";
 }
 
-def HCMulOp : HC_GenericBinaryOp<"mul", [Commutative],
+def HCMulOp : HC_GenericBinaryOp<"mul",
+    [Commutative, DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic multiplication.";
 }
 
-def HCDivOp : HC_GenericBinaryOp<"div", [],
+def HCDivOp : HC_GenericBinaryOp<"div",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic integer/float division (Python `//` for ints).";
 }
 
-def HCModOp : HC_GenericBinaryOp<"mod", [],
+def HCModOp : HC_GenericBinaryOp<"mod",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic remainder (Python `%`).";
 }
 
-def HCNegOp : HC_GenericUnaryOp<"neg", [],
+def HCNegOp : HC_GenericUnaryOp<"neg",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {
   let summary = "Generic unary minus.";
 }
@@ -287,7 +297,8 @@ def HCNotOp : HC_GenericUnaryOp<"not"> {
 // Comparisons take numeric operands; result stays wide (may be `!hc.pred`,
 // `i1`, `tensor<i1>`, `!hc.undef`).
 class HC_CmpOp<string suffix>
-    : HC_GenericBinaryOp<"cmp." # suffix, [],
+    : HC_GenericBinaryOp<"cmp." # suffix,
+                         [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
                          HC_NumericValueType, HC_ValueType> {
   let summary = "Generic comparison (`" # suffix # "`).";
   let description = [{
@@ -347,6 +358,8 @@ def HCIntrinsicOp : HC_RegionOp<"intrinsic", [IsolatedFromAbove, Symbol]> {
 
 def HCYieldOp : HC_Op<"yield",
     [Pure, Terminator,
+     DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface,
+                               ["getSuccessorRegions"]>,
      ParentOneOf<["HCForRangeOp", "HCIfOp",
                   "HCSubgroupRegionOp", "HCWorkitemRegionOp"]>]> {
   let summary =
@@ -400,6 +413,10 @@ def HCRegionReturnOp : HC_Op<"region_return",
 
 def HCForRangeOp : HC_Op<"for_range",
     [SingleBlockImplicitTerminator<"HCYieldOp">,
+     DeclareOpInterfaceMethods<RegionBranchOpInterface,
+                               ["getEntrySuccessorOperands",
+                                "getSuccessorInputs",
+                                "areTypesCompatible"]>,
      NameStoreRegionOpInterface]> {
   let summary = "Structured for-range loop over symbolic bounds.";
   let description = [{
@@ -431,6 +448,9 @@ def HCForRangeOp : HC_Op<"for_range",
 
 def HCIfOp : HC_Op<"if",
     [SingleBlockImplicitTerminator<"HCYieldOp">,
+     DeclareOpInterfaceMethods<RegionBranchOpInterface,
+                               ["getSuccessorInputs",
+                                "areTypesCompatible"]>,
      NameStoreRegionOpInterface]> {
   let summary = "Structured conditional with optional else region.";
   let description = [{
@@ -463,7 +483,8 @@ def HCIfOp : HC_Op<"if",
 //===----------------------------------------------------------------------===//
 
 class HC_LaunchGeoOp<string mnemonic>
-    : HC_Op<mnemonic, [Pure]> {
+    : HC_Op<mnemonic,
+            [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let arguments = (ins HC_ValueType:$group);
   let results = (outs Variadic<HC_ValueType>:$values);
   let assemblyFormat =
@@ -510,7 +531,8 @@ def HCWaveSizeOp : HC_LaunchGeoOp<"wave_size"> {
 // Buffer views and subscript construction.
 //===----------------------------------------------------------------------===//
 
-def HCBufferDimOp : HC_Op<"buffer_dim", [Pure]> {
+def HCBufferDimOp : HC_Op<"buffer_dim",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Symbolic dimension of a buffer (matches `a.shape[N]`).";
   let arguments = (ins HC_BufferValueType:$buffer, I64Attr:$axis);
   let results = (outs HC_ValueType:$dim);
@@ -521,7 +543,8 @@ def HCBufferDimOp : HC_Op<"buffer_dim", [Pure]> {
 }
 
 def HCSliceExprOp : HC_Op<"slice_expr",
-    [Pure, AttrSizedOperandSegments]> {
+    [Pure, AttrSizedOperandSegments,
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Build a first-class slice value.";
   let description = [{
     Produces an `!hc.slice` from any subset of `lower`, `upper`, and `step`.
@@ -566,7 +589,9 @@ def HCBufferViewOp : HC_Op<"buffer_view", [Pure]> {
 // Data movement.
 //===----------------------------------------------------------------------===//
 
-def HCLoadOp : HC_Op<"load", [MemoryEffects<[MemRead]>]> {
+def HCLoadOp : HC_Op<"load",
+    [MemoryEffects<[MemRead]>,
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Buffer -> tensor load.";
   let description = [{
     Materializes a tensor from a buffer at a variadic subscript. Shape
@@ -592,7 +617,9 @@ def HCLoadOp : HC_Op<"load", [MemoryEffects<[MemRead]>]> {
   }];
 }
 
-def HCVLoadOp : HC_Op<"vload", [MemoryEffects<[MemRead]>]> {
+def HCVLoadOp : HC_Op<"vload",
+    [MemoryEffects<[MemRead]>,
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Buffer or tensor -> vector load.";
   let description = [{
     Vector counterpart of `hc.load`; same attribute-dict shape carrier, same
@@ -626,7 +653,9 @@ def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>]> {
   }];
 }
 
-def HCVecOp : HC_Op<"vec", [MemoryEffects<[MemRead]>]> {
+def HCVecOp : HC_Op<"vec",
+    [MemoryEffects<[MemRead]>,
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Tensor -> vector materialization.";
   let description = [{
     Broadcasts a tensor (workgroup-local storage) into a per-lane vector.
@@ -639,7 +668,8 @@ def HCVecOp : HC_Op<"vec", [MemoryEffects<[MemRead]>]> {
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
-def HCWithInactiveOp : HC_Op<"with_inactive", [Pure]> {
+def HCWithInactiveOp : HC_Op<"with_inactive",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Replace inactive (masked-out) elements with a literal value.";
   let description = [{
     `$inactive` is carried in the attribute dict so later passes can pattern
@@ -659,7 +689,8 @@ def HCWithInactiveOp : HC_Op<"with_inactive", [Pure]> {
       "$value attr-dict `:` type($value) `->` type($result)";
 }
 
-def HCAsLayoutOp : HC_Op<"as_layout", [Pure]> {
+def HCAsLayoutOp : HC_Op<"as_layout",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Change the layout of a tensor or vector value.";
   let description = [{
     `$layout` is a typed `#hc<layout ...>` enum attribute. v0 admits

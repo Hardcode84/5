@@ -48,4 +48,18 @@ def HCPromoteNames : Pass<"hc-promote-names", "::mlir::ModuleOp"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCInferTypes : Pass<"hc-infer-types", "::mlir::ModuleOp"> {
+  let summary = "Infer concrete HC value types from pre-inference `!hc.undef` IR.";
+  let description = [{
+    Runs a sparse forward dataflow analysis over `hc` IR and rewrites values
+    whose type can be refined without changing program structure. The first
+    slice focuses on scalar/index facts: constants, symbols, launch geometry,
+    slice construction, buffer dimensions, index arithmetic/comparisons, and
+    structured loop carriers. Inference is monotonic: `!hc.undef` refines to a
+    concrete type, and conflicting concrete facts are left unchanged for later
+    diagnostics instead of being reconciled with a guess.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 #endif // HC_TRANSFORMS_PASSES

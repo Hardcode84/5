@@ -19,9 +19,9 @@ using namespace mlir::hc;
 namespace {
 
 // `!hc.idx` and `!hc.pred` inline their symbolic text as a quoted string.
-// Parsing routes through the dialect-owned ixsimpl store; printing reuses the
-// canonical ixsimpl-rendered form so the handle-backed attribute stays the
-// single source of truth.
+// Parsing routes through the dialect-owned ixsimpl symbolic expression store;
+// printing reuses the canonical ixsimpl-rendered form so the handle-backed
+// attribute stays the single source of truth.
 
 template <typename HandleT>
 using StoreParser = FailureOr<HandleT> (*)(sym::Store &, llvm::StringRef,
@@ -70,6 +70,8 @@ void printInlineNode(AsmPrinter &printer, MLIRContext *ctx,
 
 #define GET_TYPEDEF_CLASSES
 #include "hc/IR/HCTypes.cpp.inc"
+
+#include "hc/IR/HCTypesInterfaces.cpp.inc"
 
 void HCDialect::registerTypes() {
   addTypes<
@@ -126,6 +128,14 @@ void IdxType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
+Type IdxType::joinHCType(Type other) const {
+  // Distinct symbolic facts widen to the unpinned idx type. Keeping a concrete
+  // expression here would guess which control-flow predecessor won.
+  if (isa<IdxType>(other))
+    return IdxType::get(getContext(), ExprAttr{});
+  return {};
+}
+
 Type PredType::parse(AsmParser &parser) {
   if (failed(parser.parseOptionalLess()))
     return PredType::get(parser.getContext(), PredAttr{});
@@ -145,4 +155,12 @@ void PredType::print(AsmPrinter &printer) const {
   printer << "<";
   printInlineNode(printer, getContext(), pred.getNode());
   printer << ">";
+}
+
+Type PredType::joinHCType(Type other) const {
+  // Predicates use the same conservative widening as idx expressions: preserve
+  // the kind, drop the path-specific symbolic payload.
+  if (isa<PredType>(other))
+    return PredType::get(getContext(), PredAttr{});
+  return {};
 }

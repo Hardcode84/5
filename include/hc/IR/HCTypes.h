@@ -6,6 +6,7 @@
 #define HC_IR_HCTYPES_H
 
 #include "hc/IR/HCAttrs.h"
+#include "hc/IR/HCTypesInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #define GET_TYPEDEF_CLASSES

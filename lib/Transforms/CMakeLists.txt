@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 add_mlir_library(MLIRHCTransforms
+  HCInferTypesPass.cpp
   HCPromoteNamesPass.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -12,6 +13,7 @@ add_mlir_library(MLIRHCTransforms
   MLIRHCTransformsPassIncGen
 
   LINK_LIBS PUBLIC
+  MLIRAnalysis
   MLIRHCDialect
   MLIRIR
   MLIRPass

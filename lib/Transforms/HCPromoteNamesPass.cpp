@@ -45,6 +45,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -749,13 +750,12 @@ static LogicalResult promoteNestedScope(Operation *op) {
 // case below — the stale-interface diagnostic in `scanAndPromoteBlock`
 // exists to catch anyone who forgets the second half.
 static LogicalResult promoteRegionOp(Operation *op) {
-  if (auto forOp = dyn_cast<HCForRangeOp>(op))
-    return promoteForRange(forOp);
-  if (auto ifOp = dyn_cast<HCIfOp>(op))
-    return promoteIf(ifOp);
-  if (isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
-    return promoteNestedScope(op);
-  return success();
+  return llvm::TypeSwitch<Operation *, LogicalResult>(op)
+      .Case<HCForRangeOp>(promoteForRange)
+      .Case<HCIfOp>(promoteIf)
+      .Case<HCWorkitemRegionOp, HCSubgroupRegionOp>(
+          [](Operation *op) { return promoteNestedScope(op); })
+      .Default([](Operation *) { return success(); });
 }
 
 // Collects every `NameStoreRegionOpInterface` op in `region`'s subtree

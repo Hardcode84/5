@@ -6,6 +6,8 @@
 #define HC_IR_HCOPSINTERFACES_H
 
 #include "mlir/IR/OpDefinition.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include "hc/IR/HCOpsInterfaces.h.inc"
 

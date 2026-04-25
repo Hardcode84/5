@@ -7,6 +7,11 @@ mlir_tablegen(HCOpsInterfaces.h.inc -gen-op-interface-decls)
 mlir_tablegen(HCOpsInterfaces.cpp.inc -gen-op-interface-defs)
 add_public_tablegen_target(MLIRHCOpsInterfacesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS HCTypesInterfaces.td)
+mlir_tablegen(HCTypesInterfaces.h.inc -gen-type-interface-decls)
+mlir_tablegen(HCTypesInterfaces.cpp.inc -gen-type-interface-defs)
+add_public_tablegen_target(MLIRHCTypesInterfacesIncGen)
+
 add_mlir_dialect(HCOps hc)
 
 set(LLVM_TARGET_DEFINITIONS HCAttrs.td)

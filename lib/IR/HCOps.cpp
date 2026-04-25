@@ -4,7 +4,6 @@
 
 #include "hc/IR/HCOps.h"
 
-#include "hc/IR/HCDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -32,6 +31,18 @@ static bool compatibleSigType(Type callSite, Type callee) {
   if (isUndef(callSite) || isUndef(callee))
     return true;
   return callSite == callee;
+}
+
+static bool compatibleBranchType(Type source, Type dest) {
+  if (compatibleSigType(source, dest))
+    return true;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(source))
+    if (joinable.joinHCType(dest))
+      return true;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(dest))
+    if (joinable.joinHCType(source))
+      return true;
+  return false;
 }
 
 ArrayAttr mlir::hc::filterIntrinsicOperandParameters(ArrayAttr parameters,
@@ -639,6 +650,63 @@ OpFoldResult HCSymbolOp::fold(FoldAdaptor /*adaptor*/) {
   return TypeAttr::get(getResult().getType());
 }
 
+void HCYieldOp::getSuccessorRegions(ArrayRef<Attribute> /*operands*/,
+                                    SmallVectorImpl<RegionSuccessor> &regions) {
+  auto branch =
+      dyn_cast_or_null<RegionBranchOpInterface>((*this)->getParentOp());
+  if (!branch)
+    return;
+  branch.getSuccessorRegions(
+      cast<RegionBranchTerminatorOpInterface>(getOperation()), regions);
+}
+
+OperandRange
+HCForRangeOp::getEntrySuccessorOperands(RegionSuccessor /*successor*/) {
+  return getIterInits();
+}
+
+void HCForRangeOp::getSuccessorRegions(
+    RegionBranchPoint /*point*/, SmallVectorImpl<RegionSuccessor> &regions) {
+  // Bounds are symbolic in HC, so the dialect cannot decide whether the loop
+  // executes. Model both zero-trip and body-entry/iteration edges.
+  regions.push_back(RegionSuccessor(&getBody()));
+  regions.push_back(RegionSuccessor::parent());
+}
+
+ValueRange HCForRangeOp::getSuccessorInputs(RegionSuccessor successor) {
+  if (successor.isParent())
+    return getResults();
+  if (getBody().empty())
+    return {};
+  return getBody().front().getArguments().drop_front();
+}
+
+bool HCForRangeOp::areTypesCompatible(Type lhs, Type rhs) {
+  return compatibleBranchType(lhs, rhs);
+}
+
+void HCIfOp::getSuccessorRegions(RegionBranchPoint point,
+                                 SmallVectorImpl<RegionSuccessor> &regions) {
+  if (!point.isParent()) {
+    regions.push_back(RegionSuccessor::parent());
+    return;
+  }
+
+  regions.push_back(RegionSuccessor(&getThenRegion()));
+  if (getElseRegion().empty())
+    regions.push_back(RegionSuccessor::parent());
+  else
+    regions.push_back(RegionSuccessor(&getElseRegion()));
+}
+
+ValueRange HCIfOp::getSuccessorInputs(RegionSuccessor successor) {
+  return successor.isParent() ? ValueRange(getResults()) : ValueRange();
+}
+
+bool HCIfOp::areTypesCompatible(Type lhs, Type rhs) {
+  return compatibleBranchType(lhs, rhs);
+}
+
 LogicalResult HCForRangeOp::verify() {
   // The body block takes the induction variable plus one argument per
   // iter_args entry; result types mirror iter_inits types one-to-one.
@@ -656,7 +724,7 @@ LogicalResult HCForRangeOp::verify() {
   for (auto [idx, pair] :
        llvm::enumerate(llvm::zip_equal(getIterInits(), getIterResults()))) {
     auto [init, result] = pair;
-    if (init.getType() != result.getType())
+    if (!compatibleBranchType(init.getType(), result.getType()))
       return emitOpError("iter_args[")
              << idx << "] type " << init.getType() << " does not match result["
              << idx << "] type " << result.getType();
@@ -671,7 +739,7 @@ LogicalResult HCForRangeOp::verify() {
     auto [init, blockArg] = pair;
     Type initTy = init.getType();
     Type blockTy = blockArg.getType();
-    if (initTy == blockTy || isUndef(initTy) || isUndef(blockTy))
+    if (compatibleBranchType(initTy, blockTy))
       continue;
     return emitOpError("iter_args[")
            << idx << "] type " << initTy
@@ -693,7 +761,7 @@ LogicalResult HCForRangeOp::verify() {
     auto [yielded, result] = pair;
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
-    if (yieldedTy == resultTy || isUndef(yieldedTy) || isUndef(resultTy))
+    if (compatibleBranchType(yieldedTy, resultTy))
       continue;
     return emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx
@@ -711,7 +779,9 @@ LogicalResult HCForRangeOp::verify() {
 //   2. `$results` non-empty — post-promotion. Body must end with
 //      `hc.yield`, arity matches `$results`, each value's type is
 //      compatible with the corresponding result type (`!hc.undef`
-//      escape applies on either side, matching progressive typing).
+//      escape applies on either side, matching progressive typing). Unlike
+//      `hc.for_range` / `hc.if`, nested scopes are not region-branch ops and do
+//      not widen distinct symbolic payloads across control-flow edges.
 //
 // A `hc.region_return` terminator combined with non-empty `$results`
 // is the frontend contradicting itself — "pre-promotion" (the
@@ -809,7 +879,7 @@ LogicalResult HCIfOp::verify() {
       auto [yielded, result] = pair;
       Type yieldedTy = yielded.getType();
       Type resultTy = result.getType();
-      if (yieldedTy == resultTy || isUndef(yieldedTy) || isUndef(resultTy))
+      if (compatibleBranchType(yieldedTy, resultTy))
         continue;
       return emitOpError(label)
              << " yield[" << idx << "] type " << yieldedTy

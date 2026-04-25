@@ -51,4 +51,26 @@ def NameStoreRegionOpInterface : OpInterface<"NameStoreRegionOpInterface"> {
   let cppNamespace = "::mlir::hc";
 }
 
+def HCInferTypeOpInterface : OpInterface<"HCInferTypeOpInterface"> {
+  let description = [{
+    Op-local type inference hook for the HC dataflow type inference pass.
+
+    This is deliberately narrower than MLIR's generic `InferTypeOpInterface`:
+    the pass supplies the operand types learned by dataflow, which may be more
+    precise than the operands' current IR types during a solver iteration. The
+    hook appends one entry per result to `$resultTypes`; a null `Type` entry
+    means "no fact for this result".
+  }];
+  let cppNamespace = "::mlir::hc";
+  let methods = [
+    InterfaceMethod<
+      "Infer result types from dataflow-refined operand types.",
+      "::mlir::LogicalResult",
+      "inferHCTypes",
+      (ins "::llvm::ArrayRef<::mlir::Type>":$operandTypes,
+           "::llvm::SmallVectorImpl<::mlir::Type> &":$resultTypes)
+    >
+  ];
+}
+
 #endif // HC_IR_HCOPSINTERFACES

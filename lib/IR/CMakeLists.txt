@@ -5,6 +5,7 @@
 add_mlir_dialect_library(MLIRHCDialect
   HCAttrs.cpp
   HCDialect.cpp
+  HCInferTypeOpInterface.cpp
   HCOps.cpp
   HCSymbols.cpp
   HCTypes.cpp
@@ -17,9 +18,11 @@ add_mlir_dialect_library(MLIRHCDialect
   MLIRHCOpsIncGen
   MLIRHCOpsInterfacesIncGen
   MLIRHCTypesIncGen
+  MLIRHCTypesInterfacesIncGen
 
   LINK_LIBS PUBLIC
   HCIXSimpl
+  MLIRControlFlowInterfaces
   MLIRIR
 )
 

@@ -7,6 +7,7 @@
 
 include "hc/IR/HCDialect.td"
 include "hc/IR/HCAttrs.td"
+include "hc/IR/HCTypesInterfaces.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/CommonTypeConstraints.td"
 
@@ -30,7 +31,8 @@ def HC_UndefType : HC_Type<"Undef", "undef"> {
   }];
 }
 
-def HC_IdxType : HC_Type<"Idx", "idx"> {
+def HC_IdxType : HC_Type<"Idx", "idx",
+    [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Index-kind value, optionally pinned to a symbolic expression.";
   let description = [{
     `!hc.idx` marks a value as a scalar index. When the symbolic expression is
@@ -46,7 +48,8 @@ def HC_IdxType : HC_Type<"Idx", "idx"> {
   let hasCustomAssemblyFormat = 1;
 }
 
-def HC_PredType : HC_Type<"Pred", "pred"> {
+def HC_PredType : HC_Type<"Pred", "pred",
+    [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Boolean-kind value, optionally pinned to a symbolic predicate.";
   let description = [{
     Boolean analogue of `!hc.idx`. When pinned (`!hc.pred<"M < N">`), the type

@@ -160,7 +160,7 @@ def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
   let hasVerifier = 1;
 }
 
-def HCReturnOp : HC_Op<"return"> {
+def HCReturnOp : HC_Op<"return", [ReturnLike, Terminator]> {
   let summary = "Semantic return.";
   let description = [{
     Terminator for the nearest enclosing `hc.kernel` / `hc.func` /

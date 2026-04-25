@@ -21,6 +21,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -181,6 +182,81 @@ public:
         join(lattice, TypeFact::concrete(type));
   }
 
+protected:
+  LogicalResult visitCallOperation(
+      CallOpInterface call,
+      ArrayRef<const dataflow::AbstractSparseLattice *> operandLattices,
+      ArrayRef<dataflow::AbstractSparseLattice *> resultLattices) override {
+    if (!isa<HCCallOp>(call.getOperation()))
+      return AbstractSparseForwardDataFlowAnalysis::visitCallOperation(
+          call, operandLattices, resultLattices);
+
+    for (auto *rawLattice : resultLattices) {
+      auto *lattice = static_cast<HCTypeLattice *>(rawLattice);
+      join(lattice, factFromExistingType(lattice->getAnchor().getType()));
+    }
+    if (auto callee = dyn_cast_or_null<HCFuncOp>(call.resolveCallable())) {
+      if (std::optional<FunctionType> fnType = callee.getFunctionType()) {
+        for (auto [result, type] :
+             llvm::zip(resultLattices, fnType->getResults()))
+          if (!isUndef(type))
+            join(static_cast<HCTypeLattice *>(result),
+                 TypeFact::concrete(type));
+      }
+    }
+
+    // HC helpers are module-local in practice today, but they don't carry MLIR
+    // private visibility yet. Use the visible return sites instead of letting a
+    // public symbol's unknown external predecessors erase all useful facts.
+    ProgramPoint *point = getProgramPointAfter(call);
+    const auto *predecessors =
+        getOrCreateFor<dataflow::PredecessorState>(point, point);
+    for (Operation *predecessor : predecessors->getKnownPredecessors()) {
+      for (auto [operand, result] :
+           llvm::zip(predecessor->getOperands(), resultLattices)) {
+        const dataflow::AbstractSparseLattice *operandLattice =
+            AbstractSparseForwardDataFlowAnalysis::getLatticeElementFor(
+                point, operand);
+        AbstractSparseForwardDataFlowAnalysis::join(result, *operandLattice);
+      }
+    }
+    return success();
+  }
+
+  void visitCallableOperation(
+      CallableOpInterface callable,
+      ArrayRef<dataflow::AbstractSparseLattice *> argLattices) override {
+    if (!isa<HCFuncOp>(callable.getOperation()))
+      return AbstractSparseForwardDataFlowAnalysis::visitCallableOperation(
+          callable, argLattices);
+
+    for (auto *rawLattice : argLattices) {
+      auto *lattice = static_cast<HCTypeLattice *>(rawLattice);
+      join(lattice, factFromExistingType(lattice->getAnchor().getType()));
+    }
+
+    Region *region = callable.getCallableRegion();
+    if (!region || region->empty())
+      return AbstractSparseForwardDataFlowAnalysis::setAllToEntryStates(
+          argLattices);
+
+    ProgramPoint *point = getProgramPointBefore(&region->front());
+    const auto *callsites = getOrCreateFor<dataflow::PredecessorState>(
+        point, getProgramPointAfter(callable));
+    // Same visibility story as call results: use known in-module callsites
+    // even when public helper symbols make the generic framework conservative.
+    for (Operation *callsite : callsites->getKnownPredecessors()) {
+      auto call = cast<CallOpInterface>(callsite);
+      for (auto [operand, arg] :
+           llvm::zip(call.getArgOperands(), argLattices)) {
+        const dataflow::AbstractSparseLattice *operandLattice =
+            AbstractSparseForwardDataFlowAnalysis::getLatticeElementFor(
+                point, operand);
+        AbstractSparseForwardDataFlowAnalysis::join(arg, *operandLattice);
+      }
+    }
+  }
+
 private:
   void join(HCTypeLattice *lattice, TypeFact fact) {
     propagateIfChanged(lattice, lattice->join(fact));
@@ -210,6 +286,15 @@ static bool isNestedUnderHCCallable(Operation *op) {
     op = op->getParentOp();
   }
   return false;
+}
+
+static Operation *nearestHCCallable(Operation *op) {
+  while (op) {
+    if (isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(op))
+      return op;
+    op = op->getParentOp();
+  }
+  return nullptr;
 }
 
 static bool isNestedUnderHCCallable(Value value) {
@@ -278,6 +363,58 @@ static bool refineValue(Value value, Type inferred) {
   return true;
 }
 
+template <typename CallableOpT>
+static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
+  auto fnTypeAttr = op.getFunctionTypeAttr();
+  if (!fnTypeAttr || op.getBody().empty())
+    return false;
+
+  auto oldType = cast<FunctionType>(fnTypeAttr.getValue());
+  SmallVector<Type> inputs(op.getBody().front().getArgumentTypes());
+  SmallVector<TypeFact> resultFacts;
+  resultFacts.reserve(oldType.getNumResults());
+  for (Type result : oldType.getResults())
+    resultFacts.push_back(factFromExistingType(result));
+
+  op.getBody().walk([&](HCReturnOp ret) {
+    if (nearestHCCallable(ret.getOperation()) != op.getOperation())
+      return;
+    for (auto [idx, value] : llvm::enumerate(ret.getValues())) {
+      if (idx >= resultFacts.size())
+        return;
+      TypeFact fact = factFromExistingType(value.getType());
+      if (std::optional<Type> inferred = inferredTypeFor(solver, value))
+        fact = TypeFact::join(fact, TypeFact::concrete(*inferred));
+      resultFacts[idx] = TypeFact::join(resultFacts[idx], fact);
+    }
+  });
+
+  SmallVector<Type> results;
+  results.reserve(resultFacts.size());
+  for (auto [oldResult, fact] : llvm::zip(oldType.getResults(), resultFacts))
+    results.push_back(fact.isConcrete() ? fact.type : oldResult);
+
+  auto newType = FunctionType::get(op.getContext(), inputs, results);
+  if (newType == oldType)
+    return false;
+  op.setFunctionTypeAttr(TypeAttr::get(newType));
+  return true;
+}
+
+static bool updateCallableFunctionTypes(ModuleOp module,
+                                        DataFlowSolver &solver) {
+  bool changed = false;
+  module.walk([&](Operation *op) {
+    if (auto kernel = dyn_cast<HCKernelOp>(op))
+      changed |= updateCallableFunctionType(kernel, solver);
+    else if (auto func = dyn_cast<HCFuncOp>(op))
+      changed |= updateCallableFunctionType(func, solver);
+    else if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
+      changed |= updateCallableFunctionType(intrinsic, solver);
+  });
+  return changed;
+}
+
 static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
   bool changed = false;
   module.walk([&](Operation *op) {
@@ -298,6 +435,7 @@ static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
       }
     }
   });
+  changed |= updateCallableFunctionTypes(module, solver);
   return changed;
 }
 

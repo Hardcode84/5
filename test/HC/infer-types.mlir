@@ -108,3 +108,46 @@ hc.func @untyped_string_const_stays_unknown {
   %arch = hc.const<"gfx11"> : !hc.undef
   hc.return
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @interprocedural_callee
+// CHECK-SAME: (%{{[^:]+}}: !hc.idx<"2">) -> !hc.idx<"3">
+// CHECK: hc.add {{.*}} -> !hc.idx<"3">
+hc.func @interprocedural_callee(%x: !hc.undef) -> !hc.undef {
+  %one = hc.const<1 : i64> : !hc.undef
+  %sum = hc.add %x, %one : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return %sum : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @interprocedural_caller
+// CHECK: hc.call @interprocedural_callee(%{{.*}}) : (!hc.idx<"2">) -> !hc.idx<"3">
+hc.func @interprocedural_caller {
+  %two = hc.const<2 : i64> : !hc.undef
+  %result = hc.call @interprocedural_callee(%two) : (!hc.undef) -> !hc.undef
+  hc.return
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @joined_interprocedural_callee
+// CHECK-SAME: (%{{[^:]+}}: !hc.idx) -> !hc.idx
+// CHECK: hc.add {{.*}} -> !hc.idx
+hc.func @joined_interprocedural_callee(%x: !hc.undef) -> !hc.undef {
+  %one = hc.const<1 : i64> : !hc.undef
+  %sum = hc.add %x, %one : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return %sum : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @joined_interprocedural_caller
+// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"2">) -> !hc.idx
+// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"5">) -> !hc.idx
+hc.func @joined_interprocedural_caller {
+  %two = hc.const<2 : i64> : !hc.undef
+  %five = hc.const<5 : i64> : !hc.undef
+  %a = hc.call @joined_interprocedural_callee(%two)
+      : (!hc.undef) -> !hc.undef
+  %b = hc.call @joined_interprocedural_callee(%five)
+      : (!hc.undef) -> !hc.undef
+  hc.return
+}

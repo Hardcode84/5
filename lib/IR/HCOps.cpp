@@ -1123,14 +1123,14 @@ static LogicalResult verifySignature(CallOp op, FunctionType fnType) {
            << " result(s), call site declares " << op.getResults().size();
   for (auto [i, callSite, declared] :
        llvm::enumerate(op.getArgs().getTypes(), fnType.getInputs())) {
-    if (!compatibleSigType(callSite, declared))
+    if (!compatibleBranchType(callSite, declared))
       return op.emitOpError("arg #")
              << i << " type " << callSite
              << " is incompatible with callee declaration " << declared;
   }
   for (auto [i, callSite, declared] :
        llvm::enumerate(op.getResults().getTypes(), fnType.getResults())) {
-    if (!compatibleSigType(callSite, declared))
+    if (!compatibleBranchType(callSite, declared))
       return op.emitOpError("result #")
              << i << " type " << callSite
              << " is incompatible with callee declaration " << declared;

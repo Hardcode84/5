@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// RUN: hc-opt -hc-infer-types -split-input-file %s | FileCheck %s
+// RUN: hc-opt -hc-infer-types -split-input-file %s | FileCheck %s --implicit-check-not=__hc_join_tmp
 
 // CHECK-LABEL: hc.func @scalar_index_arithmetic
 // CHECK: hc.const<2 : i64> : !hc.idx<"2">
@@ -26,9 +26,9 @@ hc.func @scalar_index_arithmetic {
 
 // CHECK-LABEL: hc.func @for_range_iv
 // CHECK: hc.for_range
-// CHECK: ^bb0(%arg0: !hc.idx):
+// CHECK: ^bb0(%arg0: !hc.idx<"$join{{[0-9]+}}">):
 // CHECK: hc.const<1 : i64> : !hc.idx<"1">
-// CHECK: hc.add %arg0, {{.*}} : (!hc.idx, !hc.idx<"1">) -> !hc.idx
+// CHECK: hc.add %arg0, {{.*}} : (!hc.idx<"$join{{[0-9]+}}">, !hc.idx<"1">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 hc.func @for_range_iv {
   %lo = hc.const<0 : i64> : !hc.undef
   %hi = hc.const<4 : i64> : !hc.undef
@@ -46,10 +46,10 @@ hc.func @for_range_iv {
 
 // CHECK-LABEL: hc.func @region_branch_results
 // CHECK: hc.for_range
-// CHECK-SAME: -> (!hc.idx)
-// CHECK: ^bb0(%{{[^:]+}}: !hc.idx, %{{[^:]+}}: !hc.idx):
-// CHECK: hc.yield {{.*}} : !hc.idx
-// CHECK: hc.if {{.*}} -> (!hc.idx) : i1
+// CHECK-SAME: -> (!hc.idx<"$join{{[0-9]+}}">)
+// CHECK: ^bb0(%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">, %{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">):
+// CHECK: hc.yield {{.*}} : !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
+// CHECK: hc.if {{.*}} -> (!hc.idx<"$join{{[0-9]+}}">) : i1
 hc.func @region_branch_results(%cond: i1) {
   %lo = hc.const<0 : i64> : !hc.undef
   %hi = hc.const<4 : i64> : !hc.undef
@@ -67,6 +67,46 @@ hc.func @region_branch_results(%cond: i1) {
     hc.yield %then : !hc.undef
   } else {
     %else = hc.const<2 : i64> : !hc.undef
+    hc.yield %else : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @tuple_region_branch_result
+// CHECK: hc.if {{.*}} -> (tuple<!hc.idx<"$join{{[0-9]+}}">, f32>) : i1
+// CHECK: hc.yield {{.*}} : tuple<!hc.idx<"1">, f32>
+// CHECK: hc.yield {{.*}} : tuple<!hc.idx<"2">, f32>
+hc.func @tuple_region_branch_result(%cond: i1, %value: f32) {
+  %one = hc.const<1 : i64> : !hc.undef
+  %two = hc.const<2 : i64> : !hc.undef
+  %choice = hc.if %cond -> (!hc.undef) : i1 {
+    %then = hc.tuple(%one, %value) : (!hc.undef, f32) -> !hc.undef
+    hc.yield %then : !hc.undef
+  } else {
+    %else = hc.tuple(%two, %value) : (!hc.undef, f32) -> !hc.undef
+    hc.yield %else : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @tuple_multi_index_conflicts
+// CHECK: hc.if {{.*}} -> (tuple<!hc.idx<"$join0">, !hc.idx<"$join1">>) : i1
+// CHECK: hc.yield {{.*}} : tuple<!hc.idx<"1">, !hc.idx<"10">>
+// CHECK: hc.yield {{.*}} : tuple<!hc.idx<"2">, !hc.idx<"20">>
+hc.func @tuple_multi_index_conflicts(%cond: i1) {
+  %one = hc.const<1 : i64> : !hc.undef
+  %two = hc.const<2 : i64> : !hc.undef
+  %ten = hc.const<10 : i64> : !hc.undef
+  %twenty = hc.const<20 : i64> : !hc.undef
+  %choice = hc.if %cond -> (!hc.undef) : i1 {
+    %then = hc.tuple(%one, %ten) : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.yield %then : !hc.undef
+  } else {
+    %else = hc.tuple(%two, %twenty) : (!hc.undef, !hc.undef) -> !hc.undef
     hc.yield %else : !hc.undef
   }
   hc.return
@@ -131,8 +171,8 @@ hc.func @interprocedural_caller {
 // -----
 
 // CHECK-LABEL: hc.func @joined_interprocedural_callee
-// CHECK-SAME: (%{{[^:]+}}: !hc.idx) -> !hc.idx
-// CHECK: hc.add {{.*}} -> !hc.idx
+// CHECK-SAME: (%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
+// CHECK: hc.add {{.*}} -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 hc.func @joined_interprocedural_callee(%x: !hc.undef) -> !hc.undef {
   %one = hc.const<1 : i64> : !hc.undef
   %sum = hc.add %x, %one : (!hc.undef, !hc.undef) -> !hc.undef
@@ -140,8 +180,8 @@ hc.func @joined_interprocedural_callee(%x: !hc.undef) -> !hc.undef {
 }
 
 // CHECK-LABEL: hc.func @joined_interprocedural_caller
-// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"2">) -> !hc.idx
-// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"5">) -> !hc.idx
+// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"2">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
+// CHECK: hc.call @joined_interprocedural_callee(%{{.*}}) : (!hc.idx<"5">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 hc.func @joined_interprocedural_caller {
   %two = hc.const<2 : i64> : !hc.undef
   %five = hc.const<5 : i64> : !hc.undef
@@ -170,9 +210,9 @@ hc.func @workitem_tail_region_callee(%group: !hc.undef) -> !hc.undef {
 // CHECK-LABEL: hc.func @call_result_iter_arg_keeps_loop_body_live
 // CHECK: %[[INIT:.*]] = hc.call @workitem_tail_region_callee
 // CHECK: hc.for_range {{.*}} iter_args(%[[INIT]])
-// CHECK: ^bb0(%{{[^:]+}}: !hc.idx, %{{[^:]+}}: !hc.undef):
+// CHECK: ^bb0(%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">, %{{[^:]+}}: !hc.undef):
 // CHECK: hc.const<16 : i64> : !hc.idx<"16">
-// CHECK: hc.add {{.*}} : (!hc.idx, !hc.idx<"16">) -> !hc.idx
+// CHECK: hc.add {{.*}} : (!hc.idx<"$join{{[0-9]+}}">, !hc.idx<"16">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 hc.func @call_result_iter_arg_keeps_loop_body_live(%group: !hc.undef) {
   %init = hc.call @workitem_tail_region_callee(%group)
       : (!hc.undef) -> !hc.undef

@@ -58,6 +58,9 @@ private:
   const ixs_node *node = nullptr;
 };
 
+enum class ExprBinaryOp { Add, Sub, Mul, Div, Mod };
+enum class PredCmpOp { Lt, Le, Gt, Ge, Eq, Ne };
+
 /// Long-lived symbolic store owned by one `HCDialect` / `MLIRContext`.
 class Store {
 public:
@@ -106,6 +109,15 @@ mlir::FailureOr<ExprHandle> importExpr(Store &store, const ixs_node *foreign,
                                        std::string *diagnostic = nullptr);
 mlir::FailureOr<PredHandle> importPred(Store &store, const ixs_node *foreign,
                                        std::string *diagnostic = nullptr);
+
+mlir::FailureOr<ExprHandle>
+composeExprBinary(Store &store, ExprHandle lhs, ExprBinaryOp op, ExprHandle rhs,
+                  std::string *diagnostic = nullptr);
+mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
+                                           std::string *diagnostic = nullptr);
+mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
+                                           PredCmpOp op, ExprHandle rhs,
+                                           std::string *diagnostic = nullptr);
 
 mlir::FailureOr<ExprHandle> parseExprHandle(AsmParser &parser);
 mlir::FailureOr<PredHandle> parsePredHandle(AsmParser &parser);

@@ -24,15 +24,18 @@ static Type unpinnedPred(MLIRContext *ctx) {
   return PredType::get(ctx, PredAttr{});
 }
 
+static sym::Store &symbolStore(MLIRContext *ctx) {
+  return ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+}
+
 template <typename AttrT, typename HandleT,
           FailureOr<HandleT> (*Parse)(sym::Store &, StringRef, std::string *)>
 static FailureOr<AttrT> parseSymbolicAttr(MLIRContext *ctx, Twine text,
                                           Operation *diagOp, StringRef kind) {
   SmallString<64> storage;
   StringRef rendered = text.toStringRef(storage);
-  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   std::string diag;
-  FailureOr<HandleT> handle = Parse(store, rendered, &diag);
+  FailureOr<HandleT> handle = Parse(symbolStore(ctx), rendered, &diag);
   if (failed(handle)) {
     diagOp->emitOpError("failed to infer symbolic ")
         << kind << " '" << rendered << "': " << diag;
@@ -47,28 +50,57 @@ static FailureOr<ExprAttr> parseExprAttr(MLIRContext *ctx, Twine text,
       ctx, text, diagOp, "expression");
 }
 
-static FailureOr<PredAttr> parsePredAttr(MLIRContext *ctx, Twine text,
-                                         Operation *diagOp) {
-  return parseSymbolicAttr<PredAttr, sym::PredHandle, sym::parsePred>(
-      ctx, text, diagOp, "predicate");
-}
-
-// The symbolic library currently exposes parser/import entry points, not
-// structural arithmetic builders. Keep expression composition isolated here so
-// a later structural API can replace the render-parse bridge in one place.
-static std::string renderExpr(ExprAttr expr) {
-  auto *ctx = expr.getContext();
-  return ctx->getOrLoadDialect<HCDialect>()->getSymbolStore().render(
-      expr.getNode());
-}
-
-static std::optional<std::string> idxExprText(Type type) {
+static std::optional<ExprAttr> idxExprAttr(Type type) {
   auto idx = dyn_cast_or_null<IdxType>(type);
   if (!idx)
     return std::nullopt;
   if (ExprAttr expr = idx.getExpr())
-    return renderExpr(expr);
+    return expr;
   return std::nullopt;
+}
+
+template <typename HandleT>
+static LogicalResult emitComposeError(Operation *op, StringRef kind,
+                                      FailureOr<HandleT> handle,
+                                      const std::string &diag) {
+  if (succeeded(handle))
+    return success();
+  op->emitOpError("failed to infer symbolic ") << kind << ": " << diag;
+  return failure();
+}
+
+static FailureOr<ExprAttr> composeExprAttr(MLIRContext *ctx, ExprAttr lhs,
+                                           sym::ExprBinaryOp op, ExprAttr rhs,
+                                           Operation *diagOp) {
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle =
+      sym::composeExprBinary(symbolStore(ctx), sym::ExprHandle(lhs.getNode()),
+                             op, sym::ExprHandle(rhs.getNode()), &diag);
+  if (failed(emitComposeError(diagOp, "expression", handle, diag)))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
+static FailureOr<ExprAttr> composeNegExprAttr(MLIRContext *ctx, ExprAttr value,
+                                              Operation *diagOp) {
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle = sym::composeExprNeg(
+      symbolStore(ctx), sym::ExprHandle(value.getNode()), &diag);
+  if (failed(emitComposeError(diagOp, "expression", handle, diag)))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
+static FailureOr<PredAttr> composePredAttr(MLIRContext *ctx, ExprAttr lhs,
+                                           sym::PredCmpOp op, ExprAttr rhs,
+                                           Operation *diagOp) {
+  std::string diag;
+  FailureOr<sym::PredHandle> handle =
+      sym::composePredCmp(symbolStore(ctx), sym::ExprHandle(lhs.getNode()), op,
+                          sym::ExprHandle(rhs.getNode()), &diag);
+  if (failed(emitComposeError(diagOp, "predicate", handle, diag)))
+    return failure();
+  return PredAttr::get(ctx, *handle);
 }
 
 static FailureOr<Type> inferIntegerAttrAsIdx(IntegerAttr value, Operation *op) {
@@ -96,8 +128,8 @@ static LogicalResult requireOperandCount(Operation *op, ArrayRef<Type> operands,
          << expected << " operand type fact(s), got " << operands.size();
 }
 
-static LogicalResult inferIndexBinary(ArrayRef<Type> operands, StringRef opText,
-                                      Operation *op,
+static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
+                                      sym::ExprBinaryOp opKind, Operation *op,
                                       SmallVectorImpl<Type> &resultTypes) {
   if (failed(requireOperandCount(op, operands, 2)))
     return failure();
@@ -115,15 +147,14 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands, StringRef opText,
       resultTypes.push_back({});
       return success();
     }
-    std::optional<std::string> lhsExpr = idxExprText(lhs);
-    std::optional<std::string> rhsExpr = idxExprText(rhs);
+    std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
+    std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
     if (!lhsExpr || !rhsExpr) {
       resultTypes.push_back(unpinnedIdx(op->getContext()));
       return success();
     }
-    FailureOr<ExprAttr> expr = parseExprAttr(
-        op->getContext(),
-        Twine("(") + *lhsExpr + ") " + opText + " (" + *rhsExpr + ")", op);
+    FailureOr<ExprAttr> expr =
+        composeExprAttr(op->getContext(), *lhsExpr, opKind, *rhsExpr, op);
     if (failed(expr))
       return failure();
     resultTypes.push_back(IdxType::get(op->getContext(), *expr));
@@ -139,8 +170,8 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands, StringRef opText,
   return success();
 }
 
-static LogicalResult inferIndexCmp(ArrayRef<Type> operands, StringRef predText,
-                                   Operation *op,
+static LogicalResult inferIndexCmp(ArrayRef<Type> operands,
+                                   sym::PredCmpOp predKind, Operation *op,
                                    SmallVectorImpl<Type> &resultTypes) {
   if (failed(requireOperandCount(op, operands, 2)))
     return failure();
@@ -158,15 +189,14 @@ static LogicalResult inferIndexCmp(ArrayRef<Type> operands, StringRef predText,
       resultTypes.push_back({});
       return success();
     }
-    std::optional<std::string> lhsExpr = idxExprText(lhs);
-    std::optional<std::string> rhsExpr = idxExprText(rhs);
+    std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
+    std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
     if (!lhsExpr || !rhsExpr) {
       resultTypes.push_back(unpinnedPred(op->getContext()));
       return success();
     }
     FailureOr<PredAttr> pred =
-        parsePredAttr(op->getContext(),
-                      Twine(*lhsExpr) + " " + predText + " " + *rhsExpr, op);
+        composePredAttr(op->getContext(), *lhsExpr, predKind, *rhsExpr, op);
     if (failed(pred))
       return failure();
     resultTypes.push_back(PredType::get(op->getContext(), *pred));
@@ -251,27 +281,32 @@ LogicalResult HCCastOp::inferHCTypes(ArrayRef<Type> operandTypes,
 
 LogicalResult HCAddOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexBinary(operandTypes, "+", *this, resultTypes);
+  return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Add, *this,
+                          resultTypes);
 }
 
 LogicalResult HCSubOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexBinary(operandTypes, "-", *this, resultTypes);
+  return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Sub, *this,
+                          resultTypes);
 }
 
 LogicalResult HCMulOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexBinary(operandTypes, "*", *this, resultTypes);
+  return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Mul, *this,
+                          resultTypes);
 }
 
 LogicalResult HCDivOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexBinary(operandTypes, "/", *this, resultTypes);
+  return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Div, *this,
+                          resultTypes);
 }
 
 LogicalResult HCModOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexBinary(operandTypes, "%", *this, resultTypes);
+  return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Mod, *this,
+                          resultTypes);
 }
 
 LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
@@ -281,9 +316,8 @@ LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
     resultTypes.push_back({});
     return success();
   }
-  if (std::optional<std::string> expr = idxExprText(value)) {
-    FailureOr<ExprAttr> neg =
-        parseExprAttr(getContext(), Twine("-(") + *expr + ")", *this);
+  if (std::optional<ExprAttr> expr = idxExprAttr(value)) {
+    FailureOr<ExprAttr> neg = composeNegExprAttr(getContext(), *expr, *this);
     if (failed(neg))
       return failure();
     resultTypes.push_back(IdxType::get(getContext(), *neg));
@@ -295,32 +329,32 @@ LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
 
 LogicalResult HCCmpLtOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, "<", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Lt, *this, resultTypes);
 }
 
 LogicalResult HCCmpLeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, "<=", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Le, *this, resultTypes);
 }
 
 LogicalResult HCCmpGtOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, ">", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Gt, *this, resultTypes);
 }
 
 LogicalResult HCCmpGeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, ">=", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Ge, *this, resultTypes);
 }
 
 LogicalResult HCCmpEqOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, "==", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Eq, *this, resultTypes);
 }
 
 LogicalResult HCCmpNeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
-  return inferIndexCmp(operandTypes, "!=", *this, resultTypes);
+  return inferIndexCmp(operandTypes, sym::PredCmpOp::Ne, *this, resultTypes);
 }
 
 LogicalResult HCGroupIdOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,

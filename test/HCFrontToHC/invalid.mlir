@@ -31,6 +31,19 @@ module {
 
 // -----
 
+// Malformed hand-written IR can expose a block argument that the converter
+// never mapped from an hc_front producer. Diagnose the missing lowering at the
+// consumer instead of tripping the internal lowering map assertion.
+module {
+  hc_front.kernel "unmapped_block_arg_return" attributes {parameters = []} {
+  ^bb0(%arg0: !hc_front.value):
+    // expected-error@+1 {{return operand was not lowered before use}}
+    hc_front.return %arg0
+  }
+}
+
+// -----
+
 // Unknown binop kind — `Pow` and friends are unsupported today.
 module {
   hc_front.kernel "bad_binop" attributes {

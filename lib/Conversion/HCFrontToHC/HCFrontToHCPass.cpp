@@ -626,9 +626,13 @@ private:
 
   LogicalResult lowerOp(Operation *op);
 
-  Value lowerValueOperand(Value v);
-  SmallVector<Value> lowerValueOperands(ValueRange vs);
-  FailureOr<SmallVector<Value>> expandTupleOperand(Value v);
+  FailureOr<Value> lowerValueOperand(Value v, Operation *consumer,
+                                     StringRef role = "operand");
+  FailureOr<SmallVector<Value>> lowerValueOperands(ValueRange vs,
+                                                   Operation *consumer,
+                                                   StringRef role = "operand");
+  FailureOr<SmallVector<Value>> expandTupleOperand(Value v, Operation *consumer,
+                                                   StringRef role);
   FailureOr<SmallVector<Value>> lowerReturnValues(hc_front::ReturnOp op);
 
   // Per-op lowering entry points. `Value`-returning variants write into
@@ -1073,22 +1077,27 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return valueMap[s.getResult()] ? success() : failure();
   }
   if (auto t = dyn_cast<hc_front::TupleOp>(op)) {
-    SmallVector<Value> elts = lowerValueOperands(t.getElements());
-    if (llvm::any_of(elts, [](Value v) { return !v; }))
+    FailureOr<SmallVector<Value>> elts =
+        lowerValueOperands(t.getElements(), op, "tuple element");
+    if (failed(elts))
+      return failure();
+    if (llvm::any_of(*elts, [](Value v) { return !v; }))
       return t.emitOpError("tuple element did not lower to an hc value");
-    tupleElts[t.getResult()] = elts;
+    tupleElts[t.getResult()] = *elts;
     SmallVector<Type> elementTypes;
-    elementTypes.reserve(elts.size());
-    for (Value elt : elts)
+    elementTypes.reserve(elts->size());
+    for (Value elt : *elts)
       elementTypes.push_back(elt.getType());
     Type tupleType = TupleType::get(op->getContext(), elementTypes);
     valueMap[t.getResult()] =
-        HCTupleOp::create(builder, op->getLoc(), tupleType, elts);
+        HCTupleOp::create(builder, op->getLoc(), tupleType, *elts);
     return success();
   }
   if (auto k = dyn_cast<hc_front::KeywordOp>(op)) {
-    Value v = lowerValueOperand(k.getValue());
-    keywordInfo[k.getResult()] = {k.getName(), k.getValue(), v};
+    FailureOr<Value> v = lowerValueOperand(k.getValue(), op, "keyword value");
+    if (failed(v))
+      return failure();
+    keywordInfo[k.getResult()] = {k.getName(), k.getValue(), *v};
     valueMap[k.getResult()] = Value();
     return success();
   }
@@ -1101,31 +1110,46 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
 // names, attr chains) — new consumers must either treat it as
 // consumed-by-parent or null-check and diagnose; binding it into a scope or
 // handing it to an hc op builder silently produces bad IR.
-Value Lowerer::lowerValueOperand(Value v) {
+FailureOr<Value> Lowerer::lowerValueOperand(Value v, Operation *consumer,
+                                            StringRef role) {
   auto it = valueMap.find(v);
-  assert(it != valueMap.end() && "operand was not yet lowered; walk order bug");
+  if (it == valueMap.end()) {
+    consumer->emitOpError(role)
+        << " was not lowered before use; producer appears later or outside "
+           "the converted region";
+    return failure();
+  }
   return it->second;
 }
 
-SmallVector<Value> Lowerer::lowerValueOperands(ValueRange vs) {
+FailureOr<SmallVector<Value>> Lowerer::lowerValueOperands(ValueRange vs,
+                                                          Operation *consumer,
+                                                          StringRef role) {
   SmallVector<Value> out;
   out.reserve(vs.size());
-  for (Value v : vs)
-    out.push_back(lowerValueOperand(v));
+  for (Value v : vs) {
+    FailureOr<Value> lowered = lowerValueOperand(v, consumer, role);
+    if (failed(lowered))
+      return failure();
+    out.push_back(*lowered);
+  }
   return out;
 }
 
-FailureOr<SmallVector<Value>> Lowerer::expandTupleOperand(Value v) {
+FailureOr<SmallVector<Value>>
+Lowerer::expandTupleOperand(Value v, Operation *consumer, StringRef role) {
   // Only source tuple literals expand here. This is for HC ops whose syntax is
   // genuinely variadic, such as `a[i, j]`; a first-class tuple value should
   // remain a singleton operand everywhere else.
   auto it = tupleElts.find(v);
   if (it != tupleElts.end())
     return it->second;
-  Value lowered = lowerValueOperand(v);
-  if (!lowered)
+  FailureOr<Value> lowered = lowerValueOperand(v, consumer, role);
+  if (failed(lowered))
     return failure();
-  return SmallVector<Value>{lowered};
+  if (!*lowered)
+    return failure();
+  return SmallVector<Value>{*lowered};
 }
 
 FailureOr<SmallVector<Value>>
@@ -1133,10 +1157,13 @@ Lowerer::lowerReturnValues(hc_front::ReturnOp op) {
   SmallVector<Value> values;
   values.reserve(op.getValues().size());
   for (Value value : op.getValues()) {
-    Value lowered = lowerValueOperand(value);
-    if (!lowered)
+    FailureOr<Value> lowered =
+        lowerValueOperand(value, op.getOperation(), "return operand");
+    if (failed(lowered))
+      return failure();
+    if (!*lowered)
       return op.emitOpError("return operand did not lower");
-    values.push_back(lowered);
+    values.push_back(*lowered);
   }
   return values;
 }
@@ -1261,8 +1288,14 @@ Value Lowerer::lowerConstant(hc_front::ConstantOp op) {
 }
 
 Value Lowerer::lowerBinop(hc_front::BinOp op) {
-  Value lhs = lowerValueOperand(op.getLhs());
-  Value rhs = lowerValueOperand(op.getRhs());
+  FailureOr<Value> lhsOr =
+      lowerValueOperand(op.getLhs(), op.getOperation(), "lhs");
+  FailureOr<Value> rhsOr =
+      lowerValueOperand(op.getRhs(), op.getOperation(), "rhs");
+  if (failed(lhsOr) || failed(rhsOr))
+    return nullptr;
+  Value lhs = *lhsOr;
+  Value rhs = *rhsOr;
   if (!lhs || !rhs) {
     StringRef which =
         !lhs && !rhs ? StringRef("lhs+rhs") : (!lhs ? "lhs" : "rhs");
@@ -1288,7 +1321,15 @@ Value Lowerer::lowerSlice(hc_front::SliceOp op) {
   bool hasUpper = boolAttr("has_upper");
   bool hasStep = boolAttr("has_step");
 
-  SmallVector<Value> parts = lowerValueOperands(op.getParts());
+  FailureOr<SmallVector<Value>> partsOr =
+      lowerValueOperands(op.getParts(), op.getOperation(), "slice operand");
+  if (failed(partsOr))
+    return nullptr;
+  SmallVector<Value> parts = std::move(*partsOr);
+  if (llvm::any_of(parts, [](Value v) { return !v; })) {
+    op.emitOpError("slice operand did not lower to an hc value");
+    return nullptr;
+  }
   size_t expected = unsigned(hasLower) + unsigned(hasUpper) + unsigned(hasStep);
   if (parts.size() != expected) {
     op.emitOpError("slice operand count ")
@@ -1330,7 +1371,11 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   auto nameAttr = [&](StringRef n) { return StringAttr::get(ctx, n); };
 
   if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
-    Value value = lowerValueOperand(rhs);
+    FailureOr<Value> valueOr =
+        lowerValueOperand(rhs, op.getOperation(), "assignment rhs");
+    if (failed(valueOr))
+      return failure();
+    Value value = *valueOr;
     if (!value)
       return op.emitOpError("rhs for '") << tn.getName()
                                          << "' did not lower to an hc value; "
@@ -1346,7 +1391,11 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
     // `a, = scalar` does not silently become scalar assignment.
     size_t arity = tt.getElements().size();
     SmallVector<Value> sources;
-    Value value = lowerValueOperand(rhs);
+    FailureOr<Value> valueOr =
+        lowerValueOperand(rhs, op.getOperation(), "tuple-unpack rhs");
+    if (failed(valueOr))
+      return failure();
+    Value value = *valueOr;
     Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
     if (rhsOp && rhsOp->getNumResults() == arity && arity != 1) {
       sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
@@ -1379,15 +1428,24 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
   }
 
   if (auto ts = dyn_cast_if_present<hc_front::TargetSubscriptOp>(target)) {
-    Value value = lowerValueOperand(rhs);
+    FailureOr<Value> valueOr =
+        lowerValueOperand(rhs, op.getOperation(), "store source");
+    if (failed(valueOr))
+      return failure();
+    Value value = *valueOr;
     if (!value)
       return op.emitOpError("store source did not lower to an hc value");
-    Value base = lowerValueOperand(ts.getBase());
+    FailureOr<Value> baseOr = lowerValueOperand(ts.getBase(), op.getOperation(),
+                                                "target_subscript base");
+    if (failed(baseOr))
+      return failure();
+    Value base = *baseOr;
     if (!base)
       return op.emitOpError("target_subscript base is unresolved");
     SmallVector<Value> indices;
     for (Value idx : ts.getIndices()) {
-      FailureOr<SmallVector<Value>> expanded = expandTupleOperand(idx);
+      FailureOr<SmallVector<Value>> expanded =
+          expandTupleOperand(idx, op.getOperation(), "target_subscript index");
       if (failed(expanded))
         return op.emitOpError("target_subscript index did not lower");
       indices.append(expanded->begin(), expanded->end());
@@ -1438,7 +1496,13 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   // Python-style `range(stop)` / `range(start, stop)` / `range(start, stop,
   // step)`: pad the missing parts with the canonical defaults so the
   // `hc.for_range` op always sees three operands.
-  SmallVector<Value> rangeArgs = lowerValueOperands(iterCall.getArguments());
+  FailureOr<SmallVector<Value>> rangeArgsOr = lowerValueOperands(
+      iterCall.getArguments(), op.getOperation(), "range argument");
+  if (failed(rangeArgsOr))
+    return failure();
+  SmallVector<Value> rangeArgs = std::move(*rangeArgsOr);
+  if (llvm::any_of(rangeArgs, [](Value v) { return !v; }))
+    return iterCall.emitOpError("range argument did not lower to an hc value");
   Value lo, hi, step;
   if (rangeArgs.size() == 1) {
     lo = HCConstOp::create(
@@ -1573,7 +1637,11 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
     auto nameAttr = dict.getAs<StringAttr>("name");
     if (!nameAttr)
       return op.emitOpError("parameters entry missing `name`");
-    Value loweredArg = lowerValueOperand(arg);
+    FailureOr<Value> loweredArgOr =
+        lowerValueOperand(arg, op.getOperation(), "inline argument");
+    if (failed(loweredArgOr))
+      return failure();
+    Value loweredArg = *loweredArgOr;
     if (!loweredArg) {
       return op.emitOpError("inline argument for param `")
              << nameAttr.getValue() << "' did not lower to an hc value";
@@ -1600,7 +1668,11 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
       resultValues.clear();
       resultValues.reserve(r.getValues().size());
       for (Value v : r.getValues()) {
-        Value lowered = lowerValueOperand(v);
+        FailureOr<Value> loweredOr = lowerValueOperand(
+            v, r.getOperation(), "inlined_region return operand");
+        if (failed(loweredOr))
+          return failure();
+        Value lowered = *loweredOr;
         if (!lowered) {
           return r.emitOpError("inlined_region return operand did not lower");
         }
@@ -1819,7 +1891,11 @@ FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
       args.kwvalues[kwName] = kwVal;
       continue;
     }
-    Value lowered = lowerValueOperand(arg);
+    FailureOr<Value> loweredOr =
+        lowerValueOperand(arg, op.getOperation(), "call argument");
+    if (failed(loweredOr))
+      return failure();
+    Value lowered = *loweredOr;
     if (!lowered) {
       op.emitOpError("call argument did not lower to an hc value");
       return failure();
@@ -2093,7 +2169,11 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   if (ref.getKind() == "numpy_dtype_type")
     return lowerNumpyDtypeCall(call, ref, args);
 
-  Value base = lowerValueOperand(attr.getBase());
+  FailureOr<Value> baseOr =
+      lowerValueOperand(attr.getBase(), call.getOperation(), "method base");
+  if (failed(baseOr))
+    return failure();
+  Value base = *baseOr;
 
   if (method == "vec" || method == "with_inactive" || method == "astype")
     return lowerUnaryBaseMethod(call, method, base, args);
@@ -2142,7 +2222,8 @@ FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
   if (typed)
     return {
         HCConstOp::create(builder, call.getLoc(), undef, typed).getResult()};
-  return lowerValueOperand(call.getCallee());
+  return lowerValueOperand(call.getCallee(), call.getOperation(),
+                           "dtype callee");
 }
 
 FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
@@ -2419,8 +2500,16 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
     // `hc.buffer_view` path.
     StringRef method = attr.getName();
     if (op.getIndices().size() == 1) {
-      Value idxVal = lowerValueOperand(op.getIndices().front());
-      Value baseVal = lowerValueOperand(attr.getBase());
+      FailureOr<Value> idxValOr = lowerValueOperand(
+          op.getIndices().front(), op.getOperation(), "subscript index");
+      if (failed(idxValOr))
+        return nullptr;
+      FailureOr<Value> baseValOr = lowerValueOperand(
+          attr.getBase(), op.getOperation(), "subscript base");
+      if (failed(baseValOr))
+        return nullptr;
+      Value idxVal = *idxValOr;
+      Value baseVal = *baseValOr;
       auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
       auto ax =
           constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
@@ -2450,8 +2539,16 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
       StringRef method = attr.getName();
       if (isLaunchGeoMethod(method) && call.getArguments().empty() &&
           op.getIndices().size() == 1) {
-        Value idxVal = lowerValueOperand(op.getIndices().front());
-        Value launchGeo = lowerValueOperand(call.getResult());
+        FailureOr<Value> idxValOr = lowerValueOperand(
+            op.getIndices().front(), op.getOperation(), "subscript index");
+        if (failed(idxValOr))
+          return nullptr;
+        FailureOr<Value> launchGeoOr = lowerValueOperand(
+            call.getResult(), op.getOperation(), "launch-geo call result");
+        if (failed(launchGeoOr))
+          return nullptr;
+        Value idxVal = *idxValOr;
+        Value launchGeo = *launchGeoOr;
         auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
         auto ax =
             constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
@@ -2465,14 +2562,19 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
     }
   }
 
-  Value base = lowerValueOperand(op.getBase());
+  FailureOr<Value> baseOr =
+      lowerValueOperand(op.getBase(), op.getOperation(), "subscript base");
+  if (failed(baseOr))
+    return nullptr;
+  Value base = *baseOr;
   if (!base) {
     op.emitOpError("subscript base did not lower");
     return nullptr;
   }
   SmallVector<Value> indices;
   for (Value idx : op.getIndices()) {
-    FailureOr<SmallVector<Value>> expanded = expandTupleOperand(idx);
+    FailureOr<SmallVector<Value>> expanded =
+        expandTupleOperand(idx, op.getOperation(), "subscript index");
     if (failed(expanded)) {
       op.emitOpError("subscript index did not lower");
       return nullptr;

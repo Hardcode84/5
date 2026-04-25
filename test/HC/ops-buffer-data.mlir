@@ -60,7 +60,8 @@ hc.func @helper {
 // CHECK-SAME: (!hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.store %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}}
 // CHECK: hc.vec %{{.*}} : !hc.undef -> !hc.undef
-// CHECK: hc.with_inactive %{{.*}} {inactive = 0.000000e+00 : f32} : !hc.undef -> !hc.undef
+// CHECK: %[[INACTIVE:.*]] = hc.const<0.000000e+00 : f32> : f32
+// CHECK: hc.with_inactive %{{.*}}, %[[INACTIVE]] : (!hc.undef, f32) -> !hc.undef
 // CHECK: hc.as_layout %{{.*}}, layout = row_major : !hc.undef -> !hc.undef
 // CHECK: hc.as_layout %{{.*}}, layout = col_major : !hc.undef -> !hc.undef
 func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
@@ -72,8 +73,9 @@ func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
   hc.store %buf[%i, %j], %v
       : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
   %vec2 = hc.vec %t : !hc.undef -> !hc.undef
-  %masked = hc.with_inactive %v {inactive = 0.0 : f32}
-      : !hc.undef -> !hc.undef
+  %inactive = hc.const<0.0 : f32> : f32
+  %masked = hc.with_inactive %v, %inactive
+      : (!hc.undef, f32) -> !hc.undef
   %reshaped = hc.as_layout %v, layout = row_major : !hc.undef -> !hc.undef
   %transposed = hc.as_layout %v, layout = col_major : !hc.undef -> !hc.undef
   return

@@ -1145,13 +1145,10 @@ LogicalResult HCAsTypeOp::verify() {
 }
 
 LogicalResult HCWithInactiveOp::verify() {
-  // `$inactive` is a scalar literal attribute; its numeric kind must agree
-  // with the masked value's element domain. The check runs only once
-  // inference pins the operand to a shaped type with an element; pre-
-  // inference `!hc.undef` operands skip straight to success so the op
-  // remains usable out of the mechanical frontend pass.
+  // `$inactive` is a scalar SSA value; once inference gives both operands
+  // meaningful domains, it must agree with the masked value's element type.
   Type value = getValue().getType();
-  if (isHCUndefType(value) || value.isIntOrIndexOrFloat())
+  if (isHCUndefType(value))
     return success();
   Type elem;
   if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(value))
@@ -1160,18 +1157,20 @@ LogicalResult HCWithInactiveOp::verify() {
     elem = vec.getElementType();
   if (!elem || isHCUndefType(elem))
     return success();
-  Attribute inactive = getInactiveAttr();
-  auto sameDomain = [&](Attribute a) -> bool {
-    if (llvm::isa<BoolAttr>(a))
+  Type inactive = getInactive().getType();
+  if (isHCUndefType(inactive))
+    return success();
+  auto sameDomain = [&](Type t) -> bool {
+    if (llvm::isa<PredType>(t))
       return elem.isInteger(1);
-    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(a))
-      return elem == intAttr.getType();
-    if (auto floatAttr = llvm::dyn_cast<FloatAttr>(a))
-      return elem == floatAttr.getType();
+    if (llvm::isa<IdxType>(t))
+      return elem.isIntOrIndex();
+    if (t.isIntOrIndexOrFloat())
+      return elem == t;
     return false;
   };
   if (!sameDomain(inactive))
-    return emitOpError("inactive literal ")
+    return emitOpError("inactive value type ")
            << inactive << " does not match element type " << elem;
   return success();
 }

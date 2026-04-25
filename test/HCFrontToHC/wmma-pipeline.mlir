@@ -69,7 +69,7 @@
 // CHECK: hc.local_id {{.*}} : (!hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
 // CHECK: hc.buffer_view
 // CHECK: hc.vec {{.*}} : !hc.undef -> !hc.undef
-// CHECK: hc.with_inactive {{.*}} {inactive = 0.000000e+00 : f16} : !hc.undef -> !hc.undef
+// CHECK: hc.with_inactive {{.*}}, %{{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 
 // CHECK-LABEL: hc.func @load_wmma_b_fragment
 // CHECK-SAME: (%{{.*}}: !hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>
@@ -77,7 +77,7 @@
 // CHECK: hc.local_id {{.*}} : (!hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
 // CHECK: hc.buffer_view
 // CHECK: hc.vec {{.*}} : !hc.undef -> !hc.undef
-// CHECK: hc.with_inactive {{.*}} {inactive = 0.000000e+00 : f16} : !hc.undef -> !hc.undef
+// CHECK: hc.with_inactive {{.*}}, %{{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 
 // CHECK-LABEL: hc.intrinsic @wmma_gfx11
 // CHECK-SAME: -> !hc.undef

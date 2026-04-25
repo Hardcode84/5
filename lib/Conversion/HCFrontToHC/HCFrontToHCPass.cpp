@@ -2400,8 +2400,8 @@ FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
   // classified as `numpy_dtype_type`. The attr's `ref.dtype` names
   // the destination type; the single positional literal supplies the
   // payload. Emit a fresh `hc.const` carrying a typed `FloatAttr` /
-  // `IntegerAttr` so consumers like `hc.with_inactive` that require a
-  // numeric literal (not a `TypeAttr`) verify cleanly.
+  // `IntegerAttr` so consumers like `hc.with_inactive` receive an ordinary
+  // scalar SSA value (not a dtype handle).
   //
   // Degradation path: no positional arg still means "the dtype handle",
   // and an uncoercible literal (NaN/Inf or out-of-range float -> int) still
@@ -2462,11 +2462,9 @@ FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
       call.emitOpError("with_inactive missing `value=` kwarg");
       return failure();
     }
-    Attribute inactive;
-    if (auto constOp = valIt->second.getDefiningOp<HCConstOp>())
-      inactive = constOp.getValue();
+    Value inactive = valIt->second;
     if (!inactive) {
-      call.emitOpError("with_inactive value must be an hc.const");
+      call.emitOpError("with_inactive value did not lower to an hc value");
       return failure();
     }
     return {

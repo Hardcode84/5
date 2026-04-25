@@ -380,11 +380,12 @@ module {
 
 // -----
 
-// CHECK: error: 'hc.with_inactive' op inactive literal 0.000000e+00 : f32 does not match element type 'i32'
+// CHECK: error: 'hc.with_inactive' op inactive value type 'f32' does not match element type 'i32'
 module {
   func.func @bad(%v: !hc.tensor<i32, ["M"]>) -> !hc.tensor<i32, ["M"]> {
-    %r = hc.with_inactive %v {inactive = 0.0 : f32}
-        : !hc.tensor<i32, ["M"]> -> !hc.tensor<i32, ["M"]>
+    %inactive = hc.const<0.0 : f32> : f32
+    %r = hc.with_inactive %v, %inactive
+        : (!hc.tensor<i32, ["M"]>, f32) -> !hc.tensor<i32, ["M"]>
     return %r : !hc.tensor<i32, ["M"]>
   }
 }

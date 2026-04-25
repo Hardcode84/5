@@ -641,7 +641,9 @@ LogicalResult HCVecOp::inferHCTypes(ArrayRef<Type> operandTypes,
 LogicalResult
 HCWithInactiveOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                SmallVectorImpl<Type> &resultTypes) {
-  resultTypes.push_back(operandTypes.empty() ? Type{} : operandTypes.front());
+  if (failed(requireOperandCount(*this, operandTypes, 2)))
+    return failure();
+  resultTypes.push_back(operandTypes.front());
   return success();
 }
 

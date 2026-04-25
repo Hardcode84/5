@@ -738,23 +738,20 @@ def HCVecOp : HC_Op<"vec",
 
 def HCWithInactiveOp : HC_Op<"with_inactive",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
-  let summary = "Replace inactive (masked-out) elements with a literal value.";
+  let summary = "Replace inactive (masked-out) elements with an SSA value.";
   let description = [{
-    `$inactive` is carried in the attribute dict so later passes can pattern
-    match on its payload without worrying about operand discovery. The
-    payload must be a typed scalar literal (int, float, or bool) whose
-    numeric domain matches the value's element type once inference pins it;
+    `$inactive` is an ordinary scalar operand. When inference pins both
+    operands, its numeric domain must match the shaped value's element domain;
     pre-inference `!hc.undef` operands skip the check.
   }];
   let arguments = (ins
     HC_ShapedValueType:$value,
-    AnyAttrOf<[I1Attr, I8Attr, I16Attr, I32Attr, I64Attr,
-               F16Attr, F32Attr, F64Attr, IndexAttr, BoolAttr]>:$inactive
+    HC_ScalarValueType:$inactive
   );
   let results = (outs HC_ShapedValueType:$result);
   let hasVerifier = 1;
   let assemblyFormat =
-      "$value attr-dict `:` type($value) `->` type($result)";
+      "$value `,` $inactive attr-dict `:` functional-type(operands, results)";
 }
 
 def HCAsLayoutOp : HC_Op<"as_layout",

@@ -24,7 +24,8 @@ module {
   } {
     // CHECK: hc.buffer_view
     // CHECK: %[[V:.*]] = hc.vec %{{.*}} : !hc.undef -> !hc.undef
-    // CHECK: hc.with_inactive %[[V]] {inactive = 0 : i64}
+    // CHECK: %[[FILL:.*]] = hc.const<0 : i64> : !hc.undef
+    // CHECK: hc.with_inactive %[[V]], %[[FILL]] : (!hc.undef, !hc.undef) -> !hc.undef
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %zero = hc_front.constant<0 : i64>
     %one = hc_front.constant<1 : i64>
@@ -66,7 +67,7 @@ module {
   // `np.<dtype>(lit)` as a value-constructor callee: the call folds
   // the `ref.dtype` from the attr with the integer/float payload of
   // the positional literal, emitting a typed `hc.const` — `f16` zero
-  // here — so consumers that need a numeric scalar (like
+  // here — so consumers that need a numeric scalar SSA value (like
   // `hc.with_inactive`'s `$inactive`) pick up a real payload instead
   // of a dtype handle. The dtype-only `hc.const<f16>` materialized by
   // `lowerAttr` stays in the IR (the `np.float16` attr access may

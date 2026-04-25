@@ -217,6 +217,17 @@ def HC_NumericValueType : AnyTypeOf<[
   Index,
 ]>;
 
+// Scalar numeric/symbolic values. Used for operands such as inactive fills
+// that must be ordinary SSA values but never shaped aggregates.
+def HC_ScalarValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_IdxType,
+  HC_PredType,
+  AnyInteger,
+  AnyFloat,
+  Index,
+]>;
+
 // Shaped values for ops that only make sense on tensors/vectors
 // (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
 // `!hc.undef` is admitted for the same pre-inference reason as above.

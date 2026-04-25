@@ -41,6 +41,33 @@ class HC_GenericUnaryOp<string mnemonic, list<Trait> traits = [],
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
+class HCBranchCompatibleTypes<string lhs, string rhs> : TypesMatchWith<
+    lhs # " and " # rhs # " have branch-compatible types",
+    lhs, rhs, "$_self",
+    [{
+      [](::mlir::TypeRange lhsTypes, ::mlir::TypeRange rhsTypes) {
+        return ::llvm::equal(
+            lhsTypes, rhsTypes,
+            [](::mlir::Type lhsType, ::mlir::Type rhsType) {
+              if (lhsType == rhsType ||
+                  ::llvm::isa<::mlir::hc::UndefType>(lhsType) ||
+                  ::llvm::isa<::mlir::hc::UndefType>(rhsType))
+                return true;
+              if (auto joinable =
+                      ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
+                          lhsType))
+                if (joinable.joinHCType(rhsType))
+                  return true;
+              if (auto joinable =
+                      ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
+                          rhsType))
+                if (joinable.joinHCType(lhsType))
+                  return true;
+              return false;
+            });
+      }
+    }]>;
+
 def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
   let summary = "Semantic kernel region.";
   let description = [{
@@ -429,6 +456,7 @@ def HCRegionReturnOp : HC_Op<"region_return",
 
 def HCForRangeOp : HC_Op<"for_range",
     [SingleBlockImplicitTerminator<"HCYieldOp">,
+     HCBranchCompatibleTypes<"iter_results", "iter_inits">,
      DeclareOpInterfaceMethods<RegionBranchOpInterface,
                                ["getEntrySuccessorOperands",
                                 "getSuccessorInputs",
@@ -459,7 +487,8 @@ def HCForRangeOp : HC_Op<"for_range",
   let assemblyFormat = [{
     $lower `to` $upper `step` $step
     (`iter_args` `(` $iter_inits^ `)`)? attr-dict `:`
-    functional-type(operands, results) $body
+    `(` type($lower) `,` type($upper) `,` type($step) `)`
+    (`->` `(` type($iter_results)^ `)`)? $body
   }];
 }
 

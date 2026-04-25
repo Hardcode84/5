@@ -52,7 +52,7 @@ hc.kernel @for_body_name_store {
   %step = hc.const<1 : i64> : !hc.undef
   %init = hc.const<0 : i64> : !hc.undef
   hc.assign "acc", %init : !hc.undef
-  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) {
     ^bb0(%iv: !hc.undef):
     %prev = hc.name_load "acc" : !hc.undef
     %next = hc.add %prev, %iv : (!hc.undef, !hc.undef) -> !hc.undef

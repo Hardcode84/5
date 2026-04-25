@@ -64,7 +64,7 @@ module {
     %acc = hc_front.target_name "acc"
     hc_front.assign %acc = %inc
 
-    // CHECK: hc.for_range {{.*}} to {{.*}} step {{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> ()
+    // CHECK: hc.for_range {{.*}} to {{.*}} step {{.*}} : (!hc.undef, !hc.undef, !hc.undef)
     // CHECK: ^bb0(%arg{{.*}}: !hc.undef):
     hc_front.for {
       %i = hc_front.target_name "i"

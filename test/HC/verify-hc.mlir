@@ -74,7 +74,7 @@ module {
   func.func @bad(%lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef,
                  %init: !hc.undef) {
     %r = hc.for_range %lo to %hi step %step iter_args(%init)
-        : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef {
+        : (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef) {
     ^bb0(%i: !hc.undef):
       hc.yield %init : !hc.undef
     }
@@ -129,7 +129,7 @@ module {
   func.func @bad(%lo: !hc.undef, %hi: !hc.undef, %st: !hc.undef,
                  %init: !hc.undef) -> !hc.undef {
     %r = hc.for_range %lo to %hi step %st iter_args(%init)
-        : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef {
+        : (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef) {
     ^bb0(%i: !hc.undef, %acc: !hc.undef):
       hc.yield
     }
@@ -143,7 +143,7 @@ module {
 module {
   func.func @bad(%lo: i32, %hi: i32, %st: i32, %init: i32) -> i32 {
     %r = hc.for_range %lo to %hi step %st iter_args(%init)
-        : (i32, i32, i32, i32) -> i32 {
+        : (i32, i32, i32) -> (i32) {
     ^bb0(%i: i32, %acc: i64):
       hc.yield %acc : i64
     }

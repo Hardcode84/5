@@ -33,7 +33,7 @@ hc.func @for_range_iv {
   %lo = hc.const<0 : i64> : !hc.undef
   %hi = hc.const<4 : i64> : !hc.undef
   %step = hc.const<1 : i64> : !hc.undef
-  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %one = hc.const<1 : i64> : !hc.undef
     %next = hc.add %iv, %one : (!hc.undef, !hc.undef) -> !hc.undef
@@ -46,7 +46,7 @@ hc.func @for_range_iv {
 
 // CHECK-LABEL: hc.func @region_branch_results
 // CHECK: hc.for_range
-// CHECK-SAME: -> !hc.idx
+// CHECK-SAME: -> (!hc.idx)
 // CHECK: ^bb0(%{{[^:]+}}: !hc.idx, %{{[^:]+}}: !hc.idx):
 // CHECK: hc.yield {{.*}} : !hc.idx
 // CHECK: hc.if {{.*}} -> (!hc.idx) : i1
@@ -56,7 +56,7 @@ hc.func @region_branch_results(%cond: i1) {
   %step = hc.const<1 : i64> : !hc.undef
   %init = hc.const<0 : i64> : !hc.undef
   %loop = hc.for_range %lo to %hi step %step iter_args(%init)
-      : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> (!hc.undef) {
+      : (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef) {
   ^bb0(%iv: !hc.undef, %acc: !hc.undef):
     %one = hc.const<1 : i64> : !hc.undef
     %next = hc.add %acc, %one : (!hc.undef, !hc.undef) -> !hc.undef

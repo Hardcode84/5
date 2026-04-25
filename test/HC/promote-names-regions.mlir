@@ -23,7 +23,7 @@
 // CHECK-NOT: hc.assign
 // CHECK-NOT: hc.name_load
 // CHECK: %[[RES:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%arg3) :
-// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef)
 // CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %[[ACC:.*]]: !hc.undef):
 // CHECK:        %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
 // CHECK:        hc.yield %[[SUM]]
@@ -33,7 +33,7 @@ hc.func @for_range_accumulator(%lo: !hc.undef, %hi: !hc.undef,
                                %init: !hc.undef) -> !hc.undef {
   hc.assign "acc", %init : !hc.undef
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %prev = hc.name_load "acc" : !hc.undef
     %next = hc.add %prev, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -143,7 +143,7 @@ hc.func @nested_if_in_for(%lo: !hc.undef, %hi: !hc.undef,
                           %cond: !hc.undef) -> !hc.undef {
   hc.assign "acc", %init : !hc.undef
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %cur = hc.name_load "acc" : !hc.undef
     hc.if %cond : !hc.undef {
@@ -181,7 +181,7 @@ hc.func @nested_for_in_if(%lo: !hc.undef, %hi: !hc.undef,
   hc.assign "acc", %init : !hc.undef
   hc.if %cond : !hc.undef {
     hc.for_range %lo to %hi step %step
-        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+        : (!hc.undef, !hc.undef, !hc.undef) {
     ^bb0(%iv: !hc.undef):
       %cur = hc.name_load "acc" : !hc.undef
       %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -214,7 +214,7 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
   hc.assign "acc", %init : !hc.undef
   hc.assign "limit", %lim : !hc.undef
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %cur = hc.name_load "acc" : !hc.undef
     %l = hc.name_load "limit" : !hc.undef
@@ -245,7 +245,7 @@ hc.func @for_range_readonly_name(%lo: !hc.undef, %hi: !hc.undef,
 hc.func @for_range_loop_local_temp(%lo: !hc.undef, %hi: !hc.undef,
                                    %step: !hc.undef) {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %x = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
     hc.assign "t", %x : !hc.undef
@@ -279,7 +279,7 @@ hc.func @for_range_mixed_local_and_accumulator(
     %init: !hc.undef) -> !hc.undef {
   hc.assign "acc", %init : !hc.undef
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %dbl = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
     hc.assign "tmp", %dbl : !hc.undef
@@ -310,7 +310,7 @@ hc.func @for_range_mixed_local_and_accumulator(
 hc.func @for_range_write_first_assign_only(%lo: !hc.undef, %hi: !hc.undef,
                                            %step: !hc.undef) {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %t = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
     hc.assign "t", %t : !hc.undef
@@ -339,7 +339,7 @@ hc.func @for_range_write_first_assign_only(%lo: !hc.undef, %hi: !hc.undef,
 hc.func @for_range_two_write_first_locals(%lo: !hc.undef, %hi: !hc.undef,
                                           %step: !hc.undef) -> !hc.undef {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %a = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
     hc.assign "a", %a : !hc.undef
@@ -371,7 +371,7 @@ hc.func @for_range_two_write_first_locals(%lo: !hc.undef, %hi: !hc.undef,
 hc.func @for_range_iv_shadow_with_write_first_local(
     %lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef) -> !hc.undef {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     hc.assign "i", %iv : !hc.undef
     %shadow = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -402,7 +402,7 @@ hc.func @for_range_write_first_zero_trip_observed(%bound: !hc.undef,
                                                   %step: !hc.undef)
     -> !hc.undef {
   hc.for_range %bound to %bound step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %t = hc.add %iv, %iv : (!hc.undef, !hc.undef) -> !hc.undef
     hc.assign "t", %t : !hc.undef
@@ -454,7 +454,7 @@ hc.kernel @subgroup_nested_local_for(%lo: !hc.undef, %hi: !hc.undef,
   hc.subgroup_region {
     hc.assign "acc", %init : !hc.undef
     hc.for_range %lo to %hi step %step
-        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+        : (!hc.undef, !hc.undef, !hc.undef) {
     ^bb0(%iv: !hc.undef):
       %cur = hc.name_load "acc" : !hc.undef
       %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -582,7 +582,7 @@ hc.func @workitem_capturing_for(%lo: !hc.undef, %hi: !hc.undef,
   hc.assign "acc", %init : !hc.undef
   hc.workitem_region {
     hc.for_range %lo to %hi step %step
-        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+        : (!hc.undef, !hc.undef, !hc.undef) {
     ^bb0(%iv: !hc.undef):
       %cur = hc.name_load "acc" : !hc.undef
       %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -725,7 +725,7 @@ hc.func @subgroup_return_after_inner_for(%lo: !hc.undef, %hi: !hc.undef,
   hc.subgroup_region {
     hc.assign "acc", %init : !hc.undef
     hc.for_range %lo to %hi step %step
-        : (!hc.undef, !hc.undef, !hc.undef) -> () {
+        : (!hc.undef, !hc.undef, !hc.undef) {
     ^bb0(%iv: !hc.undef):
       %cur = hc.name_load "acc" : !hc.undef
       %next = hc.add %cur, %iv : (!hc.undef, !hc.undef) -> !hc.undef
@@ -840,7 +840,7 @@ hc.func @workitem_return_passthrough(%outer: !hc.undef) -> !hc.undef {
 // CHECK-LABEL: hc.func @for_range_iv_self_bind
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
-// CHECK: hc.for_range %arg0 to %arg1 step %arg2 : (!hc.undef, !hc.undef, !hc.undef) -> ()
+// CHECK: hc.for_range %arg0 to %arg1 step %arg2 : (!hc.undef, !hc.undef, !hc.undef)
 // CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef):
 // CHECK:        hc.store %arg3[%[[IV]]], %[[IV]]
 // CHECK:      }
@@ -848,7 +848,7 @@ hc.func @workitem_return_passthrough(%outer: !hc.undef) -> !hc.undef {
 hc.func @for_range_iv_self_bind(%lo: !hc.undef, %hi: !hc.undef,
                                 %step: !hc.undef, %buf: !hc.undef) {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     hc.assign "i", %iv : !hc.undef
     %a = hc.name_load "i" : !hc.undef
@@ -870,7 +870,7 @@ hc.func @for_range_iv_self_bind(%lo: !hc.undef, %hi: !hc.undef,
 // CHECK-NOT: hc.name_load
 // CHECK-NOT: hc.assign
 // CHECK: %[[R:.*]] = hc.for_range %arg0 to %arg1 step %arg2 iter_args(%arg3) :
-// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef)
 // CHECK-NEXT: ^bb0(%[[IV:.*]]: !hc.undef, %[[ACC:.*]]: !hc.undef):
 // CHECK:        %[[SUM:.*]] = hc.add %[[ACC]], %[[IV]]
 // CHECK:        hc.yield %[[SUM]]
@@ -880,7 +880,7 @@ hc.func @for_range_iv_self_bind_with_acc(%lo: !hc.undef, %hi: !hc.undef,
                                          %init: !hc.undef) -> !hc.undef {
   hc.assign "acc", %init : !hc.undef
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     hc.assign "i", %iv : !hc.undef
     %cur = hc.name_load "acc" : !hc.undef

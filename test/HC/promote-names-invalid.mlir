@@ -38,7 +38,7 @@ hc.func @different_name(%a: !hc.undef) -> !hc.undef {
 hc.func @for_body_read_before_write(%lo: !hc.undef, %hi: !hc.undef,
                                     %step: !hc.undef) -> !hc.undef {
   // expected-error @+1 {{read of name 'acc' that has no reaching `hc.assign`}}
-  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) -> () {
+  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%iv: !hc.undef):
     %cur = hc.name_load "acc" : !hc.undef
     hc.yield

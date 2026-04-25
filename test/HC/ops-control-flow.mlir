@@ -32,11 +32,11 @@ func.func @undef_value_seed() -> !hc.undef {
 }
 
 // CHECK-LABEL: func.func @simple_for_range
-// CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> () {
+// CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) {
 // CHECK: }
 func.func @simple_for_range(%lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef) {
   hc.for_range %lo to %hi step %step
-      : (!hc.undef, !hc.undef, !hc.undef) -> () {
+      : (!hc.undef, !hc.undef, !hc.undef) {
   ^bb0(%i: !hc.undef):
     hc.yield
   }
@@ -45,14 +45,14 @@ func.func @simple_for_range(%lo: !hc.undef, %hi: !hc.undef, %step: !hc.undef) {
 
 // CHECK-LABEL: func.func @for_range_with_iter_args
 // CHECK: hc.for_range %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{.*}}) :
-// CHECK-SAME: (!hc.idx<"0">, !hc.idx<"N">, !hc.idx<"1">, !hc.undef) -> !hc.undef {
+// CHECK-SAME: (!hc.idx<"0">, !hc.idx<"N">, !hc.idx<"1">) -> (!hc.undef) {
 // CHECK:   hc.yield %{{.*}} : !hc.undef
 // CHECK: }
 func.func @for_range_with_iter_args(
     %lo: !hc.idx<"0">, %hi: !hc.idx<"N">, %step: !hc.idx<"1">,
     %init: !hc.undef) -> !hc.undef {
   %acc = hc.for_range %lo to %hi step %step iter_args(%init)
-      : (!hc.idx<"0">, !hc.idx<"N">, !hc.idx<"1">, !hc.undef) -> !hc.undef {
+      : (!hc.idx<"0">, !hc.idx<"N">, !hc.idx<"1">) -> (!hc.undef) {
   ^bb0(%i: !hc.idx, %sum: !hc.undef):
     hc.yield %sum : !hc.undef
   }

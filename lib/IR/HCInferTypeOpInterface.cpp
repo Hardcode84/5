@@ -16,14 +16,6 @@ using namespace mlir::hc;
 
 namespace {
 
-static Type unpinnedIdx(MLIRContext *ctx) {
-  return IdxType::get(ctx, ExprAttr{});
-}
-
-static Type unpinnedPred(MLIRContext *ctx) {
-  return PredType::get(ctx, PredAttr{});
-}
-
 static sym::Store &symbolStore(MLIRContext *ctx) {
   return ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
 }
@@ -150,7 +142,7 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
     std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
     std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
     if (!lhsExpr || !rhsExpr) {
-      resultTypes.push_back(unpinnedIdx(op->getContext()));
+      resultTypes.push_back(getUnpinnedIdxType(op->getContext()));
       return success();
     }
     FailureOr<ExprAttr> expr =
@@ -192,7 +184,7 @@ static LogicalResult inferIndexCmp(ArrayRef<Type> operands,
     std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
     std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
     if (!lhsExpr || !rhsExpr) {
-      resultTypes.push_back(unpinnedPred(op->getContext()));
+      resultTypes.push_back(getUnpinnedPredType(op->getContext()));
       return success();
     }
     FailureOr<PredAttr> pred =
@@ -221,10 +213,10 @@ static Type inferBufferDim(Type bufferType, int64_t axis, Operation *op) {
   ShapeAttr shape = getShapeAttrFromBuffer(bufferType);
   if (!shape || axis < 0 ||
       axis >= static_cast<int64_t>(shape.getDims().size()))
-    return unpinnedIdx(op->getContext());
+    return getUnpinnedIdxType(op->getContext());
   auto dim = dyn_cast<ExprAttr>(shape.getDims()[axis]);
   if (!dim)
-    return unpinnedIdx(op->getContext());
+    return getUnpinnedIdxType(op->getContext());
   return IdxType::get(op->getContext(), dim);
 }
 
@@ -248,7 +240,7 @@ static Type inferLoadLikeResult(Type sourceType, ShapeAttr shape,
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
                                               SmallVectorImpl<Type> &types) {
-  types.append(op.getNumResults(), unpinnedIdx(op.getContext()));
+  types.append(op.getNumResults(), getUnpinnedIdxType(op.getContext()));
   return success();
 }
 
@@ -459,8 +451,8 @@ HCForRangeOp::inferHCRegionArgTypes(RegionSuccessor successor,
     return success();
   for (Value input : nonSuccessorInputs) {
     Type type = input.getType();
-    regionArgTypes.push_back(isa<UndefType>(type) ? unpinnedIdx(getContext())
-                                                  : type);
+    regionArgTypes.push_back(
+        isa<UndefType>(type) ? Type(getUnpinnedIdxType(getContext())) : type);
   }
   return success();
 }

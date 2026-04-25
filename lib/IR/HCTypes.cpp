@@ -80,6 +80,14 @@ void HCDialect::registerTypes() {
       >();
 }
 
+IdxType mlir::hc::getUnpinnedIdxType(MLIRContext *ctx) {
+  return IdxType::get(ctx, ExprAttr{});
+}
+
+PredType mlir::hc::getUnpinnedPredType(MLIRContext *ctx) {
+  return PredType::get(ctx, PredAttr{});
+}
+
 mlir::LogicalResult
 mlir::hc::BufferType::verify(function_ref<InFlightDiagnostic()> emitError,
                              Type elementType, ShapeAttr shape) {
@@ -109,7 +117,7 @@ mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
 
 Type IdxType::parse(AsmParser &parser) {
   if (failed(parser.parseOptionalLess()))
-    return IdxType::get(parser.getContext(), ExprAttr{});
+    return getUnpinnedIdxType(parser.getContext());
 
   FailureOr<ExprAttr> expr =
       parseInlineOrAttrForm<ExprAttr, sym::ExprHandle, sym::parseExpr>(
@@ -132,13 +140,13 @@ Type IdxType::joinHCType(Type other) const {
   // Distinct symbolic facts widen to the unpinned idx type. Keeping a concrete
   // expression here would guess which control-flow predecessor won.
   if (isa<IdxType>(other))
-    return IdxType::get(getContext(), ExprAttr{});
+    return getUnpinnedIdxType(getContext());
   return {};
 }
 
 Type PredType::parse(AsmParser &parser) {
   if (failed(parser.parseOptionalLess()))
-    return PredType::get(parser.getContext(), PredAttr{});
+    return getUnpinnedPredType(parser.getContext());
 
   FailureOr<PredAttr> pred =
       parseInlineOrAttrForm<PredAttr, sym::PredHandle, sym::parsePred>(
@@ -161,6 +169,6 @@ Type PredType::joinHCType(Type other) const {
   // Predicates use the same conservative widening as idx expressions: preserve
   // the kind, drop the path-specific symbolic payload.
   if (isa<PredType>(other))
-    return PredType::get(getContext(), PredAttr{});
+    return getUnpinnedPredType(getContext());
   return {};
 }

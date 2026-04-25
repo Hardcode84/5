@@ -12,4 +12,11 @@
 #define GET_TYPEDEF_CLASSES
 #include "hc/IR/HCTypes.h.inc"
 
+namespace mlir::hc {
+
+IdxType getUnpinnedIdxType(MLIRContext *ctx);
+PredType getUnpinnedPredType(MLIRContext *ctx);
+
+} // namespace mlir::hc
+
 #endif // HC_IR_HCTYPES_H

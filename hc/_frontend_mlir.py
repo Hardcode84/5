@@ -36,6 +36,15 @@ _I64_MIN = -(1 << 63)
 _I64_MAX = (1 << 63) - 1
 _PASSING_POSITIONAL = "positional"
 _PASSING_KEYWORD_ONLY = "keyword_only"
+_ANNOTATION_LAUNCH_CONTEXTS = {
+    "CurrentGroup": "group",
+    "WorkItem": "workitem",
+    "SubGroup": "subgroup",
+}
+_SCOPE_LAUNCH_CONTEXTS = {
+    "WorkItem": "workitem",
+    "SubGroup": "subgroup",
+}
 
 
 class HCFrontEmitter:
@@ -211,7 +220,7 @@ class HCFrontEmitter:
             lambda loc: constructor(captures=captures, loc=loc),
             payload,
         )
-        self._set_region_metadata_attrs(op, payload)
+        self._set_region_metadata_attrs(op, payload, kind)
         self._frames.append(_OwnerFrame(kind=kind, op=op))
         self._blocks.append(op.body.blocks.append())
 
@@ -555,6 +564,7 @@ class HCFrontEmitter:
             op,
             payload.get("parameters"),
             payload.get("parameter_annotations"),
+            self._payload_launch_context(payload),
         )
         self._set_optional_string_attr(op, "returns", payload.get("returns"))
         self._set_optional_toplevel_metadata_attrs(op, payload.get("metadata"))
@@ -568,6 +578,7 @@ class HCFrontEmitter:
         self,
         op: Any,
         payload: dict[str, object],
+        kind: str,
     ) -> None:
         self._set_optional_string_array_attr(
             op,
@@ -578,6 +589,7 @@ class HCFrontEmitter:
             op,
             payload.get("parameters"),
             payload.get("parameter_annotations"),
+            self._region_launch_context(kind),
         )
         # The region's source-level name (the inner `def`'s identifier).
         # `-hc-front-fold-region-defs` uses it to pair a region with the
@@ -591,6 +603,7 @@ class HCFrontEmitter:
         op: Any,
         value: object,
         annotations: object = None,
+        launch_context: str | None = None,
     ) -> None:
         if value is None:
             return
@@ -598,15 +611,25 @@ class HCFrontEmitter:
             raise RuntimeError(f"invalid frontend parameter records: {value!r}")
         annotation_records = self._coerce_parameter_annotations(annotations)
         parameters = []
-        for item in value:
+        for index, item in enumerate(value):
             name, annotation, passing = self._coerce_parameter_record(item)
             parameter = {"name": self._string_attr(name)}
             parameter["passing"] = self._string_attr(passing)
             if isinstance(annotation, str):
                 parameter["annotation"] = self._string_attr(annotation)
+                annotated_context = self._launch_context_from_annotation(annotation)
+                if annotated_context is not None:
+                    self._set_parameter_launch_context(parameter, annotated_context)
             record = annotation_records.get(name)
             if record is not None:
                 self._apply_structural_annotation(parameter, record)
+            if launch_context is not None:
+                self._validate_scoped_launch_context(
+                    parameter,
+                    launch_context,
+                    index,
+                    name,
+                )
             parameters.append(ir.DictAttr.get(parameter, context=self._context))
         op.operation.attributes["parameters"] = ir.ArrayAttr.get(
             parameters,
@@ -649,6 +672,66 @@ class HCFrontEmitter:
         shape = record.get("shape")
         if shape is not None:
             parameter["shape"] = self._string_array_attr(self._string_sequence(shape))
+        launch_context = record.get("launch_context")
+        if isinstance(launch_context, str):
+            self._set_parameter_launch_context(parameter, launch_context)
+
+    def _payload_launch_context(self, payload: Mapping[str, object]) -> str | None:
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return None
+        scope = metadata.get("scope")
+        if not isinstance(scope, str):
+            return None
+        return _SCOPE_LAUNCH_CONTEXTS.get(scope)
+
+    def _region_launch_context(self, kind: str) -> str | None:
+        if kind == "workitem_region":
+            return "workitem"
+        if kind == "subgroup_region":
+            return "subgroup"
+        return None
+
+    def _launch_context_from_annotation(self, annotation: str) -> str | None:
+        # Accept simple names and module-qualified names in source-only entrypoints.
+        return _ANNOTATION_LAUNCH_CONTEXTS.get(annotation.rsplit(".", 1)[-1])
+
+    def _set_parameter_launch_context(
+        self,
+        parameter: dict[str, Any],
+        launch_context: str,
+    ) -> None:
+        if launch_context not in {"group", "workitem", "subgroup"}:
+            raise RuntimeError(
+                f"unknown frontend launch-context parameter kind: {launch_context!r}"
+            )
+        parameter["kind"] = self._string_attr("launch_context")
+        parameter["launch_context"] = self._string_attr(launch_context)
+
+    def _validate_scoped_launch_context(
+        self,
+        parameter: dict[str, Any],
+        launch_context: str,
+        index: int,
+        name: str,
+    ) -> None:
+        current = parameter.get("launch_context")
+        if current is None and index == 0:
+            self._set_parameter_launch_context(parameter, launch_context)
+            return
+        if current is None:
+            return
+        current_text = current.value
+        if index != 0:
+            raise RuntimeError(
+                f"launch-context parameter {name!r} must be first in scoped "
+                "frontend signatures"
+            )
+        if current_text != launch_context:
+            raise RuntimeError(
+                f"launch-context parameter {name!r} is {current_text!r}, expected "
+                f"{launch_context!r}"
+            )
 
     def _set_optional_toplevel_metadata_attrs(
         self,

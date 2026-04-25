@@ -220,11 +220,43 @@ module {
 // inline case above.
 module {
   hc_front.kernel "local_callee_survives" attributes {parameters = []} {
-    hc_front.workitem_region attributes {decorators = ["group.workitems"], name = "inner", parameters = [{name = "wi"}]} {
+    hc_front.workitem_region attributes {decorators = ["group.workitems"], name = "inner", parameters = [{kind = "launch_context", launch_context = "workitem", name = "wi"}]} {
     }
     %0 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
     // expected-error@+1 {{`ref.kind = "local"` call survived to conversion; run `-hc-front-fold-region-defs` before `-convert-hc-front-to-hc`}}
     %1 = hc_front.call %0()
+    hc_front.return
+  }
+}
+
+// -----
+
+// Scoped launch-context markers are the source of truth for nested-region
+// parameter typing. A missing marker means hand-written front IR has lost the
+// convention before conversion.
+module {
+  hc_front.kernel "nested_region_missing_launch_context" attributes {parameters = []} {
+    // expected-error@+1 {{first nested region parameter must be marked as a workitem launch context}}
+    hc_front.workitem_region attributes {parameters = [{name = "wi"}]} {
+    }
+    hc_front.return
+  }
+}
+
+// -----
+
+// Scoped helper launch-context markers must stay in slot zero; otherwise call
+// operand binding and region metadata would silently disagree.
+module {
+  // expected-error@+1 {{launch-context parameter 'wi' must be the first parameter}}
+  hc_front.func "late_launch_context" attributes {
+    decorators = ["kernel.func"],
+    parameters = [
+      {name = "x"},
+      {kind = "launch_context", launch_context = "workitem", name = "wi"}
+    ],
+    scope = "WorkItem"
+  } {
     hc_front.return
   }
 }
@@ -369,7 +401,7 @@ module {
 
   hc_front.func "missing_nonconst_kwarg" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}],
+    parameters = [{kind = "launch_context", launch_context = "workitem", name = "group"}],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "needy" {ctx = "load", ref = {
@@ -410,7 +442,10 @@ module {
 
   hc_front.func "unknown_kwarg" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}, {name = "lane"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "group"},
+      {name = "lane"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "strict" {ctx = "load", ref = {
@@ -491,7 +526,10 @@ module {
 
   hc_front.func "keyword_only_passed_positionally" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}, {name = "lane"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "group"},
+      {name = "lane"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "kw_only_lane" {ctx = "load", ref = {
@@ -531,7 +569,10 @@ module {
 
   hc_front.func "positional_passed_as_keyword" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "a"}, {name = "b"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "a"},
+      {name = "b"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "two_positionals" {ctx = "load", ref = {
@@ -569,7 +610,11 @@ module {
 
   hc_front.func "too_many_positional" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "a"}, {name = "b"}, {name = "c"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "a"},
+      {name = "b"},
+      {name = "c"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "two_params" {ctx = "load", ref = {
@@ -595,7 +640,7 @@ module {
 module {
   hc_front.func "no_stamped_parameters" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}],
+    parameters = [{kind = "launch_context", launch_context = "workitem", name = "group"}],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "unstamped" {ctx = "load", ref = {

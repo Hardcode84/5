@@ -548,6 +548,49 @@ parseLaunchMetadata(MLIRContext *ctx, Operation *sourceOp,
   return metadata;
 }
 
+static std::optional<StringRef>
+getLaunchContextParameterKind(DictionaryAttr param) {
+  auto kind = param.getAs<StringAttr>("kind");
+  if (!kind || kind.getValue() != "launch_context")
+    return std::nullopt;
+  auto context = param.getAs<StringAttr>("launch_context");
+  if (!context)
+    return StringRef();
+  return context.getValue();
+}
+
+static std::optional<StringRef>
+getScopedLaunchContextParameterKind(Operation *sourceOp) {
+  auto scope = sourceOp->getAttrOfType<StringAttr>("scope");
+  if (!scope)
+    return std::nullopt;
+  return llvm::StringSwitch<std::optional<StringRef>>(scope.getValue())
+      .Case("WorkItem", StringRef("workitem"))
+      .Case("SubGroup", StringRef("subgroup"))
+      .Case("Subgroup", StringRef("subgroup"))
+      .Default(std::nullopt);
+}
+
+static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
+                                                    DictionaryAttr param,
+                                                    unsigned paramIndex,
+                                                    StringRef actual,
+                                                    StringRef expected) {
+  auto name = param.getAs<StringAttr>("name");
+  StringRef paramName = name ? name.getValue() : StringRef("<unknown>");
+  if (actual.empty())
+    return sourceOp->emitOpError("launch-context parameter '")
+           << paramName << "' is missing string `launch_context`";
+  if (paramIndex != 0)
+    return sourceOp->emitOpError("launch-context parameter '")
+           << paramName << "' must be the first parameter";
+  if (!expected.empty() && actual != expected)
+    return sourceOp->emitOpError("launch-context parameter '")
+           << paramName << "' is '" << actual << "', expected '" << expected
+           << "'";
+  return success();
+}
+
 static FailureOr<Type> parameterTypeFromDict(
     MLIRContext *ctx, Operation *sourceOp, DictionaryAttr param, Type fallback,
     LaunchMetadataAttrs defaultLaunchMetadata, unsigned paramIndex) {
@@ -559,26 +602,37 @@ static FailureOr<Type> parameterTypeFromDict(
   LaunchMetadataAttrs sourceMetadata = launchMetadataAttrsFrom(sourceOp);
   LaunchMetadataAttrs metadataAttrs =
       !sourceMetadata.empty() ? sourceMetadata : defaultLaunchMetadata;
-  auto scope = sourceOp->getAttrOfType<StringAttr>("scope");
-  // Scoped helper signatures follow the frontend convention that the leading
-  // parameter is the launch-context handle visible in that scope.
-  if (scope && scope.getValue() == "WorkItem" && paramIndex == 0) {
+  if (std::optional<StringRef> launchContext =
+          getLaunchContextParameterKind(param)) {
+    StringRef expected = "";
+    if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp))
+      expected = *scopedExpected;
+    if (failed(validateLaunchContextParameter(sourceOp, param, paramIndex,
+                                              *launchContext, expected)))
+      return failure();
     FailureOr<LaunchMetadata> metadata =
         parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
     if (failed(metadata))
       return failure();
-    return Type(
-        WorkitemType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+    if (*launchContext == "group")
+      return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
+                                 metadata->subgroupSize));
+    if (*launchContext == "workitem")
+      return Type(
+          WorkitemType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+    if (*launchContext == "subgroup")
+      return Type(
+          SubgroupType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+    return sourceOp->emitOpError("unknown launch-context parameter kind '")
+           << *launchContext << "'";
   }
-  if (scope && scope.getValue() == "Subgroup" && paramIndex == 0) {
-    FailureOr<LaunchMetadata> metadata =
-        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
-    if (failed(metadata))
-      return failure();
-    return Type(
-        SubgroupType::get(ctx, metadata->groupShape, metadata->subgroupSize));
-  }
-  if (name.getValue() == "group") {
+  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp);
+      scopedExpected && paramIndex == 0)
+    return sourceOp->emitOpError("first scoped helper parameter must be "
+                                 "marked as a ")
+           << *scopedExpected << " launch context";
+  if (name.getValue() == "group" &&
+      !getScopedLaunchContextParameterKind(sourceOp)) {
     FailureOr<LaunchMetadata> metadata =
         parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
     if (failed(metadata))
@@ -1015,6 +1069,21 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
                                                        Operation *sourceOp,
                                                        bool returnsValue) {
   MLIRContext *ctx = sourceOp->getContext();
+  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp)) {
+    for (auto [idx, param] : llvm::enumerate(params)) {
+      auto dict = dyn_cast<DictionaryAttr>(param);
+      if (!dict)
+        continue;
+      std::optional<StringRef> launchContext =
+          getLaunchContextParameterKind(dict);
+      if (!launchContext)
+        continue;
+      if (failed(validateLaunchContextParameter(
+              sourceOp, dict, idx, *launchContext, *scopedExpected)))
+        return failure();
+      break;
+    }
+  }
   SmallVector<Type> inputs;
   inputs.reserve(params.size());
   for (Attribute param : params) {
@@ -1867,18 +1936,33 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
                                    op.getCapturesAttr());
   Block *body = new Block();
   auto params = op->template getAttrOfType<ArrayAttr>("parameters");
-  // Region parameters use the same leading launch-context convention as
+  StringRef expectedLaunchContext =
+      isa<HCWorkitemRegionOp>(newOp.getOperation()) ? StringRef("workitem")
+                                                    : StringRef("subgroup");
+  // Region parameters must carry the same explicit launch-context marker as
   // scoped helper functions; remaining source parameters start erased.
-  auto regionParamType = [&](unsigned index) -> Type {
-    if (index != 0)
-      return undef;
+  auto regionParamType = [&](DictionaryAttr dict,
+                             unsigned index) -> FailureOr<Type> {
+    if (std::optional<StringRef> launchContext =
+            getLaunchContextParameterKind(dict)) {
+      if (failed(validateLaunchContextParameter(op.getOperation(), dict, index,
+                                                *launchContext,
+                                                expectedLaunchContext)))
+        return failure();
+    } else if (index == 0) {
+      return op.emitOpError(
+                 "first nested region parameter must be marked as a ")
+             << expectedLaunchContext << " launch context";
+    } else {
+      return Type(undef);
+    }
     if (isa<HCWorkitemRegionOp>(newOp.getOperation()))
-      return WorkitemType::get(op->getContext(), launchGroupShape,
-                               launchSubgroupSize);
+      return Type(WorkitemType::get(op->getContext(), launchGroupShape,
+                                    launchSubgroupSize));
     if (isa<HCSubgroupRegionOp>(newOp.getOperation()))
-      return SubgroupType::get(op->getContext(), launchGroupShape,
-                               launchSubgroupSize);
-    return undef;
+      return Type(SubgroupType::get(op->getContext(), launchGroupShape,
+                                    launchSubgroupSize));
+    return Type(undef);
   };
   SmallVector<StringAttr> paramNames;
   if (params) {
@@ -1890,7 +1974,10 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
       auto name = dict.template getAs<StringAttr>("name");
       if (!name)
         return op.emitOpError("parameters entry missing `name`");
-      body->addArgument(regionParamType(paramNames.size()), op.getLoc());
+      FailureOr<Type> paramType = regionParamType(dict, paramNames.size());
+      if (failed(paramType))
+        return failure();
+      body->addArgument(*paramType, op.getLoc());
       paramNames.push_back(name);
     }
   }

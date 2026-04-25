@@ -128,7 +128,7 @@ def _parameter_structural_records(op: Any) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for parameter in op.attributes["parameters"]:
         record: dict[str, object] = {}
-        for key in ("kind", "dtype"):
+        for key in ("kind", "dtype", "launch_context"):
             if key in parameter:
                 record[key] = parameter[key].value
         if "shape" in parameter:
@@ -174,7 +174,7 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
         assert "subgroup_size" not in kernel_op.attributes
         assert "literals" not in kernel_op.attributes
         assert _parameter_structural_records(kernel_op) == [
-            {},
+            {"kind": "launch_context", "launch_context": "group"},
             {"kind": "scalar", "dtype": "int"},
         ]
         assert kernel_op.attributes["returns"].value == "int"
@@ -291,7 +291,7 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
             "WMMA_M",
         ]
         assert _parameter_structural_records(kernel_op) == [
-            {},
+            {"kind": "launch_context", "launch_context": "group"},
             {"kind": "buffer", "shape": ["M", "K"]},
             {"kind": "scalar", "dtype": "int"},
             {"kind": "symbol"},

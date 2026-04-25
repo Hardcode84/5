@@ -49,7 +49,11 @@ module {
   // CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
   hc_front.func "caller" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}, {name = "value"}, {name = "lane"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "group"},
+      {name = "value"},
+      {name = "lane"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "demo_intr" {ctx = "load", ref = {
@@ -81,7 +85,11 @@ module {
   // CHECK-SAME: {arch = "gfx11", wave_size = 32 : i64}
   hc_front.func "shuffled_kwargs" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}, {name = "value"}, {name = "lane"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "group"},
+      {name = "value"},
+      {name = "lane"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "demo_intr" {ctx = "load", ref = {
@@ -114,7 +122,10 @@ module {
 // CHECK-SAME: keyword_only = ["lane", "arch"]
   hc_front.func "caller_before_intrinsic" attributes {
     decorators = ["kernel.func"],
-    parameters = [{name = "group"}, {name = "lane"}],
+    parameters = [
+      {kind = "launch_context", launch_context = "workitem", name = "group"},
+      {name = "lane"}
+    ],
     scope = "WorkItem"
   } {
     %intr = hc_front.name "late_intr" {ctx = "load", ref = {

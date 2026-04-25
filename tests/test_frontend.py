@@ -335,6 +335,7 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
         "group_shape": ("4",),
     }
     assert kernel_payload["parameter_annotations"] == {
+        "group": {"kind": "launch_context", "launch_context": "group"},
         "x": {"kind": "scalar", "dtype": "int"},
     }
     assert region_payload["captures"] == ("tmp",)

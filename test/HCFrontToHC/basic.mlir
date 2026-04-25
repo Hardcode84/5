@@ -93,7 +93,7 @@ module {
 
     // CHECK: hc.workitem_region captures = ["group"] {
     hc_front.workitem_region captures = ["group"] attributes {
-      parameters = [{name = "wi"}]
+      parameters = [{kind = "launch_context", launch_context = "workitem", name = "wi"}]
     } {
       // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.workitem<group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>) -> !hc.idx<"$WI0">
       // CHECK: %[[LID_TUPLE:.*]] = hc.tuple(%[[LIDV]]) : (!hc.idx<"$WI0">) -> tuple<!hc.idx<"$WI0">>
@@ -159,7 +159,7 @@ module {
     hc_front.workitem_region captures = ["group"] attributes {
       decorators = ["group.workitems"],
       name = "inner",
-      parameters = [{name = "wi"}],
+      parameters = [{kind = "launch_context", launch_context = "workitem", name = "wi"}],
       tail_return
     } {
       %seed = hc_front.constant<7 : i64>
@@ -180,7 +180,7 @@ module {
     hc_front.subgroup_region captures = ["group"] attributes {
       decorators = ["group.subgroups"],
       name = "wave",
-      parameters = [{name = "sg"}],
+      parameters = [{kind = "launch_context", launch_context = "subgroup", name = "sg"}],
       tail_return
     } {
       %seed = hc_front.constant<11 : i64>

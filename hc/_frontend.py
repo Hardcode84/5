@@ -1262,7 +1262,7 @@ def _collect_parameter_annotations(fn: Any) -> dict[str, dict[str, object]]:
 
 
 def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
-    from .core import BufferSpec
+    from .core import BufferSpec, CurrentGroup, SubGroup, WorkItem
     from .symbols import Symbol
 
     if isinstance(value, BufferSpec):
@@ -1270,6 +1270,12 @@ def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
             "kind": "buffer",
             "shape": tuple(str(dim) for dim in value.dimensions),
         }
+    if value is CurrentGroup:
+        return {"kind": "launch_context", "launch_context": "group"}
+    if value is WorkItem:
+        return {"kind": "launch_context", "launch_context": "workitem"}
+    if value is SubGroup:
+        return {"kind": "launch_context", "launch_context": "subgroup"}
     if isinstance(value, Symbol):
         return {"kind": "symbol"}
     if isinstance(value, type):

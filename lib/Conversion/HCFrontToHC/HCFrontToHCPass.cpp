@@ -1766,11 +1766,13 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
     if (failed(lowerOp(&child)))
       return failure();
   }
+  if (!sawReturn)
+    return op.emitOpError("inlined_region body has no return");
 
-  // Map region results. `hc_front.call` has one SSA result, so inline calls
-  // with multiple explicit return operands become one tuple value at the
-  // original call site. Populate every declared region result as a fallback for
-  // hand-written IR that references them directly.
+  // Map region results. `hc_front.call` has one SSA result, so the canonical
+  // lowering for multiple explicit return operands is one tuple value at result
+  // #0. Additional region results keep hand-written direct uses well-defined;
+  // the front dialect verifier pins their arity to the body return.
   unsigned nResults = op.getNumResults();
   if (nResults == 0) {
     if (!resultValues.empty()) {

@@ -214,6 +214,7 @@ def HCFront_InlinedRegionOp : HCFront_RegionOp<"inlined_region"> {
   );
   let results = (outs Variadic<HCFront_ValueType>:$results);
   let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
   let assemblyFormat = [{
     $callee `(` $arguments `)` (`->` `(` type($results)^ `)`)?
       attr-dict-with-keyword $body

@@ -33,6 +33,18 @@ module {
     hc_front.return %t
   }
 
+  // Raw multi-return callee: hand-written IR can expose multiple explicit
+  // return operands. The inlined region keeps those result slots, while
+  // conversion packages the original call result through result #0 as a tuple.
+  hc_front.func "pair_raw" attributes {
+    parameters = [{name = "v"}],
+    ref = {kind = "inline", qualified_name = "pkg.pair_raw"}
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "param"}}
+    %two = hc_front.constant <2 : i64>
+    hc_front.return %v, %two
+  }
+
   // Nested inline: `outer` calls `inc` on its arg then scales. After
   // the pass, both helpers are erased and `demo` contains nested
   // `hc_front.inlined_region`s — one per call site, each a name
@@ -65,6 +77,13 @@ module {
     %tgt = hc_front.target_tuple (%tn_lo, %tn_hi)
     hc_front.assign %tgt = %pair
 
+    %raw_n = hc_front.name "pair_raw" {ctx = "load", ref = {kind = "inline", qualified_name = "pkg.pair_raw"}}
+    %raw_pair = hc_front.call %raw_n(%b)
+    %rn_lo = hc_front.target_name "raw_lo"
+    %rn_hi = hc_front.target_name "raw_hi"
+    %raw_tgt = hc_front.target_tuple (%rn_lo, %rn_hi)
+    hc_front.assign %raw_tgt = %raw_pair
+
     %outer_n = hc_front.name "outer" {ctx = "load", ref = {kind = "inline", qualified_name = "pkg.outer"}}
     %nested = hc_front.call %outer_n(%a)
     %on = hc_front.target_name "nested_out"
@@ -76,6 +95,7 @@ module {
 // inline helper funcs, no call sites referring to them.
 // CHECK-NOT: hc_front.func "inc"
 // CHECK-NOT: hc_front.func "split"
+// CHECK-NOT: hc_front.func "pair_raw"
 // CHECK-NOT: hc_front.func "outer"
 // CHECK-NOT: ref = {{.*}}kind = "inline"
 
@@ -85,6 +105,10 @@ module {
 // Tuple site: one result, because the tuple is a first-class value.
 // CHECK: hc_front.inlined_region "split"
 // CHECK-SAME: -> (!hc_front.value)
+// Raw multi-return site: result #0 is the aggregate call replacement; later
+// results remain addressable for hand-written region users.
+// CHECK: hc_front.inlined_region "pair_raw"
+// CHECK-SAME: -> (!hc_front.value, !hc_front.value)
 // Nested: outer region contains an inlined_region for `inc` too.
 // CHECK: hc_front.inlined_region "outer"
 // CHECK: hc_front.inlined_region "inc"
@@ -95,4 +119,6 @@ module {
 // FLAT-NOT: hc_front
 // FLAT-NOT: hc.call @inc
 // FLAT-NOT: hc.call @split
+// FLAT-NOT: hc.call @pair_raw
 // FLAT-NOT: hc.call @outer
+// FLAT: hc.tuple

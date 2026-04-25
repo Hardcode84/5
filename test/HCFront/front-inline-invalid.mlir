@@ -143,3 +143,22 @@ module {
     hc_front.assign %t = %v
   }
 }
+
+// -----
+
+// Hand-written inlined_region must keep its declared result arity aligned with
+// the top-level return. The converter depends on this when packaging
+// multi-result inline calls into result #0.
+module {
+  hc_front.func "bad_inlined_region" attributes {parameters = [{name = "x"}]} {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %one = hc_front.constant <1 : i64>
+    // expected-error@+1 {{result arity mismatch: region declares 1, body returns 2}}
+    %r = hc_front.inlined_region "manual"(%x) -> (!hc_front.value) attributes {
+      parameters = [{name = "x"}]
+    } {
+      hc_front.return %x, %one
+    }
+    hc_front.return %r
+  }
+}

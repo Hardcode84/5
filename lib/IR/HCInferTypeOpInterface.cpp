@@ -416,3 +416,17 @@ LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
   resultTypes.push_back(operandTypes.empty() ? Type{} : operandTypes.front());
   return success();
 }
+
+LogicalResult
+HCForRangeOp::inferHCRegionArgTypes(RegionSuccessor successor,
+                                    ValueRange nonSuccessorInputs,
+                                    SmallVectorImpl<Type> &regionArgTypes) {
+  if (successor.isParent())
+    return success();
+  for (Value input : nonSuccessorInputs) {
+    Type type = input.getType();
+    regionArgTypes.push_back(isa<UndefType>(type) ? unpinnedIdx(getContext())
+                                                  : type);
+  }
+  return success();
+}

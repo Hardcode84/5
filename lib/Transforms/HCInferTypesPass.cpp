@@ -112,10 +112,6 @@ static TypeFact factFromLattice(const HCTypeLattice *lattice) {
   return lattice->getValue();
 }
 
-static Type unpinnedIdx(MLIRContext *ctx) {
-  return IdxType::get(ctx, ExprAttr{});
-}
-
 class HCTypeAnalysis
     : public dataflow::SparseForwardDataFlowAnalysis<HCTypeLattice> {
 public:
@@ -166,18 +162,23 @@ public:
       ArrayRef<HCTypeLattice *> nonSuccessorInputLattices) override {
     assert(nonSuccessorInputs.size() == nonSuccessorInputLattices.size() &&
            "size mismatch");
-    if (!isa<RegionBranchOpInterface>(op) || successor.isParent())
+    auto infer = dyn_cast<HCInferRegionArgTypeOpInterface>(op);
+    if (!infer)
       return setAllToEntryStates(nonSuccessorInputLattices);
 
-    // HC region-branch ops currently expose only loop induction variables as
-    // non-forwarded region arguments. Preserve concrete annotations when they
-    // exist, and refine pre-inference placeholders to the unpinned index type.
-    for (auto [value, lattice] :
-         llvm::zip(nonSuccessorInputs, nonSuccessorInputLattices)) {
-      join(lattice, factFromExistingType(value.getType()));
-      if (isUndef(value.getType()))
-        join(lattice, TypeFact::concrete(unpinnedIdx(op->getContext())));
+    SmallVector<Type> inferredTypes;
+    if (failed(infer.inferHCRegionArgTypes(successor, nonSuccessorInputs,
+                                           inferredTypes)))
+      return setAllToEntryStates(nonSuccessorInputLattices);
+    if (inferredTypes.size() != nonSuccessorInputLattices.size()) {
+      assert(false && "region argument inference returned the wrong arity");
+      return setAllToEntryStates(nonSuccessorInputLattices);
     }
+
+    for (auto [lattice, type] :
+         llvm::zip(nonSuccessorInputLattices, inferredTypes))
+      if (type)
+        join(lattice, TypeFact::concrete(type));
   }
 
 private:

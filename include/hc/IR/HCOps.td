@@ -417,6 +417,7 @@ def HCForRangeOp : HC_Op<"for_range",
                                ["getEntrySuccessorOperands",
                                 "getSuccessorInputs",
                                 "areTypesCompatible"]>,
+     DeclareOpInterfaceMethods<HCInferRegionArgTypeOpInterface>,
      NameStoreRegionOpInterface]> {
   let summary = "Structured for-range loop over symbolic bounds.";
   let description = [{

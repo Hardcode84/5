@@ -73,4 +73,28 @@ def HCInferTypeOpInterface : OpInterface<"HCInferTypeOpInterface"> {
   ];
 }
 
+def HCInferRegionArgTypeOpInterface :
+    OpInterface<"HCInferRegionArgTypeOpInterface"> {
+  let description = [{
+    Op-local type inference hook for non-control-flow region arguments.
+
+    MLIR's sparse dataflow framework forwards values through
+    RegionBranchOpInterface edges. Some region entry block arguments are not
+    forwarded from operands or terminators, such as a loop induction variable.
+    This hook lets the parent op describe those arguments without baking their
+    semantics into the pass.
+  }];
+  let cppNamespace = "::mlir::hc";
+  let methods = [
+    InterfaceMethod<
+      "Infer types for non-forwarded region successor inputs.",
+      "::mlir::LogicalResult",
+      "inferHCRegionArgTypes",
+      (ins "::mlir::RegionSuccessor":$successor,
+           "::mlir::ValueRange":$nonSuccessorInputs,
+           "::llvm::SmallVectorImpl<::mlir::Type> &":$regionArgTypes)
+    >
+  ];
+}
+
 #endif // HC_IR_HCOPSINTERFACES

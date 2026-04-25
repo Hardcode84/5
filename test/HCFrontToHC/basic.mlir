@@ -119,6 +119,51 @@ module {
     hc_front.return %x
   }
 
+  // `tail_return` is stamped by `-hc-front-fold-region-defs` for
+  // `return inner()` nested-region calls. Conversion should make the control
+  // flow explicit without relying on the larger WMMA fixture.
+  // CHECK-LABEL: hc.func @tail_return_workitem
+  // CHECK: %[[WREG:.*]] = hc.workitem_region captures = ["group"] -> (!hc.undef)
+  // CHECK: hc.const<7 : i64> : !hc.undef
+  // CHECK: hc.yield {{.*}} : !hc.undef
+  // CHECK: hc.return %[[WREG]] : !hc.undef
+  hc_front.func "tail_return_workitem" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}],
+    scope = "WorkGroup"
+  } {
+    hc_front.workitem_region captures = ["group"] attributes {
+      decorators = ["group.workitems"],
+      name = "inner",
+      parameters = [{name = "wi"}],
+      tail_return
+    } {
+      %seed = hc_front.constant<7 : i64>
+      hc_front.return %seed
+    }
+  }
+
+  // CHECK-LABEL: hc.func @tail_return_subgroup
+  // CHECK: %[[SREG:.*]] = hc.subgroup_region captures = ["group"] -> (!hc.undef)
+  // CHECK: hc.const<11 : i64> : !hc.undef
+  // CHECK: hc.yield {{.*}} : !hc.undef
+  // CHECK: hc.return %[[SREG]] : !hc.undef
+  hc_front.func "tail_return_subgroup" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "group"}],
+    scope = "WorkGroup"
+  } {
+    hc_front.subgroup_region captures = ["group"] attributes {
+      decorators = ["group.subgroups"],
+      name = "wave",
+      parameters = [{name = "sg"}],
+      tail_return
+    } {
+      %seed = hc_front.constant<11 : i64>
+      hc_front.return %seed
+    }
+  }
+
   // Simulator-fallback body is discarded unconditionally. The body
   // below is deliberately non-trivial so a regression into walking it
   // would emit lowered ops before the closing `}` and break CHECK-NEXT.

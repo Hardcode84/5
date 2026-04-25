@@ -35,19 +35,21 @@
 // CHECK-LABEL: hc.func @init_wmma_acc
 // CHECK-SAME: (%{{.*}}: !hc.undef) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: hc.workitem_region captures = ["group"]
+// CHECK: %{{.*}} = hc.workitem_region captures = ["group"] -> (!hc.undef)
 // CHECK: hc.vzeros {shape = #hc.shape<["8"]>} : !hc.undef
+// CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 
 // CHECK-LABEL: hc.func @issue_wmma_tile
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: hc.workitem_region captures = ["a_tile", "b_tile", "group", "acc"]
+// CHECK: %{{.*}} = hc.workitem_region captures = ["a_tile", "b_tile", "group", "acc"] -> (!hc.undef)
 // CHECK: hc.call @load_wmma_a_fragment
 // CHECK: hc.call @load_wmma_b_fragment
 // CHECK: hc.buffer_view {{.*}} : (!hc.undef, !hc.undef, !hc.idx<"$WI0">, !hc.undef) -> !hc.undef
 // CHECK: hc.call_intrinsic @wmma_gfx11
 // CHECK-SAME: {arch = "gfx11", wave_size = 32 : i64}
 // CHECK-SAME: -> !hc.undef
+// CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 
 // CHECK-LABEL: hc.func @store_wmma_tile

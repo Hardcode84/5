@@ -151,3 +151,40 @@ hc.func @joined_interprocedural_caller {
       : (!hc.undef) -> !hc.undef
   hc.return
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @workitem_tail_region_callee
+// CHECK: %[[REGION:.*]] = hc.workitem_region captures = ["group"] -> (!hc.undef)
+// CHECK: hc.yield {{.*}} : !hc.idx<"0">
+// CHECK: hc.return %[[REGION]] : !hc.undef
+hc.func @workitem_tail_region_callee(%group: !hc.undef) -> !hc.undef {
+  %region = hc.workitem_region captures = ["group"] -> (!hc.undef) {
+  ^bb0(%wi: !hc.undef):
+    %seed = hc.const<0 : i64> : !hc.undef
+    hc.yield %seed : !hc.undef
+  }
+  hc.return %region : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @call_result_iter_arg_keeps_loop_body_live
+// CHECK: %[[INIT:.*]] = hc.call @workitem_tail_region_callee
+// CHECK: hc.for_range {{.*}} iter_args(%[[INIT]])
+// CHECK: ^bb0(%{{[^:]+}}: !hc.idx, %{{[^:]+}}: !hc.undef):
+// CHECK: hc.const<16 : i64> : !hc.idx<"16">
+// CHECK: hc.add {{.*}} : (!hc.idx, !hc.idx<"16">) -> !hc.idx
+hc.func @call_result_iter_arg_keeps_loop_body_live(%group: !hc.undef) {
+  %init = hc.call @workitem_tail_region_callee(%group)
+      : (!hc.undef) -> !hc.undef
+  %lo = hc.const<0 : i64> : !hc.undef
+  %hi = hc.const<64 : i64> : !hc.undef
+  %step = hc.const<16 : i64> : !hc.undef
+  %loop = hc.for_range %lo to %hi step %step iter_args(%init)
+      : (!hc.undef, !hc.undef, !hc.undef) -> (!hc.undef) {
+  ^bb0(%iv: !hc.undef, %carried: !hc.undef):
+    %tile = hc.const<16 : i64> : !hc.undef
+    %next = hc.add %iv, %tile : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.yield %carried : !hc.undef
+  }
+  hc.return
+}

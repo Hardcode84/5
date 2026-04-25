@@ -7,9 +7,9 @@
 // `@group.workitems def inner(...): ...; inner()` patterns. The
 // triad is a ghost invocation of a nested collective `def`: there is
 // no callable named `inner` at `hc` level (the region op *is* the
-// lowering), and any `hc_front.return %v` inside the region falls
-// through to terminate the enclosing func, so the call's result — if
-// any — is already dead.
+// lowering). When the ghost call is immediately returned, stamp the
+// region so conversion can turn the inner return into a region yield
+// plus an ordinary callable-level return.
 //
 // Without this pass the converter bails at the `ref.kind = "local"`
 // callee because a local identifier has no target op. The folder
@@ -86,13 +86,12 @@ template <typename RegionOpT> void foldAfterRegion(RegionOpT regionOp) {
 
   // Scan forward through the same block for the ghost triad. The
   // Python frontend emits the `hc_front.name` immediately after the
-  // region, but we scan forward so unrelated sibling ops (e.g. a
-  // later `hc_front.assign` or a second region op) between the region
-  // and the ghost name don't prevent the match. The pattern is
-  // selected by full predicate, not by uniqueness: even if several
-  // `hc_front.name` ops share the region's string name, the first one
-  // that also has `ref.kind = "local"` and is the sole callee of a
-  // tail-or-unused call is the one we erase.
+  // region, but bare unused calls may appear after unrelated sibling
+  // ops, so we scan forward. Tail-return folds are stricter below:
+  // conversion emits the callable return at the region site, so no
+  // intervening siblings can be skipped. The pattern is selected by
+  // full predicate, not by uniqueness: even if several `hc_front.name`
+  // ops share the region's string name, the first valid ghost use wins.
   Block *block = regionOp->getBlock();
   for (Operation &op : llvm::make_early_inc_range(llvm::make_range(
            std::next(Block::iterator(regionOp)), block->end()))) {
@@ -137,8 +136,20 @@ template <typename RegionOpT> void foldAfterRegion(RegionOpT regionOp) {
     if (!tailReturn && !callResultDead)
       continue;
 
-    if (tailReturn)
+    if (tailReturn) {
+      // `return inner()` is only folded when the ghost trail is the entire
+      // enclosing tail. Otherwise conversion would reorder sibling ops.
+      if (&*std::next(Block::iterator(regionOp)) != nameOp.getOperation())
+        continue;
+      if (&*std::next(Block::iterator(nameOp)) != call.getOperation())
+        continue;
+      if (&*std::next(Block::iterator(call)) != tailReturn)
+        continue;
+      if (std::next(Block::iterator(tailReturn)) != block->end())
+        continue;
+      regionOp.setTailReturnAttr(UnitAttr::get(regionOp.getContext()));
       tailReturn->erase();
+    }
     call.erase();
     nameOp.erase();
     return;

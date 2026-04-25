@@ -566,6 +566,7 @@ private:
   Value lowerValueOperand(Value v);
   SmallVector<Value> lowerValueOperands(ValueRange vs);
   SmallVector<Value> expandTupleOperand(Value v);
+  FailureOr<SmallVector<Value>> lowerReturnValues(hc_front::ReturnOp op);
 
   // Per-op lowering entry points. `Value`-returning variants write into
   // `valueMap`; `LogicalResult`-returning ones are terminators or
@@ -1055,6 +1056,25 @@ SmallVector<Value> Lowerer::expandTupleOperand(Value v) {
     return it->second;
   Value lowered = lowerValueOperand(v);
   return lowered ? SmallVector<Value>{lowered} : SmallVector<Value>{};
+}
+
+FailureOr<SmallVector<Value>>
+Lowerer::lowerReturnValues(hc_front::ReturnOp op) {
+  if (op.getValues().size() == 1) {
+    auto it = tupleElts.find(op.getValues().front());
+    if (it != tupleElts.end())
+      return it->second;
+  }
+
+  SmallVector<Value> values;
+  values.reserve(op.getValues().size());
+  for (Value value : op.getValues()) {
+    Value lowered = lowerValueOperand(value);
+    if (!lowered)
+      return op.emitOpError("return operand did not lower");
+    values.push_back(lowered);
+  }
+  return values;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1593,6 +1613,14 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
   return success();
 }
 
+static unsigned getLogicalReturnArity(hc_front::ReturnOp op) {
+  if (op.getValues().size() == 1) {
+    if (auto tuple = op.getValues().front().getDefiningOp<hc_front::TupleOp>())
+      return tuple.getElements().size();
+  }
+  return op.getValues().size();
+}
+
 template <typename HCRegionOpT, typename FrontRegionOpT>
 LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
@@ -1602,13 +1630,37 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // resolve via the promotion pass. The `hc` op carries only a
   // captures list (no formal params), matching ODS.
   //
-  // Lowering always emits a results-less region. Intent to carry a
-  // value out travels through an `hc.region_return <names>`
-  // terminator in the body; `-hc-promote-names` then rebuilds the
-  // op with matching `$results`.
-  auto newOp =
-      HCRegionOpT::create(builder, op.getLoc(),
-                          /*resultTypes=*/TypeRange{}, op.getCapturesAttr());
+  bool sourceEmpty = op.getBody().empty();
+  if (!sourceEmpty && !op.getBody().hasOneBlock())
+    return op.emitOpError("hc_front nested region must be single-block");
+
+  // Folded `return inner()` regions lower to ordinary SSA control flow:
+  // yield from the nested scope, then return from the enclosing callable.
+  bool isTailReturnRegion = op.getTailReturnAttr() != nullptr;
+  SmallVector<Type> resultTypes;
+  if (isTailReturnRegion) {
+    if (sourceEmpty)
+      return op.emitOpError("tail-return region has no body");
+    if (std::next(Block::iterator(op.getOperation())) != op->getBlock()->end())
+      return op.emitOpError("tail-return region must be the final operation "
+                            "in its enclosing block");
+    hc_front::ReturnOp soleReturn;
+    for (Operation &child : op.getBody().front()) {
+      auto candidate = dyn_cast<hc_front::ReturnOp>(&child);
+      if (!candidate)
+        continue;
+      if (soleReturn)
+        return op.emitOpError("tail-return region has multiple returns");
+      soleReturn = candidate;
+    }
+    if (!soleReturn)
+      return op.emitOpError("tail-return region has no return");
+
+    resultTypes.assign(getLogicalReturnArity(soleReturn), undef);
+  }
+
+  auto newOp = HCRegionOpT::create(builder, op.getLoc(), resultTypes,
+                                   op.getCapturesAttr());
   Block *body = new Block();
   auto params = op->template getAttrOfType<ArrayAttr>("parameters");
   SmallVector<StringAttr> paramNames;
@@ -1627,11 +1679,42 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   }
   newOp.getBody().push_back(body);
 
-  OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(body);
-  for (auto [idx, name] : llvm::enumerate(paramNames))
-    HCAssignOp::create(builder, op.getLoc(), name, body->getArgument(idx));
-  return lowerRegion(op.getBody());
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(body);
+    for (auto [idx, name] : llvm::enumerate(paramNames))
+      HCAssignOp::create(builder, op.getLoc(), name, body->getArgument(idx));
+
+    if (!sourceEmpty) {
+      SmallVector<Value> returnValues;
+      for (Operation &child :
+           llvm::make_early_inc_range(op.getBody().front())) {
+        if (isTailReturnRegion) {
+          if (auto retOp = dyn_cast<hc_front::ReturnOp>(&child)) {
+            FailureOr<SmallVector<Value>> loweredValues =
+                lowerReturnValues(retOp);
+            if (failed(loweredValues))
+              return failure();
+            returnValues = std::move(*loweredValues);
+            if (returnValues.size() != newOp->getNumResults())
+              return retOp.emitOpError("return arity mismatch for tail-return "
+                                       "region");
+            HCYieldOp::create(builder, retOp.getLoc(), returnValues);
+            continue;
+          }
+        }
+        if (failed(lowerOp(&child)))
+          return failure();
+      }
+    }
+  }
+
+  if (!isTailReturnRegion)
+    return success();
+
+  // This is emitted in the enclosing block after the newly built region op.
+  HCReturnOp::create(builder, op.getLoc(), newOp->getResults());
+  return success();
 }
 
 LogicalResult Lowerer::lowerWorkitemRegion(hc_front::WorkitemRegionOp op) {

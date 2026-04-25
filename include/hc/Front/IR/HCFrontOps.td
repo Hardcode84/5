@@ -178,11 +178,15 @@ def HCFront_ReturnOp : HCFront_Op<"return"> {
 // ghost `hc_front.name {ref.kind = "local"} + hc_front.call` trail the
 // frontend emits for the immediate-call shape. Optional because
 // hand-written IR and round-trip fixtures need not carry it; both the
-// emitter and the fold pass treat absence as "unmatched".
+// emitter and the fold pass treat absence as "unmatched". `$tail_return`
+// marks the `return inner()` ghost-call shape after folding: conversion
+// must lower the body's `hc_front.return` as a region yield and emit the
+// enclosing callable return immediately after the region.
 def HCFront_SubgroupRegionOp : HCFront_RegionOp<"subgroup_region"> {
   let arguments = (ins
     OptionalAttr<StrArrayAttr>:$captures,
-    OptionalAttr<StrAttr>:$name
+    OptionalAttr<StrAttr>:$name,
+    OptionalAttr<UnitAttr>:$tail_return
   );
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat =
@@ -192,7 +196,8 @@ def HCFront_SubgroupRegionOp : HCFront_RegionOp<"subgroup_region"> {
 def HCFront_WorkitemRegionOp : HCFront_RegionOp<"workitem_region"> {
   let arguments = (ins
     OptionalAttr<StrArrayAttr>:$captures,
-    OptionalAttr<StrAttr>:$name
+    OptionalAttr<StrAttr>:$name,
+    OptionalAttr<UnitAttr>:$tail_return
   );
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat =

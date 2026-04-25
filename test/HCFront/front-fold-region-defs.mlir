@@ -15,12 +15,13 @@
 //
 // The frontend emits the region op with `name = "inner"`, followed by
 // the ghost `hc_front.name "inner" {ref.kind = "local"} + hc_front.call
-// + hc_front.return`. Fold erases all three — the region's inner
-// `hc_front.return %v` falls through on conversion and terminates the
-// func, so the trailing ops were always dead.
+// + hc_front.return`. Fold erases the ghost trail and marks the region so
+// conversion can lower the inner return as a region yield plus an outer
+// callable return.
 // CHECK-LABEL: hc_front.func "return_shape"
 // CHECK: hc_front.workitem_region
 // CHECK-SAME: name = "inner"
+// CHECK-SAME: tail_return
 // CHECK: hc_front.call
 // CHECK: hc_front.return
 // CHECK-NOT: hc_front.name "inner"
@@ -131,11 +132,31 @@ hc_front.func "bound_result" attributes {parameters = [], scope = "WorkItem"} {
   hc_front.assign %t = %1
 }
 
-// Mixed shape: a local-as-arg rejection must not abort the forward
-// scan; a second same-named ghost name that *is* a valid callee
-// further down still folds. This pins `continue` over `return` in the
-// arg-position guard so pathological or future IR shapes don't leak
-// ghost triads past the folder.
+// Negative: tail-return folding is only safe for the immediate
+// region/name/call/return trail. If other sibling ops sit between the
+// region and outer return, conversion cannot emit the callable return at
+// the region site without reordering those siblings.
+// CHECK-LABEL: hc_front.func "non_immediate_tail_return"
+// CHECK: hc_front.workitem_region
+// CHECK-SAME: name = "inner"
+// CHECK-NOT: tail_return
+// CHECK: hc_front.name "inner"
+// CHECK-SAME: kind = "local"
+// CHECK: hc_front.call
+// CHECK: hc_front.return
+hc_front.func "non_immediate_tail_return" attributes {parameters = [], scope = "WorkItem"} {
+  hc_front.workitem_region attributes {decorators = ["group.workitems"], name = "inner", parameters = [{name = "wi"}]} {
+  }
+  %side = hc_front.constant<0 : i64>
+  %0 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
+  %1 = hc_front.call %0()
+  hc_front.return %1
+}
+
+// Mixed bare-call shape: a local-as-arg rejection must not abort the
+// forward scan; a second same-named ghost name that *is* a valid callee
+// further down still folds. Tail-return folds are stricter because the
+// converter must emit the callable return immediately after the region.
 // CHECK-LABEL: hc_front.func "mixed_same_name"
 // CHECK: hc_front.workitem_region
 // CHECK-SAME: name = "inner"
@@ -154,5 +175,4 @@ hc_front.func "mixed_same_name" attributes {parameters = [], scope = "WorkItem"}
   %1 = hc_front.call %f(%0)
   %2 = hc_front.name "inner" {ctx = "load", ref = {kind = "local"}}
   %3 = hc_front.call %2()
-  hc_front.return %3
 }

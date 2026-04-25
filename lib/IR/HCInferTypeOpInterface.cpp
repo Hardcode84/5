@@ -240,7 +240,7 @@ static Type inferLoadLikeResult(Type sourceType, ShapeAttr shape,
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
                                               SmallVectorImpl<Type> &types) {
-  types.append(op.getNumResults(), getUnpinnedIdxType(op.getContext()));
+  types.append(op.getResultTypes().begin(), op.getResultTypes().end());
   return success();
 }
 

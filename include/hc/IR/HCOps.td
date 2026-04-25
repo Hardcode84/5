@@ -522,10 +522,11 @@ def HCIfOp : HC_Op<"if",
 // Launch-geometry queries.
 //
 // Single group-handle operand in, one or more `HC_ValueType` values out.
-// Pre-inference results are all `!hc.undef`; inference pins them to
-// `!hc.idx<"_symN">` with fresh symbols. Marked `Pure`: launch state is
-// invariant for a single kernel instance (pipeline invariant; see
-// `doc/lowering.md` "Launch-geometry invariant").
+// Frontend lowering gives generated queries internal `$`-prefixed symbols
+// (`!hc.idx<"$WG0">`, etc.) that cannot collide with Python-source symbols.
+// Marked `Pure`: launch state is invariant for a single kernel instance
+// (pipeline invariant; see `doc/lowering.md`
+// "Launch-geometry invariant").
 //===----------------------------------------------------------------------===//
 
 class HC_LaunchGeoOp<string mnemonic>

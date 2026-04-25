@@ -34,7 +34,9 @@
 //    an `hc.const` wrapping the dtype's `TypeAttr`, usable both as an
 //    argument (`x.astype(np.float32)`) and as a value-constructor
 //    callee (`np.float16(0)`);
-//  * every produced value gets `!hc.undef` — type inference pins later.
+//  * most produced values get `!hc.undef` — type inference pins later;
+//    launch-geometry queries are the exception because their internal symbolic
+//    names must not collide with Python-level symbols.
 //
 // Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
 // bodies are simulator fallbacks with no compilation meaning; the
@@ -94,6 +96,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -119,6 +122,36 @@ namespace {
 // up front — a hand-crafted IR with `axis = -1` or `axis = 2^31` should
 // diagnose, not allocate gigabytes of `!hc.undef` result types.
 constexpr int64_t kMaxLaunchAxis = 32;
+
+static FailureOr<Type> launchGeometryIdxType(MLIRContext *ctx, Location loc,
+                                             StringRef prefix, unsigned axis) {
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  SmallString<32> text(prefix);
+  text += Twine(axis).str();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle = sym::parseExpr(store, text, &diag);
+  if (failed(handle)) {
+    emitError(loc) << "failed to synthesize launch-geo symbol '" << text
+                   << "': " << diag;
+    return failure();
+  }
+  return Type(IdxType::get(ctx, ExprAttr::get(ctx, *handle)));
+}
+
+static FailureOr<SmallVector<Type>> launchGeometryIdxTypes(MLIRContext *ctx,
+                                                           Location loc,
+                                                           StringRef prefix,
+                                                           unsigned count) {
+  SmallVector<Type> types;
+  types.reserve(count);
+  for (unsigned axis = 0; axis < count; ++axis) {
+    FailureOr<Type> type = launchGeometryIdxType(ctx, loc, prefix, axis);
+    if (failed(type))
+      return failure();
+    types.push_back(*type);
+  }
+  return types;
+}
 
 //===----------------------------------------------------------------------===//
 // The Python driver (see `hc/_resolve.py`) stamps every `hc_front.name` and
@@ -2181,34 +2214,41 @@ static bool isLaunchGeoMethod(StringRef method) {
 
 Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc,
                                 std::optional<unsigned> resultIdx) {
-  auto emitMulti = [&](auto tag) -> Value {
+  auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
     unsigned n = resultIdx.value_or(0) + 1;
-    SmallVector<Type> resTypes(n, undef);
-    auto op = OpT::create(builder, loc, resTypes, group);
+    FailureOr<SmallVector<Type>> resTypes =
+        launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
+    if (failed(resTypes))
+      return {};
+    auto op = OpT::create(builder, loc, *resTypes, group);
     return op.getResult(resultIdx.value_or(0));
   };
-  auto emitScalar = [&](auto tag) -> Value {
+  auto emitScalar = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
-    auto op = OpT::create(builder, loc, undef, group);
+    FailureOr<Type> resultType =
+        launchGeometryIdxType(builder.getContext(), loc, prefix, 0);
+    if (failed(resultType))
+      return {};
+    auto op = OpT::create(builder, loc, *resultType, group);
     return op.getResult(0);
   };
   if (method == "group_id")
-    return emitMulti(HCGroupIdOp{});
+    return emitMulti(HCGroupIdOp{}, "$WG");
   if (method == "local_id")
-    return emitMulti(HCLocalIdOp{});
+    return emitMulti(HCLocalIdOp{}, "$WI");
   if (method == "subgroup_id")
-    return emitMulti(HCSubgroupIdOp{});
+    return emitMulti(HCSubgroupIdOp{}, "$SG");
   if (method == "group_shape")
-    return emitMulti(HCGroupShapeOp{});
+    return emitMulti(HCGroupShapeOp{}, "$WGS");
   if (method == "work_offset")
-    return emitMulti(HCWorkOffsetOp{});
+    return emitMulti(HCWorkOffsetOp{}, "$WO");
   if (method == "work_shape")
-    return emitMulti(HCWorkShapeOp{});
+    return emitMulti(HCWorkShapeOp{}, "$WS");
   if (method == "group_size")
-    return emitScalar(HCGroupSizeOp{});
+    return emitScalar(HCGroupSizeOp{}, "$GSZ");
   if (method == "wave_size")
-    return emitScalar(HCWaveSizeOp{});
+    return emitScalar(HCWaveSizeOp{}, "$WV");
   return {};
 }
 

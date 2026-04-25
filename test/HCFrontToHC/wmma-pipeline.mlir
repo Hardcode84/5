@@ -44,7 +44,7 @@
 // CHECK: hc.workitem_region captures = ["a_tile", "b_tile", "group", "acc"]
 // CHECK: hc.call @load_wmma_a_fragment
 // CHECK: hc.call @load_wmma_b_fragment
-// CHECK: hc.buffer_view {{.*}} : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK: hc.buffer_view {{.*}} : (!hc.undef, !hc.undef, !hc.idx<"$WI0">, !hc.undef) -> !hc.undef
 // CHECK: hc.call_intrinsic @wmma_gfx11
 // CHECK-SAME: {arch = "gfx11", wave_size = 32 : i64}
 // CHECK-SAME: -> !hc.undef

@@ -51,7 +51,7 @@ module {
     %dim_target = hc_front.target_name "dim"
     hc_front.assign %dim_target = %dim
 
-    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.undef) -> !hc.undef
+    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.undef) -> !hc.idx<"$WG0">
     %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
     %gid0 = hc_front.subscript %gid_attr[%axis]
     %gid_target = hc_front.target_name "row0"
@@ -92,7 +92,7 @@ module {
     hc_front.workitem_region captures = ["group"] attributes {
       parameters = [{name = "wi"}]
     } {
-      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.undef) -> !hc.undef
+      // CHECK: %[[LIDV:.*]] = hc.local_id %{{.*}} : (!hc.undef) -> !hc.idx<"$WI0">
       %wi = hc_front.name "wi" {ctx = "load", ref = {kind = "param"}}
       %lid_attr = hc_front.attr %wi, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
       %axis0 = hc_front.constant<0 : i64>
@@ -158,6 +158,52 @@ module {
     hc_front.return
   }
 
+  // Launch-geometry types are synthesized during conversion, before
+  // `-hc-infer-types`, and use `$` prefixes so they cannot collide with
+  // Python-level symbols.
+  // CHECK-LABEL: hc.kernel @launch_geo_symbols
+  // CHECK: hc.group_id %arg0 : (!hc.undef) -> !hc.idx<"$WG0">
+  // CHECK: hc.local_id %arg0 : (!hc.undef) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+  // CHECK: hc.subgroup_id %arg0 : (!hc.undef) -> !hc.idx<"$SG0">
+  // CHECK: hc.group_shape %arg0 : (!hc.undef) -> !hc.idx<"$WGS0">
+  // CHECK: hc.work_offset %arg0 : (!hc.undef) -> !hc.idx<"$WO0">
+  // CHECK: hc.work_shape %arg0 : (!hc.undef) -> !hc.idx<"$WS0">
+  // CHECK: hc.group_size %arg0 : (!hc.undef) -> !hc.idx<"$GSZ0">
+  // CHECK: hc.wave_size %arg0 : (!hc.undef) -> !hc.idx<"$WV0">
+  hc_front.kernel "launch_geo_symbols" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+
+    %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid0 = hc_front.subscript %gid_attr[%ax0]
+
+    %lid_attr = hc_front.attr %grp, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
+    %lid1 = hc_front.subscript %lid_attr[%ax1]
+
+    %sg_attr = hc_front.attr %grp, "subgroup_id" {ref = {kind = "dsl_method", method = "subgroup_id"}}
+    %sg0 = hc_front.subscript %sg_attr[%ax0]
+
+    %gsh_attr = hc_front.attr %grp, "group_shape" {ref = {kind = "dsl_method", method = "group_shape"}}
+    %gsh0 = hc_front.subscript %gsh_attr[%ax0]
+
+    %wo_attr = hc_front.attr %grp, "work_offset" {ref = {kind = "dsl_method", method = "work_offset"}}
+    %wo0 = hc_front.subscript %wo_attr[%ax0]
+
+    %ws_attr = hc_front.attr %grp, "work_shape" {ref = {kind = "dsl_method", method = "work_shape"}}
+    %ws0 = hc_front.subscript %ws_attr[%ax0]
+
+    %gsz_attr = hc_front.attr %grp, "group_size" {ref = {kind = "dsl_method", method = "group_size"}}
+    %gsz = hc_front.call %gsz_attr()
+
+    %wv_attr = hc_front.attr %grp, "wave_size" {ref = {kind = "dsl_method", method = "wave_size"}}
+    %wv = hc_front.call %wv_attr()
+
+    hc_front.return
+  }
+
   // Boundary coverage:
   //   * launch-geo at axis=31 (one below the pass-internal cap) must lower
   //     cleanly — regression guard on the launch-geo bounds check.
@@ -167,6 +213,7 @@ module {
   // The `:32` pins the hc.local_id result arity to kMaxLaunchAxis (32
   // variadic results, one per potential launch axis), *not* a bit-width.
   // CHECK: %{{.*}}:32 = hc.local_id %arg0
+  // CHECK-SAME: !hc.idx<"$WI31">
   // CHECK: hc.buffer_dim %arg1, axis = 200 : !hc.undef
   hc_front.kernel "axis_bounds" attributes {
     parameters = [{name = "group"}, {name = "a"}]

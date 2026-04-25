@@ -103,6 +103,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 
@@ -118,10 +119,8 @@ namespace hc_front = mlir::hc::front;
 namespace {
 
 // The Python driver emits launch-geo axes as small non-negative ints
-// (0..<launch_rank). We don't know launch rank at this site, so reject
-// anything that would build a pathologically large variadic result list
-// up front — a hand-crafted IR with `axis = -1` or `axis = 2^31` should
-// diagnose, not allocate gigabytes of `!hc.undef` result types.
+// (0..<launch_rank). When launch metadata is absent, this is only an
+// allocation cap for hand-written IR, not the semantic default rank.
 constexpr int64_t kMaxLaunchAxis = 32;
 
 struct LaunchMetadataAttrs {
@@ -646,6 +645,7 @@ private:
   ShapeAttr launchWorkShape;
   ShapeAttr launchGroupShape;
   IntegerAttr launchSubgroupSize;
+  llvm::DenseMap<Value, llvm::StringMap<unsigned>> staticLaunchGeoRanks;
 
   // Resolves a classified `hc_front.name`. Classifier kinds that name a
   // Python-level binding (`param`/`local`/`iv`) lower to an
@@ -670,6 +670,10 @@ private:
   FailureOr<Value> lowerAttr(hc_front::AttrOp op);
 
   LogicalResult lowerRegion(Region &src);
+
+  void collectStaticLaunchGeometryRanks(Operation *frontOp);
+  std::optional<unsigned> getStaticLaunchGeometryRank(Value source,
+                                                      StringRef method) const;
 
   // Shared body for `hc.workitem_region` / `hc.subgroup_region`. Both have
   // identical shape (captures attr + single-block body + optional
@@ -767,13 +771,15 @@ private:
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
-  unsigned getLaunchGeometryRank(StringRef method, Type contextType) const;
+  unsigned getLaunchGeometryRank(StringRef method, Type contextType,
+                                 std::optional<unsigned> requiredRank) const;
 
   // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
   // `method` names one. Multi-axis queries return a single `hc.tuple` value
   // wrapping the full result vector; scalar queries return the scalar op
   // result directly. Returns null when the method is not a launch-geo query.
-  Value tryEmitLaunchGeo(StringRef method, Value context, Location loc);
+  Value tryEmitLaunchGeo(StringRef method, Value context, Location loc,
+                         std::optional<unsigned> requiredRank = std::nullopt);
 
   // Per-module counter used to mint unique prefixes for each
   // `hc_front.inlined_region` we flatten. Must strictly monotonically
@@ -801,6 +807,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     return frontOp->emitOpError(
         "missing `parameters` attribute; the hc_front driver must stamp one");
   }
+  collectStaticLaunchGeometryRanks(frontOp);
 
   // All three callable kinds share the same skeleton: build a fresh
   // entry block with one block arg per param, hand (entry, fnType) to
@@ -2469,7 +2476,9 @@ Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
   if (call.getArguments().empty() && args.kwvalues.empty() &&
       args.kwattrs.empty()) {
     if (base) {
-      if (Value v = tryEmitLaunchGeo(method, base, call.getLoc()))
+      std::optional<unsigned> requiredRank =
+          getStaticLaunchGeometryRank(call.getResult(), method);
+      if (Value v = tryEmitLaunchGeo(method, base, call.getLoc(), requiredRank))
         return v;
     }
   }
@@ -2491,6 +2500,85 @@ static bool isLaunchGeoMethod(StringRef method) {
 
 static bool isScalarLaunchGeoMethod(StringRef method) {
   return method == "group_size" || method == "wave_size";
+}
+
+static std::optional<unsigned> staticLaunchGeoRequiredRank(Value axisValue) {
+  auto constant =
+      dyn_cast_if_present<hc_front::ConstantOp>(axisValue.getDefiningOp());
+  auto axis =
+      constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+  if (!axis)
+    return std::nullopt;
+  int64_t value = axis.getInt();
+  if (value < 0 || value >= kMaxLaunchAxis)
+    return std::nullopt;
+  return static_cast<unsigned>(value + 1);
+}
+
+void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
+  auto record = [&](Value source, StringRef method, unsigned rank) {
+    unsigned &current = staticLaunchGeoRanks[source][method];
+    current = std::max(current, rank);
+  };
+
+  frontOp->walk([&](hc_front::SubscriptOp op) {
+    if (op.getIndices().size() != 1)
+      return;
+    Value index = op.getIndices().front();
+
+    if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
+            op.getBase().getDefiningOp())) {
+      StringRef method = attr.getName();
+      if (!isLaunchGeoMethod(method) || isScalarLaunchGeoMethod(method))
+        return;
+      std::optional<unsigned> rank = staticLaunchGeoRequiredRank(index);
+      if (!rank)
+        return;
+      record(attr.getBase(), method, *rank);
+      return;
+    }
+
+    auto call =
+        dyn_cast_if_present<hc_front::CallOp>(op.getBase().getDefiningOp());
+    if (!call || !call.getArguments().empty())
+      return;
+    auto attr =
+        dyn_cast_if_present<hc_front::AttrOp>(call.getCallee().getDefiningOp());
+    if (!attr)
+      return;
+    StringRef method = attr.getName();
+    if (!isLaunchGeoMethod(method) || isScalarLaunchGeoMethod(method))
+      return;
+
+    // A call-style launch-geo tuple can also escape as a first-class value. In
+    // that case preserve the conservative cap-sized fallback; only pure static
+    // getitem use-sites get the tightened rank.
+    unsigned rank = 0;
+    for (Operation *user : call.getResult().getUsers()) {
+      auto subscript = dyn_cast<hc_front::SubscriptOp>(user);
+      if (!subscript || subscript.getBase() != call.getResult() ||
+          subscript.getIndices().size() != 1)
+        return;
+      std::optional<unsigned> required =
+          staticLaunchGeoRequiredRank(subscript.getIndices().front());
+      if (!required)
+        return;
+      rank = std::max(rank, *required);
+    }
+    if (rank != 0)
+      record(call.getResult(), method, rank);
+  });
+}
+
+std::optional<unsigned>
+Lowerer::getStaticLaunchGeometryRank(Value source, StringRef method) const {
+  auto sourceIt = staticLaunchGeoRanks.find(source);
+  if (sourceIt == staticLaunchGeoRanks.end())
+    return std::nullopt;
+  auto methodIt = sourceIt->second.find(method);
+  if (methodIt == sourceIt->second.end())
+    return std::nullopt;
+  return methodIt->second;
 }
 
 static LogicalResult checkLaunchGeoSubscript(hc_front::SubscriptOp op,
@@ -2518,9 +2606,12 @@ static unsigned shapeRankOrZero(ShapeAttr shape) {
   return shape ? static_cast<unsigned>(shape.getDims().size()) : 0;
 }
 
-unsigned Lowerer::getLaunchGeometryRank(StringRef method,
-                                        Type contextType) const {
-  auto fallbackRank = [] { return static_cast<unsigned>(kMaxLaunchAxis); };
+unsigned
+Lowerer::getLaunchGeometryRank(StringRef method, Type contextType,
+                               std::optional<unsigned> requiredRank) const {
+  auto fallbackRank = [&] {
+    return requiredRank.value_or(static_cast<unsigned>(kMaxLaunchAxis));
+  };
   auto groupType = dyn_cast<GroupType>(contextType);
   auto workitemType = dyn_cast<WorkitemType>(contextType);
   auto subgroupType = dyn_cast<SubgroupType>(contextType);
@@ -2551,10 +2642,11 @@ unsigned Lowerer::getLaunchGeometryRank(StringRef method,
   return fallbackRank();
 }
 
-Value Lowerer::tryEmitLaunchGeo(StringRef method, Value context, Location loc) {
+Value Lowerer::tryEmitLaunchGeo(StringRef method, Value context, Location loc,
+                                std::optional<unsigned> requiredRank) {
   auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
-    unsigned n = getLaunchGeometryRank(method, context.getType());
+    unsigned n = getLaunchGeometryRank(method, context.getType(), requiredRank);
     FailureOr<SmallVector<Type>> resTypes =
         launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
     if (failed(resTypes))
@@ -2638,7 +2730,10 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
       if (baseVal && idxVal && isLaunchGeoMethod(method)) {
         if (failed(checkLaunchGeoSubscript(op, method, ax)))
           return nullptr;
-        if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc()))
+        std::optional<unsigned> requiredRank =
+            getStaticLaunchGeometryRank(attr.getBase(), method);
+        if (Value v =
+                tryEmitLaunchGeo(method, baseVal, op.getLoc(), requiredRank))
           return HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal);
       }
     }

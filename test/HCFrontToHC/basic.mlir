@@ -242,23 +242,23 @@ module {
   // `-hc-infer-types`, and use `$` prefixes so they cannot collide with
   // Python-level symbols.
   // CHECK-LABEL: hc.kernel @launch_geo_symbols
-  // CHECK: %[[GIDV:.*]]:32 = hc.group_id %arg0 : (!hc.group)
-  // CHECK: %[[GIDT:.*]] = hc.tuple(%[[GIDV]]#0
+  // CHECK: %[[GIDV:.*]] = hc.group_id %arg0 : (!hc.group) -> !hc.idx<"$WG0">
+  // CHECK: %[[GIDT:.*]] = hc.tuple(%[[GIDV]])
   // CHECK: hc.getitem %[[GIDT]]
-  // CHECK: %[[LIDV:.*]]:32 = hc.local_id %arg0 : (!hc.group)
+  // CHECK: %[[LIDV:.*]]:2 = hc.local_id %arg0 : (!hc.group)
   // CHECK: %[[LIDT:.*]] = hc.tuple(%[[LIDV]]#0
   // CHECK: hc.getitem %[[LIDT]]
-  // CHECK: %[[SGV:.*]]:32 = hc.subgroup_id %arg0 : (!hc.group)
-  // CHECK: %[[SGT:.*]] = hc.tuple(%[[SGV]]#0
+  // CHECK: %[[SGV:.*]] = hc.subgroup_id %arg0 : (!hc.group) -> !hc.idx<"$SG0">
+  // CHECK: %[[SGT:.*]] = hc.tuple(%[[SGV]])
   // CHECK: hc.getitem %[[SGT]]
-  // CHECK: %[[GSHV:.*]]:32 = hc.group_shape %arg0 : (!hc.group)
-  // CHECK: %[[GSHT:.*]] = hc.tuple(%[[GSHV]]#0
+  // CHECK: %[[GSHV:.*]] = hc.group_shape %arg0 : (!hc.group) -> !hc.idx<"$WGS0">
+  // CHECK: %[[GSHT:.*]] = hc.tuple(%[[GSHV]])
   // CHECK: hc.getitem %[[GSHT]]
-  // CHECK: %[[WOV:.*]]:32 = hc.work_offset %arg0 : (!hc.group)
-  // CHECK: %[[WOT:.*]] = hc.tuple(%[[WOV]]#0
+  // CHECK: %[[WOV:.*]] = hc.work_offset %arg0 : (!hc.group) -> !hc.idx<"$WO0">
+  // CHECK: %[[WOT:.*]] = hc.tuple(%[[WOV]])
   // CHECK: hc.getitem %[[WOT]]
-  // CHECK: %[[WSV:.*]]:32 = hc.work_shape %arg0 : (!hc.group)
-  // CHECK: %[[WST:.*]] = hc.tuple(%[[WSV]]#0
+  // CHECK: %[[WSV:.*]] = hc.work_shape %arg0 : (!hc.group) -> !hc.idx<"$WS0">
+  // CHECK: %[[WST:.*]] = hc.tuple(%[[WSV]])
   // CHECK: hc.getitem %[[WST]]
   // CHECK: hc.group_size %arg0 : (!hc.group) -> !hc.idx<"$GSZ0">
   // CHECK: hc.wave_size %arg0 : (!hc.group) -> !hc.idx<"$WV0">
@@ -302,8 +302,9 @@ module {
   //   * `a.shape[200]` must pass through as `hc.buffer_dim` with no axis
   //     cap — buffer rank is not launch-geo and has its own verifier.
   // CHECK-LABEL: hc.kernel @axis_bounds
-  // The `:32` pins the hc.local_id result arity to kMaxLaunchAxis (32
-  // variadic results, one per potential launch axis), *not* a bit-width.
+  // The `:32` pins the required hc.local_id result arity to the largest
+  // accepted static axis plus one, which is also kMaxLaunchAxis here. It is
+  // not a bit-width.
   // CHECK: %{{.*}}:32 = hc.local_id %arg0
   // CHECK-SAME: !hc.idx<"$WI31">
   // CHECK: hc.tuple
@@ -326,6 +327,39 @@ module {
     %t_dim = hc_front.target_name "t_dim"
     hc_front.assign %t_dim = %dim
 
+    hc_front.return
+  }
+
+  // CHECK-LABEL: hc.kernel @unknown_rank_static_launch_axes
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: hc.getitem
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: hc.getitem
+  // CHECK: %{{.*}}:2 = hc.local_id %arg0 : (!hc.group) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+  // CHECK: hc.getitem
+  // CSE-LABEL: hc.kernel @unknown_rank_static_launch_axes
+  // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE-NOT: hc.group_id
+  // CSE: %{{.*}}:2 = hc.local_id %arg0 : (!hc.group) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+  hc_front.kernel "unknown_rank_static_launch_axes" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %gid_attr0 = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid0 = hc_front.subscript %gid_attr0[%ax0]
+    %gid_t0 = hc_front.target_name "gid0"
+    hc_front.assign %gid_t0 = %gid0
+    %gid_attr1 = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid1 = hc_front.subscript %gid_attr1[%ax1]
+    %gid_t1 = hc_front.target_name "gid1"
+    hc_front.assign %gid_t1 = %gid1
+    %lid_attr = hc_front.attr %grp, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
+    %lid_tuple = hc_front.call %lid_attr()
+    %lid1 = hc_front.subscript %lid_tuple[%ax1]
+    %lid_t1 = hc_front.target_name "lid1"
+    hc_front.assign %lid_t1 = %lid1
     hc_front.return
   }
 

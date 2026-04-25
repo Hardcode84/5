@@ -101,6 +101,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
@@ -159,6 +160,101 @@ static FailureOr<SmallVector<Type>> launchGeometryIdxTypes(MLIRContext *ctx,
     types.push_back(*type);
   }
   return types;
+}
+
+enum class LaunchGeoMethod {
+  GroupId,
+  LocalId,
+  SubgroupId,
+  GroupShape,
+  WorkOffset,
+  WorkShape,
+  GroupSize,
+  WaveSize,
+};
+
+enum class LaunchGeoArity {
+  MultiAxis,
+  Scalar,
+};
+
+enum class LaunchGeoRankDomain {
+  WorkGridWithGroupFallback,
+  WorkGrid,
+  Workgroup,
+  Scalar,
+};
+
+struct LaunchGeoMethodInfo {
+  LaunchGeoMethod method;
+  StringRef name;
+  StringRef symbolPrefix;
+  LaunchGeoArity arity;
+  LaunchGeoRankDomain rankDomain;
+
+  bool isScalar() const { return arity == LaunchGeoArity::Scalar; }
+};
+
+static std::optional<LaunchGeoMethodInfo>
+classifyLaunchGeoMethod(StringRef method) {
+  enum class ClassifiedMethod {
+    Unknown,
+    GroupId,
+    LocalId,
+    SubgroupId,
+    GroupShape,
+    WorkOffset,
+    WorkShape,
+    GroupSize,
+    WaveSize,
+  };
+  ClassifiedMethod kind = llvm::StringSwitch<ClassifiedMethod>(method)
+                              .Case("group_id", ClassifiedMethod::GroupId)
+                              .Case("local_id", ClassifiedMethod::LocalId)
+                              .Case("subgroup_id", ClassifiedMethod::SubgroupId)
+                              .Case("group_shape", ClassifiedMethod::GroupShape)
+                              .Case("work_offset", ClassifiedMethod::WorkOffset)
+                              .Case("work_shape", ClassifiedMethod::WorkShape)
+                              .Case("group_size", ClassifiedMethod::GroupSize)
+                              .Case("wave_size", ClassifiedMethod::WaveSize)
+                              .Default(ClassifiedMethod::Unknown);
+  switch (kind) {
+  case ClassifiedMethod::GroupId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupId, "group_id", "$WG",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGridWithGroupFallback};
+  case ClassifiedMethod::LocalId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::LocalId, "local_id", "$WI",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case ClassifiedMethod::SubgroupId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::SubgroupId, "subgroup_id",
+                               "$SG", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case ClassifiedMethod::GroupShape:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupShape, "group_shape",
+                               "$WGS", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case ClassifiedMethod::WorkOffset:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkOffset, "work_offset",
+                               "$WO", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGrid};
+  case ClassifiedMethod::WorkShape:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkShape, "work_shape", "$WS",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGrid};
+  case ClassifiedMethod::GroupSize:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupSize, "group_size", "$GSZ",
+                               LaunchGeoArity::Scalar,
+                               LaunchGeoRankDomain::Scalar};
+  case ClassifiedMethod::WaveSize:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WaveSize, "wave_size", "$WV",
+                               LaunchGeoArity::Scalar,
+                               LaunchGeoRankDomain::Scalar};
+  case ClassifiedMethod::Unknown:
+    return std::nullopt;
+  }
+  llvm_unreachable("unhandled launch-geometry method");
 }
 
 //===----------------------------------------------------------------------===//
@@ -793,14 +889,16 @@ private:
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
-  unsigned getLaunchGeometryRank(StringRef method, Type contextType,
+  unsigned getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
+                                 Type contextType,
                                  std::optional<unsigned> requiredRank) const;
 
-  // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
-  // `method` names one. Multi-axis queries return a single `hc.tuple` value
-  // wrapping the full result vector; scalar queries return the scalar op
-  // result directly. Returns null when the method is not a launch-geo query.
-  Value tryEmitLaunchGeo(StringRef method, Value context, Location loc,
+  // Emit the launch-geometry op for a classified `group.{method}` DSL
+  // attribute. Multi-axis queries return a single `hc.tuple` value wrapping
+  // the full result vector; scalar queries return the scalar op result
+  // directly.
+  Value tryEmitLaunchGeo(const LaunchGeoMethodInfo &method, Value context,
+                         Location loc,
                          std::optional<unsigned> requiredRank = std::nullopt);
 
   // Per-module counter used to mint unique prefixes for each
@@ -2498,30 +2596,18 @@ Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
   if (call.getArguments().empty() && args.kwvalues.empty() &&
       args.kwattrs.empty()) {
     if (base) {
+      std::optional<LaunchGeoMethodInfo> methodInfo =
+          classifyLaunchGeoMethod(method);
+      if (!methodInfo)
+        return {};
       std::optional<unsigned> requiredRank =
           getStaticLaunchGeometryRank(call.getResult(), method);
-      if (Value v = tryEmitLaunchGeo(method, base, call.getLoc(), requiredRank))
+      if (Value v =
+              tryEmitLaunchGeo(*methodInfo, base, call.getLoc(), requiredRank))
         return v;
     }
   }
   return {};
-}
-
-// Recognize the launch-geo method spellings so callers can gate
-// launch-geo-specific preconditions (axis bounds cap in `lowerSubscript`,
-// diagnostic wording) without calling `tryEmitLaunchGeo` eagerly, which
-// would create the underlying `hc` op before the check has a chance to
-// reject the site.
-static bool isLaunchGeoMethod(StringRef method) {
-  return llvm::StringSwitch<bool>(method)
-      .Cases({"group_id", "local_id", "subgroup_id"}, true)
-      .Cases({"group_shape", "work_offset", "work_shape"}, true)
-      .Cases({"group_size", "wave_size"}, true)
-      .Default(false);
-}
-
-static bool isScalarLaunchGeoMethod(StringRef method) {
-  return method == "group_size" || method == "wave_size";
 }
 
 static std::optional<unsigned> staticLaunchGeoRequiredRank(Value axisValue) {
@@ -2551,7 +2637,9 @@ void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
     if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
             op.getBase().getDefiningOp())) {
       StringRef method = attr.getName();
-      if (!isLaunchGeoMethod(method) || isScalarLaunchGeoMethod(method))
+      std::optional<LaunchGeoMethodInfo> methodInfo =
+          classifyLaunchGeoMethod(method);
+      if (!methodInfo || methodInfo->isScalar())
         return;
       std::optional<unsigned> rank = staticLaunchGeoRequiredRank(index);
       if (!rank)
@@ -2569,7 +2657,9 @@ void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
     if (!attr)
       return;
     StringRef method = attr.getName();
-    if (!isLaunchGeoMethod(method) || isScalarLaunchGeoMethod(method))
+    std::optional<LaunchGeoMethodInfo> methodInfo =
+        classifyLaunchGeoMethod(method);
+    if (!methodInfo || methodInfo->isScalar())
       return;
 
     // A call-style launch-geo tuple can also escape as a first-class value. In
@@ -2604,11 +2694,11 @@ Lowerer::getStaticLaunchGeometryRank(Value source, StringRef method) const {
 }
 
 static LogicalResult checkLaunchGeoSubscript(hc_front::SubscriptOp op,
-                                             StringRef method,
+                                             const LaunchGeoMethodInfo &method,
                                              IntegerAttr axis) {
-  if (isScalarLaunchGeoMethod(method))
+  if (method.isScalar())
     return op.emitOpError("scalar launch-geo query '")
-           << method << "' is not subscriptable";
+           << method.name << "' is not subscriptable";
 
   // Launch-geo axes parameterize the variadic result list built by
   // `tryEmitLaunchGeo`; cap literal axes so a hand-written `group_id[2^31]`
@@ -2629,7 +2719,8 @@ static unsigned shapeRankOrZero(ShapeAttr shape) {
 }
 
 unsigned
-Lowerer::getLaunchGeometryRank(StringRef method, Type contextType,
+Lowerer::getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
+                               Type contextType,
                                std::optional<unsigned> requiredRank) const {
   auto fallbackRank = [&] {
     return requiredRank.value_or(static_cast<unsigned>(kMaxLaunchAxis));
@@ -2648,23 +2739,27 @@ Lowerer::getLaunchGeometryRank(StringRef method, Type contextType,
     contextGroupShape = subgroupType.getGroupShape();
   }
 
-  if (method == "group_id")
+  switch (method.rankDomain) {
+  case LaunchGeoRankDomain::WorkGridWithGroupFallback:
     return shapeRankOrZero(contextWorkShape)
                ? shapeRankOrZero(contextWorkShape)
                : workRank.value_or(groupRank.value_or(fallbackRank()));
-  if (method == "work_offset" || method == "work_shape")
+  case LaunchGeoRankDomain::WorkGrid:
     return shapeRankOrZero(contextWorkShape)
                ? shapeRankOrZero(contextWorkShape)
                : workRank.value_or(fallbackRank());
-  if (method == "local_id" || method == "subgroup_id" ||
-      method == "group_shape")
+  case LaunchGeoRankDomain::Workgroup:
     return shapeRankOrZero(contextGroupShape)
                ? shapeRankOrZero(contextGroupShape)
                : groupRank.value_or(fallbackRank());
-  return fallbackRank();
+  case LaunchGeoRankDomain::Scalar:
+    return fallbackRank();
+  }
+  llvm_unreachable("unhandled launch-geometry rank domain");
 }
 
-Value Lowerer::tryEmitLaunchGeo(StringRef method, Value context, Location loc,
+Value Lowerer::tryEmitLaunchGeo(const LaunchGeoMethodInfo &method,
+                                Value context, Location loc,
                                 std::optional<unsigned> requiredRank) {
   auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
@@ -2686,23 +2781,25 @@ Value Lowerer::tryEmitLaunchGeo(StringRef method, Value context, Location loc,
     auto op = OpT::create(builder, loc, *resultType, context);
     return op.getResult(0);
   };
-  if (method == "group_id")
-    return emitMulti(HCGroupIdOp{}, "$WG");
-  if (method == "local_id")
-    return emitMulti(HCLocalIdOp{}, "$WI");
-  if (method == "subgroup_id")
-    return emitMulti(HCSubgroupIdOp{}, "$SG");
-  if (method == "group_shape")
-    return emitMulti(HCGroupShapeOp{}, "$WGS");
-  if (method == "work_offset")
-    return emitMulti(HCWorkOffsetOp{}, "$WO");
-  if (method == "work_shape")
-    return emitMulti(HCWorkShapeOp{}, "$WS");
-  if (method == "group_size")
-    return emitScalar(HCGroupSizeOp{}, "$GSZ");
-  if (method == "wave_size")
-    return emitScalar(HCWaveSizeOp{}, "$WV");
-  return {};
+  switch (method.method) {
+  case LaunchGeoMethod::GroupId:
+    return emitMulti(HCGroupIdOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::LocalId:
+    return emitMulti(HCLocalIdOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::SubgroupId:
+    return emitMulti(HCSubgroupIdOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::GroupShape:
+    return emitMulti(HCGroupShapeOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::WorkOffset:
+    return emitMulti(HCWorkOffsetOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::WorkShape:
+    return emitMulti(HCWorkShapeOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::GroupSize:
+    return emitScalar(HCGroupSizeOp{}, method.symbolPrefix);
+  case LaunchGeoMethod::WaveSize:
+    return emitScalar(HCWaveSizeOp{}, method.symbolPrefix);
+  }
+  llvm_unreachable("unhandled launch-geometry method");
 }
 
 Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
@@ -2749,13 +2846,15 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
               IntegerAttr::get(IntegerType::get(op.getContext(), 64), axVal));
         }
       }
-      if (baseVal && idxVal && isLaunchGeoMethod(method)) {
-        if (failed(checkLaunchGeoSubscript(op, method, ax)))
+      std::optional<LaunchGeoMethodInfo> methodInfo =
+          classifyLaunchGeoMethod(method);
+      if (baseVal && idxVal && methodInfo) {
+        if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
           return nullptr;
         std::optional<unsigned> requiredRank =
             getStaticLaunchGeometryRank(attr.getBase(), method);
-        if (Value v =
-                tryEmitLaunchGeo(method, baseVal, op.getLoc(), requiredRank))
+        if (Value v = tryEmitLaunchGeo(*methodInfo, baseVal, op.getLoc(),
+                                       requiredRank))
           return HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal);
       }
     }
@@ -2765,7 +2864,9 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
     if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
             call.getCallee().getDefiningOp())) {
       StringRef method = attr.getName();
-      if (isLaunchGeoMethod(method) && call.getArguments().empty() &&
+      std::optional<LaunchGeoMethodInfo> methodInfo =
+          classifyLaunchGeoMethod(method);
+      if (methodInfo && call.getArguments().empty() &&
           op.getIndices().size() == 1) {
         FailureOr<Value> idxValOr = lowerValueOperand(
             op.getIndices().front(), op.getOperation(), "subscript index");
@@ -2781,7 +2882,7 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
         auto ax =
             constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
         if (launchGeo && idxVal) {
-          if (failed(checkLaunchGeoSubscript(op, method, ax)))
+          if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
             return nullptr;
           return HCGetItemOp::create(builder, op.getLoc(), undef, launchGeo,
                                      idxVal);

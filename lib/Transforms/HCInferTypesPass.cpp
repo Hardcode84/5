@@ -46,43 +46,28 @@ namespace {
 constexpr llvm::StringLiteral kSyntheticJoinPrefix = "$join";
 constexpr llvm::StringLiteral kSyntheticJoinTmpPrefix = "$__hc_join_tmp_";
 
-static bool isSyntheticJoinTokenChar(char c) {
-  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-         (c >= 'a' && c <= 'z') || c == '_';
-}
-
-static std::optional<size_t>
-getSyntheticJoinTokenEnd(StringRef rendered, size_t pos,
-                         llvm::StringLiteral prefix, bool allowPathSuffix) {
-  size_t end = pos + prefix.size();
-  if (end >= rendered.size() || rendered[end] < '0' || rendered[end] > '9')
-    return std::nullopt;
-  while (end < rendered.size() && rendered[end] >= '0' && rendered[end] <= '9')
+static bool consumeDigits(StringRef &text) {
+  size_t end = 0;
+  while (end < text.size() && text[end] >= '0' && text[end] <= '9')
     ++end;
-  if (allowPathSuffix) {
-    while (end < rendered.size() && isSyntheticJoinTokenChar(rendered[end]))
-      ++end;
-    return end;
-  }
-  if (end < rendered.size() && isSyntheticJoinTokenChar(rendered[end]))
-    return std::nullopt;
-  return end;
+  if (end == 0)
+    return false;
+  text = text.drop_front(end);
+  return true;
 }
 
-static bool containsSyntheticJoinSymbolText(StringRef rendered) {
-  for (size_t pos = 0;
-       (pos = rendered.find(kSyntheticJoinTmpPrefix, pos)) != StringRef::npos;
-       ++pos)
-    if (getSyntheticJoinTokenEnd(rendered, pos, kSyntheticJoinTmpPrefix,
-                                 /*allowPathSuffix=*/true))
-      return true;
-  for (size_t pos = 0;
-       (pos = rendered.find(kSyntheticJoinPrefix, pos)) != StringRef::npos;
-       ++pos)
-    if (getSyntheticJoinTokenEnd(rendered, pos, kSyntheticJoinPrefix,
-                                 /*allowPathSuffix=*/false))
-      return true;
-  return false;
+static bool isSyntheticJoinSymbolName(StringRef name) {
+  StringRef rest = name;
+  if (rest.consume_front(kSyntheticJoinPrefix))
+    return consumeDigits(rest) && rest.empty();
+
+  if (!rest.consume_front(kSyntheticJoinTmpPrefix) || !consumeDigits(rest))
+    return false;
+  while (!rest.empty()) {
+    if (!rest.consume_front("_") || !consumeDigits(rest))
+      return false;
+  }
+  return true;
 }
 
 struct TypeFact {
@@ -265,10 +250,11 @@ static bool containsSyntheticJoinSymbol(IdxType type) {
   ExprAttr expr = type.getExpr();
   if (!expr)
     return false;
-  auto *dialect = type.getContext()->getOrLoadDialect<HCDialect>();
-  std::string renderedStorage =
-      dialect->getSymbolStore().render(expr.getNode());
-  return containsSyntheticJoinSymbolText(renderedStorage);
+  bool found = false;
+  sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+    found |= isSyntheticJoinSymbolName(name);
+  });
+  return found;
 }
 
 static Type joinExistingConcreteTypes(Type lhs, Type rhs) {
@@ -704,33 +690,10 @@ static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
   return changed;
 }
 
-static void collectSyntheticJoinSymbols(StringRef rendered,
-                                        llvm::StringLiteral prefix,
-                                        bool allowPathSuffix,
-                                        llvm::StringSet<> &seen,
-                                        SmallVectorImpl<std::string> &symbols) {
-  size_t pos = 0;
-  while ((pos = rendered.find(prefix, pos)) != StringRef::npos) {
-    std::optional<size_t> end =
-        getSyntheticJoinTokenEnd(rendered, pos, prefix, allowPathSuffix);
-    if (!end) {
-      ++pos;
-      continue;
-    }
-    StringRef symbol = rendered.slice(pos, *end);
-    if (seen.insert(symbol).second)
-      symbols.push_back(symbol.str());
-    pos = *end;
-  }
-}
-
-static void collectSyntheticJoinSymbols(StringRef rendered,
-                                        llvm::StringSet<> &seen,
-                                        SmallVectorImpl<std::string> &symbols) {
-  collectSyntheticJoinSymbols(rendered, kSyntheticJoinTmpPrefix,
-                              /*allowPathSuffix=*/true, seen, symbols);
-  collectSyntheticJoinSymbols(rendered, kSyntheticJoinPrefix,
-                              /*allowPathSuffix=*/false, seen, symbols);
+static void collectSyntheticJoinSymbol(StringRef name, llvm::StringSet<> &seen,
+                                       SmallVectorImpl<std::string> &symbols) {
+  if (isSyntheticJoinSymbolName(name) && seen.insert(name).second)
+    symbols.push_back(name.str());
 }
 
 static void collectSyntheticJoinSymbols(Type type, llvm::StringSet<> &seen,
@@ -738,20 +701,18 @@ static void collectSyntheticJoinSymbols(Type type, llvm::StringSet<> &seen,
   if (!type)
     return;
 
-  auto *dialect = type.getContext()->getOrLoadDialect<HCDialect>();
   if (auto idx = dyn_cast<IdxType>(type)) {
-    if (ExprAttr expr = idx.getExpr()) {
-      std::string rendered = dialect->getSymbolStore().render(expr.getNode());
-      collectSyntheticJoinSymbols(rendered, seen, symbols);
-    }
+    if (ExprAttr expr = idx.getExpr())
+      sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+        collectSyntheticJoinSymbol(name, seen, symbols);
+      });
     return;
   }
   if (auto pred = dyn_cast<PredType>(type)) {
-    if (PredAttr predicate = pred.getPred()) {
-      std::string rendered =
-          dialect->getSymbolStore().render(predicate.getNode());
-      collectSyntheticJoinSymbols(rendered, seen, symbols);
-    }
+    if (PredAttr predicate = pred.getPred())
+      sym::walkSymbolNames(predicate.getValue(), [&](StringRef name) {
+        collectSyntheticJoinSymbol(name, seen, symbols);
+      });
     return;
   }
   if (auto tuple = dyn_cast<TupleType>(type)) {

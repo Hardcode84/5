@@ -8,6 +8,7 @@
 #include "ixsimpl.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/Hashing.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Mutex.h"
 
@@ -125,6 +126,13 @@ mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
 /// an ixs integer node, or a rational node with unit denominator. Does not
 /// render or parse the expression text.
 std::optional<int64_t> getIntegerLiteralValue(ExprHandle value);
+
+/// Walk every symbolic leaf name in a hash-consed expression or predicate.
+/// Traversal is structural and does not render or parse the expression text.
+void walkSymbolNames(ExprHandle value,
+                     llvm::function_ref<void(llvm::StringRef)> callback);
+void walkSymbolNames(PredHandle value,
+                     llvm::function_ref<void(llvm::StringRef)> callback);
 
 mlir::FailureOr<ExprHandle> parseExprHandle(AsmParser &parser);
 mlir::FailureOr<PredHandle> parsePredHandle(AsmParser &parser);

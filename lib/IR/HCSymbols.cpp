@@ -6,6 +6,7 @@
 
 #include "hc/IR/HCDialect.h"
 #include "mlir/IR/OpImplementation.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -64,6 +65,26 @@ ixs_node *importNode(Session &session, const ixs_node *node,
   if (!imported)
     setDiagnostic(diagnostic, std::string("out of memory importing ") + kind);
   return imported;
+}
+
+void walkSymbolNamesImpl(const ixs_node *node,
+                         llvm::function_ref<void(StringRef)> callback) {
+  if (!node)
+    return;
+
+  SmallVector<const ixs_node *, 16> stack;
+  stack.push_back(node);
+  while (!stack.empty()) {
+    const ixs_node *current = stack.pop_back_val();
+    // ixsimpl's introspection accessors are read-only in practice but not
+    // const-qualified in the C API.
+    auto *rawNode = const_cast<ixs_node *>(current);
+    if (ixs_node_tag(rawNode) == IXS_SYM)
+      callback(ixs_node_sym_name(rawNode));
+
+    for (uint32_t index = ixs_node_nchildren(rawNode); index > 0; --index)
+      stack.push_back(ixs_node_child(rawNode, index - 1));
+  }
 }
 
 FailureOr<ExprHandle> finishExpr(ixs_session *session, ixs_node *node,
@@ -294,6 +315,16 @@ std::optional<int64_t> mlir::hc::sym::getIntegerLiteralValue(ExprHandle value) {
   if (ixs_node_tag(rawNode) == IXS_RAT && ixs_node_rat_den(rawNode) == 1)
     return ixs_node_rat_num(rawNode);
   return std::nullopt;
+}
+
+void mlir::hc::sym::walkSymbolNames(
+    ExprHandle value, llvm::function_ref<void(llvm::StringRef)> callback) {
+  walkSymbolNamesImpl(value.raw(), callback);
+}
+
+void mlir::hc::sym::walkSymbolNames(
+    PredHandle value, llvm::function_ref<void(llvm::StringRef)> callback) {
+  walkSymbolNamesImpl(value.raw(), callback);
 }
 
 FailureOr<ExprHandle> mlir::hc::sym::parseExprHandle(AsmParser &parser) {

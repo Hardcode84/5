@@ -54,7 +54,8 @@
 // to `hc`. The canonical pipeline order is:
 //
 //     -hc-front-fold-region-defs -hc-front-inline \
-//       -convert-hc-front-to-hc -hc-promote-names, then canonicalization + CSE
+//       -convert-hc-front-to-hc -hc-promote-names -hc-infer-types,
+//       then canonicalization + CSE
 //
 // - `-hc-front-inline` expands every `hc_front.call` targeting a
 //   `ref = {kind = "inline"}` marker func into an
@@ -2216,10 +2217,10 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   // `hc_front.attr` and the index is a single integer constant:
   //   x.shape[N]      -> hc.buffer_dim
   //   group.group_id[N] / local_id[N] / ... -> hc.<launch_geo>
-  // Property-style (no `()`) access to launch geometry lands here, in
-  // contrast to the call-style (`wi.local_id()[N]`) which routes through
-  // `lowerDslMethodCall` + a subsequent subscript that falls to the
-  // generic `hc.buffer_view` branch below.
+  // Property-style (no `()`) access to launch geometry lands here. The
+  // call-style form (`wi.local_id()[N]`) is handled by the sibling branch below
+  // so the default type-inference schedule never sees a launch-geo value as a
+  // fake buffer_view base.
   if (auto attr =
           dyn_cast_if_present<hc_front::AttrOp>(op.getBase().getDefiningOp())) {
     // Read the method name off the attr op (`$name`) rather than
@@ -2254,6 +2255,32 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
         // path instead of surfacing a misleading "launch-geo axis …"
         // diagnostic.
         if (isLaunchGeoMethod(method)) {
+          if (axVal < 0 || axVal >= kMaxLaunchAxis) {
+            op.emitOpError("launch-geo axis ")
+                << axVal << " out of range [0, " << kMaxLaunchAxis << ")";
+            return nullptr;
+          }
+          unsigned axis = static_cast<unsigned>(axVal);
+          if (Value v = tryEmitLaunchGeo(method, baseVal, op.getLoc(), axis))
+            return v;
+        }
+      }
+    }
+  }
+  if (auto call =
+          dyn_cast_if_present<hc_front::CallOp>(op.getBase().getDefiningOp())) {
+    if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
+            call.getCallee().getDefiningOp())) {
+      StringRef method = attr.getName();
+      if (isLaunchGeoMethod(method) && call.getArguments().empty() &&
+          op.getIndices().size() == 1) {
+        Value idxVal = lowerValueOperand(op.getIndices().front());
+        Value baseVal = lowerValueOperand(attr.getBase());
+        auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
+        auto ax =
+            constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
+        if (baseVal && ax) {
+          int64_t axVal = ax.getInt();
           if (axVal < 0 || axVal >= kMaxLaunchAxis) {
             op.emitOpError("launch-geo axis ")
                 << axVal << " out of range [0, " << kMaxLaunchAxis << ")";

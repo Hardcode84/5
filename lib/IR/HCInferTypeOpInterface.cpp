@@ -252,8 +252,11 @@ LogicalResult HCConstOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
   if (auto integer = dyn_cast<IntegerAttr>(value))
     return pushInferred(resultTypes, inferIntegerAttrAsIdx(integer, *this));
   if (auto typed = dyn_cast<TypedAttr>(value)) {
-    resultTypes.push_back(typed.getType());
-    return success();
+    Type type = typed.getType();
+    if (type && !isa<NoneType>(type)) {
+      resultTypes.push_back(type);
+      return success();
+    }
   }
   resultTypes.push_back(getResult().getType());
   return success();

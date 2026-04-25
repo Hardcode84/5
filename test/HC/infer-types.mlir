@@ -99,3 +99,12 @@ hc.func @mixed_idx_and_builtin_stays_unknown(%idx: !hc.idx<"M">, %n: i64) {
   %cmp = hc.cmp.lt %idx, %n : (!hc.idx<"M">, i64) -> !hc.undef
   hc.return
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @untyped_string_const_stays_unknown
+// CHECK: hc.const<"gfx11"> : !hc.undef
+hc.func @untyped_string_const_stays_unknown {
+  %arch = hc.const<"gfx11"> : !hc.undef
+  hc.return
+}

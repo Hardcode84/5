@@ -527,6 +527,9 @@ private:
   // by every operand lookup.
   llvm::DenseMap<Value, Value> valueMap;
 
+  std::optional<unsigned> groupRank;
+  std::optional<unsigned> workRank;
+
   // Resolves a classified `hc_front.name`. Classifier kinds that name a
   // Python-level binding (`param`/`local`/`iv`) lower to an
   // `hc.name_load "<ident>"` — a placeholder the promotion pass replaces
@@ -642,6 +645,9 @@ private:
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
+  unsigned getLaunchGeometryRank(StringRef method,
+                                 std::optional<unsigned> resultIdx) const;
+
   // Emit the launch-geometry op for a `group.{method}` DSL attribute, if
   // `method` names one. `resultIdx` is the axis for the per-axis ops
   // (group_id / local_id / …) and must be empty for the scalar ops
@@ -734,6 +740,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
               return failure();
             }
             hcKernel.setWorkShapeAttr(*shape);
+            workRank = static_cast<unsigned>((*shape).getDims().size());
           }
           if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
             auto shape = stringArrayToShape(ctx, frontOp, gs);
@@ -742,6 +749,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
               return failure();
             }
             hcKernel.setGroupShapeAttr(*shape);
+            groupRank = static_cast<unsigned>((*shape).getDims().size());
           }
           if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
             hcKernel.setSubgroupSizeAttr(sg);
@@ -2212,11 +2220,30 @@ static bool isLaunchGeoMethod(StringRef method) {
       .Default(false);
 }
 
+unsigned
+Lowerer::getLaunchGeometryRank(StringRef method,
+                               std::optional<unsigned> resultIdx) const {
+  auto fallbackRank = [&] { return resultIdx.value_or(0) + 1; };
+  if (method == "group_id")
+    return workRank.value_or(groupRank.value_or(fallbackRank()));
+  if (method == "work_offset" || method == "work_shape")
+    return workRank.value_or(fallbackRank());
+  if (method == "local_id" || method == "subgroup_id" ||
+      method == "group_shape")
+    return groupRank.value_or(fallbackRank());
+  return fallbackRank();
+}
+
 Value Lowerer::tryEmitLaunchGeo(StringRef method, Value group, Location loc,
                                 std::optional<unsigned> resultIdx) {
   auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
     using OpT = decltype(tag);
-    unsigned n = resultIdx.value_or(0) + 1;
+    unsigned n = getLaunchGeometryRank(method, resultIdx);
+    if (resultIdx && *resultIdx >= n) {
+      emitError(loc) << "launch-geo axis " << *resultIdx
+                     << " out of inferred rank " << n;
+      return {};
+    }
     FailureOr<SmallVector<Type>> resTypes =
         launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
     if (failed(resTypes))

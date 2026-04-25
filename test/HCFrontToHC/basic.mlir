@@ -10,6 +10,7 @@
 // verifier would reject.
 // RUN: hc-opt --convert-hc-front-to-hc --hc-promote-names %s | FileCheck %s
 // RUN: hc-opt --convert-hc-front-to-hc --hc-promote-names %s | hc-opt | FileCheck %s
+// RUN: hc-opt --convert-hc-front-to-hc --hc-promote-names --cse %s | FileCheck %s --check-prefix=CSE
 
 // Exercises the mechanical hc_front -> hc rewrite patterns this pass
 // covers: top-level kernel/func/intrinsic, return/constant/binop,
@@ -232,6 +233,35 @@ module {
     %t_dim = hc_front.target_name "t_dim"
     hc_front.assign %t_dim = %dim
 
+    hc_front.return
+  }
+
+  // CHECK-LABEL: hc.kernel @launch_geo_full_rank_cse
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE-LABEL: hc.kernel @launch_geo_full_rank_cse
+  // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE-NOT: hc.group_id
+  hc_front.kernel "launch_geo_full_rank_cse" attributes {
+    group_shape = ["16", "8"],
+    parameters = [{name = "group"}, {name = "out"}],
+    returns = "None",
+    work_shape = ["M", "N"]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %out = hc_front.name "out" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %v0 = hc_front.constant<0 : i64>
+    %v1 = hc_front.constant<1 : i64>
+    %gid_attr0 = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid0 = hc_front.subscript %gid_attr0[%ax0]
+    %out_idx0 = hc_front.target_subscript %out[%gid0]
+    hc_front.assign %out_idx0 = %v0
+    %gid_attr1 = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid1 = hc_front.subscript %gid_attr1[%ax1]
+    %out_idx1 = hc_front.target_subscript %out[%gid1]
+    hc_front.assign %out_idx1 = %v1
     hc_front.return
   }
 }

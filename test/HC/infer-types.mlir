@@ -10,7 +10,7 @@
 // CHECK: hc.const<7 : i64> : !hc.idx<"7">
 // CHECK: hc.add {{.*}} -> !hc.idx<"5">
 // CHECK: hc.cmp.lt {{.*}} -> !hc.pred<"True">
-// CHECK: hc.slice_expr{{.*}} -> !hc.slice
+// CHECK: hc.slice_expr{{.*}} -> !hc.slice<lower = !hc.idx<"5">, upper = !hc.idx<"7">>
 hc.func @scalar_index_arithmetic {
   %two = hc.const<2 : i64> : !hc.undef
   %three = hc.const<3 : i64> : !hc.undef
@@ -19,6 +19,45 @@ hc.func @scalar_index_arithmetic {
   %cmp = hc.cmp.lt %sum, %seven : (!hc.undef, !hc.undef) -> !hc.undef
   %slice = hc.slice_expr(lower = %sum upper = %seven)
       : (!hc.undef, !hc.undef) -> !hc.undef
+  hc.return
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @slice_region_branch_result
+// CHECK: hc.if {{.*}} -> (!hc.slice<lower = !hc.idx>) : i1
+// CHECK: hc.yield {{.*}} : !hc.slice<lower = !hc.idx<"1">>
+// CHECK: hc.yield {{.*}} : !hc.slice<lower = !hc.idx<"2">>
+hc.func @slice_region_branch_result(%cond: i1) {
+  %one = hc.const<1 : i64> : !hc.undef
+  %two = hc.const<2 : i64> : !hc.undef
+  %choice = hc.if %cond -> (!hc.undef) : i1 {
+    %then = hc.slice_expr(lower = %one) : (!hc.undef) -> !hc.undef
+    hc.yield %then : !hc.undef
+  } else {
+    %else = hc.slice_expr(lower = %two) : (!hc.undef) -> !hc.undef
+    hc.yield %else : !hc.undef
+  }
+  hc.return
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @slice_expression_conflict_renumbers_join_symbol
+// CHECK: ^bb0(%[[IV:.*]]: !hc.idx<"[[JOIN:\$join[0-9]+]]">):
+// CHECK: hc.slice_expr{{.*}} -> !hc.slice<lower = !hc.idx<"[[JOIN]]">, upper = !hc.idx<"16 + [[JOIN]]">>
+hc.func @slice_expression_conflict_renumbers_join_symbol {
+  %lo = hc.const<0 : i64> : !hc.undef
+  %hi = hc.const<4 : i64> : !hc.undef
+  %step = hc.const<1 : i64> : !hc.undef
+  %sixteen = hc.const<16 : i64> : !hc.undef
+  hc.for_range %lo to %hi step %step : (!hc.undef, !hc.undef, !hc.undef) {
+  ^bb0(%iv: !hc.undef):
+    %upper = hc.add %iv, %sixteen : (!hc.undef, !hc.undef) -> !hc.undef
+    %slice = hc.slice_expr(lower = %iv upper = %upper)
+        : (!hc.undef, !hc.undef) -> !hc.undef
+    hc.yield
+  }
   hc.return
 }
 

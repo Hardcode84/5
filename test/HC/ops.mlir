@@ -17,6 +17,7 @@
 // CHECK-SAME: !hc.pred
 // CHECK-SAME: !hc.pred<"M - N < 0">
 // CHECK-SAME: !hc.slice
+// CHECK-SAME: !hc.slice<lower = !hc.idx<"M">, step = !hc.idx>
 // CHECK-SAME: !hc.vector<f32, ["TileM", "TileN"]>
 // CHECK-SAME: !hc.buffer<f32, []>
 // CHECK-SAME: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = #hc.expr<"64">>
@@ -63,6 +64,7 @@ module {
       %p: !hc.pred,
       %ppred: !hc.pred<#hc.pred<"M < N">>,
       %s: !hc.slice,
+      %typed_slice: !hc.slice<lower = !hc.idx<"M">, step = !hc.idx>,
       %v: !hc.vector<f32, ["TileM", "TileN"]>,
       %scalar_buffer: !hc.buffer<f32, []>,
       %g: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = #hc.expr<"64">>,

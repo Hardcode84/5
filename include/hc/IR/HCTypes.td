@@ -60,17 +60,22 @@ def HC_PredType : HC_Type<"Pred", "pred",
   let hasCustomAssemblyFormat = 1;
 }
 
-def HC_SliceType : HC_Type<"Slice", "slice"> {
+def HC_SliceType : HC_Type<"Slice", "slice",
+    [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "First-class slice value.";
   let description = [{
     Produced by `hc.slice_expr` and consumed by `hc.load`, `hc.store`,
-    `hc.buffer_view`, and friends. The type is uniform: presence of the
-    lower/upper/step parts is encoded exclusively by which optional
-    operands are supplied to the producing `hc.slice_expr`
-    (`AttrSizedOperandSegments` + `Optional<>`), not by any flags on the
-    type itself. A missing part carries Python slice semantics
-    (`None`-equivalent).
+    `hc.buffer_view`, and friends. Optional lower/upper/step parameters mirror
+    the syntactically present operands of the producing `hc.slice_expr`.
+    Missing parameters carry Python slice semantics (`None`-equivalent);
+    present-but-unknown parts use `!hc.undef`.
   }];
+  let parameters = (ins
+    OptionalParameter<"::mlir::Type">:$lowerType,
+    OptionalParameter<"::mlir::Type">:$upperType,
+    OptionalParameter<"::mlir::Type">:$stepType
+  );
+  let hasCustomAssemblyFormat = 1;
 }
 
 def HC_BufferType : HC_Type<"Buffer", "buffer"> {

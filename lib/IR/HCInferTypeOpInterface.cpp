@@ -580,9 +580,21 @@ LogicalResult HCBufferDimOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
-LogicalResult HCSliceExprOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCSliceExprOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                           SmallVectorImpl<Type> &resultTypes) {
-  resultTypes.push_back(SliceType::get(getContext()));
+  unsigned nextOperand = 0;
+  auto partType = [&](Value part) -> Type {
+    if (!part)
+      return {};
+    if (nextOperand >= operandTypes.size())
+      return part.getType();
+    return operandTypes[nextOperand++];
+  };
+  Type lowerType = partType(getLower());
+  Type upperType = partType(getUpper());
+  Type stepType = partType(getStep());
+  resultTypes.push_back(
+      SliceType::get(getContext(), lowerType, upperType, stepType));
   return success();
 }
 

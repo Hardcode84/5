@@ -718,6 +718,12 @@ static void collectSyntheticJoinSymbols(Type type, llvm::StringSet<> &seen,
   if (auto tuple = dyn_cast<TupleType>(type)) {
     for (Type element : tuple.getTypes())
       collectSyntheticJoinSymbols(element, seen, symbols);
+    return;
+  }
+  if (auto slice = dyn_cast<SliceType>(type)) {
+    collectSyntheticJoinSymbols(slice.getLowerType(), seen, symbols);
+    collectSyntheticJoinSymbols(slice.getUpperType(), seen, symbols);
+    collectSyntheticJoinSymbols(slice.getStepType(), seen, symbols);
   }
 }
 
@@ -830,6 +836,24 @@ rewriteSyntheticJoinSymbols(Type type,
     if (!changed)
       return type;
     return TupleType::get(ctx, elements);
+  }
+  if (auto slice = dyn_cast<SliceType>(type)) {
+    FailureOr<Type> lower =
+        rewriteSyntheticJoinSymbols(slice.getLowerType(), substitutions);
+    if (failed(lower))
+      return failure();
+    FailureOr<Type> upper =
+        rewriteSyntheticJoinSymbols(slice.getUpperType(), substitutions);
+    if (failed(upper))
+      return failure();
+    FailureOr<Type> step =
+        rewriteSyntheticJoinSymbols(slice.getStepType(), substitutions);
+    if (failed(step))
+      return failure();
+    if (*lower == slice.getLowerType() && *upper == slice.getUpperType() &&
+        *step == slice.getStepType())
+      return type;
+    return SliceType::get(ctx, *lower, *upper, *step);
   }
   return type;
 }

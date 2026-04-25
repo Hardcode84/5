@@ -439,6 +439,106 @@ Type PredType::joinHCType(Type other) const {
   return {};
 }
 
+static FailureOr<Type> parseSlicePartType(AsmParser &parser, StringRef key) {
+  Type type;
+  if (parser.parseType(type))
+    return failure();
+  if (!type) {
+    parser.emitError(parser.getCurrentLocation())
+        << "expected type for `" << key << "`";
+    return failure();
+  }
+  return type;
+}
+
+Type SliceType::parse(AsmParser &parser) {
+  MLIRContext *ctx = parser.getContext();
+  Type lowerType;
+  Type upperType;
+  Type stepType;
+  if (failed(parser.parseOptionalLess()))
+    return SliceType::get(ctx, lowerType, upperType, stepType);
+
+  while (true) {
+    StringRef key;
+    if (parser.parseKeyword(&key) || parser.parseEqual())
+      return {};
+
+    if (key == "lower") {
+      FailureOr<Type> parsed = parseSlicePartType(parser, key);
+      if (failed(parsed))
+        return {};
+      lowerType = *parsed;
+    } else if (key == "upper") {
+      FailureOr<Type> parsed = parseSlicePartType(parser, key);
+      if (failed(parsed))
+        return {};
+      upperType = *parsed;
+    } else if (key == "step") {
+      FailureOr<Type> parsed = parseSlicePartType(parser, key);
+      if (failed(parsed))
+        return {};
+      stepType = *parsed;
+    } else {
+      parser.emitError(parser.getCurrentLocation())
+          << "unknown !hc.slice parameter `" << key << "`";
+      return {};
+    }
+
+    if (failed(parser.parseOptionalComma()))
+      break;
+  }
+
+  if (parser.parseGreater())
+    return {};
+  return SliceType::get(ctx, lowerType, upperType, stepType);
+}
+
+void SliceType::print(AsmPrinter &printer) const {
+  SmallVector<std::pair<StringRef, Type>> parts;
+  if (Type lower = getLowerType())
+    parts.push_back({"lower", lower});
+  if (Type upper = getUpperType())
+    parts.push_back({"upper", upper});
+  if (Type step = getStepType())
+    parts.push_back({"step", step});
+  if (parts.empty())
+    return;
+
+  printer << "<";
+  llvm::interleaveComma(parts, printer, [&](const auto &entry) {
+    printer << entry.first << " = " << entry.second;
+  });
+  printer << ">";
+}
+
+static Type joinSlicePart(Type lhs, Type rhs, bool &ok) {
+  if (!lhs && !rhs)
+    return {};
+  if (!lhs || !rhs) {
+    ok = false;
+    return {};
+  }
+  Type joined = joinHCTypes(lhs, rhs);
+  if (!joined)
+    ok = false;
+  return joined;
+}
+
+Type SliceType::joinHCType(Type other) const {
+  auto rhs = dyn_cast<SliceType>(other);
+  if (!rhs)
+    return {};
+
+  bool ok = true;
+  Type lower = joinSlicePart(getLowerType(), rhs.getLowerType(), ok);
+  Type upper = joinSlicePart(getUpperType(), rhs.getUpperType(), ok);
+  Type step = joinSlicePart(getStepType(), rhs.getStepType(), ok);
+  if (!ok)
+    return SliceType::get(getContext(), Type{}, Type{}, Type{});
+  return SliceType::get(getContext(), lower, upper, step);
+}
+
 Type GroupType::parse(AsmParser &parser) {
   MLIRContext *ctx = parser.getContext();
   SMLoc typeLoc = parser.getCurrentLocation();

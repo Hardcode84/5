@@ -629,6 +629,16 @@ LogicalResult HCSymbolOp::verify() {
   return success();
 }
 
+OpFoldResult HCConstOp::fold(FoldAdaptor /*adaptor*/) { return getValue(); }
+
+OpFoldResult HCUndefValueOp::fold(FoldAdaptor /*adaptor*/) {
+  return UnitAttr::get(getContext());
+}
+
+OpFoldResult HCSymbolOp::fold(FoldAdaptor /*adaptor*/) {
+  return TypeAttr::get(getResult().getType());
+}
+
 LogicalResult HCForRangeOp::verify() {
   // The body block takes the induction variable plus one argument per
   // iter_args entry; result types mirror iter_inits types one-to-one.

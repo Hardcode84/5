@@ -165,7 +165,7 @@ def HCReturnOp : HC_Op<"return"> {
 // Scalar producers and casts.
 //===----------------------------------------------------------------------===//
 
-def HCConstOp : HC_Op<"const", [Pure]> {
+def HCConstOp : HC_Op<"const", [ConstantLike, Pure]> {
   let summary = "Literal scalar producer (int, float, bool, string).";
   let description = [{
     Carries a builtin attribute payload lowered from `hc_front.constant`.
@@ -176,9 +176,10 @@ def HCConstOp : HC_Op<"const", [Pure]> {
   let arguments = (ins AnyAttr:$value);
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = "`<` $value `>` attr-dict `:` type($result)";
+  let hasFolder = 1;
 }
 
-def HCUndefValueOp : HC_Op<"undef_value", [Pure]> {
+def HCUndefValueOp : HC_Op<"undef_value", [ConstantLike, Pure]> {
   let summary = "Typed undefined seed for name-promotion scaffolding.";
   let description = [{
     Produces a `!hc.undef` value with no source operand. The name-promotion
@@ -191,9 +192,10 @@ def HCUndefValueOp : HC_Op<"undef_value", [Pure]> {
   }];
   let results = (outs HC_UndefType:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
+  let hasFolder = 1;
 }
 
-def HCSymbolOp : HC_Op<"symbol", [Pure]> {
+def HCSymbolOp : HC_Op<"symbol", [ConstantLike, Pure]> {
   let summary = "Introduce a symbolic capture bound to a named symbol.";
   let description = [{
     Produces a pinned `!hc.idx<"name">`. The bound name lives in the result
@@ -205,6 +207,7 @@ def HCSymbolOp : HC_Op<"symbol", [Pure]> {
   let results = (outs HC_IdxType:$result);
   let assemblyFormat = "attr-dict `:` qualified(type($result))";
   let hasVerifier = 1;
+  let hasFolder = 1;
 }
 
 def HCCastOp : HC_Op<"cast", [Pure]> {

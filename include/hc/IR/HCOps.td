@@ -39,7 +39,7 @@ class HC_GenericUnaryOp<string mnemonic, list<Trait> traits = [],
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 
-def HCKernelOp : HC_RegionOp<"kernel", [Symbol]> {
+def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
   let summary = "Semantic kernel region.";
   let description = [{
     Top-level compiled unit. Carries a module-scoped symbol name (`@name`) so
@@ -71,7 +71,7 @@ def HCKernelOp : HC_RegionOp<"kernel", [Symbol]> {
   let hasVerifier = 1;
 }
 
-def HCFuncOp : HC_RegionOp<"func", [Symbol]> {
+def HCFuncOp : HC_RegionOp<"func", [IsolatedFromAbove, Symbol]> {
   let summary = "Semantic helper region.";
   let description = [{
     Helper callable referenced by `hc.call`. Carries a symbol name and an
@@ -307,7 +307,7 @@ def HCCmpNeOp : HC_CmpOp<"ne">;
 // Intrinsic declaration and structured control flow.
 //===----------------------------------------------------------------------===//
 
-def HCIntrinsicOp : HC_RegionOp<"intrinsic", [Symbol]> {
+def HCIntrinsicOp : HC_RegionOp<"intrinsic", [IsolatedFromAbove, Symbol]> {
   let summary = "Scope-gated semantic intrinsic declaration.";
   let description = [{
     Declares an intrinsic with its scope and (optional) effect class.

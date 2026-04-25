@@ -6,15 +6,17 @@
 //
 // Mirrors the pass order `hc-opt` and `doc/lowering.md` document for
 // the frontend stage: fold/erase region scaffolding, inline undecorated
-// helpers, convert to `hc`, then promote `hc.name_load` / `hc.assign`
-// into SSA. `hc.compile` loads this via `-transform-preload-library`
-// and runs it with `-transform-interpreter`; callers wanting a
-// different order can pass `schedule=<path-or-text>` to override.
+// helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
+// SSA, then run the standard cleanup pair. `hc.compile` loads this via
+// `-transform-preload-library` and runs it with `-transform-interpreter`;
+// callers wanting a different order can pass `schedule=<path-or-text>`
+// to override.
 module attributes {transform.with_named_sequence} {
-  // `%m` is consumed by each `apply_registered_pass`; the verifier
+  // `%m` is consumed by the registered frontend/HC passes; the verifier
   // requires the entry block argument to reflect that by omitting the
   // `{transform.readonly}` attribute. Each pass produces a fresh handle
-  // that threads into the next.
+  // that threads into the next. The final cleanups use transform dialect
+  // ops directly on the post-promotion handle.
   transform.named_sequence @__transform_main(%m: !transform.any_op) {
     %m1 = transform.apply_registered_pass "hc-front-fold-region-defs" to %m
         : (!transform.any_op) -> !transform.any_op
@@ -24,6 +26,10 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m4 = transform.apply_registered_pass "hc-promote-names" to %m3
         : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m4 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m4 : !transform.any_op
     transform.yield
   }
 }

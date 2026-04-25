@@ -54,7 +54,7 @@
 // to `hc`. The canonical pipeline order is:
 //
 //     -hc-front-fold-region-defs -hc-front-inline \
-//       -convert-hc-front-to-hc -hc-promote-names
+//       -convert-hc-front-to-hc -hc-promote-names, then canonicalization + CSE
 //
 // - `-hc-front-inline` expands every `hc_front.call` targeting a
 //   `ref = {kind = "inline"}` marker func into an

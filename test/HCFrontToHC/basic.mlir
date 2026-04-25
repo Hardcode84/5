@@ -398,4 +398,15 @@ module {
     hc_front.assign %out_idx1 = %v1
     hc_front.return
   }
+
+  // CHECK-LABEL: hc.kernel @zero_rank_buffer_param
+  // CHECK-SAME: (%{{.*}}: !hc.buffer<!hc.undef, []>)
+  hc_front.kernel "zero_rank_buffer_param" attributes {
+    parameters = [
+      {annotation = "Buffer[()]", kind = "buffer", name = "cell", shape = []}
+    ],
+    returns = "None"
+  } {
+    hc_front.return
+  }
 }

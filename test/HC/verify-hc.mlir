@@ -358,6 +358,17 @@ module {
 
 // -----
 
+// CHECK: error: 'hc.buffer_dim' op axis 0 is out of bounds for rank-0 buffer
+module {
+  func.func @bad(%buf: !hc.buffer<f32, []>) -> !hc.undef {
+    %d = hc.buffer_dim %buf, axis = 0
+        : !hc.buffer<f32, []> -> !hc.undef
+    return %d : !hc.undef
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.reduce' op axis 5 is out of bounds for rank-2 value
 module {
   func.func @bad(%v: !hc.tensor<f32, ["M", "N"]>) -> !hc.undef {

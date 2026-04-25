@@ -80,6 +80,7 @@ def HC_BufferType : HC_Type<"Buffer", "buffer"> {
     attribute. The shape is intentionally modeled as an attribute payload so the
     symbolic surface can evolve independently from the type shell, while the
     textual type syntax inlines the shape dimensions as `["M", "N + 1"]`.
+    An empty shape is a rank-0 mutable scalar buffer, not missing metadata.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,

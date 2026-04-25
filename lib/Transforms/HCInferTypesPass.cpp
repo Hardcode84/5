@@ -202,24 +202,6 @@ static bool shouldRefine(Type current, Type inferred) {
   return false;
 }
 
-static std::optional<Type> inferredTypeFor(DataFlowSolver &solver,
-                                           Value value) {
-  const HCTypeLattice *lattice = solver.lookupState<HCTypeLattice>(value);
-  if (!lattice)
-    return std::nullopt;
-  const TypeFact &fact = lattice->getValue();
-  if (!fact.isConcrete())
-    return std::nullopt;
-  return fact.type;
-}
-
-static bool refineValue(Value value, Type inferred) {
-  if (!shouldRefine(value.getType(), inferred))
-    return false;
-  value.setType(inferred);
-  return true;
-}
-
 static bool isNestedUnderHCCallable(Operation *op) {
   while (op) {
     if (isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(op))
@@ -235,6 +217,64 @@ static bool isNestedUnderHCCallable(Value value) {
   if (auto arg = dyn_cast<BlockArgument>(value))
     return isNestedUnderHCCallable(arg.getOwner()->getParentOp());
   return false;
+}
+
+static std::optional<Type> inferredTypeFor(DataFlowSolver &solver,
+                                           Value value) {
+  const HCTypeLattice *lattice = solver.lookupState<HCTypeLattice>(value);
+  if (!lattice)
+    return std::nullopt;
+  const TypeFact &fact = lattice->getValue();
+  if (!fact.isConcrete())
+    return std::nullopt;
+  return fact.type;
+}
+
+static LogicalResult reportConflict(Value value) {
+  if (auto result = dyn_cast<OpResult>(value)) {
+    return result.getOwner()->emitOpError()
+           << "has conflicting HC type facts for result #"
+           << result.getResultNumber();
+  }
+
+  auto arg = cast<BlockArgument>(value);
+  Operation *owner = arg.getOwner()->getParentOp();
+  if (owner)
+    return owner->emitOpError()
+           << "has conflicting HC type facts for block argument #"
+           << arg.getArgNumber();
+  return failure();
+}
+
+static LogicalResult reportTypeConflicts(ModuleOp module,
+                                         DataFlowSolver &solver) {
+  bool foundConflict = false;
+  auto checkValue = [&](Value value) {
+    if (!isNestedUnderHCCallable(value))
+      return;
+    const HCTypeLattice *lattice = solver.lookupState<HCTypeLattice>(value);
+    if (!lattice || !lattice->getValue().isConflict())
+      return;
+    foundConflict = true;
+    (void)reportConflict(value);
+  };
+
+  module.walk([&](Operation *op) {
+    for (OpResult result : op->getResults())
+      checkValue(result);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          checkValue(arg);
+  });
+  return failure(foundConflict);
+}
+
+static bool refineValue(Value value, Type inferred) {
+  if (!shouldRefine(value.getType(), inferred))
+    return false;
+  value.setType(inferred);
+  return true;
 }
 
 static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
@@ -270,6 +310,8 @@ struct HCInferTypesPass : public hc::impl::HCInferTypesBase<HCInferTypesPass> {
       dataflow::loadBaselineAnalyses(solver);
       solver.load<HCTypeAnalysis>();
       if (failed(solver.initializeAndRun(module)))
+        return signalPassFailure();
+      if (failed(reportTypeConflicts(module, solver)))
         return signalPassFailure();
       if (!applyInferredTypes(module, solver))
         return;

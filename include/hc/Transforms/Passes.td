@@ -56,8 +56,8 @@ def HCInferTypes : Pass<"hc-infer-types", "::mlir::ModuleOp"> {
     slice focuses on scalar/index facts: constants, symbols, launch geometry,
     slice construction, buffer dimensions, index arithmetic/comparisons, and
     structured loop carriers. Inference is monotonic: `!hc.undef` refines to a
-    concrete type, and conflicting concrete facts are left unchanged for later
-    diagnostics instead of being reconciled with a guess.
+    concrete type, and conflicting concrete facts fail the pass instead of
+    being reconciled with a guess.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }

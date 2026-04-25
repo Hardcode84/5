@@ -37,9 +37,10 @@ llvm_config.with_environment("PATH", config.llvm_tools_dir, append_path=True)
 
 tool_dirs = [
     config.hc_tools_dir,
+    config.hc_symbols_test_dir,
     config.hc_install_tools_dir,
     config.llvm_tools_dir,
 ]
-tools = ["FileCheck", "count", "not", "hc-opt"]
+tools = ["FileCheck", "count", "not", "hc-opt", "hc-symbols-test"]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

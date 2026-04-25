@@ -8,6 +8,9 @@ config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
 config.hc_obj_root = "@PROJECT_BINARY_DIR@"
 config.hc_src_root = lit_config.substitute("@PROJECT_SOURCE_DIR@")
 config.hc_tools_dir = lit_config.substitute("@PROJECT_BINARY_DIR@/tools/hc-opt")
+config.hc_symbols_test_dir = lit_config.substitute(
+    "@PROJECT_BINARY_DIR@/tools/hc-symbols-test"
+)
 config.hc_install_tools_dir = lit_config.substitute("@CMAKE_INSTALL_PREFIX@/bin")
 config.hc_mlir_python_package_dir = lit_config.substitute(
     "@PROJECT_BINARY_DIR@/python_packages/hc_front"

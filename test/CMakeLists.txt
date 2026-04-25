@@ -22,6 +22,7 @@ configure_lit_site_cfg(
 
 set(HC_TEST_DEPENDS
   hc-opt
+  hc-symbols-test
 )
 if(TARGET HCPythonModules)
   list(APPEND HC_TEST_DEPENDS HCPythonModules)

@@ -162,101 +162,6 @@ static FailureOr<SmallVector<Type>> launchGeometryIdxTypes(MLIRContext *ctx,
   return types;
 }
 
-enum class LaunchGeoMethod {
-  GroupId,
-  LocalId,
-  SubgroupId,
-  GroupShape,
-  WorkOffset,
-  WorkShape,
-  GroupSize,
-  WaveSize,
-};
-
-enum class LaunchGeoArity {
-  MultiAxis,
-  Scalar,
-};
-
-enum class LaunchGeoRankDomain {
-  WorkGridWithGroupFallback,
-  WorkGrid,
-  Workgroup,
-  Scalar,
-};
-
-struct LaunchGeoMethodInfo {
-  LaunchGeoMethod method;
-  StringRef name;
-  StringRef symbolPrefix;
-  LaunchGeoArity arity;
-  LaunchGeoRankDomain rankDomain;
-
-  bool isScalar() const { return arity == LaunchGeoArity::Scalar; }
-};
-
-static std::optional<LaunchGeoMethodInfo>
-classifyLaunchGeoMethod(StringRef method) {
-  enum class ClassifiedMethod {
-    Unknown,
-    GroupId,
-    LocalId,
-    SubgroupId,
-    GroupShape,
-    WorkOffset,
-    WorkShape,
-    GroupSize,
-    WaveSize,
-  };
-  ClassifiedMethod kind = llvm::StringSwitch<ClassifiedMethod>(method)
-                              .Case("group_id", ClassifiedMethod::GroupId)
-                              .Case("local_id", ClassifiedMethod::LocalId)
-                              .Case("subgroup_id", ClassifiedMethod::SubgroupId)
-                              .Case("group_shape", ClassifiedMethod::GroupShape)
-                              .Case("work_offset", ClassifiedMethod::WorkOffset)
-                              .Case("work_shape", ClassifiedMethod::WorkShape)
-                              .Case("group_size", ClassifiedMethod::GroupSize)
-                              .Case("wave_size", ClassifiedMethod::WaveSize)
-                              .Default(ClassifiedMethod::Unknown);
-  switch (kind) {
-  case ClassifiedMethod::GroupId:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupId, "group_id", "$WG",
-                               LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::WorkGridWithGroupFallback};
-  case ClassifiedMethod::LocalId:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::LocalId, "local_id", "$WI",
-                               LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::Workgroup};
-  case ClassifiedMethod::SubgroupId:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::SubgroupId, "subgroup_id",
-                               "$SG", LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::Workgroup};
-  case ClassifiedMethod::GroupShape:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupShape, "group_shape",
-                               "$WGS", LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::Workgroup};
-  case ClassifiedMethod::WorkOffset:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkOffset, "work_offset",
-                               "$WO", LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::WorkGrid};
-  case ClassifiedMethod::WorkShape:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkShape, "work_shape", "$WS",
-                               LaunchGeoArity::MultiAxis,
-                               LaunchGeoRankDomain::WorkGrid};
-  case ClassifiedMethod::GroupSize:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupSize, "group_size", "$GSZ",
-                               LaunchGeoArity::Scalar,
-                               LaunchGeoRankDomain::Scalar};
-  case ClassifiedMethod::WaveSize:
-    return LaunchGeoMethodInfo{LaunchGeoMethod::WaveSize, "wave_size", "$WV",
-                               LaunchGeoArity::Scalar,
-                               LaunchGeoRankDomain::Scalar};
-  case ClassifiedMethod::Unknown:
-    return std::nullopt;
-  }
-  llvm_unreachable("unhandled launch-geometry method");
-}
-
 //===----------------------------------------------------------------------===//
 // The Python driver (see `hc/_resolve.py`) stamps every `hc_front.name` and
 // most `hc_front.attr` with a `ref` DictAttr of the form
@@ -2725,18 +2630,12 @@ Lowerer::getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
   auto fallbackRank = [&] {
     return requiredRank.value_or(static_cast<unsigned>(kMaxLaunchAxis));
   };
-  auto groupType = dyn_cast<GroupType>(contextType);
-  auto workitemType = dyn_cast<WorkitemType>(contextType);
-  auto subgroupType = dyn_cast<SubgroupType>(contextType);
   ShapeAttr contextWorkShape;
   ShapeAttr contextGroupShape;
-  if (groupType) {
-    contextWorkShape = groupType.getWorkShape();
-    contextGroupShape = groupType.getGroupShape();
-  } else if (workitemType) {
-    contextGroupShape = workitemType.getGroupShape();
-  } else if (subgroupType) {
-    contextGroupShape = subgroupType.getGroupShape();
+  if (std::optional<LaunchContextMetadata> metadata =
+          getLaunchContextMetadata(contextType)) {
+    contextWorkShape = metadata->workShape;
+    contextGroupShape = metadata->groupShape;
   }
 
   switch (method.rankDomain) {

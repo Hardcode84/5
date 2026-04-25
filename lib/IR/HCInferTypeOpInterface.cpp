@@ -316,6 +316,14 @@ static LogicalResult appendPrefixedIdxTypes(MLIRContext *ctx, Operation *op,
   return success();
 }
 
+static LogicalResult appendLaunchAxisIdxTypes(MLIRContext *ctx, Operation *op,
+                                              LaunchGeoMethod method,
+                                              unsigned count,
+                                              SmallVectorImpl<Type> &types) {
+  return appendPrefixedIdxTypes(
+      ctx, op, getLaunchGeoMethodInfo(method).symbolPrefix, count, types);
+}
+
 static void appendShapeIdxTypes(MLIRContext *ctx, ShapeAttr shape,
                                 unsigned count, SmallVectorImpl<Type> &types) {
   for (unsigned axis = 0; axis < count; ++axis) {
@@ -357,30 +365,6 @@ static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
   return Type(IdxType::get(ctx, product));
 }
 
-struct LaunchContextMetadata {
-  ShapeAttr workShape;
-  ShapeAttr groupShape;
-  ExprAttr subgroupSize;
-};
-
-static std::optional<LaunchContextMetadata>
-getLaunchContextMetadata(Type contextType) {
-  if (auto group = dyn_cast_or_null<GroupType>(contextType))
-    return LaunchContextMetadata{group.getWorkShape(), group.getGroupShape(),
-                                 group.getSubgroupSize()};
-  // Nested launch contexts intentionally carry only workgroup-local metadata;
-  // work-grid queries must come from the enclosing group handle.
-  if (auto workitem = dyn_cast_or_null<WorkitemType>(contextType))
-    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
-                                 workitem.getGroupShape(),
-                                 workitem.getSubgroupSize()};
-  if (auto subgroup = dyn_cast_or_null<SubgroupType>(contextType))
-    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
-                                 subgroup.getGroupShape(),
-                                 subgroup.getSubgroupSize()};
-  return std::nullopt;
-}
-
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
                                               ArrayRef<Type> operandTypes,
@@ -396,13 +380,17 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
   Operation *raw = op.getOperation();
   unsigned count = op->getNumResults();
   if (isa<HCGroupIdOp>(raw))
-    return appendPrefixedIdxTypes(ctx, raw, "$WG", count, types);
+    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::GroupId, count,
+                                    types);
   if (isa<HCLocalIdOp>(raw))
-    return appendPrefixedIdxTypes(ctx, raw, "$WI", count, types);
+    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::LocalId, count,
+                                    types);
   if (isa<HCSubgroupIdOp>(raw))
-    return appendPrefixedIdxTypes(ctx, raw, "$SG", count, types);
+    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::SubgroupId,
+                                    count, types);
   if (isa<HCWorkOffsetOp>(raw))
-    return appendPrefixedIdxTypes(ctx, raw, "$WO", count, types);
+    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::WorkOffset,
+                                    count, types);
   if (isa<HCGroupShapeOp>(raw)) {
     appendShapeIdxTypes(ctx, metadata->groupShape, count, types);
     return success();

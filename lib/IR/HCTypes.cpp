@@ -10,6 +10,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
@@ -181,6 +182,108 @@ IdxType mlir::hc::getUnpinnedIdxType(MLIRContext *ctx) {
 
 PredType mlir::hc::getUnpinnedPredType(MLIRContext *ctx) {
   return PredType::get(ctx, PredAttr{});
+}
+
+LaunchGeoMethodInfo mlir::hc::getLaunchGeoMethodInfo(LaunchGeoMethod method) {
+  switch (method) {
+  case LaunchGeoMethod::GroupId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupId, "group_id", "$WG",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGridWithGroupFallback};
+  case LaunchGeoMethod::LocalId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::LocalId, "local_id", "$WI",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case LaunchGeoMethod::SubgroupId:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::SubgroupId, "subgroup_id",
+                               "$SG", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case LaunchGeoMethod::GroupShape:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupShape, "group_shape",
+                               "$WGS", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::Workgroup};
+  case LaunchGeoMethod::WorkOffset:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkOffset, "work_offset",
+                               "$WO", LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGrid};
+  case LaunchGeoMethod::WorkShape:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WorkShape, "work_shape", "$WS",
+                               LaunchGeoArity::MultiAxis,
+                               LaunchGeoRankDomain::WorkGrid};
+  case LaunchGeoMethod::GroupSize:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::GroupSize, "group_size", "$GSZ",
+                               LaunchGeoArity::Scalar,
+                               LaunchGeoRankDomain::Scalar};
+  case LaunchGeoMethod::WaveSize:
+    return LaunchGeoMethodInfo{LaunchGeoMethod::WaveSize, "wave_size", "$WV",
+                               LaunchGeoArity::Scalar,
+                               LaunchGeoRankDomain::Scalar};
+  }
+  llvm_unreachable("unhandled launch-geometry method");
+}
+
+std::optional<LaunchGeoMethodInfo>
+mlir::hc::classifyLaunchGeoMethod(StringRef method) {
+  enum class ClassifiedMethod {
+    Unknown,
+    GroupId,
+    LocalId,
+    SubgroupId,
+    GroupShape,
+    WorkOffset,
+    WorkShape,
+    GroupSize,
+    WaveSize,
+  };
+  ClassifiedMethod kind = llvm::StringSwitch<ClassifiedMethod>(method)
+                              .Case("group_id", ClassifiedMethod::GroupId)
+                              .Case("local_id", ClassifiedMethod::LocalId)
+                              .Case("subgroup_id", ClassifiedMethod::SubgroupId)
+                              .Case("group_shape", ClassifiedMethod::GroupShape)
+                              .Case("work_offset", ClassifiedMethod::WorkOffset)
+                              .Case("work_shape", ClassifiedMethod::WorkShape)
+                              .Case("group_size", ClassifiedMethod::GroupSize)
+                              .Case("wave_size", ClassifiedMethod::WaveSize)
+                              .Default(ClassifiedMethod::Unknown);
+  switch (kind) {
+  case ClassifiedMethod::GroupId:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::GroupId);
+  case ClassifiedMethod::LocalId:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::LocalId);
+  case ClassifiedMethod::SubgroupId:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::SubgroupId);
+  case ClassifiedMethod::GroupShape:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::GroupShape);
+  case ClassifiedMethod::WorkOffset:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::WorkOffset);
+  case ClassifiedMethod::WorkShape:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::WorkShape);
+  case ClassifiedMethod::GroupSize:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::GroupSize);
+  case ClassifiedMethod::WaveSize:
+    return getLaunchGeoMethodInfo(LaunchGeoMethod::WaveSize);
+  case ClassifiedMethod::Unknown:
+    return std::nullopt;
+  }
+  llvm_unreachable("unhandled launch-geometry method");
+}
+
+std::optional<LaunchContextMetadata>
+mlir::hc::getLaunchContextMetadata(Type contextType) {
+  if (auto group = dyn_cast_or_null<GroupType>(contextType))
+    return LaunchContextMetadata{group.getWorkShape(), group.getGroupShape(),
+                                 group.getSubgroupSize()};
+  // Nested launch contexts intentionally carry only workgroup-local metadata;
+  // work-grid queries must come from the enclosing group handle.
+  if (auto workitem = dyn_cast_or_null<WorkitemType>(contextType))
+    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
+                                 workitem.getGroupShape(),
+                                 workitem.getSubgroupSize()};
+  if (auto subgroup = dyn_cast_or_null<SubgroupType>(contextType))
+    return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
+                                 subgroup.getGroupShape(),
+                                 subgroup.getSubgroupSize()};
+  return std::nullopt;
 }
 
 mlir::LogicalResult

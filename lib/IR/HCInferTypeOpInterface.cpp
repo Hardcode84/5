@@ -237,6 +237,41 @@ static Type inferLoadLikeResult(Type sourceType, ShapeAttr shape,
                                                        elementType, shape));
 }
 
+static std::optional<int64_t> staticIntegerIndex(Type type) {
+  std::optional<ExprAttr> expr = idxExprAttr(type);
+  if (!expr)
+    return std::nullopt;
+  // `hc.getitem` only needs literal tuple indices today. Keep broader
+  // expression evaluation out of this local helper until it has a shared home.
+  std::string rendered =
+      symbolStore(type.getContext()).render((*expr).getNode());
+  int64_t value;
+  if (StringRef(rendered).getAsInteger(10, value))
+    return std::nullopt;
+  return value;
+}
+
+static FailureOr<Type>
+inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
+  auto tuple = dyn_cast_or_null<TupleType>(sourceType);
+  if (!tuple || indexTypes.size() != 1)
+    return Type{};
+  std::optional<int64_t> index = staticIntegerIndex(indexTypes.front());
+  if (!index)
+    return Type{};
+  int64_t originalIndex = *index;
+  int64_t normalizedIndex = originalIndex;
+  int64_t tupleSize = static_cast<int64_t>(tuple.size());
+  if (normalizedIndex < 0)
+    normalizedIndex += tupleSize;
+  if (normalizedIndex < 0 || normalizedIndex >= tupleSize) {
+    op->emitOpError("tuple index ")
+        << originalIndex << " out of bounds for tuple of size " << tuple.size();
+    return failure();
+  }
+  return tuple.getType(static_cast<size_t>(normalizedIndex));
+}
+
 static bool allResultsAreUndef(Operation *op) {
   return llvm::all_of(op->getResultTypes(),
                       [](Type type) { return isa<UndefType>(type); });
@@ -523,6 +558,18 @@ LogicalResult HCVLoadOp::inferHCTypes(ArrayRef<Type> operandTypes,
   resultTypes.push_back(inferLoadLikeResult(
       operandTypes.empty() ? Type{} : operandTypes.front(), getShapeAttr(),
       /*vectorResult=*/true, *this));
+  return success();
+}
+
+LogicalResult HCGetItemOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                        SmallVectorImpl<Type> &resultTypes) {
+  Type source = operandTypes.empty() ? Type{} : operandTypes.front();
+  ArrayRef<Type> indices =
+      operandTypes.empty() ? ArrayRef<Type>{} : operandTypes.drop_front();
+  FailureOr<Type> result = inferGetItemResult(source, indices, *this);
+  if (failed(result))
+    return failure();
+  resultTypes.push_back(*result);
   return success();
 }
 

@@ -1005,6 +1005,16 @@ LogicalResult HCVLoadOp::verify() {
   return verifyLoadShapeRank(*this, getIndices());
 }
 
+LogicalResult HCGetItemOp::verify() {
+  if (getIndices().empty())
+    return emitOpError("expected at least one index");
+  if (isa<TupleType>(getBase().getType()) && getIndices().size() != 1)
+    return emitOpError(
+               "expected exactly one index when the base is a tuple, got ")
+           << getIndices().size();
+  return success();
+}
+
 LogicalResult HCReduceOp::verify() {
   // Kind is a typed enum now; wrong spellings never reach the verifier.
   if (getAxisAttr().getValue().isNegative())

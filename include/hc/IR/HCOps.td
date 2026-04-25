@@ -632,6 +632,23 @@ def HCBufferViewOp : HC_Op<"buffer_view", [Pure]> {
   }];
 }
 
+def HCGetItemOp : HC_Op<"getitem",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary = "Generic Python square-bracket indexing.";
+  let description = [{
+    Preserves Python `base[index...]` structure before the base kind is known.
+    Later inference/refinement can specialize tuple item, buffer/tensor view,
+    or element cases without requiring the frontend conversion to choose early.
+  }];
+  let arguments = (ins AnyType:$base, Variadic<HC_ValueType>:$indices);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $base `[` $indices `]` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Data movement.
 //===----------------------------------------------------------------------===//

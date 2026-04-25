@@ -34,6 +34,27 @@ module {
 
 // -----
 
+// CHECK: error: 'hc.getitem' op expected at least one index
+module {
+  hc.func @bad(%arg0: !hc.undef) {
+    %x = hc.getitem %arg0[] : (!hc.undef) -> !hc.undef
+    hc.return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.getitem' op expected exactly one index when the base is a tuple, got 2
+module {
+  hc.func @bad(%arg0: tuple<!hc.undef, !hc.undef>, %idx: !hc.undef) {
+    %x = hc.getitem %arg0[%idx, %idx]
+        : (tuple<!hc.undef, !hc.undef>, !hc.undef, !hc.undef) -> !hc.undef
+    hc.return
+  }
+}
+
+// -----
+
 // CHECK: error: expected constraints to contain only #hc.pred attributes
 module {
   hc.kernel @bad requirements = #hc.constraints<[#hc.expr<"M">]> {

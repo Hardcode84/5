@@ -19,6 +19,7 @@
 // CHECK-SAME: !hc.slice
 // CHECK-SAME: !hc.vector<f32, ["TileM", "TileN"]>
 // CHECK-SAME: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = 64 : i32>
+// CHECK-SAME: tuple<!hc.idx<"M">, f32>
 // CHECK: func.func @use_scope_and_effects
 // CHECK-SAME: effects = #hc<effects pure>
 // CHECK-SAME: scope = #hc.scope<"WorkItem">
@@ -62,7 +63,8 @@ module {
       %ppred: !hc.pred<#hc.pred<"M < N">>,
       %s: !hc.slice,
       %v: !hc.vector<f32, ["TileM", "TileN"]>,
-      %g: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = 64 : i32>) {
+      %g: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = 64 : i32>,
+      %t: tuple<!hc.idx<"M">, f32>) {
     return
   }
 

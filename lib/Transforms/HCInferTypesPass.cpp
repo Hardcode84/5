@@ -19,6 +19,7 @@
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/CallInterfaces.h"
@@ -34,6 +35,38 @@ using namespace mlir;
 using namespace mlir::hc;
 
 namespace {
+
+static bool isUndef(Type type) { return isa<UndefType>(type); }
+
+static Type joinConcreteTypes(Type lhs, Type rhs) {
+  if (lhs == rhs)
+    return lhs;
+  if (isUndef(lhs))
+    return rhs;
+  if (isUndef(rhs))
+    return lhs;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(lhs))
+    if (Type common = joinable.joinHCType(rhs))
+      return common;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(rhs))
+    if (Type common = joinable.joinHCType(lhs))
+      return common;
+
+  auto lhsTuple = dyn_cast<TupleType>(lhs);
+  auto rhsTuple = dyn_cast<TupleType>(rhs);
+  if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
+    return {};
+  SmallVector<Type> elements;
+  elements.reserve(lhsTuple.size());
+  for (auto [lhsElement, rhsElement] :
+       llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
+    Type joined = joinConcreteTypes(lhsElement, rhsElement);
+    if (!joined)
+      return {};
+    elements.push_back(joined);
+  }
+  return TupleType::get(lhs.getContext(), elements);
+}
 
 struct TypeFact {
   enum class Kind { Unknown, Concrete, Conflict };
@@ -69,14 +102,8 @@ struct TypeFact {
       return lhs;
     if (lhs.isConflict() || rhs.isConflict())
       return conflict();
-    if (lhs.type == rhs.type)
-      return lhs;
-    if (auto joinable = dyn_cast<HCJoinableTypeInterface>(lhs.type))
-      if (Type common = joinable.joinHCType(rhs.type))
-        return concrete(common);
-    if (auto joinable = dyn_cast<HCJoinableTypeInterface>(rhs.type))
-      if (Type common = joinable.joinHCType(lhs.type))
-        return concrete(common);
+    if (Type common = joinConcreteTypes(lhs.type, rhs.type))
+      return concrete(common);
     return conflict();
   }
 
@@ -98,8 +125,6 @@ struct HCTypeLattice : public dataflow::Lattice<TypeFact> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HCTypeLattice)
   using Lattice::Lattice;
 };
-
-static bool isUndef(Type type) { return isa<UndefType>(type); }
 
 static TypeFact factFromExistingType(Type type) {
   if (!type || isUndef(type))
@@ -268,6 +293,17 @@ static bool shouldRefine(Type current, Type inferred) {
     return false;
   if (isUndef(current))
     return true;
+  if (auto currentTuple = dyn_cast<TupleType>(current)) {
+    auto inferredTuple = dyn_cast<TupleType>(inferred);
+    if (!inferredTuple || currentTuple.size() != inferredTuple.size())
+      return false;
+    return llvm::any_of(
+        llvm::zip_equal(currentTuple.getTypes(), inferredTuple.getTypes()),
+        [](auto pair) {
+          auto [currentElement, inferredElement] = pair;
+          return shouldRefine(currentElement, inferredElement);
+        });
+  }
   if (auto currentIdx = dyn_cast<IdxType>(current)) {
     auto inferredIdx = dyn_cast<IdxType>(inferred);
     return inferredIdx && !currentIdx.getExpr() && inferredIdx.getExpr();

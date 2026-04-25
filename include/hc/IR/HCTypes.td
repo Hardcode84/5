@@ -140,7 +140,7 @@ def HC_GroupType : HC_Type<"Group", "group"> {
 // AnyOf constraint covering every type that a generic `hc` op (`hc.add`,
 // `hc.cmp.lt`, `hc.cast`, ...) is willing to see. Intentionally wide: an op
 // emitted by `hc_front` -> `hc` may see only `!hc.undef`; after inference it
-// may see any of the concrete `hc` types or a builtin scalar. Folding and
+// may see any of the concrete `hc` types, builtin tuple, or builtin scalar. Folding and
 // verification dispatch on the concrete-type combinations within.
 def HC_ValueType : AnyTypeOf<[
   HC_UndefType,
@@ -154,6 +154,15 @@ def HC_ValueType : AnyTypeOf<[
   AnyInteger,
   AnyFloat,
   Index,
+  AnyTuple,
+]>;
+
+// Tuple-rooted values. The dialect uses MLIR's builtin `tuple<...>` shell so
+// tuple values can carry arbitrary HC semantic element types without inventing
+// a dialect-specific aggregate type.
+def HC_TupleValueType : AnyTypeOf<[
+  HC_UndefType,
+  AnyTuple,
 ]>;
 
 // Numeric/symbolic subset. Excludes `!hc.pred`, `!hc.slice`, `!hc.buffer` —

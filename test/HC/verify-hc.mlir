@@ -55,6 +55,27 @@ module {
 
 // -----
 
+// CHECK: error: 'hc.tuple' op result tuple arity 1 does not match element count 2
+module {
+  hc.func @bad(%arg0: !hc.undef, %arg1: !hc.undef) {
+    %x = hc.tuple(%arg0, %arg1)
+        : (!hc.undef, !hc.undef) -> tuple<!hc.undef>
+    hc.return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.tuple' op element #1 type 'f32' does not match result tuple element type 'i32'
+module {
+  hc.func @bad(%arg0: !hc.undef, %arg1: f32) {
+    %x = hc.tuple(%arg0, %arg1) : (!hc.undef, f32) -> tuple<!hc.undef, i32>
+    hc.return
+  }
+}
+
+// -----
+
 // CHECK: error: expected constraints to contain only #hc.pred attributes
 module {
   hc.kernel @bad requirements = #hc.constraints<[#hc.expr<"M">]> {

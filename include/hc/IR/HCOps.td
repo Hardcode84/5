@@ -46,24 +46,35 @@ class HCBranchCompatibleTypes<string lhs, string rhs> : TypesMatchWith<
     lhs, rhs, "$_self",
     [{
       [](::mlir::TypeRange lhsTypes, ::mlir::TypeRange rhsTypes) {
+        auto compatible = [](auto &&self, ::mlir::Type lhsType,
+                             ::mlir::Type rhsType) -> bool {
+          if (lhsType == rhsType ||
+              ::llvm::isa<::mlir::hc::UndefType>(lhsType) ||
+              ::llvm::isa<::mlir::hc::UndefType>(rhsType))
+            return true;
+          if (auto joinable =
+                  ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
+                      lhsType))
+            if (joinable.joinHCType(rhsType))
+              return true;
+          if (auto joinable =
+                  ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
+                      rhsType))
+            if (joinable.joinHCType(lhsType))
+              return true;
+          auto lhsTuple = ::llvm::dyn_cast<::mlir::TupleType>(lhsType);
+          auto rhsTuple = ::llvm::dyn_cast<::mlir::TupleType>(rhsType);
+          if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
+            return false;
+          for (size_t i = 0, e = lhsTuple.size(); i < e; ++i)
+            if (!self(self, lhsTuple.getType(i), rhsTuple.getType(i)))
+              return false;
+          return true;
+        };
         return ::llvm::equal(
             lhsTypes, rhsTypes,
-            [](::mlir::Type lhsType, ::mlir::Type rhsType) {
-              if (lhsType == rhsType ||
-                  ::llvm::isa<::mlir::hc::UndefType>(lhsType) ||
-                  ::llvm::isa<::mlir::hc::UndefType>(rhsType))
-                return true;
-              if (auto joinable =
-                      ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
-                          lhsType))
-                if (joinable.joinHCType(rhsType))
-                  return true;
-              if (auto joinable =
-                      ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
-                          rhsType))
-                if (joinable.joinHCType(lhsType))
-                  return true;
-              return false;
+            [&](::mlir::Type lhsType, ::mlir::Type rhsType) {
+              return compatible(compatible, lhsType, rhsType);
             });
       }
     }]>;
@@ -238,6 +249,23 @@ def HCUndefValueOp : HC_Op<"undef_value", [ConstantLike, Pure]> {
   let results = (outs HC_UndefType:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
   let hasFolder = 1;
+}
+
+def HCTupleOp : HC_Op<"tuple",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary = "First-class tuple value.";
+  let description = [{
+    Builds a single SSA aggregate using MLIR's builtin `tuple<...>` type.
+    This preserves Python tuple structure in `hc` IR so later passes can
+    project with `hc.getitem` or destructure explicitly instead of relying on
+    converter-local side tables.
+  }];
+  let arguments = (ins Variadic<HC_ValueType>:$elements);
+  let results = (outs HC_TupleValueType:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    `(` $elements `)` attr-dict `:` functional-type(operands, results)
+  }];
 }
 
 def HCSymbolOp : HC_Op<"symbol",

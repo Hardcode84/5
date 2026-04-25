@@ -19,3 +19,15 @@ hc.func @tuple_getitem_oob(%tuple: tuple<!hc.idx<"A">, !hc.idx<"B">>,
       : (tuple<!hc.idx<"A">, !hc.idx<"B">>, !hc.idx<"2">) -> !hc.undef
   hc.return
 }
+
+// -----
+
+hc.func @tuple_getitem_multi_index_after_infer {
+  %zero = hc.const<0 : i64> : !hc.undef
+  %one = hc.const<1 : i64> : !hc.undef
+  %pair = hc.tuple(%zero, %one) : (!hc.undef, !hc.undef) -> !hc.undef
+  // expected-error @+1 {{tuple getitem expects exactly one index after inference, got 2}}
+  %item = hc.getitem %pair[%zero, %one]
+      : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+  hc.return
+}

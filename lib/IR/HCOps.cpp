@@ -25,12 +25,25 @@ using namespace mlir::hc;
 // pre-inference IR to round-trip.
 static bool isUndef(Type t) { return llvm::isa<UndefType>(t); }
 
+static bool compatibleProgressiveType(Type source, Type dest) {
+  if (isUndef(source) || isUndef(dest) || source == dest)
+    return true;
+  auto sourceTuple = dyn_cast<TupleType>(source);
+  auto destTuple = dyn_cast<TupleType>(dest);
+  if (!sourceTuple || !destTuple || sourceTuple.size() != destTuple.size())
+    return false;
+  return llvm::all_of(
+      llvm::zip_equal(sourceTuple.getTypes(), destTuple.getTypes()),
+      [](auto pair) {
+        auto [sourceElem, destElem] = pair;
+        return compatibleProgressiveType(sourceElem, destElem);
+      });
+}
+
 // Signature-compat check with the progressive-typing escape. Kept near
 // `isUndef` so every verifier that walks op↔signature pairs can share it.
 static bool compatibleSigType(Type callSite, Type callee) {
-  if (isUndef(callSite) || isUndef(callee))
-    return true;
-  return callSite == callee;
+  return compatibleProgressiveType(callSite, callee);
 }
 
 static bool compatibleBranchType(Type source, Type dest) {
@@ -793,9 +806,7 @@ LogicalResult HCForRangeOp::verify() {
 //   2. `$results` non-empty — post-promotion. Body must end with
 //      `hc.yield`, arity matches `$results`, each value's type is
 //      compatible with the corresponding result type (`!hc.undef`
-//      escape applies on either side, matching progressive typing). Unlike
-//      `hc.for_range` / `hc.if`, nested scopes are not region-branch ops and do
-//      not widen distinct symbolic payloads across control-flow edges.
+//      escape applies on either side, matching progressive typing).
 //
 // A `hc.region_return` terminator combined with non-empty `$results`
 // is the frontend contradicting itself — "pre-promotion" (the
@@ -824,7 +835,7 @@ static LogicalResult verifyNestedScopeRegion(Operation *op) {
     auto [yielded, result] = pair;
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
-    if (yieldedTy == resultTy || isUndef(yieldedTy) || isUndef(resultTy))
+    if (compatibleBranchType(yieldedTy, resultTy))
       continue;
     return op->emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx
@@ -1003,6 +1014,30 @@ LogicalResult HCLoadOp::verify() {
 
 LogicalResult HCVLoadOp::verify() {
   return verifyLoadShapeRank(*this, getIndices());
+}
+
+LogicalResult HCTupleOp::verify() {
+  Type resultType = getResult().getType();
+  if (isUndef(resultType))
+    return success();
+  auto tuple = dyn_cast<TupleType>(resultType);
+  if (!tuple)
+    return emitOpError("result must be !hc.undef or builtin tuple, got ")
+           << resultType;
+  if (tuple.size() != getElements().size())
+    return emitOpError("result tuple arity ")
+           << tuple.size() << " does not match element count "
+           << getElements().size();
+  for (auto [index, pair] :
+       llvm::enumerate(llvm::zip_equal(getElements(), tuple.getTypes()))) {
+    auto [value, type] = pair;
+    if (compatibleBranchType(value.getType(), type))
+      continue;
+    return emitOpError("element #")
+           << index << " type " << value.getType()
+           << " does not match result tuple element type " << type;
+  }
+  return success();
 }
 
 LogicalResult HCGetItemOp::verify() {

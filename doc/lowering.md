@@ -482,13 +482,16 @@ Comparison result typing:
   there is no flag/operand drift.
 * `hc.buffer_view %buf[%idx...]` — sub-view of a buffer or tensor with the
   slice-reduced shape, for cases that do not require data movement
+* `hc.tuple(%value...)` — first-class aggregate using MLIR's builtin
+  `tuple<...>` type, preserving Python tuple structure as a single SSA value
 * `hc.getitem %base[%idx...]` — generic Python square-bracket indexing kept
   before the base kind is known. Inference can refine tuple item access when
   the index converges to a concrete integer; later passes may specialize
   buffer/tensor cases into view or data-movement ops.
 
 Multi-axis subscripts on `hc.getitem`/`hc.load`/`hc.store`/`hc.buffer_view`
-take variadic operands directly; there is no separate tuple-construction op.
+take variadic operands directly; `hc.tuple` is reserved for source-level tuple
+values and explicit aggregates.
 
 #### Data movement
 

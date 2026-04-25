@@ -237,6 +237,12 @@ static Type inferLoadLikeResult(Type sourceType, ShapeAttr shape,
                                                        elementType, shape));
 }
 
+static Type inferTupleResult(ArrayRef<Type> elementTypes, Operation *op) {
+  if (llvm::any_of(elementTypes, [](Type type) { return !type; }))
+    return {};
+  return TupleType::get(op->getContext(), elementTypes);
+}
+
 static std::optional<int64_t> staticIntegerIndex(Type type) {
   std::optional<ExprAttr> expr = idxExprAttr(type);
   if (!expr)
@@ -254,19 +260,25 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
 static FailureOr<Type>
 inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
   auto tuple = dyn_cast_or_null<TupleType>(sourceType);
-  if (!tuple || indexTypes.size() != 1)
+  if (!tuple)
     return Type{};
+  if (indexTypes.size() != 1) {
+    op->emitOpError(
+        "tuple getitem expects exactly one index after inference, got ")
+        << indexTypes.size();
+    return failure();
+  }
   std::optional<int64_t> index = staticIntegerIndex(indexTypes.front());
   if (!index)
     return Type{};
   int64_t originalIndex = *index;
   int64_t normalizedIndex = originalIndex;
   int64_t tupleSize = static_cast<int64_t>(tuple.size());
-  if (normalizedIndex < 0)
+  if (normalizedIndex < 0 && normalizedIndex >= -tupleSize)
     normalizedIndex += tupleSize;
   if (normalizedIndex < 0 || normalizedIndex >= tupleSize) {
     op->emitOpError("tuple index ")
-        << originalIndex << " out of bounds for tuple of size " << tuple.size();
+        << originalIndex << " out of bounds for tuple of size " << tupleSize;
     return failure();
   }
   return tuple.getType(static_cast<size_t>(normalizedIndex));
@@ -405,6 +417,12 @@ LogicalResult HCConstOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
 LogicalResult HCSymbolOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
                                        SmallVectorImpl<Type> &resultTypes) {
   resultTypes.push_back(getResult().getType());
+  return success();
+}
+
+LogicalResult HCTupleOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                      SmallVectorImpl<Type> &resultTypes) {
+  resultTypes.push_back(inferTupleResult(operandTypes, *this));
   return success();
 }
 

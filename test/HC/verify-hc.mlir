@@ -195,6 +195,83 @@ module {
 
 // -----
 
+// CHECK: error: 'hc.group_id' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%group: !hc.group<work_shape = #hc.shape<["M", "N"]>>) {
+    %gid = hc.group_id %group
+        : (!hc.group<work_shape = #hc.shape<["M", "N"]>>) -> !hc.idx<"$WG0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.local_id' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%wi: !hc.workitem<group_shape = #hc.shape<["16", "8"]>>) {
+    %lid = hc.local_id %wi
+        : (!hc.workitem<group_shape = #hc.shape<["16", "8"]>>) -> !hc.idx<"$WI0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.subgroup_id' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%sg: !hc.subgroup<group_shape = #hc.shape<["16", "8"]>>) {
+    %sid = hc.subgroup_id %sg
+        : (!hc.subgroup<group_shape = #hc.shape<["16", "8"]>>) -> !hc.idx<"$SG0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.group_shape' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%group: !hc.group<group_shape = #hc.shape<["16", "8"]>>) {
+    %shape = hc.group_shape %group
+        : (!hc.group<group_shape = #hc.shape<["16", "8"]>>) -> !hc.idx<"$WGS0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.work_offset' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%group: !hc.group<work_shape = #hc.shape<["M", "N"]>>) {
+    %offset = hc.work_offset %group
+        : (!hc.group<work_shape = #hc.shape<["M", "N"]>>) -> !hc.idx<"$WO0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.work_shape' op expected 2 result(s) for launch-geometry query, got 1
+module {
+  func.func @bad(%group: !hc.group<work_shape = #hc.shape<["M", "N"]>>) {
+    %shape = hc.work_shape %group
+        : (!hc.group<work_shape = #hc.shape<["M", "N"]>>) -> !hc.idx<"$WS0">
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.group_size' op expected 1 result(s) for launch-geometry query, got 2
+module {
+  func.func @bad(%group: !hc.group<group_shape = #hc.shape<["32"]>>) {
+    %size:2 = hc.group_size %group
+        : (!hc.group<group_shape = #hc.shape<["32"]>>) -> (!hc.idx<"$GSZ0">, !hc.idx<"$GSZ1">)
+    return
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.buffer_dim' op axis must be non-negative
 module {
   func.func @bad(%buf: !hc.undef) -> !hc.undef {

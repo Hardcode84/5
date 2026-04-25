@@ -11,6 +11,8 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::hc;
 
@@ -636,6 +638,78 @@ OpFoldResult HCUndefValueOp::fold(FoldAdaptor /*adaptor*/) {
 
 OpFoldResult HCSymbolOp::fold(FoldAdaptor /*adaptor*/) {
   return TypeAttr::get(getResult().getType());
+}
+
+struct LaunchContextRanks {
+  std::optional<unsigned> workRank;
+  std::optional<unsigned> groupRank;
+};
+
+static std::optional<unsigned> shapeRank(ShapeAttr shape) {
+  if (!shape)
+    return std::nullopt;
+  return static_cast<unsigned>(shape.getDims().size());
+}
+
+static LaunchContextRanks launchContextRanks(Type type) {
+  if (auto group = dyn_cast<GroupType>(type))
+    return {shapeRank(group.getWorkShape()), shapeRank(group.getGroupShape())};
+  if (auto workitem = dyn_cast<WorkitemType>(type))
+    return {/*workRank=*/std::nullopt, shapeRank(workitem.getGroupShape())};
+  if (auto subgroup = dyn_cast<SubgroupType>(type))
+    return {/*workRank=*/std::nullopt, shapeRank(subgroup.getGroupShape())};
+  return {};
+}
+
+static std::optional<unsigned> expectedLaunchGeometryResults(Operation *op,
+                                                             Type contextType) {
+  if (isa<HCGroupSizeOp, HCWaveSizeOp>(op))
+    return 1u;
+
+  LaunchContextRanks ranks = launchContextRanks(contextType);
+  if (isa<HCGroupIdOp, HCWorkOffsetOp, HCWorkShapeOp>(op))
+    return ranks.workRank;
+  if (isa<HCLocalIdOp, HCSubgroupIdOp, HCGroupShapeOp>(op))
+    return ranks.groupRank;
+  return std::nullopt;
+}
+
+template <typename OpT> static LogicalResult verifyLaunchGeometryArity(OpT op) {
+  std::optional<unsigned> expected =
+      expectedLaunchGeometryResults(op.getOperation(), op.getGroup().getType());
+  if (!expected || op->getNumResults() == *expected)
+    return success();
+  return op.emitOpError("expected ")
+         << *expected << " result(s) for launch-geometry query, got "
+         << op->getNumResults();
+}
+
+LogicalResult HCGroupIdOp::verify() { return verifyLaunchGeometryArity(*this); }
+
+LogicalResult HCLocalIdOp::verify() { return verifyLaunchGeometryArity(*this); }
+
+LogicalResult HCSubgroupIdOp::verify() {
+  return verifyLaunchGeometryArity(*this);
+}
+
+LogicalResult HCGroupShapeOp::verify() {
+  return verifyLaunchGeometryArity(*this);
+}
+
+LogicalResult HCGroupSizeOp::verify() {
+  return verifyLaunchGeometryArity(*this);
+}
+
+LogicalResult HCWorkOffsetOp::verify() {
+  return verifyLaunchGeometryArity(*this);
+}
+
+LogicalResult HCWorkShapeOp::verify() {
+  return verifyLaunchGeometryArity(*this);
+}
+
+LogicalResult HCWaveSizeOp::verify() {
+  return verifyLaunchGeometryArity(*this);
 }
 
 void HCYieldOp::getSuccessorRegions(ArrayRef<Attribute> /*operands*/,

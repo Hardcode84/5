@@ -1026,31 +1026,6 @@ LogicalResult HCBufferDimOp::verify() {
   return success();
 }
 
-/// Verify that an optional `#hc.shape` on a load/vload op matches the
-/// number of index operands one-to-one. Without a shape attr, we cannot
-/// check rank — leave that to inference-stage checks.
-template <typename OpT>
-static LogicalResult
-verifyLoadShapeRank(OpT op, mlir::Operation::operand_range indices) {
-  auto shape = op.getShapeAttr();
-  if (!shape)
-    return success();
-  size_t expected = shape.getDims().size();
-  size_t actual = indices.size();
-  if (expected != actual)
-    return op.emitOpError("shape rank (")
-           << expected << ") does not match index count (" << actual << ")";
-  return success();
-}
-
-LogicalResult HCLoadOp::verify() {
-  return verifyLoadShapeRank(*this, getIndices());
-}
-
-LogicalResult HCVLoadOp::verify() {
-  return verifyLoadShapeRank(*this, getIndices());
-}
-
 LogicalResult HCTupleOp::verify() {
   Type resultType = getResult().getType();
   if (isHCUndefType(resultType))

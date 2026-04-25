@@ -161,11 +161,30 @@ hc.func @loads(%buf: !hc.buffer<f32, ["M", "N"]>, %i: !hc.idx<"0">,
                %j: !hc.idx<"1">) -> (!hc.undef, !hc.undef, !hc.undef) {
   %dim = hc.buffer_dim %buf, axis = 1
       : !hc.buffer<f32, ["M", "N"]> -> !hc.undef
-  %t = hc.load %buf[%i, %j] {shape = #hc.shape<["4", "8"]>}
-      : (!hc.buffer<f32, ["M", "N"]>, !hc.idx<"0">, !hc.idx<"1">)
+  %four = hc.const<4 : i64> : !hc.undef
+  %eight = hc.const<8 : i64> : !hc.undef
+  %shape = hc.tuple(%four, %eight)
+      : (!hc.undef, !hc.undef) -> !hc.undef
+  %t = hc.load %buf[%i, %j], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.idx<"0">, !hc.idx<"1">, !hc.undef)
         -> !hc.undef
   %v = hc.vec %t : !hc.undef -> !hc.undef
   hc.return %dim, %t, %v : !hc.undef, !hc.undef, !hc.undef
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @allocators
+// CHECK: hc.vfull {{.*}} -> !hc.vector<f32, ["4", "8"]>
+// CHECK: hc.full {{.*}} -> !hc.tensor<f32, ["4", "8"]>
+hc.func @allocators(%fill: f32) -> (!hc.undef, !hc.undef) {
+  %four = hc.const<4 : i64> : !hc.undef
+  %eight = hc.const<8 : i64> : !hc.undef
+  %shape = hc.tuple(%four, %eight)
+      : (!hc.undef, !hc.undef) -> !hc.undef
+  %vec = hc.vfull %fill, shape %shape : (f32, !hc.undef) -> !hc.undef
+  %tensor = hc.full %fill, shape %shape : (f32, !hc.undef) -> !hc.undef
+  hc.return %vec, %tensor : !hc.undef, !hc.undef
 }
 
 // -----

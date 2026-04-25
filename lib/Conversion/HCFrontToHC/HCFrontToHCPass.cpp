@@ -375,7 +375,7 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
 
 //===----------------------------------------------------------------------===//
 // `group.load(a[row_sl, col_sl], shape=(M, K))` — the WMMA pattern —
-// has to land as `hc.load %a[%row_sl, %col_sl] {shape=...}`, not as a
+// has to land as `hc.load %a[%row_sl, %col_sl], shape %shape`, not as a
 // chained `hc.buffer_view` + zero-index `hc.load`. This helper peels
 // the `hc.buffer_view` produced by `lowerSubscript` on the handle of
 // load/vload/store when the caller didn't supply trailing positional
@@ -2038,62 +2038,10 @@ FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
   for (Value arg : op.getArguments()) {
     auto kwIt = keywordInfo.find(arg);
     if (kwIt != keywordInfo.end()) {
-      // `shape = (M, N)` folds to a shape attr at the call site and
-      // lands in `kwattrs`. Everything else lands in `kwvalues` as a
-      // candidate SSA operand for `lowerCall` to match against the
-      // callee's declared `parameters` (excluding names in the
-      // `const_kwargs` whitelist, which are promoted back to
-      // call-site attributes).
-      StringRef kwName = kwIt->second.name;
-      Value kwVal = kwIt->second.loweredValue;
-      if (kwName == "shape") {
-        // The tuple-of-constants -> `#hc.shape<...>` fold. Derive the element
-        // list from the lowered `hc.tuple`; if it is not a static tuple of
-        // integer/string constants, fall back to storing the tuple value so a
-        // later lowering can still see it.
-        if (auto tuple = kwVal ? kwVal.getDefiningOp<HCTupleOp>() : nullptr) {
-          SmallVector<Attribute> dims;
-          dims.reserve(tuple.getElements().size());
-          auto &store =
-              op->getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
-          // If every element is an `hc.const` carrying an integer, we can
-          // materialize a shape attribute. String-valued constants are
-          // also accepted (they already name a symbol).
-          bool ok = true;
-          for (Value e : tuple.getElements()) {
-            Attribute dim;
-            if (auto constOp = e.getDefiningOp<HCConstOp>()) {
-              Attribute v = constOp.getValue();
-              std::string text;
-              if (auto i = dyn_cast<IntegerAttr>(v)) {
-                text = std::to_string(i.getInt());
-              } else if (auto s = dyn_cast<StringAttr>(v)) {
-                text = s.getValue().str();
-              } else {
-                ok = false;
-                break;
-              }
-              std::string diag;
-              FailureOr<sym::ExprHandle> handle =
-                  sym::parseExpr(store, text, &diag);
-              if (failed(handle)) {
-                ok = false;
-                break;
-              }
-              dim = ExprAttr::get(op.getContext(), *handle);
-            } else {
-              ok = false;
-              break;
-            }
-            dims.push_back(dim);
-          }
-          if (ok) {
-            args.kwattrs["shape"] = ShapeAttr::get(op.getContext(), dims);
-            continue;
-          }
-        }
-      }
-      args.kwvalues[kwName] = kwVal;
+      // Keyword arguments stay as SSA values at this boundary. Intrinsic
+      // const-kwargs promote selected `hc.const` values back to attributes
+      // later, and load/vload shape kwargs now remain ordinary operands.
+      args.kwvalues[kwIt->second.name] = kwIt->second.loweredValue;
       continue;
     }
     FailureOr<Value> loweredOr =
@@ -2290,8 +2238,8 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     auto call = HCCallIntrinsicOp::create(builder, op.getLoc(),
                                           TypeRange{undef}, symRef, operands);
     if (constKwargsAttr) {
-      // Promote declared const kwargs to call-site attributes: folded
-      // shape attr if present, else the producing `hc.const`'s payload.
+      // Promote declared const kwargs to call-site attributes from the
+      // producing `hc.const` payload.
       for (Attribute kw : constKwargsAttr) {
         auto kwStr = dyn_cast<StringAttr>(kw);
         if (!kwStr)
@@ -2383,7 +2331,9 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
   if (method == "vec" || method == "with_inactive" || method == "astype")
     return lowerUnaryBaseMethod(call, method, base, args);
   if (method == "load" || method == "vload" || method == "store" ||
-      method == "vzeros")
+      method == "vzeros" || method == "vones" || method == "vfull" ||
+      method == "zeros" || method == "ones" || method == "full" ||
+      method == "empty")
     return lowerMemOp(call, method, args);
   if (Value lowered = tryLowerLaunchGeoCall(call, method, base, args))
     return {lowered};
@@ -2502,11 +2452,10 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
                                      const CallArgs &args) {
   // Buffer/tensor load, vload, store: the frontend passes a (possibly
   // pre-sliced) handle as the first positional, remaining positionals go
-  // to the indices list, and an optional `shape=` kwarg lands as the
-  // attribute. We rely on `collectCallArgs`' shape-kwarg fold so no manual
-  // tuple walking is needed here. `peelBufferView` at file scope folds
-  // the pre-subscripted `hc.buffer_view` into the op's own index list;
-  // see its banner for the single-level rationale.
+  // to the indices list, and an optional `shape=` kwarg is passed through as
+  // a normal SSA operand. `peelBufferView` at file scope folds the
+  // pre-subscripted `hc.buffer_view` into the op's own index list; see its
+  // banner for the single-level rationale.
   //
   // Chained-subscript guard: if after one peel the handle is *still* a
   // `hc.buffer_view`, the user wrote `a[i][j]`-style nested subscripts.
@@ -2537,13 +2486,21 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     src = peelBufferView(src, indices);
     if (failed(rejectNestedView(src)))
       return failure();
-    auto shapeAttr = dyn_cast_or_null<ShapeAttr>(args.kwattrs.lookup("shape"));
+    auto shapeIt = args.kwvalues.find("shape");
+    Value shape =
+        shapeIt == args.kwvalues.end()
+            ? HCUndefValueOp::create(builder, call.getLoc(), undef).getResult()
+            : shapeIt->second;
+    if (!shape) {
+      call.emitOpError("`") << method << "` shape did not lower to an hc value";
+      return failure();
+    }
     Operation *op = method == "load"
                         ? HCLoadOp::create(builder, call.getLoc(), undef, src,
-                                           indices, shapeAttr)
+                                           indices, shape)
                               .getOperation()
                         : HCVLoadOp::create(builder, call.getLoc(), undef, src,
-                                            indices, shapeAttr)
+                                            indices, shape)
                               .getOperation();
     return {op->getResult(0)};
   }
@@ -2564,13 +2521,54 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     // SSA output" to `lowerCall`, distinct from the failure path below.
     return Value();
   }
-  if (method == "vzeros") {
-    auto shapeAttr = dyn_cast_or_null<ShapeAttr>(args.kwattrs.lookup("shape"));
-    if (!shapeAttr) {
-      call.emitOpError("`vzeros` missing or invalid `shape=` kwarg");
+  auto requiredShape = [&](StringRef callee) -> FailureOr<Value> {
+    auto shapeIt = args.kwvalues.find("shape");
+    if (shapeIt == args.kwvalues.end() || !shapeIt->second) {
+      call.emitOpError("`") << callee << "` missing or invalid `shape=` kwarg";
       return failure();
     }
-    return {HCVZerosOp::create(builder, call.getLoc(), undef, shapeAttr)
+    return shapeIt->second;
+  };
+
+  if (method == "vzeros" || method == "vones" || method == "zeros" ||
+      method == "ones" || method == "empty") {
+    FailureOr<Value> shape = requiredShape(method);
+    if (failed(shape))
+      return failure();
+    if (method == "vzeros")
+      return {HCVZerosOp::create(builder, call.getLoc(), undef, *shape)
+                  .getResult()};
+    if (method == "vones")
+      return {
+          HCVOnesOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+    if (method == "zeros")
+      return {
+          HCZerosOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+    if (method == "ones")
+      return {
+          HCOnesOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+    return {
+        HCEmptyOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+  }
+
+  if (method == "vfull" || method == "full") {
+    FailureOr<Value> shape = requiredShape(method);
+    if (failed(shape))
+      return failure();
+    Value fill;
+    if (auto fillIt = args.kwvalues.find("fill_value");
+        fillIt != args.kwvalues.end())
+      fill = fillIt->second;
+    else if (!args.positional.empty())
+      fill = args.positional.front();
+    if (!fill) {
+      call.emitOpError("`") << method << "` missing `fill_value=` operand";
+      return failure();
+    }
+    if (method == "vfull")
+      return {HCVFullOp::create(builder, call.getLoc(), undef, fill, *shape)
+                  .getResult()};
+    return {HCFullOp::create(builder, call.getLoc(), undef, fill, *shape)
                 .getResult()};
   }
   llvm_unreachable("unknown memory DSL method");

@@ -510,29 +510,29 @@ observe **addressable workgroup state** — `hc.load`, `hc.vload`, `hc.store`,
 carry the conservative `MemRead + MemWrite` pair until `hc.func` /
 `hc.intrinsic` grow per-target effect annotations.
 
-* `hc.load %buf[%idx...] {shape = #hc.shape<[...]>}` — buffer → tensor.
-  Carries a `MemRead` effect. The optional shape, when present, must have
-  the same rank as the index list.
-* `hc.vload %src[%idx...] {shape = #hc.shape<[...]>}` — buffer/tensor →
-  vector. Same effect/verifier shape as `hc.load`.
+* `hc.load %buf[%idx...], shape %shape` — buffer → tensor. Carries a
+  `MemRead` effect. The shape is an SSA value, usually a tuple of idx-typed
+  dimensions; missing source shape is represented as `!hc.undef`.
+* `hc.vload %src[%idx...], shape %shape` — buffer/tensor → vector. Same
+  effect and SSA shape convention as `hc.load`.
 * `hc.store %dst[%idx...], %src` — tensor or vector source; carries a
   `MemWrite` effect.
 * `hc.vec %t` — tensor → vector materialization. Carries a `MemRead` effect
   because the source tensor is addressable memory; an interleaved store can
   change what two sibling `hc.vec` ops observe, so CSE must not collapse
   them blindly.
-* `hc.with_inactive %v {inactive = T}` — replace inactive elements. The
-  `inactive` payload is a typed scalar literal (int/float/bool); once
-  inference pins the operand to a shaped type its numeric domain must
-  match the element type.
+* `hc.with_inactive %v, %inactive` — replace inactive elements. The inactive
+  fill is a scalar SSA value; once inference pins both operands its numeric
+  domain must match the shaped value's element type.
 * `hc.as_layout %v, layout = row_major | col_major` — change layout.
   The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
   spellings fail at parse. v0 admits `row_major` and `col_major`; later
   schemes can extend the enum without changing call sites.
-* `hc.vzeros`, `hc.vones`, `hc.vfull` — vector allocators (any scope).
-* `hc.zeros`, `hc.ones`, `hc.full` — tensor allocators (`WorkGroup` scope
-  only).
-* `hc.empty` — uninitialized tensor (`WorkGroup` scope).
+* `hc.vzeros shape %shape`, `hc.vones shape %shape`,
+  `hc.vfull %fill, shape %shape` — vector allocators (any scope).
+* `hc.zeros shape %shape`, `hc.ones shape %shape`,
+  `hc.full %fill, shape %shape` — tensor allocators (`WorkGroup` scope only).
+* `hc.empty shape %shape` — uninitialized tensor (`WorkGroup` scope).
 
 All allocators carry a `MemAlloc` effect: each op hands back a fresh,
 distinct storage slab, so CSE cannot collapse two sibling allocations into
@@ -625,9 +625,10 @@ hc.kernel @tiled_gfx11_wmma_matmul(
                   : (!hc.undef, !hc.undef) -> !hc.undef
     %col_sl = hc.slice_expr(lower = %k0 upper = %col_hi)
                   : (!hc.undef, !hc.undef) -> !hc.undef
-    %a_tile = hc.load %a[%row_sl, %col_sl]
-                     {shape = #hc.shape<["WMMA_M", "WMMA_K"]>}
-              : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+    %tile_shape = hc.tuple(%WM, %WK)
+        : (!hc.undef, !hc.undef) -> !hc.undef
+    %a_tile = hc.load %a[%row_sl, %col_sl], shape %tile_shape
+              : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
     // …analogous slice + load for b_tile…
     %acc1   = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
               : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
@@ -676,9 +677,12 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
     %col_hi = hc.add %k0,   %WK            // : !hc.idx<"_k0 + 16">
     %row_sl = hc.slice_expr(lower = %row0 upper = %row_hi) : !hc.slice
     %col_sl = hc.slice_expr(lower = %k0   upper = %col_hi) : !hc.slice
-    %a_tile = hc.load %a[%row_sl, %col_sl]
-                {shape = #hc.shape<["WMMA_M", "WMMA_K"]>}
-              : !hc.tensor<f16, #hc.shape<["WMMA_M","WMMA_K"]>>
+    %tile_shape = hc.tuple(%WM, %WK) : tuple<!hc.idx<"16">, !hc.idx<"16">>
+    %a_tile = hc.load %a[%row_sl, %col_sl], shape %tile_shape
+              : (!hc.buffer<f16, #hc.shape<["M","K"]>>,
+                 !hc.slice, !hc.slice,
+                 tuple<!hc.idx<"16">, !hc.idx<"16">>)
+                -> !hc.tensor<f16, #hc.shape<["WMMA_M","WMMA_K"]>>
     // ...
     %acc1 = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
     hc.yield %acc1
@@ -688,9 +692,9 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
 }
 ```
 
-Same op shape, refined types. The `%row_hi - %row0 = 16` kind of derivation
-used by `hc.load` shape verification is now a plain ixsimpl query on the
-typed expressions.
+Same op shape, refined types. The `%row_hi - %row0 = 16` kind of consistency
+check between the loaded view, `%tile_shape`, and the result type is a plain
+ixsimpl query on the typed expressions.
 
 Notes on the legalization contract these sketches assume:
 

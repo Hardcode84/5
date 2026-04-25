@@ -54,10 +54,12 @@ hc.func @helper {
 }
 
 // CHECK-LABEL: func.func @data_movement
-// CHECK: hc.load %{{.*}}[%{{.*}}, %{{.*}}] {shape = #hc.shape<["M", "K"]>}
-// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
-// CHECK: hc.vload %{{.*}}[%{{.*}}] {shape = #hc.shape<["K"]>}
-// CHECK-SAME: (!hc.undef, !hc.undef) -> !hc.undef
+// CHECK: %[[SHAPE_MK:.*]] = hc.tuple
+// CHECK: %[[SHAPE_K:.*]] = hc.tuple
+// CHECK: hc.load %{{.*}}[%{{.*}}, %{{.*}}], shape %[[SHAPE_MK]]
+// CHECK-SAME: (!hc.undef, !hc.undef, !hc.undef, tuple<!hc.undef, !hc.undef>) -> !hc.undef
+// CHECK: hc.vload %{{.*}}[%{{.*}}], shape %[[SHAPE_K]]
+// CHECK-SAME: (!hc.undef, !hc.undef, tuple<!hc.undef>) -> !hc.undef
 // CHECK: hc.store %{{.*}}[%{{.*}}, %{{.*}}], %{{.*}}
 // CHECK: hc.vec %{{.*}} : !hc.undef -> !hc.undef
 // CHECK: %[[INACTIVE:.*]] = hc.const<0.000000e+00 : f32> : f32
@@ -66,10 +68,15 @@ hc.func @helper {
 // CHECK: hc.as_layout %{{.*}}, layout = col_major : !hc.undef -> !hc.undef
 func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
                          %v: !hc.undef) {
-  %t = hc.load %buf[%i, %j] {shape = #hc.shape<["M", "K"]>}
-      : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
-  %vec = hc.vload %buf[%i] {shape = #hc.shape<["K"]>}
-      : (!hc.undef, !hc.undef) -> !hc.undef
+  %m = hc.const<"M"> : !hc.undef
+  %k = hc.const<"K"> : !hc.undef
+  %shape_mk = hc.tuple(%m, %k)
+      : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
+  %shape_k = hc.tuple(%k) : (!hc.undef) -> tuple<!hc.undef>
+  %t = hc.load %buf[%i, %j], shape %shape_mk
+      : (!hc.undef, !hc.undef, !hc.undef, tuple<!hc.undef, !hc.undef>) -> !hc.undef
+  %vec = hc.vload %buf[%i], shape %shape_k
+      : (!hc.undef, !hc.undef, tuple<!hc.undef>) -> !hc.undef
   hc.store %buf[%i, %j], %v
       : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
   %vec2 = hc.vec %t : !hc.undef -> !hc.undef
@@ -82,24 +89,30 @@ func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
 }
 
 // CHECK-LABEL: func.func @allocators
-// CHECK: hc.vzeros {shape = #hc.shape<["16", "16"]>} : !hc.vector<f32, ["16", "16"]>
-// CHECK: hc.vones {shape = #hc.shape<["16"]>} : !hc.vector<i1, ["16"]>
-// CHECK: hc.vfull %{{.*}} {shape = #hc.shape<["16"]>} : !hc.undef -> !hc.vector<f32, ["16"]>
-// CHECK: hc.zeros {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
-// CHECK: hc.ones {shape = #hc.shape<["M"]>} : !hc.tensor<i1, ["M"]>
-// CHECK: hc.full %{{.*}} {shape = #hc.shape<["M"]>} : !hc.undef -> !hc.tensor<f32, ["M"]>
-// CHECK: hc.empty {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+// CHECK: hc.vzeros shape %{{.*}} : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
+// CHECK: hc.vones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>
+// CHECK: hc.vfull %{{.*}}, shape %{{.*}} : (!hc.undef, tuple<!hc.undef>) -> !hc.vector<f32, ["16"]>
+// CHECK: hc.zeros shape %{{.*}} : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
+// CHECK: hc.ones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.tensor<i1, ["M"]>
+// CHECK: hc.full %{{.*}}, shape %{{.*}} : (!hc.undef, tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
+// CHECK: hc.empty shape %{{.*}} : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
 func.func @allocators(%s: !hc.undef) {
-  %vz = hc.vzeros {shape = #hc.shape<["16", "16"]>}
-      : !hc.vector<f32, ["16", "16"]>
-  %vo = hc.vones  {shape = #hc.shape<["16"]>} : !hc.vector<i1, ["16"]>
-  %vf = hc.vfull  %s {shape = #hc.shape<["16"]>}
-      : !hc.undef -> !hc.vector<f32, ["16"]>
-  %tz = hc.zeros  {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
-  %to = hc.ones   {shape = #hc.shape<["M"]>} : !hc.tensor<i1, ["M"]>
-  %tf = hc.full   %s {shape = #hc.shape<["M"]>}
-      : !hc.undef -> !hc.tensor<f32, ["M"]>
-  %te = hc.empty  {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+  %d16 = hc.const<16 : i64> : !hc.undef
+  %dm = hc.const<"M"> : !hc.undef
+  %shape_16_16 = hc.tuple(%d16, %d16)
+      : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
+  %shape_16 = hc.tuple(%d16) : (!hc.undef) -> tuple<!hc.undef>
+  %shape_m = hc.tuple(%dm) : (!hc.undef) -> tuple<!hc.undef>
+  %vz = hc.vzeros shape %shape_16_16
+      : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
+  %vo = hc.vones  shape %shape_16 : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>
+  %vf = hc.vfull  %s, shape %shape_16
+      : (!hc.undef, tuple<!hc.undef>) -> !hc.vector<f32, ["16"]>
+  %tz = hc.zeros  shape %shape_m : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
+  %to = hc.ones   shape %shape_m : (tuple<!hc.undef>) -> !hc.tensor<i1, ["M"]>
+  %tf = hc.full   %s, shape %shape_m
+      : (!hc.undef, tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
+  %te = hc.empty  shape %shape_m : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
   return
 }
 

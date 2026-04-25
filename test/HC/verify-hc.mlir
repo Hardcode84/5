@@ -403,17 +403,6 @@ module {
 
 // -----
 
-// CHECK: error: 'hc.load' op shape rank (2) does not match index count (1)
-module {
-  func.func @bad(%buf: !hc.undef, %i: !hc.undef) -> !hc.undef {
-    %t = hc.load %buf[%i] {shape = #hc.shape<["M", "K"]>}
-        : (!hc.undef, !hc.undef) -> !hc.undef
-    return %t : !hc.undef
-  }
-}
-
-// -----
-
 // CHECK: error: 'hc.call' op 'missing' does not reference a valid hc.func
 module {
   func.func @bad(%x: !hc.undef) -> !hc.undef {
@@ -673,7 +662,9 @@ module {
 // CHECK: error: 'hc.zeros' op tensor allocator is workgroup scope only; enclosed by hc.subgroup_region which narrows the scope
 hc.kernel @bad {
   hc.subgroup_region {
-    %z = hc.zeros {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+    %m = hc.const<"M"> : !hc.undef
+    %shape = hc.tuple(%m) : (!hc.undef) -> tuple<!hc.undef>
+    %z = hc.zeros shape %shape : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
     hc.return
   }
   hc.return
@@ -685,7 +676,9 @@ hc.kernel @bad {
 // CHECK: error: 'hc.empty' op tensor allocator is workgroup scope only; enclosed by hc.workitem_region which narrows the scope
 hc.kernel @bad {
   hc.workitem_region {
-    %z = hc.empty {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+    %m = hc.const<"M"> : !hc.undef
+    %shape = hc.tuple(%m) : (!hc.undef) -> tuple<!hc.undef>
+    %z = hc.empty shape %shape : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
     hc.return
   }
   hc.return

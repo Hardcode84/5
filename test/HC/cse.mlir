@@ -11,26 +11,30 @@
 // RUN: hc-opt -cse -split-input-file %s | FileCheck %s
 
 // CHECK-LABEL: func.func @sibling_vzeros
-// CHECK: %[[A:.*]] = hc.vzeros {shape = #hc.shape<["16"]>}
-// CHECK: %[[B:.*]] = hc.vzeros {shape = #hc.shape<["16"]>}
+// CHECK: %[[A:.*]] = hc.vzeros shape %{{.*}}
+// CHECK: %[[B:.*]] = hc.vzeros shape %{{.*}}
 // CHECK: return %[[A]], %[[B]]
 func.func @sibling_vzeros()
     -> (!hc.vector<f32, ["16"]>, !hc.vector<f32, ["16"]>) {
-  %0 = hc.vzeros {shape = #hc.shape<["16"]>} : !hc.vector<f32, ["16"]>
-  %1 = hc.vzeros {shape = #hc.shape<["16"]>} : !hc.vector<f32, ["16"]>
+  %d16 = hc.const<16 : i64> : !hc.undef
+  %shape = hc.tuple(%d16) : (!hc.undef) -> tuple<!hc.undef>
+  %0 = hc.vzeros shape %shape : (tuple<!hc.undef>) -> !hc.vector<f32, ["16"]>
+  %1 = hc.vzeros shape %shape : (tuple<!hc.undef>) -> !hc.vector<f32, ["16"]>
   return %0, %1 : !hc.vector<f32, ["16"]>, !hc.vector<f32, ["16"]>
 }
 
 // -----
 
 // CHECK-LABEL: func.func @sibling_zeros
-// CHECK: %[[A:.*]] = hc.zeros {shape = #hc.shape<["M"]>}
-// CHECK: %[[B:.*]] = hc.zeros {shape = #hc.shape<["M"]>}
+// CHECK: %[[A:.*]] = hc.zeros shape %{{.*}}
+// CHECK: %[[B:.*]] = hc.zeros shape %{{.*}}
 // CHECK: return %[[A]], %[[B]]
 func.func @sibling_zeros()
     -> (!hc.tensor<f32, ["M"]>, !hc.tensor<f32, ["M"]>) {
-  %0 = hc.zeros {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
-  %1 = hc.zeros {shape = #hc.shape<["M"]>} : !hc.tensor<f32, ["M"]>
+  %m = hc.const<"M"> : !hc.undef
+  %shape = hc.tuple(%m) : (!hc.undef) -> tuple<!hc.undef>
+  %0 = hc.zeros shape %shape : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
+  %1 = hc.zeros shape %shape : (tuple<!hc.undef>) -> !hc.tensor<f32, ["M"]>
   return %0, %1 : !hc.tensor<f32, ["M"]>, !hc.tensor<f32, ["M"]>
 }
 

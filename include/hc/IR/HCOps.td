@@ -662,25 +662,20 @@ def HCLoadOp : HC_Op<"load",
      DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Buffer -> tensor load.";
   let description = [{
-    Materializes a tensor from a buffer at a variadic subscript. Shape
-    metadata (optional `#hc.shape`) travels in the attribute dict rather
-    than inline because `#hc.shape`'s free-form printer confuses an inline
-    `:` terminator; keeping it inside `{}` keeps the assembly format
-    unambiguous at the cost of slightly more verbose textual IR.
-
-    When present, the shape attribute must have the same rank as the index
-    list; the verifier rejects rank mismatches. The op carries a `MemRead`
+    Materializes a tensor from a buffer at a variadic subscript. The result
+    shape is an ordinary SSA value, normally a tuple of idx-typed dimensions.
+    A missing source-level shape is represented as `!hc.undef`; a later
+    verifier pass owns static-shape diagnostics. The op carries a `MemRead`
     effect so effect-aware passes cannot reorder it past a store.
   }];
   let arguments = (ins
     HC_BufferValueType:$buffer,
     Variadic<HC_ValueType>:$indices,
-    OptionalAttr<HC_ShapeAttr>:$shape
+    HC_TupleValueType:$shape
   );
   let results = (outs HC_ValueType:$result);
-  let hasVerifier = 1;
   let assemblyFormat = [{
-    $buffer `[` $indices `]` attr-dict `:`
+    $buffer `[` $indices `]` `,` `shape` $shape attr-dict `:`
     functional-type(operands, results)
   }];
 }
@@ -690,26 +685,29 @@ def HCVLoadOp : HC_Op<"vload",
      DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Buffer or tensor -> vector load.";
   let description = [{
-    Vector counterpart of `hc.load`; same attribute-dict shape carrier, same
-    rank-match verifier, same `MemRead` effect. Only the source operand's
-    admissible type broadens (tensor is also legal) and the result is a
-    vector instead of a tensor.
+    Vector counterpart of `hc.load`; same SSA shape carrier and `MemRead`
+    effect. Only the source operand's admissible type broadens (tensor is also
+    legal) and the result is a vector instead of a tensor.
   }];
   let arguments = (ins
     HC_BufferOrTensorValueType:$source,
     Variadic<HC_ValueType>:$indices,
-    OptionalAttr<HC_ShapeAttr>:$shape
+    HC_TupleValueType:$shape
   );
   let results = (outs HC_ValueType:$result);
-  let hasVerifier = 1;
   let assemblyFormat = [{
-    $source `[` $indices `]` attr-dict `:`
+    $source `[` $indices `]` `,` `shape` $shape attr-dict `:`
     functional-type(operands, results)
   }];
 }
 
 def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tensor or vector into a buffer or tensor.";
+  let description = [{
+    Stores the shaped `$source` value into `$dest`. Unlike load and allocator
+    ops, store does not need a separate shape operand because the stored value's
+    type already carries the tensor/vector shape.
+  }];
   let arguments = (ins
     HC_BufferOrTensorValueType:$dest,
     Variadic<HC_ValueType>:$indices,
@@ -774,24 +772,29 @@ def HCAsLayoutOp : HC_Op<"as_layout",
 //===----------------------------------------------------------------------===//
 // Allocators. Vector variants are scope-free; tensor variants are workgroup
 // scope (checked by a later pass). All carry `MemAlloc` so CSE does not
-// collapse sibling allocations. Shape travels in the attribute dict to keep
-// the assembly format unambiguous. See `doc/lowering.md` "Data movement"
-// for the full rationale.
+// collapse sibling allocations. Shape is an ordinary SSA value so frontend
+// `shape=` kwargs do not need a dialect-side attribute escape hatch.
 //===----------------------------------------------------------------------===//
 
 class HC_NullaryShapedAllocOp<string mnemonic>
-    : HC_Op<mnemonic, [MemoryEffects<[MemAlloc]>]> {
-  let arguments = (ins HC_ShapeAttr:$shape);
+    : HC_Op<mnemonic, [
+        MemoryEffects<[MemAlloc]>,
+        DeclareOpInterfaceMethods<HCInferTypeOpInterface>
+      ]> {
+  let arguments = (ins HC_TupleValueType:$shape);
   let results = (outs HC_ValueType:$result);
-  let assemblyFormat = "attr-dict `:` type($result)";
+  let assemblyFormat = "`shape` $shape attr-dict `:` functional-type(operands, results)";
 }
 
 class HC_FillShapedAllocOp<string mnemonic>
-    : HC_Op<mnemonic, [MemoryEffects<[MemAlloc]>]> {
-  let arguments = (ins HC_ValueType:$value, HC_ShapeAttr:$shape);
+    : HC_Op<mnemonic, [
+        MemoryEffects<[MemAlloc]>,
+        DeclareOpInterfaceMethods<HCInferTypeOpInterface>
+      ]> {
+  let arguments = (ins HC_ValueType:$value, HC_TupleValueType:$shape);
   let results = (outs HC_ValueType:$result);
   let assemblyFormat =
-      "$value attr-dict `:` type($value) `->` type($result)";
+      "$value `,` `shape` $shape attr-dict `:` functional-type(operands, results)";
 }
 
 def HCVZerosOp : HC_NullaryShapedAllocOp<"vzeros"> {

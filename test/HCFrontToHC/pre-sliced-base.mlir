@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // `group.load(a[row_sl, col_sl], shape=(M, K))` — the WMMA pattern — has
-// to land as `hc.load %a[%row_sl, %col_sl] {shape = ...}`, not as a
+// to land as `hc.load %a[%row_sl, %col_sl], shape %shape`, not as a
 // chained `hc.buffer_view` + zero-index `hc.load`. Same story for
 // `vload` and `store`. Before the peel fix, the frontend subscript
 // would lower into an `hc.buffer_view` whose SSA result then arrived
 // at the load branch as a single positional with no trailing indices,
-// and the shape-rank verifier on `hc.load` would reject the rank-0
-// index list against a rank-2 `shape` attr.
+// leaving the load with the wrong addressing shape.
 // The second RUN parses the output back through `hc-opt` so the `hc`
 // verifier sees the same IR FileCheck does; a rank mismatch surfaces
 // as a parse-time failure there.
@@ -27,7 +26,7 @@ module {
   } {
     // CHECK: %[[ROW:.*]] = hc.slice_expr
     // CHECK: %[[COL:.*]] = hc.slice_expr
-    // CHECK: hc.load %arg1[%[[ROW]], %[[COL]]] {shape = #hc.shape<["16", "16"]>}
+    // CHECK: hc.load %arg1[%[[ROW]], %[[COL]]], shape %{{.*}}
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %load_attr = hc_front.attr %grp, "load" {ref = {kind = "dsl_method", method = "load"}}
@@ -61,7 +60,7 @@ module {
   } {
     // CHECK: %[[ROW:.*]] = hc.slice_expr
     // CHECK: %[[COL:.*]] = hc.slice_expr
-    // CHECK: hc.vload %arg1[%[[ROW]], %[[COL]]] {shape = #hc.shape<["16", "16"]>}
+    // CHECK: hc.vload %arg1[%[[ROW]], %[[COL]]], shape %{{.*}}
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %vload_attr = hc_front.attr %grp, "vload" {ref = {kind = "dsl_method", method = "vload"}}
@@ -128,7 +127,7 @@ module {
     ]
   } {
     // CHECK: %[[VIEW:.*]] = hc.buffer_view %arg1[%{{.*}}, %{{.*}}]
-    // CHECK: hc.load %arg1[%{{.*}}, %{{.*}}] {shape = #hc.shape<["16", "16"]>}
+    // CHECK: hc.load %arg1[%{{.*}}, %{{.*}}], shape %{{.*}}
     // CHECK: hc.buffer_dim %[[VIEW]], axis = 0
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}

@@ -247,14 +247,8 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
   std::optional<ExprAttr> expr = idxExprAttr(type);
   if (!expr)
     return std::nullopt;
-  // `hc.getitem` only needs literal tuple indices today. Keep broader
-  // expression evaluation out of this local helper until it has a shared home.
-  std::string rendered =
-      symbolStore(type.getContext()).render((*expr).getNode());
-  int64_t value;
-  if (StringRef(rendered).getAsInteger(10, value))
-    return std::nullopt;
-  return value;
+  // Tuple getitem needs literal indexing, not general symbolic evaluation.
+  return sym::getIntegerLiteralValue(sym::ExprHandle(expr->getNode()));
 }
 
 static FailureOr<Type>

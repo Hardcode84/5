@@ -11,6 +11,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Mutex.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 
 namespace mlir {
@@ -118,6 +120,11 @@ mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
 mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
                                            PredCmpOp op, ExprHandle rhs,
                                            std::string *diagnostic = nullptr);
+
+/// Returns the integer payload when an expression is structurally integral:
+/// an ixs integer node, or a rational node with unit denominator. Does not
+/// render or parse the expression text.
+std::optional<int64_t> getIntegerLiteralValue(ExprHandle value);
 
 mlir::FailureOr<ExprHandle> parseExprHandle(AsmParser &parser);
 mlir::FailureOr<PredHandle> parsePredHandle(AsmParser &parser);

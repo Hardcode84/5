@@ -33,13 +33,14 @@ std::string joinSessionErrors(ixs_session *session) {
 
 std::string renderNode(const ixs_node *node) {
   assert(node && "expected non-null ixsimpl node");
+  auto *rawNode = const_cast<ixs_node *>(node);
   // The vendored ixsimpl printer is a pure read-only walk over the immutable
   // node graph, so rendering does not need an ixs_session scratch object.
-  size_t n = ixs_print(const_cast<ixs_node *>(node), nullptr, 0);
+  size_t n = ixs_print(rawNode, nullptr, 0);
   if (n == std::numeric_limits<size_t>::max())
     llvm::report_fatal_error("hc symbolic printer reported an invalid length");
   std::string text(n + 1, '\0');
-  ixs_print(const_cast<ixs_node *>(node), text.data(), text.size());
+  ixs_print(rawNode, text.data(), text.size());
   text.resize(n);
   return text;
 }
@@ -277,6 +278,22 @@ mlir::hc::sym::composePredCmp(Store &store, ExprHandle lhsHandle, PredCmpOp op,
   }
   return finishPred(session.raw(), ixs_cmp(session.raw(), lhs, cmp, rhs),
                     diagnostic, "failed to compose hc.pred");
+}
+
+std::optional<int64_t> mlir::hc::sym::getIntegerLiteralValue(ExprHandle value) {
+  const ixs_node *node = value.raw();
+  if (!node)
+    return std::nullopt;
+  // ixsimpl's introspection accessors are read-only in practice but not
+  // const-qualified in the C API.
+  auto *rawNode = const_cast<ixs_node *>(node);
+  if (!ixs_node_is_expr(rawNode))
+    return std::nullopt;
+  if (ixs_node_tag(rawNode) == IXS_INT)
+    return ixs_node_int_val(rawNode);
+  if (ixs_node_tag(rawNode) == IXS_RAT && ixs_node_rat_den(rawNode) == 1)
+    return ixs_node_rat_num(rawNode);
+  return std::nullopt;
 }
 
 FailureOr<ExprHandle> mlir::hc::sym::parseExprHandle(AsmParser &parser) {

@@ -5,8 +5,8 @@
 #ifndef HC_IR_HCTYPES
 #define HC_IR_HCTYPES
 
-include "hc/IR/HCDialect.td"
 include "hc/IR/HCAttrs.td"
+include "hc/IR/HCDialect.td"
 include "hc/IR/HCTypesInterfaces.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/CommonTypeConstraints.td"

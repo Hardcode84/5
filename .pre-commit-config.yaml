@@ -19,9 +19,15 @@ repos:
         types_or: [c, c++]
 
   - repo: https://github.com/Hardcode84/3
-    rev: v0.3.0
+    rev: b9e06135de091a05e60831c40b3b1edb8cf39088
     hooks:
       - id: sort-cmake-lists
+
+  - repo: https://github.com/Hardcode84/6
+    rev: 030626f25acb8a963c0ecd49a66684e860c4e14a
+    hooks:
+      - id: tgenfmt
+        name: Run tgenfmt on TableGen files
 
   - repo: https://github.com/psf/black
     rev: 26.3.1

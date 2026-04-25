@@ -66,6 +66,21 @@ void printInlineNode(AsmPrinter &printer, MLIRContext *ctx,
   printer.printString(store.render(node));
 }
 
+template <typename AttrT>
+FailureOr<AttrT> parseTypedAttr(AsmParser &parser, StringRef key,
+                                StringRef expected) {
+  Attribute attr;
+  if (parser.parseAttribute(attr))
+    return failure();
+  auto typed = dyn_cast<AttrT>(attr);
+  if (!typed) {
+    parser.emitError(parser.getCurrentLocation())
+        << "expected " << expected << " for `" << key << "`";
+    return failure();
+  }
+  return typed;
+}
+
 } // namespace
 
 #define GET_TYPEDEF_CLASSES
@@ -112,6 +127,17 @@ mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
   (void)elementType;
   if (!shape)
     return emitError() << "expected #hc.shape attribute";
+  return success();
+}
+
+mlir::LogicalResult
+mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,
+                            ShapeAttr workShape, ShapeAttr groupShape,
+                            IntegerAttr subgroupSize) {
+  (void)workShape;
+  (void)groupShape;
+  if (subgroupSize && subgroupSize.getValue().isNegative())
+    return emitError() << "subgroup_size must be non-negative";
   return success();
 }
 
@@ -171,4 +197,69 @@ Type PredType::joinHCType(Type other) const {
   if (isa<PredType>(other))
     return getUnpinnedPredType(getContext());
   return {};
+}
+
+Type GroupType::parse(AsmParser &parser) {
+  MLIRContext *ctx = parser.getContext();
+  ShapeAttr workShape;
+  ShapeAttr groupShape;
+  IntegerAttr subgroupSize;
+  if (failed(parser.parseOptionalLess()))
+    return GroupType::get(ctx, workShape, groupShape, subgroupSize);
+
+  while (true) {
+    StringRef key;
+    if (parser.parseKeyword(&key) || parser.parseEqual())
+      return {};
+
+    if (key == "work_shape") {
+      FailureOr<ShapeAttr> parsed =
+          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
+      if (failed(parsed))
+        return {};
+      workShape = *parsed;
+    } else if (key == "group_shape") {
+      FailureOr<ShapeAttr> parsed =
+          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
+      if (failed(parsed))
+        return {};
+      groupShape = *parsed;
+    } else if (key == "subgroup_size") {
+      FailureOr<IntegerAttr> parsed =
+          parseTypedAttr<IntegerAttr>(parser, key, "integer attribute");
+      if (failed(parsed))
+        return {};
+      subgroupSize = *parsed;
+    } else {
+      parser.emitError(parser.getCurrentLocation())
+          << "unknown !hc.group parameter `" << key << "`";
+      return {};
+    }
+
+    if (failed(parser.parseOptionalComma()))
+      break;
+  }
+
+  if (parser.parseGreater())
+    return {};
+  return GroupType::get(ctx, workShape, groupShape, subgroupSize);
+}
+
+void GroupType::print(AsmPrinter &printer) const {
+  SmallVector<std::pair<StringRef, Attribute>> attrs;
+  if (ShapeAttr workShape = getWorkShape())
+    attrs.push_back({"work_shape", workShape});
+  if (ShapeAttr groupShape = getGroupShape())
+    attrs.push_back({"group_shape", groupShape});
+  if (IntegerAttr subgroupSize = getSubgroupSize())
+    attrs.push_back({"subgroup_size", subgroupSize});
+  if (attrs.empty())
+    return;
+
+  printer << "<";
+  llvm::interleaveComma(attrs, printer, [&](const auto &entry) {
+    printer << entry.first << " = ";
+    printer.printAttribute(entry.second);
+  });
+  printer << ">";
 }

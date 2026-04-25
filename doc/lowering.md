@@ -282,6 +282,8 @@ Semantic dialect types:
 * `!hc.tensor<elem, #hc.shape<...>>` — workgroup-local tensor
 * `!hc.vector<elem, #hc.shape<...>>` — immutable fixed-size vector, carrying
   activity mask semantics and an optional collective-return suffix
+* `!hc.group<...>` — kernel launch-context token carrying invariant
+  `work_shape`, `group_shape`, and `subgroup_size` metadata when available
 * `!hc.slice` — first-class slice value with optional low/high/step, built by
   `hc.slice_expr` and consumed by load/store/subscript
 * builtin `index`, `i*`, `f*` are first-class operand/result types of the
@@ -300,6 +302,8 @@ every type listed above. Ops with clear semantic categories tighten further:
   excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either
   (`hc.buffer_view.$buffer`, `hc.vload.$source`, `hc.store.$dest`)
+* `HC_GroupValueType` — launch-geometry query root (`!hc.group` or
+  pre-inference `!hc.undef`)
 
 Every narrow constraint still admits `!hc.undef` so the `hc_front -> hc`
 pass stays mechanical. Further narrowings (booleans for `hc.and/or/not`)
@@ -564,28 +568,34 @@ under `-cse`, an unannotated one does not.
 
 The example `examples/amdgpu_gfx11_wmma_matmul.py` is the shape-first
 integration target. Two snapshots are shown: immediately after `hc_front → hc`
-(mostly `!hc.undef`, with trivially seeded buffer parameters, generic ops, no
-inference), and after type / symbol inference.
+(mostly `!hc.undef`, with trivially seeded group/buffer parameters, generic
+ops, no inference), and after type / symbol inference.
 
 #### After `hc_front → hc` (mechanical, mostly `!hc.undef`)
 
 ```mlir
-hc.kernel @tiled_gfx11_wmma_matmul attributes {
+hc.kernel @tiled_gfx11_wmma_matmul(
+  %group: !hc.group<work_shape = #hc.shape<["ceil_div(M, 16) * 32", "ceil_div(N, 16)"]>,
+                    group_shape = #hc.shape<["32", "1"]>,
+                    subgroup_size = 32 : i32>,
+  %a: !hc.buffer<!hc.undef, ["M", "K"]>,
+  %b: !hc.buffer<!hc.undef, ["K", "N"]>,
+  %c: !hc.buffer<!hc.undef, ["M", "N"]>) attributes {
   work_shape    = #hc.shape<["ceil_div(M, 16) * 32", "ceil_div(N, 16)"]>,
   group_shape   = #hc.shape<["32", "1"]>,
   subgroup_size = 32 : i32,
   literals      = ["WMMA_M", "WMMA_N", "WMMA_K", "WAVE_LANES"]
-} (%group, %a, %b, %c) {
+} {
   %c0 = hc.const <0 : i64>  : !hc.undef
   %WM = hc.const <16 : i64> : !hc.undef
   %WK = hc.const <16 : i64> : !hc.undef
 
-  %gr, %gc = hc.group_id %group       : (!hc.undef, !hc.undef)
+  %gr, %gc = hc.group_id %group       : (!hc.group<...>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
   %row0    = hc.mul %gr, %WM           : !hc.undef
   %col0    = hc.mul %gc, %WM           : !hc.undef
 
-  %a_k     = hc.buffer_dim %a, axis = 1 : !hc.undef
-  %acc0    = hc.call @init_wmma_acc(%group) : (!hc.undef) -> !hc.undef
+  %a_k     = hc.buffer_dim %a, axis = 1 : !hc.buffer<!hc.undef, ["M", "K"]> -> !hc.undef
+  %acc0    = hc.call @init_wmma_acc(%group) : (!hc.group<...>) -> !hc.undef
 
   %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK
                             iter_args (%acc = %acc0) : !hc.undef {

@@ -120,6 +120,23 @@ def HC_VectorType : HC_Type<"Vector", "vector"> {
   let genVerifyDecl = 1;
 }
 
+def HC_GroupType : HC_Type<"Group", "group"> {
+  let summary = "Kernel launch-context token.";
+  let description = [{
+    Carries invariant launch metadata for the special kernel `group`
+    parameter. Dynamic launch queries (`hc.group_id`, `hc.local_id`, ...)
+    still produce ordinary `!hc.idx` values; this type only records the
+    static metadata those queries can derive ranks and shape facts from.
+  }];
+  let parameters = (ins
+    OptionalParameter<"::mlir::hc::ShapeAttr">:$workShape,
+    OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
+    OptionalParameter<"::mlir::IntegerAttr">:$subgroupSize
+  );
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+}
+
 // AnyOf constraint covering every type that a generic `hc` op (`hc.add`,
 // `hc.cmp.lt`, `hc.cast`, ...) is willing to see. Intentionally wide: an op
 // emitted by `hc_front` -> `hc` may see only `!hc.undef`; after inference it
@@ -133,6 +150,7 @@ def HC_ValueType : AnyTypeOf<[
   HC_BufferType,
   HC_TensorType,
   HC_VectorType,
+  HC_GroupType,
   AnyInteger,
   AnyFloat,
   Index,
@@ -175,6 +193,13 @@ def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
   HC_TensorType,
+]>;
+
+// Launch-context root. `!hc.undef` keeps hand-written pre-inference IR legal;
+// `!hc.group` is the seeded form produced for kernel group parameters.
+def HC_GroupValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_GroupType,
 ]>;
 
 #endif // HC_IR_HCTYPES

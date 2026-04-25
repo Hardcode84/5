@@ -35,8 +35,9 @@
 //    argument (`x.astype(np.float32)`) and as a value-constructor
 //    callee (`np.float16(0)`);
 //  * most produced values get `!hc.undef` — type inference pins later;
-//    launch-geometry queries are the exception because their internal symbolic
-//    names must not collide with Python-level symbols.
+//    kernel group parameters and launch-geometry query results are the
+//    exceptions because launch metadata and internal `$` symbols are known
+//    here.
 //
 // Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
 // bodies are simulator fallbacks with no compilation meaning; the
@@ -488,6 +489,25 @@ FailureOr<Type> parameterTypeFromDict(MLIRContext *ctx, Operation *sourceOp,
   auto name = param.getAs<StringAttr>("name");
   if (!name)
     return sourceOp->emitOpError("`parameters` entry missing `name` key");
+  if (name.getValue() == "group" && isa<hc_front::KernelOp>(sourceOp)) {
+    ShapeAttr workShape;
+    ShapeAttr groupShape;
+    if (auto ws = sourceOp->getAttrOfType<ArrayAttr>("work_shape")) {
+      FailureOr<ShapeAttr> parsed = stringArrayToShape(ctx, sourceOp, ws);
+      if (failed(parsed))
+        return failure();
+      workShape = *parsed;
+    }
+    if (auto gs = sourceOp->getAttrOfType<ArrayAttr>("group_shape")) {
+      FailureOr<ShapeAttr> parsed = stringArrayToShape(ctx, sourceOp, gs);
+      if (failed(parsed))
+        return failure();
+      groupShape = *parsed;
+    }
+    return Type(
+        GroupType::get(ctx, workShape, groupShape,
+                       sourceOp->getAttrOfType<IntegerAttr>("subgroup_size")));
+  }
   if (!kind) {
     if (shapeAttr)
       return sourceOp->emitOpError("parameter '")

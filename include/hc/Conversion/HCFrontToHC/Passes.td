@@ -14,9 +14,10 @@ def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
     top-level op and emits the parallel `hc` callable, consuming the `ref`
     DictAttr stamped by the Python driver on each `hc_front.name` /
     `hc_front.attr` plus the callable `parameters` metadata. Most produced
-    values start as `!hc.undef`; buffer parameters are seeded as
-    `!hc.buffer<...>` when their dict carries `kind = "buffer"` and shape
-    metadata. A later inference pass pins the remaining concrete types.
+    values start as `!hc.undef`; kernel `group` parameters are seeded as
+    `!hc.group<...>`, and buffer parameters are seeded as `!hc.buffer<...>`
+    when their dict carries `kind = "buffer"` and shape metadata. A later
+    inference pass pins the remaining concrete types.
 
     ## Pipeline contract (canonical)
 

@@ -532,7 +532,7 @@ def HCIfOp : HC_Op<"if",
 class HC_LaunchGeoOp<string mnemonic>
     : HC_Op<mnemonic,
             [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
-  let arguments = (ins HC_ValueType:$group);
+  let arguments = (ins HC_GroupValueType:$group);
   let results = (outs Variadic<HC_ValueType>:$values);
   let assemblyFormat =
       "$group attr-dict `:` functional-type(operands, results)";

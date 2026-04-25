@@ -237,9 +237,114 @@ static Type inferLoadLikeResult(Type sourceType, ShapeAttr shape,
                                                        elementType, shape));
 }
 
+static bool allResultsAreUndef(Operation *op) {
+  return llvm::all_of(op->getResultTypes(),
+                      [](Type type) { return isa<UndefType>(type); });
+}
+
+static LogicalResult appendPrefixedIdxTypes(MLIRContext *ctx, Operation *op,
+                                            StringRef prefix, unsigned count,
+                                            SmallVectorImpl<Type> &types) {
+  for (unsigned axis = 0; axis < count; ++axis) {
+    FailureOr<ExprAttr> expr =
+        parseExprAttr(ctx, Twine(prefix) + Twine(axis), op);
+    if (failed(expr))
+      return failure();
+    types.push_back(IdxType::get(ctx, *expr));
+  }
+  return success();
+}
+
+static void appendShapeIdxTypes(MLIRContext *ctx, ShapeAttr shape,
+                                unsigned count, SmallVectorImpl<Type> &types) {
+  for (unsigned axis = 0; axis < count; ++axis) {
+    if (shape && axis < shape.getDims().size()) {
+      if (auto expr = dyn_cast<ExprAttr>(shape.getDims()[axis])) {
+        types.push_back(IdxType::get(ctx, expr));
+        continue;
+      }
+    }
+    types.push_back(getUnpinnedIdxType(ctx));
+  }
+}
+
+static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
+                                     Operation *op) {
+  if (!shape)
+    return Type(getUnpinnedIdxType(ctx));
+  if (shape.getDims().empty()) {
+    FailureOr<ExprAttr> one = parseExprAttr(ctx, "1", op);
+    if (failed(one))
+      return failure();
+    return Type(IdxType::get(ctx, *one));
+  }
+
+  auto first = dyn_cast<ExprAttr>(shape.getDims().front());
+  if (!first)
+    return Type(getUnpinnedIdxType(ctx));
+  ExprAttr product = first;
+  for (Attribute dim : shape.getDims().drop_front()) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      return Type(getUnpinnedIdxType(ctx));
+    FailureOr<ExprAttr> next =
+        composeExprAttr(ctx, product, sym::ExprBinaryOp::Mul, expr, op);
+    if (failed(next))
+      return failure();
+    product = *next;
+  }
+  return Type(IdxType::get(ctx, product));
+}
+
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
+                                              ArrayRef<Type> operandTypes,
                                               SmallVectorImpl<Type> &types) {
+  auto group = dyn_cast_or_null<GroupType>(
+      operandTypes.empty() ? Type{} : operandTypes[0]);
+  if (!group || !allResultsAreUndef(op.getOperation())) {
+    types.append(op.getResultTypes().begin(), op.getResultTypes().end());
+    return success();
+  }
+
+  MLIRContext *ctx = op.getContext();
+  Operation *raw = op.getOperation();
+  unsigned count = op->getNumResults();
+  if (isa<HCGroupIdOp>(raw))
+    return appendPrefixedIdxTypes(ctx, raw, "$WG", count, types);
+  if (isa<HCLocalIdOp>(raw))
+    return appendPrefixedIdxTypes(ctx, raw, "$WI", count, types);
+  if (isa<HCSubgroupIdOp>(raw))
+    return appendPrefixedIdxTypes(ctx, raw, "$SG", count, types);
+  if (isa<HCWorkOffsetOp>(raw))
+    return appendPrefixedIdxTypes(ctx, raw, "$WO", count, types);
+  if (isa<HCGroupShapeOp>(raw)) {
+    appendShapeIdxTypes(ctx, group.getGroupShape(), count, types);
+    return success();
+  }
+  if (isa<HCWorkShapeOp>(raw)) {
+    appendShapeIdxTypes(ctx, group.getWorkShape(), count, types);
+    return success();
+  }
+  if (isa<HCGroupSizeOp>(raw)) {
+    FailureOr<Type> type = groupSizeType(ctx, group.getGroupShape(), raw);
+    if (failed(type))
+      return failure();
+    types.push_back(*type);
+    return success();
+  }
+  if (isa<HCWaveSizeOp>(raw)) {
+    if (IntegerAttr size = group.getSubgroupSize()) {
+      FailureOr<ExprAttr> expr = parseExprAttr(ctx, Twine(size.getInt()), raw);
+      if (failed(expr))
+        return failure();
+      types.push_back(IdxType::get(ctx, *expr));
+      return success();
+    }
+    types.push_back(getUnpinnedIdxType(ctx));
+    return success();
+  }
+
   types.append(op.getResultTypes().begin(), op.getResultTypes().end());
   return success();
 }
@@ -352,44 +457,44 @@ LogicalResult HCCmpNeOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return inferIndexCmp(operandTypes, sym::PredCmpOp::Ne, *this, resultTypes);
 }
 
-LogicalResult HCGroupIdOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCGroupIdOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                         SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCLocalIdOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCLocalIdOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                         SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCSubgroupIdOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCSubgroupIdOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                            SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCGroupShapeOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCGroupShapeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                            SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCGroupSizeOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCGroupSizeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                           SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCWorkOffsetOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCWorkOffsetOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                            SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCWorkShapeOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCWorkShapeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                           SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
-LogicalResult HCWaveSizeOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+LogicalResult HCWaveSizeOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                          SmallVectorImpl<Type> &resultTypes) {
-  return inferLaunchGeometryTypes(*this, resultTypes);
+  return inferLaunchGeometryTypes(*this, operandTypes, resultTypes);
 }
 
 LogicalResult HCBufferDimOp::inferHCTypes(ArrayRef<Type> operandTypes,

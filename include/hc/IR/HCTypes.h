@@ -7,6 +7,7 @@
 
 #include "hc/IR/HCAttrs.h"
 #include "hc/IR/HCTypesInterfaces.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #define GET_TYPEDEF_CLASSES

@@ -21,7 +21,7 @@
 // on dedicated hc ops (vec, astype, with_inactive, store).
 
 // CHECK-LABEL: hc.kernel @basic
-// CHECK-SAME: (%arg0: !hc.undef, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
+// CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
 // CHECK-SAME: attributes {
 // CHECK-SAME: group_shape = #hc.shape<["32"]>
 // CHECK-SAME: literals = ["TILE"]
@@ -52,7 +52,7 @@ module {
     %dim_target = hc_front.target_name "dim"
     hc_front.assign %dim_target = %dim
 
-    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.undef) -> !hc.idx<"$WG0">
+    // CHECK: %[[GID:.*]] = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = 32 : i32>) -> !hc.idx<"$WG0">
     %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
     %gid0 = hc_front.subscript %gid_attr[%axis]
     %gid_target = hc_front.target_name "row0"
@@ -218,14 +218,14 @@ module {
   // `-hc-infer-types`, and use `$` prefixes so they cannot collide with
   // Python-level symbols.
   // CHECK-LABEL: hc.kernel @launch_geo_symbols
-  // CHECK: hc.group_id %arg0 : (!hc.undef) -> !hc.idx<"$WG0">
-  // CHECK: hc.local_id %arg0 : (!hc.undef) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
-  // CHECK: hc.subgroup_id %arg0 : (!hc.undef) -> !hc.idx<"$SG0">
-  // CHECK: hc.group_shape %arg0 : (!hc.undef) -> !hc.idx<"$WGS0">
-  // CHECK: hc.work_offset %arg0 : (!hc.undef) -> !hc.idx<"$WO0">
-  // CHECK: hc.work_shape %arg0 : (!hc.undef) -> !hc.idx<"$WS0">
-  // CHECK: hc.group_size %arg0 : (!hc.undef) -> !hc.idx<"$GSZ0">
-  // CHECK: hc.wave_size %arg0 : (!hc.undef) -> !hc.idx<"$WV0">
+  // CHECK: hc.group_id %arg0 : (!hc.group) -> !hc.idx<"$WG0">
+  // CHECK: hc.local_id %arg0 : (!hc.group) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+  // CHECK: hc.subgroup_id %arg0 : (!hc.group) -> !hc.idx<"$SG0">
+  // CHECK: hc.group_shape %arg0 : (!hc.group) -> !hc.idx<"$WGS0">
+  // CHECK: hc.work_offset %arg0 : (!hc.group) -> !hc.idx<"$WO0">
+  // CHECK: hc.work_shape %arg0 : (!hc.group) -> !hc.idx<"$WS0">
+  // CHECK: hc.group_size %arg0 : (!hc.group) -> !hc.idx<"$GSZ0">
+  // CHECK: hc.wave_size %arg0 : (!hc.group) -> !hc.idx<"$WV0">
   hc_front.kernel "launch_geo_symbols" attributes {
     parameters = [{name = "group"}]
   } {
@@ -292,10 +292,10 @@ module {
   }
 
   // CHECK-LABEL: hc.kernel @launch_geo_full_rank_cse
-  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
-  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
   // CSE-LABEL: hc.kernel @launch_geo_full_rank_cse
-  // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.undef) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>>) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
   // CSE-NOT: hc.group_id
   hc_front.kernel "launch_geo_full_rank_cse" attributes {
     group_shape = ["16", "8"],

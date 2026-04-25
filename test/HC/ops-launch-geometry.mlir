@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // RUN: hc-opt %s | hc-opt | FileCheck %s
+// RUN: hc-opt --hc-infer-types %s | FileCheck %s --check-prefix=INFER
 
 // CHECK-LABEL: func.func @geometry_undef
 // CHECK: %{{.*}}:2 = hc.group_id %{{.*}} : (!hc.undef) -> (!hc.undef, !hc.undef)
@@ -33,4 +34,38 @@ func.func @geometry_refined(%g: !hc.undef) {
       : (!hc.undef) -> (!hc.idx<"_gid0">, !hc.idx<"_gid1">)
   %ws    = hc.wave_size %g : (!hc.undef) -> !hc.idx<"32">
   return
+}
+
+// CHECK-LABEL: func.func @geometry_group
+// CHECK: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>
+func.func @geometry_group(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+  %gid:2 = hc.group_id %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  return
+}
+
+// INFER-LABEL: hc.func @geometry_group_infer
+// INFER: hc.group_id {{.*}} -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+// INFER: hc.group_shape {{.*}} -> (!hc.idx<"16">, !hc.idx<"8">)
+// INFER: hc.work_shape {{.*}} -> (!hc.idx<"M">, !hc.idx<"N">)
+// INFER: hc.group_size {{.*}} -> !hc.idx<"128">
+// INFER: hc.wave_size {{.*}} -> !hc.idx<"32">
+hc.func @geometry_group_infer(%g: !hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>) {
+  %gid:2 = hc.group_id %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %gs:2 = hc.group_shape %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %ws:2 = hc.work_shape %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> (!hc.undef, !hc.undef)
+  %size = hc.group_size %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> !hc.undef
+  %wave = hc.wave_size %g
+      : (!hc.group<work_shape = #hc.shape<["M", "N"]>, group_shape = #hc.shape<["16", "8"]>, subgroup_size = 32 : i32>)
+        -> !hc.undef
+  hc.return
 }

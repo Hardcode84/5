@@ -626,21 +626,12 @@ private:
   // entries; every `hc_front.name` read lowers to `hc.name_load`. See
   // the `ConvertHCFrontToHC` ODS description for the full contract.
 
-  // `hc_front.tuple` lowers to a first-class `hc.tuple` SSA value. A few
-  // source forms are still variadic syntax, not tuple values: shape kwargs
-  // and tuple-literal subscript indices. Keep the source literal's lowered
-  // elements so those sites do not depend on whatever later happens to the
-  // materialized `hc.tuple`.
-  llvm::DenseMap<Value, SmallVector<Value>> tupleElts;
-
   // `hc_front.keyword "name" = %v` is consumed at the parent call. The
   // map is keyed by the keyword op's SSA result and stores the name, the
-  // original hc_front value (so shape-tuple folds can still reach into
-  // `tupleElts`), and the lowered value (may be null for attr operands that
-  // have no standalone hc counterpart).
+  // lowered value (may be null for attr operands that have no standalone hc
+  // counterpart).
   struct KeywordInfo {
     StringRef name;
-    Value origValue;
     Value loweredValue;
   };
   llvm::DenseMap<Value, KeywordInfo> keywordInfo;
@@ -1166,7 +1157,6 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
       return failure();
     if (llvm::any_of(*elts, [](Value v) { return !v; }))
       return t.emitOpError("tuple element did not lower to an hc value");
-    tupleElts[t.getResult()] = *elts;
     SmallVector<Type> elementTypes;
     elementTypes.reserve(elts->size());
     for (Value elt : *elts)
@@ -1180,7 +1170,7 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     FailureOr<Value> v = lowerValueOperand(k.getValue(), op, "keyword value");
     if (failed(v))
       return failure();
-    keywordInfo[k.getResult()] = {k.getName(), k.getValue(), *v};
+    keywordInfo[k.getResult()] = {k.getName(), *v};
     valueMap[k.getResult()] = Value();
     return success();
   }
@@ -1221,17 +1211,18 @@ FailureOr<SmallVector<Value>> Lowerer::lowerValueOperands(ValueRange vs,
 
 FailureOr<SmallVector<Value>>
 Lowerer::expandTupleOperand(Value v, Operation *consumer, StringRef role) {
-  // Only source tuple literals expand here. This is for HC ops whose syntax is
-  // genuinely variadic, such as `a[i, j]`; a first-class tuple value should
-  // remain a singleton operand everywhere else.
-  auto it = tupleElts.find(v);
-  if (it != tupleElts.end())
-    return it->second;
   FailureOr<Value> lowered = lowerValueOperand(v, consumer, role);
   if (failed(lowered))
     return failure();
   if (!*lowered)
     return failure();
+  // Only syntax sites that are genuinely variadic call this helper. Everywhere
+  // else an `hc.tuple` remains one first-class SSA value.
+  if (auto tuple = (*lowered).getDefiningOp<HCTupleOp>()) {
+    SmallVector<Value> elements;
+    elements.append(tuple.getElements().begin(), tuple.getElements().end());
+    return elements;
+  }
   return SmallVector<Value>{*lowered};
 }
 
@@ -1935,25 +1926,22 @@ FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
       // `const_kwargs` whitelist, which are promoted back to
       // call-site attributes).
       StringRef kwName = kwIt->second.name;
-      Value kwOrig = kwIt->second.origValue;
       Value kwVal = kwIt->second.loweredValue;
       if (kwName == "shape") {
-        // The tuple-of-constants -> `#hc.shape<...>` fold. The keyword's
-        // *original* hc_front value is the tuple op; look up in
-        // `tupleElts` by that key. If the elements aren't all integer/string
-        // hc.const producers, fall back to storing the tuple value so a later
-        // lowering can still see it.
-        auto tupleIt = tupleElts.find(kwOrig);
-        if (tupleIt != tupleElts.end()) {
+        // The tuple-of-constants -> `#hc.shape<...>` fold. Derive the element
+        // list from the lowered `hc.tuple`; if it is not a static tuple of
+        // integer/string constants, fall back to storing the tuple value so a
+        // later lowering can still see it.
+        if (auto tuple = kwVal ? kwVal.getDefiningOp<HCTupleOp>() : nullptr) {
           SmallVector<Attribute> dims;
-          dims.reserve(tupleIt->second.size());
+          dims.reserve(tuple.getElements().size());
           auto &store =
               op->getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
           // If every element is an `hc.const` carrying an integer, we can
           // materialize a shape attribute. String-valued constants are
           // also accepted (they already name a symbol).
           bool ok = true;
-          for (Value e : tupleIt->second) {
+          for (Value e : tuple.getElements()) {
             Attribute dim;
             if (auto constOp = e.getDefiningOp<HCConstOp>()) {
               Attribute v = constOp.getValue();

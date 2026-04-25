@@ -53,3 +53,14 @@ hc.func @tuple_branch_compatibility(%lo: !hc.undef, %hi: !hc.undef,
   }
   hc.return
 }
+
+// CHECK-LABEL: hc.func @tuple_branch_joinable_elements
+// CHECK: hc.workitem_region -> (tuple<!hc.idx, !hc.pred>)
+// CHECK: hc.yield {{.*}} : tuple<!hc.idx<"M">, !hc.pred<{{.*}}>>
+hc.func @tuple_branch_joinable_elements(
+    %pair: tuple<!hc.idx<"M">, !hc.pred<"M < N">>) {
+  %region = hc.workitem_region -> (tuple<!hc.idx, !hc.pred>) {
+    hc.yield %pair : tuple<!hc.idx<"M">, !hc.pred<"M < N">>
+  }
+  hc.return
+}

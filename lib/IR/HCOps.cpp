@@ -19,45 +19,6 @@ using namespace mlir::hc;
 #define GET_OP_CLASSES
 #include "hc/IR/HCOps.cpp.inc"
 
-// `!hc.undef` is the refinement lattice's bottom element: it is compatible
-// with any refined type by construction, so verifiers that tighten over the
-// iter_args / yield / result triples must treat it as a wildcard to allow
-// pre-inference IR to round-trip.
-static bool isUndef(Type t) { return llvm::isa<UndefType>(t); }
-
-static bool compatibleProgressiveType(Type source, Type dest) {
-  if (isUndef(source) || isUndef(dest) || source == dest)
-    return true;
-  auto sourceTuple = dyn_cast<TupleType>(source);
-  auto destTuple = dyn_cast<TupleType>(dest);
-  if (!sourceTuple || !destTuple || sourceTuple.size() != destTuple.size())
-    return false;
-  return llvm::all_of(
-      llvm::zip_equal(sourceTuple.getTypes(), destTuple.getTypes()),
-      [](auto pair) {
-        auto [sourceElem, destElem] = pair;
-        return compatibleProgressiveType(sourceElem, destElem);
-      });
-}
-
-// Signature-compat check with the progressive-typing escape. Kept near
-// `isUndef` so every verifier that walks op↔signature pairs can share it.
-static bool compatibleSigType(Type callSite, Type callee) {
-  return compatibleProgressiveType(callSite, callee);
-}
-
-static bool compatibleBranchType(Type source, Type dest) {
-  if (compatibleSigType(source, dest))
-    return true;
-  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(source))
-    if (joinable.joinHCType(dest))
-      return true;
-  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(dest))
-    if (joinable.joinHCType(source))
-      return true;
-  return false;
-}
-
 ArrayAttr mlir::hc::filterIntrinsicOperandParameters(ArrayAttr parameters,
                                                      ArrayAttr constKwargs) {
   if (!parameters || !constKwargs || constKwargs.empty())
@@ -648,7 +609,7 @@ LogicalResult HCReturnOp::verify() {
            << " result(s)";
   for (auto [i, returned, declared] :
        llvm::enumerate(getValues().getTypes(), fnType.getResults())) {
-    if (!compatibleSigType(returned, declared))
+    if (!areHCProgressiveTypesCompatible(returned, declared))
       return emitOpError("returned value #")
              << i << " type " << returned << " does not match enclosing "
              << callee->getName() << " result type " << declared;
@@ -709,7 +670,7 @@ ValueRange HCForRangeOp::getSuccessorInputs(RegionSuccessor successor) {
 }
 
 bool HCForRangeOp::areTypesCompatible(Type lhs, Type rhs) {
-  return compatibleBranchType(lhs, rhs);
+  return areHCBranchTypesCompatible(lhs, rhs);
 }
 
 void HCIfOp::getSuccessorRegions(RegionBranchPoint point,
@@ -731,7 +692,7 @@ ValueRange HCIfOp::getSuccessorInputs(RegionSuccessor successor) {
 }
 
 bool HCIfOp::areTypesCompatible(Type lhs, Type rhs) {
-  return compatibleBranchType(lhs, rhs);
+  return areHCBranchTypesCompatible(lhs, rhs);
 }
 
 LogicalResult HCForRangeOp::verify() {
@@ -751,7 +712,7 @@ LogicalResult HCForRangeOp::verify() {
   for (auto [idx, pair] :
        llvm::enumerate(llvm::zip_equal(getIterInits(), getIterResults()))) {
     auto [init, result] = pair;
-    if (!compatibleBranchType(init.getType(), result.getType()))
+    if (!areHCBranchTypesCompatible(init.getType(), result.getType()))
       return emitOpError("iter_args[")
              << idx << "] type " << init.getType() << " does not match result["
              << idx << "] type " << result.getType();
@@ -766,7 +727,7 @@ LogicalResult HCForRangeOp::verify() {
     auto [init, blockArg] = pair;
     Type initTy = init.getType();
     Type blockTy = blockArg.getType();
-    if (compatibleBranchType(initTy, blockTy))
+    if (areHCBranchTypesCompatible(initTy, blockTy))
       continue;
     return emitOpError("iter_args[")
            << idx << "] type " << initTy
@@ -788,7 +749,7 @@ LogicalResult HCForRangeOp::verify() {
     auto [yielded, result] = pair;
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
-    if (compatibleBranchType(yieldedTy, resultTy))
+    if (areHCBranchTypesCompatible(yieldedTy, resultTy))
       continue;
     return emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx
@@ -835,7 +796,7 @@ static LogicalResult verifyNestedScopeRegion(Operation *op) {
     auto [yielded, result] = pair;
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
-    if (compatibleBranchType(yieldedTy, resultTy))
+    if (areHCBranchTypesCompatible(yieldedTy, resultTy))
       continue;
     return op->emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx
@@ -904,7 +865,7 @@ LogicalResult HCIfOp::verify() {
       auto [yielded, result] = pair;
       Type yieldedTy = yielded.getType();
       Type resultTy = result.getType();
-      if (compatibleBranchType(yieldedTy, resultTy))
+      if (areHCBranchTypesCompatible(yieldedTy, resultTy))
         continue;
       return emitOpError(label)
              << " yield[" << idx << "] type " << yieldedTy
@@ -1018,7 +979,7 @@ LogicalResult HCVLoadOp::verify() {
 
 LogicalResult HCTupleOp::verify() {
   Type resultType = getResult().getType();
-  if (isUndef(resultType))
+  if (isHCUndefType(resultType))
     return success();
   auto tuple = dyn_cast<TupleType>(resultType);
   if (!tuple)
@@ -1031,7 +992,7 @@ LogicalResult HCTupleOp::verify() {
   for (auto [index, pair] :
        llvm::enumerate(llvm::zip_equal(getElements(), tuple.getTypes()))) {
     auto [value, type] = pair;
-    if (compatibleBranchType(value.getType(), type))
+    if (areHCBranchTypesCompatible(value.getType(), type))
       continue;
     return emitOpError("element #")
            << index << " type " << value.getType()
@@ -1082,7 +1043,7 @@ LogicalResult HCAsTypeOp::verify() {
   // `!hc.undef` escape keeps pre-inference IR legal. Anything else is a
   // builder bug that should fail loudly instead of silently round-tripping.
   Type result = getResult().getType();
-  if (isUndef(result))
+  if (isHCUndefType(result))
     return success();
   if (result.isIntOrIndexOrFloat()) {
     if (result != target)
@@ -1116,14 +1077,14 @@ LogicalResult HCWithInactiveOp::verify() {
   // inference `!hc.undef` operands skip straight to success so the op
   // remains usable out of the mechanical frontend pass.
   Type value = getValue().getType();
-  if (isUndef(value) || value.isIntOrIndexOrFloat())
+  if (isHCUndefType(value) || value.isIntOrIndexOrFloat())
     return success();
   Type elem;
   if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(value))
     elem = tens.getElementType();
   else if (auto vec = llvm::dyn_cast<mlir::hc::VectorType>(value))
     elem = vec.getElementType();
-  if (!elem || isUndef(elem))
+  if (!elem || isHCUndefType(elem))
     return success();
   Attribute inactive = getInactiveAttr();
   auto sameDomain = [&](Attribute a) -> bool {
@@ -1168,14 +1129,14 @@ static LogicalResult verifySignature(CallOp op, FunctionType fnType) {
            << " result(s), call site declares " << op.getResults().size();
   for (auto [i, callSite, declared] :
        llvm::enumerate(op.getArgs().getTypes(), fnType.getInputs())) {
-    if (!compatibleBranchType(callSite, declared))
+    if (!areHCBranchTypesCompatible(callSite, declared))
       return op.emitOpError("arg #")
              << i << " type " << callSite
              << " is incompatible with callee declaration " << declared;
   }
   for (auto [i, callSite, declared] :
        llvm::enumerate(op.getResults().getTypes(), fnType.getResults())) {
-    if (!compatibleBranchType(callSite, declared))
+    if (!areHCBranchTypesCompatible(callSite, declared))
       return op.emitOpError("result #")
              << i << " type " << callSite
              << " is incompatible with callee declaration " << declared;

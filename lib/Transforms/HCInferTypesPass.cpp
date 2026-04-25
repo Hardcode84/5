@@ -36,38 +36,6 @@ using namespace mlir::hc;
 
 namespace {
 
-static bool isUndef(Type type) { return isa<UndefType>(type); }
-
-static Type joinConcreteTypes(Type lhs, Type rhs) {
-  if (lhs == rhs)
-    return lhs;
-  if (isUndef(lhs))
-    return rhs;
-  if (isUndef(rhs))
-    return lhs;
-  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(lhs))
-    if (Type common = joinable.joinHCType(rhs))
-      return common;
-  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(rhs))
-    if (Type common = joinable.joinHCType(lhs))
-      return common;
-
-  auto lhsTuple = dyn_cast<TupleType>(lhs);
-  auto rhsTuple = dyn_cast<TupleType>(rhs);
-  if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
-    return {};
-  SmallVector<Type> elements;
-  elements.reserve(lhsTuple.size());
-  for (auto [lhsElement, rhsElement] :
-       llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
-    Type joined = joinConcreteTypes(lhsElement, rhsElement);
-    if (!joined)
-      return {};
-    elements.push_back(joined);
-  }
-  return TupleType::get(lhs.getContext(), elements);
-}
-
 struct TypeFact {
   enum class Kind { Unknown, Concrete, Conflict };
 
@@ -102,7 +70,7 @@ struct TypeFact {
       return lhs;
     if (lhs.isConflict() || rhs.isConflict())
       return conflict();
-    if (Type common = joinConcreteTypes(lhs.type, rhs.type))
+    if (Type common = joinHCTypes(lhs.type, rhs.type))
       return concrete(common);
     return conflict();
   }
@@ -127,7 +95,7 @@ struct HCTypeLattice : public dataflow::Lattice<TypeFact> {
 };
 
 static TypeFact factFromExistingType(Type type) {
-  if (!type || isUndef(type))
+  if (!type || isHCUndefType(type))
     return TypeFact::unknown();
   return TypeFact::concrete(type);
 }
@@ -224,7 +192,7 @@ protected:
       if (std::optional<FunctionType> fnType = callee.getFunctionType()) {
         for (auto [result, type] :
              llvm::zip(resultLattices, fnType->getResults()))
-          if (!isUndef(type))
+          if (!isHCUndefType(type))
             join(static_cast<HCTypeLattice *>(result),
                  TypeFact::concrete(type));
       }
@@ -287,33 +255,6 @@ private:
     propagateIfChanged(lattice, lattice->join(fact));
   }
 };
-
-static bool shouldRefine(Type current, Type inferred) {
-  if (!inferred || current == inferred)
-    return false;
-  if (isUndef(current))
-    return true;
-  if (auto currentTuple = dyn_cast<TupleType>(current)) {
-    auto inferredTuple = dyn_cast<TupleType>(inferred);
-    if (!inferredTuple || currentTuple.size() != inferredTuple.size())
-      return false;
-    return llvm::any_of(
-        llvm::zip_equal(currentTuple.getTypes(), inferredTuple.getTypes()),
-        [](auto pair) {
-          auto [currentElement, inferredElement] = pair;
-          return shouldRefine(currentElement, inferredElement);
-        });
-  }
-  if (auto currentIdx = dyn_cast<IdxType>(current)) {
-    auto inferredIdx = dyn_cast<IdxType>(inferred);
-    return inferredIdx && !currentIdx.getExpr() && inferredIdx.getExpr();
-  }
-  if (auto currentPred = dyn_cast<PredType>(current)) {
-    auto inferredPred = dyn_cast<PredType>(inferred);
-    return inferredPred && !currentPred.getPred() && inferredPred.getPred();
-  }
-  return false;
-}
 
 static bool isNestedUnderHCCallable(Operation *op) {
   while (op) {
@@ -393,7 +334,7 @@ static LogicalResult reportTypeConflicts(ModuleOp module,
 }
 
 static bool refineValue(Value value, Type inferred) {
-  if (!shouldRefine(value.getType(), inferred))
+  if (!shouldRefineHCType(value.getType(), inferred))
     return false;
   value.setType(inferred);
   return true;

@@ -46,35 +46,10 @@ class HCBranchCompatibleTypes<string lhs, string rhs> : TypesMatchWith<
     lhs, rhs, "$_self",
     [{
       [](::mlir::TypeRange lhsTypes, ::mlir::TypeRange rhsTypes) {
-        auto compatible = [](auto &&self, ::mlir::Type lhsType,
-                             ::mlir::Type rhsType) -> bool {
-          if (lhsType == rhsType ||
-              ::llvm::isa<::mlir::hc::UndefType>(lhsType) ||
-              ::llvm::isa<::mlir::hc::UndefType>(rhsType))
-            return true;
-          if (auto joinable =
-                  ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
-                      lhsType))
-            if (joinable.joinHCType(rhsType))
-              return true;
-          if (auto joinable =
-                  ::llvm::dyn_cast<::mlir::hc::HCJoinableTypeInterface>(
-                      rhsType))
-            if (joinable.joinHCType(lhsType))
-              return true;
-          auto lhsTuple = ::llvm::dyn_cast<::mlir::TupleType>(lhsType);
-          auto rhsTuple = ::llvm::dyn_cast<::mlir::TupleType>(rhsType);
-          if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
-            return false;
-          for (size_t i = 0, e = lhsTuple.size(); i < e; ++i)
-            if (!self(self, lhsTuple.getType(i), rhsTuple.getType(i)))
-              return false;
-          return true;
-        };
         return ::llvm::equal(
             lhsTypes, rhsTypes,
             [&](::mlir::Type lhsType, ::mlir::Type rhsType) {
-              return compatible(compatible, lhsType, rhsType);
+              return ::mlir::hc::areHCBranchTypesCompatible(lhsType, rhsType);
             });
       }
     }]>;

@@ -18,6 +18,25 @@ namespace mlir::hc {
 IdxType getUnpinnedIdxType(MLIRContext *ctx);
 PredType getUnpinnedPredType(MLIRContext *ctx);
 
+/// Returns true when `type` is HC's erased refinement placeholder.
+bool isHCUndefType(Type type);
+
+/// Join two concrete HC type facts, recursively joining tuple elements.
+/// Returns null when the facts are incompatible.
+Type joinHCTypes(Type lhs, Type rhs);
+
+/// Compatibility used for progressive signatures: exact match, `!hc.undef`,
+/// or recursive tuple compatibility.
+bool areHCProgressiveTypesCompatible(Type source, Type dest);
+
+/// Compatibility used across region/control-flow edges. This includes
+/// progressive compatibility plus recursive `HCJoinableTypeInterface` joins.
+bool areHCBranchTypesCompatible(Type source, Type dest);
+
+/// Returns true when replacing `current` with `inferred` is a monotonic HC type
+/// refinement.
+bool shouldRefineHCType(Type current, Type inferred);
+
 } // namespace mlir::hc
 
 #endif // HC_IR_HCTYPES_H

@@ -8,6 +8,7 @@
 #include "hc/IR/HCDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
@@ -15,6 +16,84 @@
 
 using namespace mlir;
 using namespace mlir::hc;
+
+bool mlir::hc::isHCUndefType(Type type) { return isa<UndefType>(type); }
+
+Type mlir::hc::joinHCTypes(Type lhs, Type rhs) {
+  if (lhs == rhs)
+    return lhs;
+  if (isHCUndefType(lhs))
+    return rhs;
+  if (isHCUndefType(rhs))
+    return lhs;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(lhs))
+    if (Type common = joinable.joinHCType(rhs))
+      return common;
+  if (auto joinable = dyn_cast<HCJoinableTypeInterface>(rhs))
+    if (Type common = joinable.joinHCType(lhs))
+      return common;
+
+  auto lhsTuple = dyn_cast<TupleType>(lhs);
+  auto rhsTuple = dyn_cast<TupleType>(rhs);
+  if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
+    return {};
+  SmallVector<Type> elements;
+  elements.reserve(lhsTuple.size());
+  for (auto [lhsElement, rhsElement] :
+       llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
+    Type joined = joinHCTypes(lhsElement, rhsElement);
+    if (!joined)
+      return {};
+    elements.push_back(joined);
+  }
+  return TupleType::get(lhs.getContext(), elements);
+}
+
+bool mlir::hc::areHCProgressiveTypesCompatible(Type source, Type dest) {
+  if (isHCUndefType(source) || isHCUndefType(dest) || source == dest)
+    return true;
+  auto sourceTuple = dyn_cast<TupleType>(source);
+  auto destTuple = dyn_cast<TupleType>(dest);
+  if (!sourceTuple || !destTuple || sourceTuple.size() != destTuple.size())
+    return false;
+  return llvm::all_of(
+      llvm::zip_equal(sourceTuple.getTypes(), destTuple.getTypes()),
+      [](auto pair) {
+        auto [sourceElem, destElem] = pair;
+        return areHCProgressiveTypesCompatible(sourceElem, destElem);
+      });
+}
+
+bool mlir::hc::areHCBranchTypesCompatible(Type source, Type dest) {
+  return static_cast<bool>(joinHCTypes(source, dest));
+}
+
+bool mlir::hc::shouldRefineHCType(Type current, Type inferred) {
+  if (!inferred || current == inferred)
+    return false;
+  if (isHCUndefType(current))
+    return true;
+  if (auto currentTuple = dyn_cast<TupleType>(current)) {
+    auto inferredTuple = dyn_cast<TupleType>(inferred);
+    if (!inferredTuple || currentTuple.size() != inferredTuple.size())
+      return false;
+    return llvm::any_of(
+        llvm::zip_equal(currentTuple.getTypes(), inferredTuple.getTypes()),
+        [](auto pair) {
+          auto [currentElement, inferredElement] = pair;
+          return shouldRefineHCType(currentElement, inferredElement);
+        });
+  }
+  if (auto currentIdx = dyn_cast<IdxType>(current)) {
+    auto inferredIdx = dyn_cast<IdxType>(inferred);
+    return inferredIdx && !currentIdx.getExpr() && inferredIdx.getExpr();
+  }
+  if (auto currentPred = dyn_cast<PredType>(current)) {
+    auto inferredPred = dyn_cast<PredType>(inferred);
+    return inferredPred && !currentPred.getPred() && inferredPred.getPred();
+  }
+  return false;
+}
 
 namespace {
 

@@ -617,13 +617,13 @@ def HCSliceExprOp : HC_Op<"slice_expr",
 }
 
 def HCBufferViewOp : HC_Op<"buffer_view", [Pure]> {
-  let summary = "Sub-buffer (no data movement).";
+  let summary = "Sub-view into a buffer or tensor (no data movement).";
   let description = [{
-    Returns a view of `$buffer` reduced by the variadic index/slice
+    Returns a view of the buffer-or-tensor root reduced by the variadic index/slice
     operands. The variadic list carries a mix of scalar indices and
     `!hc.slice` values, matching Python-style multi-axis subscripts.
   }];
-  let arguments = (ins HC_BufferValueType:$buffer,
+  let arguments = (ins HC_BufferOrTensorValueType:$buffer,
                        Variadic<HC_ValueType>:$indices);
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{

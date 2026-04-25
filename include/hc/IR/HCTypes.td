@@ -168,8 +168,9 @@ def HC_BufferValueType : AnyTypeOf<[
   HC_BufferType,
 ]>;
 
-// Buffer or tensor root. `hc.vload` reads from either; `hc.store` writes
-// into either.
+// Buffer or tensor root. Used by ops that can address either storage class:
+// `hc.buffer_view` forms a no-copy sub-view, `hc.vload` reads from either, and
+// `hc.store` writes into either.
 def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,

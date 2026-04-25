@@ -481,6 +481,48 @@ keywordOnlyParametersFromDicts(ArrayAttr params, Operation *sourceOp) {
   return ArrayAttr::get(ctx, keywordOnly);
 }
 
+FailureOr<Type> parameterTypeFromDict(MLIRContext *ctx, Operation *sourceOp,
+                                      DictionaryAttr param, Type fallback) {
+  auto kind = param.getAs<StringAttr>("kind");
+  auto shapeAttr = param.getAs<ArrayAttr>("shape");
+  auto name = param.getAs<StringAttr>("name");
+  if (!name)
+    return sourceOp->emitOpError("`parameters` entry missing `name` key");
+  if (!kind) {
+    if (shapeAttr)
+      return sourceOp->emitOpError("parameter '")
+             << name.getValue()
+             << "' has `shape` metadata but no string `kind`";
+    return fallback;
+  }
+  if (kind.getValue() != "buffer") {
+    if (shapeAttr)
+      return sourceOp->emitOpError("parameter '")
+             << name.getValue() << "' has `shape` metadata but kind '"
+             << kind.getValue() << "' is not `buffer`";
+    return fallback;
+  }
+
+  if (!shapeAttr)
+    return sourceOp->emitOpError("buffer parameter '")
+           << name.getValue() << "' is missing `shape` metadata";
+
+  Type elementType = fallback;
+  if (auto dtype = param.getAs<StringAttr>("dtype")) {
+    std::optional<Type> resolved = resolveNumpyDtypeType(ctx, dtype.getValue());
+    if (!resolved)
+      return sourceOp->emitOpError("buffer parameter '")
+             << name.getValue() << "' has unsupported dtype '"
+             << dtype.getValue() << "'";
+    elementType = *resolved;
+  }
+
+  FailureOr<ShapeAttr> shape = stringArrayToShape(ctx, sourceOp, shapeAttr);
+  if (failed(shape))
+    return failure();
+  return Type(BufferType::get(ctx, elementType, *shape));
+}
+
 //===----------------------------------------------------------------------===//
 // Lowerer. Instantiated once per top-level `hc_front` callable; walks the
 // body, threads the scope map through nested regions, and emits the
@@ -595,8 +637,9 @@ private:
   FailureOr<Value> lowerCall(hc_front::CallOp op);
   Value lowerSubscript(hc_front::SubscriptOp op);
 
-  // Populates `entry`'s block arguments (one `!hc.undef` per param) and
-  // returns the matching `FunctionType`. No `hc.assign` is emitted here;
+  // Populates `entry`'s block arguments and returns the matching
+  // `FunctionType`. Buffer parameters are seeded from their metadata;
+  // everything else starts as `!hc.undef`. No `hc.assign` is emitted here;
   // param-name publishing happens in `emitParameterAssigns` once the
   // enclosing op has attached `entry` to its body.
   FailureOr<FunctionType> materializeParameters(ArrayAttr params, Block &entry,
@@ -825,7 +868,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     // `hc.intrinsic` owns the const-kwarg filtering rule: its
     // `function_type` is the runtime operand signature, while
     // `parameters` keeps the full declared order for call-site kwarg
-    // binding.
+    // binding. Intrinsics keep runtime operand types erased here because
+    // target-specific lowering validates and specializes their operands.
     FunctionType fnType = getIntrinsicOperandFunctionType(
         *parameterNames, constKwargsAttr, TypeRange{undef}, undef);
     ArrayAttr parameterNamesAttr = *parameterNames;
@@ -875,12 +919,12 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
     auto name = dict.getAs<StringAttr>("name");
     if (!name)
       return sourceOp->emitOpError("`parameters` entry missing `name` key");
-    // Every parameter enters as `!hc.undef`. The driver also stamps typed
-    // annotation records on each param dict, but pinning them here is a
-    // separate concern — a later inference pass walks those records and
-    // refines once the semantic shape is known.
-    inputs.push_back(undef);
-    entry.addArgument(undef, sourceOp->getLoc());
+    FailureOr<Type> paramType =
+        parameterTypeFromDict(ctx, sourceOp, dict, undef);
+    if (failed(paramType))
+      return failure();
+    inputs.push_back(*paramType);
+    entry.addArgument(*paramType, sourceOp->getLoc());
   }
 
   SmallVector<Type> results;
@@ -892,11 +936,10 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
 void Lowerer::emitParameterAssigns(ArrayAttr params, Block &entry,
                                    Location loc) {
   // Preconditions set up by `materializeParameters`: the dict shape of
-  // every entry is already validated, and `entry` has exactly
-  // `params.size()` block arguments (one `!hc.undef` per param). Assert
-  // the block-arg count here so a future caller that forgets to call
-  // `materializeParameters` first trips a loud check instead of an
-  // out-of-bounds read.
+  // every entry is already validated, and `entry` has exactly one block
+  // argument per parameter. Assert the block-arg count here so a future caller
+  // that forgets to call `materializeParameters` first trips a loud check
+  // instead of an out-of-bounds read.
   assert(entry.getNumArguments() == params.size() &&
          "emitParameterAssigns: entry block arg count mismatch; "
          "caller must run materializeParameters first");
@@ -2454,8 +2497,9 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
     SmallVector<Value> expanded = expandTupleOperand(idx);
     indices.append(expanded.begin(), expanded.end());
   }
-  // `hc.buffer_view` accepts `!hc.undef` as the buffer handle via
-  // `HC_BufferValueType`, so pre-inference subscripts pass verify.
+  // `hc.buffer_view` accepts `!hc.undef`, buffers, and tensors as the root
+  // value, so pre-inference subscripts and inferred tensor subscripts both
+  // pass verify.
   return HCBufferViewOp::create(builder, op.getLoc(), undef, base, indices);
 }
 

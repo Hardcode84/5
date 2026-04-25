@@ -275,6 +275,50 @@ module {
 
 // -----
 
+// Buffer parameter metadata is part of the conversion boundary now: malformed
+// records should fail here, before later passes see partially typed IR.
+module {
+  // expected-error@+1 {{buffer parameter 'x' is missing `shape` metadata}}
+  hc_front.kernel "buffer_missing_shape" attributes {
+    parameters = [
+      {kind = "buffer", name = "x"}
+    ]
+  } {
+    hc_front.return
+  }
+}
+
+// -----
+
+// `dtype` is optional, but if present it must name a supported NumPy dtype.
+module {
+  // expected-error@+1 {{buffer parameter 'x' has unsupported dtype 'float128'}}
+  hc_front.kernel "buffer_bad_dtype" attributes {
+    parameters = [
+      {dtype = "float128", kind = "buffer", name = "x", shape = ["M"]}
+    ]
+  } {
+    hc_front.return
+  }
+}
+
+// -----
+
+// Shape metadata only has meaning for buffers. Other parameter kinds keep
+// using `!hc.undef` until inference can refine them.
+module {
+  // expected-error@+1 {{parameter 'x' has `shape` metadata but kind 'scalar' is not `buffer`}}
+  hc_front.kernel "shape_without_buffer_kind" attributes {
+    parameters = [
+      {kind = "scalar", name = "x", shape = ["M"]}
+    ]
+  } {
+    hc_front.return
+  }
+}
+
+// -----
+
 // `group.load(a[i][j], ...)` — chained Python subscripts lower to
 // nested `hc.buffer_view`s whose index lists cannot be safely spliced
 // (outer slice re-indexes the already-reduced view, not the original

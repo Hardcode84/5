@@ -296,10 +296,10 @@ every type listed above. Ops with clear semantic categories tighten further:
 * `HC_ShapedValueType` — ops that only make sense on tensors/vectors
   (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`,
   `hc.store`'s `$source`)
-* `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.buffer_view`,
-  `hc.load`; excludes everything non-buffer
+* `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.load`;
+  excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either
-  (`hc.vload.$source`, `hc.store.$dest`)
+  (`hc.buffer_view.$buffer`, `hc.vload.$source`, `hc.store.$dest`)
 
 Every narrow constraint still admits `!hc.undef` so the `hc_front -> hc`
 pass stays mechanical. Further narrowings (booleans for `hc.and/or/not`)
@@ -476,8 +476,8 @@ Comparison result typing:
   Python slice syntax (`x[1:]`, `x[1:10:2]`, `x[:]`, `x[::2]`, ...).
   Implementation: MLIR's `Optional<>` + `AttrSizedOperandSegments`, so
   there is no flag/operand drift.
-* `hc.buffer_view %buf[%idx...]` — sub-buffer with the slice-reduced shape,
-  for cases that do not require data movement
+* `hc.buffer_view %buf[%idx...]` — sub-view of a buffer or tensor with the
+  slice-reduced shape, for cases that do not require data movement
 
 Multi-axis subscripts on `hc.load`/`hc.store`/`hc.buffer_view` take variadic
 operands directly; there is no separate tuple-construction op.
@@ -564,10 +564,10 @@ under `-cse`, an unannotated one does not.
 
 The example `examples/amdgpu_gfx11_wmma_matmul.py` is the shape-first
 integration target. Two snapshots are shown: immediately after `hc_front → hc`
-(all `!hc.undef`, generic ops, no inference), and after type / symbol
-inference.
+(mostly `!hc.undef`, with trivially seeded buffer parameters, generic ops, no
+inference), and after type / symbol inference.
 
-#### After `hc_front → hc` (mechanical, all `!hc.undef`)
+#### After `hc_front → hc` (mechanical, mostly `!hc.undef`)
 
 ```mlir
 hc.kernel @tiled_gfx11_wmma_matmul attributes {

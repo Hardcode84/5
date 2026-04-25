@@ -8,13 +8,15 @@
 include "mlir/Pass/PassBase.td"
 
 def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
-  let summary = "Mechanical hc_front -> hc lowering driven by `ref` metadata.";
+  let summary = "Mechanical hc_front -> hc lowering driven by frontend metadata.";
   let description = [{
     Walks every `hc_front.kernel` / `hc_front.func` / `hc_front.intrinsic`
     top-level op and emits the parallel `hc` callable, consuming the `ref`
     DictAttr stamped by the Python driver on each `hc_front.name` /
-    `hc_front.attr`. Every produced value has `!hc.undef`; a later
-    inference pass pins concrete types.
+    `hc_front.attr` plus the callable `parameters` metadata. Most produced
+    values start as `!hc.undef`; buffer parameters are seeded as
+    `!hc.buffer<...>` when their dict carries `kind = "buffer"` and shape
+    metadata. A later inference pass pins the remaining concrete types.
 
     ## Pipeline contract (canonical)
 

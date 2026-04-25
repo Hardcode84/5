@@ -21,7 +21,7 @@
 // on dedicated hc ops (vec, astype, with_inactive, store).
 
 // CHECK-LABEL: hc.kernel @basic
-// CHECK-SAME: (%arg0: !hc.undef, %arg1: !hc.undef, %arg2: !hc.undef)
+// CHECK-SAME: (%arg0: !hc.undef, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
 // CHECK-SAME: attributes {
 // CHECK-SAME: group_shape = #hc.shape<["32"]>
 // CHECK-SAME: literals = ["TILE"]
@@ -43,7 +43,7 @@ module {
     subgroup_size = 32 : i32,
     work_shape = ["M"]
   } {
-    // CHECK: %[[D:.*]] = hc.buffer_dim %arg1, axis = 0 : !hc.undef
+    // CHECK: %[[D:.*]] = hc.buffer_dim %arg1, axis = 0 : !hc.buffer<!hc.undef, ["M"]>
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %axis = hc_front.constant<0 : i64>
@@ -76,13 +76,13 @@ module {
       %range_fn = hc_front.name "range" {ctx = "load", ref = {builtin = "range", kind = "builtin"}}
       %range_call = hc_front.call %range_fn(%lo, %hi, %st)
     } do {
-      // CHECK: hc.buffer_view %arg1[%{{.*}}] : (!hc.undef, !hc.undef) -> !hc.undef
+      // CHECK: hc.buffer_view %arg1[%{{.*}}] : (!hc.buffer<!hc.undef, ["M"]>, !hc.undef) -> !hc.undef
       %iv = hc_front.name "i" {ctx = "load", ref = {kind = "iv"}}
       %a_ref = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
       %load = hc_front.subscript %a_ref[%iv]
       // CHECK: hc.const<2 : i64> : !hc.undef
       %c2 = hc_front.constant<2 : i64>
-      // CHECK: hc.store %arg2[%{{.*}}], %{{.*}} : (!hc.undef, !hc.undef, !hc.undef) -> ()
+      // CHECK: hc.store %arg2[%{{.*}}], %{{.*}} : (!hc.buffer<!hc.undef, ["M"]>, !hc.undef, !hc.undef) -> ()
       %b_ref = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
       %b_idx = hc_front.target_subscript %b_ref[%iv]
       hc_front.assign %b_idx = %c2
@@ -200,6 +200,16 @@ module {
   hc_front.kernel "return_none" attributes {
     parameters = [{name = "group"}],
     returns = "None"
+  } {
+    hc_front.return
+  }
+
+  // CHECK-LABEL: hc.kernel @typed_buffer_param
+  // CHECK-SAME: (%{{.*}}: !hc.buffer<f32, ["M"]>)
+  hc_front.kernel "typed_buffer_param" attributes {
+    parameters = [
+      {dtype = "float32", kind = "buffer", name = "x", shape = ["M"]}
+    ]
   } {
     hc_front.return
   }

@@ -482,7 +482,9 @@ Comparison result typing:
   Implementation: MLIR's `Optional<>` + `AttrSizedOperandSegments`, so
   there is no flag/operand drift.
 * `hc.buffer_view %buf[%idx...]` — sub-view of a buffer or tensor with the
-  slice-reduced shape, for cases that do not require data movement
+  slice-reduced shape, for cases that do not require data movement. Inference
+  preserves the storage class (`!hc.buffer` or `!hc.tensor`) and removes axes
+  consumed by scalar indices.
 * `hc.tuple(%value...)` — first-class aggregate using MLIR's builtin
   `tuple<...>` type, preserving Python tuple structure as a single SSA value
 * `hc.getitem %base[%idx...]` — generic Python square-bracket indexing kept

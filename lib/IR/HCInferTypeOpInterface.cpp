@@ -85,6 +85,16 @@ static FailureOr<ExprAttr> composeNegExprAttr(MLIRContext *ctx, ExprAttr value,
   return ExprAttr::get(ctx, *handle);
 }
 
+static FailureOr<ExprAttr> composeCeilExprAttr(MLIRContext *ctx, ExprAttr value,
+                                               Operation *diagOp) {
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle = sym::composeExprCeil(
+      symbolStore(ctx), sym::ExprHandle(value.getNode()), &diag);
+  if (failed(emitComposeError(diagOp, "expression", handle, diag)))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
 static FailureOr<PredAttr> composePredAttr(MLIRContext *ctx, ExprAttr lhs,
                                            sym::PredCmpOp op, ExprAttr rhs,
                                            Operation *diagOp) {
@@ -211,6 +221,22 @@ static ShapeAttr getShapeAttrFromBuffer(Type type) {
   return {};
 }
 
+static ShapeAttr getShapeAttrFromBufferOrTensor(Type type) {
+  if (auto buffer = dyn_cast_or_null<mlir::hc::BufferType>(type))
+    return buffer.getShape();
+  if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(type))
+    return tensor.getShape();
+  return {};
+}
+
+static Type getElementTypeFromBufferOrTensor(Type type) {
+  if (auto buffer = dyn_cast_or_null<mlir::hc::BufferType>(type))
+    return buffer.getElementType();
+  if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(type))
+    return tensor.getElementType();
+  return {};
+}
+
 static Type inferBufferDim(Type bufferType, int64_t axis, Operation *op) {
   ShapeAttr shape = getShapeAttrFromBuffer(bufferType);
   if (!shape || axis < 0 ||
@@ -237,6 +263,117 @@ static ShapeAttr shapeFromTupleType(Type shapeType, Operation *op) {
     dims.push_back(idx.getExpr());
   }
   return ShapeAttr::get(op->getContext(), dims);
+}
+
+static FailureOr<ExprAttr> defaultZeroExpr(MLIRContext *ctx, Operation *op) {
+  return parseExprAttr(ctx, "0", op);
+}
+
+static FailureOr<ExprAttr> defaultOneExpr(MLIRContext *ctx, Operation *op) {
+  return parseExprAttr(ctx, "1", op);
+}
+
+static FailureOr<ExprAttr> composeSubExprAttr(MLIRContext *ctx, ExprAttr lhs,
+                                              ExprAttr rhs, Operation *op) {
+  return composeExprAttr(ctx, lhs, sym::ExprBinaryOp::Sub, rhs, op);
+}
+
+static FailureOr<ExprAttr> composeDivExprAttr(MLIRContext *ctx, ExprAttr lhs,
+                                              ExprAttr rhs, Operation *op) {
+  return composeExprAttr(ctx, lhs, sym::ExprBinaryOp::Div, rhs, op);
+}
+
+static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
+                                             Operation *op) {
+  MLIRContext *ctx = op->getContext();
+  Type lowerType = slice.getLowerType();
+  Type upperType = slice.getUpperType();
+  Type stepType = slice.getStepType();
+
+  if (!lowerType && !upperType && !stepType)
+    return baseDim;
+
+  std::optional<ExprAttr> lower =
+      lowerType ? idxExprAttr(lowerType) : std::optional<ExprAttr>();
+  std::optional<ExprAttr> upper =
+      upperType ? idxExprAttr(upperType) : std::optional<ExprAttr>();
+  std::optional<ExprAttr> step =
+      stepType ? idxExprAttr(stepType) : std::optional<ExprAttr>();
+  if ((lowerType && !lower) || (upperType && !upper) || (stepType && !step))
+    return failure();
+
+  FailureOr<ExprAttr> zero = defaultZeroExpr(ctx, op);
+  if (failed(zero))
+    return failure();
+  ExprAttr start = lower.value_or(*zero);
+  ExprAttr stop = upper.value_or(baseDim);
+  FailureOr<ExprAttr> extent = composeSubExprAttr(ctx, stop, start, op);
+  if (failed(extent))
+    return failure();
+
+  if (!stepType)
+    return *extent;
+
+  FailureOr<ExprAttr> one = defaultOneExpr(ctx, op);
+  if (failed(one))
+    return failure();
+  if (*step == *one)
+    return *extent;
+
+  FailureOr<ExprAttr> scaled = composeDivExprAttr(ctx, *extent, *step, op);
+  if (failed(scaled))
+    return failure();
+  return composeCeilExprAttr(ctx, *scaled, op);
+}
+
+static FailureOr<Type> inferBufferViewResult(Type sourceType,
+                                             ArrayRef<Type> indexTypes,
+                                             Type currentResultType,
+                                             Operation *op) {
+  if (!sourceType || isHCUndefType(sourceType))
+    return currentResultType;
+
+  Type elementType = getElementTypeFromBufferOrTensor(sourceType);
+  ShapeAttr shape = getShapeAttrFromBufferOrTensor(sourceType);
+  if (!elementType || !shape)
+    return currentResultType;
+
+  ArrayRef<Attribute> baseDims = shape.getDims();
+  SmallVector<Attribute> resultDims;
+  unsigned axis = 0;
+  for (Type indexType : indexTypes) {
+    if (axis >= baseDims.size())
+      return currentResultType;
+    auto baseDim = dyn_cast<ExprAttr>(baseDims[axis]);
+    if (!baseDim)
+      return currentResultType;
+
+    if (!indexType || isHCUndefType(indexType))
+      return currentResultType;
+    if (auto slice = dyn_cast<SliceType>(indexType)) {
+      FailureOr<ExprAttr> dim = inferSliceViewDim(baseDim, slice, op);
+      if (failed(dim))
+        return currentResultType;
+      resultDims.push_back(*dim);
+      ++axis;
+      continue;
+    }
+    if (isa<IdxType>(indexType) || indexType.isIntOrIndex()) {
+      ++axis;
+      continue;
+    }
+    return currentResultType;
+  }
+
+  for (; axis < baseDims.size(); ++axis)
+    resultDims.push_back(baseDims[axis]);
+
+  ShapeAttr resultShape = ShapeAttr::get(op->getContext(), resultDims);
+  if (isa<mlir::hc::BufferType>(sourceType))
+    return Type(
+        mlir::hc::BufferType::get(op->getContext(), elementType, resultShape));
+  return Type(
+      mlir::hc::TensorType::get(op->getContext(), elementType, resultShape));
 }
 
 static Type inferLoadLikeResult(Type sourceType, Type shapeType,
@@ -623,6 +760,16 @@ LogicalResult HCBufferDimOp::inferHCTypes(ArrayRef<Type> operandTypes,
   resultTypes.push_back(inferBufferDim(
       operandTypes.empty() ? Type{} : operandTypes[0], getAxis(), *this));
   return success();
+}
+
+LogicalResult HCBufferViewOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                           SmallVectorImpl<Type> &resultTypes) {
+  Type sourceType = operandTypes.empty() ? Type{} : operandTypes.front();
+  ArrayRef<Type> indexTypes =
+      operandTypes.empty() ? ArrayRef<Type>{} : operandTypes.drop_front();
+  return pushInferred(resultTypes,
+                      inferBufferViewResult(sourceType, indexTypes,
+                                            getResult().getType(), *this));
 }
 
 LogicalResult HCSliceExprOp::inferHCTypes(ArrayRef<Type> operandTypes,

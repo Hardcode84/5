@@ -620,7 +620,8 @@ def HCSliceExprOp : HC_Op<"slice_expr",
   }];
 }
 
-def HCBufferViewOp : HC_Op<"buffer_view", [Pure]> {
+def HCBufferViewOp : HC_Op<"buffer_view",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Sub-view into a buffer or tensor (no data movement).";
   let description = [{
     Returns a view of the buffer-or-tensor root reduced by the variadic index/slice

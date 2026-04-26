@@ -116,6 +116,8 @@ mlir::FailureOr<PredHandle> importPred(Store &store, const ixs_node *foreign,
 mlir::FailureOr<ExprHandle>
 composeExprBinary(Store &store, ExprHandle lhs, ExprBinaryOp op, ExprHandle rhs,
                   std::string *diagnostic = nullptr);
+mlir::FailureOr<ExprHandle> composeExprCeil(Store &store, ExprHandle value,
+                                            std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
                                            std::string *diagnostic = nullptr);
 mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,

@@ -174,6 +174,42 @@ hc.func @loads(%buf: !hc.buffer<f32, ["M", "N"]>, %i: !hc.idx<"0">,
 
 // -----
 
+// CHECK-LABEL: hc.func @buffer_views
+// CHECK: hc.buffer_view {{.*}} -> !hc.buffer<f32, ["4", "N"]>
+// CHECK: hc.buffer_dim {{.*}} -> !hc.idx<"4">
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f16, ["16"]>
+// CHECK: hc.vec {{.*}} -> !hc.vector<f16, ["16"]>
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f16, ["8"]>
+hc.func @buffer_views(%buf: !hc.buffer<f32, ["M", "N"]>,
+                      %tensor: !hc.tensor<f16, ["16", "16"]>,
+                      %idx: !hc.idx<"3">)
+    -> (!hc.undef, !hc.undef, !hc.undef, !hc.undef) {
+  %zero = hc.const<0 : i64> : !hc.undef
+  %two = hc.const<2 : i64> : !hc.undef
+  %four = hc.const<4 : i64> : !hc.undef
+  %sixteen = hc.const<16 : i64> : !hc.undef
+  %head = hc.slice_expr(lower = %zero upper = %four)
+      : (!hc.undef, !hc.undef) -> !hc.undef
+  %full = hc.slice_expr() : () -> !hc.undef
+  %even_rows = hc.slice_expr(lower = %zero upper = %sixteen step = %two)
+      : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+  %buf_view = hc.buffer_view %buf[%head]
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.undef) -> !hc.undef
+  %dim = hc.buffer_dim %buf_view, axis = 0
+      : !hc.undef -> !hc.undef
+  %tensor_view = hc.buffer_view %tensor[%idx, %full]
+      : (!hc.tensor<f16, ["16", "16"]>, !hc.idx<"3">, !hc.undef)
+        -> !hc.undef
+  %vec = hc.vec %tensor_view : !hc.undef -> !hc.undef
+  %stepped = hc.buffer_view %tensor[%even_rows, %idx]
+      : (!hc.tensor<f16, ["16", "16"]>, !hc.undef, !hc.idx<"3">)
+        -> !hc.undef
+  hc.return %dim, %tensor_view, %vec, %stepped
+      : !hc.undef, !hc.undef, !hc.undef, !hc.undef
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @allocators
 // CHECK: hc.vzeros shape {{.*}}, dtype = f32 {{.*}} -> !hc.vector<f32, ["4", "8"]>
 // CHECK: hc.vfull {{.*}} -> !hc.vector<f32, ["4", "8"]>

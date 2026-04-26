@@ -429,6 +429,14 @@ def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> N
     assert "parameter_annotations" not in intrinsic_payload
 
 
+def test_lower_function_rejects_raw_intrinsic_type_contract_payloads() -> None:
+    @kernel.intrinsic(result_types=({"kind": "tensor"},))
+    def bad_contract(): ...
+
+    with pytest.raises(RuntimeError, match="unsupported HC intrinsic type spec"):
+        lower_function(bad_contract, RecordingEmitter())
+
+
 def test_lower_source_does_not_fabricate_toplevel_metadata() -> None:
     emitter = RecordingEmitter()
 

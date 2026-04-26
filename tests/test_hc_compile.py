@@ -363,6 +363,58 @@ def test_default_compile_schedule_verifies_static_shapes(tmp_path: Path) -> None
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+@pytest.mark.parametrize(
+    ("shape_source", "dtype_source", "diagnostic"),
+    [
+        ('"8"', "np.complex64", "unsupported dtype 'complex64'"),
+        ('"M +"', "np.float32", "failed to parse hc.shape dim 'M +'"),
+    ],
+)
+def test_compile_reports_invalid_intrinsic_type_contracts_from_python_metadata(
+    tmp_path: Path,
+    shape_source: str,
+    dtype_source: str,
+    diagnostic: str,
+) -> None:
+    script = tmp_path / "compile_bad_intrinsic_contract.py"
+    script.write_text(textwrap.dedent(f"""
+            import numpy as np
+
+            import hc
+            from hc import CurrentGroup, WorkItem, kernel, vector_type
+
+
+            @kernel.intrinsic(
+                scope=WorkItem,
+                result_types=(vector_type(({shape_source},), {dtype_source}),),
+            )
+            def bad_contract_intrinsic():
+                ...
+
+
+            @kernel(work_shape=(1,), group_shape=(1,))
+            def uses_bad_contract(group: CurrentGroup) -> None:
+                _ = bad_contract_intrinsic()
+
+
+            def main() -> None:
+                handle = hc.compile(uses_bad_contract)
+                assert handle.hc_ir is None, handle.hc_ir_text
+                assert handle.hc_ir_text is None
+                joined = "\\n".join(handle.pipeline_diagnostics)
+                assert {diagnostic!r} in joined, joined
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
     # A custom schedule that only runs `-convert-hc-front-to-hc` — no
     # fold/inline — must still produce valid hc IR for a kernel without

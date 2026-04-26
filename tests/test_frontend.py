@@ -378,7 +378,7 @@ def test_buffer_dtype_suffix_is_numpy_dtype_only() -> None:
     assert string_name.dtype is None
 
 
-def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> None:
+def test_lower_function_records_wmma_intrinsic_contract_metadata() -> None:
     emitter = RecordingEmitter()
 
     lower_function(wmma_gfx11, emitter)

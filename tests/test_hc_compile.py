@@ -554,9 +554,6 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
     # every load-context ``hc_front.name`` carries a ``ref`` attribute.
     # The real WMMA example is the richest fixture we have for this check.
     #
-    # We deliberately do not assert on ``handle.hc_ir`` here: WMMA still
-    # exercises lowering gaps that need dedicated pipeline snapshot coverage
-    # before this can gate the full compiler path on the heaviest example.
     script = tmp_path / "compile_wmma.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
@@ -581,6 +578,17 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     handle.front_ir_symbols
                 )
                 assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
+                assert handle.hc_ir is not None, handle.pipeline_diagnostics
+                assert handle.hc_ir_text is not None
+                assert (
+                    '!hc.vector<f32, ["8"]>, !hc.idx<"$WI0">) -> '
+                    '!hc.vector<f32, ["8"]>'
+                ) in handle.hc_ir_text
+                assert (
+                    'hc.buffer_view %arg3'
+                    in handle.hc_ir_text
+                    and ') -> !hc.vector<f32, ["8"]>' in handle.hc_ir_text
+                )
 
                 loads = re.findall(
                     r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',

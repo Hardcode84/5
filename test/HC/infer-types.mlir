@@ -213,22 +213,31 @@ hc.func @buffer_views(%buf: !hc.buffer<f32, ["M", "N"]>,
 // CHECK-LABEL: hc.func @vector_views
 // CHECK: hc.buffer_view {{.*}} -> f32
 // CHECK: hc.buffer_view {{.*}} -> !hc.vector<f32, ["4"]>
+// CHECK: hc.buffer_view {{.*}} -> !hc.vector<f32, ["8"]>
+// CHECK: hc.buffer_view {{.*}} -> f32
 // CHECK: hc.getitem {{.*}} -> f32
 hc.func @vector_views(%vector: !hc.vector<f32, ["8"]>,
                       %idx: !hc.idx<"3">)
-    -> (!hc.undef, !hc.undef, !hc.undef) {
+    -> (!hc.undef, !hc.undef, !hc.undef, !hc.undef, !hc.undef) {
   %zero = hc.const<0 : i64> : !hc.undef
   %four = hc.const<4 : i64> : !hc.undef
+  %lane = hc.const<7 : i64> : !hc.undef
   %head = hc.slice_expr(lower = %zero upper = %four)
       : (!hc.undef, !hc.undef) -> !hc.undef
+  %full = hc.slice_expr() : () -> !hc.undef
   %element = hc.buffer_view %vector[%idx]
       : (!hc.vector<f32, ["8"]>, !hc.idx<"3">) -> !hc.undef
   %fragment = hc.buffer_view %vector[%head]
       : (!hc.vector<f32, ["8"]>, !hc.undef) -> !hc.undef
+  %collective_fragment = hc.buffer_view %vector[%full, %lane, %full]
+      : (!hc.vector<f32, ["8"]>, !hc.undef, !hc.undef, !hc.undef)
+        -> !hc.undef
+  %collective_element = hc.buffer_view %vector[%idx, %lane]
+      : (!hc.vector<f32, ["8"]>, !hc.idx<"3">, !hc.undef) -> !hc.undef
   %item = hc.getitem %vector[%idx]
       : (!hc.vector<f32, ["8"]>, !hc.idx<"3">) -> !hc.undef
-  hc.return %element, %fragment, %item
-      : !hc.undef, !hc.undef, !hc.undef
+  hc.return %element, %fragment, %collective_fragment, %collective_element, %item
+      : !hc.undef, !hc.undef, !hc.undef, !hc.undef, !hc.undef
 }
 
 // -----

@@ -321,9 +321,21 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   ArrayRef<Attribute> baseDims = shape.getDims();
   SmallVector<Attribute> resultDims;
   unsigned axis = 0;
+  bool vectorRoot = isa<mlir::hc::VectorType>(sourceType);
   for (Type indexType : indexTypes) {
-    if (axis >= baseDims.size())
+    if (axis >= baseDims.size()) {
+      // Workitem/subgroup-lifted vectors carry collective suffix axes in
+      // syntax even though the vector type stores only the participant-local
+      // shape. Once local axes are consumed, typed suffix indices refine no
+      // local result dimensions.
+      if (!vectorRoot)
+        return currentResultType;
+      if (!indexType || isHCUndefType(indexType))
+        return currentResultType;
+      if (isa<SliceType, IdxType>(indexType) || indexType.isIntOrIndex())
+        continue;
       return currentResultType;
+    }
     auto baseDim = dyn_cast<ExprAttr>(baseDims[axis]);
     if (!baseDim)
       return currentResultType;
@@ -352,7 +364,7 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   if (isa<mlir::hc::BufferType>(sourceType))
     return Type(
         mlir::hc::BufferType::get(op->getContext(), elementType, resultShape));
-  if (isa<mlir::hc::VectorType>(sourceType)) {
+  if (vectorRoot) {
     if (resultDims.empty())
       return elementType;
     return Type(

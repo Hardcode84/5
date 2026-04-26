@@ -33,7 +33,7 @@
 // CHECK: hc.load %[[B]][%[[K_SLICE]], %[[B_COL]]], shape %{{.*}} : (!hc.buffer<f16, ["K", "N"]>, !hc.undef, !hc.undef, {{.*}}) -> !hc.undef
 // CHECK: hc.call @issue_wmma_tile(%[[GROUP]], {{.*}}) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.yield {{.*}} : !hc.undef, !hc.undef, !hc.undef
-// CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef, !hc.undef) -> ()
 
 // CHECK-LABEL: hc.func @init_wmma_acc
 // CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> !hc.undef
@@ -58,6 +58,7 @@
 // CHECK: hc.return {{.*}} : !hc.undef
 
 // CHECK-LABEL: hc.func @store_wmma_tile
+// CHECK-NOT: -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
 // CHECK: hc.workitem_region captures =
 // CHECK: hc.slice_expr(lower =

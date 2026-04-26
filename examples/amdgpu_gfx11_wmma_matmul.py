@@ -282,7 +282,7 @@ def issue_wmma_tile(group, a_tile, b_tile, acc):
 
 
 @kernel.func(scope=WorkGroup)
-def store_wmma_tile(group, c, row0, col0, acc):
+def store_wmma_tile(group, c, row0, col0, acc) -> None:
     @group.workitems
     def wave(wi):
         lane = wi.local_id()[0]

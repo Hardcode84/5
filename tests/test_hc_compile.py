@@ -589,6 +589,10 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     in handle.hc_ir_text
                     and ') -> !hc.vector<f32, ["8"]>' in handle.hc_ir_text
                 )
+                assert re.search(
+                    r"hc\\.call @store_wmma_tile\\([^\\n]+\\) -> \\(\\)",
+                    handle.hc_ir_text,
+                )
 
                 loads = re.findall(
                     r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',

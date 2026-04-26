@@ -285,6 +285,25 @@ FailureOr<ExprAttr> stringToExpr(Operation *sourceOp, StringAttr text,
   return ExprAttr::get(ctx, *handle);
 }
 
+static bool declaresNoneReturn(Operation *op) {
+  auto returns = op->getAttrOfType<StringAttr>("returns");
+  return returns && returns.getValue() == "None";
+}
+
+static bool unresolvedFrontFuncDeclaresNoResults(Operation *anchor,
+                                                 StringRef callee) {
+  ModuleOp module = anchor->getParentOfType<ModuleOp>();
+  if (!module)
+    return false;
+
+  for (Operation &op : *module.getBody()) {
+    auto func = dyn_cast<hc_front::FuncOp>(&op);
+    if (func && func.getName() == callee)
+      return declaresNoneReturn(&op);
+  }
+  return false;
+}
+
 // The front-end emits `effects = "pure"` / `"read"` / `"write"` /
 // `"read_write"` as a plain string. Translate into the typed `HC_EffectsAttr`
 // that `hc.func` / `hc.intrinsic` want.
@@ -1069,7 +1088,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
 
   if (auto func = dyn_cast<hc_front::FuncOp>(frontOp)) {
     return runBody(
-        params, /*returnsValue=*/true,
+        params, /*returnsValue=*/!declaresNoneReturn(frontOp),
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcFunc = HCFuncOp::create(
               builder, loc, StringAttr::get(ctx, func.getName()),
@@ -2220,13 +2239,26 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
       callee = callee.drop_front();
     auto symRef = FlatSymbolRefAttr::get(op.getContext(), callee);
 
-    // `hc` calls carry a single result (pre-inference = `!hc.undef`); if a
-    // downstream multi-assign wants more, the assign pattern detects it
-    // from the RHS op and distributes. `hc.call_intrinsic` additionally
-    // promotes `const_kwargs` into attributes on the op.
+    // `hc` calls usually carry one progressive-typing result. Helpers annotated
+    // `-> None` are side-effect only, so their call sites carry no result.
     if (kind == "callee") {
-      auto call = HCCallOp::create(builder, op.getLoc(), TypeRange{undef},
-                                   symRef, args.positional);
+      SmallVector<Type> resultTypes;
+      if (auto decl = SymbolTable::lookupNearestSymbolFrom<HCFuncOp>(
+              op.getOperation(), symRef)) {
+        if (std::optional<FunctionType> fnType = decl.getFunctionType()) {
+          resultTypes.assign(fnType->getResults().begin(),
+                             fnType->getResults().end());
+        } else {
+          resultTypes.push_back(undef);
+        }
+      } else if (!unresolvedFrontFuncDeclaresNoResults(op.getOperation(),
+                                                       callee)) {
+        resultTypes.push_back(undef);
+      }
+      auto call = HCCallOp::create(builder, op.getLoc(), resultTypes, symRef,
+                                   args.positional);
+      if (call->getNumResults() == 0)
+        return Value();
       return call.getResult(0);
     }
 

@@ -216,30 +216,26 @@ static LogicalResult inferIndexCmp(ArrayRef<Type> operands,
   return success();
 }
 
-static ShapeAttr getShapeAttrFromBuffer(Type type) {
-  if (auto buffer = dyn_cast_or_null<mlir::hc::BufferType>(type))
-    return buffer.getShape();
+static ShapeAttr getSymbolicShape(Type type) {
+  if (auto shaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(type))
+    return shaped.getSymbolicShape();
   return {};
 }
 
-static ShapeAttr getShapeAttrFromBufferOrTensor(Type type) {
-  if (auto buffer = dyn_cast_or_null<mlir::hc::BufferType>(type))
-    return buffer.getShape();
-  if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(type))
-    return tensor.getShape();
+static Type getSymbolicElementType(Type type) {
+  if (auto shaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(type))
+    return shaped.getSymbolicElementType();
   return {};
 }
 
-static Type getElementTypeFromBufferOrTensor(Type type) {
-  if (auto buffer = dyn_cast_or_null<mlir::hc::BufferType>(type))
-    return buffer.getElementType();
-  if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(type))
-    return tensor.getElementType();
-  return {};
+static Type getShapedValueElementType(Type type) {
+  if (!isa<mlir::hc::TensorType, mlir::hc::VectorType>(type))
+    return {};
+  return getSymbolicElementType(type);
 }
 
 static Type inferBufferDim(Type bufferType, int64_t axis, Operation *op) {
-  ShapeAttr shape = getShapeAttrFromBuffer(bufferType);
+  ShapeAttr shape = getSymbolicShape(bufferType);
   if (!shape || axis < 0 ||
       axis >= static_cast<int64_t>(shape.getDims().size()))
     return getUnpinnedIdxType(op->getContext());
@@ -338,8 +334,8 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
     return currentResultType;
   }
 
-  Type elementType = getElementTypeFromBufferOrTensor(sourceType);
-  ShapeAttr shape = getShapeAttrFromBufferOrTensor(sourceType);
+  Type elementType = getSymbolicElementType(sourceType);
+  ShapeAttr shape = getSymbolicShape(sourceType);
   if (!elementType || !shape)
     return currentResultType;
 
@@ -386,11 +382,7 @@ static Type inferLoadLikeResult(Type sourceType, Type shapeType,
   ShapeAttr shape = shapeFromTupleType(shapeType, op);
   if (!shape || !sourceType)
     return {};
-  Type elementType;
-  if (auto buffer = dyn_cast<mlir::hc::BufferType>(sourceType))
-    elementType = buffer.getElementType();
-  else if (auto tensor = dyn_cast<mlir::hc::TensorType>(sourceType))
-    elementType = tensor.getElementType();
+  Type elementType = getSymbolicElementType(sourceType);
   if (!elementType)
     return {};
   return vectorResult ? Type(mlir::hc::VectorType::get(op->getContext(),
@@ -399,21 +391,13 @@ static Type inferLoadLikeResult(Type sourceType, Type shapeType,
                                                        elementType, shape));
 }
 
-static Type shapedElementType(Type type) {
-  if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(type))
-    return tensor.getElementType();
-  if (auto vector = dyn_cast_or_null<mlir::hc::VectorType>(type))
-    return vector.getElementType();
-  return {};
-}
-
 static Type inferAllocLikeResult(Type resultType, Type shapeType,
                                  TypeAttr dtype, Type fillType,
                                  bool vectorResult, Operation *op) {
   ShapeAttr shape = shapeFromTupleType(shapeType, op);
   if (!shape)
     return resultType;
-  Type elementType = shapedElementType(resultType);
+  Type elementType = getShapedValueElementType(resultType);
   if (!elementType && dtype)
     elementType = dtype.getValue();
   if (!elementType && fillType && !isHCUndefType(fillType))

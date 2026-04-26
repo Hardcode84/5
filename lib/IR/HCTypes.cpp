@@ -296,6 +296,9 @@ mlir::hc::BufferType::verify(function_ref<InFlightDiagnostic()> emitError,
 }
 
 ShapeAttr mlir::hc::BufferType::getSymbolicShape() const { return getShape(); }
+Type mlir::hc::BufferType::getSymbolicElementType() const {
+  return getElementType();
+}
 
 mlir::LogicalResult
 mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -307,6 +310,9 @@ mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
 }
 
 ShapeAttr mlir::hc::TensorType::getSymbolicShape() const { return getShape(); }
+Type mlir::hc::TensorType::getSymbolicElementType() const {
+  return getElementType();
+}
 
 mlir::LogicalResult
 mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -318,6 +324,9 @@ mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
 }
 
 ShapeAttr mlir::hc::VectorType::getSymbolicShape() const { return getShape(); }
+Type mlir::hc::VectorType::getSymbolicElementType() const {
+  return getElementType();
+}
 
 mlir::LogicalResult
 mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,

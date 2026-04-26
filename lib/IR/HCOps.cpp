@@ -956,20 +956,13 @@ LogicalResult HCIfOp::verify() {
   return success();
 }
 
-/// Extract a concrete shape attribute from a shaped `hc` type, or `nullptr`
-/// if the type does not (yet) carry one. Pre-inference IR is typically
-/// `!hc.undef`, in which case rank is unknown and axis range cannot be
-/// checked — later inference refines the type and picks up the check.
-///
-/// Fully-qualified `mlir::hc::{Buffer,Tensor,Vector}Type` are required to
-/// avoid colliding with MLIR's builtin `VectorType`/`TensorType`.
+/// Extract a concrete shape attribute from a symbolically shaped `hc` type, or
+/// `nullptr` if the type does not (yet) carry one. Pre-inference IR is
+/// typically `!hc.undef`, in which case rank is unknown and axis range cannot
+/// be checked — later inference refines the type and picks up the check.
 static ShapeAttr tryGetShape(Type t) {
-  if (auto buf = llvm::dyn_cast<mlir::hc::BufferType>(t))
-    return buf.getShape();
-  if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(t))
-    return tens.getShape();
-  if (auto vec = llvm::dyn_cast<mlir::hc::VectorType>(t))
-    return vec.getShape();
+  if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
+    return shaped.getSymbolicShape();
   return nullptr;
 }
 
@@ -1101,10 +1094,10 @@ LogicalResult HCAsTypeOp::verify() {
     return success();
   }
   auto elementOf = [](Type t) -> Type {
-    if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(t))
-      return tens.getElementType();
-    if (auto vec = llvm::dyn_cast<mlir::hc::VectorType>(t))
-      return vec.getElementType();
+    if (!llvm::isa<mlir::hc::TensorType, mlir::hc::VectorType>(t))
+      return {};
+    if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
+      return shaped.getSymbolicElementType();
     return {};
   };
   if (Type elem = elementOf(result)) {
@@ -1126,10 +1119,8 @@ LogicalResult HCWithInactiveOp::verify() {
   if (isHCUndefType(value))
     return success();
   Type elem;
-  if (auto tens = llvm::dyn_cast<mlir::hc::TensorType>(value))
-    elem = tens.getElementType();
-  else if (auto vec = llvm::dyn_cast<mlir::hc::VectorType>(value))
-    elem = vec.getElementType();
+  if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(value))
+    elem = shaped.getSymbolicElementType();
   if (!elem || isHCUndefType(elem))
     return success();
   Type inactive = getInactive().getType();

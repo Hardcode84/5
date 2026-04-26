@@ -97,4 +97,44 @@ def HCInferRegionArgTypeOpInterface :
   ];
 }
 
+def HCStaticShapeOpInterface : OpInterface<"HCStaticShapeOpInterface"> {
+  let description = [{
+    Contract for ops whose result shape is supplied by an SSA shape carrier.
+
+    The verifier pass owns the common policy: the carrier must resolve to a
+    tuple of pinned `!hc.idx<...>` dimensions, the shaped result must carry the
+    same static shape, and ops with an addressed source can expose that source
+    plus their index/slice operands for rank diagnostics. Individual ops only
+    describe where those pieces live.
+  }];
+  let cppNamespace = "::mlir::hc";
+  let methods = [
+    InterfaceMethod<
+      "Return the SSA value carrying the requested static shape.",
+      "::mlir::Value",
+      "getStaticShapeOperand"
+    >,
+    InterfaceMethod<
+      "Return the tensor/vector result type checked against the shape carrier.",
+      "::mlir::Type",
+      "getStaticShapedResultType"
+    >,
+    InterfaceMethod<
+      "Return true when the shaped result is expected to be `!hc.vector`.",
+      "bool",
+      "hasStaticVectorResult"
+    >,
+    InterfaceMethod<
+      "Return the addressed source operand, or null for allocator-like ops.",
+      "::mlir::Value",
+      "getStaticShapeSourceOperand"
+    >,
+    InterfaceMethod<
+      "Return index/slice operands addressing the source, if any.",
+      "::mlir::ValueRange",
+      "getStaticShapeIndexOperands"
+    >
+  ];
+}
+
 #endif // HC_IR_HCOPSINTERFACES

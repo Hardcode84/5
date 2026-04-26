@@ -1150,6 +1150,18 @@ LogicalResult HCWithInactiveOp::verify() {
   return success();
 }
 
+Value HCLoadOp::getStaticShapeOperand() { return getShape(); }
+Type HCLoadOp::getStaticShapedResultType() { return getResult().getType(); }
+bool HCLoadOp::hasStaticVectorResult() { return false; }
+Value HCLoadOp::getStaticShapeSourceOperand() { return getBuffer(); }
+ValueRange HCLoadOp::getStaticShapeIndexOperands() { return getIndices(); }
+
+Value HCVLoadOp::getStaticShapeOperand() { return getShape(); }
+Type HCVLoadOp::getStaticShapedResultType() { return getResult().getType(); }
+bool HCVLoadOp::hasStaticVectorResult() { return true; }
+Value HCVLoadOp::getStaticShapeSourceOperand() { return getSource(); }
+ValueRange HCVLoadOp::getStaticShapeIndexOperands() { return getIndices(); }
+
 LogicalResult HCZerosOp::verify() { return verifyTensorAllocScope(*this); }
 LogicalResult HCOnesOp::verify() { return verifyTensorAllocScope(*this); }
 LogicalResult HCFullOp::verify() { return verifyTensorAllocScope(*this); }

@@ -5,6 +5,7 @@
 add_mlir_library(MLIRHCTransforms
   HCInferTypesPass.cpp
   HCPromoteNamesPass.cpp
+  HCVerifyStaticShapesPass.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/hc/Transforms

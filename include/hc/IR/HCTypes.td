@@ -78,7 +78,8 @@ def HC_SliceType : HC_Type<"Slice", "slice",
   let hasCustomAssemblyFormat = 1;
 }
 
-def HC_BufferType : HC_Type<"Buffer", "buffer"> {
+def HC_BufferType : HC_Type<"Buffer", "buffer",
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
   let summary = "Semantic buffer type";
   let description = [{
     Initial semantic buffer type carrying an element type and a shape
@@ -95,7 +96,8 @@ def HC_BufferType : HC_Type<"Buffer", "buffer"> {
   let genVerifyDecl = 1;
 }
 
-def HC_TensorType : HC_Type<"Tensor", "tensor"> {
+def HC_TensorType : HC_Type<"Tensor", "tensor",
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
   let summary = "Semantic tensor type";
   let description = [{
     Initial semantic tensor type carrying an element type and a symbolic shape
@@ -110,7 +112,8 @@ def HC_TensorType : HC_Type<"Tensor", "tensor"> {
   let genVerifyDecl = 1;
 }
 
-def HC_VectorType : HC_Type<"Vector", "vector"> {
+def HC_VectorType : HC_Type<"Vector", "vector",
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
   let summary = "Semantic vector type";
   let description = [{
     Immutable fixed-size vector value. Carries an element type and a symbolic

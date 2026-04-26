@@ -662,7 +662,8 @@ def HCGetItemOp : HC_Op<"getitem",
 
 def HCLoadOp : HC_Op<"load",
     [MemoryEffects<[MemRead]>,
-     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>,
+     DeclareOpInterfaceMethods<HCStaticShapeOpInterface>]> {
   let summary = "Buffer -> tensor load.";
   let description = [{
     Materializes a tensor from a buffer at a variadic subscript. The result
@@ -685,7 +686,8 @@ def HCLoadOp : HC_Op<"load",
 
 def HCVLoadOp : HC_Op<"vload",
     [MemoryEffects<[MemRead]>,
-     DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>,
+     DeclareOpInterfaceMethods<HCStaticShapeOpInterface>]> {
   let summary = "Buffer or tensor -> vector load.";
   let description = [{
     Vector counterpart of `hc.load`; same SSA shape carrier and `MemRead`
@@ -779,10 +781,11 @@ def HCAsLayoutOp : HC_Op<"as_layout",
 // `shape=` kwargs do not need a dialect-side attribute escape hatch.
 //===----------------------------------------------------------------------===//
 
-class HC_NullaryShapedAllocOp<string mnemonic>
+class HC_NullaryShapedAllocOp<string mnemonic, bit vectorResult>
     : HC_Op<mnemonic, [
         MemoryEffects<[MemAlloc]>,
-        DeclareOpInterfaceMethods<HCInferTypeOpInterface>
+        DeclareOpInterfaceMethods<HCInferTypeOpInterface>,
+        HCStaticShapeOpInterface
       ]> {
   let arguments = (ins
     HC_TupleValueType:$shape,
@@ -793,12 +796,22 @@ class HC_NullaryShapedAllocOp<string mnemonic>
     `shape` $shape (`,` `dtype` `=` $dtype^)? attr-dict `:`
     functional-type(operands, results)
   }];
+  // Allocator shape carriers all have the same layout; keep their static-shape
+  // interface hooks on the shared ODS base instead of repeating per mnemonic.
+  let extraClassDeclaration = [{
+    ::mlir::Value getStaticShapeOperand() { return getShape(); }
+    ::mlir::Type getStaticShapedResultType() { return getResult().getType(); }
+    bool hasStaticVectorResult() { return }] # !if(vectorResult, "true", "false") # [{; }
+    ::mlir::Value getStaticShapeSourceOperand() { return {}; }
+    ::mlir::ValueRange getStaticShapeIndexOperands() { return {}; }
+  }];
 }
 
-class HC_FillShapedAllocOp<string mnemonic>
+class HC_FillShapedAllocOp<string mnemonic, bit vectorResult>
     : HC_Op<mnemonic, [
         MemoryEffects<[MemAlloc]>,
-        DeclareOpInterfaceMethods<HCInferTypeOpInterface>
+        DeclareOpInterfaceMethods<HCInferTypeOpInterface>,
+        HCStaticShapeOpInterface
       ]> {
   let arguments = (ins
     HC_ValueType:$value,
@@ -810,36 +823,45 @@ class HC_FillShapedAllocOp<string mnemonic>
     $value `,` `shape` $shape (`,` `dtype` `=` $dtype^)? attr-dict `:`
     functional-type(operands, results)
   }];
+  // Fill allocators share the same shape contract as nullary allocators; only
+  // the leading fill value differs.
+  let extraClassDeclaration = [{
+    ::mlir::Value getStaticShapeOperand() { return getShape(); }
+    ::mlir::Type getStaticShapedResultType() { return getResult().getType(); }
+    bool hasStaticVectorResult() { return }] # !if(vectorResult, "true", "false") # [{; }
+    ::mlir::Value getStaticShapeSourceOperand() { return {}; }
+    ::mlir::ValueRange getStaticShapeIndexOperands() { return {}; }
+  }];
 }
 
-def HCVZerosOp : HC_NullaryShapedAllocOp<"vzeros"> {
+def HCVZerosOp : HC_NullaryShapedAllocOp<"vzeros", 1> {
   let summary = "Zero-initialized vector.";
 }
 
-def HCVOnesOp : HC_NullaryShapedAllocOp<"vones"> {
+def HCVOnesOp : HC_NullaryShapedAllocOp<"vones", 1> {
   let summary = "Ones-initialized vector.";
 }
 
-def HCVFullOp : HC_FillShapedAllocOp<"vfull"> {
+def HCVFullOp : HC_FillShapedAllocOp<"vfull", 1> {
   let summary = "Vector filled with a scalar value.";
 }
 
-def HCZerosOp : HC_NullaryShapedAllocOp<"zeros"> {
+def HCZerosOp : HC_NullaryShapedAllocOp<"zeros", 0> {
   let summary = "Zero-initialized tensor (workgroup scope).";
   let hasVerifier = 1;
 }
 
-def HCOnesOp : HC_NullaryShapedAllocOp<"ones"> {
+def HCOnesOp : HC_NullaryShapedAllocOp<"ones", 0> {
   let summary = "Ones-initialized tensor (workgroup scope).";
   let hasVerifier = 1;
 }
 
-def HCFullOp : HC_FillShapedAllocOp<"full"> {
+def HCFullOp : HC_FillShapedAllocOp<"full", 0> {
   let summary = "Tensor filled with a scalar value (workgroup scope).";
   let hasVerifier = 1;
 }
 
-def HCEmptyOp : HC_NullaryShapedAllocOp<"empty"> {
+def HCEmptyOp : HC_NullaryShapedAllocOp<"empty", 0> {
   let summary = "Uninitialized tensor (workgroup scope).";
   let hasVerifier = 1;
 }

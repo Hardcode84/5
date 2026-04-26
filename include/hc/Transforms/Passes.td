@@ -62,4 +62,16 @@ def HCInferTypes : Pass<"hc-infer-types", "::mlir::ModuleOp"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
+  let summary = "Verify SSA shape operands have static HC shape metadata.";
+  let description = [{
+    Checks `hc.load`, `hc.vload`, and shaped allocator ops after type
+    inference. Shape operands must be tuple values whose element types are
+    pinned `!hc.idx<...>` dimensions, and the resulting tensor/vector type must
+    carry the same static shape. Load-like ops also require a statically-ranked
+    source and index/slice operands whose arity stays within that source rank.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 #endif // HC_TRANSFORMS_PASSES

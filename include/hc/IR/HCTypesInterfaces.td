@@ -27,4 +27,22 @@ def HCJoinableTypeInterface : TypeInterface<"HCJoinableTypeInterface"> {
   ];
 }
 
+def SymbolicallyShapedTypeInterface
+    : TypeInterface<"SymbolicallyShapedTypeInterface"> {
+  let description = [{
+    Type-local hook for HC types that carry symbolic shape metadata.
+
+    Consumers that only need rank/dimension expressions should depend on this
+    interface instead of enumerating buffer/tensor/vector shells.
+  }];
+  let cppNamespace = "::mlir::hc";
+  let methods = [
+    InterfaceMethod<
+      "Return the symbolic shape carried by this type.",
+      "::mlir::hc::ShapeAttr",
+      "getSymbolicShape"
+    >
+  ];
+}
+
 #endif // HC_IR_HCTYPESINTERFACES

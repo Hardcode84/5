@@ -22,7 +22,7 @@ import textwrap
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import singledispatchmethod
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 __all__ = [
     "FrontendEmitError",
@@ -1271,7 +1271,7 @@ def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
             "shape": tuple(str(dim) for dim in value.dimensions),
         }
         if value.dtype is not None:
-            record["dtype"] = _dtype_annotation_name(value.dtype)
+            record["dtype"] = value.dtype
         return record
     if value is CurrentGroup:
         return {"kind": "launch_context", "launch_context": "group"}
@@ -1286,12 +1286,6 @@ def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
         if dtype is not None:
             return {"kind": "scalar", "dtype": dtype}
     return None
-
-
-def _dtype_annotation_name(value: Any) -> str:
-    import numpy as np
-
-    return cast(str, np.dtype(value).name)
 
 
 def _region_payload(

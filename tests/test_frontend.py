@@ -361,6 +361,23 @@ def test_lower_function_records_buffer_dtype_annotations() -> None:
     }
 
 
+def test_buffer_dtype_suffix_is_numpy_dtype_only() -> None:
+    scalar_type = Buffer[4, np.float32]
+    dtype_object = Buffer[4, np.dtype(np.float16)]
+    builtin_type = Buffer[4, float]
+    string_name = Buffer[4, "float32"]
+
+    assert scalar_type.dimensions == (4,)
+    assert scalar_type.dtype == "float32"
+    assert repr(scalar_type) == "Buffer[4, float32]"
+    assert dtype_object.dimensions == (4,)
+    assert dtype_object.dtype == "float16"
+    assert builtin_type.dimensions == (4, float)
+    assert builtin_type.dtype is None
+    assert string_name.dimensions == (4, "float32")
+    assert string_name.dtype is None
+
+
 def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> None:
     emitter = RecordingEmitter()
 

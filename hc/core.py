@@ -17,13 +17,12 @@ from typing import Any, Protocol, cast
 @dataclass(frozen=True)
 class BufferSpec:
     dimensions: tuple[Any, ...]
-    dtype: Any = None
+    dtype: str | None = None
 
     def __repr__(self) -> str:
         parts = [str(dim) for dim in self.dimensions]
         if self.dtype is not None:
-            name = getattr(self.dtype, "__name__", None)
-            parts.append(str(name if isinstance(name, str) else self.dtype))
+            parts.append(self.dtype)
         body = ", ".join(parts)
         return f"Buffer[{body}]"
 
@@ -32,23 +31,21 @@ class Buffer:
     def __class_getitem__(cls, item: Any) -> BufferSpec:
         if not isinstance(item, tuple):
             item = (item,)
-        dtype = None
-        if len(item) >= 2 and _is_dtype_spec(item[-1]):
-            *dims, dtype = item
+        dtype = _buffer_dtype_annotation_name(item[-1]) if len(item) >= 2 else None
+        if dtype is not None:
+            dims = item[:-1]
             item = tuple(dims)
         return BufferSpec(item, dtype=dtype)
 
 
-def _is_dtype_spec(value: Any) -> bool:
-    if value is None or isinstance(value, str):
-        return False
-    try:
-        import numpy as np
+def _buffer_dtype_annotation_name(value: Any) -> str | None:
+    import numpy as np
 
-        np.dtype(value)
-    except (TypeError, ValueError):
-        return False
-    return True
+    if isinstance(value, np.dtype):
+        return str(value.name)
+    if isinstance(value, type) and issubclass(value, np.generic):
+        return str(np.dtype(value).name)
+    return None
 
 
 @dataclass(frozen=True)

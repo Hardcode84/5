@@ -167,7 +167,8 @@ def f(group: CurrentGroup,
     ...
 ```
 
-The optional final argument may be a NumPy dtype object:
+The optional final argument may be a NumPy scalar dtype type or `np.dtype`
+instance:
 ```python
 def f(group: CurrentGroup,
       a: Buffer[M, K, np.float16],
@@ -181,9 +182,9 @@ calls infer element types before looking at concrete runtime arrays. If the
 dtype is omitted, the source-level annotation only constrains shape; compiled IR
 keeps the buffer element type unknown until another contract refines it.
 
-The dtype must name a supported NumPy scalar dtype. String values are not
-interpreted as dtype annotations, so string-like symbolic dimensions remain
-shape dimensions.
+The dtype must name a supported NumPy scalar dtype. Builtin Python scalar types
+such as `float`, and string values such as `"float32"`, are not interpreted as
+dtype annotations, so they remain shape dimensions.
 
 ### Symbols
 Symbols express equality relationships between kernel arguments and launch

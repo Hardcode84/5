@@ -24,8 +24,9 @@ static sym::Store &symbolStore(MLIRContext *ctx) {
 
 template <typename AttrT, typename HandleT,
           FailureOr<HandleT> (*Parse)(sym::Store &, StringRef, std::string *)>
-static FailureOr<AttrT> parseSymbolicAttr(MLIRContext *ctx, Twine text,
-                                          Operation *diagOp, StringRef kind) {
+static FailureOr<AttrT> parseSymbolicAttr(Twine text, Operation *diagOp,
+                                          StringRef kind) {
+  MLIRContext *ctx = diagOp->getContext();
   SmallString<64> storage;
   StringRef rendered = text.toStringRef(storage);
   std::string diag;
@@ -38,10 +39,9 @@ static FailureOr<AttrT> parseSymbolicAttr(MLIRContext *ctx, Twine text,
   return AttrT::get(ctx, *handle);
 }
 
-static FailureOr<ExprAttr> parseExprAttr(MLIRContext *ctx, Twine text,
-                                         Operation *diagOp) {
+static FailureOr<ExprAttr> parseExprAttr(Twine text, Operation *diagOp) {
   return parseSymbolicAttr<ExprAttr, sym::ExprHandle, sym::parseExpr>(
-      ctx, text, diagOp, "expression");
+      text, diagOp, "expression");
 }
 
 static std::optional<ExprAttr> idxExprAttr(Type type) {
@@ -63,9 +63,9 @@ static LogicalResult emitComposeError(Operation *op, StringRef kind,
   return failure();
 }
 
-static FailureOr<ExprAttr> composeExprAttr(MLIRContext *ctx, ExprAttr lhs,
-                                           sym::ExprBinaryOp op, ExprAttr rhs,
-                                           Operation *diagOp) {
+static FailureOr<ExprAttr> composeExprAttr(ExprAttr lhs, sym::ExprBinaryOp op,
+                                           ExprAttr rhs, Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
   std::string diag;
   FailureOr<sym::ExprHandle> handle =
       sym::composeExprBinary(symbolStore(ctx), sym::ExprHandle(lhs.getNode()),
@@ -75,8 +75,9 @@ static FailureOr<ExprAttr> composeExprAttr(MLIRContext *ctx, ExprAttr lhs,
   return ExprAttr::get(ctx, *handle);
 }
 
-static FailureOr<ExprAttr> composeNegExprAttr(MLIRContext *ctx, ExprAttr value,
+static FailureOr<ExprAttr> composeNegExprAttr(ExprAttr value,
                                               Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
   std::string diag;
   FailureOr<sym::ExprHandle> handle = sym::composeExprNeg(
       symbolStore(ctx), sym::ExprHandle(value.getNode()), &diag);
@@ -85,8 +86,9 @@ static FailureOr<ExprAttr> composeNegExprAttr(MLIRContext *ctx, ExprAttr value,
   return ExprAttr::get(ctx, *handle);
 }
 
-static FailureOr<ExprAttr> composeCeilExprAttr(MLIRContext *ctx, ExprAttr value,
+static FailureOr<ExprAttr> composeCeilExprAttr(ExprAttr value,
                                                Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
   std::string diag;
   FailureOr<sym::ExprHandle> handle = sym::composeExprCeil(
       symbolStore(ctx), sym::ExprHandle(value.getNode()), &diag);
@@ -95,9 +97,9 @@ static FailureOr<ExprAttr> composeCeilExprAttr(MLIRContext *ctx, ExprAttr value,
   return ExprAttr::get(ctx, *handle);
 }
 
-static FailureOr<PredAttr> composePredAttr(MLIRContext *ctx, ExprAttr lhs,
-                                           sym::PredCmpOp op, ExprAttr rhs,
-                                           Operation *diagOp) {
+static FailureOr<PredAttr> composePredAttr(ExprAttr lhs, sym::PredCmpOp op,
+                                           ExprAttr rhs, Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
   std::string diag;
   FailureOr<sym::PredHandle> handle =
       sym::composePredCmp(symbolStore(ctx), sym::ExprHandle(lhs.getNode()), op,
@@ -110,7 +112,7 @@ static FailureOr<PredAttr> composePredAttr(MLIRContext *ctx, ExprAttr lhs,
 static FailureOr<Type> inferIntegerAttrAsIdx(IntegerAttr value, Operation *op) {
   SmallString<32> text;
   value.getValue().toStringSigned(text);
-  FailureOr<ExprAttr> expr = parseExprAttr(op->getContext(), text, op);
+  FailureOr<ExprAttr> expr = parseExprAttr(text, op);
   if (failed(expr))
     return failure();
   return Type(IdxType::get(op->getContext(), *expr));
@@ -157,8 +159,7 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
       resultTypes.push_back(getUnpinnedIdxType(op->getContext()));
       return success();
     }
-    FailureOr<ExprAttr> expr =
-        composeExprAttr(op->getContext(), *lhsExpr, opKind, *rhsExpr, op);
+    FailureOr<ExprAttr> expr = composeExprAttr(*lhsExpr, opKind, *rhsExpr, op);
     if (failed(expr))
       return failure();
     resultTypes.push_back(IdxType::get(op->getContext(), *expr));
@@ -200,7 +201,7 @@ static LogicalResult inferIndexCmp(ArrayRef<Type> operands,
       return success();
     }
     FailureOr<PredAttr> pred =
-        composePredAttr(op->getContext(), *lhsExpr, predKind, *rhsExpr, op);
+        composePredAttr(*lhsExpr, predKind, *rhsExpr, op);
     if (failed(pred))
       return failure();
     resultTypes.push_back(PredType::get(op->getContext(), *pred));
@@ -265,27 +266,26 @@ static ShapeAttr shapeFromTupleType(Type shapeType, Operation *op) {
   return ShapeAttr::get(op->getContext(), dims);
 }
 
-static FailureOr<ExprAttr> defaultZeroExpr(MLIRContext *ctx, Operation *op) {
-  return parseExprAttr(ctx, "0", op);
+static FailureOr<ExprAttr> defaultZeroExpr(Operation *op) {
+  return parseExprAttr("0", op);
 }
 
-static FailureOr<ExprAttr> defaultOneExpr(MLIRContext *ctx, Operation *op) {
-  return parseExprAttr(ctx, "1", op);
+static FailureOr<ExprAttr> defaultOneExpr(Operation *op) {
+  return parseExprAttr("1", op);
 }
 
-static FailureOr<ExprAttr> composeSubExprAttr(MLIRContext *ctx, ExprAttr lhs,
-                                              ExprAttr rhs, Operation *op) {
-  return composeExprAttr(ctx, lhs, sym::ExprBinaryOp::Sub, rhs, op);
+static FailureOr<ExprAttr> composeSubExprAttr(ExprAttr lhs, ExprAttr rhs,
+                                              Operation *op) {
+  return composeExprAttr(lhs, sym::ExprBinaryOp::Sub, rhs, op);
 }
 
-static FailureOr<ExprAttr> composeDivExprAttr(MLIRContext *ctx, ExprAttr lhs,
-                                              ExprAttr rhs, Operation *op) {
-  return composeExprAttr(ctx, lhs, sym::ExprBinaryOp::Div, rhs, op);
+static FailureOr<ExprAttr> composeDivExprAttr(ExprAttr lhs, ExprAttr rhs,
+                                              Operation *op) {
+  return composeExprAttr(lhs, sym::ExprBinaryOp::Div, rhs, op);
 }
 
 static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
                                              Operation *op) {
-  MLIRContext *ctx = op->getContext();
   Type lowerType = slice.getLowerType();
   Type upperType = slice.getUpperType();
   Type stepType = slice.getStepType();
@@ -302,28 +302,28 @@ static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
   if ((lowerType && !lower) || (upperType && !upper) || (stepType && !step))
     return failure();
 
-  FailureOr<ExprAttr> zero = defaultZeroExpr(ctx, op);
+  FailureOr<ExprAttr> zero = defaultZeroExpr(op);
   if (failed(zero))
     return failure();
   ExprAttr start = lower.value_or(*zero);
   ExprAttr stop = upper.value_or(baseDim);
-  FailureOr<ExprAttr> extent = composeSubExprAttr(ctx, stop, start, op);
+  FailureOr<ExprAttr> extent = composeSubExprAttr(stop, start, op);
   if (failed(extent))
     return failure();
 
   if (!stepType)
     return *extent;
 
-  FailureOr<ExprAttr> one = defaultOneExpr(ctx, op);
+  FailureOr<ExprAttr> one = defaultOneExpr(op);
   if (failed(one))
     return failure();
   if (*step == *one)
     return *extent;
 
-  FailureOr<ExprAttr> scaled = composeDivExprAttr(ctx, *extent, *step, op);
+  FailureOr<ExprAttr> scaled = composeDivExprAttr(*extent, *step, op);
   if (failed(scaled))
     return failure();
-  return composeCeilExprAttr(ctx, *scaled, op);
+  return composeCeilExprAttr(*scaled, op);
 }
 
 static FailureOr<Type> inferBufferViewResult(Type sourceType,
@@ -485,12 +485,12 @@ static bool allResultsAreUndef(Operation *op) {
                       [](Type type) { return isa<UndefType>(type); });
 }
 
-static LogicalResult appendPrefixedIdxTypes(MLIRContext *ctx, Operation *op,
-                                            StringRef prefix, unsigned count,
+static LogicalResult appendPrefixedIdxTypes(Operation *op, StringRef prefix,
+                                            unsigned count,
                                             SmallVectorImpl<Type> &types) {
+  MLIRContext *ctx = op->getContext();
   for (unsigned axis = 0; axis < count; ++axis) {
-    FailureOr<ExprAttr> expr =
-        parseExprAttr(ctx, Twine(prefix) + Twine(axis), op);
+    FailureOr<ExprAttr> expr = parseExprAttr(Twine(prefix) + Twine(axis), op);
     if (failed(expr))
       return failure();
     types.push_back(IdxType::get(ctx, *expr));
@@ -498,12 +498,12 @@ static LogicalResult appendPrefixedIdxTypes(MLIRContext *ctx, Operation *op,
   return success();
 }
 
-static LogicalResult appendLaunchAxisIdxTypes(MLIRContext *ctx, Operation *op,
+static LogicalResult appendLaunchAxisIdxTypes(Operation *op,
                                               LaunchGeoMethod method,
                                               unsigned count,
                                               SmallVectorImpl<Type> &types) {
-  return appendPrefixedIdxTypes(
-      ctx, op, getLaunchGeoMethodInfo(method).symbolPrefix, count, types);
+  return appendPrefixedIdxTypes(op, getLaunchGeoMethodInfo(method).symbolPrefix,
+                                count, types);
 }
 
 static void appendShapeIdxTypes(MLIRContext *ctx, ShapeAttr shape,
@@ -519,12 +519,12 @@ static void appendShapeIdxTypes(MLIRContext *ctx, ShapeAttr shape,
   }
 }
 
-static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
-                                     Operation *op) {
+static FailureOr<Type> groupSizeType(ShapeAttr shape, Operation *op) {
+  MLIRContext *ctx = op->getContext();
   if (!shape)
     return Type(getUnpinnedIdxType(ctx));
   if (shape.getDims().empty()) {
-    FailureOr<ExprAttr> one = parseExprAttr(ctx, "1", op);
+    FailureOr<ExprAttr> one = parseExprAttr("1", op);
     if (failed(one))
       return failure();
     return Type(IdxType::get(ctx, *one));
@@ -539,7 +539,7 @@ static FailureOr<Type> groupSizeType(MLIRContext *ctx, ShapeAttr shape,
     if (!expr)
       return Type(getUnpinnedIdxType(ctx));
     FailureOr<ExprAttr> next =
-        composeExprAttr(ctx, product, sym::ExprBinaryOp::Mul, expr, op);
+        composeExprAttr(product, sym::ExprBinaryOp::Mul, expr, op);
     if (failed(next))
       return failure();
     product = *next;
@@ -562,17 +562,17 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
   Operation *raw = op.getOperation();
   unsigned count = op->getNumResults();
   if (isa<HCGroupIdOp>(raw))
-    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::GroupId, count,
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::GroupId, count,
                                     types);
   if (isa<HCLocalIdOp>(raw))
-    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::LocalId, count,
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::LocalId, count,
                                     types);
   if (isa<HCSubgroupIdOp>(raw))
-    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::SubgroupId,
-                                    count, types);
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::SubgroupId, count,
+                                    types);
   if (isa<HCWorkOffsetOp>(raw))
-    return appendLaunchAxisIdxTypes(ctx, raw, LaunchGeoMethod::WorkOffset,
-                                    count, types);
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::WorkOffset, count,
+                                    types);
   if (isa<HCGroupShapeOp>(raw)) {
     appendShapeIdxTypes(ctx, metadata->groupShape, count, types);
     return success();
@@ -582,7 +582,7 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
     return success();
   }
   if (isa<HCGroupSizeOp>(raw)) {
-    FailureOr<Type> type = groupSizeType(ctx, metadata->groupShape, raw);
+    FailureOr<Type> type = groupSizeType(metadata->groupShape, raw);
     if (failed(type))
       return failure();
     types.push_back(*type);
@@ -675,7 +675,7 @@ LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
     return success();
   }
   if (std::optional<ExprAttr> expr = idxExprAttr(value)) {
-    FailureOr<ExprAttr> neg = composeNegExprAttr(getContext(), *expr, *this);
+    FailureOr<ExprAttr> neg = composeNegExprAttr(*expr, *this);
     if (failed(neg))
       return failure();
     resultTypes.push_back(IdxType::get(getContext(), *neg));

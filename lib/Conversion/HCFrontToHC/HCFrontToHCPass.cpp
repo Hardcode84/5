@@ -244,8 +244,8 @@ private:
 // `hc_front` uses for `work_shape` / `group_shape`) into a `#hc.shape<...>`
 // attribute. Returns null on a malformed dimension so the caller can emit a
 // diagnostic against the source op.
-FailureOr<ShapeAttr> stringArrayToShape(MLIRContext *ctx, Operation *sourceOp,
-                                        ArrayAttr array) {
+FailureOr<ShapeAttr> stringArrayToShape(Operation *sourceOp, ArrayAttr array) {
+  MLIRContext *ctx = sourceOp->getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   SmallVector<Attribute> dims;
   dims.reserve(array.size());
@@ -504,11 +504,11 @@ struct LaunchMetadata {
   ExprAttr subgroupSize;
 };
 
-static FailureOr<ExprAttr> subgroupSizeToExprAttr(MLIRContext *ctx,
-                                                  Operation *sourceOp,
+static FailureOr<ExprAttr> subgroupSizeToExprAttr(Operation *sourceOp,
                                                   IntegerAttr attr) {
   if (!attr)
     return ExprAttr();
+  MLIRContext *ctx = sourceOp->getContext();
   SmallString<32> text;
   attr.getValue().toStringSigned(text);
   std::string diagnostic;
@@ -523,24 +523,22 @@ static FailureOr<ExprAttr> subgroupSizeToExprAttr(MLIRContext *ctx,
 }
 
 static FailureOr<LaunchMetadata>
-parseLaunchMetadata(MLIRContext *ctx, Operation *sourceOp,
-                    LaunchMetadataAttrs attrs) {
+parseLaunchMetadata(Operation *sourceOp, LaunchMetadataAttrs attrs) {
   LaunchMetadata metadata;
   FailureOr<ExprAttr> subgroupSize =
-      subgroupSizeToExprAttr(ctx, sourceOp, attrs.subgroupSize);
+      subgroupSizeToExprAttr(sourceOp, attrs.subgroupSize);
   if (failed(subgroupSize))
     return failure();
   metadata.subgroupSize = *subgroupSize;
   if (attrs.workShape) {
-    FailureOr<ShapeAttr> parsed =
-        stringArrayToShape(ctx, sourceOp, attrs.workShape);
+    FailureOr<ShapeAttr> parsed = stringArrayToShape(sourceOp, attrs.workShape);
     if (failed(parsed))
       return failure();
     metadata.workShape = *parsed;
   }
   if (attrs.groupShape) {
     FailureOr<ShapeAttr> parsed =
-        stringArrayToShape(ctx, sourceOp, attrs.groupShape);
+        stringArrayToShape(sourceOp, attrs.groupShape);
     if (failed(parsed))
       return failure();
     metadata.groupShape = *parsed;
@@ -591,9 +589,11 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
   return success();
 }
 
-static FailureOr<Type> parameterTypeFromDict(
-    MLIRContext *ctx, Operation *sourceOp, DictionaryAttr param, Type fallback,
-    LaunchMetadataAttrs defaultLaunchMetadata, unsigned paramIndex) {
+static FailureOr<Type>
+parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
+                      LaunchMetadataAttrs defaultLaunchMetadata,
+                      unsigned paramIndex) {
+  MLIRContext *ctx = sourceOp->getContext();
   auto kind = param.getAs<StringAttr>("kind");
   auto shapeAttr = param.getAs<ArrayAttr>("shape");
   auto name = param.getAs<StringAttr>("name");
@@ -611,7 +611,7 @@ static FailureOr<Type> parameterTypeFromDict(
                                               *launchContext, expected)))
       return failure();
     FailureOr<LaunchMetadata> metadata =
-        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
+        parseLaunchMetadata(sourceOp, metadataAttrs);
     if (failed(metadata))
       return failure();
     if (*launchContext == "group")
@@ -634,7 +634,7 @@ static FailureOr<Type> parameterTypeFromDict(
   if (name.getValue() == "group" &&
       !getScopedLaunchContextParameterKind(sourceOp)) {
     FailureOr<LaunchMetadata> metadata =
-        parseLaunchMetadata(ctx, sourceOp, metadataAttrs);
+        parseLaunchMetadata(sourceOp, metadataAttrs);
     if (failed(metadata))
       return failure();
     return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
@@ -669,7 +669,7 @@ static FailureOr<Type> parameterTypeFromDict(
     elementType = *resolved;
   }
 
-  FailureOr<ShapeAttr> shape = stringArrayToShape(ctx, sourceOp, shapeAttr);
+  FailureOr<ShapeAttr> shape = stringArrayToShape(sourceOp, shapeAttr);
   if (failed(shape))
     return failure();
   return Type(BufferType::get(ctx, elementType, *shape));
@@ -939,7 +939,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
           // Shape-like metadata travels as string arrays in hc_front;
           // convert to `#hc.shape<...>` for typed downstream consumers.
           if (auto ws = frontOp->getAttrOfType<ArrayAttr>("work_shape")) {
-            auto shape = stringArrayToShape(ctx, frontOp, ws);
+            auto shape = stringArrayToShape(frontOp, ws);
             if (failed(shape)) {
               hcKernel->erase();
               return failure();
@@ -948,7 +948,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
             workRank = static_cast<unsigned>((*shape).getDims().size());
           }
           if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
-            auto shape = stringArrayToShape(ctx, frontOp, gs);
+            auto shape = stringArrayToShape(frontOp, gs);
             if (failed(shape)) {
               hcKernel->erase();
               return failure();
@@ -1096,7 +1096,7 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
     if (!name)
       return sourceOp->emitOpError("`parameters` entry missing `name` key");
     FailureOr<Type> paramType =
-        parameterTypeFromDict(ctx, sourceOp, dict, undef, defaultLaunchMetadata,
+        parameterTypeFromDict(sourceOp, dict, undef, defaultLaunchMetadata,
                               static_cast<unsigned>(inputs.size()));
     if (failed(paramType))
       return failure();

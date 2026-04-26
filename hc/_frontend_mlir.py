@@ -764,6 +764,46 @@ class HCFrontEmitter:
             self._set_optional_string_array_attr(
                 op, "const_kwargs", metadata["const_kwargs"]
             )
+        self._set_optional_type_contract_attr(
+            op, "operand_types", metadata.get("operand_types")
+        )
+        self._set_optional_type_contract_attr(
+            op, "result_types", metadata.get("result_types")
+        )
+
+    def _set_optional_type_contract_attr(
+        self,
+        op: Any,
+        name: str,
+        value: object,
+    ) -> None:
+        if value is None:
+            return
+        if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+            raise RuntimeError(f"frontend metadata '{name}' must be a sequence")
+        op.operation.attributes[name] = ir.ArrayAttr.get(
+            [self._type_contract_record_attr(item) for item in value],
+            context=self._context,
+        )
+
+    def _type_contract_record_attr(self, value: object) -> Any:
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"expected type contract record, got {value!r}")
+        entries: dict[str, Any] = {}
+        kind = value.get("kind")
+        if not isinstance(kind, str):
+            raise RuntimeError(f"type contract record missing string kind: {value!r}")
+        entries["kind"] = self._string_attr(kind)
+        shape = value.get("shape")
+        if shape is not None:
+            entries["shape"] = self._string_array_attr(self._string_sequence(shape))
+        dtype = value.get("dtype")
+        if isinstance(dtype, str):
+            entries["dtype"] = self._string_attr(dtype)
+        expr = value.get("expr")
+        if isinstance(expr, str):
+            entries["expr"] = self._string_attr(expr)
+        return ir.DictAttr.get(entries, context=self._context)
 
     def _set_optional_i32_attr(self, op: Any, name: str, value: object) -> None:
         # Symmetrical with sibling _set_optional_* helpers: loud on bad

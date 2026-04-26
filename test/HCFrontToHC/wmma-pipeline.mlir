@@ -80,7 +80,7 @@
 // CHECK: hc.with_inactive {{.*}}, %{{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 
 // CHECK-LABEL: hc.intrinsic @wmma_gfx11
-// CHECK-SAME: -> !hc.undef
+// CHECK-SAME: (%{{.*}}: !hc.undef, %{{.*}}: !hc.tensor<f16, ["16", "16"]>, %{{.*}}: !hc.tensor<f16, ["16", "16"]>, %{{.*}}: !hc.vector<f16, ["16"]>, %{{.*}}: !hc.vector<f16, ["16"]>, %{{.*}}: !hc.vector<f32, ["8"]>, %{{.*}}: !hc.idx) -> !hc.vector<f32, ["8"]>
 // CHECK-SAME: scope = <"WorkItem">
 // CHECK-SAME: effects = pure
 // CHECK-SAME: const_kwargs = ["arch", "wave_size"]

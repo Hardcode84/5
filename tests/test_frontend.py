@@ -389,6 +389,18 @@ def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> N
     assert metadata["scope"] == "WorkItem"
     assert metadata["effects"] == "pure"
     assert metadata["const_kwargs"] == ("arch", "wave_size")
+    assert metadata["operand_types"] == (
+        {"kind": "undef"},
+        {"kind": "tensor", "shape": ("16", "16"), "dtype": "float16"},
+        {"kind": "tensor", "shape": ("16", "16"), "dtype": "float16"},
+        {"kind": "vector", "shape": ("16",), "dtype": "float16"},
+        {"kind": "vector", "shape": ("16",), "dtype": "float16"},
+        {"kind": "vector", "shape": ("8",), "dtype": "float32"},
+        {"kind": "idx"},
+    )
+    assert metadata["result_types"] == (
+        {"kind": "vector", "shape": ("8",), "dtype": "float32"},
+    )
     assert tuple(name for name, *_ in intrinsic_payload["parameters"]) == (
         "group",
         "a_tile",

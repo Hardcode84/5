@@ -20,7 +20,16 @@ from build_tools.hc_native_tools import (
     export_hc_native_environment,
 )
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
-from hc import Buffer, CurrentGroup, WorkGroup, WorkItem, kernel, sym
+from hc import (
+    Buffer,
+    CurrentGroup,
+    WorkGroup,
+    WorkItem,
+    kernel,
+    sym,
+    undef_type,
+    vector_type,
+)
 from hc._frontend import (
     FrontendError,
     lower_function_to_front_ir,
@@ -93,6 +102,8 @@ def _metadata_helper(group: CurrentGroup, x: int) -> int:
     scope=WorkItem,
     effects="pure",
     const_attrs={"wave_size", "arch"},
+    operand_types=(undef_type(),),
+    result_types=(vector_type((8,), np.float32),),
 )
 def _metadata_intrinsic(group, *, wave_size, arch):  # pragma: no cover - metadata-only
     ...
@@ -323,6 +334,12 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
             "keyword_only",
             "keyword_only",
         ]
+        operand_types = intrinsic_op.attributes["operand_types"]
+        result_types = intrinsic_op.attributes["result_types"]
+        assert operand_types[0]["kind"].value == "undef"
+        assert result_types[0]["kind"].value == "vector"
+        assert _string_array_values(result_types[0]["shape"]) == ["8"]
+        assert result_types[0]["dtype"].value == "float32"
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

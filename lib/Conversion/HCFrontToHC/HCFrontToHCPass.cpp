@@ -270,6 +270,21 @@ FailureOr<ShapeAttr> stringArrayToShape(Operation *sourceOp, ArrayAttr array) {
   return ShapeAttr::get(ctx, dims);
 }
 
+FailureOr<ExprAttr> stringToExpr(Operation *sourceOp, StringAttr text,
+                                 StringRef attrName) {
+  MLIRContext *ctx = sourceOp->getContext();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle =
+      sym::parseExpr(store, text.getValue(), &diag);
+  if (failed(handle)) {
+    sourceOp->emitOpError("failed to parse ")
+        << attrName << " '" << text.getValue() << "': " << diag;
+    return failure();
+  }
+  return ExprAttr::get(ctx, *handle);
+}
+
 // The front-end emits `effects = "pure"` / `"read"` / `"write"` /
 // `"read_write"` as a plain string. Translate into the typed `HC_EffectsAttr`
 // that `hc.func` / `hc.intrinsic` want.
@@ -675,6 +690,75 @@ parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
   return Type(BufferType::get(ctx, elementType, *shape));
 }
 
+static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
+                                            DictionaryAttr record,
+                                            StringRef attrName,
+                                            unsigned index) {
+  MLIRContext *ctx = sourceOp->getContext();
+  auto kind = record.getAs<StringAttr>("kind");
+  if (!kind)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " missing string `kind`";
+  if (kind.getValue() == "undef")
+    return Type(UndefType::get(ctx));
+  if (kind.getValue() == "idx") {
+    if (auto expr = record.getAs<StringAttr>("expr")) {
+      FailureOr<ExprAttr> parsed = stringToExpr(sourceOp, expr, "idx expr");
+      if (failed(parsed))
+        return failure();
+      return Type(IdxType::get(ctx, *parsed));
+    }
+    return Type(IdxType::get(ctx, ExprAttr()));
+  }
+
+  bool isTensor = kind.getValue() == "tensor";
+  bool isVector = kind.getValue() == "vector";
+  if (!isTensor && !isVector)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " has unsupported kind '"
+           << kind.getValue() << "'";
+
+  auto dtype = record.getAs<StringAttr>("dtype");
+  if (!dtype)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " missing string `dtype`";
+  std::optional<Type> elementType =
+      resolveNumpyDtypeType(ctx, dtype.getValue());
+  if (!elementType)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " has unsupported dtype '"
+           << dtype.getValue() << "'";
+  auto shapeAttr = record.getAs<ArrayAttr>("shape");
+  if (!shapeAttr)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " missing `shape`";
+  FailureOr<ShapeAttr> shape = stringArrayToShape(sourceOp, shapeAttr);
+  if (failed(shape))
+    return failure();
+  if (isTensor)
+    return Type(::mlir::hc::TensorType::get(ctx, *elementType, *shape));
+  return Type(::mlir::hc::VectorType::get(ctx, *elementType, *shape));
+}
+
+static FailureOr<SmallVector<Type>> typesFromContractArray(Operation *sourceOp,
+                                                           ArrayAttr array,
+                                                           StringRef attrName) {
+  SmallVector<Type> types;
+  types.reserve(array.size());
+  for (auto [index, item] : llvm::enumerate(array)) {
+    auto record = dyn_cast<DictionaryAttr>(item);
+    if (!record)
+      return sourceOp->emitOpError("`") << attrName << "` entry #" << index
+                                        << " must be a dictionary attribute";
+    FailureOr<Type> type =
+        typeFromContractDict(sourceOp, record, attrName, index);
+    if (failed(type))
+      return failure();
+    types.push_back(*type);
+  }
+  return types;
+}
+
 //===----------------------------------------------------------------------===//
 // Lowerer. Instantiated once per top-level `hc_front` callable; walks the
 // body, threads the scope map through nested regions, and emits the
@@ -1029,10 +1113,33 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     // `hc.intrinsic` owns the const-kwarg filtering rule: its
     // `function_type` is the runtime operand signature, while
     // `parameters` keeps the full declared order for call-site kwarg
-    // binding. Intrinsics keep runtime operand types erased here because
-    // target-specific lowering validates and specializes their operands.
+    // binding. Python metadata may publish a typed contract; otherwise
+    // operands/results stay erased for target-specific validation.
     FunctionType fnType = getIntrinsicOperandFunctionType(
         *parameterNames, constKwargsAttr, TypeRange{undef}, undef);
+    if (auto operandTypesAttr =
+            frontOp->getAttrOfType<ArrayAttr>("operand_types")) {
+      FailureOr<SmallVector<Type>> operandTypes =
+          typesFromContractArray(frontOp, operandTypesAttr, "operand_types");
+      if (failed(operandTypes))
+        return failure();
+      if (operandTypes->size() != fnType.getNumInputs())
+        return frontOp->emitOpError("`operand_types` declares ")
+               << operandTypes->size()
+               << " type(s) but intrinsic runtime signature has "
+               << fnType.getNumInputs() << " SSA operand(s)";
+      SmallVector<Type> resultTypes(fnType.getResults().begin(),
+                                    fnType.getResults().end());
+      fnType = FunctionType::get(ctx, *operandTypes, resultTypes);
+    }
+    if (auto resultTypesAttr =
+            frontOp->getAttrOfType<ArrayAttr>("result_types")) {
+      FailureOr<SmallVector<Type>> resultTypes =
+          typesFromContractArray(frontOp, resultTypesAttr, "result_types");
+      if (failed(resultTypes))
+        return failure();
+      fnType = FunctionType::get(ctx, fnType.getInputs(), *resultTypes);
+    }
     ArrayAttr parameterNamesAttr = *parameterNames;
     ArrayAttr keywordOnlyParametersAttr = *keywordOnlyParameters;
     Block *entry = new Block();

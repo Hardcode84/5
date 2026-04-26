@@ -354,8 +354,9 @@ refine; folders dispatch on the concrete-type combinations they recognize.
   and an optional `effects = #hc.effects<...>`; its body region holds the
   fallback implementation (may be empty, in which case lowering patterns
   handle the op directly). Also a `Symbol`, with the same optional
-  `function_type` signature story as `hc.func`. An optional
-  `const_kwargs = ["wave_size", "arch", ...]` list declares specialization
+  `function_type` signature story as `hc.func`; the Python decorator may
+  publish this from explicit `operand_types` / `result_types` metadata. An
+  optional `const_kwargs = ["wave_size", "arch", ...]` list declares specialization
   attributes every `hc.call_intrinsic` must carry; missing entries fail at
   verify time. Extra attributes on the call site stay allowed so targets
   can attach their own decorations without modifying the declaration.

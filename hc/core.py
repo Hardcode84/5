@@ -8,7 +8,7 @@ import ast
 import dis
 import inspect
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from types import CodeType
 from typing import Any, Protocol, cast
@@ -25,6 +25,44 @@ class BufferSpec:
             parts.append(self.dtype)
         body = ", ".join(parts)
         return f"Buffer[{body}]"
+
+
+@dataclass(frozen=True)
+class TensorTypeSpec:
+    dimensions: tuple[Any, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class VectorTypeSpec:
+    dimensions: tuple[Any, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class IdxTypeSpec:
+    expr: Any = None
+
+
+@dataclass(frozen=True)
+class UndefTypeSpec:
+    pass
+
+
+def tensor_type(shape: Sequence[Any], dtype: Any) -> TensorTypeSpec:
+    return TensorTypeSpec(tuple(shape), _dtype_annotation_name(dtype))
+
+
+def vector_type(shape: Sequence[Any], dtype: Any) -> VectorTypeSpec:
+    return VectorTypeSpec(tuple(shape), _dtype_annotation_name(dtype))
+
+
+def idx_type(expr: Any = None) -> IdxTypeSpec:
+    return IdxTypeSpec(expr)
+
+
+def undef_type() -> UndefTypeSpec:
+    return UndefTypeSpec()
 
 
 class Buffer:
@@ -44,8 +82,14 @@ def _buffer_dtype_annotation_name(value: Any) -> str | None:
     if isinstance(value, np.dtype):
         return str(value.name)
     if isinstance(value, type) and issubclass(value, np.generic):
-        return str(np.dtype(value).name)
+        return _dtype_annotation_name(value)
     return None
+
+
+def _dtype_annotation_name(value: Any) -> str:
+    import numpy as np
+
+    return str(np.dtype(value).name)
 
 
 @dataclass(frozen=True)
@@ -115,6 +159,8 @@ class IntrinsicMetadata:
     scope: Any = None
     effects: Any = None
     const_attrs: frozenset[str] = field(default_factory=frozenset)
+    operand_types: tuple[Any, ...] | None = None
+    result_types: tuple[Any, ...] = ()
 
 
 class _KernelFunction(Protocol):
@@ -312,11 +358,23 @@ class _KernelNamespace:
         scope: Any = None,
         effects: Any = None,
         const_attrs: set[str] | frozenset[str] | None = None,
+        operand_types: Sequence[Any] | None = None,
+        result_types: Sequence[Any] | Any = (),
     ) -> Callable[..., Any]:
+        if result_types is None:
+            normalized_results: tuple[Any, ...] = ()
+        elif isinstance(result_types, Sequence) and not isinstance(
+            result_types, str | bytes
+        ):
+            normalized_results = tuple(result_types)
+        else:
+            normalized_results = (result_types,)
         metadata = IntrinsicMetadata(
             scope=scope,
             effects=effects,
             const_attrs=frozenset() if const_attrs is None else frozenset(const_attrs),
+            operand_types=None if operand_types is None else tuple(operand_types),
+            result_types=normalized_results,
         )
 
         def decorate(target: Callable[..., Any]) -> Callable[..., Any]:

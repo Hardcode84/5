@@ -1210,7 +1210,40 @@ def _serialize_intrinsic_metadata(meta: Any) -> dict[str, object]:
         result["effects"] = str(meta.effects)
     if meta.const_attrs:
         result["const_kwargs"] = tuple(sorted(str(name) for name in meta.const_attrs))
+    if meta.operand_types is not None:
+        result["operand_types"] = tuple(
+            _serialize_hc_type_spec(item) for item in meta.operand_types
+        )
+    if meta.result_types:
+        result["result_types"] = tuple(
+            _serialize_hc_type_spec(item) for item in meta.result_types
+        )
     return result
+
+
+def _serialize_hc_type_spec(value: Any) -> dict[str, object]:
+    from .core import IdxTypeSpec, TensorTypeSpec, UndefTypeSpec, VectorTypeSpec
+
+    if isinstance(value, TensorTypeSpec):
+        return {
+            "kind": "tensor",
+            "shape": tuple(str(dim) for dim in value.dimensions),
+            "dtype": value.dtype,
+        }
+    if isinstance(value, VectorTypeSpec):
+        return {
+            "kind": "vector",
+            "shape": tuple(str(dim) for dim in value.dimensions),
+            "dtype": value.dtype,
+        }
+    if isinstance(value, IdxTypeSpec):
+        record: dict[str, object] = {"kind": "idx"}
+        if value.expr is not None:
+            record["expr"] = str(value.expr)
+        return record
+    if isinstance(value, UndefTypeSpec) or value is None:
+        return {"kind": "undef"}
+    raise RuntimeError(f"unsupported HC intrinsic type spec: {value!r}")
 
 
 def _shape_tuple(values: Iterable[Any]) -> tuple[str, ...]:

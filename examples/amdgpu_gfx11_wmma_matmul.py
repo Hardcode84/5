@@ -40,7 +40,17 @@ from collections.abc import Sequence
 import numpy as np
 
 import hc.simulator as sim
-from hc import Buffer, WorkGroup, WorkItem, kernel, sym
+from hc import (
+    Buffer,
+    WorkGroup,
+    WorkItem,
+    idx_type,
+    kernel,
+    sym,
+    tensor_type,
+    undef_type,
+    vector_type,
+)
 from hc.symbols import ceil_div
 
 WAVE_LANES = 32
@@ -135,6 +145,16 @@ def _require_wmma_operands(sig) -> None:
     scope=WorkItem,
     effects="pure",
     const_attrs={"wave_size", "arch"},
+    operand_types=(
+        undef_type(),
+        tensor_type((WMMA_M, WMMA_K), np.float16),
+        tensor_type((WMMA_K, WMMA_N), np.float16),
+        vector_type((WMMA_K,), np.float16),
+        vector_type((WMMA_K,), np.float16),
+        vector_type((WMMA_ACC_FRAGMENT,), np.float32),
+        idx_type(),
+    ),
+    result_types=(vector_type((WMMA_ACC_FRAGMENT,), np.float32),),
 )
 def wmma_gfx11(
     group,

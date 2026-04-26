@@ -657,3 +657,20 @@ module {
     hc_front.return %r
   }
 }
+
+// -----
+
+module {
+  // expected-error@+1 {{`operand_types` declares 1 type(s) but intrinsic runtime signature has 2 SSA operand(s)}}
+  hc_front.intrinsic "bad_intrinsic_contract_arity" attributes {
+    const_kwargs = ["arch"],
+    operand_types = [{kind = "idx"}],
+    parameters = [
+      {name = "group", passing = "positional"},
+      {name = "value", passing = "positional"},
+      {name = "arch", passing = "keyword_only"}
+    ],
+    scope = "WorkItem"
+  } {
+  }
+}

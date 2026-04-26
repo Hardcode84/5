@@ -842,7 +842,17 @@ naturally expressed as target-specific IR rather than as built-in NumPy-style
 tensor/vector operations. Intrinsics are called from kernels as ordinary
 functions:
 ```python
-@kernel.intrinsic(scope=SubGroup, effects="pure", const_attrs={"blocksz"})
+@kernel.intrinsic(
+    scope=SubGroup,
+    effects="pure",
+    const_attrs={"blocksz"},
+    operand_types=(
+        vector_type((16,), np.float16),
+        vector_type((16,), np.float16),
+        vector_type((8,), np.float32),
+    ),
+    result_types=(vector_type((8,), np.float32),),
+)
 def mfma(a, b, acc, *, blocksz):
     # Fallback semantics
     return acc + (a @ b)
@@ -864,6 +874,13 @@ code like any other function. The declaration specifies the scope in which the
 intrinsic is legal, and may additionally declare effect information and a set
 of keyword attributes that must be compile-time or specialization-time
 constants.
+
+`operand_types` and `result_types` optionally publish the intrinsic's static
+SSA contract to the compiler. Operand entries describe the runtime SSA
+parameters after `const_attrs` have been removed; constant keyword attributes
+remain call-site attributes. Use `tensor_type(shape, dtype)`,
+`vector_type(shape, dtype)`, `idx_type()`, or `undef_type()` for entries that
+must remain progressive-typing wildcards.
 
 The intrinsic body defines fallback semantics. If no target-specific lowering
 matches the current compilation target, the compiler lowers the intrinsic body

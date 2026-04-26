@@ -355,11 +355,14 @@ refine; folders dispatch on the concrete-type combinations they recognize.
   fallback implementation (may be empty, in which case lowering patterns
   handle the op directly). Also a `Symbol`, with the same optional
   `function_type` signature story as `hc.func`; the Python decorator may
-  publish this from explicit `operand_types` / `result_types` metadata. An
-  optional `const_kwargs = ["wave_size", "arch", ...]` list declares specialization
-  attributes every `hc.call_intrinsic` must carry; missing entries fail at
-  verify time. Extra attributes on the call site stay allowed so targets
-  can attach their own decorations without modifying the declaration.
+  publish this from explicit `operand_types` / `result_types` metadata.
+  `function_type` inputs follow the intrinsic's declared parameter order after
+  filtering out Python `const_attrs` names; those filtered names are stored as
+  the MLIR-side `const_kwargs = ["wave_size", "arch", ...]` list. Each
+  `hc.call_intrinsic` must carry the declared constant kwargs as attributes;
+  missing entries fail at verify time. Extra attributes on the call site stay
+  allowed so targets can attach their own decorations without modifying the
+  declaration.
 * `hc.subgroup_region`, `hc.workitem_region` — collective regions with
   syntactic capture lists
 

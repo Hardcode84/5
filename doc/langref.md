@@ -876,11 +876,16 @@ of keyword attributes that must be compile-time or specialization-time
 constants.
 
 `operand_types` and `result_types` optionally publish the intrinsic's static
-SSA contract to the compiler. Operand entries describe the runtime SSA
-parameters after `const_attrs` have been removed; constant keyword attributes
-remain call-site attributes. Use `tensor_type(shape, dtype)`,
-`vector_type(shape, dtype)`, `idx_type()`, or `undef_type()` for entries that
-must remain progressive-typing wildcards.
+SSA contract to the compiler. `operand_types` is ordered like the Python
+function signature after removing names listed in `const_attrs`: positional
+parameters first, then any non-constant keyword-only parameters in declaration
+order. Names in `const_attrs` must be keyword-only; they do not consume SSA
+operand slots and remain call-site attributes for specialization. The lowering
+spells that filtered set as `const_kwargs` on the `hc.intrinsic` declaration,
+while the Python API keeps the decorator name `const_attrs`.
+
+Use `tensor_type(shape, dtype)`, `vector_type(shape, dtype)`, `idx_type()`, or
+`undef_type()` for entries that must remain progressive-typing wildcards.
 
 The intrinsic body defines fallback semantics. If no target-specific lowering
 matches the current compilation target, the compiler lowers the intrinsic body

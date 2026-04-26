@@ -329,6 +329,40 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_default_compile_schedule_verifies_static_shapes(tmp_path: Path) -> None:
+    script = tmp_path / "compile_static_shape_failure.py"
+    script.write_text(textwrap.dedent("""
+            import hc
+            from hc import Buffer, CurrentGroup, kernel
+
+
+            @kernel(work_shape=(4,), group_shape=(4,))
+            def bad_shape(group: CurrentGroup, x: Buffer[4], n: int) -> None:
+                tile = group.load(x, shape=(n,))
+                _ = tile
+
+
+            def main() -> None:
+                handle = hc.compile(bad_shape)
+                assert handle.hc_ir is None, handle.hc_ir_text
+                assert handle.hc_ir_text is None
+                assert handle.pipeline_diagnostics, (
+                    "expected static shape verifier diagnostics"
+                )
+                joined = "\\n".join(handle.pipeline_diagnostics)
+                assert "shape dimension #0" in joined, joined
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
     # A custom schedule that only runs `-convert-hc-front-to-hc` — no
     # fold/inline — must still produce valid hc IR for a kernel without

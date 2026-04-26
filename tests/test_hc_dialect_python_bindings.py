@@ -121,7 +121,9 @@ def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
             "hc-front-fold-region-defs,"
             "hc-front-inline,"
             "convert-hc-front-to-hc,"
-            "hc-promote-names)"
+            "hc-promote-names,"
+            "hc-infer-types,"
+            "hc-verify-static-shapes)"
         )
         transform_driver = "builtin.module(transform-interpreter)"
 

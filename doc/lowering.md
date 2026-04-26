@@ -831,6 +831,8 @@ folding / inline markers on is:
     hc-front-fold-region-defs → hc-front-inline
                               → convert-hc-front-to-hc
                               → hc-promote-names
+                              → hc-infer-types
+                              → hc-verify-static-shapes
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
@@ -841,15 +843,17 @@ shipped as `hc/schedules/front_to_hc.mlir`; `hc-opt` is the CLI handle
 on the same pass list, so
 
     hc-opt --hc-front-fold-region-defs --hc-front-inline \
-           --convert-hc-front-to-hc --hc-promote-names
+           --convert-hc-front-to-hc --hc-promote-names \
+           --hc-infer-types --hc-verify-static-shapes
 
 and `hc.compile(...)` with the default schedule produce identical
 output. See [`doc/schedules.md`](schedules.md) for the schedule format
 and override API.
 
-Postcondition: semantic `hc` operations and explicit region structure exist, but
-name-based bindings, partially unknown types, and symbolic launch parameters may
-still remain.
+Postcondition: semantic `hc` operations and explicit region structure exist,
+name-based bindings have been promoted into SSA, inferable HC types have been
+refined, and static tensor/vector shape operands have been verified. Symbolic
+launch parameters may still remain.
 
 ### SSA construction
 

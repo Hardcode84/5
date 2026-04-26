@@ -8,7 +8,7 @@ order. The Python driver builds a two-pass pipeline —
 `transform-preload-library` followed by `transform-interpreter` — and
 hands it the schedule file, so any pass that is registered in the
 process's MLIR pass registry (upstream canonicalize / cse / ...,
-plus the three `hc` pass families) is fair game inside a schedule.
+plus the `hc` pass families) is fair game inside a schedule.
 
 This is a pipeline manifest, not a full schedule language yet — no
 knobs, no payload filtering, no scoping. It will grow as the compiler
@@ -31,10 +31,24 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m4 = transform.apply_registered_pass "hc-promote-names" to %m3
         : (!transform.any_op) -> !transform.any_op
+    %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
+        : (!transform.any_op) -> !transform.any_op
+    %m6 = transform.apply_registered_pass "hc-verify-static-shapes" to %m5
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m6 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m6 : !transform.any_op
     transform.yield
   }
 }
 ```
+
+The static shape verifier runs after type inference because it validates SSA
+shape operands through their inferred `!hc.idx<...>` tuple element types. It
+runs before canonicalization and CSE so default compilation rejects invalid
+shape contracts before later cleanup can obscure the producer that carried the
+bad shape.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

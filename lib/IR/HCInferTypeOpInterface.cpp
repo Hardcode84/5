@@ -312,11 +312,6 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                              Operation *op) {
   if (!sourceType || isHCUndefType(sourceType))
     return currentResultType;
-  if (isa<mlir::hc::VectorType>(sourceType)) {
-    // Vector subscripts stay as deferred views until getitem/view
-    // specialization decides whether the result is an element or fragment.
-    return currentResultType;
-  }
 
   Type elementType = getSymbolicElementType(sourceType);
   ShapeAttr shape = getSymbolicShape(sourceType);
@@ -357,6 +352,12 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   if (isa<mlir::hc::BufferType>(sourceType))
     return Type(
         mlir::hc::BufferType::get(op->getContext(), elementType, resultShape));
+  if (isa<mlir::hc::VectorType>(sourceType)) {
+    if (resultDims.empty())
+      return elementType;
+    return Type(
+        mlir::hc::VectorType::get(op->getContext(), elementType, resultShape));
+  }
   return Type(
       mlir::hc::TensorType::get(op->getContext(), elementType, resultShape));
 }
@@ -412,6 +413,8 @@ static FailureOr<Type>
 inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
   if (!sourceType)
     return Type{};
+  if (isa<mlir::hc::VectorType>(sourceType))
+    return inferBufferViewResult(sourceType, indexTypes, Type{}, op);
   auto tuple = dyn_cast<TupleType>(sourceType);
   if (!tuple) {
     if (isa<UndefType, mlir::hc::BufferType, mlir::hc::TensorType,

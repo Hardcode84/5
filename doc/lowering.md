@@ -301,7 +301,9 @@ every type listed above. Ops with clear semantic categories tighten further:
 * `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.load`;
   excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either
-  (`hc.buffer_view.$buffer`, `hc.vload.$source`, `hc.store.$dest`)
+  (`hc.vload.$source`, `hc.store.$dest`)
+* `HC_ViewRootValueType` — generic subscript roots
+  (`hc.buffer_view.$buffer`), admitting buffers, tensors, and vectors
 * `HC_GroupValueType` — launch-geometry query root (`!hc.group` or
   pre-inference `!hc.undef`)
 
@@ -481,21 +483,21 @@ Comparison result typing:
   Python slice syntax (`x[1:]`, `x[1:10:2]`, `x[:]`, `x[::2]`, ...).
   Implementation: MLIR's `Optional<>` + `AttrSizedOperandSegments`, so
   there is no flag/operand drift.
-* `hc.buffer_view %buf[%idx...]` — sub-view of a buffer or tensor with the
-  slice-reduced shape, for cases that do not require data movement. Inference
-  preserves the storage class (`!hc.buffer` or `!hc.tensor`) and removes axes
-  consumed by scalar indices. Vector roots are also verifier-legal as a
-  deferred generic-subscript form; inference leaves them unrefined until later
-  view/getitem specialization chooses element or fragment semantics.
+* `hc.buffer_view %buf[%idx...]` — sub-view of a buffer, tensor, or vector with
+  the slice-reduced shape, for cases that do not require data movement.
+  Inference preserves the storage class (`!hc.buffer` or `!hc.tensor`) and
+  removes axes consumed by scalar indices. Vector roots refine to
+  `!hc.vector` fragments when slices/trailing dimensions remain, or to the
+  element type when scalar indices consume every axis.
 * `hc.tuple(%value...)` — first-class aggregate using MLIR's builtin
   `tuple<...>` type, preserving Python tuple structure as a single SSA value
 * `hc.getitem %base[%idx...]` — generic Python square-bracket indexing kept
   before the base kind is known. Inference can refine tuple item access when
   the index converges to a concrete integer. Once the base is known to be a
   tuple, failure to produce exactly one static integer index is diagnosed in
-  `hc-infer-types`; concrete non-indexable bases are rejected there too. Buffer,
-  tensor, and vector bases remain deferred for later view/element
-  specialization.
+  `hc-infer-types`; concrete non-indexable bases are rejected there too. Vector
+  bases use the same element/fragment inference as `hc.buffer_view`, while
+  buffer and tensor bases remain deferred to `hc.buffer_view`-style lowering.
 
 Multi-axis subscripts on `hc.getitem`/`hc.load`/`hc.store`/`hc.buffer_view`
 take variadic operands directly; `hc.tuple` is reserved for source-level tuple

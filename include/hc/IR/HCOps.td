@@ -628,9 +628,9 @@ def HCBufferViewOp : HC_Op<"buffer_view",
   let description = [{
     Returns a view of the root reduced by the variadic index/slice operands.
     The variadic list carries a mix of scalar indices and `!hc.slice` values,
-    matching Python-style multi-axis subscripts. Vector roots are legal as a
-    deferred generic-subscript form; inference leaves them unrefined until a
-    later view/getitem specialization can choose element or fragment semantics.
+    matching Python-style multi-axis subscripts. Vector roots use the same
+    shape-reduction rules: scalar indices consume axes, slices produce vector
+    fragments, and indexing every vector axis yields the element type.
   }];
   let arguments = (ins HC_ViewRootValueType:$buffer,
                        Variadic<HC_ValueType>:$indices);

@@ -2916,8 +2916,8 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
     indices.append(expanded->begin(), expanded->end());
   }
   // `hc.buffer_view` accepts `!hc.undef`, buffer, tensor, and vector roots.
-  // Vector roots keep generic subscript IR verifier-legal until a later pass
-  // can specialize the view as an element or fragment projection.
+  // Type inference later specializes vector roots to element or fragment
+  // projections once the index types are known.
   return HCBufferViewOp::create(builder, op.getLoc(), undef, base, indices);
 }
 

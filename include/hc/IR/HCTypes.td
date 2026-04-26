@@ -251,7 +251,7 @@ def HC_BufferValueType : AnyTypeOf<[
 // Buffer or tensor root. Used by ops that can address either storage class:
 // `hc.vload` reads from either, and `hc.store` writes into either.
 // `hc.buffer_view` uses `HC_ViewRootValueType` because generic subscripts may
-// temporarily carry vectors before later specialization.
+// carry vectors and specialize them during type inference.
 def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
@@ -259,9 +259,8 @@ def HC_BufferOrTensorValueType : AnyTypeOf<[
 ]>;
 
 // Roots accepted by the generic subscript form that still lowers to
-// `hc.buffer_view` today. Vector subscripts are left unrefined until a later
-// getitem/view specialization pass, but they must remain verifier-legal after
-// interprocedural inference discovers vector accumulator types.
+// `hc.buffer_view` today. Vector subscripts refine to either a vector fragment
+// or the scalar element type once inference knows the root and index types.
 def HC_ViewRootValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,

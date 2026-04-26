@@ -5,6 +5,9 @@
 This document describes an MLIR-first lowering path for the high-level kernel
 API defined in `doc/langref.md`.
 
+For the concrete upstream MLIR executable path centered on the WMMA example,
+see `doc/upstream-lowering.md`.
+
 The main design goal is to get a useful end-to-end compiler running quickly
 while keeping the Python frontend intentionally thin. Type inference, semantic
 checks, specialization, and non-trivial rewrites should live in MLIR, not in a

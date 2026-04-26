@@ -265,12 +265,15 @@ static Type shapedElementType(Type type) {
   return {};
 }
 
-static Type inferAllocLikeResult(Type resultType, Type shapeType, Type fillType,
+static Type inferAllocLikeResult(Type resultType, Type shapeType,
+                                 TypeAttr dtype, Type fillType,
                                  bool vectorResult, Operation *op) {
   ShapeAttr shape = shapeFromTupleType(shapeType, op);
   if (!shape)
     return resultType;
   Type elementType = shapedElementType(resultType);
+  if (!elementType && dtype)
+    elementType = dtype.getValue();
   if (!elementType && fillType && !isHCUndefType(fillType))
     elementType = fillType;
   if (!elementType)
@@ -702,16 +705,18 @@ LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
 LogicalResult HCVZerosOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                        SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();
-  resultTypes.push_back(inferAllocLikeResult(
-      getResult().getType(), shapeType, Type{}, /*vectorResult=*/true, *this));
+  resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
+                                             getDtypeAttr(), Type{},
+                                             /*vectorResult=*/true, *this));
   return success();
 }
 
 LogicalResult HCVOnesOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();
-  resultTypes.push_back(inferAllocLikeResult(
-      getResult().getType(), shapeType, Type{}, /*vectorResult=*/true, *this));
+  resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
+                                             getDtypeAttr(), Type{},
+                                             /*vectorResult=*/true, *this));
   return success();
 }
 
@@ -720,24 +725,26 @@ LogicalResult HCVFullOp::inferHCTypes(ArrayRef<Type> operandTypes,
   Type fillType = operandTypes.empty() ? Type{} : operandTypes.front();
   Type shapeType = operandTypes.size() < 2 ? Type{} : operandTypes[1];
   resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
-                                             fillType, /*vectorResult=*/true,
-                                             *this));
+                                             getDtypeAttr(), fillType,
+                                             /*vectorResult=*/true, *this));
   return success();
 }
 
 LogicalResult HCZerosOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();
-  resultTypes.push_back(inferAllocLikeResult(
-      getResult().getType(), shapeType, Type{}, /*vectorResult=*/false, *this));
+  resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
+                                             getDtypeAttr(), Type{},
+                                             /*vectorResult=*/false, *this));
   return success();
 }
 
 LogicalResult HCOnesOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                      SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();
-  resultTypes.push_back(inferAllocLikeResult(
-      getResult().getType(), shapeType, Type{}, /*vectorResult=*/false, *this));
+  resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
+                                             getDtypeAttr(), Type{},
+                                             /*vectorResult=*/false, *this));
   return success();
 }
 
@@ -746,16 +753,17 @@ LogicalResult HCFullOp::inferHCTypes(ArrayRef<Type> operandTypes,
   Type fillType = operandTypes.empty() ? Type{} : operandTypes.front();
   Type shapeType = operandTypes.size() < 2 ? Type{} : operandTypes[1];
   resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
-                                             fillType, /*vectorResult=*/false,
-                                             *this));
+                                             getDtypeAttr(), fillType,
+                                             /*vectorResult=*/false, *this));
   return success();
 }
 
 LogicalResult HCEmptyOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();
-  resultTypes.push_back(inferAllocLikeResult(
-      getResult().getType(), shapeType, Type{}, /*vectorResult=*/false, *this));
+  resultTypes.push_back(inferAllocLikeResult(getResult().getType(), shapeType,
+                                             getDtypeAttr(), Type{},
+                                             /*vectorResult=*/false, *this));
   return success();
 }
 

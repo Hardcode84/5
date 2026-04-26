@@ -2529,31 +2529,52 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     }
     return shapeIt->second;
   };
+  auto optionalDtype = [&](StringRef callee) -> FailureOr<TypeAttr> {
+    auto dtypeIt = args.kwvalues.find("dtype");
+    if (dtypeIt == args.kwvalues.end())
+      return TypeAttr();
+    Value dtype = dtypeIt->second;
+    if (!dtype) {
+      call.emitOpError("`") << callee << "` dtype did not lower to an hc value";
+      return failure();
+    }
+    if (auto constOp = dtype.getDefiningOp<HCConstOp>())
+      if (auto type = dyn_cast<TypeAttr>(constOp.getValue()))
+        return type;
+    call.emitOpError("`") << callee << "` dtype must resolve to a TypeAttr";
+    return failure();
+  };
 
   if (method == "vzeros" || method == "vones" || method == "zeros" ||
       method == "ones" || method == "empty") {
     FailureOr<Value> shape = requiredShape(method);
     if (failed(shape))
       return failure();
+    FailureOr<TypeAttr> dtype = optionalDtype(method);
+    if (failed(dtype))
+      return failure();
     if (method == "vzeros")
-      return {HCVZerosOp::create(builder, call.getLoc(), undef, *shape)
+      return {HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
                   .getResult()};
     if (method == "vones")
-      return {
-          HCVOnesOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+      return {HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                  .getResult()};
     if (method == "zeros")
-      return {
-          HCZerosOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+      return {HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                  .getResult()};
     if (method == "ones")
-      return {
-          HCOnesOp::create(builder, call.getLoc(), undef, *shape).getResult()};
-    return {
-        HCEmptyOp::create(builder, call.getLoc(), undef, *shape).getResult()};
+      return {HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                  .getResult()};
+    return {HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                .getResult()};
   }
 
   if (method == "vfull" || method == "full") {
     FailureOr<Value> shape = requiredShape(method);
     if (failed(shape))
+      return failure();
+    FailureOr<TypeAttr> dtype = optionalDtype(method);
+    if (failed(dtype))
       return failure();
     Value fill;
     if (auto fillIt = args.kwvalues.find("fill_value");
@@ -2566,10 +2587,12 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
       return failure();
     }
     if (method == "vfull")
-      return {HCVFullOp::create(builder, call.getLoc(), undef, fill, *shape)
-                  .getResult()};
-    return {HCFullOp::create(builder, call.getLoc(), undef, fill, *shape)
-                .getResult()};
+      return {
+          HCVFullOp::create(builder, call.getLoc(), undef, fill, *shape, *dtype)
+              .getResult()};
+    return {
+        HCFullOp::create(builder, call.getLoc(), undef, fill, *shape, *dtype)
+            .getResult()};
   }
   llvm_unreachable("unknown memory DSL method");
 }

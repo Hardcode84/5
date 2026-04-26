@@ -781,9 +781,15 @@ class HC_NullaryShapedAllocOp<string mnemonic>
         MemoryEffects<[MemAlloc]>,
         DeclareOpInterfaceMethods<HCInferTypeOpInterface>
       ]> {
-  let arguments = (ins HC_TupleValueType:$shape);
+  let arguments = (ins
+    HC_TupleValueType:$shape,
+    OptionalAttr<TypeAttr>:$dtype
+  );
   let results = (outs HC_ValueType:$result);
-  let assemblyFormat = "`shape` $shape attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = [{
+    `shape` $shape (`,` `dtype` `=` $dtype^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
 }
 
 class HC_FillShapedAllocOp<string mnemonic>
@@ -791,10 +797,16 @@ class HC_FillShapedAllocOp<string mnemonic>
         MemoryEffects<[MemAlloc]>,
         DeclareOpInterfaceMethods<HCInferTypeOpInterface>
       ]> {
-  let arguments = (ins HC_ValueType:$value, HC_TupleValueType:$shape);
+  let arguments = (ins
+    HC_ValueType:$value,
+    HC_TupleValueType:$shape,
+    OptionalAttr<TypeAttr>:$dtype
+  );
   let results = (outs HC_ValueType:$result);
-  let assemblyFormat =
-      "$value `,` `shape` $shape attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = [{
+    $value `,` `shape` $shape (`,` `dtype` `=` $dtype^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
 }
 
 def HCVZerosOp : HC_NullaryShapedAllocOp<"vzeros"> {

@@ -528,11 +528,15 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
   The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
   spellings fail at parse. v0 admits `row_major` and `col_major`; later
   schemes can extend the enum without changing call sites.
-* `hc.vzeros shape %shape`, `hc.vones shape %shape`,
-  `hc.vfull %fill, shape %shape` — vector allocators (any scope).
-* `hc.zeros shape %shape`, `hc.ones shape %shape`,
-  `hc.full %fill, shape %shape` — tensor allocators (`WorkGroup` scope only).
-* `hc.empty shape %shape` — uninitialized tensor (`WorkGroup` scope).
+* `hc.vzeros shape %shape, dtype = T`, `hc.vones shape %shape, dtype = T`,
+  `hc.vfull %fill, shape %shape, dtype = T` — vector allocators (any scope).
+  The dtype is optional when the result or fill operand already fixes the
+  element type.
+* `hc.zeros shape %shape, dtype = T`, `hc.ones shape %shape, dtype = T`,
+  `hc.full %fill, shape %shape, dtype = T` — tensor allocators (`WorkGroup`
+  scope only), with the same optional dtype convention.
+* `hc.empty shape %shape, dtype = T` — uninitialized tensor (`WorkGroup`
+  scope); dtype is required for inference unless the result is already typed.
 
 All allocators carry a `MemAlloc` effect: each op hands back a fresh,
 distinct storage slab, so CSE cannot collapse two sibling allocations into

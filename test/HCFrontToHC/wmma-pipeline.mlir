@@ -39,7 +39,7 @@
 // CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
 // CHECK: %{{.*}} = hc.workitem_region captures = ["group"] -> (!hc.undef)
-// CHECK: hc.vzeros shape %{{.*}} : ({{.*}}) -> !hc.undef
+// CHECK: hc.vzeros shape %{{.*}}, dtype = f32 : ({{.*}}) -> !hc.undef
 // CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 

@@ -138,6 +138,52 @@ struct TypeFact {
 
 static bool containsSyntheticJoinSymbol(IdxType type);
 
+template <typename JoinIdxConflictFn>
+static Type joinConcreteTypesWithPolicy(Type lhs, Type rhs,
+                                        SmallVectorImpl<unsigned> &elementPath,
+                                        JoinIdxConflictFn joinIdxConflict) {
+  if (lhs == rhs || isHCUndefType(lhs))
+    return rhs;
+  if (isHCUndefType(rhs))
+    return lhs;
+
+  auto lhsTuple = dyn_cast<TupleType>(lhs);
+  auto rhsTuple = dyn_cast<TupleType>(rhs);
+  if (lhsTuple || rhsTuple) {
+    if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
+      return {};
+    SmallVector<Type> elements;
+    elements.reserve(lhsTuple.size());
+    unsigned elementIndex = 0;
+    for (auto [lhsElement, rhsElement] :
+         llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
+      elementPath.push_back(elementIndex++);
+      Type joined = joinConcreteTypesWithPolicy(lhsElement, rhsElement,
+                                                elementPath, joinIdxConflict);
+      elementPath.pop_back();
+      if (!joined)
+        return {};
+      elements.push_back(joined);
+    }
+    return TupleType::get(lhs.getContext(), elements);
+  }
+
+  auto lhsIdx = dyn_cast<IdxType>(lhs);
+  auto rhsIdx = dyn_cast<IdxType>(rhs);
+  if (lhsIdx && rhsIdx && lhsIdx.getExpr() && rhsIdx.getExpr()) {
+    // Once a conflict has a synthetic representative, keep it stable across
+    // later solver reruns and expressions derived from that representative.
+    if (containsSyntheticJoinSymbol(lhsIdx))
+      return lhs;
+    if (containsSyntheticJoinSymbol(rhsIdx))
+      return rhs;
+    if (Type joined = joinIdxConflict(lhs.getContext(), elementPath))
+      return joined;
+  }
+
+  return joinHCTypes(lhs, rhs);
+}
+
 struct HCTypeLattice : public dataflow::Lattice<TypeFact> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HCTypeLattice)
   using Lattice::Lattice;
@@ -176,48 +222,6 @@ private:
     return IdxType::get(ctx, ExprAttr::get(ctx, *handle));
   }
 
-  Type joinConcreteTypes(Type lhs, Type rhs,
-                         SmallVectorImpl<unsigned> &elementPath) const {
-    if (lhs == rhs || isHCUndefType(lhs))
-      return rhs;
-    if (isHCUndefType(rhs))
-      return lhs;
-
-    auto lhsTuple = dyn_cast<TupleType>(lhs);
-    auto rhsTuple = dyn_cast<TupleType>(rhs);
-    if (lhsTuple || rhsTuple) {
-      if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
-        return {};
-      SmallVector<Type> elements;
-      elements.reserve(lhsTuple.size());
-      unsigned elementIndex = 0;
-      for (auto [lhsElement, rhsElement] :
-           llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
-        elementPath.push_back(elementIndex++);
-        Type joined = joinConcreteTypes(lhsElement, rhsElement, elementPath);
-        elementPath.pop_back();
-        if (!joined)
-          return {};
-        elements.push_back(joined);
-      }
-      return TupleType::get(lhs.getContext(), elements);
-    }
-
-    auto lhsIdx = dyn_cast<IdxType>(lhs);
-    auto rhsIdx = dyn_cast<IdxType>(rhs);
-    if (lhsIdx && rhsIdx && lhsIdx.getExpr() && rhsIdx.getExpr()) {
-      // Once a conflict has a synthetic representative, keep it stable across
-      // later solver reruns and expressions derived from that representative.
-      if (containsSyntheticJoinSymbol(lhsIdx))
-        return lhs;
-      if (containsSyntheticJoinSymbol(rhsIdx))
-        return rhs;
-      return synthesizeIdxConflictType(lhs.getContext(), elementPath);
-    }
-
-    return joinHCTypes(lhs, rhs);
-  }
-
   TypeFact joinFacts(const TypeFact &lhs, const TypeFact &rhs) const {
     if (lhs.isUnknown())
       return rhs;
@@ -228,7 +232,12 @@ private:
     if (rhs.isConflict())
       return rhs;
     SmallVector<unsigned, 4> elementPath;
-    if (Type common = joinConcreteTypes(lhs.type, rhs.type, elementPath))
+    auto synthesizeIdxConflict = [&](MLIRContext *ctx,
+                                     ArrayRef<unsigned> path) {
+      return synthesizeIdxConflictType(ctx, path);
+    };
+    if (Type common = joinConcreteTypesWithPolicy(
+            lhs.type, rhs.type, elementPath, synthesizeIdxConflict))
       return TypeFact::concrete(common);
     return TypeFact::conflict();
   }
@@ -258,38 +267,11 @@ static bool containsSyntheticJoinSymbol(IdxType type) {
 }
 
 static Type joinExistingConcreteTypes(Type lhs, Type rhs) {
-  if (lhs == rhs || isHCUndefType(lhs))
-    return rhs;
-  if (isHCUndefType(rhs))
-    return lhs;
-
-  auto lhsTuple = dyn_cast<TupleType>(lhs);
-  auto rhsTuple = dyn_cast<TupleType>(rhs);
-  if (lhsTuple || rhsTuple) {
-    if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
-      return {};
-    SmallVector<Type> elements;
-    elements.reserve(lhsTuple.size());
-    for (auto [lhsElement, rhsElement] :
-         llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
-      Type joined = joinExistingConcreteTypes(lhsElement, rhsElement);
-      if (!joined)
-        return {};
-      elements.push_back(joined);
-    }
-    return TupleType::get(lhs.getContext(), elements);
-  }
-
-  auto lhsIdx = dyn_cast<IdxType>(lhs);
-  auto rhsIdx = dyn_cast<IdxType>(rhs);
-  if (lhsIdx && rhsIdx && lhsIdx.getExpr() && rhsIdx.getExpr()) {
-    if (containsSyntheticJoinSymbol(lhsIdx))
-      return lhs;
-    if (containsSyntheticJoinSymbol(rhsIdx))
-      return rhs;
-  }
-
-  return joinHCTypes(lhs, rhs);
+  SmallVector<unsigned, 4> elementPath;
+  auto noSyntheticRepresentative =
+      [](MLIRContext *, ArrayRef<unsigned>) -> Type { return {}; };
+  return joinConcreteTypesWithPolicy(lhs, rhs, elementPath,
+                                     noSyntheticRepresentative);
 }
 
 static TypeFact joinExistingFacts(const TypeFact &lhs, const TypeFact &rhs) {

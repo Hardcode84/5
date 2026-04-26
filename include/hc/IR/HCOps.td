@@ -970,12 +970,18 @@ def HCCallOp : HC_Op<"call",
 
 def HCCallIntrinsicOp : HC_Op<"call_intrinsic",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+     DeclareOpInterfaceMethods<HCInferTypeOpInterface>,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Call into an `hc.intrinsic` declaration.";
   let description = [{
     Specialization-required keyword arguments live on this op as
     attributes (e.g. `{wave_size = 32 : i64}`), not SSA operands, so they
     are available to verify/specialize hooks without operand bookkeeping.
+
+    Result types participate in HC type inference through the callee
+    `function_type`; intrinsic declarations are the target-independent
+    contract surface, while target lowering remains responsible for turning the
+    call into backend-specific IR.
 
     Memory effects are inherited from the callee intrinsic's `effects`
     class; absence defaults to `MemRead + MemWrite`, same policy as

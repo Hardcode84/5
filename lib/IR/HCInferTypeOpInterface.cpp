@@ -9,6 +9,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/SmallString.h"
 
 #include <optional>
@@ -829,6 +830,28 @@ HCWithInactiveOp::inferHCTypes(ArrayRef<Type> operandTypes,
   if (failed(requireOperandCount(*this, operandTypes, 2)))
     return failure();
   resultTypes.push_back(operandTypes.front());
+  return success();
+}
+
+LogicalResult
+HCCallIntrinsicOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                SmallVectorImpl<Type> &resultTypes) {
+  (void)operandTypes;
+  auto callee = SymbolTable::lookupNearestSymbolFrom<HCIntrinsicOp>(
+      getOperation(), getCalleeAttr());
+  if (!callee || !callee.getFunctionTypeAttr()) {
+    resultTypes.append(getNumResults(), Type{});
+    return success();
+  }
+
+  auto fnType = cast<FunctionType>(callee.getFunctionTypeAttr().getValue());
+  if (fnType.getNumResults() != getNumResults())
+    return emitOpError("callee function_type declares ")
+           << fnType.getNumResults() << " result(s), but call has "
+           << getNumResults();
+
+  for (Type type : fnType.getResults())
+    resultTypes.push_back(isHCUndefType(type) ? Type{} : type);
   return success();
 }
 

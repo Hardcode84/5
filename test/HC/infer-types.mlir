@@ -271,6 +271,23 @@ hc.func @interprocedural_caller {
 
 // -----
 
+// CHECK-LABEL: hc.intrinsic @typed_vector_intrinsic
+// CHECK-SAME: (%{{[^:]+}}: !hc.vector<f16, ["16"]>) -> !hc.vector<f32, ["8"]>
+hc.intrinsic @typed_vector_intrinsic(%frag: !hc.vector<f16, ["16"]>)
+    -> !hc.vector<f32, ["8"]>
+    scope = #hc.scope<"WorkItem"> parameters = ["frag"] {}
+
+// CHECK-LABEL: hc.func @intrinsic_contract_caller
+// CHECK: hc.call_intrinsic @typed_vector_intrinsic(%{{.*}})
+// CHECK-SAME: (!hc.vector<f16, ["16"]>) -> !hc.vector<f32, ["8"]>
+hc.func @intrinsic_contract_caller(%frag: !hc.vector<f16, ["16"]>) {
+  %result = hc.call_intrinsic @typed_vector_intrinsic(%frag)
+      : (!hc.vector<f16, ["16"]>) -> !hc.undef
+  hc.return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @joined_interprocedural_callee
 // CHECK-SAME: (%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 // CHECK: hc.add {{.*}} -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>

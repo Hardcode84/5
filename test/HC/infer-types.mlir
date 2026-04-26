@@ -296,9 +296,10 @@ hc.func @joined_interprocedural_caller {
 // -----
 
 // CHECK-LABEL: hc.func @workitem_tail_region_callee
-// CHECK: %[[REGION:.*]] = hc.workitem_region captures = ["group"] -> (!hc.undef)
+// CHECK-SAME: -> !hc.idx<"0">
+// CHECK: %[[REGION:.*]] = hc.workitem_region captures = ["group"] -> (!hc.idx<"0">)
 // CHECK: hc.yield {{.*}} : !hc.idx<"0">
-// CHECK: hc.return %[[REGION]] : !hc.undef
+// CHECK: hc.return %[[REGION]] : !hc.idx<"0">
 hc.func @workitem_tail_region_callee(%group: !hc.undef) -> !hc.undef {
   %region = hc.workitem_region captures = ["group"] -> (!hc.undef) {
   ^bb0(%wi: !hc.undef):
@@ -308,10 +309,24 @@ hc.func @workitem_tail_region_callee(%group: !hc.undef) -> !hc.undef {
   hc.return %region : !hc.undef
 }
 
+// CHECK-LABEL: hc.func @subgroup_tail_region_callee
+// CHECK-SAME: -> !hc.idx<"1">
+// CHECK: %[[REGION:.*]] = hc.subgroup_region captures = ["group"] -> (!hc.idx<"1">)
+// CHECK: hc.yield {{.*}} : !hc.idx<"1">
+// CHECK: hc.return %[[REGION]] : !hc.idx<"1">
+hc.func @subgroup_tail_region_callee(%group: !hc.undef) -> !hc.undef {
+  %region = hc.subgroup_region captures = ["group"] -> (!hc.undef) {
+  ^bb0(%sg: !hc.undef):
+    %seed = hc.const<1 : i64> : !hc.undef
+    hc.yield %seed : !hc.undef
+  }
+  hc.return %region : !hc.undef
+}
+
 // CHECK-LABEL: hc.func @call_result_iter_arg_keeps_loop_body_live
 // CHECK: %[[INIT:.*]] = hc.call @workitem_tail_region_callee
 // CHECK: hc.for_range {{.*}} iter_args(%[[INIT]])
-// CHECK: ^bb0(%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">, %{{[^:]+}}: !hc.undef):
+// CHECK: ^bb0(%{{[^:]+}}: !hc.idx<"$join{{[0-9]+}}">, %{{[^:]+}}: !hc.idx<"0">):
 // CHECK: hc.const<16 : i64> : !hc.idx<"16">
 // CHECK: hc.add {{.*}} : (!hc.idx<"$join{{[0-9]+}}">, !hc.idx<"16">) -> !hc.idx<{{.*}}$join{{[0-9]+}}{{.*}}>
 hc.func @call_result_iter_arg_keeps_loop_body_live(%group: !hc.undef) {

@@ -332,6 +332,11 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                              Operation *op) {
   if (!sourceType || isHCUndefType(sourceType))
     return currentResultType;
+  if (isa<mlir::hc::VectorType>(sourceType)) {
+    // Vector subscripts stay as deferred views until getitem/view
+    // specialization decides whether the result is an element or fragment.
+    return currentResultType;
+  }
 
   Type elementType = getElementTypeFromBufferOrTensor(sourceType);
   ShapeAttr shape = getShapeAttrFromBufferOrTensor(sourceType);

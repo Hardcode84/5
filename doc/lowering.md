@@ -484,7 +484,9 @@ Comparison result typing:
 * `hc.buffer_view %buf[%idx...]` — sub-view of a buffer or tensor with the
   slice-reduced shape, for cases that do not require data movement. Inference
   preserves the storage class (`!hc.buffer` or `!hc.tensor`) and removes axes
-  consumed by scalar indices.
+  consumed by scalar indices. Vector roots are also verifier-legal as a
+  deferred generic-subscript form; inference leaves them unrefined until later
+  view/getitem specialization chooses element or fragment semantics.
 * `hc.tuple(%value...)` — first-class aggregate using MLIR's builtin
   `tuple<...>` type, preserving Python tuple structure as a single SSA value
 * `hc.getitem %base[%idx...]` — generic Python square-bracket indexing kept

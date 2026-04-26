@@ -607,6 +607,50 @@ static bool refineValue(Value value, Type inferred) {
   return true;
 }
 
+static TypeFact factFromValue(DataFlowSolver &solver, Value value) {
+  TypeFact fact = factFromExistingType(value.getType());
+  if (std::optional<Type> inferred = inferredTypeFor(solver, value)) {
+    TypeFact inferredFact = TypeFact::concrete(*inferred);
+    if (!fact.hasUsableType() || shouldRefineHCType(fact.type, *inferred))
+      return inferredFact;
+    return joinExistingFacts(fact, inferredFact);
+  }
+  return fact;
+}
+
+static HCYieldOp nestedScopeYield(Operation *op) {
+  if (!isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
+    return {};
+  if (op->getNumResults() == 0)
+    return {};
+  Region &body = op->getRegion(0);
+  if (body.empty() || body.front().empty())
+    return {};
+  return dyn_cast<HCYieldOp>(body.front().getTerminator());
+}
+
+static bool updateNestedScopeRegionResultTypes(ModuleOp module,
+                                               DataFlowSolver &solver) {
+  bool changed = false;
+  module.walk([&](Operation *op) {
+    HCYieldOp yield = nestedScopeYield(op);
+    if (!yield)
+      return;
+    if (yield.getValues().size() != op->getNumResults()) {
+      assert(false && "verified nested scope yield arity mismatch");
+      return;
+    }
+    for (auto [result, yielded] :
+         llvm::zip_equal(op->getResults(), yield.getValues())) {
+      TypeFact fact = factFromValue(solver, yielded);
+      if (!fact.hasUsableType())
+        continue;
+      changed |= refineValue(result, fact.type);
+    }
+  });
+  return changed;
+}
+
 template <typename CallableOpT>
 static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
   auto fnTypeAttr = op.getFunctionTypeAttr();
@@ -626,13 +670,7 @@ static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
     for (auto [idx, value] : llvm::enumerate(ret.getValues())) {
       if (idx >= resultFacts.size())
         return;
-      TypeFact fact = factFromExistingType(value.getType());
-      if (std::optional<Type> inferred = inferredTypeFor(solver, value)) {
-        if (!fact.hasUsableType() || shouldRefineHCType(fact.type, *inferred))
-          fact = TypeFact::concrete(*inferred);
-        else
-          fact = joinExistingFacts(fact, TypeFact::concrete(*inferred));
-      }
+      TypeFact fact = factFromValue(solver, value);
       if (resultFacts[idx].hasUsableType() && fact.hasUsableType() &&
           shouldRefineHCType(resultFacts[idx].type, fact.type))
         resultFacts[idx] = fact;
@@ -669,6 +707,10 @@ static bool updateCallableFunctionTypes(ModuleOp module,
 
 static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
   bool changed = updateCallableFunctionTypes(module, solver);
+  // Region result refinement can itself update enclosing callable signatures
+  // through return users; the outer solver loop reruns until those surfaces
+  // converge.
+  changed |= updateNestedScopeRegionResultTypes(module, solver);
   module.walk([&](Operation *op) {
     for (OpResult result : op->getResults()) {
       if (!isNestedUnderHCCallable(result))

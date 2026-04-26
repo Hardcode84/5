@@ -22,9 +22,11 @@
 // CHECK: hc.slice_expr(lower = %{{.*}} upper = %{{.*}} step = %{{.*}}) : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.buffer_view %{{.*}}[%{{.*}}, %{{.*}}] : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.buffer_view %{{.*}}[%{{.*}}] : (!hc.tensor<f32, ["M", "N"]>, !hc.undef) -> !hc.undef
+// CHECK: hc.buffer_view %{{.*}}[%{{.*}}] : (!hc.vector<f32, ["8"]>, !hc.undef) -> !hc.undef
 func.func @buffer_queries(%buf: !hc.undef, %lo: !hc.undef, %hi: !hc.undef,
                           %st: !hc.undef,
-                          %tensor: !hc.tensor<f32, ["M", "N"]>) {
+                          %tensor: !hc.tensor<f32, ["M", "N"]>,
+                          %vector: !hc.vector<f32, ["8"]>) {
   %d        = hc.buffer_dim %buf, axis = 1 : !hc.undef -> !hc.undef
   %sl_none  = hc.slice_expr() : () -> !hc.undef
   %sl_lo    = hc.slice_expr(lower = %lo) : (!hc.undef) -> !hc.undef
@@ -42,6 +44,8 @@ func.func @buffer_queries(%buf: !hc.undef, %lo: !hc.undef, %hi: !hc.undef,
       : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
   %tv  = hc.buffer_view %tensor[%lo]
       : (!hc.tensor<f32, ["M", "N"]>, !hc.undef) -> !hc.undef
+  %vv  = hc.buffer_view %vector[%lo]
+      : (!hc.vector<f32, ["8"]>, !hc.undef) -> !hc.undef
   return
 }
 

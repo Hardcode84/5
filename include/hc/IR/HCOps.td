@@ -622,13 +622,15 @@ def HCSliceExprOp : HC_Op<"slice_expr",
 
 def HCBufferViewOp : HC_Op<"buffer_view",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
-  let summary = "Sub-view into a buffer or tensor (no data movement).";
+  let summary = "Sub-view into a buffer, tensor, or vector root.";
   let description = [{
-    Returns a view of the buffer-or-tensor root reduced by the variadic index/slice
-    operands. The variadic list carries a mix of scalar indices and
-    `!hc.slice` values, matching Python-style multi-axis subscripts.
+    Returns a view of the root reduced by the variadic index/slice operands.
+    The variadic list carries a mix of scalar indices and `!hc.slice` values,
+    matching Python-style multi-axis subscripts. Vector roots are legal as a
+    deferred generic-subscript form; inference leaves them unrefined until a
+    later view/getitem specialization can choose element or fragment semantics.
   }];
-  let arguments = (ins HC_BufferOrTensorValueType:$buffer,
+  let arguments = (ins HC_ViewRootValueType:$buffer,
                        Variadic<HC_ValueType>:$indices);
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{

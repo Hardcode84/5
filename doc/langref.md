@@ -14,7 +14,8 @@ geometry, workgroup-local tensors, and fixed-size vectors.
   dimensions, tuple arguments, and launch attributes.
 * `Buffer[...]`: kernel parameter type for externally visible storage supplied
   by the caller. Its annotated dimensions participate in symbol binding and
-  launch validation.
+  launch validation. A final NumPy dtype argument may also be supplied, e.g.
+  `Buffer[M, K, np.float16]`.
 * `CurrentGroup`: runtime object representing the current `WorkGroup`
   invocation. It provides launch-derived geometry, workgroup-local allocation
   and load/store APIs, and access to nested `SubGroup` / `WorkItem` scopes.
@@ -153,6 +154,36 @@ def test(gr: CurrentGroup,
 
 test((1024, 1, 1), (64, 1, 1))
 ```
+
+### Buffer annotations
+
+Kernel buffer parameters use `Buffer[...]` annotations. All leading arguments
+are logical dimensions. A dimension may be a symbol, a literal integer, or a
+symbolic expression accepted anywhere else a shape dimension is accepted:
+```python
+def f(group: CurrentGroup,
+      a: Buffer[M, K],
+      b: Buffer[M, 16]):
+    ...
+```
+
+The optional final argument may be a NumPy dtype object:
+```python
+def f(group: CurrentGroup,
+      a: Buffer[M, K, np.float16],
+      c: Buffer[M, N, np.float32]):
+    ...
+```
+
+The shape part still drives launch symbol binding. The dtype part constrains
+the buffer element type seen by compiled code and lets loads, views, and helper
+calls infer element types before looking at concrete runtime arrays. If the
+dtype is omitted, the source-level annotation only constrains shape; compiled IR
+keeps the buffer element type unknown until another contract refines it.
+
+The dtype must name a supported NumPy scalar dtype. String values are not
+interpreted as dtype annotations, so string-like symbolic dimensions remain
+shape dimensions.
 
 ### Symbols
 Symbols express equality relationships between kernel arguments and launch

@@ -285,9 +285,9 @@ def store_wmma_tile(group, c, row0, col0, acc):
 )
 def tiled_gfx11_wmma_matmul(
     group,
-    a: Buffer[M, K],
-    b: Buffer[K, N],
-    c: Buffer[M, N],
+    a: Buffer[M, K, np.float16],
+    b: Buffer[K, N, np.float16],
+    c: Buffer[M, N, np.float32],
 ) -> None:
     row0, col0 = _tile_origin(group.group_id[0], group.group_id[1])
     acc = init_wmma_acc(group)

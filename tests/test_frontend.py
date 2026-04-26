@@ -8,6 +8,7 @@ import ast
 import inspect
 import re
 
+import numpy as np
 import pytest
 from frontend_return_fixtures import (
     FUNC_RETURN_NONE_SOURCE,
@@ -15,7 +16,7 @@ from frontend_return_fixtures import (
 )
 
 from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
-from hc import CurrentGroup, WorkItem, kernel
+from hc import Buffer, CurrentGroup, WorkItem, kernel
 from hc._frontend import (
     FrontendError,
     RecordingEmitter,
@@ -262,6 +263,11 @@ def _bad_file_kernel(group: CurrentGroup, x: int) -> int:
     return x
 
 
+@kernel(work_shape=(4,), group_shape=(4,))
+def _typed_buffer_kernel(group: CurrentGroup, data: Buffer[4, np.float32]) -> None:
+    return None
+
+
 def _event_kinds(emitter: RecordingEmitter) -> list[str]:
     return [event.kind for event in emitter.events]
 
@@ -341,6 +347,18 @@ def test_lower_function_records_kernel_and_collective_region() -> None:
     assert region_payload["captures"] == ("tmp",)
     assert tuple(name for name, *_ in region_payload["parameters"]) == ("wi",)
     assert _payloads(emitter, "target_name")[0]["id"] == "tmp"
+
+
+def test_lower_function_records_buffer_dtype_annotations() -> None:
+    emitter = RecordingEmitter()
+
+    lower_function(_typed_buffer_kernel, emitter)
+
+    kernel_payload = _payloads(emitter, "kernel_begin")[0]
+    assert kernel_payload["parameter_annotations"] == {
+        "group": {"kind": "launch_context", "launch_context": "group"},
+        "data": {"kind": "buffer", "shape": ("4",), "dtype": "float32"},
+    }
 
 
 def test_lower_function_records_intrinsic_metadata_and_buffer_annotations() -> None:

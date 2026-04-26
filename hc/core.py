@@ -17,9 +17,14 @@ from typing import Any, Protocol, cast
 @dataclass(frozen=True)
 class BufferSpec:
     dimensions: tuple[Any, ...]
+    dtype: Any = None
 
     def __repr__(self) -> str:
-        body = ", ".join(str(dim) for dim in self.dimensions)
+        parts = [str(dim) for dim in self.dimensions]
+        if self.dtype is not None:
+            name = getattr(self.dtype, "__name__", None)
+            parts.append(str(name if isinstance(name, str) else self.dtype))
+        body = ", ".join(parts)
         return f"Buffer[{body}]"
 
 
@@ -27,7 +32,23 @@ class Buffer:
     def __class_getitem__(cls, item: Any) -> BufferSpec:
         if not isinstance(item, tuple):
             item = (item,)
-        return BufferSpec(item)
+        dtype = None
+        if len(item) >= 2 and _is_dtype_spec(item[-1]):
+            *dims, dtype = item
+            item = tuple(dims)
+        return BufferSpec(item, dtype=dtype)
+
+
+def _is_dtype_spec(value: Any) -> bool:
+    if value is None or isinstance(value, str):
+        return False
+    try:
+        import numpy as np
+
+        np.dtype(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 @dataclass(frozen=True)

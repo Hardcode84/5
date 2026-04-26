@@ -301,8 +301,7 @@ hc.intrinsic @typed_vector_intrinsic(%frag: !hc.vector<f16, ["16"]>)
     scope = #hc.scope<"WorkItem"> parameters = ["frag"] {}
 
 // CHECK-LABEL: hc.func @intrinsic_contract_caller
-// CHECK: hc.call_intrinsic @typed_vector_intrinsic(%{{.*}})
-// CHECK-SAME: (!hc.vector<f16, ["16"]>) -> !hc.vector<f32, ["8"]>
+// CHECK: hc.call_intrinsic @typed_vector_intrinsic(%{{[^)]*}}) : (!hc.vector<f16, ["16"]>) -> !hc.vector<f32, ["8"]>
 hc.func @intrinsic_contract_caller(%frag: !hc.vector<f16, ["16"]>) {
   %result = hc.call_intrinsic @typed_vector_intrinsic(%frag)
       : (!hc.vector<f16, ["16"]>) -> !hc.undef

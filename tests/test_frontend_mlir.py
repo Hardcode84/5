@@ -11,6 +11,7 @@ import textwrap
 from functools import lru_cache
 from typing import Any, cast
 
+import numpy as np
 import pytest
 from frontend_return_fixtures import KERNEL_RETURN_NONE_SOURCE
 
@@ -77,7 +78,7 @@ _K = sym.K
 )
 def _metadata_kernel(
     group: CurrentGroup,
-    a: Buffer[_M, _K],
+    a: Buffer[_M, _K, np.float16],
     b: int,
     n: _M,
 ) -> None: ...
@@ -292,7 +293,7 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         ]
         assert _parameter_structural_records(kernel_op) == [
             {"kind": "launch_context", "launch_context": "group"},
-            {"kind": "buffer", "shape": ["M", "K"]},
+            {"kind": "buffer", "dtype": "float16", "shape": ["M", "K"]},
             {"kind": "scalar", "dtype": "int"},
             {"kind": "symbol"},
         ]

@@ -756,6 +756,12 @@ def _bind_buffer(
         raise LaunchError(f"{source} must be a numpy.ndarray buffer")
     if value.ndim != len(spec.dimensions):
         raise LaunchError(f"{source} rank does not match its Buffer annotation")
+    if spec.dtype is not None:
+        expected = np.dtype(spec.dtype)
+        if value.dtype != expected:
+            raise LaunchError(
+                f"{source} dtype expected {expected.name}, got {value.dtype.name}"
+            )
     for index, dim in enumerate(spec.dimensions):
         _bind_dimension(
             bindings, dim, int(value.shape[index]), f"{source}.shape[{index}]"

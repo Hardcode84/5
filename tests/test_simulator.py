@@ -196,6 +196,17 @@ def test_launch_rejects_conflicting_symbol_bindings() -> None:
         sim.launch(same_shape, x, y)
 
 
+def test_launch_rejects_buffer_dtype_mismatches() -> None:
+    @kernel(work_shape=(4,), group_shape=(4,))
+    def typed(group, x: Buffer[4, np.float32]) -> None:
+        return None
+
+    sim.launch(typed, np.zeros((4,), dtype=np.float32))
+
+    with pytest.raises(sim.LaunchError, match="x dtype expected float32, got float64"):
+        sim.launch(typed, np.zeros((4,), dtype=np.float64))
+
+
 def test_vector_load_and_store_preserve_active_elements_only() -> None:
     W = sym.W
 

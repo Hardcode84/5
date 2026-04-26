@@ -596,23 +596,22 @@ under `-cse`, an unannotated one does not.
 
 The example `examples/amdgpu_gfx11_wmma_matmul.py` is the shape-first
 integration target. Two snapshots are shown: immediately after `hc_front → hc`
-(mostly `!hc.undef`, with trivially seeded group/buffer parameters, generic
-ops, no inference), and after type / symbol inference.
+(structural ops with metadata-seeded group, buffer, and intrinsic contract
+types, but no dataflow inference), and after type / symbol inference.
 
-#### After `hc_front → hc` (mechanical, mostly `!hc.undef`)
+#### After `hc_front → hc` (mechanical, with annotation-seeded contracts)
 
 ```mlir
 hc.kernel @tiled_gfx11_wmma_matmul(
-  %group: !hc.group<work_shape = #hc.shape<["ceil_div(M, 16) * 32", "ceil_div(N, 16)"]>,
+  %group: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>,
                     group_shape = #hc.shape<["32", "1"]>,
-                    subgroup_size = 32 : i32>,
-  %a: !hc.buffer<!hc.undef, ["M", "K"]>,
-  %b: !hc.buffer<!hc.undef, ["K", "N"]>,
-  %c: !hc.buffer<!hc.undef, ["M", "N"]>) attributes {
-  work_shape    = #hc.shape<["ceil_div(M, 16) * 32", "ceil_div(N, 16)"]>,
+                    subgroup_size = #hc.expr<"32">>,
+  %a: !hc.buffer<f16, ["M", "K"]>,
+  %b: !hc.buffer<f16, ["K", "N"]>,
+  %c: !hc.buffer<f32, ["M", "N"]>) attributes {
+  work_shape    = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>,
   group_shape   = #hc.shape<["32", "1"]>,
-  subgroup_size = 32 : i32,
-  literals      = ["WMMA_M", "WMMA_N", "WMMA_K", "WAVE_LANES"]
+  subgroup_size = 32 : i32
 } {
   %c0 = hc.const <0 : i64>  : !hc.undef
   %c1 = hc.const <1 : i64>  : !hc.undef
@@ -628,7 +627,7 @@ hc.kernel @tiled_gfx11_wmma_matmul(
   %row0     = hc.mul %gr, %WM          : !hc.undef
   %col0     = hc.mul %gc, %WM          : !hc.undef
 
-  %a_k     = hc.buffer_dim %a, axis = 1 : !hc.buffer<!hc.undef, ["M", "K"]> -> !hc.undef
+  %a_k     = hc.buffer_dim %a, axis = 1 : !hc.buffer<f16, ["M", "K"]> -> !hc.undef
   %acc0    = hc.call @init_wmma_acc(%group) : (!hc.group<...>) -> !hc.undef
 
   %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK
@@ -640,35 +639,66 @@ hc.kernel @tiled_gfx11_wmma_matmul(
     %col_sl = hc.slice_expr(lower = %k0 upper = %col_hi)
                   : (!hc.undef, !hc.undef) -> !hc.undef
     %tile_shape = hc.tuple(%WM, %WK)
-        : (!hc.undef, !hc.undef) -> !hc.undef
+        : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
     %a_tile = hc.load %a[%row_sl, %col_sl], shape %tile_shape
-              : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+              : (!hc.buffer<f16, ["M", "K"]>, !hc.undef, !hc.undef,
+                 tuple<!hc.undef, !hc.undef>) -> !hc.undef
     // …analogous slice + load for b_tile…
     %acc1   = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
-              : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+              : (!hc.group<...>, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
     hc.yield %acc1 : !hc.undef
   }
 
   hc.call @store_wmma_tile(%group, %c, %row0, %col0, %acc_final)
-      : (!hc.undef, !hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
+      : (!hc.group<...>, !hc.buffer<f32, ["M", "N"]>,
+         !hc.undef, !hc.undef, !hc.undef) -> ()
 }
+
+hc.intrinsic @wmma_gfx11(
+  %group: !hc.undef,
+  %a_tile: !hc.tensor<f16, ["16", "16"]>,
+  %b_tile: !hc.tensor<f16, ["16", "16"]>,
+  %a_frag: !hc.vector<f16, ["16"]>,
+  %b_frag: !hc.vector<f16, ["16"]>,
+  %acc_frag: !hc.vector<f32, ["8"]>,
+  %lane: !hc.idx) -> !hc.vector<f32, ["8"]>
+  scope = <"WorkItem"> effects = pure
+  const_kwargs = ["arch", "wave_size"]
+  parameters = ["group", "a_tile", "b_tile", "a_frag", "b_frag",
+                "acc_frag", "lane", "wave_size", "arch"]
+  keyword_only = ["lane", "wave_size", "arch"] { }
 ```
 
-Every op is structural, no semantic checks yet. The pass is a tree rewrite
-over `hc_front` with no per-op inference work.
+Every op is structural, and most expression results still start as `!hc.undef`.
+The exceptions are metadata-backed surfaces: kernel buffer annotations seed
+element dtypes, launch-context parameters become group/workitem types, and
+intrinsic `operand_types` / `result_types` publish the callee `function_type`
+before dataflow inference runs.
 
 #### After type / symbol inference
 
 ```mlir
-hc.intrinsic @wmma_gfx11 scope = #hc.scope<"WorkItem">
-    effects = #hc.effects<"Pure"> {}
-// Specialization kwargs (`wave_size`, `arch`, ...) travel on the matching
-// `hc.call_intrinsic` sites as op attributes; a typed kwarg-descriptor
-// attribute on `hc.intrinsic` itself is a follow-up.
+hc.intrinsic @wmma_gfx11(
+  !hc.undef,
+  !hc.tensor<f16, ["16", "16"]>, !hc.tensor<f16, ["16", "16"]>,
+  !hc.vector<f16, ["16"]>, !hc.vector<f16, ["16"]>,
+  !hc.vector<f32, ["8"]>, !hc.idx) -> !hc.vector<f32, ["8"]>
+  scope = <"WorkItem"> effects = pure
+  const_kwargs = ["arch", "wave_size"] { }
 
-hc.func @init_wmma_acc   attributes {scope = #hc.scope<"WorkGroup">} (...)
-hc.func @issue_wmma_tile attributes {scope = #hc.scope<"WorkGroup">} (...)
-hc.func @store_wmma_tile attributes {scope = #hc.scope<"WorkGroup">} (...)
+hc.func @init_wmma_acc(%group: !hc.group<...>)
+    -> !hc.vector<f32, ["8"]> attributes {scope = #hc.scope<"WorkGroup">} (...)
+hc.func @issue_wmma_tile(%group: !hc.group<...>,
+                         %a_tile: !hc.tensor<f16, ["16", "16"]>,
+                         %b_tile: !hc.tensor<f16, ["16", "16"]>,
+                         %acc: !hc.vector<f32, ["8"]>)
+    -> !hc.vector<f32, ["8"]> attributes {scope = #hc.scope<"WorkGroup">} (...)
+hc.func @store_wmma_tile(%group: !hc.group<...>,
+                         %c: !hc.buffer<f32, ["M", "N"]>,
+                         %row0: !hc.idx<"16*$WG0">,
+                         %col0: !hc.idx<"16*$WG1">,
+                         %acc: !hc.vector<f32, ["8"]>)
+    attributes {scope = #hc.scope<"WorkGroup">} (...)
 
 hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
           (%group, %a, %b, %c) {
@@ -682,8 +712,7 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
 
   %a_k     = hc.buffer_dim %a, axis = 1    // : !hc.idx<K>
   %acc0    = hc.call @init_wmma_acc(%group)
-                 : (!hc.buffer<f16, #hc.shape<["M","K"]>>)
-                -> !hc.vector<f32, #hc.shape<["WMMA_ACC_FRAGMENT","32","1"]>>
+                 : (!hc.group<...>) -> !hc.vector<f32, ["8"]>
 
   %acc_final = hc.for_range %k0 = %c0 to %a_k step %WK    // %k0 : !hc.idx<"_k0">
                             iter_args (%acc = %acc0) {
@@ -693,16 +722,22 @@ hc.kernel @tiled_gfx11_wmma_matmul attributes { /* ...same attrs... */ }
     %col_sl = hc.slice_expr(lower = %k0   upper = %col_hi) : !hc.slice
     %tile_shape = hc.tuple(%WM, %WK) : tuple<!hc.idx<"16">, !hc.idx<"16">>
     %a_tile = hc.load %a[%row_sl, %col_sl], shape %tile_shape
-              : (!hc.buffer<f16, #hc.shape<["M","K"]>>,
+              : (!hc.buffer<f16, ["M", "K"]>,
                  !hc.slice, !hc.slice,
                  tuple<!hc.idx<"16">, !hc.idx<"16">>)
-                -> !hc.tensor<f16, #hc.shape<["WMMA_M","WMMA_K"]>>
+                -> !hc.tensor<f16, ["16", "16"]>
     // ...
     %acc1 = hc.call @issue_wmma_tile(%group, %a_tile, %b_tile, %acc)
+        : (!hc.group<...>, !hc.tensor<f16, ["16", "16"]>,
+           !hc.tensor<f16, ["16", "16"]>, !hc.vector<f32, ["8"]>)
+          -> !hc.vector<f32, ["8"]>
     hc.yield %acc1
   }
 
   hc.call @store_wmma_tile(%group, %c, %row0, %col0, %acc_final)
+      : (!hc.group<...>, !hc.buffer<f32, ["M", "N"]>,
+         !hc.idx<"16*$WG0">, !hc.idx<"16*$WG1">,
+         !hc.vector<f32, ["8"]>) -> ()
 }
 ```
 

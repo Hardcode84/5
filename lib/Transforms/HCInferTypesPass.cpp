@@ -600,30 +600,19 @@ static TypeFact factFromValue(DataFlowSolver &solver, Value value) {
   return fact;
 }
 
-static HCYieldOp nestedScopeYield(Operation *op) {
-  if (!isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
-    return {};
-  if (op->getNumResults() == 0)
-    return {};
-  Region &body = op->getRegion(0);
-  if (body.empty() || body.front().empty())
-    return {};
-  return dyn_cast<HCYieldOp>(body.front().getTerminator());
-}
-
-static bool updateNestedScopeRegionResultTypes(ModuleOp module,
-                                               DataFlowSolver &solver) {
+static bool updateYieldedRegionResultTypes(ModuleOp module,
+                                           DataFlowSolver &solver) {
   bool changed = false;
-  module.walk([&](Operation *op) {
-    HCYieldOp yield = nestedScopeYield(op);
-    if (!yield)
+  module.walk([&](HCYieldedResultsOpInterface op) {
+    ValueRange yieldedValues = op.getYieldedResultValues();
+    if (yieldedValues.empty())
       return;
-    if (yield.getValues().size() != op->getNumResults()) {
-      assert(false && "verified nested scope yield arity mismatch");
+    if (yieldedValues.size() != op->getNumResults()) {
+      assert(false && "verified yielded-result region arity mismatch");
       return;
     }
     for (auto [result, yielded] :
-         llvm::zip_equal(op->getResults(), yield.getValues())) {
+         llvm::zip_equal(op->getResults(), yieldedValues)) {
       TypeFact fact = factFromValue(solver, yielded);
       if (!fact.hasUsableType())
         continue;
@@ -692,7 +681,7 @@ static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
   // Region result refinement can itself update enclosing callable signatures
   // through return users; the outer solver loop reruns until those surfaces
   // converge.
-  changed |= updateNestedScopeRegionResultTypes(module, solver);
+  changed |= updateYieldedRegionResultTypes(module, solver);
   module.walk([&](Operation *op) {
     for (OpResult result : op->getResults()) {
       if (!isNestedUnderHCCallable(result))

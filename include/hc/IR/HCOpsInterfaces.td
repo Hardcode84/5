@@ -97,6 +97,26 @@ def HCInferRegionArgTypeOpInterface :
   ];
 }
 
+def HCYieldedResultsOpInterface : OpInterface<"HCYieldedResultsOpInterface"> {
+  let description = [{
+    Contract for single-region ops whose `hc.yield` operands define the parent
+    op results.
+
+    This is narrower than `RegionBranchOpInterface`: it is for ops where the
+    dataflow solver does not otherwise propagate region terminator facts back
+    to parent results, but the region's sole terminator is still the semantic
+    source of those result values.
+  }];
+  let cppNamespace = "::mlir::hc";
+  let methods = [
+    InterfaceMethod<
+      "Return the values yielded to the parent op results, or empty if absent.",
+      "::mlir::ValueRange",
+      "getYieldedResultValues"
+    >
+  ];
+}
+
 def HCStaticShapeOpInterface : OpInterface<"HCStaticShapeOpInterface"> {
   let description = [{
     Contract for ops whose result shape is supplied by an SSA shape carrier.

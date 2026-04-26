@@ -148,7 +148,8 @@ def HCFuncOp : HC_RegionOp<"func",
 // verifier enforces that `$results`-declaring shape always pairs with
 // a concrete `hc.yield` of matching arity and type.
 def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
-    [NameStoreRegionOpInterface]> {
+    [NameStoreRegionOpInterface,
+     DeclareOpInterfaceMethods<HCYieldedResultsOpInterface>]> {
   let summary = "Semantic subgroup region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
   let results = (outs Variadic<HC_ValueType>:$results);
@@ -161,7 +162,8 @@ def HCSubgroupRegionOp : HC_RegionOp<"subgroup_region",
 }
 
 def HCWorkitemRegionOp : HC_RegionOp<"workitem_region",
-    [NameStoreRegionOpInterface]> {
+    [NameStoreRegionOpInterface,
+     DeclareOpInterfaceMethods<HCYieldedResultsOpInterface>]> {
   let summary = "Semantic workitem region.";
   let arguments = (ins OptionalAttr<StrArrayAttr>:$captures);
   let results = (outs Variadic<HC_ValueType>:$results);

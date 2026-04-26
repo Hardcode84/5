@@ -769,6 +769,27 @@ bool HCIfOp::areTypesCompatible(Type lhs, Type rhs) {
   return areHCBranchTypesCompatible(lhs, rhs);
 }
 
+template <typename RegionOpT>
+static ValueRange getSingleBlockYieldedResultValues(RegionOpT op) {
+  if (op->getNumResults() == 0)
+    return {};
+  Region &body = op.getBody();
+  if (body.empty() || body.front().empty())
+    return {};
+  auto yield = dyn_cast<HCYieldOp>(body.front().getTerminator());
+  if (!yield)
+    return {};
+  return yield.getValues();
+}
+
+ValueRange HCSubgroupRegionOp::getYieldedResultValues() {
+  return getSingleBlockYieldedResultValues(*this);
+}
+
+ValueRange HCWorkitemRegionOp::getYieldedResultValues() {
+  return getSingleBlockYieldedResultValues(*this);
+}
+
 LogicalResult HCForRangeOp::verify() {
   // The body block takes the induction variable plus one argument per
   // iter_args entry; result types mirror iter_inits types one-to-one.

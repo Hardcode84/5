@@ -674,3 +674,17 @@ module {
   } {
   }
 }
+
+// -----
+
+module {
+  // expected-error@+1 {{`operand_types` entry #0 kind 'tensor' has unsupported key 'expr'}}
+  hc_front.intrinsic "bad_intrinsic_contract_key" attributes {
+    operand_types = [{kind = "tensor", shape = ["4"], dtype = "float32", expr = "M"}],
+    parameters = [
+      {name = "value", passing = "positional"}
+    ],
+    scope = "WorkItem"
+  } {
+  }
+}

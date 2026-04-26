@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from ._frontend import FrontendEmitError
+from ._intrinsic_contracts import validate_intrinsic_type_contract_record
 from .mlir import ir
 from .mlir.dialects import hc_front
 
@@ -789,11 +790,9 @@ class HCFrontEmitter:
     def _type_contract_record_attr(self, value: object) -> Any:
         if not isinstance(value, Mapping):
             raise RuntimeError(f"expected type contract record, got {value!r}")
+        value = validate_intrinsic_type_contract_record(value)
         entries: dict[str, Any] = {}
-        kind = value.get("kind")
-        if not isinstance(kind, str):
-            raise RuntimeError(f"type contract record missing string kind: {value!r}")
-        entries["kind"] = self._string_attr(kind)
+        entries["kind"] = self._string_attr(str(value["kind"]))
         shape = value.get("shape")
         if shape is not None:
             entries["shape"] = self._string_array_attr(self._string_sequence(shape))

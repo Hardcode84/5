@@ -699,9 +699,26 @@ static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
   if (!kind)
     return sourceOp->emitOpError("`")
            << attrName << "` entry #" << index << " missing string `kind`";
-  if (kind.getValue() == "undef")
+  auto verifyKeys = [&](ArrayRef<StringRef> allowedKeys) -> LogicalResult {
+    llvm::SmallDenseSet<StringRef, 4> allowed(allowedKeys.begin(),
+                                              allowedKeys.end());
+    for (NamedAttribute attr : record) {
+      StringRef key = attr.getName().getValue();
+      if (!allowed.contains(key))
+        return sourceOp->emitOpError("`")
+               << attrName << "` entry #" << index << " kind '"
+               << kind.getValue() << "' has unsupported key '" << key << "'";
+    }
+    return success();
+  };
+  if (kind.getValue() == "undef") {
+    if (failed(verifyKeys({"kind"})))
+      return failure();
     return Type(UndefType::get(ctx));
+  }
   if (kind.getValue() == "idx") {
+    if (failed(verifyKeys({"kind", "expr"})))
+      return failure();
     if (auto expr = record.getAs<StringAttr>("expr")) {
       FailureOr<ExprAttr> parsed = stringToExpr(sourceOp, expr, "idx expr");
       if (failed(parsed))
@@ -717,6 +734,8 @@ static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
     return sourceOp->emitOpError("`")
            << attrName << "` entry #" << index << " has unsupported kind '"
            << kind.getValue() << "'";
+  if (failed(verifyKeys({"kind", "shape", "dtype"})))
+    return failure();
 
   auto dtype = record.getAs<StringAttr>("dtype");
   if (!dtype)

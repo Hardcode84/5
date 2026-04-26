@@ -246,23 +246,6 @@ static Type inferBufferDim(Type bufferType, int64_t axis, Operation *op) {
   return IdxType::get(op->getContext(), dim);
 }
 
-static ShapeAttr shapeFromTupleType(Type shapeType, Operation *op) {
-  if (!shapeType || isHCUndefType(shapeType))
-    return {};
-  auto tuple = dyn_cast<TupleType>(shapeType);
-  if (!tuple)
-    return {};
-  SmallVector<Attribute> dims;
-  dims.reserve(tuple.size());
-  for (Type dimType : tuple.getTypes()) {
-    auto idx = dyn_cast<IdxType>(dimType);
-    if (!idx || !idx.getExpr())
-      return {};
-    dims.push_back(idx.getExpr());
-  }
-  return ShapeAttr::get(op->getContext(), dims);
-}
-
 static FailureOr<ExprAttr> defaultZeroExpr(Operation *op) {
   return parseExprAttr("0", op);
 }
@@ -380,7 +363,7 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
 
 static Type inferLoadLikeResult(Type sourceType, Type shapeType,
                                 bool vectorResult, Operation *op) {
-  ShapeAttr shape = shapeFromTupleType(shapeType, op);
+  ShapeAttr shape = getStaticShapeFromTupleType(shapeType);
   if (!shape || !sourceType)
     return {};
   Type elementType = getSymbolicElementType(sourceType);
@@ -395,7 +378,7 @@ static Type inferLoadLikeResult(Type sourceType, Type shapeType,
 static Type inferAllocLikeResult(Type resultType, Type shapeType,
                                  TypeAttr dtype, Type fillType,
                                  bool vectorResult, Operation *op) {
-  ShapeAttr shape = shapeFromTupleType(shapeType, op);
+  ShapeAttr shape = getStaticShapeFromTupleType(shapeType);
   if (!shape)
     return resultType;
   Type elementType = getShapedValueElementType(resultType);

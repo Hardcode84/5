@@ -21,6 +21,60 @@ using namespace mlir::hc;
 
 bool mlir::hc::isHCUndefType(Type type) { return isa<UndefType>(type); }
 
+namespace {
+
+static FailureOr<ShapeAttr> staticShapeFromTupleType(Type shapeType,
+                                                     Operation *diagOp) {
+  if (!shapeType || isHCUndefType(shapeType)) {
+    if (diagOp)
+      return diagOp->emitOpError("shape operand is still !hc.undef; "
+                                 "expected a concrete tuple of static "
+                                 "!hc.idx dimensions");
+    return failure();
+  }
+
+  auto tuple = dyn_cast<TupleType>(shapeType);
+  if (!tuple) {
+    if (diagOp)
+      return diagOp->emitOpError("shape operand must be a tuple, got ")
+             << shapeType;
+    return failure();
+  }
+
+  SmallVector<Attribute> dims;
+  dims.reserve(tuple.size());
+  for (auto [idx, dimType] : llvm::enumerate(tuple.getTypes())) {
+    auto dim = dyn_cast<IdxType>(dimType);
+    if (!dim) {
+      if (diagOp)
+        return diagOp->emitOpError("shape dimension #")
+               << idx << " must be !hc.idx with a static expression, got "
+               << dimType;
+      return failure();
+    }
+    if (!dim.getExpr()) {
+      if (diagOp)
+        return diagOp->emitOpError("shape dimension #")
+               << idx << " is dynamic; expected pinned !hc.idx expression";
+      return failure();
+    }
+    dims.push_back(dim.getExpr());
+  }
+  return ShapeAttr::get(shapeType.getContext(), dims);
+}
+
+} // namespace
+
+ShapeAttr mlir::hc::getStaticShapeFromTupleType(Type shapeType) {
+  FailureOr<ShapeAttr> shape = staticShapeFromTupleType(shapeType, nullptr);
+  return succeeded(shape) ? *shape : ShapeAttr();
+}
+
+FailureOr<ShapeAttr>
+mlir::hc::verifyStaticShapeFromTupleType(Type shapeType, Operation *diagOp) {
+  return staticShapeFromTupleType(shapeType, diagOp);
+}
+
 Type mlir::hc::joinHCTypes(Type lhs, Type rhs) {
   if (lhs == rhs)
     return lhs;

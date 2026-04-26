@@ -29,34 +29,6 @@ using namespace mlir::hc;
 
 namespace {
 
-static FailureOr<ShapeAttr> staticShapeFromTuple(Value shapeOperand,
-                                                 Operation *op) {
-  Type shapeType = shapeOperand.getType();
-  if (isHCUndefType(shapeType))
-    return op->emitOpError(
-        "shape operand is still !hc.undef; expected a concrete tuple of "
-        "static !hc.idx dimensions");
-
-  auto tuple = dyn_cast<TupleType>(shapeType);
-  if (!tuple)
-    return op->emitOpError("shape operand must be a tuple, got ") << shapeType;
-
-  SmallVector<Attribute> dims;
-  dims.reserve(tuple.size());
-  for (auto [idx, dimType] : llvm::enumerate(tuple.getTypes())) {
-    auto dim = dyn_cast<IdxType>(dimType);
-    if (!dim)
-      return op->emitOpError("shape dimension #")
-             << idx << " must be !hc.idx with a static expression, got "
-             << dimType;
-    if (!dim.getExpr())
-      return op->emitOpError("shape dimension #")
-             << idx << " is dynamic; expected pinned !hc.idx expression";
-    dims.push_back(dim.getExpr());
-  }
-  return ShapeAttr::get(op->getContext(), dims);
-}
-
 static ShapeAttr symbolicShapeFromType(Type type) {
   if (auto shaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(type))
     return shaped.getSymbolicShape();
@@ -102,8 +74,8 @@ static LogicalResult verifyIndexStructure(Operation *op, ValueRange indices,
 
 static LogicalResult verifyStaticShapeOp(HCStaticShapeOpInterface shapeOp) {
   Operation *op = shapeOp.getOperation();
-  FailureOr<ShapeAttr> staticShape =
-      staticShapeFromTuple(shapeOp.getStaticShapeOperand(), op);
+  FailureOr<ShapeAttr> staticShape = verifyStaticShapeFromTupleType(
+      shapeOp.getStaticShapeOperand().getType(), op);
   if (failed(staticShape))
     return failure();
 

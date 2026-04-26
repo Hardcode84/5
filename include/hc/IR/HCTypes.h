@@ -9,6 +9,7 @@
 #include "hc/IR/HCTypesInterfaces.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Operation.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -68,6 +69,15 @@ std::optional<LaunchContextMetadata> getLaunchContextMetadata(Type contextType);
 
 /// Returns true when `type` is HC's erased refinement placeholder.
 bool isHCUndefType(Type type);
+
+/// Extract a static shape from a tuple whose elements are pinned `!hc.idx`.
+/// Returns null when the type is absent, erased, non-tuple, or contains a
+/// dynamic/non-index dimension.
+ShapeAttr getStaticShapeFromTupleType(Type shapeType);
+
+/// Diagnostic form of `getStaticShapeFromTupleType` for verifier passes.
+FailureOr<ShapeAttr> verifyStaticShapeFromTupleType(Type shapeType,
+                                                    Operation *diagOp);
 
 /// Join two concrete HC type facts, recursively joining tuple elements.
 /// Returns null when the facts are incompatible.

@@ -111,6 +111,22 @@ static LogicalResult collectOneToOneOperands(ArrayRef<ValueRange> operands,
   return success();
 }
 
+static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
+  SmallVector<Value> flattened;
+  for (ValueRange range : values)
+    llvm::append_range(flattened, range);
+  return flattened;
+}
+
+static LogicalResult convertFunctionType(FunctionType fnType,
+                                         const TypeConverter &converter,
+                                         SmallVectorImpl<Type> &inputs,
+                                         SmallVectorImpl<Type> &results) {
+  if (failed(converter.convertTypes(fnType.getInputs(), inputs)))
+    return failure();
+  return converter.convertTypes(fnType.getResults(), results);
+}
+
 static void replaceSingleResultWithSplit(ConversionPatternRewriter &rewriter,
                                          Operation *op, Value data,
                                          Value mask) {
@@ -164,6 +180,85 @@ public:
         });
     addSourceMaterialization(materializeSourceCast);
     addTargetMaterialization(materializeTargetCast);
+  }
+};
+
+template <typename OpT>
+struct ConvertCallableSignatureOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    TypeAttr fnTypeAttr = op.getFunctionTypeAttr();
+    if (!fnTypeAttr)
+      return failure();
+
+    FunctionType fnType = cast<FunctionType>(fnTypeAttr.getValue());
+    TypeConverter::SignatureConversion blockConversion(fnType.getNumInputs());
+    if (failed(this->typeConverter->convertSignatureArgs(fnType.getInputs(),
+                                                         blockConversion)))
+      return failure();
+
+    SmallVector<Type> convertedInputs;
+    SmallVector<Type> convertedResults;
+    if (failed(convertFunctionType(fnType, *this->typeConverter,
+                                   convertedInputs, convertedResults)))
+      return failure();
+
+    rewriter.applySignatureConversion(&op.getBody().front(), blockConversion,
+                                      this->typeConverter);
+    FunctionType convertedFnType = FunctionType::get(
+        rewriter.getContext(), convertedInputs, convertedResults);
+    rewriter.modifyOpInPlace(
+        op, [&] { op.setFunctionTypeAttr(TypeAttr::get(convertedFnType)); });
+    return success();
+  }
+};
+
+struct ConvertCallOp : public OpConversionPattern<HCCallOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCCallOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Value> convertedArgs = flattenValues(adaptor.getArgs());
+    SmallVector<Type> convertedResults;
+    SmallVector<unsigned> resultWidths;
+    for (Type resultType : op.getResultTypes()) {
+      unsigned start = convertedResults.size();
+      if (failed(typeConverter->convertTypes(resultType, convertedResults)))
+        return failure();
+      resultWidths.push_back(convertedResults.size() - start);
+    }
+
+    auto newCall = HCCallOp::create(rewriter, op.getLoc(), convertedResults,
+                                    op.getCalleeAttr(), convertedArgs);
+    newCall->setAttrs(op->getAttrs());
+
+    SmallVector<ValueRange> replacements;
+    unsigned offset = 0;
+    for (unsigned width : resultWidths) {
+      replacements.push_back(newCall->getResults().slice(offset, width));
+      offset += width;
+    }
+    rewriter.replaceOpWithMultiple(op, replacements);
+    return success();
+  }
+};
+
+struct ConvertReturnOp : public OpConversionPattern<HCReturnOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCReturnOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    HCReturnOp::create(rewriter, op.getLoc(),
+                       flattenValues(adaptor.getValues()));
+    rewriter.eraseOp(op);
+    return success();
   }
 };
 
@@ -403,6 +498,9 @@ struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
 static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 MLIRContext *ctx,
                                                 RewritePatternSet &patterns) {
+  patterns.add<ConvertCallableSignatureOp<HCKernelOp>,
+               ConvertCallableSignatureOp<HCFuncOp>, ConvertCallOp,
+               ConvertReturnOp>(converter, ctx);
   patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp, ConvertVecOp,
                ConvertWithInactiveOp>(converter, ctx);
   patterns
@@ -417,6 +515,12 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
                                     const TypeConverter &converter) {
   ConversionTarget target(*ctx);
   target.addLegalOp<UnrealizedConversionCastOp>();
+  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp>([&](Operation *op) {
+    return regionsAreLegal(op, converter) &&
+           callableSignatureIsLegal(op, converter);
+  });
+  target.addDynamicallyLegalOp<HCCallOp, HCReturnOp>(
+      [&](Operation *op) { return converter.isLegal(op); });
   target.markUnknownOpDynamicallyLegal([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter) &&
            callableSignatureIsLegal(op, converter);
@@ -430,11 +534,15 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
   ConversionTarget target(*ctx);
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
-  target
-      .addDynamicallyLegalOp<HCLoadOp, HCVLoadOp, HCBufferViewOp, HCVecOp,
-                             HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
-                             HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
-          [&](Operation *op) { return converter.isLegal(op); });
+  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp>([&](Operation *op) {
+    return regionsAreLegal(op, converter) &&
+           callableSignatureIsLegal(op, converter);
+  });
+  target.addDynamicallyLegalOp<HCCallOp, HCReturnOp, HCLoadOp, HCVLoadOp,
+                               HCBufferViewOp, HCVecOp, HCWithInactiveOp,
+                               HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp,
+                               HCEmptyOp, HCVFullOp, HCFullOp>(
+      [&](Operation *op) { return converter.isLegal(op); });
   return target;
 }
 

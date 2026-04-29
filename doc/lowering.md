@@ -898,9 +898,10 @@ Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
 refined, static tensor/vector shape operands have been verified, and supported
 semantic shaped values may have been split into bare data/masks. The scheduled
-decomposition is non-strict: helper calls, stores, and shaped region boundaries
-that are not decomposed yet are preserved with `builtin.unrealized_conversion_cast`.
-Symbolic launch parameters may still remain.
+decomposition is non-strict: helper-call signatures and call sites are
+decomposed, while stores, intrinsics, and shaped region boundaries that are not
+decomposed yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic
+launch parameters may still remain.
 
 ### SSA construction
 

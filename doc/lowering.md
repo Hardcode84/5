@@ -875,6 +875,7 @@ folding / inline markers on is:
                               → hc-promote-names
                               → hc-infer-types
                               → hc-verify-static-shapes
+                              → hc-decompose-shaped-values(strict=false)
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
@@ -886,7 +887,8 @@ on the same pass list, so
 
     hc-opt --hc-front-fold-region-defs --hc-front-inline \
            --convert-hc-front-to-hc --hc-promote-names \
-           --hc-infer-types --hc-verify-static-shapes
+           --hc-infer-types --hc-verify-static-shapes \
+           --hc-decompose-shaped-values=strict=false
 
 and `hc.compile(...)` with the default schedule produce identical
 output. See [`doc/schedules.md`](schedules.md) for the schedule format
@@ -894,8 +896,11 @@ and override API.
 
 Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
-refined, and static tensor/vector shape operands have been verified. Symbolic
-launch parameters may still remain.
+refined, static tensor/vector shape operands have been verified, and supported
+semantic shaped values may have been split into bare data/masks. The scheduled
+decomposition is non-strict until helper calls, stores, and shaped region
+boundaries all have decomposition rules. Symbolic launch parameters may still
+remain.
 
 ### SSA construction
 

@@ -373,6 +373,55 @@ struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
   }
 };
 
+static void populateShapedDecompositionPatterns(TypeConverter &converter,
+                                                MLIRContext *ctx,
+                                                RewritePatternSet &patterns) {
+  patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp, ConvertVecOp,
+               ConvertWithInactiveOp>(converter, ctx);
+  patterns
+      .add<ConvertNullaryAllocOp<HCVZerosOp>, ConvertNullaryAllocOp<HCVOnesOp>,
+           ConvertNullaryAllocOp<HCZerosOp>, ConvertNullaryAllocOp<HCOnesOp>,
+           ConvertNullaryAllocOp<HCEmptyOp>, ConvertFillAllocOp<HCVFullOp>,
+           ConvertFillAllocOp<HCFullOp>>(converter, ctx);
+}
+
+static ConversionTarget
+makeShapedDecompositionTarget(MLIRContext *ctx,
+                              const TypeConverter &converter) {
+  ConversionTarget target(*ctx);
+  target.markUnknownOpDynamicallyLegal([&](Operation *op) {
+    return converter.isLegal(op) && regionsAreLegal(op, converter) &&
+           callableSignatureIsLegal(op, converter);
+  });
+  return target;
+}
+
+static bool hasSemanticShapedResult(Operation *op) {
+  return llvm::any_of(op->getResultTypes(), isSemanticShaped);
+}
+
+static bool isSupportedDecompositionRoot(Operation *op) {
+  return hasSemanticShapedResult(op) &&
+         isa<HCLoadOp, HCVLoadOp, HCBufferViewOp, HCVecOp, HCWithInactiveOp,
+             HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp,
+             HCFullOp>(op);
+}
+
+static bool shouldAttemptNonStrictConversion(Operation *root,
+                                             ConversionTarget &target) {
+  bool canConvert = true;
+  root->walk([&](Operation *op) {
+    if (target.isLegal(op) || isSupportedDecompositionRoot(op))
+      return;
+
+    // The default frontend schedule runs before every shaped consumer has a
+    // decomposition rule. Keep that best-effort mode quiet unless this pass can
+    // rewrite the whole module without surfacing strict-mode diagnostics.
+    canConvert = false;
+  });
+  return canConvert;
+}
+
 struct HCDecomposeShapedValuesPass
     : public hc::impl::HCDecomposeShapedValuesBase<
           HCDecomposeShapedValuesPass> {
@@ -383,23 +432,15 @@ struct HCDecomposeShapedValuesPass
     HCShapedTypeConverter converter;
 
     RewritePatternSet patterns(ctx);
-    patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
-                 ConvertVecOp, ConvertWithInactiveOp>(converter, ctx);
-    patterns
-        .add<ConvertNullaryAllocOp<HCVZerosOp>,
-             ConvertNullaryAllocOp<HCVOnesOp>, ConvertNullaryAllocOp<HCZerosOp>,
-             ConvertNullaryAllocOp<HCOnesOp>, ConvertNullaryAllocOp<HCEmptyOp>,
-             ConvertFillAllocOp<HCVFullOp>, ConvertFillAllocOp<HCFullOp>>(
-            converter, ctx);
+    populateShapedDecompositionPatterns(converter, ctx, patterns);
+    FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-    ConversionTarget target(*ctx);
-    target.markUnknownOpDynamicallyLegal([&](Operation *op) {
-      return converter.isLegal(op) && regionsAreLegal(op, converter) &&
-             callableSignatureIsLegal(op, converter);
-    });
+    ConversionTarget target = makeShapedDecompositionTarget(ctx, converter);
+    if (!strictMode &&
+        !shouldAttemptNonStrictConversion(getOperation(), target))
+      return;
 
-    if (failed(
-            applyFullConversion(getOperation(), target, std::move(patterns))))
+    if (failed(applyFullConversion(getOperation(), target, frozenPatterns)))
       signalPassFailure();
   }
 };

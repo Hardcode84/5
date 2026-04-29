@@ -84,6 +84,11 @@ def HCDecomposeShapedValues
     for upstream lowering; semantic shaped values that cross unsupported ops are
     diagnosed instead of being silently dropped.
   }];
+  let options = [
+    Option<"strictMode", "strict", "bool", "true",
+           "Fail when the whole module cannot be decomposed. Disable this for "
+           "best-effort scheduling before all shaped consumers are supported.">
+  ];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 

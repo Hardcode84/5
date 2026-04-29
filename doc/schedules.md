@@ -10,9 +10,10 @@ hands it the schedule file, so any pass that is registered in the
 process's MLIR pass registry (upstream canonicalize / cse / ...,
 plus the `hc` pass families) is fair game inside a schedule.
 
-This is a pipeline manifest, not a full schedule language yet — no
-knobs, no payload filtering, no scoping. It will grow as the compiler
-earns knobs; today it only picks which passes run and in what order.
+This is a pipeline manifest, not a full schedule language yet — pass
+options are supported, but there is no payload filtering or scoping. It will
+grow as the compiler earns knobs; today it mostly picks which passes run and
+in what order.
 
 ## Default schedule
 
@@ -35,10 +36,13 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m6 = transform.apply_registered_pass "hc-verify-static-shapes" to %m5
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m6 {
+    %m7 = transform.apply_registered_pass "hc-decompose-shaped-values"
+        with options = { "strict" = false } to %m6
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m7 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m6 : !transform.any_op
+    transform.apply_cse to %m7 : !transform.any_op
     transform.yield
   }
 }
@@ -48,7 +52,11 @@ The static shape verifier runs after type inference because it validates SSA
 shape operands through their inferred `!hc.idx<...>` tuple element types. It
 runs before canonicalization and CSE so default compilation rejects invalid
 shape contracts before later cleanup can obscure the producer that carried the
-bad shape.
+bad shape. Shaped-value decomposition runs next in non-strict mode: modules
+whose semantic tensors/vectors only touch supported producers and users are
+split into bare data/masks, while modules that still cross helper-call, store,
+or region boundaries are left unchanged until those consumers grow
+decomposition rules.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

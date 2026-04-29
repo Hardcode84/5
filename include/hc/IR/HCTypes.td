@@ -274,6 +274,34 @@ def HC_ShapedValueType : AnyTypeOf<[
   HC_VectorType,
 ]>;
 
+// Compiler-internal raw data/mask containers used after semantic shaped values
+// are decomposed. Kept separate from `HC_ShapedValueType` so source-semantic ops
+// opt into the split representation deliberately.
+def HC_BareShapedValueType : AnyTypeOf<[
+  HC_BareTensorType,
+  HC_BareVectorType,
+]>;
+
+def HC_TensorLikeValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_TensorType,
+  HC_BareTensorType,
+]>;
+
+def HC_VectorLikeValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_VectorType,
+  HC_BareVectorType,
+]>;
+
+def HC_DecomposableShapedValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_TensorType,
+  HC_VectorType,
+  HC_BareTensorType,
+  HC_BareVectorType,
+]>;
+
 // Buffer-rooted values. Used on the "handle" operand of data-movement and
 // subscript ops so a stray `!hc.pred` or scalar value cannot stand in for a
 // buffer even pre-inference.
@@ -290,6 +318,7 @@ def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
   HC_TensorType,
+  HC_BareTensorType,
 ]>;
 
 // Roots accepted by the generic subscript form that still lowers to
@@ -300,6 +329,8 @@ def HC_ViewRootValueType : AnyTypeOf<[
   HC_BufferType,
   HC_TensorType,
   HC_VectorType,
+  HC_BareTensorType,
+  HC_BareVectorType,
 ]>;
 
 // Launch-context root. `!hc.undef` keeps hand-written pre-inference IR legal;

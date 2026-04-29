@@ -1162,6 +1162,60 @@ LogicalResult HCWithInactiveOp::verify() {
   return success();
 }
 
+static Type bareShapedElement(Type type) {
+  if (!llvm::isa<BareTensorType, BareVectorType>(type))
+    return {};
+  auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  return shaped ? shaped.getSymbolicElementType() : Type{};
+}
+
+static LogicalResult verifyBarePredicateMask(Operation *op, Type type) {
+  Type elem = bareShapedElement(type);
+  if (!elem || !llvm::isa<PredType>(elem))
+    return op->emitOpError("result type must be a bare tensor/vector of "
+                           "`!hc.pred`, got ")
+           << type;
+  return success();
+}
+
+LogicalResult HCLoadMaskOp::verify() {
+  return verifyBarePredicateMask(getOperation(), getMask().getType());
+}
+
+LogicalResult HCFullMaskOp::verify() {
+  return verifyBarePredicateMask(getOperation(), getMask().getType());
+}
+
+LogicalResult HCSelectOp::verify() {
+  Type condition = getCondition().getType();
+  if (failed(verifyBarePredicateMask(getOperation(), condition)))
+    return failure();
+
+  Type trueValue = getTrueValue().getType();
+  Type result = getResult().getType();
+  if (trueValue != result)
+    return emitOpError("true value type ")
+           << trueValue << " must match result type " << result;
+
+  Type elem = bareShapedElement(result);
+  Type inactive = getFalseValue().getType();
+  if (!elem || isHCUndefType(inactive))
+    return success();
+  auto sameDomain = [&](Type t) -> bool {
+    if (llvm::isa<PredType>(t))
+      return elem.isInteger(1);
+    if (llvm::isa<IdxType>(t))
+      return elem.isIntOrIndex();
+    if (t.isIntOrIndexOrFloat())
+      return elem == t;
+    return false;
+  };
+  if (!sameDomain(inactive))
+    return emitOpError("false value type ")
+           << inactive << " does not match result element type " << elem;
+  return success();
+}
+
 Value HCLoadOp::getStaticShapeOperand() { return getShape(); }
 Type HCLoadOp::getStaticShapedResultType() { return getResult().getType(); }
 bool HCLoadOp::hasStaticVectorResult() { return false; }

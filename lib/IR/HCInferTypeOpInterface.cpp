@@ -230,7 +230,8 @@ static Type getSymbolicElementType(Type type) {
 }
 
 static Type getShapedValueElementType(Type type) {
-  if (!isa<mlir::hc::TensorType, mlir::hc::VectorType>(type))
+  if (!isa<mlir::hc::TensorType, mlir::hc::VectorType, mlir::hc::BareTensorType,
+           mlir::hc::BareVectorType>(type))
     return {};
   return getSymbolicElementType(type);
 }
@@ -321,7 +322,8 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   ArrayRef<Attribute> baseDims = shape.getDims();
   SmallVector<Attribute> resultDims;
   unsigned axis = 0;
-  bool vectorRoot = isa<mlir::hc::VectorType>(sourceType);
+  bool vectorRoot =
+      isa<mlir::hc::VectorType, mlir::hc::BareVectorType>(sourceType);
   for (Type indexType : indexTypes) {
     if (axis >= baseDims.size()) {
       // Workitem/subgroup-lifted vectors carry collective suffix axes in
@@ -367,9 +369,15 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   if (vectorRoot) {
     if (resultDims.empty())
       return elementType;
+    if (isa<mlir::hc::BareVectorType>(sourceType))
+      return Type(mlir::hc::BareVectorType::get(op->getContext(), elementType,
+                                                resultShape));
     return Type(
         mlir::hc::VectorType::get(op->getContext(), elementType, resultShape));
   }
+  if (isa<mlir::hc::BareTensorType>(sourceType))
+    return Type(mlir::hc::BareTensorType::get(op->getContext(), elementType,
+                                              resultShape));
   return Type(
       mlir::hc::TensorType::get(op->getContext(), elementType, resultShape));
 }
@@ -816,6 +824,11 @@ LogicalResult HCVecOp::inferHCTypes(ArrayRef<Type> operandTypes,
   if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(value)) {
     resultTypes.push_back(mlir::hc::VectorType::get(
         getContext(), tensor.getElementType(), tensor.getShape()));
+    return success();
+  }
+  if (auto bareTensor = dyn_cast_or_null<mlir::hc::BareTensorType>(value)) {
+    resultTypes.push_back(mlir::hc::BareVectorType::get(
+        getContext(), bareTensor.getElementType(), bareTensor.getShape()));
     return success();
   }
   resultTypes.push_back(value);

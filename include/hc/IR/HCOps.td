@@ -362,6 +362,24 @@ def HCCmpGeOp : HC_CmpOp<"ge">;
 def HCCmpEqOp : HC_CmpOp<"eq">;
 def HCCmpNeOp : HC_CmpOp<"ne">;
 
+def HCSelectOp : HC_Op<"select", [Pure]> {
+  let summary = "Select between bare shaped data and a scalar inactive value.";
+  let description = [{
+    Internal form used after mask decomposition. `$condition` is a bare
+    `!hc.pred` tensor/vector mask, `$true_value` is matching bare data, and
+    `$false_value` is the scalar fill for inactive elements.
+  }];
+  let arguments = (ins
+    HC_BareShapedValueType:$condition,
+    HC_BareShapedValueType:$true_value,
+    HC_ScalarValueType:$false_value
+  );
+  let results = (outs HC_BareShapedValueType:$result);
+  let hasVerifier = 1;
+  let assemblyFormat =
+      "$condition `,` $true_value `,` $false_value attr-dict `:` functional-type(operands, results)";
+}
+
 //===----------------------------------------------------------------------===//
 // Intrinsic declaration and structured control flow.
 //===----------------------------------------------------------------------===//
@@ -708,6 +726,37 @@ def HCVLoadOp : HC_Op<"vload",
   }];
 }
 
+def HCLoadMaskOp : HC_Op<"load_mask", [Pure]> {
+  let summary = "Compute the validity mask for a shaped load.";
+  let description = [{
+    Internal companion for decomposed `hc.load` / `hc.vload`. It carries the
+    same addressing operands as the load that produced the data and returns a
+    bare tensor/vector of `!hc.pred` values describing element validity.
+  }];
+  let arguments = (ins
+    HC_BufferOrTensorValueType:$source,
+    Variadic<HC_ValueType>:$indices,
+    HC_TupleValueType:$shape
+  );
+  let results = (outs HC_BareShapedValueType:$mask);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $source `[` $indices `]` `,` `shape` $shape attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+def HCFullMaskOp : HC_Op<"full_mask", [Pure]> {
+  let summary = "Produce an all-true bare predicate mask.";
+  let description = [{
+    Internal mask seed for values whose whole static shape is known valid after
+    decomposition, such as allocators and inactive-filled vectors.
+  }];
+  let results = (outs HC_BareShapedValueType:$mask);
+  let hasVerifier = 1;
+  let assemblyFormat = "attr-dict `:` type($mask)";
+}
+
 def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tensor or vector into a buffer or tensor.";
   let description = [{
@@ -736,8 +785,8 @@ def HCVecOp : HC_Op<"vec",
     memory; two `hc.vec` ops on the same tensor may observe different contents
     if a store is interleaved, so CSE must not collapse them blindly.
   }];
-  let arguments = (ins HC_ShapedValueType:$value);
-  let results = (outs HC_ShapedValueType:$result);
+  let arguments = (ins HC_TensorLikeValueType:$value);
+  let results = (outs HC_VectorLikeValueType:$result);
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
 

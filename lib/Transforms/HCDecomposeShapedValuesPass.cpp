@@ -1,0 +1,409 @@
+// SPDX-FileCopyrightText: 2026 hc contributors
+//
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// Implements `-hc-decompose-shaped-values`, the HC-to-HC boundary that makes
+// implicit tensor/vector validity explicit before upstream dialect conversion.
+
+#include "hc/Transforms/Passes.h"
+
+#include "hc/IR/HCDialect.h"
+#include "hc/IR/HCOps.h"
+#include "hc/IR/HCTypes.h"
+
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/STLExtras.h"
+
+namespace mlir::hc {
+#define GEN_PASS_DEF_HCDECOMPOSESHAPEDVALUES
+#include "hc/Transforms/Passes.h.inc"
+} // namespace mlir::hc
+
+using namespace mlir;
+using namespace mlir::hc;
+
+namespace {
+
+static bool isSemanticShaped(Type type) {
+  return isa<mlir::hc::TensorType, mlir::hc::VectorType>(type);
+}
+
+static Type bareDataType(Type type) {
+  if (auto tensor = dyn_cast<mlir::hc::TensorType>(type))
+    return BareTensorType::get(type.getContext(), tensor.getElementType(),
+                               tensor.getShape());
+  if (auto vector = dyn_cast<mlir::hc::VectorType>(type))
+    return BareVectorType::get(type.getContext(), vector.getElementType(),
+                               vector.getShape());
+  return {};
+}
+
+static Type bareMaskType(Type type) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  if (!shaped)
+    return {};
+  Type pred = getUnpinnedPredType(type.getContext());
+  if (isa<mlir::hc::TensorType, BareTensorType>(type))
+    return BareTensorType::get(type.getContext(), pred,
+                               shaped.getSymbolicShape());
+  if (isa<mlir::hc::VectorType, BareVectorType>(type))
+    return BareVectorType::get(type.getContext(), pred,
+                               shaped.getSymbolicShape());
+  return {};
+}
+
+static bool functionTypeIsLegal(TypeAttr attr, const TypeConverter &converter) {
+  if (!attr)
+    return true;
+  auto fnType = dyn_cast<FunctionType>(attr.getValue());
+  return !fnType || converter.isSignatureLegal(fnType);
+}
+
+static bool callableSignatureIsLegal(Operation *op,
+                                     const TypeConverter &converter) {
+  if (auto func = dyn_cast<FunctionOpInterface>(op)) {
+    auto fnType = dyn_cast<FunctionType>(func.getFunctionType());
+    return !fnType || converter.isSignatureLegal(fnType);
+  }
+  if (auto kernel = dyn_cast<HCKernelOp>(op))
+    return functionTypeIsLegal(kernel.getFunctionTypeAttr(), converter);
+  if (auto func = dyn_cast<HCFuncOp>(op))
+    return functionTypeIsLegal(func.getFunctionTypeAttr(), converter);
+  if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
+    return functionTypeIsLegal(intrinsic.getFunctionTypeAttr(), converter);
+  return true;
+}
+
+static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
+  return llvm::all_of(op->getRegions(), [&](Region &region) {
+    return converter.isLegal(&region);
+  });
+}
+
+static FailureOr<Value> expectOne(ValueRange values, Operation *op,
+                                  StringRef what) {
+  if (values.size() == 1)
+    return values.front();
+  return op->emitOpError("expected one converted value for ")
+         << what << ", got " << values.size();
+}
+
+static FailureOr<std::pair<Value, Value>>
+expectSplit(ValueRange values, Operation *op, StringRef what) {
+  if (values.size() == 2)
+    return std::make_pair(values[0], values[1]);
+  return op->emitOpError("expected decomposed data and mask for ")
+         << what << ", got " << values.size() << " value(s)";
+}
+
+static LogicalResult collectOneToOneOperands(ArrayRef<ValueRange> operands,
+                                             Operation *op, StringRef what,
+                                             SmallVectorImpl<Value> &values) {
+  values.reserve(values.size() + operands.size());
+  for (ValueRange operand : operands) {
+    FailureOr<Value> value = expectOne(operand, op, what);
+    if (failed(value))
+      return failure();
+    values.push_back(*value);
+  }
+  return success();
+}
+
+static void replaceSingleResultWithSplit(ConversionPatternRewriter &rewriter,
+                                         Operation *op, Value data,
+                                         Value mask) {
+  SmallVector<SmallVector<Value>> replacements;
+  replacements.push_back({data, mask});
+  rewriter.replaceOpWithMultiple(op, std::move(replacements));
+}
+
+class HCShapedTypeConverter : public TypeConverter {
+public:
+  HCShapedTypeConverter() {
+    addConversion([](Type type) -> std::optional<Type> { return type; });
+    addConversion(
+        [](mlir::hc::TensorType type,
+           SmallVectorImpl<Type> &results) -> std::optional<LogicalResult> {
+          results.push_back(bareDataType(type));
+          results.push_back(bareMaskType(type));
+          return success();
+        });
+    addConversion(
+        [](mlir::hc::VectorType type,
+           SmallVectorImpl<Type> &results) -> std::optional<LogicalResult> {
+          results.push_back(bareDataType(type));
+          results.push_back(bareMaskType(type));
+          return success();
+        });
+  }
+};
+
+struct ConvertLoadOp : public OpConversionPattern<HCLoadOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCLoadOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<Value> buffer = expectOne(adaptor.getBuffer(), op, "load buffer");
+    FailureOr<Value> shape = expectOne(adaptor.getShape(), op, "load shape");
+    if (failed(buffer) || failed(shape))
+      return failure();
+    SmallVector<Value> indices;
+    if (failed(collectOneToOneOperands(adaptor.getIndices(), op, "load index",
+                                       indices)))
+      return failure();
+
+    auto data =
+        HCLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
+                         *buffer, indices, *shape);
+    auto mask =
+        HCLoadMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
+                             *buffer, indices, *shape);
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
+struct ConvertVLoadOp : public OpConversionPattern<HCVLoadOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCVLoadOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<Value> shape = expectOne(adaptor.getShape(), op, "vload shape");
+    if (failed(shape))
+      return failure();
+    SmallVector<Value> indices;
+    if (failed(collectOneToOneOperands(adaptor.getIndices(), op, "vload index",
+                                       indices)))
+      return failure();
+
+    Value dataSource;
+    Value maskSource;
+    if (adaptor.getSource().size() == 1) {
+      dataSource = adaptor.getSource().front();
+    } else {
+      FailureOr<std::pair<Value, Value>> source =
+          expectSplit(adaptor.getSource(), op, "vload source");
+      if (failed(source))
+        return failure();
+      dataSource = source->first;
+      maskSource = source->second;
+    }
+    auto data =
+        HCVLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
+                          dataSource, indices, *shape);
+    Value maskValue;
+    if (maskSource) {
+      maskValue =
+          HCVLoadOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
+                            maskSource, indices, *shape)
+              .getResult();
+    } else {
+      maskValue = HCLoadMaskOp::create(rewriter, op.getLoc(),
+                                       bareMaskType(originalType), dataSource,
+                                       indices, *shape)
+                      .getMask();
+    }
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(), maskValue);
+    return success();
+  }
+};
+
+template <typename OpT>
+struct ConvertNullaryAllocOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<Value> shape =
+        expectOne(adaptor.getShape(), op, "allocator shape");
+    if (failed(shape))
+      return failure();
+    auto data = OpT::create(rewriter, op.getLoc(), bareDataType(originalType),
+                            *shape, op.getDtypeAttr());
+    auto mask =
+        HCFullMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType));
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
+template <typename OpT>
+struct ConvertFillAllocOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<Value> fill = expectOne(adaptor.getValue(), op, "allocator fill");
+    FailureOr<Value> shape =
+        expectOne(adaptor.getShape(), op, "allocator shape");
+    if (failed(fill) || failed(shape))
+      return failure();
+    auto data = OpT::create(rewriter, op.getLoc(), bareDataType(originalType),
+                            *fill, *shape, op.getDtypeAttr());
+    auto mask =
+        HCFullMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType));
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
+struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCBufferViewOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    Value dataSource;
+    Value maskSource;
+    if (adaptor.getBuffer().size() == 1 &&
+        isa<BufferType>(op.getBuffer().getType())) {
+      dataSource = adaptor.getBuffer().front();
+    } else {
+      FailureOr<std::pair<Value, Value>> source =
+          expectSplit(adaptor.getBuffer(), op, "buffer_view source");
+      if (failed(source))
+        return failure();
+      dataSource = source->first;
+      maskSource = source->second;
+    }
+    SmallVector<Value> indices;
+    if (failed(collectOneToOneOperands(adaptor.getIndices(), op,
+                                       "buffer_view index", indices)))
+      return failure();
+
+    auto data = HCBufferViewOp::create(
+        rewriter, op.getLoc(), bareDataType(originalType), dataSource, indices);
+    Value maskValue;
+    if (maskSource) {
+      maskValue = HCBufferViewOp::create(rewriter, op.getLoc(),
+                                         bareMaskType(originalType), maskSource,
+                                         indices)
+                      .getResult();
+    } else {
+      maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
+                                       bareMaskType(originalType))
+                      .getMask();
+    }
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(), maskValue);
+    return success();
+  }
+};
+
+struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCVecOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getValue(), op, "vec source");
+    if (failed(source))
+      return failure();
+    auto data = HCVecOp::create(rewriter, op.getLoc(),
+                                bareDataType(originalType), source->first);
+    auto mask = HCVecOp::create(rewriter, op.getLoc(),
+                                bareMaskType(originalType), source->second);
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getResult());
+    return success();
+  }
+};
+
+struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCWithInactiveOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getValue(), op, "with_inactive source");
+    FailureOr<Value> inactive =
+        expectOne(adaptor.getInactive(), op, "with_inactive fill");
+    if (failed(source) || failed(inactive))
+      return failure();
+    auto data =
+        HCSelectOp::create(rewriter, op.getLoc(), bareDataType(originalType),
+                           source->second, source->first, *inactive);
+    auto mask =
+        HCFullMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType));
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
+struct HCDecomposeShapedValuesPass
+    : public hc::impl::HCDecomposeShapedValuesBase<
+          HCDecomposeShapedValuesPass> {
+  using Base::Base;
+
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    HCShapedTypeConverter converter;
+
+    RewritePatternSet patterns(ctx);
+    patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
+                 ConvertVecOp, ConvertWithInactiveOp>(converter, ctx);
+    patterns
+        .add<ConvertNullaryAllocOp<HCVZerosOp>,
+             ConvertNullaryAllocOp<HCVOnesOp>, ConvertNullaryAllocOp<HCZerosOp>,
+             ConvertNullaryAllocOp<HCOnesOp>, ConvertNullaryAllocOp<HCEmptyOp>,
+             ConvertFillAllocOp<HCVFullOp>, ConvertFillAllocOp<HCFullOp>>(
+            converter, ctx);
+
+    ConversionTarget target(*ctx);
+    target.markUnknownOpDynamicallyLegal([&](Operation *op) {
+      return converter.isLegal(op) && regionsAreLegal(op, converter) &&
+             callableSignatureIsLegal(op, converter);
+    });
+
+    if (failed(
+            applyFullConversion(getOperation(), target, std::move(patterns))))
+      signalPassFailure();
+  }
+};
+
+} // namespace
+
+// `createHCDecomposeShapedValuesPass()` is emitted by tablegen.

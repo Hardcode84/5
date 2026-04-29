@@ -74,4 +74,17 @@ def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCDecomposeShapedValues
+    : Pass<"hc-decompose-shaped-values", "::mlir::ModuleOp"> {
+  let summary = "Split semantic tensor/vector values into bare data and masks.";
+  let description = [{
+    Rewrites supported semantic `!hc.tensor` / `!hc.vector` producers and users
+    into compiler-internal `!hc.bare_tensor` / `!hc.bare_vector` data plus
+    matching bare `!hc.pred` masks. This is an HC-to-HC normalization boundary
+    for upstream lowering; semantic shaped values that cross unsupported ops are
+    diagnosed instead of being silently dropped.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 #endif // HC_TRANSFORMS_PASSES

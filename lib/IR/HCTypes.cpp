@@ -383,6 +383,38 @@ Type mlir::hc::VectorType::getSymbolicElementType() const {
 }
 
 mlir::LogicalResult
+mlir::hc::BareTensorType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 Type elementType, ShapeAttr shape) {
+  (void)elementType;
+  if (!shape)
+    return emitError() << "expected #hc.shape attribute";
+  return success();
+}
+
+ShapeAttr mlir::hc::BareTensorType::getSymbolicShape() const {
+  return getShape();
+}
+Type mlir::hc::BareTensorType::getSymbolicElementType() const {
+  return getElementType();
+}
+
+mlir::LogicalResult
+mlir::hc::BareVectorType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 Type elementType, ShapeAttr shape) {
+  (void)elementType;
+  if (!shape)
+    return emitError() << "expected #hc.shape attribute";
+  return success();
+}
+
+ShapeAttr mlir::hc::BareVectorType::getSymbolicShape() const {
+  return getShape();
+}
+Type mlir::hc::BareVectorType::getSymbolicElementType() const {
+  return getElementType();
+}
+
+mlir::LogicalResult
 mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,
                             ShapeAttr workShape, ShapeAttr groupShape,
                             ExprAttr subgroupSize) {

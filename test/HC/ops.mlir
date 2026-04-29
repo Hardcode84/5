@@ -19,6 +19,8 @@
 // CHECK-SAME: !hc.slice
 // CHECK-SAME: !hc.slice<lower = !hc.idx<"M">, step = !hc.idx>
 // CHECK-SAME: !hc.vector<f32, ["TileM", "TileN"]>
+// CHECK-SAME: !hc.bare_tensor<!hc.pred, ["TileM", "TileN"]>
+// CHECK-SAME: !hc.bare_vector<f32, ["TileM"]>
 // CHECK-SAME: !hc.buffer<f32, []>
 // CHECK-SAME: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = #hc.expr<"64">>
 // CHECK-SAME: tuple<!hc.idx<"M">, f32>
@@ -66,6 +68,8 @@ module {
       %s: !hc.slice,
       %typed_slice: !hc.slice<lower = !hc.idx<"M">, step = !hc.idx>,
       %v: !hc.vector<f32, ["TileM", "TileN"]>,
+      %bare_mask: !hc.bare_tensor<!hc.pred, ["TileM", "TileN"]>,
+      %bare_vec: !hc.bare_vector<f32, ["TileM"]>,
       %scalar_buffer: !hc.buffer<f32, []>,
       %g: !hc.group<work_shape = #hc.shape<["M"]>, subgroup_size = #hc.expr<"64">>,
       %t: tuple<!hc.idx<"M">, f32>) {

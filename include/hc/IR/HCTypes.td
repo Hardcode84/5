@@ -129,6 +129,38 @@ def HC_VectorType : HC_Type<"Vector", "vector",
   let genVerifyDecl = 1;
 }
 
+def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+  let summary = "Compiler-internal tensor data without semantic validity.";
+  let description = [{
+    Raw shaped tensor container produced by HC normalization before upstream
+    lowering. Unlike `!hc.tensor`, this type carries only data; validity travels
+    as a parallel `!hc.bare_tensor<!hc.pred, ...>` value with the same shape.
+  }];
+  let parameters = (ins
+    TypeParameter<"::mlir::Type", "element type">:$elementType,
+    HC_InlineShapeAttrParameter:$shape
+  );
+  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let genVerifyDecl = 1;
+}
+
+def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+  let summary = "Compiler-internal vector data without semantic validity.";
+  let description = [{
+    Raw shaped vector container produced by HC normalization before upstream
+    lowering. Unlike `!hc.vector`, this type carries only data; validity travels
+    as a parallel `!hc.bare_vector<!hc.pred, ...>` value with the same shape.
+  }];
+  let parameters = (ins
+    TypeParameter<"::mlir::Type", "element type">:$elementType,
+    HC_InlineShapeAttrParameter:$shape
+  );
+  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let genVerifyDecl = 1;
+}
+
 def HC_GroupType : HC_Type<"Group", "group"> {
   let summary = "Kernel launch-context token.";
   let description = [{
@@ -190,6 +222,8 @@ def HC_ValueType : AnyTypeOf<[
   HC_BufferType,
   HC_TensorType,
   HC_VectorType,
+  HC_BareTensorType,
+  HC_BareVectorType,
   HC_GroupType,
   HC_WorkitemType,
   HC_SubgroupType,

@@ -53,10 +53,10 @@ shape operands through their inferred `!hc.idx<...>` tuple element types. It
 runs before canonicalization and CSE so default compilation rejects invalid
 shape contracts before later cleanup can obscure the producer that carried the
 bad shape. Shaped-value decomposition runs next in non-strict mode: supported
-producers and users, including helper-call signatures and `hc.call` sites, are
-split into bare data/masks, while remaining store, intrinsic, and shaped region
-boundaries are preserved with `builtin.unrealized_conversion_cast` until those
-consumers grow decomposition rules.
+producers and users, including helper-call signatures, `hc.call` sites, and
+stores, are split into bare data/masks, while remaining intrinsic and shaped
+region boundaries are preserved with `builtin.unrealized_conversion_cast` until
+those consumers grow decomposition rules.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

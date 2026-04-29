@@ -249,6 +249,48 @@ struct ConvertCallOp : public OpConversionPattern<HCCallOp> {
   }
 };
 
+struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCStoreOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalSourceType = op.getSource().getType();
+    if (!isSemanticShaped(originalSourceType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getSource(), op, "store source");
+    if (failed(source))
+      return failure();
+
+    SmallVector<Value> indices;
+    if (failed(collectOneToOneOperands(adaptor.getIndices(), op, "store index",
+                                       indices)))
+      return failure();
+
+    if (adaptor.getDest().size() == 1) {
+      HCStoreOp::create(rewriter, op.getLoc(), adaptor.getDest().front(),
+                        indices, source->first, source->second);
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    FailureOr<std::pair<Value, Value>> dest =
+        expectSplit(adaptor.getDest(), op, "store destination");
+    if (failed(dest))
+      return failure();
+    // Tensor-backed stores update the decomposed payload and validity channels
+    // independently; a later lowering pass decides how those channels alias.
+    HCStoreOp::create(rewriter, op.getLoc(), dest->first, indices,
+                      source->first, Value{});
+    HCStoreOp::create(rewriter, op.getLoc(), dest->second, indices,
+                      source->second, Value{});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct ConvertReturnOp : public OpConversionPattern<HCReturnOp> {
   using Base::Base;
 
@@ -410,6 +452,8 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
 
     Value dataSource;
     Value maskSource;
+    // Buffer roots are not decomposed by this pass, so a single adapted operand
+    // means the view starts from fully valid buffer storage.
     if (adaptor.getBuffer().size() == 1 &&
         isa<BufferType>(op.getBuffer().getType())) {
       dataSource = adaptor.getBuffer().front();
@@ -434,6 +478,54 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
                                          bareMaskType(originalType), maskSource,
                                          indices)
                       .getResult();
+    } else {
+      maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
+                                       bareMaskType(originalType))
+                      .getMask();
+    }
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(), maskValue);
+    return success();
+  }
+};
+
+struct ConvertGetItemOp : public OpConversionPattern<HCGetItemOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCGetItemOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    Value dataSource;
+    Value maskSource;
+    // Buffer roots are not decomposed by this pass, so a single adapted operand
+    // means the item starts from fully valid buffer storage.
+    if (adaptor.getBase().size() == 1 &&
+        isa<BufferType>(op.getBase().getType())) {
+      dataSource = adaptor.getBase().front();
+    } else {
+      FailureOr<std::pair<Value, Value>> source =
+          expectSplit(adaptor.getBase(), op, "getitem base");
+      if (failed(source))
+        return failure();
+      dataSource = source->first;
+      maskSource = source->second;
+    }
+    SmallVector<Value> indices;
+    if (failed(collectOneToOneOperands(adaptor.getIndices(), op,
+                                       "getitem index", indices)))
+      return failure();
+
+    auto data = HCGetItemOp::create(
+        rewriter, op.getLoc(), bareDataType(originalType), dataSource, indices);
+    Value maskValue;
+    if (maskSource) {
+      maskValue =
+          HCGetItemOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
+                              maskSource, indices)
+              .getResult();
     } else {
       maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
                                        bareMaskType(originalType))
@@ -500,9 +592,10 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 RewritePatternSet &patterns) {
   patterns.add<ConvertCallableSignatureOp<HCKernelOp>,
                ConvertCallableSignatureOp<HCFuncOp>, ConvertCallOp,
-               ConvertReturnOp>(converter, ctx);
-  patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp, ConvertVecOp,
-               ConvertWithInactiveOp>(converter, ctx);
+               ConvertStoreOp, ConvertReturnOp>(converter, ctx);
+  patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
+               ConvertGetItemOp, ConvertVecOp, ConvertWithInactiveOp>(converter,
+                                                                      ctx);
   patterns
       .add<ConvertNullaryAllocOp<HCVZerosOp>, ConvertNullaryAllocOp<HCVOnesOp>,
            ConvertNullaryAllocOp<HCZerosOp>, ConvertNullaryAllocOp<HCOnesOp>,
@@ -519,7 +612,7 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
     return regionsAreLegal(op, converter) &&
            callableSignatureIsLegal(op, converter);
   });
-  target.addDynamicallyLegalOp<HCCallOp, HCReturnOp>(
+  target.addDynamicallyLegalOp<HCCallOp, HCStoreOp, HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.markUnknownOpDynamicallyLegal([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter) &&
@@ -538,10 +631,10 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
     return regionsAreLegal(op, converter) &&
            callableSignatureIsLegal(op, converter);
   });
-  target.addDynamicallyLegalOp<HCCallOp, HCReturnOp, HCLoadOp, HCVLoadOp,
-                               HCBufferViewOp, HCVecOp, HCWithInactiveOp,
-                               HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp,
-                               HCEmptyOp, HCVFullOp, HCFullOp>(
+  target.addDynamicallyLegalOp<
+      HCCallOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp, HCBufferViewOp,
+      HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
+      HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   return target;
 }

@@ -1169,6 +1169,20 @@ static Type bareShapedElement(Type type) {
   return shaped ? shaped.getSymbolicElementType() : Type{};
 }
 
+static Type barePredicateMaskType(Type type) {
+  auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  if (!shaped)
+    return {};
+  Type pred = getUnpinnedPredType(type.getContext());
+  if (llvm::isa<BareTensorType>(type))
+    return BareTensorType::get(type.getContext(), pred,
+                               shaped.getSymbolicShape());
+  if (llvm::isa<BareVectorType>(type))
+    return BareVectorType::get(type.getContext(), pred,
+                               shaped.getSymbolicShape());
+  return {};
+}
+
 static LogicalResult verifyBarePredicateMask(Operation *op, Type type) {
   Type elem = bareShapedElement(type);
   if (!elem || !llvm::isa<PredType>(elem))
@@ -1184,6 +1198,25 @@ LogicalResult HCLoadMaskOp::verify() {
 
 LogicalResult HCFullMaskOp::verify() {
   return verifyBarePredicateMask(getOperation(), getMask().getType());
+}
+
+LogicalResult HCStoreOp::verify() {
+  Value mask = getMask();
+  Type source = getSource().getType();
+
+  if (!mask)
+    return success();
+
+  Type expectedMask = barePredicateMaskType(source);
+  if (!expectedMask)
+    return emitOpError(
+               "mask operand requires a bare tensor/vector source, got ")
+           << source;
+  if (mask.getType() != expectedMask)
+    return emitOpError("mask type ")
+           << mask.getType() << " must match source validity type "
+           << expectedMask;
+  return verifyBarePredicateMask(getOperation(), mask.getType());
 }
 
 LogicalResult HCSelectOp::verify() {

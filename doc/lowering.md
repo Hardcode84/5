@@ -298,9 +298,10 @@ every type listed above. Ops with clear semantic categories tighten further:
 * `HC_NumericValueType` — arithmetic operands (`hc.add`, `hc.sub`, `hc.mul`,
   `hc.div`, `hc.mod`, `hc.neg`) and `hc.cmp.*` inputs; excludes `!hc.pred`,
   `!hc.slice`, `!hc.buffer`
-* `HC_ShapedValueType` — ops that only make sense on tensors/vectors
-  (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`,
-  `hc.store`'s `$source`)
+* `HC_ShapedValueType` — ops that only make sense on semantic tensors/vectors
+  (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`)
+* `HC_DecomposableShapedValueType` — semantic or bare shaped values at
+  decomposition-aware boundaries such as `hc.store`'s `$source`
 * `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.load`;
   excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either
@@ -529,7 +530,8 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
 * `hc.vload %src[%idx...], shape %shape` — buffer/tensor → vector. Same
   effect and SSA shape convention as `hc.load`.
 * `hc.store %dst[%idx...], %src` — tensor or vector source; carries a
-  `MemWrite` effect.
+  `MemWrite` effect. After shaped-value decomposition, bare data stores may
+  carry `mask %preds` with matching bare `!hc.pred` validity.
 * `hc.vec %t` — tensor → vector materialization. Carries a `MemRead` effect
   because the source tensor is addressable memory; an interleaved store can
   change what two sibling `hc.vec` ops observe, so CSE must not collapse
@@ -898,10 +900,10 @@ Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
 refined, static tensor/vector shape operands have been verified, and supported
 semantic shaped values may have been split into bare data/masks. The scheduled
-decomposition is non-strict: helper-call signatures and call sites are
-decomposed, while stores, intrinsics, and shaped region boundaries that are not
-decomposed yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic
-launch parameters may still remain.
+decomposition is non-strict: helper-call signatures, call sites, and stores are
+decomposed, while intrinsics and shaped region boundaries that are not decomposed
+yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic launch
+parameters may still remain.
 
 ### SSA construction
 

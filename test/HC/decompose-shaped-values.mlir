@@ -77,6 +77,51 @@ func.func @buffer_view_from_buffer(%buf: !hc.buffer<f32, ["M"]>) {
 
 // -----
 
+// CHECK-LABEL: func.func @getitem_vector
+// CHECK: %[[DATA:.*]] = hc.vec {{.*}} -> !hc.bare_vector<f32, ["4"]>
+// CHECK: %[[MASK:.*]] = hc.vec {{.*}} -> !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: %[[ITEM:.*]] = hc.getitem %[[DATA]]
+// CHECK-SAME: -> !hc.bare_vector<f32, ["4"]>
+// CHECK: hc.getitem %[[MASK]]
+// CHECK-SAME: -> !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK-NOT: !hc.tensor
+// CHECK-NOT: !hc.vector
+func.func @getitem_vector(%buf: !hc.buffer<f32, ["M"]>,
+                          %i: !hc.idx<"0">) {
+  %four = hc.const<4 : i64> : !hc.idx<"4">
+  %shape = hc.tuple(%four) : (!hc.idx<"4">) -> tuple<!hc.idx<"4">>
+  %full = hc.slice_expr() : () -> !hc.slice
+  %tile = hc.load %buf[%i], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, tuple<!hc.idx<"4">>)
+        -> !hc.tensor<f32, ["4"]>
+  %vec = hc.vec %tile : !hc.tensor<f32, ["4"]> -> !hc.vector<f32, ["4"]>
+  %item = hc.getitem %vec[%full]
+      : (!hc.vector<f32, ["4"]>, !hc.slice) -> !hc.vector<f32, ["4"]>
+  return
+}
+
+// -----
+
+// CHECK-LABEL: func.func @store_to_buffer
+// CHECK: %[[DATA:.*]] = hc.load {{.*}} -> !hc.bare_tensor<f32, ["4"]>
+// CHECK: %[[MASK:.*]] = hc.load_mask {{.*}} -> !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK: hc.store {{.*}}, %[[DATA]], mask %[[MASK]]
+// CHECK-SAME: !hc.bare_tensor<f32, ["4"]>, !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK-NOT: builtin.unrealized_conversion_cast
+func.func @store_to_buffer(%buf: !hc.buffer<f32, ["M"]>,
+                           %i: !hc.idx<"0">) {
+  %four = hc.const<4 : i64> : !hc.idx<"4">
+  %shape = hc.tuple(%four) : (!hc.idx<"4">) -> tuple<!hc.idx<"4">>
+  %tile = hc.load %buf[%i], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, tuple<!hc.idx<"4">>)
+        -> !hc.tensor<f32, ["4"]>
+  hc.store %buf[%i], %tile
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, !hc.tensor<f32, ["4"]>) -> ()
+  return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @passthrough
 // CHECK-SAME: %[[ARG_DATA:.*]]: !hc.bare_tensor<f32, ["4"]>
 // CHECK-SAME: %[[ARG_MASK:.*]]: !hc.bare_tensor<!hc.pred, ["4"]>

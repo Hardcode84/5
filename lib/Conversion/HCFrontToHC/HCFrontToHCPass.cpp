@@ -1770,7 +1770,7 @@ LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
         return op.emitOpError("target_subscript index did not lower");
       indices.append(expanded->begin(), expanded->end());
     }
-    HCStoreOp::create(builder, op.getLoc(), base, indices, value);
+    HCStoreOp::create(builder, op.getLoc(), base, indices, value, Value{});
     return success();
   }
 
@@ -2674,7 +2674,7 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     dest = peelBufferView(dest, indices);
     if (failed(rejectNestedView(dest)))
       return failure();
-    HCStoreOp::create(builder, call.getLoc(), dest, indices, source);
+    HCStoreOp::create(builder, call.getLoc(), dest, indices, source, Value{});
     // `hc.store` is a no-result op; success+null signals "consumed, no
     // SSA output" to `lowerCall`, distinct from the failure path below.
     return Value();

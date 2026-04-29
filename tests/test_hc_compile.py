@@ -652,6 +652,12 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     r'!hc\\.bare_vector<!hc\\.pred, \\["8"\\]>\\) -> \\(\\)',
                     handle.hc_ir_text,
                 )
+                assert re.search(
+                    r'hc\\.store [^\\n]+, %[0-9]+, mask %[0-9]+ : '
+                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8"\\]>, '
+                    r'!hc\\.bare_vector<!hc\\.pred, \\["8"\\]>\\) -> \\(\\)',
+                    handle.hc_ir_text,
+                )
 
                 loads = re.findall(
                     r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',

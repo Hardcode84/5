@@ -757,20 +757,26 @@ def HCFullMaskOp : HC_Op<"full_mask", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($mask)";
 }
 
-def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>]> {
+def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>,
+                                 AttrSizedOperandSegments]> {
   let summary = "Store a tensor or vector into a buffer or tensor.";
   let description = [{
-    Stores the shaped `$source` value into `$dest`. Unlike load and allocator
-    ops, store does not need a separate shape operand because the stored value's
-    type already carries the tensor/vector shape.
+    Stores the shaped `$source` value into `$dest`. After shaped-value
+    decomposition, `$source` may be a bare data container and `$mask` carries the
+    matching bare `!hc.pred` validity for masked writes. Unlike load and
+    allocator ops, store does not need a separate shape operand because the
+    stored value's type already carries the tensor/vector shape. The operand
+    segment attribute keeps the variadic indices distinct from the optional mask.
   }];
   let arguments = (ins
     HC_BufferOrTensorValueType:$dest,
     Variadic<HC_ValueType>:$indices,
-    HC_ShapedValueType:$source
+    HC_DecomposableShapedValueType:$source,
+    Optional<HC_BareShapedValueType>:$mask
   );
+  let hasVerifier = 1;
   let assemblyFormat = [{
-    $dest `[` $indices `]` `,` $source attr-dict `:`
+    $dest `[` $indices `]` `,` $source (`,` `mask` $mask^)? attr-dict `:`
     functional-type(operands, results)
   }];
 }

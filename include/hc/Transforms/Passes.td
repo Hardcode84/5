@@ -86,8 +86,9 @@ def HCDecomposeShapedValues
   }];
   let options = [
     Option<"strictMode", "strict", "bool", "true",
-           "Fail when the whole module cannot be decomposed. Disable this for "
-           "best-effort scheduling before all shaped consumers are supported.">
+           "Fail unless every semantic shaped boundary is decomposed. Disable "
+           "this to run a partial conversion that preserves unsupported "
+           "boundaries with unrealized conversion casts.">
   ];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }

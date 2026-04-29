@@ -119,6 +119,31 @@ static void replaceSingleResultWithSplit(ConversionPatternRewriter &rewriter,
   rewriter.replaceOpWithMultiple(op, std::move(replacements));
 }
 
+static Value materializeSourceCast(OpBuilder &builder, Type type,
+                                   ValueRange inputs, Location loc) {
+  if (!isSemanticShaped(type) || inputs.size() != 2)
+    return {};
+  if (inputs[0].getType() != bareDataType(type) ||
+      inputs[1].getType() != bareMaskType(type))
+    return {};
+  return UnrealizedConversionCastOp::create(builder, loc, type, inputs)
+      .getResult(0);
+}
+
+static SmallVector<Value> materializeTargetCast(OpBuilder &builder,
+                                                TypeRange types,
+                                                ValueRange inputs, Location loc,
+                                                Type originalType) {
+  if (!isSemanticShaped(originalType) || types.size() != 2 ||
+      inputs.size() != 1)
+    return {};
+  if (types[0] != bareDataType(originalType) ||
+      types[1] != bareMaskType(originalType))
+    return {};
+  return UnrealizedConversionCastOp::create(builder, loc, types, inputs)
+      .getResults();
+}
+
 class HCShapedTypeConverter : public TypeConverter {
 public:
   HCShapedTypeConverter() {
@@ -137,6 +162,8 @@ public:
           results.push_back(bareMaskType(type));
           return success();
         });
+    addSourceMaterialization(materializeSourceCast);
+    addTargetMaterialization(materializeTargetCast);
   }
 };
 
@@ -386,9 +413,10 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
 }
 
 static ConversionTarget
-makeShapedDecompositionTarget(MLIRContext *ctx,
-                              const TypeConverter &converter) {
+makeStrictShapedDecompositionTarget(MLIRContext *ctx,
+                                    const TypeConverter &converter) {
   ConversionTarget target(*ctx);
+  target.addLegalOp<UnrealizedConversionCastOp>();
   target.markUnknownOpDynamicallyLegal([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter) &&
            callableSignatureIsLegal(op, converter);
@@ -396,30 +424,18 @@ makeShapedDecompositionTarget(MLIRContext *ctx,
   return target;
 }
 
-static bool hasSemanticShapedResult(Operation *op) {
-  return llvm::any_of(op->getResultTypes(), isSemanticShaped);
-}
-
-static bool isSupportedDecompositionRoot(Operation *op) {
-  return hasSemanticShapedResult(op) &&
-         isa<HCLoadOp, HCVLoadOp, HCBufferViewOp, HCVecOp, HCWithInactiveOp,
-             HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp,
-             HCFullOp>(op);
-}
-
-static bool shouldAttemptNonStrictConversion(Operation *root,
-                                             ConversionTarget &target) {
-  bool canConvert = true;
-  root->walk([&](Operation *op) {
-    if (target.isLegal(op) || isSupportedDecompositionRoot(op))
-      return;
-
-    // The default frontend schedule runs before every shaped consumer has a
-    // decomposition rule. Keep that best-effort mode quiet unless this pass can
-    // rewrite the whole module without surfacing strict-mode diagnostics.
-    canConvert = false;
-  });
-  return canConvert;
+static ConversionTarget
+makePartialShapedDecompositionTarget(MLIRContext *ctx,
+                                     const TypeConverter &converter) {
+  ConversionTarget target(*ctx);
+  target.addLegalOp<UnrealizedConversionCastOp>();
+  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+  target
+      .addDynamicallyLegalOp<HCLoadOp, HCVLoadOp, HCBufferViewOp, HCVecOp,
+                             HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
+                             HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
+          [&](Operation *op) { return converter.isLegal(op); });
+  return target;
 }
 
 struct HCDecomposeShapedValuesPass
@@ -435,12 +451,14 @@ struct HCDecomposeShapedValuesPass
     populateShapedDecompositionPatterns(converter, ctx, patterns);
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-    ConversionTarget target = makeShapedDecompositionTarget(ctx, converter);
-    if (!strictMode &&
-        !shouldAttemptNonStrictConversion(getOperation(), target))
-      return;
-
-    if (failed(applyFullConversion(getOperation(), target, frozenPatterns)))
+    ConversionTarget target =
+        strictMode ? makeStrictShapedDecompositionTarget(ctx, converter)
+                   : makePartialShapedDecompositionTarget(ctx, converter);
+    LogicalResult result =
+        strictMode
+            ? applyFullConversion(getOperation(), target, frozenPatterns)
+            : applyPartialConversion(getOperation(), target, frozenPatterns);
+    if (failed(result))
       signalPassFailure();
   }
 };

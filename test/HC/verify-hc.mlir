@@ -64,6 +64,34 @@ module {
 
 // -----
 
+// CHECK: error: 'hc.store' op mask operand requires a bare tensor/vector source, got '!hc.tensor<f32, ["4"]>'
+module {
+  hc.func @bad(%buf: !hc.buffer<f32, []>,
+               %src: !hc.tensor<f32, ["4"]>,
+               %mask: !hc.bare_tensor<!hc.pred, ["4"]>) {
+    hc.store %buf[], %src, mask %mask
+        : (!hc.buffer<f32, []>, !hc.tensor<f32, ["4"]>,
+           !hc.bare_tensor<!hc.pred, ["4"]>) -> ()
+    hc.return
+  }
+}
+
+// -----
+
+// CHECK: error: 'hc.store' op mask type '!hc.bare_tensor<!hc.pred, ["8"]>' must match source validity type '!hc.bare_tensor<!hc.pred, ["4"]>'
+module {
+  hc.func @bad(%buf: !hc.buffer<f32, []>,
+               %src: !hc.bare_tensor<f32, ["4"]>,
+               %mask: !hc.bare_tensor<!hc.pred, ["8"]>) {
+    hc.store %buf[], %src, mask %mask
+        : (!hc.buffer<f32, []>, !hc.bare_tensor<f32, ["4"]>,
+           !hc.bare_tensor<!hc.pred, ["8"]>) -> ()
+    hc.return
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.tuple' op result tuple arity 1 does not match element count 2
 module {
   hc.func @bad(%arg0: !hc.undef, %arg1: !hc.undef) {

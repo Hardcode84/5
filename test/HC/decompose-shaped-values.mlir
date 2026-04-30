@@ -122,6 +122,25 @@ func.func @store_to_buffer(%buf: !hc.buffer<f32, ["M"]>,
 
 // -----
 
+// CHECK-LABEL: hc.func @store_to_tensor
+// CHECK-SAME: %[[DST_DATA:[^:]+]]: !hc.bare_tensor<f32, ["4"]>
+// CHECK-SAME: %[[DST_MASK:[^:]+]]: !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK-SAME: %[[SRC_DATA:[^:]+]]: !hc.bare_tensor<f32, ["4"]>
+// CHECK-SAME: %[[SRC_MASK:[^:]+]]: !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK: hc.store %[[DST_DATA]][], %[[SRC_DATA]]
+// CHECK-SAME: (!hc.bare_tensor<f32, ["4"]>, !hc.bare_tensor<f32, ["4"]>) -> ()
+// CHECK: hc.store %[[DST_MASK]][], %[[SRC_MASK]]
+// CHECK-SAME: (!hc.bare_tensor<!hc.pred, ["4"]>, !hc.bare_tensor<!hc.pred, ["4"]>) -> ()
+// CHECK-NOT: builtin.unrealized_conversion_cast
+hc.func @store_to_tensor(%dst: !hc.tensor<f32, ["4"]>,
+                         %src: !hc.tensor<f32, ["4"]>) {
+  hc.store %dst[], %src
+      : (!hc.tensor<f32, ["4"]>, !hc.tensor<f32, ["4"]>) -> ()
+  hc.return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @passthrough
 // CHECK-SAME: %[[ARG_DATA:.*]]: !hc.bare_tensor<f32, ["4"]>
 // CHECK-SAME: %[[ARG_MASK:.*]]: !hc.bare_tensor<!hc.pred, ["4"]>

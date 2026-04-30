@@ -5,6 +5,7 @@
 add_mlir_library(MLIRHCTransforms
   HCDecomposeShapedValuesPass.cpp
   HCInferTypesPass.cpp
+  HCLowerBarePredicatesPass.cpp
   HCPromoteNamesPass.cpp
   HCVerifyStaticShapesPass.cpp
 
@@ -16,10 +17,14 @@ add_mlir_library(MLIRHCTransforms
 
   LINK_LIBS PUBLIC
   MLIRAnalysis
+  MLIRArithDialect
+  MLIRFuncDialect
   MLIRHCDialect
   MLIRIR
   MLIRPass
   MLIRSupport
+  MLIRTransforms
+  MLIRVectorDialect
 )
 
 target_include_directories(

@@ -93,4 +93,24 @@ def HCDecomposeShapedValues
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerBarePredicates
+    : Pass<"hc-lower-bare-predicates", "::mlir::ModuleOp"> {
+  let summary = "Lower bare HC predicate containers to upstream i1 masks.";
+  let description = [{
+    Converts concrete `!hc.pred` values to `i1` and static `!hc.bare_vector`
+    values to upstream `vector` values. Predicate vectors become
+    `vector<...xi1>` masks, and supported HC mask operations are lowered to
+    `arith`/`vector` operations. Bare tensors remain HC values for the later
+    memory/tensor lowering. Unsupported HC boundaries are preserved with
+    `builtin.unrealized_conversion_cast` so this pass can be staged before the
+    full HC-to-upstream lowering.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::func::FuncDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::vector::VectorDialect"
+  ];
+}
+
 #endif // HC_TRANSFORMS_PASSES

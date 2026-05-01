@@ -172,3 +172,53 @@ func.func @call_boundary(%buf: !hc.buffer<f32, ["M"]>,
   %vec = hc.vec %out : !hc.tensor<f32, ["4"]> -> !hc.vector<f32, ["4"]>
   return
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @for_range_iter_arg
+// CHECK-SAME: %[[INIT_DATA:.*]]: !hc.bare_vector<f32, ["4"]>
+// CHECK-SAME: %[[INIT_MASK:.*]]: !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: %[[LOOP:.*]]:2 = hc.for_range {{.*}} iter_args(%[[INIT_DATA]], %[[INIT_MASK]])
+// CHECK-SAME: -> (!hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>)
+// CHECK: ^bb0(%{{.*}}: !hc.idx<"0">, %[[ARG_DATA:.*]]: !hc.bare_vector<f32, ["4"]>, %[[ARG_MASK:.*]]: !hc.bare_vector<!hc.pred, ["4"]>):
+// CHECK: hc.yield %[[ARG_DATA]], %[[ARG_MASK]]
+// CHECK-SAME: !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: hc.return %[[LOOP]]#0, %[[LOOP]]#1
+hc.func @for_range_iter_arg(%init: !hc.vector<f32, ["4"]>)
+    -> !hc.vector<f32, ["4"]> {
+  %lo = hc.const<0 : i64> : !hc.idx<"0">
+  %hi = hc.const<4 : i64> : !hc.idx<"4">
+  %step = hc.const<1 : i64> : !hc.idx<"1">
+  %loop = hc.for_range %lo to %hi step %step iter_args(%init)
+      : (!hc.idx<"0">, !hc.idx<"4">, !hc.idx<"1">)
+        -> (!hc.vector<f32, ["4"]>) {
+  ^bb0(%iv: !hc.idx<"0">, %carried: !hc.vector<f32, ["4"]>):
+    hc.yield %carried : !hc.vector<f32, ["4"]>
+  }
+  hc.return %loop : !hc.vector<f32, ["4"]>
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @if_result
+// CHECK-SAME: %[[LHS_DATA:[^:]+]]: !hc.bare_vector<f32, ["4"]>
+// CHECK-SAME: %[[LHS_MASK:[^:]+]]: !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK-SAME: %[[RHS_DATA:[^:]+]]: !hc.bare_vector<f32, ["4"]>
+// CHECK-SAME: %[[RHS_MASK:[^:]+]]: !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: %[[IF:.*]]:2 = hc.if {{.*}} -> (!hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>)
+// CHECK: hc.yield %[[LHS_DATA]], %[[LHS_MASK]]
+// CHECK-SAME: !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: hc.yield %[[RHS_DATA]], %[[RHS_MASK]]
+// CHECK-SAME: !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: hc.return %[[IF]]#0, %[[IF]]#1
+hc.func @if_result(%cond: i1,
+                   %lhs: !hc.vector<f32, ["4"]>,
+                   %rhs: !hc.vector<f32, ["4"]>)
+    -> !hc.vector<f32, ["4"]> {
+  %choice = hc.if %cond -> (!hc.vector<f32, ["4"]>) : i1 {
+    hc.yield %lhs : !hc.vector<f32, ["4"]>
+  } else {
+    hc.yield %rhs : !hc.vector<f32, ["4"]>
+  }
+  hc.return %choice : !hc.vector<f32, ["4"]>
+}

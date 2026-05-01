@@ -127,6 +127,107 @@ static LogicalResult convertFunctionType(FunctionType fnType,
   return converter.convertTypes(fnType.getResults(), results);
 }
 
+static LogicalResult
+convertResultTypes(TypeRange resultTypes, const TypeConverter &converter,
+                   SmallVectorImpl<Type> &convertedResults,
+                   SmallVectorImpl<unsigned> &resultWidths) {
+  for (Type resultType : resultTypes) {
+    unsigned start = convertedResults.size();
+    if (failed(converter.convertTypes(resultType, convertedResults)))
+      return failure();
+    resultWidths.push_back(convertedResults.size() - start);
+  }
+  return success();
+}
+
+static SmallVector<TypeRange> resultTypeSlices(TypeRange convertedResults,
+                                               ArrayRef<unsigned> widths) {
+  SmallVector<TypeRange> slices;
+  slices.reserve(widths.size());
+  unsigned offset = 0;
+  for (unsigned width : widths) {
+    slices.push_back(convertedResults.slice(offset, width));
+    offset += width;
+  }
+  return slices;
+}
+
+static FailureOr<SmallVector<Value>>
+adaptValuesToTypes(ValueRange values, TypeRange targetTypes, Operation *op,
+                   ConversionPatternRewriter &rewriter, StringRef what) {
+  if (values.size() == targetTypes.size())
+    return SmallVector<Value>(values);
+  if (values.size() == 1) {
+    auto cast = UnrealizedConversionCastOp::create(rewriter, op->getLoc(),
+                                                   targetTypes, values.front());
+    return SmallVector<Value>(cast.getResults());
+  }
+  return op->emitOpError("expected ")
+         << targetTypes.size() << " converted value(s) for " << what << ", got "
+         << values.size();
+}
+
+static LogicalResult buildForRangeBodySignatureConversion(
+    HCForRangeOp op, TypeRange convertedResultTypes,
+    ArrayRef<unsigned> resultWidths, const TypeConverter &converter,
+    TypeConverter::SignatureConversion &bodyConversion) {
+  Block &body = op.getBody().front();
+  if (body.getNumArguments() != 1 + resultWidths.size())
+    return failure();
+
+  SmallVector<Type> ivTypes;
+  if (failed(converter.convertType(body.getArgument(0).getType(), ivTypes)))
+    return failure();
+  bodyConversion.addInputs(0, ivTypes);
+
+  SmallVector<TypeRange> resultSlices =
+      resultTypeSlices(convertedResultTypes, resultWidths);
+  for (auto [index, types] : llvm::enumerate(resultSlices)) {
+    SmallVector<Type> copiedTypes(types.begin(), types.end());
+    bodyConversion.addInputs(index + 1, copiedTypes);
+  }
+  return success();
+}
+
+static LogicalResult
+adaptForRangeIterInits(HCForRangeOp op, ArrayRef<ValueRange> adaptedIterInits,
+                       TypeRange convertedResultTypes,
+                       ArrayRef<unsigned> resultWidths,
+                       ConversionPatternRewriter &rewriter,
+                       SmallVectorImpl<Value> &convertedIterInits) {
+  if (adaptedIterInits.size() != resultWidths.size())
+    return op.emitOpError("expected ")
+           << resultWidths.size() << " iter init group(s), got "
+           << adaptedIterInits.size();
+
+  SmallVector<TypeRange> resultSlices =
+      resultTypeSlices(convertedResultTypes, resultWidths);
+  for (auto [index, pair] :
+       llvm::enumerate(llvm::zip_equal(adaptedIterInits, resultSlices))) {
+    auto [values, types] = pair;
+    FailureOr<SmallVector<Value>> adapted = adaptValuesToTypes(
+        values, types, op, rewriter,
+        Twine("for_range iter init #").concat(Twine(index)).str());
+    if (failed(adapted))
+      return failure();
+    llvm::append_range(convertedIterInits, *adapted);
+  }
+  return success();
+}
+
+static void replaceOpWithResultSlices(ConversionPatternRewriter &rewriter,
+                                      Operation *op,
+                                      ResultRange convertedResults,
+                                      ArrayRef<unsigned> resultWidths) {
+  SmallVector<ValueRange> replacements;
+  unsigned offset = 0;
+  for (unsigned width : resultWidths) {
+    replacements.push_back(convertedResults.slice(offset, width));
+    offset += width;
+  }
+  rewriter.replaceOpWithMultiple(op, replacements);
+}
+
 static void replaceSingleResultWithSplit(ConversionPatternRewriter &rewriter,
                                          Operation *op, Value data,
                                          Value mask) {
@@ -227,24 +328,91 @@ struct ConvertCallOp : public OpConversionPattern<HCCallOp> {
     SmallVector<Value> convertedArgs = flattenValues(adaptor.getArgs());
     SmallVector<Type> convertedResults;
     SmallVector<unsigned> resultWidths;
-    for (Type resultType : op.getResultTypes()) {
-      unsigned start = convertedResults.size();
-      if (failed(typeConverter->convertTypes(resultType, convertedResults)))
-        return failure();
-      resultWidths.push_back(convertedResults.size() - start);
-    }
+    if (failed(convertResultTypes(op.getResultTypes(), *typeConverter,
+                                  convertedResults, resultWidths)))
+      return failure();
 
     auto newCall = HCCallOp::create(rewriter, op.getLoc(), convertedResults,
                                     op.getCalleeAttr(), convertedArgs);
     newCall->setAttrs(op->getAttrs());
 
-    SmallVector<ValueRange> replacements;
-    unsigned offset = 0;
-    for (unsigned width : resultWidths) {
-      replacements.push_back(newCall->getResults().slice(offset, width));
-      offset += width;
-    }
-    rewriter.replaceOpWithMultiple(op, replacements);
+    replaceOpWithResultSlices(rewriter, op, newCall->getResults(),
+                              resultWidths);
+    return success();
+  }
+};
+
+struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCForRangeOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    FailureOr<Value> lower =
+        expectOne(adaptor.getLower(), op, "for_range lower");
+    FailureOr<Value> upper =
+        expectOne(adaptor.getUpper(), op, "for_range upper");
+    FailureOr<Value> step = expectOne(adaptor.getStep(), op, "for_range step");
+    if (failed(lower) || failed(upper) || failed(step))
+      return failure();
+
+    SmallVector<Type> convertedResults;
+    SmallVector<unsigned> resultWidths;
+    if (failed(convertResultTypes(op.getResultTypes(), *typeConverter,
+                                  convertedResults, resultWidths)))
+      return failure();
+    SmallVector<Value> convertedIterInits;
+    if (failed(adaptForRangeIterInits(op, adaptor.getIterInits(),
+                                      convertedResults, resultWidths, rewriter,
+                                      convertedIterInits)))
+      return failure();
+
+    TypeConverter::SignatureConversion bodyConversion(
+        op.getBody().front().getNumArguments());
+    if (failed(buildForRangeBodySignatureConversion(
+            op, convertedResults, resultWidths, *typeConverter,
+            bodyConversion)))
+      return failure();
+
+    auto newLoop =
+        HCForRangeOp::create(rewriter, op.getLoc(), convertedResults, *lower,
+                             *upper, *step, convertedIterInits);
+    newLoop->setAttrs(op->getAttrs());
+    rewriter.inlineRegionBefore(op.getBody(), newLoop.getBody(),
+                                newLoop.getBody().begin());
+    rewriter.applySignatureConversion(&newLoop.getBody().front(),
+                                      bodyConversion, typeConverter);
+
+    replaceOpWithResultSlices(rewriter, op, newLoop->getResults(),
+                              resultWidths);
+    return success();
+  }
+};
+
+struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCIfOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    FailureOr<Value> cond = expectOne(adaptor.getCond(), op, "if condition");
+    if (failed(cond))
+      return failure();
+
+    SmallVector<Type> convertedResults;
+    SmallVector<unsigned> resultWidths;
+    if (failed(convertResultTypes(op.getResultTypes(), *typeConverter,
+                                  convertedResults, resultWidths)))
+      return failure();
+
+    auto newIf = HCIfOp::create(rewriter, op.getLoc(), convertedResults, *cond);
+    newIf->setAttrs(op->getAttrs());
+    rewriter.inlineRegionBefore(op.getThenRegion(), newIf.getThenRegion(),
+                                newIf.getThenRegion().begin());
+    rewriter.inlineRegionBefore(op.getElseRegion(), newIf.getElseRegion(),
+                                newIf.getElseRegion().begin());
+
+    replaceOpWithResultSlices(rewriter, op, newIf->getResults(), resultWidths);
     return success();
   }
 };
@@ -299,6 +467,21 @@ struct ConvertReturnOp : public OpConversionPattern<HCReturnOp> {
                   ConversionPatternRewriter &rewriter) const override {
     HCReturnOp::create(rewriter, op.getLoc(),
                        flattenValues(adaptor.getValues()));
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct ConvertYieldOp : public OpConversionPattern<HCYieldOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCYieldOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+      return failure();
+    HCYieldOp::create(rewriter, op.getLoc(),
+                      flattenValues(adaptor.getValues()));
     rewriter.eraseOp(op);
     return success();
   }
@@ -592,7 +775,8 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 RewritePatternSet &patterns) {
   patterns.add<ConvertCallableSignatureOp<HCKernelOp>,
                ConvertCallableSignatureOp<HCFuncOp>, ConvertCallOp,
-               ConvertStoreOp, ConvertReturnOp>(converter, ctx);
+               ConvertForRangeOp, ConvertIfOp, ConvertStoreOp, ConvertReturnOp,
+               ConvertYieldOp>(converter, ctx);
   patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
                ConvertGetItemOp, ConvertVecOp, ConvertWithInactiveOp>(converter,
                                                                       ctx);
@@ -614,6 +798,14 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
   });
   target.addDynamicallyLegalOp<HCCallOp, HCStoreOp, HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
+  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp>([&](Operation *op) {
+    return converter.isLegal(op) && regionsAreLegal(op, converter);
+  });
+  target.addDynamicallyLegalOp<HCYieldOp>([&](Operation *op) {
+    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+      return true;
+    return converter.isLegal(op);
+  });
   target.markUnknownOpDynamicallyLegal([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter) &&
            callableSignatureIsLegal(op, converter);
@@ -636,6 +828,14 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
       HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
       HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
       [&](Operation *op) { return converter.isLegal(op); });
+  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp>([&](Operation *op) {
+    return converter.isLegal(op) && regionsAreLegal(op, converter);
+  });
+  target.addDynamicallyLegalOp<HCYieldOp>([&](Operation *op) {
+    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+      return true;
+    return converter.isLegal(op);
+  });
   return target;
 }
 

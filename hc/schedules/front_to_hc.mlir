@@ -7,9 +7,9 @@
 // Mirrors the pass order `hc-opt` and `doc/lowering.md` document for
 // the frontend stage: fold/erase region scaffolding, inline undecorated
 // helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
-// SSA, infer concrete HC value types, verify static shape carriers, split
-// semantic shaped values into bare data/masks, then run the standard cleanup
-// pair.
+// SSA, infer concrete HC value types, materialize bound symbolic values, verify
+// static shape carriers, split semantic shaped values into bare data/masks,
+// then run the standard cleanup pair.
 // `hc.compile` loads this via `-transform-preload-library` and runs it with
 // `-transform-interpreter`; callers wanting a different order can pass
 // `schedule=<path-or-text>` to override.
@@ -30,15 +30,17 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
         : (!transform.any_op) -> !transform.any_op
-    %m6 = transform.apply_registered_pass "hc-verify-static-shapes" to %m5
+    %m6 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m5
         : (!transform.any_op) -> !transform.any_op
-    %m7 = transform.apply_registered_pass "hc-decompose-shaped-values"
-        with options = { "strict" = false } to %m6
+    %m7 = transform.apply_registered_pass "hc-verify-static-shapes" to %m6
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m7 {
+    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
+        with options = { "strict" = false } to %m7
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m8 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m7 : !transform.any_op
+    transform.apply_cse to %m8 : !transform.any_op
     transform.yield
   }
 }

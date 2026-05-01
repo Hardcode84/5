@@ -34,29 +34,33 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
         : (!transform.any_op) -> !transform.any_op
-    %m6 = transform.apply_registered_pass "hc-verify-static-shapes" to %m5
+    %m6 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m5
         : (!transform.any_op) -> !transform.any_op
-    %m7 = transform.apply_registered_pass "hc-decompose-shaped-values"
-        with options = { "strict" = false } to %m6
+    %m7 = transform.apply_registered_pass "hc-verify-static-shapes" to %m6
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m7 {
+    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
+        with options = { "strict" = false } to %m7
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m8 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m7 : !transform.any_op
+    transform.apply_cse to %m8 : !transform.any_op
     transform.yield
   }
 }
 ```
 
-The static shape verifier runs after type inference because it validates SSA
-shape operands through their inferred `!hc.idx<...>` tuple element types. It
-runs before canonicalization and CSE so default compilation rejects invalid
-shape contracts before later cleanup can obscure the producer that carried the
+Bound symbolic expression materialization runs after type inference so it can
+see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope
+normalization needs launch-context-independent SSA values. The static shape
+verifier then validates SSA shape operands through their inferred tuple element
+types before canonicalization and CSE can obscure the producer that carried a
 bad shape. Shaped-value decomposition runs next in non-strict mode: supported
-producers and users, including helper-call signatures, `hc.call` sites, and
-stores, are split into bare data/masks, while remaining intrinsic and shaped
-region boundaries are preserved with `builtin.unrealized_conversion_cast` until
-those consumers grow decomposition rules.
+producers and users, including helper-call signatures, `hc.call` sites, stores,
+and structured/collective region boundaries, are split into bare data/masks,
+while remaining intrinsic boundaries are preserved with
+`builtin.unrealized_conversion_cast` until those consumers grow decomposition
+rules.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

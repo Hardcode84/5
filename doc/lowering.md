@@ -876,6 +876,7 @@ folding / inline markers on is:
                               → convert-hc-front-to-hc
                               → hc-promote-names
                               → hc-infer-types
+                              → hc-materialize-bound-exprs
                               → hc-verify-static-shapes
                               → hc-decompose-shaped-values(strict=false)
 
@@ -889,7 +890,8 @@ on the same pass list, so
 
     hc-opt --hc-front-fold-region-defs --hc-front-inline \
            --convert-hc-front-to-hc --hc-promote-names \
-           --hc-infer-types --hc-verify-static-shapes \
+           --hc-infer-types --hc-materialize-bound-exprs \
+           --hc-verify-static-shapes \
            --hc-decompose-shaped-values=strict=false
 
 and `hc.compile(...)` with the default schedule produce identical
@@ -898,12 +900,13 @@ and override API.
 
 Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
-refined, static tensor/vector shape operands have been verified, and supported
-semantic shaped values may have been split into bare data/masks. The scheduled
-decomposition is non-strict: helper-call signatures, call sites, and stores are
-decomposed, while intrinsics and shaped region boundaries that are not decomposed
-yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic launch
-parameters may still remain.
+refined, bound symbolic expressions have been materialized as SSA, static
+tensor/vector shape operands have been verified, and supported semantic shaped
+values may have been split into bare data/masks. The scheduled decomposition is
+non-strict: helper-call signatures, call sites, stores, and structured/collective
+region boundaries are decomposed, while intrinsic boundaries that are not
+decomposed yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic
+launch parameters may still remain.
 
 ### SSA construction
 

@@ -6,6 +6,7 @@ add_mlir_library(MLIRHCTransforms
   HCDecomposeShapedValuesPass.cpp
   HCInferTypesPass.cpp
   HCLowerBarePredicatesPass.cpp
+  HCMaterializeBoundExprsPass.cpp
   HCPromoteNamesPass.cpp
   HCVerifyStaticShapesPass.cpp
 

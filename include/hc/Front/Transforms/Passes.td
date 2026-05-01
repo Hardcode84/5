@@ -7,7 +7,7 @@
 
 include "mlir/Pass/PassBase.td"
 
-def HCFrontFoldRegionDefs : Pass<"hc-front-fold-region-defs", "::mlir::ModuleOp"> {
+def HCFrontFoldRegionDefs : Pass<"hc-front-fold-region-defs"> {
   let summary = "Fold `@group.workitems`/`@group.subgroups` def + immediate call.";
   let description = [{
     Python's only way to materialize an `hc_front.workitem_region` or
@@ -46,7 +46,7 @@ def HCFrontFoldRegionDefs : Pass<"hc-front-fold-region-defs", "::mlir::ModuleOp"
   ];
 }
 
-def HCFrontInline : Pass<"hc-front-inline", "::mlir::ModuleOp"> {
+def HCFrontInline : Pass<"hc-front-inline"> {
   let summary = "Inline `hc_front.func`s tagged `ref.kind = \"inline\"` at every call site.";
   let description = [{
     Rewrites each `hc_front.call` whose callee's `hc_front.name` carries

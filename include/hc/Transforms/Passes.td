@@ -7,7 +7,7 @@
 
 include "mlir/Pass/PassBase.td"
 
-def HCPromoteNames : Pass<"hc-promote-names", "::mlir::ModuleOp"> {
+def HCPromoteNames : Pass<"hc-promote-names"> {
   let summary = "Promote Python name-store ops to SSA values.";
   let description = [{
     Replaces `hc.assign` / `hc.name_load` with structured SSA carriers,
@@ -48,7 +48,7 @@ def HCPromoteNames : Pass<"hc-promote-names", "::mlir::ModuleOp"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
-def HCInferTypes : Pass<"hc-infer-types", "::mlir::ModuleOp"> {
+def HCInferTypes : Pass<"hc-infer-types"> {
   let summary = "Infer concrete HC value types from pre-inference `!hc.undef` IR.";
   let description = [{
     Runs a sparse forward dataflow analysis over `hc` IR and rewrites values
@@ -75,7 +75,7 @@ def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
 }
 
 def HCDecomposeShapedValues
-    : Pass<"hc-decompose-shaped-values", "::mlir::ModuleOp"> {
+    : Pass<"hc-decompose-shaped-values"> {
   let summary = "Split semantic tensor/vector values into bare data and masks.";
   let description = [{
     Rewrites supported semantic `!hc.tensor` / `!hc.vector` producers and users
@@ -94,7 +94,7 @@ def HCDecomposeShapedValues
 }
 
 def HCLowerBarePredicates
-    : Pass<"hc-lower-bare-predicates", "::mlir::ModuleOp"> {
+    : Pass<"hc-lower-bare-predicates"> {
   let summary = "Lower bare HC predicate containers to upstream i1 masks.";
   let description = [{
     Converts concrete `!hc.pred` values to `i1` and static `!hc.bare_vector`
@@ -111,6 +111,19 @@ def HCLowerBarePredicates
     "::mlir::hc::HCDialect",
     "::mlir::vector::VectorDialect"
   ];
+}
+
+def HCMaterializeBoundExprs
+    : Pass<"hc-materialize-bound-exprs"> {
+  let summary = "Materialize bound symbolic HC expressions as SSA values.";
+  let description = [{
+    Replaces uses of values typed as pinned `!hc.idx<expr>` or
+    `!hc.pred<pred>` with `hc.materialize_bound_expr` when every symbolic leaf
+    is a bound symbol or the expression is constant-only. The original producer
+    is left in place for canonicalization/DCE, which lets this pass break
+    dependence on launch-context query chains before scope normalization.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
 #endif // HC_TRANSFORMS_PASSES

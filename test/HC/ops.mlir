@@ -45,6 +45,9 @@
 // CHECK: hc.func @tile_helper {
 // CHECK: hc.func @typed_with_return(%arg0: i32) -> i32 {
 // CHECK-NEXT: hc.return %arg0 : i32
+// CHECK: hc.func @materialize_bound_expr {
+// CHECK: hc.materialize_bound_expr : !hc.idx<"$WI0">
+// CHECK: hc.materialize_bound_expr : !hc.pred<"-32 + $WI0 < 0">
 
 module {
   func.func @use_types(
@@ -123,5 +126,11 @@ module {
   // the return-parity verifier.
   hc.func @typed_with_return(%a: i32) -> i32 {
     hc.return %a : i32
+  }
+
+  hc.func @materialize_bound_expr {
+    %idx = hc.materialize_bound_expr : !hc.idx<"$WI0">
+    %pred = hc.materialize_bound_expr : !hc.pred<"$WI0 < 32">
+    hc.return
   }
 }

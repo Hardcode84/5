@@ -519,7 +519,7 @@ static LogicalResult reportConflict(Value value) {
   return failure();
 }
 
-static LogicalResult reportTypeConflicts(ModuleOp module,
+static LogicalResult reportTypeConflicts(Operation *root,
                                          DataFlowSolver &solver) {
   bool foundConflict = false;
   auto checkValue = [&](Value value) {
@@ -532,7 +532,7 @@ static LogicalResult reportTypeConflicts(ModuleOp module,
     (void)reportConflict(value);
   };
 
-  module.walk([&](Operation *op) {
+  root->walk([&](Operation *op) {
     for (OpResult result : op->getResults())
       checkValue(result);
     for (Region &region : op->getRegions())
@@ -733,10 +733,10 @@ static TypeFact factFromValue(DataFlowSolver &solver, Value value) {
   return fact;
 }
 
-static FailureOr<bool> updateYieldedRegionResultTypes(ModuleOp module,
+static FailureOr<bool> updateYieldedRegionResultTypes(Operation *root,
                                                       DataFlowSolver &solver) {
   bool changed = false;
-  WalkResult walkStatus = module.walk([&](HCYieldedResultsOpInterface op) {
+  WalkResult walkStatus = root->walk([&](HCYieldedResultsOpInterface op) {
     ValueRange yieldedValues = op.getYieldedResultValues();
     if (yieldedValues.empty())
       return WalkResult::advance();
@@ -802,10 +802,10 @@ static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
   return true;
 }
 
-static bool updateCallableFunctionTypes(ModuleOp module,
+static bool updateCallableFunctionTypes(Operation *root,
                                         DataFlowSolver &solver) {
   bool changed = false;
-  module.walk([&](Operation *op) {
+  root->walk([&](Operation *op) {
     if (auto kernel = dyn_cast<HCKernelOp>(op))
       changed |= updateCallableFunctionType(kernel, solver);
     else if (auto func = dyn_cast<HCFuncOp>(op))
@@ -816,18 +816,18 @@ static bool updateCallableFunctionTypes(ModuleOp module,
   return changed;
 }
 
-static FailureOr<bool> applyInferredTypes(ModuleOp module,
+static FailureOr<bool> applyInferredTypes(Operation *root,
                                           DataFlowSolver &solver) {
-  bool changed = updateCallableFunctionTypes(module, solver);
+  bool changed = updateCallableFunctionTypes(root, solver);
   // Region result refinement can itself update enclosing callable signatures
   // through return users; the outer solver loop reruns until those surfaces
   // converge.
   FailureOr<bool> regionResultsChanged =
-      updateYieldedRegionResultTypes(module, solver);
+      updateYieldedRegionResultTypes(root, solver);
   if (failed(regionResultsChanged))
     return failure();
   changed |= *regionResultsChanged;
-  module.walk([&](Operation *op) {
+  root->walk([&](Operation *op) {
     for (OpResult result : op->getResults()) {
       if (!isNestedUnderHCCallable(result))
         continue;
@@ -1062,12 +1062,12 @@ rewriteCallableFunctionType(CallableOpT op,
 }
 
 static LogicalResult
-renumberSyntheticJoinSymbols(ModuleOp module,
+renumberSyntheticJoinSymbols(Operation *root,
                              ArrayRef<SymbolSubstitution> substitutions) {
   if (substitutions.empty())
     return success();
 
-  WalkResult walkStatus = module.walk([&](Operation *op) -> WalkResult {
+  WalkResult walkStatus = root->walk([&](Operation *op) -> WalkResult {
     if (auto kernel = dyn_cast<HCKernelOp>(op)) {
       if (failed(rewriteCallableFunctionType(kernel, substitutions)))
         return WalkResult::interrupt();
@@ -1102,10 +1102,10 @@ renumberSyntheticJoinSymbols(ModuleOp module,
   return failure(walkStatus.wasInterrupted());
 }
 
-static LogicalResult renumberSyntheticJoinSymbols(ModuleOp module) {
+static LogicalResult renumberSyntheticJoinSymbols(Operation *root) {
   llvm::StringSet<> seen;
   SmallVector<std::string> symbols;
-  module.walk([&](Operation *op) {
+  root->walk([&](Operation *op) {
     if (auto kernel = dyn_cast<HCKernelOp>(op))
       collectSyntheticJoinSymbols(kernel, seen, symbols);
     else if (auto func = dyn_cast<HCFuncOp>(op))
@@ -1128,27 +1128,27 @@ static LogicalResult renumberSyntheticJoinSymbols(ModuleOp module) {
     stable += Twine(index).str();
     substitutions.emplace_back(symbol, stable.str().str());
   }
-  return renumberSyntheticJoinSymbols(module, substitutions);
+  return renumberSyntheticJoinSymbols(root, substitutions);
 }
 
 struct HCInferTypesPass : public hc::impl::HCInferTypesBase<HCInferTypesPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
+    Operation *root = getOperation();
     while (true) {
       DataFlowSolver solver;
       dataflow::loadBaselineAnalyses(solver);
       solver.load<HCTypeAnalysis>();
-      if (failed(solver.initializeAndRun(module)))
+      if (failed(solver.initializeAndRun(root)))
         return signalPassFailure();
-      if (failed(reportTypeConflicts(module, solver)))
+      if (failed(reportTypeConflicts(root, solver)))
         return signalPassFailure();
-      FailureOr<bool> changed = applyInferredTypes(module, solver);
+      FailureOr<bool> changed = applyInferredTypes(root, solver);
       if (failed(changed))
         return signalPassFailure();
       if (!*changed) {
-        if (failed(renumberSyntheticJoinSymbols(module)))
+        if (failed(renumberSyntheticJoinSymbols(root)))
           return signalPassFailure();
         return;
       }

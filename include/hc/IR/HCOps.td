@@ -261,6 +261,20 @@ def HCSymbolOp : HC_Op<"symbol",
   let hasFolder = 1;
 }
 
+def HCMaterializeBoundExprOp : HC_Op<"materialize_bound_expr",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary = "Materialize a bound symbolic expression as SSA.";
+  let description = [{
+    Inserted after type inference for pinned `!hc.idx` / `!hc.pred`
+    expressions that depend only on launch/bound symbols and constants. This
+    breaks the dependence on the original symbolic producer chain before scope
+    normalization erases launch-context tokens.
+  }];
+  let results = (outs HC_ValueType:$result);
+  let assemblyFormat = "attr-dict `:` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
 def HCCastOp : HC_Op<"cast",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "User-visible value-level type conversion.";

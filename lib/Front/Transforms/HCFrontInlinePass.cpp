@@ -213,28 +213,40 @@ struct HCFrontInlinePass
   using HCFrontInlineBase::HCFrontInlineBase;
 
   void runOnOperation() override {
-    ModuleOp moduleOp = getOperation();
+    Operation *root = getOperation();
     MLIRContext *ctx = &getContext();
 
     llvm::StringMap<hc_front::FuncOp> inlinableFuncs;
-    for (Operation &topOp : *moduleOp.getBody()) {
-      auto funcOp = dyn_cast<hc_front::FuncOp>(topOp);
-      if (!funcOp)
-        continue;
-      auto refAttr = funcOp->getAttrOfType<DictionaryAttr>("ref");
-      if (!refAttr)
-        continue;
-      auto kindAttr = refAttr.getAs<StringAttr>("kind");
-      if (!kindAttr || kindAttr.getValue() != "inline")
-        continue;
-      StringRef name = funcOp.getName();
-      auto [_, inserted] = inlinableFuncs.try_emplace(name, funcOp);
-      if (!inserted) {
-        funcOp.emitOpError("duplicate inlinable func name `")
-            << name << "'; names must be unique within a module";
-        signalPassFailure();
-        return;
-      }
+    auto visitTopLevelOps = [&](auto callback) -> LogicalResult {
+      for (Region &region : root->getRegions())
+        for (Block &block : region)
+          for (Operation &topOp : block)
+            if (failed(callback(topOp)))
+              return failure();
+      return success();
+    };
+
+    if (failed(visitTopLevelOps([&](Operation &topOp) -> LogicalResult {
+          auto funcOp = dyn_cast<hc_front::FuncOp>(topOp);
+          if (!funcOp)
+            return success();
+          auto refAttr = funcOp->getAttrOfType<DictionaryAttr>("ref");
+          if (!refAttr)
+            return success();
+          auto kindAttr = refAttr.getAs<StringAttr>("kind");
+          if (!kindAttr || kindAttr.getValue() != "inline")
+            return success();
+          StringRef name = funcOp.getName();
+          auto [_, inserted] = inlinableFuncs.try_emplace(name, funcOp);
+          if (!inserted) {
+            funcOp.emitOpError("duplicate inlinable func name `")
+                << name << "'; names must be unique within a module";
+            return failure();
+          }
+          return success();
+        }))) {
+      signalPassFailure();
+      return;
     }
 
     if (inlinableFuncs.empty())
@@ -256,18 +268,21 @@ struct HCFrontInlinePass
     }
 
     // Inline at every real call site across the module.
-    for (Operation &topOp : *moduleOp.getBody()) {
-      if (isa<hc_front::FuncOp>(topOp)) {
-        auto refAttr = topOp.getAttrOfType<DictionaryAttr>("ref");
-        auto kindAttr =
-            refAttr ? refAttr.getAs<StringAttr>("kind") : StringAttr();
-        if (kindAttr && kindAttr.getValue() == "inline")
-          continue; // already processed as a helper body above.
-      }
-      if (failed(inliner.inlineReachable(&topOp, /*chain=*/{}))) {
-        signalPassFailure();
-        return;
-      }
+    if (failed(visitTopLevelOps([&](Operation &topOp) -> LogicalResult {
+          if (isa<hc_front::FuncOp>(topOp)) {
+            auto refAttr = topOp.getAttrOfType<DictionaryAttr>("ref");
+            auto kindAttr =
+                refAttr ? refAttr.getAs<StringAttr>("kind") : StringAttr();
+            if (kindAttr && kindAttr.getValue() == "inline")
+              return success(); // already processed as a helper body above.
+          }
+          if (failed(inliner.inlineReachable(&topOp, /*chain=*/{}))) {
+            return failure();
+          }
+          return success();
+        }))) {
+      signalPassFailure();
+      return;
     }
 
     // Erase the marker funcs. Any `hc_front.name` that referred to

@@ -621,6 +621,13 @@ LogicalResult HCSymbolOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
   return success();
 }
 
+LogicalResult
+HCMaterializeBoundExprOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+                                       SmallVectorImpl<Type> &resultTypes) {
+  resultTypes.push_back(getResult().getType());
+  return success();
+}
+
 LogicalResult HCTupleOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   resultTypes.push_back(inferTupleResult(operandTypes, *this));

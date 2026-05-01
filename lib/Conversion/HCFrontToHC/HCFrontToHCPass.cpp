@@ -3090,18 +3090,20 @@ struct ConvertHCFrontToHCPass
   using ConvertHCFrontToHCBase::ConvertHCFrontToHCBase;
 
   void runOnOperation() override {
-    ModuleOp moduleOp = getOperation();
+    Operation *root = getOperation();
     MLIRContext *ctx = &getContext();
     UndefType undef = UndefType::get(ctx);
 
     SmallVector<Operation *> intrinsicOps;
     SmallVector<Operation *> frontOps;
-    for (Operation &op : *moduleOp.getBody()) {
-      if (isa<hc_front::KernelOp, hc_front::FuncOp>(op))
-        frontOps.push_back(&op);
-      else if (isa<hc_front::IntrinsicOp>(op))
-        intrinsicOps.push_back(&op);
-    }
+    for (Region &region : root->getRegions())
+      for (Block &block : region)
+        for (Operation &op : block) {
+          if (isa<hc_front::KernelOp, hc_front::FuncOp>(op))
+            frontOps.push_back(&op);
+          else if (isa<hc_front::IntrinsicOp>(op))
+            intrinsicOps.push_back(&op);
+        }
 
     LaunchMetadataAttrs defaultLaunchMetadata;
     Operation *singleKernel = nullptr;

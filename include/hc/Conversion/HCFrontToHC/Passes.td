@@ -7,7 +7,7 @@
 
 include "mlir/Pass/PassBase.td"
 
-def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc", "::mlir::ModuleOp"> {
+def ConvertHCFrontToHC : Pass<"convert-hc-front-to-hc"> {
   let summary = "Mechanical hc_front -> hc lowering driven by frontend metadata.";
   let description = [{
     Walks every `hc_front.kernel` / `hc_front.func` / `hc_front.intrinsic`

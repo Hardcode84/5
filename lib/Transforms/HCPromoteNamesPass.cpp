@@ -793,8 +793,8 @@ struct HCPromoteNamesPass
   using Base::Base;
 
   void runOnOperation() override {
-    ModuleOp moduleOp = getOperation();
-    WalkResult result = moduleOp.walk([&](Operation *op) {
+    Operation *root = getOperation();
+    WalkResult result = root->walk([&](Operation *op) {
       Region *body = nullptr;
       if (auto k = dyn_cast<HCKernelOp>(op))
         body = &k.getBody();

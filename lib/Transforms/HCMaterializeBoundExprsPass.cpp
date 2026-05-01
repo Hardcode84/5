@@ -57,6 +57,29 @@ static bool shouldMaterializeValue(Value value) {
   return true;
 }
 
+static bool isScopeToken(Type type) {
+  return isa<WorkitemType, SubgroupType>(type);
+}
+
+static bool isLaunchGeometryOp(Operation *op) {
+  return isa<HCGroupIdOp, HCLocalIdOp, HCSubgroupIdOp, HCGroupShapeOp,
+             HCGroupSizeOp, HCWorkOffsetOp, HCWorkShapeOp, HCWaveSizeOp>(op);
+}
+
+static LogicalResult rejectLiveScopeTokenGeometry(Operation *root) {
+  WalkResult walkStatus = root->walk([&](Operation *op) -> WalkResult {
+    if (!isLaunchGeometryOp(op) || op->use_empty())
+      return WalkResult::advance();
+    ValueRange operands = op->getOperands();
+    if (operands.empty() || !isScopeToken(operands.front().getType()))
+      return WalkResult::advance();
+    op->emitOpError("still has live results depending on a workitem/subgroup "
+                    "scope token after bound-expression materialization");
+    return WalkResult::interrupt();
+  });
+  return failure(walkStatus.wasInterrupted());
+}
+
 static Operation *nearestHCCallable(Operation *op) {
   while (op) {
     if (isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(op))
@@ -115,6 +138,8 @@ struct HCMaterializeBoundExprsPass
     OpBuilder builder(root->getContext());
     for (Value value : values)
       materializeValue(value, builder);
+    if (failed(rejectLiveScopeTokenGeometry(root)))
+      signalPassFailure();
   }
 };
 

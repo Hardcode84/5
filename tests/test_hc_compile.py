@@ -637,25 +637,27 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     '!hc.vector<f32, ["8"]>'
                 ) in handle.hc_ir_text
                 assert (
-                    'to !hc.bare_vector<f32, ["8"]>, '
-                    '!hc.bare_vector<!hc.pred, ["8"]>'
+                    'to !hc.bare_vector<f32, ["8", "32", "1"]>, '
+                    '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>'
                     in handle.hc_ir_text
-                    and ') -> !hc.bare_vector<f32, ["8"]>'
+                    and ') -> (!hc.bare_vector<f32, ["8", "32", "1"]>'
                     in handle.hc_ir_text
-                    and ') -> !hc.bare_vector<!hc.pred, ["8"]>'
+                    and '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>)'
+                    in handle.hc_ir_text
+                    and 'to !hc.vector<f32, ["8", "32", "1"]>'
                     in handle.hc_ir_text
                     and 'to !hc.vector<f32, ["8"]>' in handle.hc_ir_text
                 )
                 assert re.search(
                     r'hc\\.call @store_wmma_tile\\([^\\n]+\\) : '
-                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8"\\]>, '
-                    r'!hc\\.bare_vector<!hc\\.pred, \\["8"\\]>\\) -> \\(\\)',
+                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8", "32", "1"\\]>, '
+                    r'!hc\\.bare_vector<!hc\\.pred, \\["8", "32", "1"\\]>\\) -> \\(\\)',
                     handle.hc_ir_text,
                 )
                 assert re.search(
                     r'hc\\.store [^\\n]+, %[0-9]+, mask %[0-9]+ : '
-                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8"\\]>, '
-                    r'!hc\\.bare_vector<!hc\\.pred, \\["8"\\]>\\) -> \\(\\)',
+                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8", "1"\\]>, '
+                    r'!hc\\.bare_vector<!hc\\.pred, \\["8", "1"\\]>\\) -> \\(\\)',
                     handle.hc_ir_text,
                 )
 

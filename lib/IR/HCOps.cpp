@@ -4,6 +4,7 @@
 
 #include "hc/IR/HCOps.h"
 
+#include "hc/IR/HCDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -790,6 +791,124 @@ ValueRange HCWorkitemRegionOp::getYieldedResultValues() {
   return getSingleBlockYieldedResultValues(*this);
 }
 
+static FailureOr<ExprAttr> composeCollectiveDim(Operation *op, ExprAttr lhs,
+                                                sym::ExprBinaryOp opKind,
+                                                ExprAttr rhs) {
+  MLIRContext *ctx = op->getContext();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle = sym::composeExprBinary(
+      ctx->getOrLoadDialect<HCDialect>()->getSymbolStore(),
+      sym::ExprHandle(lhs.getNode()), opKind, sym::ExprHandle(rhs.getNode()),
+      &diag);
+  if (failed(handle))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
+static FailureOr<SmallVector<Attribute>>
+subgroupCollectiveSuffix(Operation *op, LaunchContextMetadata metadata) {
+  if (!metadata.groupShape || !metadata.subgroupSize ||
+      metadata.groupShape.getDims().empty())
+    return SmallVector<Attribute>{};
+
+  auto firstDim = dyn_cast<ExprAttr>(metadata.groupShape.getDims().front());
+  if (!firstDim)
+    return SmallVector<Attribute>{};
+
+  FailureOr<ExprAttr> count = composeCollectiveDim(
+      op, firstDim, sym::ExprBinaryOp::Div, metadata.subgroupSize);
+  if (failed(count))
+    return failure();
+
+  for (Attribute dim : metadata.groupShape.getDims().drop_front()) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      return SmallVector<Attribute>{};
+    count = composeCollectiveDim(op, *count, sym::ExprBinaryOp::Mul, expr);
+    if (failed(count))
+      return failure();
+  }
+  return SmallVector<Attribute>{*count};
+}
+
+static FailureOr<SmallVector<Attribute>>
+collectiveSuffix(Operation *op, LaunchContextMetadata metadata) {
+  if (isa<HCWorkitemRegionOp>(op)) {
+    if (!metadata.groupShape)
+      return SmallVector<Attribute>{};
+    return SmallVector<Attribute>(metadata.groupShape.getDims());
+  }
+  if (isa<HCSubgroupRegionOp>(op))
+    return subgroupCollectiveSuffix(op, metadata);
+  return SmallVector<Attribute>{};
+}
+
+static bool isCollectiveScalarType(Type type) {
+  return isa<IdxType, PredType>(type) || type.isIntOrIndexOrFloat();
+}
+
+static Type appendCollectiveSuffixToVector(Type type,
+                                           ArrayRef<Attribute> suffix) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  if (!shaped)
+    return {};
+  SmallVector<Attribute> dims(shaped.getSymbolicShape().getDims());
+  llvm::append_range(dims, suffix);
+  ShapeAttr shape = ShapeAttr::get(type.getContext(), dims);
+  if (auto vector = dyn_cast<mlir::hc::VectorType>(type))
+    return mlir::hc::VectorType::get(type.getContext(), vector.getElementType(),
+                                     shape);
+  if (auto bareVector = dyn_cast<mlir::hc::BareVectorType>(type))
+    return mlir::hc::BareVectorType::get(type.getContext(),
+                                         bareVector.getElementType(), shape);
+  return {};
+}
+
+static Type collectiveLiftedType(Type yieldedType, ArrayRef<Attribute> suffix) {
+  if (suffix.empty() || !yieldedType || isHCUndefType(yieldedType))
+    return yieldedType;
+
+  if (auto tuple = dyn_cast<TupleType>(yieldedType)) {
+    SmallVector<Type> elements;
+    elements.reserve(tuple.size());
+    for (Type element : tuple.getTypes()) {
+      if (isa<TupleType>(element))
+        return {};
+      Type lifted = collectiveLiftedType(element, suffix);
+      if (!lifted)
+        return {};
+      elements.push_back(lifted);
+    }
+    return TupleType::get(yieldedType.getContext(), elements);
+  }
+
+  if (Type vector = appendCollectiveSuffixToVector(yieldedType, suffix))
+    return vector;
+
+  if (isCollectiveScalarType(yieldedType)) {
+    ShapeAttr shape = ShapeAttr::get(yieldedType.getContext(), suffix);
+    return mlir::hc::VectorType::get(yieldedType.getContext(), yieldedType,
+                                     shape);
+  }
+  return {};
+}
+
+static bool collectiveYieldMatchesRegionResult(Operation *op, Type yieldedType,
+                                               Type resultType) {
+  if (!isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op) ||
+      op->getRegion(0).empty() ||
+      op->getRegion(0).front().getNumArguments() == 0)
+    return false;
+  std::optional<LaunchContextMetadata> metadata = getLaunchContextMetadata(
+      op->getRegion(0).front().getArgument(0).getType());
+  if (!metadata)
+    return false;
+  FailureOr<SmallVector<Attribute>> suffix = collectiveSuffix(op, *metadata);
+  if (failed(suffix))
+    return false;
+  return collectiveLiftedType(yieldedType, *suffix) == resultType;
+}
+
 LogicalResult HCForRangeOp::verify() {
   // The body block takes the induction variable plus one argument per
   // iter_args entry; result types mirror iter_inits types one-to-one.
@@ -863,6 +982,9 @@ LogicalResult HCForRangeOp::verify() {
 //      `hc.yield`, arity matches `$results`, each value's type is
 //      compatible with the corresponding result type (`!hc.undef`
 //      escape applies on either side, matching progressive typing).
+//      Collective region results additionally accept the source-level lifting
+//      rule where each yielded scalar/vector gains the region's participant
+//      suffix in the enclosing scope.
 //
 // A `hc.region_return` terminator combined with non-empty `$results`
 // is the frontend contradicting itself — "pre-promotion" (the
@@ -892,6 +1014,8 @@ static LogicalResult verifyNestedScopeRegion(Operation *op) {
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
     if (areHCBranchTypesCompatible(yieldedTy, resultTy))
+      continue;
+    if (collectiveYieldMatchesRegionResult(op, yieldedTy, resultTy))
       continue;
     return op->emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx

@@ -589,6 +589,139 @@ static bool refineValue(Value value, Type inferred) {
   return true;
 }
 
+static FailureOr<ExprAttr> composeCollectiveExprAttr(ExprAttr lhs,
+                                                     sym::ExprBinaryOp op,
+                                                     ExprAttr rhs,
+                                                     Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle = sym::composeExprBinary(
+      ctx->getOrLoadDialect<HCDialect>()->getSymbolStore(),
+      sym::ExprHandle(lhs.getNode()), op, sym::ExprHandle(rhs.getNode()),
+      &diag);
+  if (failed(handle)) {
+    diagOp->emitOpError("failed to infer collective return dimension: ")
+        << diag;
+    return failure();
+  }
+  return ExprAttr::get(ctx, *handle);
+}
+
+static FailureOr<SmallVector<Attribute>>
+subgroupCollectiveSuffix(Operation *op, LaunchContextMetadata metadata) {
+  if (!metadata.groupShape || !metadata.subgroupSize ||
+      metadata.groupShape.getDims().empty())
+    return SmallVector<Attribute>{};
+
+  auto firstDim = dyn_cast<ExprAttr>(metadata.groupShape.getDims().front());
+  if (!firstDim)
+    return SmallVector<Attribute>{};
+
+  FailureOr<ExprAttr> count = composeCollectiveExprAttr(
+      firstDim, sym::ExprBinaryOp::Div, metadata.subgroupSize, op);
+  if (failed(count))
+    return failure();
+
+  for (Attribute dim : metadata.groupShape.getDims().drop_front()) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      return SmallVector<Attribute>{};
+    count = composeCollectiveExprAttr(*count, sym::ExprBinaryOp::Mul, expr, op);
+    if (failed(count))
+      return failure();
+  }
+  return SmallVector<Attribute>{*count};
+}
+
+static FailureOr<SmallVector<Attribute>>
+collectiveSuffix(Operation *op, LaunchContextMetadata metadata) {
+  if (isa<HCWorkitemRegionOp>(op)) {
+    if (!metadata.groupShape)
+      return SmallVector<Attribute>{};
+    return SmallVector<Attribute>(metadata.groupShape.getDims());
+  }
+  if (isa<HCSubgroupRegionOp>(op))
+    return subgroupCollectiveSuffix(op, metadata);
+  return SmallVector<Attribute>{};
+}
+
+static bool isCollectiveScalarType(Type type) {
+  return isa<IdxType, PredType>(type) || type.isIntOrIndexOrFloat();
+}
+
+static Type appendCollectiveSuffixToVector(Type type,
+                                           ArrayRef<Attribute> suffix) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  if (!shaped)
+    return {};
+  SmallVector<Attribute> dims(shaped.getSymbolicShape().getDims());
+  llvm::append_range(dims, suffix);
+  ShapeAttr shape = ShapeAttr::get(type.getContext(), dims);
+  if (auto vector = dyn_cast<mlir::hc::VectorType>(type))
+    return mlir::hc::VectorType::get(type.getContext(), vector.getElementType(),
+                                     shape);
+  if (auto bareVector = dyn_cast<mlir::hc::BareVectorType>(type))
+    return mlir::hc::BareVectorType::get(type.getContext(),
+                                         bareVector.getElementType(), shape);
+  return {};
+}
+
+static FailureOr<Type> liftCollectiveReturnType(Operation *op, Type type,
+                                                ArrayRef<Attribute> suffix) {
+  if (suffix.empty() || !type || isHCUndefType(type))
+    return type;
+
+  if (isa<mlir::hc::TensorType, mlir::hc::BareTensorType>(type))
+    return op->emitOpError("collective region cannot return tensor value ")
+           << type;
+
+  if (auto tuple = dyn_cast<TupleType>(type)) {
+    SmallVector<Type> elements;
+    elements.reserve(tuple.size());
+    for (Type element : tuple.getTypes()) {
+      if (isa<TupleType>(element))
+        return op->emitOpError("collective region cannot return nested tuple ")
+               << type;
+      FailureOr<Type> lifted = liftCollectiveReturnType(op, element, suffix);
+      if (failed(lifted))
+        return failure();
+      elements.push_back(*lifted);
+    }
+    return Type(TupleType::get(type.getContext(), elements));
+  }
+
+  if (Type vector = appendCollectiveSuffixToVector(type, suffix))
+    return vector;
+
+  if (isCollectiveScalarType(type)) {
+    ShapeAttr shape = ShapeAttr::get(type.getContext(), suffix);
+    return Type(mlir::hc::VectorType::get(type.getContext(), type, shape));
+  }
+
+  return op->emitOpError("collective region cannot return value of type ")
+         << type;
+}
+
+static FailureOr<Type> inferCollectiveRegionResultType(Operation *op,
+                                                       Type yieldedType) {
+  if (!isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op))
+    return yieldedType;
+  if (op->getNumRegions() != 1 || op->getRegion(0).empty() ||
+      op->getRegion(0).front().getNumArguments() == 0)
+    return yieldedType;
+
+  Block &body = op->getRegion(0).front();
+  std::optional<LaunchContextMetadata> metadata =
+      getLaunchContextMetadata(body.getArgument(0).getType());
+  if (!metadata)
+    return yieldedType;
+
+  FailureOr<SmallVector<Attribute>> suffix = collectiveSuffix(op, *metadata);
+  if (failed(suffix))
+    return failure();
+  return liftCollectiveReturnType(op, yieldedType, *suffix);
+}
+
 static TypeFact factFromValue(DataFlowSolver &solver, Value value) {
   TypeFact fact = factFromExistingType(value.getType());
   if (std::optional<Type> inferred = inferredTypeFor(solver, value)) {
@@ -600,25 +733,32 @@ static TypeFact factFromValue(DataFlowSolver &solver, Value value) {
   return fact;
 }
 
-static bool updateYieldedRegionResultTypes(ModuleOp module,
-                                           DataFlowSolver &solver) {
+static FailureOr<bool> updateYieldedRegionResultTypes(ModuleOp module,
+                                                      DataFlowSolver &solver) {
   bool changed = false;
-  module.walk([&](HCYieldedResultsOpInterface op) {
+  WalkResult walkStatus = module.walk([&](HCYieldedResultsOpInterface op) {
     ValueRange yieldedValues = op.getYieldedResultValues();
     if (yieldedValues.empty())
-      return;
+      return WalkResult::advance();
     if (yieldedValues.size() != op->getNumResults()) {
       assert(false && "verified yielded-result region arity mismatch");
-      return;
+      return WalkResult::advance();
     }
     for (auto [result, yielded] :
          llvm::zip_equal(op->getResults(), yieldedValues)) {
       TypeFact fact = factFromValue(solver, yielded);
       if (!fact.hasUsableType())
         continue;
-      changed |= refineValue(result, fact.type);
+      FailureOr<Type> resultType =
+          inferCollectiveRegionResultType(op.getOperation(), fact.type);
+      if (failed(resultType))
+        return WalkResult::interrupt();
+      changed |= refineValue(result, *resultType);
     }
+    return WalkResult::advance();
   });
+  if (walkStatus.wasInterrupted())
+    return failure();
   return changed;
 }
 
@@ -676,12 +816,17 @@ static bool updateCallableFunctionTypes(ModuleOp module,
   return changed;
 }
 
-static bool applyInferredTypes(ModuleOp module, DataFlowSolver &solver) {
+static FailureOr<bool> applyInferredTypes(ModuleOp module,
+                                          DataFlowSolver &solver) {
   bool changed = updateCallableFunctionTypes(module, solver);
   // Region result refinement can itself update enclosing callable signatures
   // through return users; the outer solver loop reruns until those surfaces
   // converge.
-  changed |= updateYieldedRegionResultTypes(module, solver);
+  FailureOr<bool> regionResultsChanged =
+      updateYieldedRegionResultTypes(module, solver);
+  if (failed(regionResultsChanged))
+    return failure();
+  changed |= *regionResultsChanged;
   module.walk([&](Operation *op) {
     for (OpResult result : op->getResults()) {
       if (!isNestedUnderHCCallable(result))
@@ -999,7 +1144,10 @@ struct HCInferTypesPass : public hc::impl::HCInferTypesBase<HCInferTypesPass> {
         return signalPassFailure();
       if (failed(reportTypeConflicts(module, solver)))
         return signalPassFailure();
-      if (!applyInferredTypes(module, solver)) {
+      FailureOr<bool> changed = applyInferredTypes(module, solver);
+      if (failed(changed))
+        return signalPassFailure();
+      if (!*changed) {
         if (failed(renumberSyntheticJoinSymbols(module)))
           return signalPassFailure();
         return;

@@ -50,3 +50,16 @@ hc.func @getitem_invalid_base(%base: !hc.idx<"N">, %idx: !hc.idx<"0">) {
       : (!hc.idx<"N">, !hc.idx<"0">) -> !hc.undef
   hc.return
 }
+
+// -----
+
+hc.func @workitem_region_rejects_tensor_return(
+    %tile: !hc.tensor<f32, ["4"]>) {
+  // expected-error @+1 {{collective region cannot return tensor value '!hc.tensor<f32, ["4"]>'}}
+  %region = hc.workitem_region -> (!hc.undef) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %tile : !hc.tensor<f32, ["4"]>
+  }
+  hc.return
+}

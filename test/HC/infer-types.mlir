@@ -371,6 +371,61 @@ hc.func @subgroup_tail_region_callee(%group: !hc.undef) -> !hc.undef {
   hc.return %region : !hc.undef
 }
 
+// CHECK-LABEL: hc.func @workitem_region_vector_lifts_collective_suffix
+// CHECK: %[[REGION:.*]] = hc.workitem_region -> (!hc.vector<f32, ["8", "32", "1"]>)
+// CHECK: hc.yield {{.*}} : !hc.vector<f32, ["8"]>
+// CHECK: hc.return %[[REGION]] : !hc.vector<f32, ["8", "32", "1"]>
+hc.func @workitem_region_vector_lifts_collective_suffix(
+    %local: !hc.vector<f32, ["8"]>) -> !hc.undef {
+  %region = hc.workitem_region -> (!hc.undef) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %local : !hc.vector<f32, ["8"]>
+  }
+  hc.return %region : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @workitem_region_scalar_lifts_collective_suffix
+// CHECK: %[[REGION:.*]] = hc.workitem_region -> (!hc.vector<i32, ["32", "1"]>)
+// CHECK: hc.yield {{.*}} : i32
+// CHECK: hc.return %[[REGION]] : !hc.vector<i32, ["32", "1"]>
+hc.func @workitem_region_scalar_lifts_collective_suffix(%value: i32)
+    -> !hc.undef {
+  %region = hc.workitem_region -> (!hc.undef) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %value : i32
+  }
+  hc.return %region : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @subgroup_region_vector_lifts_collective_suffix
+// CHECK: %[[REGION:.*]] = hc.subgroup_region -> (!hc.vector<f32, ["4", "2"]>)
+// CHECK: hc.yield {{.*}} : !hc.vector<f32, ["4"]>
+// CHECK: hc.return %[[REGION]] : !hc.vector<f32, ["4", "2"]>
+hc.func @subgroup_region_vector_lifts_collective_suffix(
+    %local: !hc.vector<f32, ["4"]>) -> !hc.undef {
+  %region = hc.subgroup_region -> (!hc.undef) {
+  ^bb0(%sg: !hc.subgroup<group_shape = #hc.shape<["64"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %local : !hc.vector<f32, ["4"]>
+  }
+  hc.return %region : !hc.undef
+}
+
+// CHECK-LABEL: hc.func @distributed_vector_indexes_back_to_local_fragment
+// CHECK: hc.buffer_view {{.*}} -> !hc.vector<f32, ["8"]>
+hc.func @distributed_vector_indexes_back_to_local_fragment(
+    %acc: !hc.vector<f32, ["8", "32", "1"]>,
+    %lane: !hc.idx<"7">,
+    %zero: !hc.idx<"0">) -> !hc.undef {
+  %full = hc.slice_expr() : () -> !hc.undef
+  %local = hc.buffer_view %acc[%full, %lane, %zero]
+      : (!hc.vector<f32, ["8", "32", "1"]>, !hc.undef, !hc.idx<"7">,
+         !hc.idx<"0">) -> !hc.undef
+  hc.return %local : !hc.undef
+}
+
 // CHECK-LABEL: hc.func @call_result_iter_arg_keeps_loop_body_live
 // CHECK: %[[INIT:.*]] = hc.call @workitem_tail_region_callee
 // CHECK: hc.for_range {{.*}} iter_args(%[[INIT]])

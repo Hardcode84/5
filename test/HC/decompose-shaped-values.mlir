@@ -222,3 +222,45 @@ hc.func @if_result(%cond: i1,
   }
   hc.return %choice : !hc.vector<f32, ["4"]>
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @workitem_region_result
+// CHECK-SAME: %[[LOCAL_DATA:[^:]+]]: !hc.bare_vector<f32, ["8"]>
+// CHECK-SAME: %[[LOCAL_MASK:[^:]+]]: !hc.bare_vector<!hc.pred, ["8"]>
+// CHECK-SAME: -> (!hc.bare_vector<f32, ["8", "32", "1"]>, !hc.bare_vector<!hc.pred, ["8", "32", "1"]>)
+// CHECK: %[[REGION:.*]]:2 = hc.workitem_region -> (!hc.bare_vector<f32, ["8", "32", "1"]>, !hc.bare_vector<!hc.pred, ["8", "32", "1"]>)
+// CHECK: ^bb0(%{{.*}}: !hc.workitem<group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>):
+// CHECK: hc.yield %[[LOCAL_DATA]], %[[LOCAL_MASK]]
+// CHECK-SAME: !hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>
+// CHECK: hc.return %[[REGION]]#0, %[[REGION]]#1
+hc.func @workitem_region_result(%local: !hc.vector<f32, ["8"]>)
+    -> !hc.vector<f32, ["8", "32", "1"]> {
+  %region = hc.workitem_region -> (!hc.vector<f32, ["8", "32", "1"]>) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %local : !hc.vector<f32, ["8"]>
+  }
+  hc.return %region : !hc.vector<f32, ["8", "32", "1"]>
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @subgroup_region_result
+// CHECK-SAME: %[[LOCAL_DATA:[^:]+]]: !hc.bare_vector<f32, ["4"]>
+// CHECK-SAME: %[[LOCAL_MASK:[^:]+]]: !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK-SAME: -> (!hc.bare_vector<f32, ["4", "2"]>, !hc.bare_vector<!hc.pred, ["4", "2"]>)
+// CHECK: %[[REGION:.*]]:2 = hc.subgroup_region -> (!hc.bare_vector<f32, ["4", "2"]>, !hc.bare_vector<!hc.pred, ["4", "2"]>)
+// CHECK: ^bb0(%{{.*}}: !hc.subgroup<group_shape = #hc.shape<["64"]>, subgroup_size = #hc.expr<"32">>):
+// CHECK: hc.yield %[[LOCAL_DATA]], %[[LOCAL_MASK]]
+// CHECK-SAME: !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: hc.return %[[REGION]]#0, %[[REGION]]#1
+hc.func @subgroup_region_result(%local: !hc.vector<f32, ["4"]>)
+    -> !hc.vector<f32, ["4", "2"]> {
+  %region = hc.subgroup_region -> (!hc.vector<f32, ["4", "2"]>) {
+  ^bb0(%sg: !hc.subgroup<group_shape = #hc.shape<["64"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %local : !hc.vector<f32, ["4"]>
+  }
+  hc.return %region : !hc.vector<f32, ["4", "2"]>
+}

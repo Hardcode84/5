@@ -417,6 +417,41 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
   }
 };
 
+template <typename OpT>
+struct ConvertCollectiveRegionOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Type> convertedResults;
+    SmallVector<unsigned> resultWidths;
+    if (failed(convertResultTypes(op->getResultTypes(), *this->typeConverter,
+                                  convertedResults, resultWidths)))
+      return failure();
+
+    TypeConverter::SignatureConversion bodyConversion(
+        op.getBody().front().getNumArguments());
+    if (failed(this->typeConverter->convertSignatureArgs(
+            op.getBody().front().getArgumentTypes(), bodyConversion)))
+      return failure();
+
+    auto newRegion = OpT::create(rewriter, op.getLoc(), convertedResults,
+                                 op.getCapturesAttr());
+    newRegion->setAttrs(op->getAttrs());
+    rewriter.inlineRegionBefore(op.getBody(), newRegion.getBody(),
+                                newRegion.getBody().begin());
+    rewriter.applySignatureConversion(&newRegion.getBody().front(),
+                                      bodyConversion, this->typeConverter);
+
+    replaceOpWithResultSlices(rewriter, op, newRegion->getResults(),
+                              resultWidths);
+    return success();
+  }
+};
+
 struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
   using Base::Base;
 
@@ -478,7 +513,8 @@ struct ConvertYieldOp : public OpConversionPattern<HCYieldOp> {
   LogicalResult
   matchAndRewrite(HCYieldOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+    if (!isa<HCForRangeOp, HCIfOp, HCWorkitemRegionOp, HCSubgroupRegionOp>(
+            op->getParentOp()))
       return failure();
     HCYieldOp::create(rewriter, op.getLoc(),
                       flattenValues(adaptor.getValues()));
@@ -775,8 +811,10 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 RewritePatternSet &patterns) {
   patterns.add<ConvertCallableSignatureOp<HCKernelOp>,
                ConvertCallableSignatureOp<HCFuncOp>, ConvertCallOp,
-               ConvertForRangeOp, ConvertIfOp, ConvertStoreOp, ConvertReturnOp,
-               ConvertYieldOp>(converter, ctx);
+               ConvertForRangeOp, ConvertIfOp,
+               ConvertCollectiveRegionOp<HCWorkitemRegionOp>,
+               ConvertCollectiveRegionOp<HCSubgroupRegionOp>, ConvertStoreOp,
+               ConvertReturnOp, ConvertYieldOp>(converter, ctx);
   patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
                ConvertGetItemOp, ConvertVecOp, ConvertWithInactiveOp>(converter,
                                                                       ctx);
@@ -798,11 +836,13 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
   });
   target.addDynamicallyLegalOp<HCCallOp, HCStoreOp, HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
-  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp>([&](Operation *op) {
+  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
+                               HCSubgroupRegionOp>([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter);
   });
   target.addDynamicallyLegalOp<HCYieldOp>([&](Operation *op) {
-    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+    if (!isa<HCForRangeOp, HCIfOp, HCWorkitemRegionOp, HCSubgroupRegionOp>(
+            op->getParentOp()))
       return true;
     return converter.isLegal(op);
   });
@@ -828,11 +868,13 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
       HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
       HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
       [&](Operation *op) { return converter.isLegal(op); });
-  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp>([&](Operation *op) {
+  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
+                               HCSubgroupRegionOp>([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter);
   });
   target.addDynamicallyLegalOp<HCYieldOp>([&](Operation *op) {
-    if (!isa<HCForRangeOp, HCIfOp>(op->getParentOp()))
+    if (!isa<HCForRangeOp, HCIfOp, HCWorkitemRegionOp, HCSubgroupRegionOp>(
+            op->getParentOp()))
       return true;
     return converter.isLegal(op);
   });

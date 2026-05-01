@@ -637,12 +637,14 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     '!hc.vector<f32, ["8"]>'
                 ) in handle.hc_ir_text
                 assert (
-                    'to !hc.bare_vector<f32, ["8", "32", "1"]>, '
+                    '-> (!hc.bare_vector<f32, ["8", "32", "1"]>, '
                     '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>'
                     in handle.hc_ir_text
-                    and ') -> (!hc.bare_vector<f32, ["8", "32", "1"]>'
-                    in handle.hc_ir_text
                     and '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>)'
+                    in handle.hc_ir_text
+                    and 'hc.workitem_region captures = ["group"] -> '
+                    '(!hc.bare_vector<f32, ["8", "32", "1"]>, '
+                    '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>)'
                     in handle.hc_ir_text
                     and 'to !hc.vector<f32, ["8"]>' in handle.hc_ir_text
                 )

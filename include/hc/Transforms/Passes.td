@@ -126,4 +126,18 @@ def HCMaterializeBoundExprs
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCNormalizeScopeRegions
+    : Pass<"hc-normalize-scope-regions"> {
+  let summary = "Flatten supported collective scope regions into SPMD HC IR.";
+  let description = [{
+    Normalizes HC toward per-workitem SPMD form before upstream GPU lowering.
+    The first supported slice flattens resultless `hc.workitem_region` bodies
+    after bound expression materialization has removed live uses of the
+    workitem token. Result-producing workitem regions and subgroup regions are
+    diagnosed until distributed value projection and subgroup-local workitem
+    semantics are handled explicitly.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 #endif // HC_TRANSFORMS_PASSES

@@ -126,6 +126,7 @@ def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
             "hc-verify-static-shapes,"
             "hc-decompose-shaped-values,"
             "hc-materialize-bound-exprs,"
+            "hc-normalize-scope-regions,"
             "hc-lower-bare-predicates)"
         )
         transform_driver = "builtin.module(transform-interpreter)"

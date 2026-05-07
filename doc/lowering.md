@@ -347,8 +347,9 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 #### Declarations and regions
 
 * `hc.kernel @name` — compiled kernel; carries a module-scoped symbol name
-  plus symbolic launch geometry, parameter annotations, and literal-symbol
-  set attributes. `Symbol` trait so references go through the symbol table.
+  plus symbolic launch geometry, declared bound-symbol metadata, parameter
+  annotations, and literal-symbol set attributes. `Symbol` trait so references
+  go through the symbol table.
 * `hc.func @name` — helper callable referenced by `hc.call`. Also a
   `Symbol`. An optional inline `function_type` signature makes the op
   self-describing; when present, `hc.call` sites get arity and type
@@ -616,7 +617,10 @@ hc.kernel @tiled_gfx11_wmma_matmul(
   %c: !hc.buffer<f32, ["M", "N"]>) attributes {
   work_shape    = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>,
   group_shape   = #hc.shape<["32", "1"]>,
-  subgroup_size = 32 : i32
+  subgroup_size = 32 : i32,
+  bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1",
+                   "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1",
+                   "$GSZ0", "$WV0"]
 } {
   %c0 = hc.const <0 : i64>  : !hc.undef
   %c1 = hc.const <1 : i64>  : !hc.undef
@@ -906,19 +910,19 @@ and override API.
 
 Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
-refined, bound symbolic expressions have been materialized as SSA, static
-tensor/vector shape operands have been verified, and supported semantic shaped
-values may have been split into bare data/masks. The scheduled decomposition is
-non-strict: helper-call signatures, call sites, stores, and structured/collective
-region boundaries are decomposed, while intrinsic boundaries that are not
-decomposed yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic
-launch parameters may still remain. Supported helper calls and workitem scope
-regions are then normalized away so the executable HC body is closer to
-per-workitem SPMD form before upstream lowering. Bound-expression materialization
-runs a second time after helper inlining because inlined helper bodies can expose
-fresh launch-geometry producer chains; DCE/canonicalization removes the dead
-scope-token producers before region normalization checks for remaining live
-scope-token uses.
+refined, bound symbolic expressions declared by kernel `bound_symbols` have
+been materialized as SSA, static tensor/vector shape operands have been verified,
+and supported semantic shaped values may have been split into bare data/masks.
+The scheduled decomposition is non-strict: helper-call signatures, call sites,
+stores, and structured/collective region boundaries are decomposed, while
+intrinsic boundaries that are not decomposed yet are preserved with
+`builtin.unrealized_conversion_cast`. Symbolic launch parameters may still
+remain. Supported helper calls and workitem scope regions are then normalized
+away so the executable HC body is closer to per-workitem SPMD form before
+upstream lowering. Bound-expression materialization runs a second time after
+helper inlining because inlined helper bodies can expose fresh launch-geometry
+producer chains; DCE/canonicalization removes the dead scope-token producers
+before region normalization checks for remaining live scope-token uses.
 
 ### SSA construction
 

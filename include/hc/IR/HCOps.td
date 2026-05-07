@@ -67,10 +67,11 @@ def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
     are forbidden — kernels terminate with an operand-less `hc.return`.
 
     Decorator metadata arrives as optional attributes: symbolic `work_shape`
-    and `group_shape` as `#hc.shape`, `subgroup_size` as an `i32`, and
-    `literals` as a `StrArrayAttr` listing symbols that specialization is
-    allowed to bind. All are optional so the `hc_front -> hc` pass can fill
-    them in progressively.
+    and `group_shape` as `#hc.shape`, `subgroup_size` as an `i32`,
+    `bound_symbols` as a `StrArrayAttr` listing launch/bound symbols that may
+    be materialized, and `literals` as a `StrArrayAttr` listing symbols that
+    specialization is allowed to bind. All are optional so the `hc_front -> hc`
+    pass can fill them in progressively.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,
@@ -78,6 +79,7 @@ def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
     OptionalAttr<HC_ShapeAttr>:$work_shape,
     OptionalAttr<HC_ShapeAttr>:$group_shape,
     OptionalAttr<I32Attr>:$subgroup_size,
+    OptionalAttr<StrArrayAttr>:$bound_symbols,
     OptionalAttr<StrArrayAttr>:$literals,
     OptionalAttr<HC_ConstraintSetAttr>:$requirements
   );

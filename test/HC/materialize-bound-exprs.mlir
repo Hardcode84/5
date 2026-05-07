@@ -44,3 +44,15 @@ hc.func @bound_predicate(%pred: !hc.pred<"$WI0 - 32 < 0">)
 hc.func @user_symbol_stays_symbolic(%m: !hc.idx<"M">) -> !hc.idx<"M"> {
   hc.return %m : !hc.idx<"M">
 }
+
+// -----
+
+// CHECK-LABEL: hc.kernel @declared_kernel_bound_symbol
+// CHECK-SAME: bound_symbols = ["$WG0"]
+// CHECK: %[[WG0:.*]] = hc.materialize_bound_expr : !hc.idx<"$WG0">
+// CHECK: hc.add %[[WG0]], %[[WG0]]
+hc.kernel @declared_kernel_bound_symbol(%gid: !hc.idx<"$WG0">)
+    attributes {bound_symbols = ["$WG0"]} {
+  %sum = hc.add %gid, %gid : (!hc.idx<"$WG0">, !hc.idx<"$WG0">) -> !hc.idx<"2*$WG0">
+  hc.return
+}

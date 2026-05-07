@@ -25,3 +25,12 @@ hc.func @live_subgroup_geometry_is_rejected(
                       subgroup_size = #hc.expr<"32">>) -> !hc.idx
   hc.return %sid : !hc.idx
 }
+
+// -----
+
+hc.kernel @materialized_expr_must_use_declared_symbol
+    attributes {bound_symbols = ["$WI0"]} {
+  // expected-error @+1 {{references undeclared bound symbol '$WG0'}}
+  %bad = hc.materialize_bound_expr : !hc.idx<"$WG0">
+  hc.return
+}

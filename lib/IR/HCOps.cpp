@@ -11,6 +11,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <optional>
 
@@ -293,6 +294,17 @@ LogicalResult HCKernelOp::verify() {
       return emitOpError(
           "kernel signatures must declare no results; kernels return via "
           "an operand-less `hc.return`");
+  }
+  if (auto boundSymbols = getBoundSymbolsAttr()) {
+    llvm::StringSet<> seen;
+    for (StringAttr symbol : boundSymbols.getAsRange<StringAttr>()) {
+      StringRef name = symbol.getValue();
+      if (!name.starts_with("$"))
+        return emitOpError("bound symbol '")
+               << name << "' must use the internal `$` prefix";
+      if (!seen.insert(name).second)
+        return emitOpError("duplicate bound symbol '") << name << "'";
+    }
   }
   return verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody());
 }

@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCMATERIALIZEBOUNDEXPRS
@@ -27,30 +28,75 @@ using namespace mlir::hc;
 
 namespace {
 
-static bool isBoundSymbolName(StringRef name) {
-  // The richer kernel metadata contract is tracked separately. Today generated
-  // launch and scope symbols are reserved with a `$` prefix, while user/problem
-  // symbols such as `M`/`N` must remain symbolic until specialization.
+struct BoundSymbolSet {
+  llvm::StringSet<> symbols;
+  bool hasDeclarations = false;
+};
+
+static BoundSymbolSet collectBoundSymbols(Operation *root) {
+  BoundSymbolSet boundSymbols;
+  root->walk([&](HCKernelOp kernel) {
+    ArrayAttr symbols = kernel.getBoundSymbolsAttr();
+    if (!symbols)
+      return;
+    boundSymbols.hasDeclarations = true;
+    for (StringAttr symbol : symbols.getAsRange<StringAttr>())
+      boundSymbols.symbols.insert(symbol.getValue());
+  });
+  return boundSymbols;
+}
+
+static bool isBoundSymbolName(StringRef name,
+                              const BoundSymbolSet &boundSymbols) {
+  if (boundSymbols.hasDeclarations)
+    return boundSymbols.symbols.count(name);
+  // Legacy and helper-only IR can still be run without a kernel metadata
+  // anchor. Generated launch and scope symbols use a reserved `$` prefix;
+  // user/problem symbols such as `M`/`N` remain symbolic until specialization.
   return name.starts_with("$");
 }
 
-template <typename AttrT> static bool dependsOnlyOnBoundSymbols(AttrT attr) {
+template <typename AttrT>
+static bool dependsOnlyOnBoundSymbols(AttrT attr,
+                                      const BoundSymbolSet &boundSymbols) {
   bool ok = true;
-  sym::walkSymbolNames(attr.getValue(),
-                       [&](StringRef name) { ok &= isBoundSymbolName(name); });
+  sym::walkSymbolNames(attr.getValue(), [&](StringRef name) {
+    ok &= isBoundSymbolName(name, boundSymbols);
+  });
   return ok;
 }
 
-static bool shouldMaterializeType(Type type) {
+static std::string firstUndeclaredSymbol(Attribute attr,
+                                         const BoundSymbolSet &boundSymbols) {
+  std::string undeclared;
+  if (!boundSymbols.hasDeclarations)
+    return undeclared;
+  auto checkName = [&](StringRef name) {
+    if (undeclared.empty() && !isBoundSymbolName(name, boundSymbols))
+      undeclared = name.str();
+  };
+  if (auto expr = dyn_cast<ExprAttr>(attr))
+    sym::walkSymbolNames(expr.getValue(), checkName);
+  if (auto pred = dyn_cast<PredAttr>(attr))
+    sym::walkSymbolNames(pred.getValue(), checkName);
+  return undeclared;
+}
+
+static bool shouldMaterializeType(Type type,
+                                  const BoundSymbolSet &boundSymbols) {
   if (auto idx = dyn_cast_or_null<IdxType>(type))
-    return idx.getExpr() && dependsOnlyOnBoundSymbols(idx.getExpr());
+    return idx.getExpr() &&
+           dependsOnlyOnBoundSymbols(idx.getExpr(), boundSymbols);
   if (auto pred = dyn_cast_or_null<PredType>(type))
-    return pred.getPred() && dependsOnlyOnBoundSymbols(pred.getPred());
+    return pred.getPred() &&
+           dependsOnlyOnBoundSymbols(pred.getPred(), boundSymbols);
   return false;
 }
 
-static bool shouldMaterializeValue(Value value) {
-  if (!shouldMaterializeType(value.getType()) || value.use_empty())
+static bool shouldMaterializeValue(Value value,
+                                   const BoundSymbolSet &boundSymbols) {
+  if (!shouldMaterializeType(value.getType(), boundSymbols) ||
+      value.use_empty())
     return false;
   if (auto result = dyn_cast<OpResult>(value))
     return !isa<HCMaterializeBoundExprOp>(result.getOwner());
@@ -116,6 +162,29 @@ static void materializeValue(Value value, OpBuilder &builder) {
   value.replaceAllUsesExcept(materialized.getResult(), materialized);
 }
 
+static LogicalResult
+verifyMaterializedExprSymbols(Operation *root,
+                              const BoundSymbolSet &boundSymbols) {
+  WalkResult status =
+      root->walk([&](HCMaterializeBoundExprOp op) -> WalkResult {
+        Type result = op.getResult().getType();
+        Attribute expr;
+        if (auto idx = dyn_cast<IdxType>(result))
+          expr = idx.getExpr();
+        else if (auto pred = dyn_cast<PredType>(result))
+          expr = pred.getPred();
+        if (!expr)
+          return WalkResult::advance();
+        std::string undeclared = firstUndeclaredSymbol(expr, boundSymbols);
+        if (undeclared.empty())
+          return WalkResult::advance();
+        op->emitOpError("references undeclared bound symbol '")
+            << undeclared << "'";
+        return WalkResult::interrupt();
+      });
+  return failure(status.wasInterrupted());
+}
+
 struct HCMaterializeBoundExprsPass
     : public hc::impl::HCMaterializeBoundExprsBase<
           HCMaterializeBoundExprsPass> {
@@ -123,21 +192,26 @@ struct HCMaterializeBoundExprsPass
 
   void runOnOperation() override {
     Operation *root = getOperation();
+    BoundSymbolSet boundSymbols = collectBoundSymbols(root);
     SmallVector<Value> values;
     root->walk([&](Operation *op) {
       for (OpResult result : op->getResults())
-        if (isNestedUnderHCCallable(result) && shouldMaterializeValue(result))
+        if (isNestedUnderHCCallable(result) &&
+            shouldMaterializeValue(result, boundSymbols))
           values.push_back(result);
       for (Region &region : op->getRegions())
         for (Block &block : region)
           for (BlockArgument arg : block.getArguments())
-            if (isNestedUnderHCCallable(arg) && shouldMaterializeValue(arg))
+            if (isNestedUnderHCCallable(arg) &&
+                shouldMaterializeValue(arg, boundSymbols))
               values.push_back(arg);
     });
 
     OpBuilder builder(root->getContext());
     for (Value value : values)
       materializeValue(value, builder);
+    if (failed(verifyMaterializedExprSymbols(root, boundSymbols)))
+      signalPassFailure();
     if (failed(rejectLiveScopeTokenGeometry(root)))
       signalPassFailure();
   }

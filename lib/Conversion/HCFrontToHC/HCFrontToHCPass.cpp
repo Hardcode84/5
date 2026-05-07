@@ -580,6 +580,40 @@ parseLaunchMetadata(Operation *sourceOp, LaunchMetadataAttrs attrs) {
   return metadata;
 }
 
+static void appendLaunchBoundSymbols(MLIRContext *ctx, StringRef prefix,
+                                     unsigned rank,
+                                     SmallVectorImpl<Attribute> &symbols) {
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    SmallString<16> name(prefix);
+    name += Twine(axis).str();
+    symbols.push_back(StringAttr::get(ctx, name));
+  }
+}
+
+static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, ShapeAttr workShape,
+                                         ShapeAttr groupShape) {
+  SmallVector<Attribute> symbols;
+  unsigned workRank =
+      workShape ? static_cast<unsigned>(workShape.getDims().size()) : 0;
+  unsigned groupRank =
+      groupShape ? static_cast<unsigned>(groupShape.getDims().size()) : 0;
+  unsigned groupIdRank = workRank ? workRank : groupRank;
+
+  auto appendMethod = [&](LaunchGeoMethod method, unsigned rank) {
+    appendLaunchBoundSymbols(ctx, getLaunchGeoMethodInfo(method).symbolPrefix,
+                             rank, symbols);
+  };
+  appendMethod(LaunchGeoMethod::GroupId, groupIdRank);
+  appendMethod(LaunchGeoMethod::LocalId, groupRank);
+  appendMethod(LaunchGeoMethod::SubgroupId, groupRank);
+  appendMethod(LaunchGeoMethod::GroupShape, groupRank);
+  appendMethod(LaunchGeoMethod::WorkOffset, workRank);
+  appendMethod(LaunchGeoMethod::WorkShape, workRank);
+  appendMethod(LaunchGeoMethod::GroupSize, 1);
+  appendMethod(LaunchGeoMethod::WaveSize, 1);
+  return ArrayAttr::get(ctx, symbols);
+}
+
 static std::optional<StringRef>
 getLaunchContextParameterKind(DictionaryAttr param) {
   auto kind = param.getAs<StringAttr>("kind");
@@ -1062,7 +1096,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
               builder, loc, StringAttr::get(ctx, kernel.getName()),
               TypeAttr::get(fnType), /*work_shape=*/ShapeAttr(),
               /*group_shape=*/ShapeAttr(),
-              /*subgroup_size=*/IntegerAttr(), /*literals=*/ArrayAttr(),
+              /*subgroup_size=*/IntegerAttr(), /*bound_symbols=*/ArrayAttr(),
+              /*literals=*/ArrayAttr(),
               /*requirements=*/ConstraintSetAttr());
           hcKernel.getBody().push_back(entry);
           // Shape-like metadata travels as string arrays in hc_front;
@@ -1087,6 +1122,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
           }
           if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
             hcKernel.setSubgroupSizeAttr(sg);
+          hcKernel.setBoundSymbolsAttr(buildKernelBoundSymbols(
+              ctx, hcKernel.getWorkShapeAttr(), hcKernel.getGroupShapeAttr()));
           if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
             hcKernel.setLiteralsAttr(lits);
           return &kernel.getBody();

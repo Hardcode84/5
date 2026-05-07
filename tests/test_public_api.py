@@ -14,6 +14,7 @@ from hc import (
     as_layout,
     index_map,
     kernel,
+    undef_type,
 )
 
 
@@ -57,13 +58,24 @@ def test_helper_decorator_stores_scope() -> None:
 
 
 def test_intrinsic_decorator_registers_hooks() -> None:
-    @kernel.intrinsic(scope=SubGroup, effects="pure", const_attrs={"blocksz"})
+    @kernel.intrinsic(
+        scope=SubGroup,
+        effects="pure",
+        const_attrs={"blocksz"},
+        result_types=(undef_type(),),
+    )
     def mfma(a, b, acc, *, blocksz):
         return acc
 
     @mfma.lower(target="amdgpu")
-    def _lower(*args, **kwargs):
-        return (args, kwargs)
+    def _lower(t, call):
+        op = t.create(
+            "test.mfma",
+            operands=[call.operand("a"), call.operand(1), call.operand("acc")],
+            result_types=[call.result_type(0)],
+            attrs={"blocksz": call.attr("blocksz")},
+        )
+        return op.result(0)
 
     @mfma.verify
     def _verify(sig, target):
@@ -76,8 +88,36 @@ def test_intrinsic_decorator_registers_hooks() -> None:
     assert mfma.__hc_intrinsic__.scope == SubGroup
     assert mfma.__hc_intrinsic__.const_attrs == frozenset({"blocksz"})
     assert "amdgpu" in mfma.__hc_lowerings__
+    recipe = mfma.__hc_lowerings__["amdgpu"]
+    record = recipe.to_record()
+    assert record["intrinsic"] == "mfma"
+    assert record["target"] == "amdgpu"
+    assert recipe.steps[0].op_name == "test.mfma"
+    assert [value.name for value in recipe.steps[0].operands] == [
+        "operand_a",
+        "operand_b",
+        "operand_acc",
+    ]
+    assert recipe.replacement[0].name == "created0_0"
     assert mfma.__hc_verify__ is _verify
     assert mfma.__hc_infer__ is _infer
+
+
+def test_wmma_lowering_records_transform_recipe() -> None:
+    from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
+
+    recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
+    assert recipe.intrinsic_name == "wmma_gfx11"
+    assert recipe.steps[0].op_name == "amdgpu.wmma"
+    assert [value.name for value in recipe.steps[0].operands] == [
+        "operand_a_frag",
+        "operand_b_frag",
+        "operand_acc_frag",
+    ]
+    assert recipe.steps[0].attrs[0][0] == "arch"
+    assert recipe.steps[0].attrs[0][1].name == "attr_arch"
+    assert recipe.replacement[0].name == "created0_0"
+    assert 'transform.hc.create_op "amdgpu.wmma"' in recipe.to_mlir()
 
 
 def test_index_map_records_callables() -> None:

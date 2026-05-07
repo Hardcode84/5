@@ -198,32 +198,28 @@ def _verify_wmma(sig, target):
 
 
 @wmma_gfx11.lower(target="amdgpu-gfx11")
-def _lower_wmma(
-    ctx,
-    group,
-    a_tile,
-    b_tile,
-    a_frag,
-    b_frag,
-    acc_frag,
-    *,
-    lane,
-    wave_size,
-    arch,
-):
-    _ = (group, a_tile, b_tile, lane)
-    op = ctx.builder.create(
+def _lower_wmma(t, call):
+    _ = (
+        call.operand("group"),
+        call.operand("a_tile"),
+        call.operand("b_tile"),
+        call.operand("lane"),
+    )
+    op = t.create(
         "amdgpu.wmma",
-        results=[ctx.result_type(0)],
-        operands=[a_frag, b_frag, acc_frag],
+        result_types=[call.result_type(0)],
+        operands=[
+            call.operand("a_frag"),
+            call.operand("b_frag"),
+            call.operand("acc_frag"),
+        ],
         attrs={
-            "arch": arch,
-            "wave_size": wave_size,
+            "arch": call.attr("arch"),
+            "wave_size": call.attr("wave_size"),
             "m": WMMA_M,
             "n": WMMA_N,
             "k": WMMA_K,
         },
-        loc=ctx.loc,
     )
     return op.result(0)
 

@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from types import CodeType
 from typing import Any, Protocol, cast
 
+from ._intrinsic_recipes import (
+    IntrinsicTransformRecipe,
+    build_intrinsic_transform_recipe,
+)
+
 
 @dataclass(frozen=True)
 class BufferSpec:
@@ -179,7 +184,7 @@ class _HelperFunction(Protocol):
 class _IntrinsicFunction(Protocol):
     __name__: str
     __hc_intrinsic__: IntrinsicMetadata
-    __hc_lowerings__: dict[str, Callable[..., Any]]
+    __hc_lowerings__: dict[str, IntrinsicTransformRecipe]
     __hc_verify__: Callable[..., Any] | None
     __hc_infer__: Callable[..., Any] | None
     __hc_has_fallback__: bool
@@ -229,7 +234,7 @@ def _function_body(fn: Callable[..., Any]) -> list[ast.stmt] | None:
     if not module.body:
         return None
     node = module.body[0]
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
         return None
     body = list(node.body)
     if _starts_with_docstring(body):
@@ -288,7 +293,16 @@ def _attach_intrinsic_hooks(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     def lower(*, target: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def register(cb: Callable[..., Any]) -> Callable[..., Any]:
-            intrinsic_fn.__hc_lowerings__[target] = cb
+            intrinsic_fn.__hc_lowerings__[target] = build_intrinsic_transform_recipe(
+                cb,
+                intrinsic_name=intrinsic_fn.__name__,
+                target=target,
+                operand_names=_intrinsic_operand_names(
+                    intrinsic_fn, intrinsic_fn.__hc_intrinsic__
+                ),
+                attr_names=intrinsic_fn.__hc_intrinsic__.const_attrs,
+                result_count=len(intrinsic_fn.__hc_intrinsic__.result_types),
+            )
             return cb
 
         return register
@@ -305,6 +319,25 @@ def _attach_intrinsic_hooks(fn: Callable[..., Any]) -> Callable[..., Any]:
     intrinsic_fn.verify = verify
     intrinsic_fn.infer = infer
     return intrinsic_fn
+
+
+def _intrinsic_operand_names(
+    fn: Callable[..., Any],
+    metadata: IntrinsicMetadata,
+) -> tuple[str, ...]:
+    result = []
+    for param in inspect.signature(fn).parameters.values():
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            continue
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        if (
+            param.kind is inspect.Parameter.KEYWORD_ONLY
+            and param.name in metadata.const_attrs
+        ):
+            continue
+        result.append(param.name)
+    return tuple(result)
 
 
 class _KernelNamespace:

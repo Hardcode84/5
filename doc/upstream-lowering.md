@@ -214,11 +214,14 @@ cross-function lowering of vector fragments. Later, helpers can become private
 
 Use `index`-typed SSA for launch geometry and buffer coordinates.
 
-* `!hc.idx<expr>` becomes `index` plus optional verifier-only expression
-  metadata while still in HC.
-* `hc.slice_expr(lower, upper, step)` becomes offset, size, and stride values.
-* Tile shape tuples such as `(16, 16)` become `vector.transfer_*` sizes or
-  static vector shapes.
+* `!hc.idx<expr>` becomes `index` for SSA operands and intrinsic contracts.
+* `hc.materialize_bound_expr` lowers launch symbols such as `$WG0` / `$WI0`
+  from `gpu.launch` block/thread ids and ABI symbols such as `M` / `N` from
+  `memref.dim`.
+* `hc.const`, simple index arithmetic/comparisons, `hc.buffer_dim`, and
+  `hc.for_range` lower to `arith`, `memref.dim`, and `scf.for`.
+* `hc.slice_expr` and tile shape tuples remain HC carriers for the memory
+  lowering slice, but their scalar operands are upstream `index` values.
 
 The static shape verifier should already have rejected dynamic tile dimensions
 for the WMMA subset.

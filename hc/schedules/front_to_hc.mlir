@@ -10,7 +10,8 @@
 // SSA, infer concrete HC value types, materialize bound symbolic values, verify
 // static shape carriers, split semantic shaped values into bare data/masks,
 // inline helpers, normalize supported scope regions, run the standard cleanup
-// pair, then wrap kernels in upstream GPU launches.
+// pair, wrap kernels in upstream GPU launches, lower launch-body scalar/control
+// flow, then clean up again.
 // `hc.compile` loads this via `-transform-preload-library` and runs it with
 // `-transform-interpreter`; callers wanting a different order can pass
 // `schedule=<path-or-text>` to override.
@@ -51,10 +52,12 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m11 : !transform.any_op
     %m12 = transform.apply_registered_pass "hc-lower-kernels-to-gpu-launch" to %m11
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m12 {
+    %m13 = transform.apply_registered_pass "hc-lower-launch-body" to %m12
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m12 : !transform.any_op
+    transform.apply_cse to %m13 : !transform.any_op
     transform.yield
   }
 }

@@ -635,14 +635,14 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert handle.hc_ir_text is not None
                 assert "!hc.tensor<" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "!hc.vector<" not in handle.hc_ir_text, handle.hc_ir_text
+                assert 'scf.for' in handle.hc_ir_text, handle.hc_ir_text
+                assert 'hc.for_range' not in handle.hc_ir_text, handle.hc_ir_text
+                assert '-> (!hc.bare_tensor<f16, ["16", "16"]>' not in (
+                    handle.hc_ir_text
+                )
+                assert '!hc.bare_vector<f32, ["8"]>, ' in handle.hc_ir_text
                 assert (
-                    'hc.for_range' in handle.hc_ir_text
-                    and '-> (!hc.bare_tensor<f16, ["16", "16"]>, '
-                    in handle.hc_ir_text
-                    and '!hc.bare_vector<f32, ["8"]>, '
-                    in handle.hc_ir_text
-                    and '!hc.bare_vector<!hc.pred, ["8"]>)'
-                    in handle.hc_ir_text
+                    '!hc.bare_vector<!hc.pred, ["8"]>)' in handle.hc_ir_text
                 )
                 assert "hc.workitem_region" not in handle.hc_ir_text
                 assert "hc.call @" not in handle.hc_ir_text
@@ -662,7 +662,8 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert '!hc.bare_vector<!hc.pred, ["16"]>' in intrinsic_args
                 assert '!hc.bare_vector<f32, ["8"]>' in intrinsic_args
                 assert '!hc.bare_vector<!hc.pred, ["8"]>' in intrinsic_args
-                assert '!hc.idx<"$WI0">' in intrinsic_args
+                assert "index" in intrinsic_args
+                assert '!hc.idx<"$WI0">' not in intrinsic_args
                 assert intrinsic.group("results") == (
                     '!hc.bare_vector<f32, ["8"]>, '
                     '!hc.bare_vector<!hc.pred, ["8"]>'

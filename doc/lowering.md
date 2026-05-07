@@ -888,6 +888,7 @@ folding / inline markers on is:
                               → hc-materialize-bound-exprs
                               → hc-normalize-scope-regions
                               → hc-lower-kernels-to-gpu-launch
+                              → hc-lower-launch-body
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
@@ -905,7 +906,8 @@ on the same pass list, so
            --hc-inline-helpers --hc-materialize-bound-exprs \
            --canonicalize \
            --hc-normalize-scope-regions --canonicalize --cse \
-           --hc-lower-kernels-to-gpu-launch --canonicalize --cse
+           --hc-lower-kernels-to-gpu-launch \
+           --hc-lower-launch-body --canonicalize --cse
 
 and `hc.compile(...)` with the default schedule produce identical
 output. See [`doc/schedules.md`](schedules.md) for the schedule format

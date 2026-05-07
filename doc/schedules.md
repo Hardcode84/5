@@ -54,10 +54,12 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m11 : !transform.any_op
     %m12 = transform.apply_registered_pass "hc-lower-kernels-to-gpu-launch" to %m11
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m12 {
+    %m13 = transform.apply_registered_pass "hc-lower-launch-body" to %m12
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m12 : !transform.any_op
+    transform.apply_cse to %m13 : !transform.any_op
     transform.yield
   }
 }
@@ -81,8 +83,10 @@ pass. The final normalization removes supported `hc.func` call boundaries and
 result-producing workitem regions from the executable HC body, leaving subgroup
 and other unsupported scope cases to diagnose. Cleanup runs over that normalized
 HC body before `hc-lower-kernels-to-gpu-launch` wraps each `hc.kernel` in a host
-`func.func` containing a `gpu.launch`; a final cleanup pass pair folds the
-launch-geometry arithmetic where possible.
+`func.func` containing a `gpu.launch`. `hc-lower-launch-body` then lowers the
+scalar/index subset inside that launch to upstream `arith`/`scf` operations
+while preserving shaped memory and intrinsic HC ops for later slices; a final
+cleanup pass pair folds the launch-body arithmetic where possible.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

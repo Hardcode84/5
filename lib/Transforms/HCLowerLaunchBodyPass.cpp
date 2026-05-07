@@ -702,6 +702,7 @@ struct ConvertIntBinaryOp : public OpConversionPattern<OpT> {
 
 struct SliceAxis {
   Value offset;
+  Value stride;
   bool isSlice = false;
 };
 
@@ -709,16 +710,24 @@ static Value zeroIndex(OpBuilder &builder, Location loc) {
   return arith::ConstantIndexOp::create(builder, loc, 0).getResult();
 }
 
+static Value oneIndex(OpBuilder &builder, Location loc) {
+  return arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+}
+
 static LogicalResult collectSliceAxis(Operation *op, Value index,
-                                      OpBuilder &builder, SliceAxis &axis) {
+                                      OpBuilder &builder, SliceAxis &axis,
+                                      bool requireUnitStride = true) {
   auto slice = index.getDefiningOp<HCSliceExprOp>();
   if (!slice)
     return failure();
   if (Value step = slice.getStep()) {
     APInt stepValue;
-    if (!matchPattern(step, m_ConstantInt(&stepValue)) ||
-        stepValue.getSExtValue() != 1)
+    if (requireUnitStride && (!matchPattern(step, m_ConstantInt(&stepValue)) ||
+                              stepValue.getSExtValue() != 1))
       return op->emitOpError("only unit-stride slices lower to vector ops");
+    axis.stride = step;
+  } else {
+    axis.stride = oneIndex(builder, op->getLoc());
   }
   axis.offset =
       slice.getLower() ? slice.getLower() : zeroIndex(builder, op->getLoc());
@@ -727,19 +736,21 @@ static LogicalResult collectSliceAxis(Operation *op, Value index,
 }
 
 static FailureOr<SmallVector<SliceAxis>>
-collectAxes(Operation *op, ValueRange indices, OpBuilder &builder) {
+collectAxes(Operation *op, ValueRange indices, OpBuilder &builder,
+            bool requireUnitStride = true) {
   SmallVector<SliceAxis> axes;
   axes.reserve(indices.size());
   for (Value index : indices) {
     SliceAxis axis;
     if (isa<SliceType>(index.getType())) {
-      if (failed(collectSliceAxis(op, index, builder, axis)))
+      if (failed(collectSliceAxis(op, index, builder, axis, requireUnitStride)))
         return failure();
     } else {
       if (!index.getType().isIndex())
         return op->emitOpError("expected index or slice subscript after "
                                "launch-body scalar lowering");
       axis.offset = index;
+      axis.stride = oneIndex(builder, op->getLoc());
     }
     axes.push_back(axis);
   }
@@ -805,6 +816,86 @@ static FailureOr<Value> readMemRefAsVector(OpBuilder &builder, Location loc,
              zeroOffsets(builder, loc, memrefType.getRank()),
              std::optional<Value>(padding))
       .getResult();
+}
+
+static FailureOr<Value> shapedValueAsVector(OpBuilder &builder, Location loc,
+                                            Value value, Type convertedType) {
+  if (auto vectorType = dyn_cast<mlir::VectorType>(convertedType)) {
+    if (value.getType() == vectorType)
+      return value;
+    return failure();
+  }
+  auto memrefType = dyn_cast<MemRefType>(convertedType);
+  if (!memrefType)
+    return failure();
+  mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
+  if (!vectorType)
+    return failure();
+  return readMemRefAsVector(builder, loc, value, vectorType);
+}
+
+static Value extractVectorElement(OpBuilder &builder, Location loc,
+                                  Value vector, ArrayRef<int64_t> coordinates) {
+  if (coordinates.empty())
+    return vector;
+  SmallVector<OpFoldResult> positions;
+  positions.reserve(coordinates.size());
+  for (int64_t coordinate : coordinates)
+    positions.push_back(builder.getI64IntegerAttr(coordinate));
+  return vector::ExtractOp::create(builder, loc, vector, positions).getResult();
+}
+
+static SmallVector<SmallVector<int64_t>>
+staticVectorCoordinates(ArrayRef<int64_t> shape) {
+  int64_t elementCount = 1;
+  for (int64_t dim : shape)
+    elementCount *= dim;
+
+  SmallVector<SmallVector<int64_t>> coordinates;
+  coordinates.reserve(elementCount);
+  for (int64_t linear = 0; linear != elementCount; ++linear) {
+    int64_t remaining = linear;
+    SmallVector<int64_t> coordinate(shape.size(), 0);
+    for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
+         --axis) {
+      coordinate[axis] = remaining % shape[axis];
+      remaining /= shape[axis];
+    }
+    coordinates.push_back(std::move(coordinate));
+  }
+  return coordinates;
+}
+
+static Value scaleIndexOffset(OpBuilder &builder, Location loc, Value stride,
+                              int64_t coordinate) {
+  if (coordinate == 0)
+    return arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  if (coordinate == 1)
+    return stride;
+  Value coordinateValue =
+      arith::ConstantIndexOp::create(builder, loc, coordinate);
+  return arith::MulIOp::create(builder, loc, stride, coordinateValue)
+      .getResult();
+}
+
+static SmallVector<Value> storeIndicesForCoordinate(OpBuilder &builder,
+                                                    Location loc,
+                                                    ArrayRef<SliceAxis> axes,
+                                                    ArrayRef<int64_t> coords) {
+  SmallVector<Value> indices;
+  indices.reserve(axes.size());
+  int64_t sliceAxis = 0;
+  for (const SliceAxis &axis : axes) {
+    if (!axis.isSlice) {
+      indices.push_back(axis.offset);
+      continue;
+    }
+    Value scaled =
+        scaleIndexOffset(builder, loc, axis.stride, coords[sliceAxis++]);
+    indices.push_back(
+        arith::AddIOp::create(builder, loc, axis.offset, scaled).getResult());
+  }
+  return indices;
 }
 
 template <typename OpT>
@@ -1121,6 +1212,92 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
     rewriter.replaceOpWithNewOp<arith::SelectOp>(
         op, converted, adaptor.getCondition(), adaptor.getTrueValue(),
         falseValue);
+    return success();
+  }
+};
+
+struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCStoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value memref = sourceMemRef(adaptor.getDest());
+    if (!memref)
+      return op.emitOpError(
+          "expected store destination to be a memref or memref ABI cast");
+    auto memrefType = dyn_cast<MemRefType>(memref.getType());
+    if (!memrefType || memrefType.getRank() !=
+                           static_cast<int64_t>(adaptor.getIndices().size()))
+      return op.emitOpError(
+          "expected ranked memref with one subscript per axis");
+
+    FailureOr<SmallVector<SliceAxis>> axes =
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                    /*requireUnitStride=*/false);
+    if (failed(axes))
+      return failure();
+
+    Type convertedSource = typeConverter->convertType(op.getSource().getType());
+    FailureOr<Value> source = shapedValueAsVector(
+        rewriter, op.getLoc(), adaptor.getSource(), convertedSource);
+    if (failed(source))
+      return op.emitOpError("expected store source to lower to a vector");
+    auto sourceType = dyn_cast<mlir::VectorType>(source->getType());
+    if (!sourceType)
+      return op.emitOpError("expected store source to be a vector");
+
+    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+          return axis.isSlice;
+        }) != sourceType.getRank())
+      return op.emitOpError(
+          "store source rank must match slice subscript rank");
+
+    Value mask;
+    if (Value originalMask = op.getMask()) {
+      Type convertedMask = typeConverter->convertType(originalMask.getType());
+      FailureOr<Value> maskVector = shapedValueAsVector(
+          rewriter, op.getLoc(), adaptor.getMask(), convertedMask);
+      if (failed(maskVector))
+        return op.emitOpError("expected store mask to lower to a vector");
+      auto maskType = dyn_cast<mlir::VectorType>(maskVector->getType());
+      auto expectedMaskType =
+          mlir::VectorType::get(sourceType.getShape(), rewriter.getI1Type());
+      if (maskType != expectedMaskType)
+        return op.emitOpError("store mask type ")
+               << maskVector->getType() << " must match " << expectedMaskType;
+      mask = *maskVector;
+    }
+
+    for (ArrayRef<int64_t> coordinate :
+         staticVectorCoordinates(sourceType.getShape())) {
+      Value element =
+          extractVectorElement(rewriter, op.getLoc(), *source, coordinate);
+      SmallVector<Value> indices =
+          storeIndicesForCoordinate(rewriter, op.getLoc(), *axes, coordinate);
+      if (!mask) {
+        memref::StoreOp::create(rewriter, op.getLoc(), element, memref,
+                                indices);
+        continue;
+      }
+
+      Value guard =
+          extractVectorElement(rewriter, op.getLoc(), mask, coordinate);
+      auto ifOp = scf::IfOp::create(rewriter, op.getLoc(), TypeRange{}, guard,
+                                    /*withElseRegion=*/false);
+      Block &thenBlock = ifOp.getThenRegion().front();
+      Operation *terminator = thenBlock.empty() ? nullptr : &thenBlock.back();
+      if (terminator)
+        rewriter.setInsertionPoint(terminator);
+      else
+        rewriter.setInsertionPointToEnd(&thenBlock);
+      memref::StoreOp::create(rewriter, op.getLoc(), element, memref, indices);
+      if (!terminator)
+        scf::YieldOp::create(rewriter, op.getLoc());
+      rewriter.setInsertionPointAfter(ifOp);
+    }
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -1500,26 +1677,25 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
 static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                MLIRContext *ctx,
                                                RewritePatternSet &patterns) {
-  patterns.add<ConvertMaterializeBoundExprOp, ConvertConstOp,
-               ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
-               ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
-               ConvertIntBinaryOp<HCMulOp, arith::MulIOp>, ConvertDivOp,
-               ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
-               ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>,
-               ConvertCmpOp<HCCmpGtOp>, ConvertCmpOp<HCCmpGeOp>,
-               ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>, ConvertCastOp,
-               ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
-               ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
-               ConvertLoadMaskOp, ConvertFullMaskOp,
-               ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
-               ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
-               ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
-               ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
-               ConvertFillShapedConstantOp<HCVFullOp>,
-               ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp,
-               ConvertVecOp, ConvertSelectOp, ConvertCallIntrinsicOp,
-               ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter,
-                                                                    ctx);
+  patterns.add<
+      ConvertMaterializeBoundExprOp, ConvertConstOp,
+      ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
+      ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
+      ConvertIntBinaryOp<HCMulOp, arith::MulIOp>, ConvertDivOp,
+      ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
+      ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>, ConvertCmpOp<HCCmpGtOp>,
+      ConvertCmpOp<HCCmpGeOp>, ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>,
+      ConvertCastOp, ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
+      ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
+      ConvertLoadMaskOp, ConvertFullMaskOp,
+      ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
+      ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
+      ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
+      ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
+      ConvertFillShapedConstantOp<HCVFullOp>,
+      ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp, ConvertVecOp,
+      ConvertSelectOp, ConvertStoreOp, ConvertCallIntrinsicOp,
+      ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter, ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
                AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
@@ -1537,14 +1713,14 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
                          gpu::GPUDialect, memref::MemRefDialect,
                          scf::SCFDialect, vector::VectorDialect>();
-  target.addLegalOp<HCStoreOp, HCUndefValueOp, UnrealizedConversionCastOp>();
+  target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp>();
   target.addIllegalOp<HCMaterializeBoundExprOp, HCConstOp, HCAddOp, HCSubOp,
                       HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
                       HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
                       HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
                       HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
                       HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                      HCSelectOp, HCForRangeOp, HCIfOp, HCYieldOp>();
+                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

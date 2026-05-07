@@ -266,10 +266,11 @@ Initial implementation options for the data path:
 The current `hc-lower-launch-body` slice stages the direct global read into
 workgroup memory: data tiles become workgroup `memref`s, `hc.load_mask` builds a
 `vector.create_mask` and writes it into a matching predicate memref, and
-`hc.buffer_view` copies tensor fragments through workgroup storage. Only
+`hc.buffer_view` forms subviews over tensor fragments in workgroup storage. Only
 `hc.vec` materializes those tensor fragments as upstream `vector` values;
-`hc.select` then becomes `arith.select`. The WMMA intrinsic and final store
-remain HC boundaries with explicit casts until their lowering slices land.
+`hc.select` then becomes `arith.select`. Final masked stores scalarize to
+guarded `memref.store` operations; the WMMA intrinsic remains an HC boundary
+with explicit casts until its lowering slice lands.
 
 ### 6. Lower fragment extraction
 
@@ -343,6 +344,11 @@ with one of:
 
 The first correctness target should favor explicit masks/guards over clever
 stores.
+
+The current launch-body lowering implements the guarded scalar-store path. It
+extracts each accumulator element and its predicate bit, applies destination
+slice offsets and strides, and emits the `memref.store` inside `scf.if` so
+inactive edge lanes never perform an out-of-bounds write.
 
 ## Pass structure
 

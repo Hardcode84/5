@@ -199,4 +199,40 @@ module {
     }
     return
   }
+
+  // CHECK-LABEL: func.func @masked_vector_store(
+  // CHECK: vector.extract
+  // CHECK-SAME: f32 from vector<4xf32>
+  // CHECK: vector.extract
+  // CHECK-SAME: i1 from vector<4xi1>
+  // CHECK: scf.if
+  // CHECK: memref.store
+  // CHECK-SAME: memref<?xf32>
+  // CHECK-NOT: hc.store
+  func.func @masked_vector_store(%a: memref<?xf32>) {
+    %c1 = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %a
+        : memref<?xf32> to !hc.buffer<f32, ["M"]>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %data_vector = arith.constant dense<1.000000e+00> : vector<4xf32>
+      %mask_vector = arith.constant dense<true> : vector<4xi1>
+      %data = builtin.unrealized_conversion_cast %data_vector
+          : vector<4xf32> to !hc.bare_vector<f32, ["4"]>
+      %mask = builtin.unrealized_conversion_cast %mask_vector
+          : vector<4xi1> to !hc.bare_vector<!hc.pred, ["4"]>
+      %zero = hc.const<0 : i64> : !hc.idx<"0">
+      %eight = hc.const<8 : i64> : !hc.idx<"8">
+      %two = hc.const<2 : i64> : !hc.idx<"2">
+      %rows = hc.slice_expr(lower = %zero upper = %eight step = %two)
+          : (!hc.idx<"0">, !hc.idx<"8">, !hc.idx<"2">)
+            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"2">>
+      hc.store %buffer[%rows], %data, mask %mask
+          : (!hc.buffer<f32, ["M"]>,
+             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"2">>,
+             !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>) -> ()
+      gpu.terminator
+    }
+    return
+  }
 }

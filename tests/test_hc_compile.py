@@ -643,6 +643,10 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
                 assert "hc.load " not in handle.hc_ir_text
                 assert "hc.buffer_view" not in handle.hc_ir_text
+                assert "hc.store" not in handle.hc_ir_text
+                assert "memref.store" in handle.hc_ir_text
+                assert "scf.if" in handle.hc_ir_text
+                assert "vector.extract" in handle.hc_ir_text
                 assert '-> (!hc.bare_tensor<f16, ["16", "16"]>' not in (
                     handle.hc_ir_text
                 )
@@ -669,19 +673,6 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert intrinsic.group("results") == (
                     '!hc.bare_vector<f32, ["8"]>, '
                     '!hc.bare_vector<!hc.pred, ["8"]>'
-                )
-
-                store = re.search(
-                    r'hc\\.store (?P<dest>[^\\n]+), (?P<data>%[^,\\s]+), '
-                    r'mask (?P<mask>%[^\\s]+) : \\((?P<types>[^\\n]+)\\) -> \\(\\)',
-                    handle.hc_ir_text,
-                )
-                assert store, handle.hc_ir_text
-                store_types = store.group("types")
-                assert '!hc.buffer<f32, ["M", "N"]>' in store_types
-                assert '!hc.bare_vector<f32, ["8", "1"]>' in store_types
-                assert (
-                    '!hc.bare_vector<!hc.pred, ["8", "1"]>' in store_types
                 )
 
                 loads = re.findall(

@@ -180,8 +180,9 @@ def HCLowerLaunchBody
     from launch ids and buffer dimensions, simple arithmetic lowers to `arith`,
     `hc.for_range`/`hc.if` become `scf` control flow, static bare tensors lower
     to workgroup `memref` storage, and bare vectors lower to upstream `vector`
-    values. Intrinsic and final store boundaries remain HC operations with
-    explicit casts until their dedicated lowering slices.
+    values. Final masked stores lower to guarded memref writes. Intrinsic
+    boundaries remain HC operations with explicit casts until their dedicated
+    lowering slice.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",

@@ -40,5 +40,7 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     dump_hc_ir()
 
     captured = capsys.readouterr()
-    assert "hc.kernel @tiled_gfx11_wmma_matmul" in captured.out
+    assert "func.func @tiled_gfx11_wmma_matmul" in captured.out
+    assert "gpu.launch" in captured.out
+    assert "hc.kernel" not in captured.out
     assert "hc_front." not in captured.out

@@ -288,10 +288,10 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
     # Happy path for the transform-schedule driver: compile a trivial
-    # kernel and assert the `hc_ir_text` snapshot contains hc-dialect ops
-    # (not hc_front.*), with no captured diagnostics. This is the gate we
-    # care about for the CompiledKernel contract now that the pipeline
-    # stage actually runs.
+    # kernel and assert the `hc_ir_text` snapshot has reached the default
+    # GPU-launch wrapper stage (not hc_front.*), with no captured diagnostics.
+    # This is the gate we care about for the CompiledKernel contract now that
+    # the pipeline stage actually runs.
     script = tmp_path / "compile_pipeline.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -310,7 +310,8 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
                 assert isinstance(handle, CompiledKernel)
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.hc_ir_text is not None
-                assert "hc.kernel" in handle.hc_ir_text, handle.hc_ir_text
+                assert "func.func @foo" in handle.hc_ir_text, handle.hc_ir_text
+                assert "hc.kernel" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "hc_front." not in handle.hc_ir_text, handle.hc_ir_text
                 # `front_ir_text` must remain the pre-pipeline snapshot
                 # even after a successful run; the module clone in

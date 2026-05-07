@@ -887,6 +887,7 @@ folding / inline markers on is:
                               → hc-inline-helpers
                               → hc-materialize-bound-exprs
                               → hc-normalize-scope-regions
+                              → hc-lower-kernels-to-gpu-launch
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
@@ -903,7 +904,8 @@ on the same pass list, so
            --hc-decompose-shaped-values=strict=false \
            --hc-inline-helpers --hc-materialize-bound-exprs \
            --canonicalize \
-           --hc-normalize-scope-regions
+           --hc-normalize-scope-regions --canonicalize --cse \
+           --hc-lower-kernels-to-gpu-launch --canonicalize --cse
 
 and `hc.compile(...)` with the default schedule produce identical
 output. See [`doc/schedules.md`](schedules.md) for the schedule format
@@ -924,6 +926,10 @@ upstream lowering. Bound-expression materialization runs a second time after
 helper inlining because inlined helper bodies can expose fresh launch-geometry
 producer chains; DCE/canonicalization removes the dead scope-token producers
 before region normalization checks for remaining live scope-token uses.
+Kernel lowering then converts each semantic `hc.kernel` into a host
+`func.func` with a `gpu.launch`, exposing buffer ABI arguments as memrefs and
+leaving remaining HC body operations behind explicit conversion boundaries for
+the subsequent upstream-lowering slices.
 
 ### SSA construction
 

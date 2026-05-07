@@ -152,4 +152,23 @@ def HCNormalizeScopeRegions
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerKernelsToGPULaunch
+    : Pass<"hc-lower-kernels-to-gpu-launch"> {
+  let summary = "Wrap HC kernels in upstream GPU launch operations.";
+  let description = [{
+    Rewrites `hc.kernel` symbols into host `func.func` entry points that launch
+    the former kernel body with `gpu.launch`. Kernel buffer ABI arguments are
+    exposed as dynamic memrefs, scalar bound arguments become upstream scalar
+    values, and the original HC body is kept inside the launch behind explicit
+    cast boundaries for the later memory and intrinsic lowering passes.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::func::FuncDialect",
+    "::mlir::gpu::GPUDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::memref::MemRefDialect"
+  ];
+}
+
 #endif // HC_TRANSFORMS_PASSES

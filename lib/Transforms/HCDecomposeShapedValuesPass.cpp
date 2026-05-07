@@ -261,6 +261,59 @@ static SmallVector<Value> materializeTargetCast(OpBuilder &builder,
       .getResults();
 }
 
+static ArrayAttr convertIntrinsicParameters(HCIntrinsicOp op,
+                                            FunctionType originalFnType,
+                                            const TypeConverter &converter) {
+  ArrayAttr parameters = op.getParametersAttr();
+  if (!parameters)
+    return {};
+
+  llvm::SmallDenseSet<StringRef> constKwargs;
+  if (ArrayAttr attrs = op.getConstKwargsAttr())
+    for (StringAttr attr : attrs.getAsRange<StringAttr>())
+      constKwargs.insert(attr.getValue());
+
+  MLIRContext *ctx = op.getContext();
+  SmallVector<Attribute> converted;
+  unsigned inputIndex = 0;
+  for (StringAttr parameter : parameters.getAsRange<StringAttr>()) {
+    StringRef name = parameter.getValue();
+    if (constKwargs.contains(name)) {
+      converted.push_back(parameter);
+      continue;
+    }
+    if (inputIndex >= originalFnType.getNumInputs())
+      return {};
+
+    SmallVector<Type> convertedTypes;
+    if (failed(converter.convertType(originalFnType.getInput(inputIndex++),
+                                     convertedTypes)))
+      return {};
+    if (convertedTypes.size() == 1) {
+      converted.push_back(parameter);
+      continue;
+    }
+    StringRef suffixes[] = {"data", "mask"};
+    for (auto [index, suffix] : llvm::enumerate(suffixes)) {
+      if (index >= convertedTypes.size())
+        break;
+      SmallString<32> splitName(name);
+      splitName += ".";
+      splitName += suffix;
+      converted.push_back(StringAttr::get(ctx, splitName));
+    }
+    for (unsigned index = 2; index < convertedTypes.size(); ++index) {
+      SmallString<32> splitName(name);
+      splitName += ".";
+      splitName += Twine(index).str();
+      converted.push_back(StringAttr::get(ctx, splitName));
+    }
+  }
+  if (inputIndex != originalFnType.getNumInputs())
+    return {};
+  return ArrayAttr::get(ctx, converted);
+}
+
 class HCShapedTypeConverter : public TypeConverter {
 public:
   HCShapedTypeConverter() {
@@ -313,8 +366,19 @@ struct ConvertCallableSignatureOp : public OpConversionPattern<OpT> {
                                       this->typeConverter);
     FunctionType convertedFnType = FunctionType::get(
         rewriter.getContext(), convertedInputs, convertedResults);
-    rewriter.modifyOpInPlace(
-        op, [&] { op.setFunctionTypeAttr(TypeAttr::get(convertedFnType)); });
+    ArrayAttr convertedParameters;
+    if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op.getOperation())) {
+      convertedParameters =
+          convertIntrinsicParameters(intrinsic, fnType, *this->typeConverter);
+      if (intrinsic.getParametersAttr() && !convertedParameters)
+        return op.emitOpError("failed to convert intrinsic parameter metadata");
+    }
+    rewriter.modifyOpInPlace(op, [&] {
+      op.setFunctionTypeAttr(TypeAttr::get(convertedFnType));
+      if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op.getOperation()))
+        if (convertedParameters)
+          intrinsic.setParametersAttr(convertedParameters);
+    });
     return success();
   }
 };
@@ -334,6 +398,30 @@ struct ConvertCallOp : public OpConversionPattern<HCCallOp> {
 
     auto newCall = HCCallOp::create(rewriter, op.getLoc(), convertedResults,
                                     op.getCalleeAttr(), convertedArgs);
+    newCall->setAttrs(op->getAttrs());
+
+    replaceOpWithResultSlices(rewriter, op, newCall->getResults(),
+                              resultWidths);
+    return success();
+  }
+};
+
+struct ConvertCallIntrinsicOp : public OpConversionPattern<HCCallIntrinsicOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCCallIntrinsicOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Value> convertedArgs = flattenValues(adaptor.getArgs());
+    SmallVector<Type> convertedResults;
+    SmallVector<unsigned> resultWidths;
+    if (failed(convertResultTypes(op.getResultTypes(), *typeConverter,
+                                  convertedResults, resultWidths)))
+      return failure();
+
+    auto newCall =
+        HCCallIntrinsicOp::create(rewriter, op.getLoc(), convertedResults,
+                                  op.getCalleeAttr(), convertedArgs);
     newCall->setAttrs(op->getAttrs());
 
     replaceOpWithResultSlices(rewriter, op, newCall->getResults(),
@@ -810,8 +898,9 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 MLIRContext *ctx,
                                                 RewritePatternSet &patterns) {
   patterns.add<ConvertCallableSignatureOp<HCKernelOp>,
-               ConvertCallableSignatureOp<HCFuncOp>, ConvertCallOp,
-               ConvertForRangeOp, ConvertIfOp,
+               ConvertCallableSignatureOp<HCFuncOp>,
+               ConvertCallableSignatureOp<HCIntrinsicOp>, ConvertCallOp,
+               ConvertCallIntrinsicOp, ConvertForRangeOp, ConvertIfOp,
                ConvertCollectiveRegionOp<HCWorkitemRegionOp>,
                ConvertCollectiveRegionOp<HCSubgroupRegionOp>, ConvertStoreOp,
                ConvertReturnOp, ConvertYieldOp>(converter, ctx);
@@ -830,11 +919,13 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
                                     const TypeConverter &converter) {
   ConversionTarget target(*ctx);
   target.addLegalOp<UnrealizedConversionCastOp>();
-  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp>([&](Operation *op) {
-    return regionsAreLegal(op, converter) &&
-           callableSignatureIsLegal(op, converter);
-  });
-  target.addDynamicallyLegalOp<HCCallOp, HCStoreOp, HCReturnOp>(
+  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp, HCIntrinsicOp>(
+      [&](Operation *op) {
+        return regionsAreLegal(op, converter) &&
+               callableSignatureIsLegal(op, converter);
+      });
+  target.addDynamicallyLegalOp<HCCallOp, HCCallIntrinsicOp, HCStoreOp,
+                               HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {
@@ -859,14 +950,15 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
   ConversionTarget target(*ctx);
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
-  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp>([&](Operation *op) {
-    return regionsAreLegal(op, converter) &&
-           callableSignatureIsLegal(op, converter);
-  });
+  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp, HCIntrinsicOp>(
+      [&](Operation *op) {
+        return regionsAreLegal(op, converter) &&
+               callableSignatureIsLegal(op, converter);
+      });
   target.addDynamicallyLegalOp<
-      HCCallOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp, HCBufferViewOp,
-      HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp, HCVOnesOp, HCZerosOp,
-      HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
+      HCCallOp, HCCallIntrinsicOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp,
+      HCBufferViewOp, HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp,
+      HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {

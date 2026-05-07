@@ -632,10 +632,8 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.hc_ir_text is not None
-                assert (
-                    '!hc.vector<f32, ["8"]>, !hc.idx<"$WI0">) -> '
-                    '!hc.vector<f32, ["8"]>'
-                ) in handle.hc_ir_text
+                assert "!hc.tensor<" not in handle.hc_ir_text, handle.hc_ir_text
+                assert "!hc.vector<" not in handle.hc_ir_text, handle.hc_ir_text
                 assert (
                     'hc.for_range' in handle.hc_ir_text
                     and '-> (!hc.bare_tensor<f16, ["16", "16"]>, '
@@ -644,22 +642,42 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     in handle.hc_ir_text
                     and '!hc.bare_vector<!hc.pred, ["8"]>)'
                     in handle.hc_ir_text
-                    and 'to !hc.vector<f32, ["8"]>' in handle.hc_ir_text
                 )
                 assert "hc.workitem_region" not in handle.hc_ir_text
                 assert "hc.call @" not in handle.hc_ir_text
-                assert re.search(
+                intrinsic = re.search(
                     r'hc\\.call_intrinsic @wmma_gfx11\\([^\\n]+\\) '
                     r'\\{arch = "gfx11", wave_size = 32 : i64\\} : '
-                    r'\\([^\\n]+!hc\\.vector<f32, \\["8"\\]>, '
-                    r'!hc\\.idx<"\\$WI0">\\) -> !hc\\.vector<f32, \\["8"\\]>',
+                    r'\\((?P<args>[^\\n]+)\\) -> \\((?P<results>[^\\n]+)\\)',
                     handle.hc_ir_text,
                 )
-                assert re.search(
-                    r'hc\\.store [^\\n]+, %[0-9]+, mask %[0-9]+ : '
-                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8", "1"\\]>, '
-                    r'!hc\\.bare_vector<!hc\\.pred, \\["8", "1"\\]>\\) -> \\(\\)',
+                assert intrinsic, handle.hc_ir_text
+                intrinsic_args = intrinsic.group("args")
+                assert '!hc.bare_tensor<f16, ["16", "16"]>' in intrinsic_args
+                assert (
+                    '!hc.bare_tensor<!hc.pred, ["16", "16"]>' in intrinsic_args
+                )
+                assert '!hc.bare_vector<f16, ["16"]>' in intrinsic_args
+                assert '!hc.bare_vector<!hc.pred, ["16"]>' in intrinsic_args
+                assert '!hc.bare_vector<f32, ["8"]>' in intrinsic_args
+                assert '!hc.bare_vector<!hc.pred, ["8"]>' in intrinsic_args
+                assert '!hc.idx<"$WI0">' in intrinsic_args
+                assert intrinsic.group("results") == (
+                    '!hc.bare_vector<f32, ["8"]>, '
+                    '!hc.bare_vector<!hc.pred, ["8"]>'
+                )
+
+                store = re.search(
+                    r'hc\\.store (?P<dest>[^\\n]+), (?P<data>%[^,\\s]+), '
+                    r'mask (?P<mask>%[^\\s]+) : \\((?P<types>[^\\n]+)\\) -> \\(\\)',
                     handle.hc_ir_text,
+                )
+                assert store, handle.hc_ir_text
+                store_types = store.group("types")
+                assert '!hc.buffer<f32, ["M", "N"]>' in store_types
+                assert '!hc.bare_vector<f32, ["8", "1"]>' in store_types
+                assert (
+                    '!hc.bare_vector<!hc.pred, ["8", "1"]>' in store_types
                 )
 
                 loads = re.findall(

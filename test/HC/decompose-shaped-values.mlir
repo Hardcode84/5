@@ -175,6 +175,42 @@ func.func @call_boundary(%buf: !hc.buffer<f32, ["M"]>,
 
 // -----
 
+// CHECK-LABEL: hc.intrinsic @intrinsic_passthrough
+// CHECK-SAME: %{{[^:]+}}: !hc.bare_vector<f32, ["4"]>
+// CHECK-SAME: %{{[^:]+}}: !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK-SAME: -> (!hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>)
+hc.intrinsic @intrinsic_passthrough(%vec: !hc.vector<f32, ["4"]>)
+    -> !hc.vector<f32, ["4"]>
+    scope = #hc.scope<"WorkItem"> parameters = ["vec"] {}
+
+// CHECK-LABEL: func.func @intrinsic_boundary
+// CHECK: %[[LOAD:.*]] = hc.load {{.*}} -> !hc.bare_tensor<f32, ["4"]>
+// CHECK: %[[LOAD_MASK:.*]] = hc.load_mask {{.*}} -> !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK: %[[VEC:.*]] = hc.vec %[[LOAD]]
+// CHECK-SAME: -> !hc.bare_vector<f32, ["4"]>
+// CHECK: %[[VEC_MASK:.*]] = hc.vec %[[LOAD_MASK]]
+// CHECK-SAME: -> !hc.bare_vector<!hc.pred, ["4"]>
+// CHECK: %[[CALL:.*]]:2 = hc.call_intrinsic @intrinsic_passthrough(%[[VEC]], %[[VEC_MASK]])
+// CHECK-SAME: (!hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>) -> (!hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>)
+// CHECK: hc.store {{.*}}, %[[CALL]]#0, mask %[[CALL]]#1
+// CHECK-NOT: builtin.unrealized_conversion_cast
+func.func @intrinsic_boundary(%buf: !hc.buffer<f32, ["M"]>,
+                              %i: !hc.idx<"0">) {
+  %four = hc.const<4 : i64> : !hc.idx<"4">
+  %shape = hc.tuple(%four) : (!hc.idx<"4">) -> tuple<!hc.idx<"4">>
+  %tile = hc.load %buf[%i], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, tuple<!hc.idx<"4">>)
+        -> !hc.tensor<f32, ["4"]>
+  %vec = hc.vec %tile : !hc.tensor<f32, ["4"]> -> !hc.vector<f32, ["4"]>
+  %out = hc.call_intrinsic @intrinsic_passthrough(%vec)
+      : (!hc.vector<f32, ["4"]>) -> !hc.vector<f32, ["4"]>
+  hc.store %buf[%i], %out
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, !hc.vector<f32, ["4"]>) -> ()
+  return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @for_range_iter_arg
 // CHECK-SAME: %[[INIT_DATA:.*]]: !hc.bare_vector<f32, ["4"]>
 // CHECK-SAME: %[[INIT_MASK:.*]]: !hc.bare_vector<!hc.pred, ["4"]>

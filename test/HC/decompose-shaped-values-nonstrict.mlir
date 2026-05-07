@@ -5,8 +5,8 @@
 // RUN: hc-opt --hc-decompose-shaped-values=strict=false %s | FileCheck %s
 
 // The default frontend schedule uses non-strict decomposition while some
-// intrinsic and region-boundary consumers are still being taught to preserve
-// masks. Dialect conversion should bridge converted and unconverted boundaries
+// some unsupported consumers are still being taught to preserve masks. Dialect
+// conversion should bridge converted and unconverted boundaries
 // with unrealized casts instead of failing during `hc.compile`.
 
 // CHECK-LABEL: func.func @masked_store

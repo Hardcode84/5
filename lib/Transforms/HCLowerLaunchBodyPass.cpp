@@ -799,6 +799,29 @@ static LogicalResult writeVectorToMemRef(OpBuilder &builder, Location loc,
   return success();
 }
 
+static FailureOr<Value> materializeShapedResult(OpBuilder &builder,
+                                                Location loc,
+                                                Type convertedType,
+                                                Value vector) {
+  if (auto vectorType = dyn_cast_if_present<mlir::VectorType>(convertedType)) {
+    if (vector.getType() != vectorType)
+      return failure();
+    return vector;
+  }
+
+  auto memrefType = dyn_cast_if_present<MemRefType>(convertedType);
+  if (!memrefType)
+    return failure();
+  mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
+  if (!vectorType || vector.getType() != vectorType)
+    return failure();
+
+  Value shared = allocateWorkgroupMemRef(builder, loc, memrefType);
+  if (failed(writeVectorToMemRef(builder, loc, vector, shared)))
+    return failure();
+  return shared;
+}
+
 static FailureOr<Value> readMemRefAsVector(OpBuilder &builder, Location loc,
                                            Value memref,
                                            mlir::VectorType vectorType) {
@@ -955,16 +978,11 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
                        transferPermutationMap(rewriter.getContext(),
                                               memrefType.getRank(), *axes))
                        .getResult();
-    if (resultVectorType) {
-      rewriter.replaceOp(op, loaded);
-      return success();
-    }
-
-    Value shared =
-        allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
-    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), loaded, shared)))
+    FailureOr<Value> result =
+        materializeShapedResult(rewriter, op.getLoc(), converted, loaded);
+    if (failed(result))
       return failure();
-    rewriter.replaceOp(op, shared);
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -1014,16 +1032,11 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
 
     Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(), maskType,
                                               maskSizes);
-    if (resultVectorType) {
-      rewriter.replaceOp(op, mask);
-      return success();
-    }
-
-    Value shared =
-        allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
-    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), mask, shared)))
+    FailureOr<Value> result =
+        materializeShapedResult(rewriter, op.getLoc(), converted, mask);
+    if (failed(result))
       return failure();
-    rewriter.replaceOp(op, shared);
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -1037,19 +1050,20 @@ struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
     Type converted = typeConverter->convertType(op.getMask().getType());
     if (!converted)
       return failure();
-    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
-      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
-      if (!vectorType)
-        return failure();
+    auto vectorType = dyn_cast<mlir::VectorType>(converted);
+    if (auto memrefType = dyn_cast<MemRefType>(converted))
+      vectorType = vectorTypeForMemRef(memrefType);
+    if (vectorType) {
       FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, 1);
       if (failed(attr))
         return failure();
       Value vector =
           arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
-      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+      FailureOr<Value> result =
+          materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+      if (failed(result))
         return failure();
-      rewriter.replaceOp(op, shared);
+      rewriter.replaceOp(op, *result);
       return success();
     }
     FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, 1);
@@ -1070,19 +1084,20 @@ struct ConvertNullaryShapedConstantOp : public OpConversionPattern<OpT> {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
     if (!converted)
       return failure();
-    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
-      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
-      if (!vectorType)
-        return failure();
+    auto vectorType = dyn_cast<mlir::VectorType>(converted);
+    if (auto memrefType = dyn_cast<MemRefType>(converted))
+      vectorType = vectorTypeForMemRef(memrefType);
+    if (vectorType) {
       FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
       if (failed(attr))
         return failure();
       Value vector =
           arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
-      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+      FailureOr<Value> result =
+          materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+      if (failed(result))
         return failure();
-      rewriter.replaceOp(op, shared);
+      rewriter.replaceOp(op, *result);
       return success();
     }
     FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, FillValue);
@@ -1110,14 +1125,11 @@ struct ConvertFillShapedConstantOp : public OpConversionPattern<OpT> {
       return failure();
     Value vector = vector::BroadcastOp::create(rewriter, op.getLoc(),
                                                vectorType, adaptor.getValue());
-    if (!memrefType) {
-      rewriter.replaceOp(op, vector);
-      return success();
-    }
-    Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
-    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+    FailureOr<Value> result =
+        materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+    if (failed(result))
       return failure();
-    rewriter.replaceOp(op, shared);
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -1196,10 +1208,11 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
           arith::SelectOp::create(rewriter, op.getLoc(), vectorType, *condition,
                                   *trueValue, falseValue)
               .getResult();
-      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
-      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), selected, shared)))
+      FailureOr<Value> result =
+          materializeShapedResult(rewriter, op.getLoc(), converted, selected);
+      if (failed(result))
         return failure();
-      rewriter.replaceOp(op, shared);
+      rewriter.replaceOp(op, *result);
       return success();
     }
 

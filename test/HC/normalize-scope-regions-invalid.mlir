@@ -18,18 +18,6 @@ hc.func @live_workitem_token_is_rejected {
 
 // -----
 
-hc.func @result_producing_workitem_is_rejected(%v: !hc.bare_vector<f32, ["8"]>) {
-  // expected-error @+1 {{result-producing workitem region normalization requires distributed value projection support}}
-  %region = hc.workitem_region -> (!hc.bare_vector<f32, ["8", "32"]>) {
-  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32"]>,
-                         subgroup_size = #hc.expr<"32">>):
-    hc.yield %v : !hc.bare_vector<f32, ["8"]>
-  }
-  hc.return
-}
-
-// -----
-
 hc.func @subgroup_is_rejected {
   // expected-error @+1 {{subgroup region normalization is not supported yet}}
   hc.subgroup_region {

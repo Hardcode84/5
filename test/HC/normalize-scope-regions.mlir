@@ -33,3 +33,45 @@ hc.func @erase_empty_yield {
   }
   hc.return
 }
+
+// -----
+
+// CHECK-LABEL: hc.func @project_workitem_result
+// CHECK-SAME: %[[LOCAL:.*]]: !hc.bare_vector<f32, ["8"]>
+// CHECK-SAME: -> !hc.bare_vector<f32, ["8"]>
+// CHECK-NOT: hc.workitem_region
+// CHECK: hc.return %[[LOCAL]] : !hc.bare_vector<f32, ["8"]>
+hc.func @project_workitem_result(%local: !hc.bare_vector<f32, ["8"]>)
+    -> !hc.bare_vector<f32, ["8", "32"]> {
+  %region = hc.workitem_region -> (!hc.bare_vector<f32, ["8", "32"]>) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %local : !hc.bare_vector<f32, ["8"]>
+  }
+  hc.return %region : !hc.bare_vector<f32, ["8", "32"]>
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @drop_workitem_token_call_arg
+// CHECK-SAME: %[[VALUE:[^:]+]]: i32
+// CHECK-SAME: {
+// CHECK: hc.call @workitem_helper(%[[VALUE]]) : (i32) -> i32
+hc.func @drop_workitem_token_call_arg(
+    %wi: !hc.workitem<group_shape = #hc.shape<["32"]>,
+                      subgroup_size = #hc.expr<"32">>,
+    %value: i32) {
+  %result = hc.call @workitem_helper(%wi, %value)
+      : (!hc.workitem<group_shape = #hc.shape<["32"]>,
+                      subgroup_size = #hc.expr<"32">>, i32) -> i32
+  hc.return
+}
+
+// CHECK-LABEL: hc.func @workitem_helper
+// CHECK-SAME: (%[[VALUE:.*]]: i32) -> i32
+hc.func @workitem_helper(
+    %wi: !hc.workitem<group_shape = #hc.shape<["32"]>,
+                      subgroup_size = #hc.expr<"32">>,
+    %value: i32) -> i32 attributes {scope = #hc.scope<"WorkItem">} {
+  hc.return %value : i32
+}

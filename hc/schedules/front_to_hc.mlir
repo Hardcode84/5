@@ -9,7 +9,8 @@
 // helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
 // SSA, infer concrete HC value types, materialize bound symbolic values, verify
 // static shape carriers, split semantic shaped values into bare data/masks,
-// then run the standard cleanup pair.
+// inline helpers, normalize supported scope regions, then run the standard
+// cleanup pair.
 // `hc.compile` loads this via `-transform-preload-library` and runs it with
 // `-transform-interpreter`; callers wanting a different order can pass
 // `schedule=<path-or-text>` to override.
@@ -37,10 +38,17 @@ module attributes {transform.with_named_sequence} {
     %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
         with options = { "strict" = false } to %m7
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m8 {
+    %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
+        : (!transform.any_op) -> !transform.any_op
+    %m10 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m9
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_dce to %m10 : !transform.any_op
+    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m11 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m8 : !transform.any_op
+    transform.apply_cse to %m11 : !transform.any_op
     transform.yield
   }
 }

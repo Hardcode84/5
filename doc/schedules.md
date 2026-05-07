@@ -41,10 +41,17 @@ module attributes {transform.with_named_sequence} {
     %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
         with options = { "strict" = false } to %m7
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m8 {
+    %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
+        : (!transform.any_op) -> !transform.any_op
+    %m10 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m9
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_dce to %m10 : !transform.any_op
+    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m11 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m8 : !transform.any_op
+    transform.apply_cse to %m11 : !transform.any_op
     transform.yield
   }
 }
@@ -60,7 +67,13 @@ producers and users, including helper-call signatures, `hc.call` sites, stores,
 and structured/collective region boundaries, are split into bare data/masks,
 while remaining intrinsic boundaries are preserved with
 `builtin.unrealized_conversion_cast` until those consumers grow decomposition
-rules.
+rules. Helper inlining can clone fresh launch-geometry producer chains from
+callee bodies, so bound-expression materialization runs again before
+scope-region normalization. DCE then removes now-dead scope-token geometry
+producers; live workitem/subgroup token uses still diagnose in the normalization
+pass. The final normalization removes supported `hc.func` call boundaries and
+result-producing workitem regions from the executable HC body, leaving subgroup
+and other unsupported scope cases to diagnose.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

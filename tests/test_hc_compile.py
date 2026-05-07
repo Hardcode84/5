@@ -637,21 +637,22 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                     '!hc.vector<f32, ["8"]>'
                 ) in handle.hc_ir_text
                 assert (
-                    '-> (!hc.bare_vector<f32, ["8", "32", "1"]>, '
-                    '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>'
+                    'hc.for_range' in handle.hc_ir_text
+                    and '-> (!hc.bare_tensor<f16, ["16", "16"]>, '
                     in handle.hc_ir_text
-                    and '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>)'
+                    and '!hc.bare_vector<f32, ["8"]>, '
                     in handle.hc_ir_text
-                    and 'hc.workitem_region captures = ["group"] -> '
-                    '(!hc.bare_vector<f32, ["8", "32", "1"]>, '
-                    '!hc.bare_vector<!hc.pred, ["8", "32", "1"]>)'
+                    and '!hc.bare_vector<!hc.pred, ["8"]>)'
                     in handle.hc_ir_text
                     and 'to !hc.vector<f32, ["8"]>' in handle.hc_ir_text
                 )
+                assert "hc.workitem_region" not in handle.hc_ir_text
+                assert "hc.call @" not in handle.hc_ir_text
                 assert re.search(
-                    r'hc\\.call @store_wmma_tile\\([^\\n]+\\) : '
-                    r'\\([^\\n]+!hc\\.bare_vector<f32, \\["8", "32", "1"\\]>, '
-                    r'!hc\\.bare_vector<!hc\\.pred, \\["8", "32", "1"\\]>\\) -> \\(\\)',
+                    r'hc\\.call_intrinsic @wmma_gfx11\\([^\\n]+\\) '
+                    r'\\{arch = "gfx11", wave_size = 32 : i64\\} : '
+                    r'\\([^\\n]+!hc\\.vector<f32, \\["8"\\]>, '
+                    r'!hc\\.idx<"\\$WI0">\\) -> !hc\\.vector<f32, \\["8"\\]>',
                     handle.hc_ir_text,
                 )
                 assert re.search(

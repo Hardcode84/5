@@ -879,6 +879,9 @@ folding / inline markers on is:
                               → hc-materialize-bound-exprs
                               → hc-verify-static-shapes
                               → hc-decompose-shaped-values(strict=false)
+                              → hc-inline-helpers
+                              → hc-materialize-bound-exprs
+                              → hc-normalize-scope-regions
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
@@ -892,7 +895,10 @@ on the same pass list, so
            --convert-hc-front-to-hc --hc-promote-names \
            --hc-infer-types --hc-materialize-bound-exprs \
            --hc-verify-static-shapes \
-           --hc-decompose-shaped-values=strict=false
+           --hc-decompose-shaped-values=strict=false \
+           --hc-inline-helpers --hc-materialize-bound-exprs \
+           --canonicalize \
+           --hc-normalize-scope-regions
 
 and `hc.compile(...)` with the default schedule produce identical
 output. See [`doc/schedules.md`](schedules.md) for the schedule format
@@ -906,7 +912,13 @@ values may have been split into bare data/masks. The scheduled decomposition is
 non-strict: helper-call signatures, call sites, stores, and structured/collective
 region boundaries are decomposed, while intrinsic boundaries that are not
 decomposed yet are preserved with `builtin.unrealized_conversion_cast`. Symbolic
-launch parameters may still remain.
+launch parameters may still remain. Supported helper calls and workitem scope
+regions are then normalized away so the executable HC body is closer to
+per-workitem SPMD form before upstream lowering. Bound-expression materialization
+runs a second time after helper inlining because inlined helper bodies can expose
+fresh launch-geometry producer chains; DCE/canonicalization removes the dead
+scope-token producers before region normalization checks for remaining live
+scope-token uses.
 
 ### SSA construction
 

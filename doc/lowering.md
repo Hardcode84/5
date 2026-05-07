@@ -347,9 +347,10 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 #### Declarations and regions
 
 * `hc.kernel @name` — compiled kernel; carries a module-scoped symbol name
-  plus symbolic launch geometry, declared bound-symbol metadata, parameter
-  annotations, and literal-symbol set attributes. `Symbol` trait so references
-  go through the symbol table.
+  plus symbolic launch geometry, declared bound-symbol metadata for launch
+  queries and kernel input ABI symbols, parameter annotations, and
+  literal-symbol set attributes. `Symbol` trait so references go through the
+  symbol table.
 * `hc.func @name` — helper callable referenced by `hc.call`. Also a
   `Symbol`. An optional inline `function_type` signature makes the op
   self-describing; when present, `hc.call` sites get arity and type
@@ -620,7 +621,7 @@ hc.kernel @tiled_gfx11_wmma_matmul(
   subgroup_size = 32 : i32,
   bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1",
                    "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1",
-                   "$GSZ0", "$WV0"]
+                   "$GSZ0", "$WV0", "M", "K", "N"]
 } {
   %c0 = hc.const <0 : i64>  : !hc.undef
   %c1 = hc.const <1 : i64>  : !hc.undef

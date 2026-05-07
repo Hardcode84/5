@@ -23,6 +23,7 @@
 // CHECK-LABEL: hc.kernel @basic
 // CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
 // CHECK-SAME: attributes {
+// CHECK-SAME: bound_symbols = ["$WG0", "$WI0", "$SG0", "$WGS0", "$WO0", "$WS0", "$GSZ0", "$WV0", "M"]
 // CHECK-SAME: group_shape = #hc.shape<["32"]>
 // CHECK-SAME: literals = ["TILE"]
 // CHECK-SAME: subgroup_size = 32 : i32

@@ -14,7 +14,7 @@
 // CHECK: module {
 // CHECK-NEXT: hc.kernel @tiled_gfx11_wmma_matmul
 // CHECK-SAME: (%[[GROUP:arg[0-9]+]]: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %[[A:arg[0-9]+]]: !hc.buffer<f16, ["M", "K"]>, %[[B:arg[0-9]+]]: !hc.buffer<f16, ["K", "N"]>, %[[C:arg[0-9]+]]: !hc.buffer<f32, ["M", "N"]>)
-// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1", "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1", "$GSZ0", "$WV0"]
+// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1", "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1", "$GSZ0", "$WV0", "M", "K", "N"]
 // CHECK-SAME: group_shape = #hc.shape<["32", "1"]>
 // CHECK-SAME: subgroup_size = 32 : i32
 // CHECK-SAME: work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>

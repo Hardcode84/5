@@ -299,9 +299,8 @@ LogicalResult HCKernelOp::verify() {
     llvm::StringSet<> seen;
     for (StringAttr symbol : boundSymbols.getAsRange<StringAttr>()) {
       StringRef name = symbol.getValue();
-      if (!name.starts_with("$"))
-        return emitOpError("bound symbol '")
-               << name << "' must use the internal `$` prefix";
+      if (name.empty())
+        return emitOpError("bound symbol names must be non-empty");
       if (!seen.insert(name).second)
         return emitOpError("duplicate bound symbol '") << name << "'";
     }

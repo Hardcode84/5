@@ -56,3 +56,21 @@ hc.kernel @declared_kernel_bound_symbol(%gid: !hc.idx<"$WG0">)
   %sum = hc.add %gid, %gid : (!hc.idx<"$WG0">, !hc.idx<"$WG0">) -> !hc.idx<"2*$WG0">
   hc.return
 }
+
+// -----
+
+// CHECK-LABEL: hc.kernel @declared_kernel_abi_symbols
+// CHECK-SAME: bound_symbols = ["M", "N"]
+// CHECK-DAG: %[[M:.*]] = hc.materialize_bound_expr : !hc.idx<"M">
+// CHECK-DAG: %[[PRED:.*]] = hc.materialize_bound_expr : !hc.pred<"M - N < 0">
+// CHECK: hc.add %[[M]]
+// CHECK: hc.if %[[PRED]]
+hc.kernel @declared_kernel_abi_symbols(%m: !hc.idx<"M">,
+                                       %pred: !hc.pred<"M < N">)
+    attributes {bound_symbols = ["M", "N"]} {
+  %one = hc.const<1 : i64> : !hc.idx<"1">
+  %next = hc.add %m, %one : (!hc.idx<"M">, !hc.idx<"1">) -> !hc.idx<"M + 1">
+  hc.if %pred : !hc.pred<"M < N"> {
+  }
+  hc.return
+}

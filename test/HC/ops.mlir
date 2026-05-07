@@ -34,7 +34,7 @@
 // CHECK: hc.return
 // CHECK: hc.kernel @full_kernel(%arg0: !hc.buffer<f32, ["M", "N"]>, %arg1: !hc.buffer<f32, ["M", "N"]>)
 // CHECK-SAME: attributes {
-// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1"]
+// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "M", "N"]
 // CHECK-SAME: group_shape = #hc.shape<["32", "1"]>
 // CHECK-SAME: literals = ["WMMA_M", "WMMA_K"]
 // CHECK-SAME: subgroup_size = 32 : i32
@@ -105,7 +105,7 @@ module {
         work_shape = #hc.shape<["M", "N"]>,
         group_shape = #hc.shape<["32", "1"]>,
         subgroup_size = 32 : i32,
-        bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1"],
+        bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "M", "N"],
         literals = ["WMMA_M", "WMMA_K"]
       } {
     hc.return

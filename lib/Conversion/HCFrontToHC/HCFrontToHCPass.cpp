@@ -101,6 +101,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Error.h"
 
@@ -580,18 +581,70 @@ parseLaunchMetadata(Operation *sourceOp, LaunchMetadataAttrs attrs) {
   return metadata;
 }
 
+static void appendBoundSymbol(MLIRContext *ctx, StringRef name,
+                              llvm::StringSet<> &seen,
+                              SmallVectorImpl<Attribute> &symbols) {
+  if (seen.insert(name).second)
+    symbols.push_back(StringAttr::get(ctx, name));
+}
+
+static void appendExprBoundSymbols(MLIRContext *ctx, ExprAttr expr,
+                                   llvm::StringSet<> &seen,
+                                   SmallVectorImpl<Attribute> &symbols) {
+  if (!expr)
+    return;
+  sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+    appendBoundSymbol(ctx, name, seen, symbols);
+  });
+}
+
+static void appendPredBoundSymbols(MLIRContext *ctx, PredAttr pred,
+                                   llvm::StringSet<> &seen,
+                                   SmallVectorImpl<Attribute> &symbols) {
+  if (!pred)
+    return;
+  sym::walkSymbolNames(pred.getValue(), [&](StringRef name) {
+    appendBoundSymbol(ctx, name, seen, symbols);
+  });
+}
+
+static void appendShapeBoundSymbols(MLIRContext *ctx, ShapeAttr shape,
+                                    llvm::StringSet<> &seen,
+                                    SmallVectorImpl<Attribute> &symbols) {
+  if (!shape)
+    return;
+  for (Attribute dim : shape.getDims())
+    appendExprBoundSymbols(ctx, dyn_cast<ExprAttr>(dim), seen, symbols);
+}
+
+static void appendInputTypeBoundSymbols(MLIRContext *ctx, Type type,
+                                        llvm::StringSet<> &seen,
+                                        SmallVectorImpl<Attribute> &symbols) {
+  if (auto buffer = dyn_cast<BufferType>(type))
+    return appendShapeBoundSymbols(ctx, buffer.getShape(), seen, symbols);
+  if (auto idx = dyn_cast<IdxType>(type))
+    return appendExprBoundSymbols(ctx, idx.getExpr(), seen, symbols);
+  if (auto pred = dyn_cast<PredType>(type))
+    return appendPredBoundSymbols(ctx, pred.getPred(), seen, symbols);
+  if (auto tuple = dyn_cast<TupleType>(type))
+    for (Type element : tuple.getTypes())
+      appendInputTypeBoundSymbols(ctx, element, seen, symbols);
+}
+
 static void appendLaunchBoundSymbols(MLIRContext *ctx, StringRef prefix,
-                                     unsigned rank,
+                                     unsigned rank, llvm::StringSet<> &seen,
                                      SmallVectorImpl<Attribute> &symbols) {
   for (unsigned axis = 0; axis < rank; ++axis) {
     SmallString<16> name(prefix);
     name += Twine(axis).str();
-    symbols.push_back(StringAttr::get(ctx, name));
+    appendBoundSymbol(ctx, name, seen, symbols);
   }
 }
 
-static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, ShapeAttr workShape,
+static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, TypeRange inputTypes,
+                                         ShapeAttr workShape,
                                          ShapeAttr groupShape) {
+  llvm::StringSet<> seen;
   SmallVector<Attribute> symbols;
   unsigned workRank =
       workShape ? static_cast<unsigned>(workShape.getDims().size()) : 0;
@@ -601,7 +654,7 @@ static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, ShapeAttr workShape,
 
   auto appendMethod = [&](LaunchGeoMethod method, unsigned rank) {
     appendLaunchBoundSymbols(ctx, getLaunchGeoMethodInfo(method).symbolPrefix,
-                             rank, symbols);
+                             rank, seen, symbols);
   };
   appendMethod(LaunchGeoMethod::GroupId, groupIdRank);
   appendMethod(LaunchGeoMethod::LocalId, groupRank);
@@ -611,6 +664,8 @@ static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, ShapeAttr workShape,
   appendMethod(LaunchGeoMethod::WorkShape, workRank);
   appendMethod(LaunchGeoMethod::GroupSize, 1);
   appendMethod(LaunchGeoMethod::WaveSize, 1);
+  for (Type inputType : inputTypes)
+    appendInputTypeBoundSymbols(ctx, inputType, seen, symbols);
   return ArrayAttr::get(ctx, symbols);
 }
 
@@ -1123,7 +1178,8 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
           if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
             hcKernel.setSubgroupSizeAttr(sg);
           hcKernel.setBoundSymbolsAttr(buildKernelBoundSymbols(
-              ctx, hcKernel.getWorkShapeAttr(), hcKernel.getGroupShapeAttr()));
+              ctx, fnType.getInputs(), hcKernel.getWorkShapeAttr(),
+              hcKernel.getGroupShapeAttr()));
           if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
             hcKernel.setLiteralsAttr(lits);
           return &kernel.getBody();

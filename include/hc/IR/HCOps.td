@@ -68,10 +68,10 @@ def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
 
     Decorator metadata arrives as optional attributes: symbolic `work_shape`
     and `group_shape` as `#hc.shape`, `subgroup_size` as an `i32`,
-    `bound_symbols` as a `StrArrayAttr` listing launch/bound symbols that may
-    be materialized, and `literals` as a `StrArrayAttr` listing symbols that
-    specialization is allowed to bind. All are optional so the `hc_front -> hc`
-    pass can fill them in progressively.
+    `bound_symbols` as a `StrArrayAttr` listing launch and kernel-input ABI
+    symbols that may be materialized, and `literals` as a `StrArrayAttr`
+    listing symbols that specialization is allowed to bind. All are optional so
+    the `hc_front -> hc` pass can fill them in progressively.
   }];
   let arguments = (ins
     SymbolNameAttr:$sym_name,

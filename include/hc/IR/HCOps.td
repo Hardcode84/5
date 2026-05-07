@@ -86,8 +86,9 @@ def HCKernelOp : HC_RegionOp<"kernel", [IsolatedFromAbove, Symbol]> {
   let hasVerifier = 1;
 }
 
-def HCFuncOp : HC_RegionOp<"func",
+def HCFuncOp : HC_Op<"func",
     [IsolatedFromAbove, Symbol,
+     SingleBlockImplicitTerminator<"HCReturnOp">,
      DeclareOpInterfaceMethods<CallableOpInterface,
                                ["getCallableRegion", "getArgumentTypes",
                                 "getResultTypes"]>]> {

@@ -1024,7 +1024,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // — attaches `entry` to the hc op first, so any later failure can
   // `hcOp->erase()` and take the block with it.
   auto runBody =
-      [&](ArrayAttr runParams, bool returnsValue,
+      [&](ArrayAttr runParams, bool returnsValue, bool ensureReturn,
           llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
       -> LogicalResult {
     Block *entry = new Block();
@@ -1044,12 +1044,19 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
     // `emitParameterAssigns` leaves the builder just past the last
     // parameter `hc.assign`, which is where we want `lowerRegion` to
     // start appending the body's converted ops.
-    return lowerRegion(**bodyRegion);
+    if (failed(lowerRegion(**bodyRegion)))
+      return failure();
+    if (ensureReturn && (entry->empty() || !isa<HCReturnOp>(entry->back()))) {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToEnd(entry);
+      HCReturnOp::create(builder, frontOp->getLoc(), ValueRange{});
+    }
+    return success();
   };
 
   if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
     return runBody(
-        params, /*returnsValue=*/false,
+        params, /*returnsValue=*/false, /*ensureReturn=*/false,
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcKernel = HCKernelOp::create(
               builder, loc, StringAttr::get(ctx, kernel.getName()),
@@ -1089,6 +1096,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   if (auto func = dyn_cast<hc_front::FuncOp>(frontOp)) {
     return runBody(
         params, /*returnsValue=*/!declaresNoneReturn(frontOp),
+        /*ensureReturn=*/true,
         [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
           auto hcFunc = HCFuncOp::create(
               builder, loc, StringAttr::get(ctx, func.getName()),

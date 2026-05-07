@@ -5,6 +5,7 @@
 add_mlir_library(MLIRHCTransforms
   HCDecomposeShapedValuesPass.cpp
   HCInferTypesPass.cpp
+  HCInlineHelpersPass.cpp
   HCLowerBarePredicatesPass.cpp
   HCMaterializeBoundExprsPass.cpp
   HCNormalizeScopeRegionsPass.cpp

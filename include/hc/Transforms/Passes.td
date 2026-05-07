@@ -126,6 +126,18 @@ def HCMaterializeBoundExprs
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCInlineHelpers
+    : Pass<"hc-inline-helpers"> {
+  let summary = "Inline supported HC helper calls.";
+  let description = [{
+    Inlines `hc.call` sites targeting `hc.func` helpers. The pass owns HC
+    helper call-graph concerns separately from scope-region normalization:
+    recursion and unsupported callee body shapes are diagnosed here, and helpers
+    that were actually inlined are erased once no `hc.call` references remain.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCNormalizeScopeRegions
     : Pass<"hc-normalize-scope-regions"> {
   let summary = "Flatten supported collective scope regions into SPMD HC IR.";

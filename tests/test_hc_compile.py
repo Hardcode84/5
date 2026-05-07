@@ -635,14 +635,16 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert handle.hc_ir_text is not None
                 assert "!hc.tensor<" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "!hc.vector<" not in handle.hc_ir_text, handle.hc_ir_text
-                assert 'scf.for' in handle.hc_ir_text, handle.hc_ir_text
-                assert 'hc.for_range' not in handle.hc_ir_text, handle.hc_ir_text
+                assert "scf.for" in handle.hc_ir_text, handle.hc_ir_text
+                assert "hc.for_range" not in handle.hc_ir_text, handle.hc_ir_text
+                assert "vector.transfer_read" in handle.hc_ir_text
+                assert "vector.transfer_write" in handle.hc_ir_text
+                assert "memref.alloca" in handle.hc_ir_text
+                assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
+                assert "hc.load " not in handle.hc_ir_text
+                assert "hc.buffer_view" not in handle.hc_ir_text
                 assert '-> (!hc.bare_tensor<f16, ["16", "16"]>' not in (
                     handle.hc_ir_text
-                )
-                assert '!hc.bare_vector<f32, ["8"]>, ' in handle.hc_ir_text
-                assert (
-                    '!hc.bare_vector<!hc.pred, ["8"]>)' in handle.hc_ir_text
                 )
                 assert "hc.workitem_region" not in handle.hc_ir_text
                 assert "hc.call @" not in handle.hc_ir_text

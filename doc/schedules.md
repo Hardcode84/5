@@ -84,9 +84,11 @@ result-producing workitem regions from the executable HC body, leaving subgroup
 and other unsupported scope cases to diagnose. Cleanup runs over that normalized
 HC body before `hc-lower-kernels-to-gpu-launch` wraps each `hc.kernel` in a host
 `func.func` containing a `gpu.launch`. `hc-lower-launch-body` then lowers the
-scalar/index subset inside that launch to upstream `arith`/`scf` operations
-while preserving shaped memory and intrinsic HC ops for later slices; a final
-cleanup pass pair folds the launch-body arithmetic where possible.
+scalar/index subset inside that launch to upstream `arith`/`scf` operations and
+lowers static bare tensors to workgroup-memory `memref`s. Bare vectors lower to
+upstream `vector` values. Intrinsic and final store boundaries remain HC ops with
+explicit casts for later slices; a final cleanup pass pair folds the launch-body
+arithmetic where possible.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

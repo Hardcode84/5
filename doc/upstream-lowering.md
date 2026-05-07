@@ -178,6 +178,8 @@ Suggested operation mapping:
 | `hc.local_id` | `gpu.launch` thread ids |
 | `hc.for_range` | `scf.for` |
 | `hc.const`, arithmetic ops | `arith` over `index`, integer, or float types |
+| `!hc.bare_tensor<T, shape>` | workgroup-memory `memref<...xT, #gpu.address_space<workgroup>>` |
+| `!hc.bare_tensor<!hc.pred, shape>` | workgroup-memory `memref<...xi1, #gpu.address_space<workgroup>>` |
 | `!hc.bare_vector<T, shape>` | `vector<...xT>` after converting HC element types |
 | `!hc.bare_vector<!hc.pred, shape>` | `vector<...xi1>` |
 | `hc.slice_expr` | offset / size / stride SSA tuples for memref/vector ops |
@@ -261,10 +263,13 @@ Initial implementation options for the data path:
 * Or introduce LDS/shared-memory staging later with `memref.alloca` in a GPU
   address space and cooperative loads.
 
-The first route is simpler and sufficient for proving the end-to-end lowering
-shape. LDS staging can be a later performance pass. The predicate tile lowers to
-a `vector<16x16xi1>` mask for `vector.transfer_read`, with a zero padding value
-for inactive elements.
+The current `hc-lower-launch-body` slice stages the direct global read into
+workgroup memory: data tiles become workgroup `memref`s, `hc.load_mask` builds a
+`vector.create_mask` and writes it into a matching predicate memref, and
+`hc.buffer_view` copies tensor fragments through workgroup storage. Only
+`hc.vec` materializes those tensor fragments as upstream `vector` values;
+`hc.select` then becomes `arith.select`. The WMMA intrinsic and final store
+remain HC boundaries with explicit casts until their lowering slices land.
 
 ### 6. Lower fragment extraction
 
@@ -278,9 +283,9 @@ b_frag_mask : !hc.bare_vector<!hc.pred, ["16"]>
 acc_data    : !hc.bare_vector<f32, ["8"]>
 ```
 
-Lower fragment extraction from the `16x16xf16` tiles using the launch thread id
-`lane = gpu.thread_id x`. Apply the same extraction to the predicate tiles so
-data and validity stay aligned.
+Lower fragment extraction from the `16x16xf16` workgroup tile memrefs using the
+launch thread id `lane = gpu.thread_id x`. Apply the same extraction to the
+predicate tile memrefs so data and validity stay aligned.
 
 The current HC code already models collective suffix axes on accumulator vector
 views, so the post-inference shape for:

@@ -173,14 +173,15 @@ def HCLowerKernelsToGPULaunch
 
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
-  let summary = "Lower scalar HC operations inside GPU launches.";
+  let summary = "Lower HC launch-body operations to upstream dialects.";
   let description = [{
-    Converts the scalar/index HC subset that remains inside `gpu.launch` after
-    kernel wrapping. Bound symbolic expressions become upstream SSA values
-    derived from launch ids and buffer dimensions, simple arithmetic lowers to
-    `arith`, and `hc.for_range`/`hc.if` become `scf` control flow. Shaped memory
-    and intrinsic operations are preserved with converted scalar operands for
-    later upstream-lowering slices.
+    Converts the HC subset that remains inside `gpu.launch` after kernel
+    wrapping. Bound symbolic expressions become upstream SSA values derived
+    from launch ids and buffer dimensions, simple arithmetic lowers to `arith`,
+    `hc.for_range`/`hc.if` become `scf` control flow, static bare tensors lower
+    to workgroup `memref` storage, and bare vectors lower to upstream `vector`
+    values. Intrinsic and final store boundaries remain HC operations with
+    explicit casts until their dedicated lowering slices.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -188,7 +189,8 @@ def HCLowerLaunchBody
     "::mlir::gpu::GPUDialect",
     "::mlir::hc::HCDialect",
     "::mlir::memref::MemRefDialect",
-    "::mlir::scf::SCFDialect"
+    "::mlir::scf::SCFDialect",
+    "::mlir::vector::VectorDialect"
   ];
 }
 

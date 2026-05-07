@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-launch-body`, the scalar/control-flow slice that runs
+// Implements `-hc-lower-launch-body`, the launch-body lowering slice that runs
 // after HC kernels have been wrapped in `gpu.launch`.
 
 #include "hc/Transforms/Passes.h"
@@ -17,8 +17,11 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
@@ -61,11 +64,87 @@ static bool isOneNode(ixs_node *node) {
   return ixs_node_tag(node) == IXS_INT && ixs_node_int_val(node) == 1;
 }
 
+static Type convertElementType(Type type) {
+  if (isa<PredType>(type))
+    return IntegerType::get(type.getContext(), 1);
+  if (type.isIntOrIndexOrFloat())
+    return type;
+  return {};
+}
+
+static FailureOr<SmallVector<int64_t>> staticIntegerShape(ShapeAttr shape,
+                                                          Operation *diagOp) {
+  SmallVector<int64_t> dims;
+  dims.reserve(shape.getDims().size());
+  for (auto [index, attr] : llvm::enumerate(shape.getDims())) {
+    auto expr = dyn_cast<ExprAttr>(attr);
+    std::optional<int64_t> value =
+        expr ? sym::getIntegerLiteralValue(sym::ExprHandle(expr.getNode()))
+             : std::nullopt;
+    if (!value || *value < 0) {
+      if (diagOp)
+        return diagOp->emitOpError("expected static non-negative integer "
+                                   "dimension at #")
+               << index << ", got " << attr;
+      return failure();
+    }
+    dims.push_back(*value);
+  }
+  return dims;
+}
+
+static FailureOr<SmallVector<int64_t>>
+staticIntegerShape(SymbolicallyShapedTypeInterface shaped) {
+  FailureOr<SmallVector<int64_t>> dims =
+      staticIntegerShape(shaped.getSymbolicShape(), nullptr);
+  if (failed(dims))
+    return failure();
+  return *dims;
+}
+
+static Type convertBareTensorType(BareTensorType type) {
+  auto shaped = cast<SymbolicallyShapedTypeInterface>(type);
+  Type element = convertElementType(shaped.getSymbolicElementType());
+  if (!element)
+    return {};
+  FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(shaped);
+  if (failed(dims))
+    return {};
+  Attribute memorySpace = gpu::AddressSpaceAttr::get(
+      type.getContext(), gpu::AddressSpace::Workgroup);
+  return MemRefType::get(*dims, element, MemRefLayoutAttrInterface{},
+                         memorySpace);
+}
+
+static Type convertBareVectorType(BareVectorType type) {
+  auto shaped = cast<SymbolicallyShapedTypeInterface>(type);
+  Type element = convertElementType(shaped.getSymbolicElementType());
+  if (!element)
+    return {};
+  FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(shaped);
+  if (failed(dims))
+    return {};
+  if (dims->empty())
+    return element;
+  for (int64_t dim : *dims)
+    if (dim <= 0)
+      return {};
+  return mlir::VectorType::get(*dims, element);
+}
+
 static Value materializeCast(OpBuilder &builder, Type type, ValueRange inputs,
                              Location loc) {
   if (inputs.size() != 1)
     return {};
   return UnrealizedConversionCastOp::create(builder, loc, type, inputs)
+      .getResult(0);
+}
+
+static Value castIfNeeded(OpBuilder &builder, Location loc, Value value,
+                          Type type) {
+  if (value.getType() == type)
+    return value;
+  return UnrealizedConversionCastOp::create(builder, loc, type, value)
       .getResult(0);
 }
 
@@ -77,6 +156,16 @@ public:
         [](IdxType type) -> Type { return IndexType::get(type.getContext()); });
     addConversion([](PredType type) -> Type {
       return IntegerType::get(type.getContext(), 1);
+    });
+    addConversion([](BareTensorType type) -> std::optional<Type> {
+      if (Type converted = convertBareTensorType(type))
+        return converted;
+      return Type(type);
+    });
+    addConversion([](BareVectorType type) -> std::optional<Type> {
+      if (Type converted = convertBareVectorType(type))
+        return converted;
+      return Type(type);
     });
     addConversion([&](TupleType type) -> std::optional<Type> {
       SmallVector<Type> elements;
@@ -418,21 +507,63 @@ private:
   const BoundValues &boundValues;
 };
 
-static Value sourceMemref(Value buffer) {
-  auto cast = buffer.getDefiningOp<UnrealizedConversionCastOp>();
-  if (!cast || cast.getInputs().size() != 1 || cast.getOutputs().size() != 1)
-    return {};
-  Value input = cast.getInputs().front();
-  return isa<MemRefType>(input.getType()) ? input : Value();
+static Value sourceMemRef(Value source) {
+  auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
+  if (cast && cast.getInputs().size() == 1 && cast.getOutputs().size() == 1) {
+    Value input = cast.getInputs().front();
+    if (isa<MemRefType>(input.getType()))
+      return input;
+  }
+  return isa<MemRefType>(source.getType()) ? source : Value();
 }
 
-static LogicalResult convertFunctionSignature(FunctionType fnType,
-                                              const TypeConverter &converter,
-                                              SmallVectorImpl<Type> &inputs,
-                                              SmallVectorImpl<Type> &results) {
-  return success(
-      succeeded(converter.convertTypes(fnType.getInputs(), inputs)) &&
-      succeeded(converter.convertTypes(fnType.getResults(), results)));
+static Type convertIntrinsicBoundaryType(Type type,
+                                         const TypeConverter &converter) {
+  if (isa<BareTensorType, BareVectorType>(type))
+    return type;
+  auto tuple = dyn_cast<TupleType>(type);
+  if (!tuple)
+    return converter.convertType(type);
+
+  SmallVector<Type> elements;
+  elements.reserve(tuple.size());
+  for (Type element : tuple.getTypes()) {
+    Type converted = convertIntrinsicBoundaryType(element, converter);
+    if (!converted)
+      return {};
+    elements.push_back(converted);
+  }
+  return TupleType::get(type.getContext(), elements);
+}
+
+static LogicalResult convertIntrinsicFunctionSignature(
+    FunctionType fnType, const TypeConverter &converter,
+    SmallVectorImpl<Type> &inputs, SmallVectorImpl<Type> &results) {
+  for (Type input : fnType.getInputs()) {
+    Type converted = convertIntrinsicBoundaryType(input, converter);
+    if (!converted)
+      return failure();
+    inputs.push_back(converted);
+  }
+  for (Type result : fnType.getResults()) {
+    Type converted = convertIntrinsicBoundaryType(result, converter);
+    if (!converted)
+      return failure();
+    results.push_back(converted);
+  }
+  return success();
+}
+
+static LogicalResult convertIntrinsicBodySignature(
+    FunctionType fnType, TypeConverter::SignatureConversion &bodyConversion,
+    const TypeConverter &converter) {
+  for (auto [index, input] : llvm::enumerate(fnType.getInputs())) {
+    Type converted = convertIntrinsicBoundaryType(input, converter);
+    if (!converted)
+      return failure();
+    bodyConversion.addInputs(index, converted);
+  }
+  return success();
 }
 
 struct ConvertIntrinsicSignatureOp : public OpConversionPattern<HCIntrinsicOp> {
@@ -447,8 +578,8 @@ struct ConvertIntrinsicSignatureOp : public OpConversionPattern<HCIntrinsicOp> {
 
     SmallVector<Type> inputs;
     SmallVector<Type> results;
-    if (failed(
-            convertFunctionSignature(*fnType, *typeConverter, inputs, results)))
+    if (failed(convertIntrinsicFunctionSignature(*fnType, *typeConverter,
+                                                 inputs, results)))
       return failure();
 
     auto converted = FunctionType::get(rewriter.getContext(), inputs, results);
@@ -457,8 +588,8 @@ struct ConvertIntrinsicSignatureOp : public OpConversionPattern<HCIntrinsicOp> {
       if (!op.getBody().empty()) {
         TypeConverter::SignatureConversion bodyConversion(
             fnType->getNumInputs());
-        (void)typeConverter->convertSignatureArgs(fnType->getInputs(),
-                                                  bodyConversion);
+        (void)convertIntrinsicBodySignature(*fnType, bodyConversion,
+                                            *typeConverter);
         rewriter.applySignatureConversion(&op.getBody().front(), bodyConversion,
                                           typeConverter);
       }
@@ -494,6 +625,37 @@ struct ConvertMaterializeBoundExprOp
     return failure();
   }
 };
+
+static FailureOr<TypedAttr> splatAttr(OpBuilder &builder, Type type,
+                                      int64_t value) {
+  Type elementType = type;
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    elementType = shaped.getElementType();
+
+  Attribute scalar;
+  if (elementType.isInteger(1))
+    scalar = builder.getBoolAttr(value != 0);
+  else if (elementType.isIndex())
+    scalar = builder.getIndexAttr(value);
+  else if (auto intType = dyn_cast<IntegerType>(elementType))
+    scalar = builder.getIntegerAttr(intType, value);
+  else if (auto floatType = dyn_cast<FloatType>(elementType))
+    scalar = builder.getFloatAttr(floatType, value);
+  else
+    return failure();
+
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    return cast<TypedAttr>(DenseElementsAttr::get(shaped, scalar));
+  return cast<TypedAttr>(scalar);
+}
+
+static Value constantSplat(OpBuilder &builder, Location loc, Type type,
+                           int64_t value) {
+  FailureOr<TypedAttr> attr = splatAttr(builder, type, value);
+  if (failed(attr))
+    return {};
+  return arith::ConstantOp::create(builder, loc, type, *attr).getResult();
+}
 
 struct ConvertConstOp : public OpConversionPattern<HCConstOp> {
   using Base::Base;
@@ -534,6 +696,575 @@ struct ConvertIntBinaryOp : public OpConversionPattern<OpT> {
       return failure();
     rewriter.template replaceOpWithNewOp<ArithOpT>(
         op, converted, adaptor.getLhs(), adaptor.getRhs());
+    return success();
+  }
+};
+
+struct SliceAxis {
+  Value offset;
+  bool isSlice = false;
+};
+
+static Value zeroIndex(OpBuilder &builder, Location loc) {
+  return arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+}
+
+static LogicalResult collectSliceAxis(Operation *op, Value index,
+                                      OpBuilder &builder, SliceAxis &axis) {
+  auto slice = index.getDefiningOp<HCSliceExprOp>();
+  if (!slice)
+    return failure();
+  if (Value step = slice.getStep()) {
+    APInt stepValue;
+    if (!matchPattern(step, m_ConstantInt(&stepValue)) ||
+        stepValue.getSExtValue() != 1)
+      return op->emitOpError("only unit-stride slices lower to vector ops");
+  }
+  axis.offset =
+      slice.getLower() ? slice.getLower() : zeroIndex(builder, op->getLoc());
+  axis.isSlice = true;
+  return success();
+}
+
+static FailureOr<SmallVector<SliceAxis>>
+collectAxes(Operation *op, ValueRange indices, OpBuilder &builder) {
+  SmallVector<SliceAxis> axes;
+  axes.reserve(indices.size());
+  for (Value index : indices) {
+    SliceAxis axis;
+    if (isa<SliceType>(index.getType())) {
+      if (failed(collectSliceAxis(op, index, builder, axis)))
+        return failure();
+    } else {
+      if (!index.getType().isIndex())
+        return op->emitOpError("expected index or slice subscript after "
+                               "launch-body scalar lowering");
+      axis.offset = index;
+    }
+    axes.push_back(axis);
+  }
+  return axes;
+}
+
+static AffineMap transferPermutationMap(MLIRContext *ctx, int64_t sourceRank,
+                                        ArrayRef<SliceAxis> axes) {
+  SmallVector<AffineExpr> results;
+  results.reserve(axes.size());
+  for (auto [axis, info] : llvm::enumerate(axes))
+    if (info.isSlice)
+      results.push_back(getAffineDimExpr(axis, ctx));
+  return AffineMap::get(sourceRank, 0, results, ctx);
+}
+
+static SmallVector<Value> zeroOffsets(OpBuilder &builder, Location loc,
+                                      int64_t rank) {
+  SmallVector<Value> offsets;
+  offsets.reserve(rank);
+  for (int64_t axis = 0; axis != rank; ++axis)
+    offsets.push_back(zeroIndex(builder, loc));
+  return offsets;
+}
+
+static mlir::VectorType vectorTypeForMemRef(MemRefType memrefType) {
+  if (!memrefType.hasStaticShape())
+    return {};
+  return mlir::VectorType::get(memrefType.getShape(),
+                               memrefType.getElementType());
+}
+
+static Value allocateWorkgroupMemRef(OpBuilder &builder, Location loc,
+                                     MemRefType type) {
+  return memref::AllocaOp::create(builder, loc, type).getResult();
+}
+
+static LogicalResult writeVectorToMemRef(OpBuilder &builder, Location loc,
+                                         Value vector, Value memref) {
+  auto memrefType = dyn_cast<MemRefType>(memref.getType());
+  if (!memrefType)
+    return failure();
+  vector::TransferWriteOp::create(
+      builder, loc, vector, memref,
+      zeroOffsets(builder, loc, memrefType.getRank()));
+  return success();
+}
+
+static FailureOr<Value> readMemRefAsVector(OpBuilder &builder, Location loc,
+                                           Value memref,
+                                           mlir::VectorType vectorType) {
+  memref = sourceMemRef(memref);
+  if (!memref)
+    return failure();
+  auto memrefType = dyn_cast<MemRefType>(memref.getType());
+  if (!memrefType || memrefType.getRank() != vectorType.getRank())
+    return failure();
+  Value padding = constantSplat(builder, loc, vectorType.getElementType(), 0);
+  if (!padding)
+    return failure();
+  return vector::TransferReadOp::create(
+             builder, loc, vectorType, memref,
+             zeroOffsets(builder, loc, memrefType.getRank()),
+             std::optional<Value>(padding))
+      .getResult();
+}
+
+template <typename OpT>
+struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
+  using OpConversionPattern<OpT>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = this->typeConverter->convertType(op.getResult().getType());
+    auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
+    auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+    mlir::VectorType transferVectorType =
+        resultMemRefType ? vectorTypeForMemRef(resultMemRefType)
+                         : resultVectorType;
+    if (!transferVectorType)
+      return failure();
+
+    Value source = [&]() -> Value {
+      if constexpr (std::is_same_v<OpT, HCLoadOp>)
+        return adaptor.getBuffer();
+      else
+        return adaptor.getSource();
+    }();
+    Value memref = sourceMemRef(source);
+    if (!memref)
+      return op.emitOpError(
+          "expected load source to be a memref or memref ABI cast");
+    auto memrefType = dyn_cast<MemRefType>(memref.getType());
+    if (!memrefType || memrefType.getRank() !=
+                           static_cast<int64_t>(adaptor.getIndices().size()))
+      return op.emitOpError(
+          "expected ranked memref with one subscript per axis");
+
+    FailureOr<SmallVector<SliceAxis>> axes =
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+    if (failed(axes))
+      return failure();
+    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+          return axis.isSlice;
+        }) != transferVectorType.getRank())
+      return op.emitOpError("load result rank must match slice subscript rank");
+
+    SmallVector<Value> offsets;
+    offsets.reserve(axes->size());
+    for (const SliceAxis &axis : *axes)
+      offsets.push_back(axis.offset);
+
+    Value padding = constantSplat(rewriter, op.getLoc(),
+                                  transferVectorType.getElementType(), 0);
+    if (!padding)
+      return failure();
+
+    Value loaded = vector::TransferReadOp::create(
+                       rewriter, op.getLoc(), transferVectorType, memref,
+                       offsets, std::optional<Value>(padding),
+                       transferPermutationMap(rewriter.getContext(),
+                                              memrefType.getRank(), *axes))
+                       .getResult();
+    if (resultVectorType) {
+      rewriter.replaceOp(op, loaded);
+      return success();
+    }
+
+    Value shared =
+        allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
+    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), loaded, shared)))
+      return failure();
+    rewriter.replaceOp(op, shared);
+    return success();
+  }
+};
+
+struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCLoadMaskOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getMask().getType());
+    auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
+    auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+    mlir::VectorType maskType = resultMemRefType
+                                    ? vectorTypeForMemRef(resultMemRefType)
+                                    : resultVectorType;
+    if (!maskType || !maskType.getElementType().isInteger(1))
+      return failure();
+
+    Value memref = sourceMemRef(adaptor.getSource());
+    if (!memref)
+      return op.emitOpError(
+          "expected mask source to be a memref or memref ABI cast");
+    auto memrefType = dyn_cast<MemRefType>(memref.getType());
+    if (!memrefType || memrefType.getRank() !=
+                           static_cast<int64_t>(adaptor.getIndices().size()))
+      return op.emitOpError(
+          "expected ranked memref with one subscript per axis");
+
+    FailureOr<SmallVector<SliceAxis>> axes =
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+    if (failed(axes))
+      return failure();
+    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+          return axis.isSlice;
+        }) != maskType.getRank())
+      return op.emitOpError("mask result rank must match slice subscript rank");
+
+    SmallVector<Value> maskSizes;
+    for (auto [axis, info] : llvm::enumerate(*axes)) {
+      if (!info.isSlice)
+        continue;
+      Value extent = dim(rewriter, op.getLoc(), memref, axis);
+      maskSizes.push_back(
+          arith::SubIOp::create(rewriter, op.getLoc(), extent, info.offset));
+    }
+
+    Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(), maskType,
+                                              maskSizes);
+    if (resultVectorType) {
+      rewriter.replaceOp(op, mask);
+      return success();
+    }
+
+    Value shared =
+        allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
+    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), mask, shared)))
+      return failure();
+    rewriter.replaceOp(op, shared);
+    return success();
+  }
+};
+
+struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCFullMaskOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getMask().getType());
+    if (!converted)
+      return failure();
+    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
+      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
+      if (!vectorType)
+        return failure();
+      FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, 1);
+      if (failed(attr))
+        return failure();
+      Value vector =
+          arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
+      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
+      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+        return failure();
+      rewriter.replaceOp(op, shared);
+      return success();
+    }
+    FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, 1);
+    if (failed(attr))
+      return failure();
+    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, converted, *attr);
+    return success();
+  }
+};
+
+template <typename OpT, int64_t FillValue>
+struct ConvertNullaryShapedConstantOp : public OpConversionPattern<OpT> {
+  using OpConversionPattern<OpT>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OpT op, typename OpT::Adaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = this->typeConverter->convertType(op.getResult().getType());
+    if (!converted)
+      return failure();
+    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
+      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
+      if (!vectorType)
+        return failure();
+      FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
+      if (failed(attr))
+        return failure();
+      Value vector =
+          arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
+      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
+      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+        return failure();
+      rewriter.replaceOp(op, shared);
+      return success();
+    }
+    FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, FillValue);
+    if (failed(attr))
+      return failure();
+    rewriter.template replaceOpWithNewOp<arith::ConstantOp>(op, converted,
+                                                            *attr);
+    return success();
+  }
+};
+
+template <typename OpT>
+struct ConvertFillShapedConstantOp : public OpConversionPattern<OpT> {
+  using OpConversionPattern<OpT>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = this->typeConverter->convertType(op.getResult().getType());
+    auto vectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+    auto memrefType = dyn_cast_if_present<MemRefType>(converted);
+    if (!vectorType && memrefType)
+      vectorType = vectorTypeForMemRef(memrefType);
+    if (!vectorType)
+      return failure();
+    Value vector = vector::BroadcastOp::create(rewriter, op.getLoc(),
+                                               vectorType, adaptor.getValue());
+    if (!memrefType) {
+      rewriter.replaceOp(op, vector);
+      return success();
+    }
+    Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
+    if (failed(writeVectorToMemRef(rewriter, op.getLoc(), vector, shared)))
+      return failure();
+    rewriter.replaceOp(op, shared);
+    return success();
+  }
+};
+
+struct ConvertEmptyOp : public OpConversionPattern<HCEmptyOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCEmptyOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto memrefType = dyn_cast_if_present<MemRefType>(
+        typeConverter->convertType(op.getResult().getType()));
+    if (!memrefType)
+      return failure();
+    rewriter.replaceOp(
+        op, allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType));
+    return success();
+  }
+};
+
+struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCVecOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getResult().getType());
+    auto vectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+    if (isa<MemRefType>(adaptor.getValue().getType())) {
+      if (!vectorType)
+        return failure();
+      FailureOr<Value> vector = readMemRefAsVector(
+          rewriter, op.getLoc(), adaptor.getValue(), vectorType);
+      if (failed(vector))
+        return failure();
+      rewriter.replaceOp(op, *vector);
+      return success();
+    }
+    if (!converted || converted != adaptor.getValue().getType())
+      return failure();
+    rewriter.replaceOp(op, adaptor.getValue());
+    return success();
+  }
+};
+
+struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCSelectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getResult().getType());
+    if (!converted)
+      return failure();
+
+    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
+      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
+      if (!vectorType)
+        return failure();
+
+      mlir::VectorType maskType =
+          mlir::VectorType::get(vectorType.getShape(), rewriter.getI1Type());
+      FailureOr<Value> condition = readMemRefAsVector(
+          rewriter, op.getLoc(), adaptor.getCondition(), maskType);
+      FailureOr<Value> trueValue = readMemRefAsVector(
+          rewriter, op.getLoc(), adaptor.getTrueValue(), vectorType);
+      if (failed(condition) || failed(trueValue))
+        return op.emitOpError(
+            "expected tensor select operands to lower to memrefs");
+
+      Value falseValue =
+          vector::BroadcastOp::create(rewriter, op.getLoc(), vectorType,
+                                      adaptor.getFalseValue())
+              .getResult();
+      Value selected =
+          arith::SelectOp::create(rewriter, op.getLoc(), vectorType, *condition,
+                                  *trueValue, falseValue)
+              .getResult();
+      Value shared = allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType);
+      if (failed(writeVectorToMemRef(rewriter, op.getLoc(), selected, shared)))
+        return failure();
+      rewriter.replaceOp(op, shared);
+      return success();
+    }
+
+    Value falseValue = adaptor.getFalseValue();
+    if (isa<mlir::VectorType>(converted))
+      falseValue = vector::BroadcastOp::create(rewriter, op.getLoc(), converted,
+                                               falseValue)
+                       .getResult();
+
+    rewriter.replaceOpWithNewOp<arith::SelectOp>(
+        op, converted, adaptor.getCondition(), adaptor.getTrueValue(),
+        falseValue);
+    return success();
+  }
+};
+
+struct ConvertCallIntrinsicOp : public OpConversionPattern<HCCallIntrinsicOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCCallIntrinsicOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    SmallVector<Value> operands;
+    operands.reserve(op.getArgs().size());
+    for (auto [original, converted] :
+         llvm::zip_equal(op.getArgs(), adaptor.getArgs())) {
+      Type boundary =
+          convertIntrinsicBoundaryType(original.getType(), *typeConverter);
+      if (!boundary)
+        return failure();
+      operands.push_back(
+          castIfNeeded(rewriter, op.getLoc(), converted, boundary));
+    }
+
+    SmallVector<Type> results;
+    results.reserve(op.getResultTypes().size());
+    for (Type result : op.getResultTypes()) {
+      Type boundary = convertIntrinsicBoundaryType(result, *typeConverter);
+      if (!boundary)
+        return failure();
+      results.push_back(boundary);
+    }
+
+    OperationState state(op.getLoc(), op->getName());
+    state.addOperands(operands);
+    state.addTypes(results);
+    state.addAttributes(op->getAttrs());
+    Operation *replacement = rewriter.create(state);
+    rewriter.replaceOp(op, replacement->getResults());
+    return success();
+  }
+};
+
+struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCBufferViewOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getResult().getType());
+    if (auto sourceMemRefType =
+            dyn_cast<MemRefType>(adaptor.getBuffer().getType())) {
+      auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
+      if (!resultMemRefType)
+        return failure();
+      FailureOr<SmallVector<SliceAxis>> axes =
+          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+      if (failed(axes))
+        return failure();
+      if (static_cast<int64_t>(axes->size()) != sourceMemRefType.getRank())
+        return op.emitOpError("expected one view subscript per memref axis");
+      if (!resultMemRefType.hasStaticShape())
+        return failure();
+      if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+            return axis.isSlice;
+          }) != resultMemRefType.getRank())
+        return op.emitOpError(
+            "view result rank must match slice subscript rank");
+
+      SmallVector<OpFoldResult> offsets;
+      SmallVector<OpFoldResult> sizes;
+      SmallVector<OpFoldResult> strides;
+      offsets.reserve(axes->size());
+      sizes.reserve(axes->size());
+      strides.reserve(axes->size());
+      SmallVector<int64_t> resultShape;
+      resultShape.reserve(resultMemRefType.getRank());
+      int64_t resultAxis = 0;
+      for (const SliceAxis &info : *axes) {
+        offsets.push_back(info.offset);
+        strides.push_back(rewriter.getIndexAttr(1));
+        if (info.isSlice) {
+          int64_t size = resultMemRefType.getDimSize(resultAxis++);
+          resultShape.push_back(size);
+          sizes.push_back(rewriter.getIndexAttr(size));
+        } else {
+          sizes.push_back(rewriter.getIndexAttr(1));
+        }
+      }
+
+      MemRefType subviewType = memref::SubViewOp::inferRankReducedResultType(
+          resultShape, sourceMemRefType, offsets, sizes, strides);
+      rewriter.replaceOpWithNewOp<memref::SubViewOp>(
+          op, subviewType, adaptor.getBuffer(), offsets, sizes, strides);
+      return success();
+    }
+
+    auto sourceType = dyn_cast<mlir::VectorType>(adaptor.getBuffer().getType());
+    if (!sourceType || !converted)
+      return failure();
+
+    FailureOr<SmallVector<SliceAxis>> axes =
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+    if (failed(axes))
+      return failure();
+    if (static_cast<int64_t>(axes->size()) < sourceType.getRank())
+      return op.emitOpError(
+          "expected at least one view subscript per vector axis");
+
+    ArrayRef<SliceAxis> localAxes(*axes);
+    localAxes = localAxes.take_front(sourceType.getRank());
+    SmallVector<int64_t> permutation;
+    SmallVector<OpFoldResult> positions;
+    permutation.reserve(localAxes.size());
+    for (auto [axis, info] : llvm::enumerate(localAxes)) {
+      if (info.isSlice)
+        continue;
+      permutation.push_back(axis);
+      positions.push_back(info.offset);
+    }
+    for (auto [axis, info] : llvm::enumerate(localAxes)) {
+      if (info.isSlice)
+        permutation.push_back(axis);
+    }
+
+    Value source = adaptor.getBuffer();
+    if (!llvm::equal(permutation, llvm::seq<int64_t>(0, localAxes.size())))
+      source = vector::TransposeOp::create(rewriter, op.getLoc(), source,
+                                           permutation)
+                   .getResult();
+
+    Value result = source;
+    if (!positions.empty())
+      result =
+          vector::ExtractOp::create(rewriter, op.getLoc(), source, positions)
+              .getResult();
+
+    if (result.getType() != converted) {
+      if (!isa<mlir::VectorType>(result.getType()) ||
+          !isa<mlir::VectorType>(converted))
+        return failure();
+      result =
+          vector::ShapeCastOp::create(rewriter, op.getLoc(), converted, result)
+              .getResult();
+    }
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -632,9 +1363,10 @@ struct ConvertBufferDimOp : public OpConversionPattern<HCBufferDimOp> {
     Type converted = typeConverter->convertType(op.getDim().getType());
     if (!converted || !converted.isIndex())
       return failure();
-    Value memref = sourceMemref(adaptor.getBuffer());
+    Value memref = sourceMemRef(adaptor.getBuffer());
     if (!memref)
-      return op.emitOpError("expected buffer to come from a memref ABI cast");
+      return op.emitOpError(
+          "expected buffer to be a memref or memref ABI cast");
     rewriter.replaceOp(op, dim(rewriter, op.getLoc(), memref, op.getAxis()));
     return success();
   }
@@ -699,8 +1431,11 @@ struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
     }
 
     SmallVector<Value> yielded;
-    for (Value value : yield.getValues())
-      yielded.push_back(mapping.lookupOrDefault(value));
+    for (auto [index, value] : llvm::enumerate(yield.getValues())) {
+      Value mapped = mapping.lookupOrDefault(value);
+      yielded.push_back(castIfNeeded(rewriter, op.getLoc(), mapped,
+                                     loop.getResultTypes()[index]));
+    }
     if (dstTerminator)
       rewriter.replaceOpWithNewOp<scf::YieldOp>(dstTerminator, yielded);
     else
@@ -741,8 +1476,11 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
         rewriter.clone(nested, mapping);
       }
       SmallVector<Value> yielded;
-      for (Value value : yield.getValues())
-        yielded.push_back(mapping.lookupOrDefault(value));
+      for (auto [index, value] : llvm::enumerate(yield.getValues())) {
+        Value mapped = mapping.lookupOrDefault(value);
+        yielded.push_back(
+            castIfNeeded(rewriter, op.getLoc(), mapped, results[index]));
+      }
       if (dstTerminator)
         rewriter.replaceOpWithNewOp<scf::YieldOp>(dstTerminator, yielded);
       else
@@ -771,18 +1509,20 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                ConvertCmpOp<HCCmpGtOp>, ConvertCmpOp<HCCmpGeOp>,
                ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>, ConvertCastOp,
                ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
-               ConvertForRangeOp, ConvertIfOp>(converter, ctx);
+               ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
+               ConvertLoadMaskOp, ConvertFullMaskOp,
+               ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
+               ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
+               ConvertFillShapedConstantOp<HCVFullOp>,
+               ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp,
+               ConvertVecOp, ConvertSelectOp, ConvertCallIntrinsicOp,
+               ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter,
+                                                                    ctx);
 
-  patterns
-      .add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
-           AdaptRegionlessOp<HCBufferViewOp>, AdaptRegionlessOp<HCGetItemOp>,
-           AdaptRegionlessOp<HCLoadOp>, AdaptRegionlessOp<HCVLoadOp>,
-           AdaptRegionlessOp<HCLoadMaskOp>, AdaptRegionlessOp<HCStoreOp>,
-           AdaptRegionlessOp<HCVecOp>, AdaptRegionlessOp<HCVZerosOp>,
-           AdaptRegionlessOp<HCVOnesOp>, AdaptRegionlessOp<HCZerosOp>,
-           AdaptRegionlessOp<HCOnesOp>, AdaptRegionlessOp<HCFullMaskOp>,
-           AdaptRegionlessOp<HCSelectOp>, AdaptRegionlessOp<HCCallIntrinsicOp>>(
-          converter, ctx);
+  patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
+               AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
 }
 
 static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
@@ -794,22 +1534,43 @@ static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
 static ConversionTarget
 makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   ConversionTarget target(*ctx);
-  target
-      .addLegalDialect<arith::ArithDialect, func::FuncDialect, gpu::GPUDialect,
-                       memref::MemRefDialect, scf::SCFDialect>();
-  target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp>();
+  target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
+                         gpu::GPUDialect, memref::MemRefDialect,
+                         scf::SCFDialect, vector::VectorDialect>();
+  target.addLegalOp<HCStoreOp, HCUndefValueOp, UnrealizedConversionCastOp>();
   target.addIllegalOp<HCMaterializeBoundExprOp, HCConstOp, HCAddOp, HCSubOp,
                       HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
                       HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
-                      HCBufferDimOp, HCForRangeOp, HCIfOp, HCYieldOp>();
+                      HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
+                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
+                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
+                      HCSelectOp, HCForRangeOp, HCIfOp, HCYieldOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
-    return !fnType || converter.isSignatureLegal(*fnType);
+    if (!fnType)
+      return true;
+    SmallVector<Type> inputs;
+    SmallVector<Type> results;
+    if (failed(convertIntrinsicFunctionSignature(*fnType, converter, inputs,
+                                                 results)))
+      return false;
+    return llvm::equal(fnType->getInputs(), inputs) &&
+           llvm::equal(fnType->getResults(), results);
   });
-  target.addDynamicallyLegalOp<
-      HCTupleOp, HCSliceExprOp, HCBufferViewOp, HCGetItemOp, HCLoadOp,
-      HCVLoadOp, HCLoadMaskOp, HCStoreOp, HCVecOp, HCVZerosOp, HCVOnesOp,
-      HCZerosOp, HCOnesOp, HCFullMaskOp, HCSelectOp, HCCallIntrinsicOp>(
+  target.addDynamicallyLegalOp<HCCallIntrinsicOp>([&](HCCallIntrinsicOp op) {
+    for (Value arg : op.getArgs()) {
+      Type boundary = convertIntrinsicBoundaryType(arg.getType(), converter);
+      if (!boundary || arg.getType() != boundary)
+        return false;
+    }
+    for (Type result : op.getResultTypes()) {
+      Type boundary = convertIntrinsicBoundaryType(result, converter);
+      if (!boundary || result != boundary)
+        return false;
+    }
+    return true;
+  });
+  target.addDynamicallyLegalOp<HCTupleOp, HCSliceExprOp, HCGetItemOp>(
       [&](Operation *op) {
         return converter.isLegal(op) && regionsAreLegal(op, converter);
       });

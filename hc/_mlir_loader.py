@@ -11,6 +11,8 @@ import threading
 from pathlib import Path
 from types import ModuleType
 
+from ._native_paths import package_mlir_python_package_dir
+
 _LOCK = threading.Lock()
 _PACKAGE_NAME = "hc_mlir"
 _SOURCE_BOOTSTRAP_COMMAND = "python -m build_tools.hc_native_tools"
@@ -39,6 +41,9 @@ def _package_root() -> Path:
     override = os.environ.get("HC_MLIR_PYTHON_PACKAGE_DIR")
     if override:
         return Path(override).resolve()
+    package_root = package_mlir_python_package_dir()
+    if _is_built_package_root(package_root):
+        return package_root
     return _expected_package_root()
 
 
@@ -101,10 +106,14 @@ def _module_paths(module: ModuleType) -> list[Path]:
 
 
 def _require_local_build(package_root: Path) -> None:
-    package_dir = package_root / _PACKAGE_NAME
-    if package_root.is_dir() and (package_dir / "ir.py").exists():
+    if _is_built_package_root(package_root):
         return
     raise _missing_build_error(package_root)
+
+
+def _is_built_package_root(package_root: Path) -> bool:
+    package_dir = package_root / _PACKAGE_NAME
+    return package_root.is_dir() and (package_dir / "ir.py").exists()
 
 
 def _prepend_package_root(package_root: Path) -> None:
@@ -121,7 +130,9 @@ def _missing_build_error(package_root: Path) -> ImportError:
             f"expected: {package_root / _PACKAGE_NAME / 'ir.py'}"
         )
     return ImportError(
-        "Managed hc_front Python bindings are not built for this checkout.\n"
-        f"Run `{_SOURCE_BOOTSTRAP_COMMAND}` and restart the interpreter.\n"
+        "Packaged hc_front Python bindings are missing.\n"
+        "Reinstall hc so the native MLIR artifacts are copied into the "
+        "package, or set HC_MLIR_PYTHON_PACKAGE_DIR to a built package root.\n"
+        f"Source checkouts can also run `{_SOURCE_BOOTSTRAP_COMMAND}`.\n"
         f"expected: {package_root / _PACKAGE_NAME / 'ir.py'}"
     )

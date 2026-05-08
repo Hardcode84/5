@@ -176,16 +176,22 @@ def test_ensure_llvm_toolchain_promotes_current_staging_install(
     assert not layout.staging_root.exists()
 
 
-def test_scripts_or_path_executable_prefers_python_scripts_dir(
+def test_scripts_or_path_executable_prefers_interpreter_scripts_dir(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    interpreter_dir = tmp_path / "interpreter-bin"
+    interpreter_dir.mkdir()
+    interpreter_cmake = interpreter_dir / "cmake"
+    interpreter_cmake.write_text("", encoding="utf-8")
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     cmake_path = scripts_dir / "cmake"
     cmake_path.write_text("", encoding="utf-8")
 
     def fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "cmake" and path == str(interpreter_dir):
+            return str(interpreter_cmake)
         if name == "cmake" and path == str(scripts_dir):
             return str(cmake_path)
         if name == "cmake" and path is None:
@@ -193,8 +199,13 @@ def test_scripts_or_path_executable_prefers_python_scripts_dir(
         return None
 
     monkeypatch.setattr(
+        llvm_toolchain.sys,
+        "executable",
+        str(interpreter_dir / "python"),
+    )
+    monkeypatch.setattr(
         llvm_toolchain.sysconfig, "get_path", lambda key: str(scripts_dir)
     )
     monkeypatch.setattr(llvm_toolchain.shutil, "which", fake_which)
 
-    assert llvm_toolchain._scripts_or_path_executable("cmake") == str(cmake_path)
+    assert llvm_toolchain._scripts_or_path_executable("cmake") == str(interpreter_cmake)

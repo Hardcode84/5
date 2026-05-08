@@ -114,13 +114,19 @@ textual frontend operations and types are spelled `hc_front.*` and
 Older textual IR that used the bootstrap `hc.front.*` / `!hc.front.*` spelling
 must be renamed to `hc_front.*` / `!hc_front.*`.
 
-Wheel and editable package builds place the native install under the gitignored
-project-local cache at `.hc/native/install/<toolchain-key>/`. The resulting
-driver binary lives at:
+Wheel and editable package builds first populate the gitignored project-local
+cache at `.hc/native/install/<toolchain-key>/`, then copy the runtime pieces
+into the installed `hc` package under:
 
 ```text
-.hc/native/install/<toolchain-key>/bin/hc-opt
+hc/_native/
 ```
+
+The package-relative native tree carries `bin/hc-opt`, the generated
+`python_packages/hc_front/hc_mlir/` bindings, and the native libraries needed
+by those bindings. Runtime discovery uses that package-relative tree by
+default, so `hc.mlir` works after `pip install -e .[dev]` without exporting
+`HC_MLIR_PYTHON_PACKAGE_DIR`.
 
 To bootstrap the native tool explicitly from a source checkout, run:
 
@@ -128,25 +134,23 @@ To bootstrap the native tool explicitly from a source checkout, run:
 python -m build_tools.hc_native_tools
 ```
 
-That managed native install also carries a relocatable MLIR Python package
-under:
+The managed cache also carries the same relocatable MLIR Python package under:
 
 ```text
 .hc/native/install/<toolchain-key>/python_packages/hc_front/hc_mlir/
 ```
 
 The generated package embeds the core MLIR Python API plus the out-of-tree
-frontend dialect bindings. From a source checkout, `hc.mlir` loads that managed
-package on demand, so imports such as `from hc.mlir import ir` and
-`from hc.mlir.dialects import hc_front` use the same pinned native build as
-`hc-opt`.
+frontend dialect bindings. After installation, imports such as
+`from hc.mlir import ir` and `from hc.mlir.dialects import hc_front` load the
+package-relative copy so they use the same pinned native build as `hc-opt`.
 
 Advanced override: set `HC_MLIR_PYTHON_PACKAGE_DIR` to the package root that
 contains `hc_mlir/ir.py` when you need `hc.mlir` to load bindings from a
-non-default managed install. In other words, point it at
+non-default managed install. In other words, point it at a directory containing
+`hc_mlir/ir.py`, such as
 `.hc/native/install/<toolchain-key>/python_packages/hc_front/`, not at the
-nested `hc_mlir/` directory itself. Keep that override aligned with the same
-native install as `hc-opt`.
+nested `hc_mlir/` directory itself.
 
 `hc.mlir` expects to manage the underlying `hc_mlir` import itself. Import
 `hc.mlir` before importing `hc_mlir` directly, and do not pre-import a

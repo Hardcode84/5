@@ -36,12 +36,14 @@ test = ["greenlet", "numpy", "pytest"]
 
 [tool.setuptools.packages.find]
 include = ["hc*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 # `.mlir` schedules are loaded as `importlib.resources` at runtime; keeping
 # them as data means users can override schedules without rebuilding the
 # wheel, and `hc-opt` can run the same file the Python driver does.
 "hc.schedules" = ["*.mlir"]
+"hc" = ["_native/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -61,3 +63,4 @@ files = ["hc"]
 python_version = "3.12"
 strict = true
 warn_unused_configs = true
+exclude = ["hc/_native/"]

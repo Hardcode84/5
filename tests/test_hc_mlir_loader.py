@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -117,6 +118,46 @@ def test_hc_mlir_loads_bindings_from_managed_package_root(tmp_path: Path) -> Non
         "kernel": "managed",
         "register": "managed",
     }
+
+
+def test_hc_mlir_loads_package_relative_bindings_without_build_tools(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package-root"
+    hc_package = package_root / "hc"
+    hc_package.mkdir(parents=True)
+    (hc_package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy(REPO_ROOT / "hc" / "_mlir_loader.py", hc_package / "_mlir_loader.py")
+    shutil.copy(REPO_ROOT / "hc" / "_native_paths.py", hc_package / "_native_paths.py")
+    _write_fake_hc_mlir_package(
+        hc_package / "_native" / "python_packages" / "hc_front",
+        "packaged",
+    )
+    env = os.environ.copy()
+    env.pop("HC_MLIR_PYTHON_PACKAGE_DIR", None)
+    env["PYTHONPATH"] = str(package_root)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            import json
+
+            from hc._mlir_loader import load_hc_mlir
+
+            module = load_hc_mlir()
+            print(json.dumps({"tag": module.ir.IR_TAG}))
+            """),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout) == {"tag": "packaged"}
 
 
 def test_hc_mlir_rejects_preimported_package_from_elsewhere(tmp_path: Path) -> None:

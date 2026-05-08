@@ -1,5 +1,6 @@
 .beads/
 .hc/
+hc/_native/
 __pycache__/
 *.py[cod]
 *.egg-info/

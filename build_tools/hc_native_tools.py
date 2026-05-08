@@ -39,11 +39,16 @@ def ensure_hc_native_tools_built(
     llvm_install_root: Path | None = None,
     *,
     project_root: Path | None = None,
+    package_build: bool = False,
 ) -> Path:
     llvm_root = (
         ensure_llvm_toolchain() if llvm_install_root is None else llvm_install_root
     )
-    layout = hc_native_tools_layout(llvm_root, project_root=project_root)
+    layout = hc_native_tools_layout(
+        llvm_root,
+        project_root=project_root,
+        package_build=package_build,
+    )
     with _LOCK:
         _ensure_hc_native_tools_built(layout, llvm_root)
     return layout.install_root
@@ -66,13 +71,15 @@ def hc_native_tools_layout(
     llvm_install_root: Path,
     *,
     project_root: Path | None = None,
+    package_build: bool = False,
 ) -> HcNativeToolsLayout:
     root = _project_root(project_root) / ".hc" / "native"
     key = llvm_install_root.name
+    build_dir = "package-build" if package_build else "build"
     return HcNativeToolsLayout(
         project_root=_project_root(project_root),
         root=root,
-        build_root=root / "build" / key,
+        build_root=root / build_dir / key,
         install_root=root / "install" / key,
         lock_path=root / _LOCK_FILE_DIR / f"{key}.lock",
     )

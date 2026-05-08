@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import threading
 from pathlib import Path
 
@@ -26,9 +28,12 @@ _LLVM_BOOTSTRAPPED = False
 _HC_NATIVE_BOOTSTRAPPED = False
 _LLVM_INSTALL_ROOT: Path | None = None
 _HC_NATIVE_INSTALL_ROOT: Path | None = None
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_PACKAGE_NATIVE_ROOT = _PROJECT_ROOT / "hc" / "_native"
+_PACKAGE_NATIVE_SUBTREES = ("bin", "lib", "python_packages")
 
 
-def _ensure_build_dependencies_bootstrapped() -> None:
+def _ensure_build_dependencies_bootstrapped() -> Path | None:
     global _IXSIMPL_BOOTSTRAPPED
     global _LLVM_BOOTSTRAPPED
     global _HC_NATIVE_BOOTSTRAPPED
@@ -36,7 +41,7 @@ def _ensure_build_dependencies_bootstrapped() -> None:
     global _HC_NATIVE_INSTALL_ROOT
     need_llvm = os.environ.get("HC_SKIP_LLVM_BOOTSTRAP") != "1"
     if _IXSIMPL_BOOTSTRAPPED and not need_llvm:
-        return
+        return None
     with _BOOTSTRAP_LOCK:
         if not _IXSIMPL_BOOTSTRAPPED:
             ensure_ixsimpl_built()
@@ -50,7 +55,8 @@ def _ensure_build_dependencies_bootstrapped() -> None:
             export_toolchain_environment(_LLVM_INSTALL_ROOT, os.environ)
             if not _HC_NATIVE_BOOTSTRAPPED:
                 _HC_NATIVE_INSTALL_ROOT = ensure_hc_native_tools_built(
-                    _LLVM_INSTALL_ROOT
+                    _LLVM_INSTALL_ROOT,
+                    package_build=True,
                 )
                 _HC_NATIVE_BOOTSTRAPPED = True
             if _HC_NATIVE_INSTALL_ROOT is None:
@@ -58,6 +64,45 @@ def _ensure_build_dependencies_bootstrapped() -> None:
                     "hc native bootstrap completed without an install root"
                 )
             export_hc_native_environment(_HC_NATIVE_INSTALL_ROOT, os.environ)
+            return _HC_NATIVE_INSTALL_ROOT
+        return None
+
+
+def _install_package_native_artifacts(native_install_root: Path) -> None:
+    _validate_native_install(native_install_root)
+    if _PACKAGE_NATIVE_ROOT.exists():
+        shutil.rmtree(_PACKAGE_NATIVE_ROOT)
+    _PACKAGE_NATIVE_ROOT.mkdir(parents=True)
+    for name in _PACKAGE_NATIVE_SUBTREES:
+        source = native_install_root / name
+        if source.exists():
+            shutil.copytree(
+                source,
+                _PACKAGE_NATIVE_ROOT / name,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+    _write_native_manifest(native_install_root)
+
+
+def _validate_native_install(native_install_root: Path) -> None:
+    hc_opt = native_install_root / "bin" / "hc-opt"
+    hc_mlir = native_install_root / "python_packages" / "hc_front" / "hc_mlir"
+    missing = [str(path) for path in (hc_opt, hc_mlir / "ir.py") if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            "hc native install is incomplete; missing:\n" + "\n".join(missing)
+        )
+
+
+def _write_native_manifest(native_install_root: Path) -> None:
+    manifest = {
+        "source": str(native_install_root),
+        "subtrees": list(_PACKAGE_NATIVE_SUBTREES),
+    }
+    (_PACKAGE_NATIVE_ROOT / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_wheel(
@@ -65,7 +110,9 @@ def build_wheel(
     config_settings: dict[str, str | list[str]] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    _ensure_build_dependencies_bootstrapped()
+    native_install_root = _ensure_build_dependencies_bootstrapped()
+    if native_install_root is not None:
+        _install_package_native_artifacts(native_install_root)
     return _build_meta.build_wheel(
         wheel_directory,
         config_settings=config_settings,
@@ -78,7 +125,9 @@ def build_editable(
     config_settings: dict[str, str | list[str]] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    _ensure_build_dependencies_bootstrapped()
+    native_install_root = _ensure_build_dependencies_bootstrapped()
+    if native_install_root is not None:
+        _install_package_native_artifacts(native_install_root)
     return _build_meta.build_editable(
         wheel_directory,
         config_settings=config_settings,

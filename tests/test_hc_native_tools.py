@@ -32,6 +32,20 @@ def test_hc_native_tools_layout_uses_project_local_cache(tmp_path: Path) -> None
     )
 
 
+def test_hc_native_tools_layout_uses_separate_package_build_cache(
+    tmp_path: Path,
+) -> None:
+    llvm_install_root = _sample_llvm_install_root(tmp_path)
+    layout = hc_native_tools_layout(
+        llvm_install_root,
+        project_root=tmp_path,
+        package_build=True,
+    )
+
+    assert layout.build_root == layout.root / "package-build" / llvm_install_root.name
+    assert layout.install_root == layout.root / "install" / llvm_install_root.name
+
+
 def test_export_hc_native_environment_sets_tool_paths(tmp_path: Path) -> None:
     install_root = tmp_path / "native-install"
     env = export_hc_native_environment(install_root, {})

@@ -352,6 +352,10 @@ def _ninja_executable() -> str | None:
 
 
 def _scripts_or_path_executable(name: str) -> str | None:
+    interpreter_scripts_dir = Path(sys.executable).resolve().parent
+    path = shutil.which(name, path=str(interpreter_scripts_dir))
+    if path is not None:
+        return path
     scripts_dir = sysconfig.get_path("scripts")
     if scripts_dir:
         path = shutil.which(name, path=scripts_dir)

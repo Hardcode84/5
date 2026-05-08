@@ -12,12 +12,19 @@
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/InitAllPasses.h"
+#include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   mlir::registerAllExtensions(registry);
+  // Register LLVM IR translation interfaces so passes that reach for
+  // translateModuleToLLVMIR (notably gpu-module-to-binary on the rocdl path)
+  // can find the per-dialect translation hooks. Without this the GPU binary
+  // emission pass fails at the IR-translation step before it ever shells out
+  // to lld.
+  mlir::registerAllToLLVMIRTranslations(registry);
   mlir::registerAllPasses();
   mlir::hc::front::registerHCFrontToHCConversionPasses();
   mlir::hc::front::registerHCFrontTransformsPasses();

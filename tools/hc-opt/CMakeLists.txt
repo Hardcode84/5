@@ -17,6 +17,7 @@ target_link_libraries(
   MLIRRegisterAllDialects
   MLIRRegisterAllExtensions
   MLIRRegisterAllPasses
+  MLIRToLLVMIRTranslationRegistration
 )
 mlir_check_all_link_libraries(hc-opt)
 

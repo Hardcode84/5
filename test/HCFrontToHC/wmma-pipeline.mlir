@@ -110,6 +110,22 @@
 // CHECK: transform.hc.require_intrinsic_attr
 // CHECK-SAME: expected = 32 : i64
 // CHECK-SAME: name = "wave_size"
+// `amdgpu.wmma` consumes plain upstream `vector<NxF>` types, while the
+// post-`hc-lower-launch-body` call site presents `!hc.bare_vector` operands
+// and result. The recipe plants two literal types (one per fragment shape)
+// plus three operand-side casts and one result-side cast that bridge bare
+// ↔ upstream via `unrealized_conversion_cast`; these casts pair with the
+// UCCs the launch-body pass already plants on either side of the call,
+// and post-rewrite `--canonicalize` collapses the chains to identity.
+// The const_type / cast_value ops appear interleaved because the recipe
+// builder emits each cast right after the literal type it consumes, with
+// dedup folding repeated `vector<16xf16>` references onto a single
+// `constant_type` op.
+// CHECK: transform.hc.constant_type vector<16xf16>
+// CHECK: transform.hc.cast_value
+// CHECK: transform.hc.cast_value
+// CHECK: transform.hc.constant_type vector<8xf32>
+// CHECK: transform.hc.cast_value
 // CHECK: transform.hc.create_op "amdgpu.wmma"
 // `amdgpu.wmma` rejects unknown attributes (`arch`/`wave_size` ride on
 // the call site purely for dispatch), and its `m`/`n`/`k` slots are
@@ -118,4 +134,5 @@
 // created op.
 // CHECK-SAME: dynamic_attrs []()
 // CHECK-SAME: static_attrs = {k = 16 : i32, m = 16 : i32, n = 16 : i32}
+// CHECK: transform.hc.cast_value
 // CHECK: transform.hc.replace_intrinsic_call

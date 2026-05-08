@@ -197,6 +197,10 @@ def _verify_wmma(sig, target):
     _require_wmma_operands(sig)
 
 
+_FRAG_AB_TYPE = f"vector<{WMMA_K}xf16>"
+_FRAG_ACC_TYPE = f"vector<{WMMA_ACC_FRAGMENT}xf32>"
+
+
 @wmma_gfx11.lower(target="amdgpu-gfx11")
 def _lower_wmma(t, call):
     # `amdgpu.wmma` only consumes the per-lane fragment vectors and the
@@ -226,19 +230,24 @@ def _lower_wmma(t, call):
     # mismatch counts as a value mismatch.
     t.require_attr(call, "arch", GFX_ARCH)
     t.require_attr(call, "wave_size", t.i64(WAVE_LANES))
-    # `amdgpu.wmma` returns a single fragment data vector. The call site
-    # post-decomposition has two results — `acc.data` (the new accumulator)
-    # and `acc.mask` (its validity bits). The mask channel is invariant
-    # across the matmul step (the per-lane accumulator stays valid wherever
-    # it was valid going in), so forward `acc_frag.mask` unchanged as the
-    # second replacement.
+    # `amdgpu.wmma` rejects HC bare types; bridge through
+    # `unrealized_conversion_cast` at every operand and at the result. The
+    # `expected_type=` shortcut on `call.operand` plants the operand-side
+    # casts; `t.create(..., result_types=[upstream_str])` plus a closing
+    # `t.cast` swap the result-side type back to the bare form the call
+    # site exposes. `hc-lower-launch-body` already plants paired UCCs
+    # around every `hc.call_intrinsic` boundary, so the recipe-inserted
+    # casts pair with those existing ones and a post-rewrite
+    # `--canonicalize` collapses the chains to identity — `amdgpu.wmma`
+    # ends up sitting between plain upstream `vector<...>` values with
+    # no leftover bridging machinery.
     op = t.create(
         "amdgpu.wmma",
-        result_types=[call.result_type(0)],
+        result_types=[_FRAG_ACC_TYPE],
         operands=[
-            call.operand("a_frag.data"),
-            call.operand("b_frag.data"),
-            call.operand("acc_frag.data"),
+            call.operand("a_frag.data", expected_type=_FRAG_AB_TYPE),
+            call.operand("b_frag.data", expected_type=_FRAG_AB_TYPE),
+            call.operand("acc_frag.data", expected_type=_FRAG_ACC_TYPE),
         ],
         # `amdgpu.wmma` declares `m`, `n`, `k` as `i32` attributes with
         # confined value sets; emit them at the right width so the upstream
@@ -250,7 +259,16 @@ def _lower_wmma(t, call):
             "k": t.i32(WMMA_K),
         },
     )
-    return (op.result(0), call.operand("acc_frag.mask"))
+    # `amdgpu.wmma` returns a single fragment data vector. The call site
+    # post-decomposition has two results — `acc.data` (the new accumulator)
+    # and `acc.mask` (its validity bits). The mask channel is invariant
+    # across the matmul step (the per-lane accumulator stays valid wherever
+    # it was valid going in), so forward `acc_frag.mask` unchanged as the
+    # second replacement.
+    return (
+        t.cast(op.result(0), to=call.result_type(0)),
+        call.operand("acc_frag.mask"),
+    )
 
 
 @kernel.func(scope=WorkItem)

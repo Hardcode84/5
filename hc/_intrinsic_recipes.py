@@ -89,7 +89,56 @@ class RecipeRequireAttrStep:
         }
 
 
-RecipeStep = RecipeCreateStep | RecipeRequireAttrStep
+@dataclass(frozen=True)
+class RecipeConstantTypeStep:
+    """Materializes a literal MLIR type as a recipe-side type handle.
+
+    Lowers to `transform.hc.constant_type` in the named_sequence body. The
+    builder dedupes by literal text so multiple `t.literal_type("vector<...>")`
+    calls share a single payload op; recipe authors normally don't construct
+    these directly — they pop out of `t.cast(value, to="vector<...>")` and
+    `t.create(..., result_types=["vector<...>"])` callsites.
+    """
+
+    name: str
+    type_literal: str
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "kind": "constant_type",
+            "name": self.name,
+            "type": self.type_literal,
+        }
+
+
+@dataclass(frozen=True)
+class RecipeCastStep:
+    """Bridges an operand value through `builtin.unrealized_conversion_cast`.
+
+    Lowers to `transform.hc.cast_value`, which inserts a UCC at the source
+    value's definition site (or skips when source/target types match). The
+    motivating use is bare ↔ upstream bridging at intrinsic call boundaries:
+    the recipe-inserted casts pair with the UCCs `hc-lower-launch-body`
+    plants on either side of the call, so post-rewrite `--canonicalize`
+    folds upstream → bare → upstream chains back to identity.
+    """
+
+    name: str
+    source: RecipeValue
+    target_type: RecipeValue
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "kind": "cast",
+            "name": self.name,
+            "source": self.source.to_record(),
+            "target_type": self.target_type.to_record(),
+        }
+
+
+RecipeStep = (
+    RecipeCreateStep | RecipeRequireAttrStep | RecipeConstantTypeStep | RecipeCastStep
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +160,23 @@ class CreatedOpHandle:
 RecipeValueLike = RecipeValue | CreatedOpHandle
 RecipeAttrValue = RecipeLiteral | RecipeValueLike
 RecipeResultTypeValue = str | RecipeValueLike
+# Recipe value sources whose payload SSA values are produced inside the
+# named_sequence body (by create/constant_type/cast steps), as opposed to
+# input handles derived from the matched call site. Kept as a frozenset so
+# it can be reused by `_input_handles` without rebuilding per call.
+_BODY_SOURCES: frozenset[str] = frozenset({"op_result", "cast", "const_type"})
+_INPUT_SOURCES: frozenset[str] = frozenset({"operand", "result_type", "attr"})
+
+
+def _input_only(values: Iterable[Any]) -> list[RecipeValue]:
+    # Filter to call-derived handles. Non-`RecipeValue` entries (e.g. raw
+    # `RecipeLiteral` attribute values) are silently dropped — they don't
+    # carry an SSA handle the named-sequence prelude needs to materialize.
+    return [
+        value
+        for value in values
+        if isinstance(value, RecipeValue) and value.source in _INPUT_SOURCES
+    ]
 
 
 @dataclass(frozen=True)
@@ -152,20 +218,19 @@ class IntrinsicTransformRecipe:
         return _recipe_symbol_name(self)
 
     def _input_handles(self) -> tuple[RecipeValue, ...]:
+        # Only call-derived handles (operand/result_type/attr) need their
+        # `transform.hc.get_intrinsic_*` op emitted up front before the body
+        # steps run. Body-produced values (op_result, cast, const_type) get
+        # registered in the handle table when the corresponding step emits.
         result: list[RecipeValue] = []
         for step in self.steps:
-            if not isinstance(step, RecipeCreateStep):
-                continue
-            result.extend(step.operands)
-            result.extend(
-                value for value in step.result_types if isinstance(value, RecipeValue)
-            )
-            result.extend(
-                value for _name, value in step.attrs if isinstance(value, RecipeValue)
-            )
-        result.extend(
-            value for value in self.replacement if value.source != "op_result"
-        )
+            if isinstance(step, RecipeCreateStep):
+                result.extend(_input_only(step.operands))
+                result.extend(_input_only(step.result_types))
+                result.extend(_input_only(value for _name, value in step.attrs))
+            elif isinstance(step, RecipeCastStep):
+                result.extend(_input_only((step.source, step.target_type)))
+        result.extend(_input_only(self.replacement))
         return tuple(result)
 
 
@@ -174,8 +239,18 @@ class IntrinsicRecipeCall:
     operand_names: tuple[str, ...]
     attr_names: frozenset[str]
     result_count: int
+    # The owning builder, snapshot at recipe-build time. Optional because
+    # tests can construct an `IntrinsicRecipeCall` standalone (e.g. for
+    # operand-name validation) without involving a builder; only the
+    # `expected_type` shortcut needs the builder reference.
+    _builder: IntrinsicRecipeBuilder | None = None
 
-    def operand(self, name_or_index: str | int) -> RecipeValue:
+    def operand(
+        self,
+        name_or_index: str | int,
+        *,
+        expected_type: str | RecipeValueLike | None = None,
+    ) -> RecipeValue:
         if isinstance(name_or_index, int):
             index = name_or_index
             if index < 0 or index >= len(self.operand_names):
@@ -187,11 +262,24 @@ class IntrinsicRecipeCall:
                 index = self.operand_names.index(name)
             except ValueError as exc:
                 raise ValueError(f"unknown intrinsic operand {name!r}") from exc
-        return RecipeValue(
+        value = RecipeValue(
             source="operand",
             key=index,
             name=f"operand_{_symbol_part(name)}",
         )
+        if expected_type is None:
+            return value
+        # Sugar around `t.cast(call.operand(name), to=expected_type)`. The
+        # cast is a no-op at apply time when the actual operand type already
+        # matches (the C++ side forwards the source value unchanged), so
+        # passing `expected_type` is safe for recipes targeting both bridged
+        # and not-yet-bridged pipeline configurations.
+        if self._builder is None:
+            raise RuntimeError(
+                "call.operand expected_type requires a builder context; "
+                "use IntrinsicRecipeBuilder via build_intrinsic_transform_recipe"
+            )
+        return self._builder.cast(value, to=expected_type)
 
     def result_type(self, index: int) -> RecipeValue:
         if index < 0 or index >= self.result_count:
@@ -220,6 +308,11 @@ class IntrinsicRecipeBuilder:
         # builders constructed directly (e.g. tests); only the
         # `build_intrinsic_transform_recipe` entry point fills this in.
         self._attr_names = attr_names
+        # Constant_type ops dedupe by literal text: every `t.literal_type`
+        # call (including the implicit ones from `t.cast(..., to=str)` and
+        # `t.create(result_types=[str])`) shares one payload op per type so
+        # the recipe IR stays compact.
+        self._constant_types: dict[str, RecipeConstantTypeStep] = {}
 
     @staticmethod
     def i32(value: int) -> TypedIntAttr:
@@ -231,6 +324,55 @@ class IntrinsicRecipeBuilder:
     @staticmethod
     def i64(value: int) -> TypedIntAttr:
         return TypedIntAttr(value=int(value), width=64)
+
+    def literal_type(self, type_text: str) -> RecipeValue:
+        """Materialize a literal MLIR type as a recipe-side type handle.
+
+        Recipes use this to declare an upstream type they want to assert at
+        create-op time (e.g. `vector<16xf16>` for `amdgpu.wmma`). The
+        resulting handle is interchangeable with the type handle
+        `call.result_type(N)` produces, so it can flow into either
+        `t.create(result_types=[...])` or `t.cast(value, to=...)`.
+        """
+        if not type_text:
+            raise ValueError("literal type text must be non-empty")
+        existing = self._constant_types.get(type_text)
+        if existing is not None:
+            step = existing
+        else:
+            step = RecipeConstantTypeStep(
+                name=f"const_type{len(self._constant_types)}",
+                type_literal=type_text,
+            )
+            self._constant_types[type_text] = step
+            self._steps.append(step)
+        return RecipeValue(source="const_type", key=step.name, name=step.name)
+
+    def cast(
+        self,
+        source: RecipeValueLike,
+        *,
+        to: str | RecipeValueLike,
+    ) -> RecipeValue:
+        """Bridge a value to a target type via `unrealized_conversion_cast`.
+
+        `source` is any recipe value (call operand, prior create result,
+        prior cast). `to` is either a literal type string (sugar that
+        materializes a `constant_type` op behind the scenes) or another
+        type handle (typically `call.result_type(N)` for casting back to a
+        bare HC type). The C++ side skips the cast when source and target
+        types already match, so writing `t.cast(...)` against a recipe that
+        only sometimes needs the bridge stays cheap.
+        """
+        src = _coerce_value(source)
+        target = self.literal_type(to) if isinstance(to, str) else _coerce_value(to)
+        step = RecipeCastStep(
+            name=f"cast{self._next_cast_index()}",
+            source=src,
+            target_type=target,
+        )
+        self._steps.append(step)
+        return RecipeValue(source="cast", key=step.name, name=step.name)
 
     def create(
         self,
@@ -247,7 +389,7 @@ class IntrinsicRecipeBuilder:
             name=f"created{self._next_create_index()}",
             op_name=op_name,
             operands=tuple(_coerce_value(value) for value in operands),
-            result_types=tuple(_coerce_type(value) for value in result_types),
+            result_types=tuple(self._coerce_type(value) for value in result_types),
             attrs=normalized_attrs,
         )
         self._steps.append(step)
@@ -294,6 +436,19 @@ class IntrinsicRecipeBuilder:
     def _next_create_index(self) -> int:
         return sum(1 for step in self._steps if isinstance(step, RecipeCreateStep))
 
+    def _next_cast_index(self) -> int:
+        return sum(1 for step in self._steps if isinstance(step, RecipeCastStep))
+
+    def _coerce_type(self, value: RecipeResultTypeValue) -> RecipeValue:
+        # `t.create(result_types=[...])` accepts literal type strings as
+        # sugar for `t.literal_type(...)`. Coercing through the builder
+        # keeps `_coerce_type` (the standalone helper) string-aware as well,
+        # but here we route through `literal_type` so the dedupe table sees
+        # every literal request.
+        if isinstance(value, str):
+            return self.literal_type(value)
+        return _coerce_value(value)
+
 
 def build_intrinsic_transform_recipe(
     callback: Callable[[IntrinsicRecipeBuilder, IntrinsicRecipeCall], object],
@@ -309,6 +464,7 @@ def build_intrinsic_transform_recipe(
         operand_names=tuple(operand_names),
         attr_names=attr_names,
         result_count=result_count,
+        _builder=builder,
     )
     replacement = callback(builder, call)
     return builder.finish(
@@ -362,12 +518,6 @@ def _coerce_attr_value(value: RecipeAttrValue) -> NormalizedRecipeAttr:
     if value is None or isinstance(value, str | int | float | bool):
         return value
     raise TypeError(f"unsupported intrinsic recipe attribute value: {value!r}")
-
-
-def _coerce_type(value: RecipeResultTypeValue) -> NormalizedRecipeType:
-    if isinstance(value, str):
-        return value
-    return _coerce_value(value)
 
 
 def _value_record(value: NormalizedRecipeAttr | NormalizedRecipeType) -> object:
@@ -443,7 +593,34 @@ class _TransformModuleBuilder:
         if isinstance(step, RecipeRequireAttrStep):
             self._create_require_attr_op(call, step)
             return
+        if isinstance(step, RecipeConstantTypeStep):
+            self._create_constant_type_op(step)
+            return
+        if isinstance(step, RecipeCastStep):
+            self._create_cast_value_op(step)
+            return
         raise TypeError(f"unsupported intrinsic recipe step: {step!r}")
+
+    def _create_constant_type_op(self, step: RecipeConstantTypeStep) -> None:
+        type_attr = self.ir.TypeAttr.get(
+            self.ir.Type.parse(step.type_literal, context=self.context)
+        )
+        op = self.ir.Operation.create(
+            "transform.hc.constant_type",
+            results=[self._transform_type_param_type()],
+            attributes={"value": type_attr},
+        )
+        self._handles[("const_type", step.name)] = op.result
+
+    def _create_cast_value_op(self, step: RecipeCastStep) -> None:
+        source = self._handles[_value_key(step.source)]
+        target = self._handles[_value_key(step.target_type)]
+        op = self.ir.Operation.create(
+            "transform.hc.cast_value",
+            results=[self.transform.AnyValueType.get(self.context)],
+            operands=[source, target],
+        )
+        self._handles[("cast", step.name)] = op.result
 
     def _create_require_attr_op(self, call: Any, step: RecipeRequireAttrStep) -> None:
         self.ir.Operation.create(

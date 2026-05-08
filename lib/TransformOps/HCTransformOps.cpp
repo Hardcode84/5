@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
@@ -301,6 +302,76 @@ void HCTransformCreateOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   xform::onlyReadsHandle(getOperation()->getOpOperands(), effects);
   xform::producesHandle(getOperation()->getOpResults(), effects);
+  xform::modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure
+HCTransformConstantTypeOp::apply(xform::TransformRewriter &rewriter,
+                                 xform::TransformResults &results,
+                                 xform::TransformState &state) {
+  results.setParams(cast<OpResult>(getResult()), {TypeAttr::get(getValue())});
+  return DiagnosedSilenceableFailure::success();
+}
+
+void HCTransformConstantTypeOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  // The op is `Pure` at the TableGen level (no side effects); only the
+  // result handle needs an explicit producer effect so the transform
+  // verifier can wire downstream uses.
+  xform::producesHandle(getOperation()->getOpResults(), effects);
+}
+
+DiagnosedSilenceableFailure
+HCTransformCastValueOp::apply(xform::TransformRewriter &rewriter,
+                              xform::TransformResults &results,
+                              xform::TransformState &state) {
+  Value source;
+  DiagnosedSilenceableFailure diag =
+      requireSinglePayloadValue(*this, getSource(), state, "source", source);
+  if (!diag.succeeded())
+    return diag;
+
+  Attribute targetAttr;
+  diag = requireSingleParam(*this, getTargetType(), state, "target type",
+                            targetAttr);
+  if (!diag.succeeded())
+    return diag;
+  auto targetTypeAttr = dyn_cast<TypeAttr>(targetAttr);
+  if (!targetTypeAttr) {
+    return emitSilenceableError() << "target_type parameter is not a TypeAttr";
+  }
+  Type targetType = targetTypeAttr.getValue();
+
+  Value resultValue = source;
+  if (source.getType() != targetType) {
+    // Anchor the cast at the source's definition site so any future
+    // create_op consuming this handle sees a dominator that is independent
+    // of the consumer's eventual placement. Block-argument sources land
+    // their cast at the start of the owning block.
+    OpBuilder::InsertionGuard guard(rewriter);
+    if (Operation *defOp = source.getDefiningOp()) {
+      rewriter.setInsertionPointAfter(defOp);
+    } else {
+      auto blockArg = cast<BlockArgument>(source);
+      rewriter.setInsertionPointToStart(blockArg.getOwner());
+    }
+    auto cast = UnrealizedConversionCastOp::create(
+        rewriter, source.getLoc(), TypeRange{targetType}, ValueRange{source});
+    resultValue = cast.getResult(0);
+  }
+  results.setValues(::mlir::cast<OpResult>(getResult()), {resultValue});
+  return DiagnosedSilenceableFailure::success();
+}
+
+void HCTransformCastValueOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  xform::onlyReadsHandle(getSourceMutable(), effects);
+  xform::onlyReadsHandle(getTargetTypeMutable(), effects);
+  xform::producesHandle(getOperation()->getOpResults(), effects);
+  // The cast is a real payload mutation when source/target types differ;
+  // the no-op forwarding case still benefits from declaring `modifiesPayload`
+  // because canonicalize would otherwise be tempted to eliminate the
+  // op-level side-effect-free producer-of-only-reads-handle pair.
   xform::modifiesPayload(effects);
 }
 

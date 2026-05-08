@@ -130,6 +130,53 @@ def HCTransformRequireIntrinsicAttrOp
   }];
 }
 
+def HCTransformConstantTypeOp
+    : HCTransform_Op<"constant_type"> {
+  let summary = "Materialize a literal type as a transform type parameter";
+  let description = [{
+    Produces a `!transform.type_param` carrying the literal type attribute.
+    Recipes that want to assert a concrete upstream type at create-op time
+    (for example `vector<16xf16>` to satisfy `amdgpu.wmma`'s operand
+    constraints) feed this through `transform.hc.create_op`'s `result_types`
+    or `transform.hc.cast_value`'s `target_type`. The transform op is pure
+    in payload terms (no IR mutation) but produces a result handle that
+    downstream recipe ops consume; the explicit `getEffects` model declares
+    only the producer effect so the verifier is happy.
+  }];
+
+  let arguments = (ins TypeAttr:$value);
+  let results = (outs Transform_TypeParamType:$result);
+  let assemblyFormat = [{ $value attr-dict `:` type($result) }];
+}
+
+def HCTransformCastValueOp
+    : HCTransform_Op<"cast_value"> {
+  let summary = "Bridge an operand value to a target type via UCC";
+  let description = [{
+    Inserts a `builtin.unrealized_conversion_cast` at the source value's
+    definition site, casting it to the target type, and yields a value
+    handle to the cast result. When the source value already has the
+    target type the source is forwarded unchanged and no cast is inserted.
+
+    Recipes lowering `hc.call_intrinsic` boundaries use this to bridge HC
+    bare types ↔ upstream types: `hc-lower-launch-body` keeps
+    `!hc.bare_vector` / `!hc.bare_tensor` operands across the call, but
+    upstream payload ops (e.g. `amdgpu.wmma`) want plain `vector<NxF>`.
+    The recipe-inserted cast pairs with the existing UCC the launch-body
+    pass plants on either side of the call boundary, so the post-rewrite
+    canonicalize collapses the upstream → bare → upstream chain to identity
+    and the bridging UCC disappears entirely.
+  }];
+
+  let arguments = (ins TransformValueHandleTypeInterface:$source,
+                       TransformParamTypeInterface:$target_type);
+  let results = (outs TransformValueHandleTypeInterface:$result);
+  let assemblyFormat = [{
+    $source `to` $target_type attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
 def HCTransformReplaceIntrinsicCallOp
     : HCTransform_Op<"replace_intrinsic_call"> {
   let summary = "Replace an intrinsic call with payload values";

@@ -103,22 +103,13 @@ def test_intrinsic_decorator_registers_hooks() -> None:
     assert mfma.__hc_infer__ is _infer
 
 
-def test_wmma_lowering_records_transform_recipe() -> None:
-    from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
-    from hc._intrinsic_recipes import (
-        RecipeCreateStep,
-        RecipeRequireAttrStep,
-        TypedIntAttr,
-    )
-
-    recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
-    assert recipe.intrinsic_name == "wmma_gfx11"
-    require_steps = [s for s in recipe.steps if isinstance(s, RecipeRequireAttrStep)]
-    create_steps = [s for s in recipe.steps if isinstance(s, RecipeCreateStep)]
+def _assert_wmma_require_steps(require_steps) -> None:
     # The recipe asserts both `arch` and `wave_size` before letting the
     # rewrite touch the call. Match the literal types/values the frontend
     # emits at the call site (`arch` as a plain string, `wave_size` at i64
     # because the call-site attribute is `wave_size = 32 : i64`).
+    from hc._intrinsic_recipes import TypedIntAttr
+
     require_by_name = {step.name: step for step in require_steps}
     assert set(require_by_name) == {"arch", "wave_size"}
     assert require_by_name["arch"].expected == "gfx11"
@@ -127,13 +118,22 @@ def test_wmma_lowering_records_transform_recipe() -> None:
     assert wave_expected.width == 64
     assert wave_expected.value == 32
 
-    create = create_steps[0]
+
+def _assert_wmma_create_step(create, cast_steps) -> None:
+    # Each `call.operand(name, expected_type=...)` planted a cast step;
+    # the create op consumes the cast results directly. Cast names are
+    # generated in builder order, so the three `a/b/acc` inputs map to
+    # the first three casts.
+    from hc._intrinsic_recipes import TypedIntAttr
+
     assert create.op_name == "amdgpu.wmma"
-    # The recipe runs after `hc-decompose-shaped-values`, which splits each
-    # shaped operand into a `.data` + `.mask` pair. Recipe-side names use
-    # the dotted form so they bind to the post-decomposition indices the
-    # interpreter actually sees; only the data fragments feed `amdgpu.wmma`.
-    assert [value.name for value in create.operands] == [
+    assert [value.name for value in create.operands] == ["cast0", "cast1", "cast2"]
+    cast_sources = [
+        step.source.name
+        for step in cast_steps
+        if step.name in {"cast0", "cast1", "cast2"}
+    ]
+    assert cast_sources == [
         "operand_a_frag_data",
         "operand_b_frag_data",
         "operand_acc_frag_data",
@@ -146,20 +146,54 @@ def test_wmma_lowering_records_transform_recipe() -> None:
         assert isinstance(value, TypedIntAttr), name
         assert value.width == 32, name
         assert value.value == 16, name
-    # Two replacement values: the freshly created `amdgpu.wmma` result for
-    # the accumulator data, and the original `acc_frag.mask` operand passed
-    # straight through (the matmul step preserves accumulator validity).
-    assert len(recipe.replacement) == 2
-    assert recipe.replacement[0].name == "created0_0"
-    assert recipe.replacement[1].name == "operand_acc_frag_mask"
-    text = recipe.to_mlir()
+
+
+def _assert_wmma_recipe_text(text: str) -> None:
     assert 'transform.hc.create_op "amdgpu.wmma"' in text
     assert "transform.hc.require_intrinsic_attr" in text
+    assert "transform.hc.constant_type vector<16xf16>" in text
+    assert "transform.hc.constant_type vector<8xf32>" in text
+    assert "transform.hc.cast_value" in text
     assert 'expected = "gfx11"' in text
     assert "expected = 32 : i64" in text
     assert "k = 16 : i32" in text
     assert "m = 16 : i32" in text
     assert "n = 16 : i32" in text
+
+
+def test_wmma_lowering_records_transform_recipe() -> None:
+    from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
+    from hc._intrinsic_recipes import (
+        RecipeCastStep,
+        RecipeConstantTypeStep,
+        RecipeCreateStep,
+        RecipeRequireAttrStep,
+    )
+
+    recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
+    assert recipe.intrinsic_name == "wmma_gfx11"
+    require_steps = [s for s in recipe.steps if isinstance(s, RecipeRequireAttrStep)]
+    create_steps = [s for s in recipe.steps if isinstance(s, RecipeCreateStep)]
+    cast_steps = [s for s in recipe.steps if isinstance(s, RecipeCastStep)]
+    const_type_steps = [
+        s for s in recipe.steps if isinstance(s, RecipeConstantTypeStep)
+    ]
+    _assert_wmma_require_steps(require_steps)
+    # Two literal types are referenced: the f16 fragment vector that
+    # `amdgpu.wmma` expects for the `a`/`b` inputs, and the f32 accumulator
+    # vector for the third input + result. The builder dedupes by literal
+    # text so each shows up exactly once.
+    literals = {step.type_literal for step in const_type_steps}
+    assert literals == {"vector<16xf16>", "vector<8xf32>"}
+    _assert_wmma_create_step(create_steps[0], cast_steps)
+    # Two replacement values: the cast that bridges the upstream
+    # `amdgpu.wmma` result back to `!hc.bare_vector<f32, [8]>` so the call
+    # replacement type-checks, and the original `acc_frag.mask` operand
+    # passed through (the matmul step preserves accumulator validity).
+    assert len(recipe.replacement) == 2
+    assert recipe.replacement[0].source == "cast"
+    assert recipe.replacement[1].name == "operand_acc_frag_mask"
+    _assert_wmma_recipe_text(recipe.to_mlir())
 
 
 def test_index_map_records_callables() -> None:

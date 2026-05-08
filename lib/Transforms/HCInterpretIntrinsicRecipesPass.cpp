@@ -24,6 +24,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCINTERPRETINTRINSICRECIPES
@@ -97,6 +98,15 @@ public:
 
     if (failed(diagnoseUncovered(root, targetRef)))
       return signalPassFailure();
+
+    // The intrinsic decl is a symbol op the recipe machinery only reads
+    // through `hc.call_intrinsic` users. Once every call site in the
+    // surrounding module has been rewritten, the decl is dead — and
+    // because `HCIntrinsicOp` carries the `Symbol` trait, regular
+    // canonicalize/DCE leaves it alone. Sweeping unused decls here keeps
+    // the post-interpretation IR free of stray HC ops without forcing
+    // every caller to add a separate symbol-DCE pass.
+    eraseUnusedIntrinsics(root);
   }
 
 private:
@@ -132,6 +142,27 @@ private:
         diag << " for target '" << target << "'";
     }
     return failure();
+  }
+
+  void eraseUnusedIntrinsics(ModuleOp root) {
+    // Build the live-callee set in one walk so a second pass can erase
+    // anything it didn't see referenced. Walking calls is cheaper than
+    // calling `SymbolTable::symbolKnownUseEmpty` per intrinsic when there
+    // are many decls.
+    llvm::StringSet<> liveCallees;
+    root.walk(
+        [&](HCCallIntrinsicOp call) { liveCallees.insert(call.getCallee()); });
+    SmallVector<HCIntrinsicOp> dead;
+    for (Operation &op : *root.getBody()) {
+      auto intrinsic = dyn_cast<HCIntrinsicOp>(op);
+      if (!intrinsic)
+        continue;
+      if (liveCallees.contains(intrinsic.getSymName()))
+        continue;
+      dead.push_back(intrinsic);
+    }
+    for (HCIntrinsicOp intrinsic : dead)
+      intrinsic.erase();
   }
 };
 

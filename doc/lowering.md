@@ -1173,32 +1173,91 @@ Each recipe callback receives a builder `t` and a typed call view `call`:
 def _lower_wmma(t, call):
     op = t.create(
         "amdgpu.wmma",
-        result_types=[call.result_type(0)],
+        result_types=["vector<8xf32>"],
         operands=[
-            call.operand("a_frag"),
-            call.operand("b_frag"),
-            call.operand("acc_frag"),
+            call.operand("a_frag.data", expected_type="vector<16xf16>"),
+            call.operand("b_frag.data", expected_type="vector<16xf16>"),
+            call.operand("acc_frag.data", expected_type="vector<8xf32>"),
         ],
         attrs={"m": t.i32(16), "n": t.i32(16), "k": t.i32(16)},
     )
-    return op.result(0)
+    return (
+        t.cast(op.result(0), to=call.result_type(0)),
+        call.operand("acc_frag.mask"),
+    )
 ```
 
-* `call.operand(name_or_index)` — a runtime SSA operand handle.
+* `call.operand(name_or_index, expected_type=...)` — a runtime SSA
+  operand handle. The optional `expected_type=` argument is sugar for
+  `t.cast(call.operand(name), to=expected_type)`: it wraps the operand
+  in `builtin.unrealized_conversion_cast` to the requested upstream
+  type, bridging the bare HC types `hc-lower-launch-body` keeps at
+  `hc.call_intrinsic` boundaries to the upstream types target ops like
+  `amdgpu.wmma` expect. Naming follows `hc-decompose-shaped-values`:
+  every shaped operand splits into `<name>.data` + `<name>.mask`
+  channels at the call site once decomposition runs.
 * `call.result_type(index)` — the call's result type as a transform type
-  parameter.
+  parameter (typically a `!hc.bare_*` type post-launch-body).
 * `call.attr(name)` — a value of one of the declared `const_kwargs`.
 * `t.i32(value)` / `t.i64(value)` — width-annotated integer literal
   helpers (plain Python `int`s default to `i64`; widths matter when the
   target op declares confined integer attributes).
+* `t.literal_type("vector<16xf16>")` — materialize a literal MLIR type
+  as a recipe-side type handle (deduped by literal text). Strings
+  passed to `t.create(result_types=[...])` or `t.cast(..., to=...)`
+  are routed through this helper automatically.
+* `t.cast(value, to=type)` — bridge a value through
+  `builtin.unrealized_conversion_cast` to the target type. The C++
+  side skips the cast when source and target types already match, so
+  recipes can opportunistically request a type without paying for an
+  extra UCC. The `to=` argument accepts either a literal type string or
+  a type handle (e.g. `call.result_type(0)` to bridge an upstream
+  result back to the call's bare type for replacement).
 * `t.create(name, operands=..., result_types=..., attrs=...)` — emit a
   payload op; returns a handle whose `.result(i)` is the replacement for
-  the matched call's `i`-th result.
-* The callback returns the SSA values that replace the matched call.
+  the matched call's `i`-th result. `result_types` accepts both
+  literal type strings (sugar for `t.literal_type(...)`) and type
+  handles from `call.result_type(...)`.
+* `t.require_attr(call, name, expected)` — pre-rewrite assertion that a
+  named call attribute equals the literal value. Lowers to
+  `transform.hc.require_intrinsic_attr` and fails the apply with a
+  definite diagnostic on mismatch (so the user sees "wrong arch"
+  instead of the generic "no recipe matched").
+* The callback returns the SSA values that replace the matched call —
+  one value per post-decomposition result. Tuple/list returns become
+  multi-result replacements; a single value or `CreatedOpHandle`
+  unwraps as appropriate.
 
 Operand-shape and attribute-value validation falls out of the target op's
 own verifier: when the recipe constructs `amdgpu.wmma`, the upstream
 verifier rejects mismatched vector lengths or out-of-range `m`/`n`/`k`.
+
+##### Bare ↔ upstream bridging
+
+`hc-lower-launch-body` keeps `!hc.bare_vector` / `!hc.bare_tensor`
+operands across every `hc.call_intrinsic` boundary, planting paired
+`builtin.unrealized_conversion_cast` ops on either side that bridge the
+surrounding upstream-typed values into and out of the call. Target
+payload ops like `amdgpu.wmma` reject bare types — they want plain
+`vector<NxF>` — so recipes use `expected_type=` / `t.cast` to insert a
+matching pair around the freshly created op:
+
+```text
+%upstream_a = ...                                           // surrounding upstream values
+%bare_a = unrealized_conversion_cast %upstream_a            // launch-body planted
+%bare_a_up = unrealized_conversion_cast %bare_a             // recipe-inserted by expected_type
+%out = amdgpu.wmma %bare_a_up, %bare_b_up, %bare_acc_up
+%bare_out = unrealized_conversion_cast %out                 // recipe-inserted by t.cast
+%upstream_out = unrealized_conversion_cast %bare_out        // launch-body planted
+```
+
+The recipe-inserted casts pair with the launch-body casts, so the
+round-trip `upstream → bare → upstream` chain on each side collapses to
+identity. A `--canonicalize` pass after `-hc-interpret-intrinsic-recipes`
+folds every UCC away, leaving `amdgpu.wmma` between plain upstream
+vectors with no leftover bridging machinery. Recipes that target
+already-upstream-typed operands (no surrounding bare types) pay nothing:
+`cast_value` short-circuits when source and target types already match.
 
 #### Generic HC transform ops
 
@@ -1211,6 +1270,18 @@ transform ops (defined in `hc/include/hc/TransformOps/HCTransformOps.td`):
   `transform.hc.get_intrinsic_result_type`,
   `transform.hc.get_intrinsic_attr` — thread call operands, result types,
   and constant kwargs into transform handles.
+* `transform.hc.require_intrinsic_attr %call {expected = ..., name =
+  "..."}` — fail the apply (with a pinpointed diagnostic) when the call's
+  named attribute doesn't equal the literal. Used for pre-rewrite
+  invariant checks the target op itself can't express.
+* `transform.hc.constant_type <type-attr> : !transform.type` —
+  materialize a literal MLIR type as a transform parameter handle.
+  Recipes pair this with `cast_value` and `create_op` to assert
+  upstream types without going through a payload-derived handle.
+* `transform.hc.cast_value %value to %type` — insert a
+  `builtin.unrealized_conversion_cast` from the source value to the
+  target type at the value's definition site, returning a value handle
+  to the cast result. No-op when source/target types already match.
 * `transform.hc.create_op "<op_name>" at %call (operands) result_types(types)
   dynamic_attrs [names](values) static_attrs = {...}` — emit a payload op
   at the call site; consumes operand/type/attr handles.
@@ -1261,7 +1332,10 @@ target op expects:
 5. walk the payload one final time and emit a clear `no intrinsic
    lowering recipe matched @<callee> for target '<t>'` diagnostic for
    every surviving `hc.call_intrinsic`. Silent passthrough would just
-   relocate the gap to the next pass.
+   relocate the gap to the next pass;
+6. sweep top-level `hc.intrinsic` declarations whose last call site was
+   rewritten so the post-interpretation IR is free of stray HC ops
+   without forcing every caller to run a separate symbol-DCE pass.
 
 Earlier `hc` passes (verify/infer hooks, type inference, decomposition,
 launch wrapping) operate on the structural `hc.intrinsic` *declaration*

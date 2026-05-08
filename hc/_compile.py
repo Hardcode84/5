@@ -53,6 +53,10 @@ class CompiledKernel:
     hc_ir: Any | None = field(default=None)
     hc_ir_text: str | None = field(default=None)
     pipeline_diagnostics: tuple[str, ...] = field(default=())
+    # Echo of the `target=` argument the caller passed (or `None` for
+    # "any target"). Useful for downstream stages and debugging — the
+    # actual recipe selection happened inside the pipeline.
+    target: str | None = field(default=None)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
@@ -65,7 +69,8 @@ class CompiledKernel:
         name = getattr(self.kernel, "__name__", "<kernel>")
         joined = ", ".join(f"{k}={v}" for k, v in sorted(self.bindings.items()))
         stage = "hc" if self.hc_ir_text is not None else "hc_front"
-        return f"CompiledKernel({name}, {{{joined}}}, stage={stage})"
+        target = "" if self.target is None else f", target={self.target!r}"
+        return f"CompiledKernel({name}, {{{joined}}}, stage={stage}{target})"
 
 
 def compile(
@@ -73,6 +78,7 @@ def compile(
     symbols: Mapping[Any, int] | None = None,
     *,
     schedule: ScheduleSource = None,
+    target: str | None = None,
 ) -> CompiledKernel:
     """Run the current compilation pipeline (frontend + hc_front -> hc) on a kernel.
 
@@ -88,6 +94,18 @@ def compile(
     transform-dialect schedule: a `pathlib.Path` is read from disk, a
     `str` is treated as inline MLIR text. The schedule must define a
     `@__transform_main` named sequence.
+
+    `target` selects which intrinsic lowering recipe the schedule's
+    `hc-interpret-intrinsic-recipes` step applies. The string is
+    substituted into the schedule's `__HC_TARGET__` placeholder before
+    the pass runs, so it ends up in the pass's `target=` option and the
+    interpreter only fires named sequences whose `hc.target` matches.
+    Pass `None` (the default) to leave the placeholder empty — the pass
+    then runs every recipe regardless of `hc.target`, which is the
+    right behaviour while each intrinsic registers at most one recipe
+    per compile. A user-provided `schedule` that drops the placeholder
+    silently ignores `target`; the override owns its own pass
+    invocations.
 
     Bindings are stored on the returned handle but the current pipeline
     does not substitute them into the emitted IR; `front_ir`/`hc_ir`
@@ -132,7 +150,7 @@ def compile(
     from .mlir import ir as _ir
 
     pipeline_module = _ir.Module.parse(front_ir_text, context=context)
-    result = run_front_to_hc(pipeline_module, schedule=schedule)
+    result = run_front_to_hc(pipeline_module, schedule=schedule, target=target)
     # Only decorated top-levels are surfaced on the public handle;
     # undecorated inline helpers are an implementation detail of the
     # `hc_front` pipeline (they're consumed by `-hc-front-inline`
@@ -147,6 +165,7 @@ def compile(
         hc_ir=result.module,
         hc_ir_text=result.module_text,
         pipeline_diagnostics=result.diagnostics,
+        target=target,
     )
 
 

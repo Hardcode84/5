@@ -119,6 +119,33 @@ def test_compile_rejects_non_int_binding() -> None:
         compile(foo, {sym.W: "16"})
 
 
+def test_compile_rejects_target_with_forbidden_chars() -> None:
+    # The driver substitutes `target` into a literal MLIR string in the
+    # default schedule; characters that would close the string early
+    # ('"', '\\') or break the option parser ('\\n', '\\r') are rejected
+    # up front so the user sees a clear error instead of a downstream
+    # MLIR diagnostic.
+    sym = _sym()
+
+    @kernel(work_shape=(sym.W,), literals={sym.W})
+    def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+        return None
+
+    with pytest.raises(ValueError, match="forbidden characters"):
+        compile(foo, target='bad"target')
+
+
+def test_compile_rejects_non_string_target() -> None:
+    sym = _sym()
+
+    @kernel(work_shape=(sym.W,), literals={sym.W})
+    def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+        return None
+
+    with pytest.raises(TypeError, match="target must be"):
+        compile(foo, target=42)  # type: ignore[arg-type]
+
+
 # --- normalise_bindings ----------------------------------------------------
 
 
@@ -682,6 +709,59 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert loads, "expected at least one load-context name op"
                 for line in loads:
                     assert "ref = {" in line, line
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """)
+    )
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_target_selects_recipe(tmp_path: Path) -> None:
+    # Three-way subprocess check on the new `target=` plumbing:
+    #   * `target=None` — recipe still fires (default empty target runs
+    #     every named sequence) and `amdgpu.wmma` lands.
+    #   * `target="amdgpu-gfx11"` — explicit match, same outcome plus
+    #     the handle echoes the value back.
+    #   * `target="amdgpu-gfx12"` — no recipe matches, so
+    #     `hc-interpret-intrinsic-recipes` surfaces a hard "no
+    #     intrinsic lowering recipe matched" diagnostic instead of
+    #     silently passing the call through to whichever stage runs
+    #     next.
+    script = tmp_path / "compile_target.py"
+    script.write_text(
+        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
+            import hc
+            from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
+
+
+            def main() -> None:
+                default = hc.compile(tiled_gfx11_wmma_matmul)
+                assert default.target is None, default.target
+                assert default.hc_ir_text is not None
+                assert "amdgpu.wmma" in default.hc_ir_text
+
+                matched = hc.compile(
+                    tiled_gfx11_wmma_matmul, target="amdgpu-gfx11"
+                )
+                assert matched.target == "amdgpu-gfx11", matched.target
+                assert matched.hc_ir_text is not None
+                assert "amdgpu.wmma" in matched.hc_ir_text
+                assert "target='amdgpu-gfx11'" in repr(matched), repr(matched)
+
+                missed = hc.compile(
+                    tiled_gfx11_wmma_matmul, target="amdgpu-gfx12"
+                )
+                assert missed.target == "amdgpu-gfx12", missed.target
+                assert missed.hc_ir_text is None, missed.hc_ir_text
+                joined = "\\n".join(missed.pipeline_diagnostics)
+                assert "no intrinsic lowering recipe matched" in joined, joined
+                assert "amdgpu-gfx12" in joined, joined
                 print("OK")
 
 

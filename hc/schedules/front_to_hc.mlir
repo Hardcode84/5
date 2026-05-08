@@ -60,17 +60,19 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
-    // Default `target=""` runs every named sequence in the sibling
-    // `__hc_intrinsic_lowerings__` module — which is the right behaviour
-    // today because each intrinsic registers at most one recipe per
-    // compile. If/when multiple targets per intrinsic land in the same
-    // module, this option will need a real value (probably plumbed
-    // through from `hc.compile(target=...)`); keeping the empty default
-    // surfaces that need as a recipe-application conflict rather than
-    // silently picking one. The pass is also a no-op for kernels that
-    // never use intrinsics: no lowerings module, no calls, nothing to
-    // diagnose.
-    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes" to %m13
+    // The `__HC_TARGET__` placeholder is substituted by the Python
+    // driver before the schedule is handed to the transform
+    // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the
+    // string in, `target=None` (the default) substitutes the empty
+    // string. Empty `target` runs every named sequence in the sibling
+    // `__hc_intrinsic_lowerings__` module — fine while each intrinsic
+    // registers at most one recipe per compile; multi-target lowerings
+    // must thread an explicit `target=` through `hc.compile` so the
+    // interpreter picks the right recipe instead of running them all.
+    // The pass is also a no-op for kernels that never use intrinsics:
+    // no lowerings module, no calls, nothing to diagnose.
+    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
+        with options = { "target" = "__HC_TARGET__" } to %m13
         : (!transform.any_op) -> !transform.any_op
     // Final cleanup pair folds away every `unrealized_conversion_cast`
     // the recipe-side `transform.hc.cast_value` planted around the

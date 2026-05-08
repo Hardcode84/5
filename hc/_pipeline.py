@@ -31,6 +31,20 @@ from typing import Any
 _ENTRY_POINT = "__transform_main"
 _DEFAULT_SCHEDULE_PACKAGE = "hc.schedules"
 _DEFAULT_SCHEDULE_NAME = "front_to_hc.mlir"
+# Sentinel the default schedule plants in the
+# `transform.apply_registered_pass "hc-interpret-intrinsic-recipes"` op
+# for `target=`. The Python driver substitutes it with the value of
+# `hc.compile(target=...)` (empty string for the `None` default, which
+# tells the pass to apply every recipe). Substitution is intentionally
+# a literal string-replace — using a verbose sentinel keeps the
+# operation safe against unintended matches even if the schedule grows
+# additional `hc-interpret-intrinsic-recipes` calls.
+_TARGET_PLACEHOLDER = "__HC_TARGET__"
+# Characters that would either escape the MLIR string literal we
+# substitute into or break the transform option parser. Reject up
+# front so the user gets a clear error from `hc.compile` instead of a
+# garbled MLIR diagnostic.
+_TARGET_FORBIDDEN_CHARS = frozenset('"\\\n\r')
 
 ScheduleSource = Path | str | None
 
@@ -63,6 +77,7 @@ def run_front_to_hc(
     front_module: Any,
     *,
     schedule: ScheduleSource = None,
+    target: str | None = None,
 ) -> PipelineResult:
     """Run the hc_front -> hc transform schedule on a parsed front module.
 
@@ -73,6 +88,15 @@ def run_front_to_hc(
     `hc_front.*` ops to `hc.*` ops. Callers wanting to preserve the
     original should pass a clone (`ir.Module.parse(str(original),
     context=ctx)`).
+
+    `target` is substituted into the schedule's `__HC_TARGET__`
+    placeholder before the transform interpreter runs; the default
+    schedule wires it into `hc-interpret-intrinsic-recipes`'s `target=`
+    option. Pass `None` (the default) to leave the placeholder empty,
+    which tells the recipe interpreter to apply every named sequence
+    regardless of `hc.target`. A user-provided schedule that does not
+    contain the placeholder silently ignores the value — the override
+    owns its own pass invocations.
     """
 
     from .mlir import ir
@@ -90,7 +114,7 @@ def run_front_to_hc(
 
     with (
         context,
-        _schedule_file(schedule) as schedule_path,
+        _schedule_file(schedule, target=target) as schedule_path,
         context.attach_diagnostic_handler(capture),
     ):
         pipeline = _pipeline_string(schedule_path)
@@ -181,44 +205,68 @@ def _capture_exception(diagnostics: list[str], exc: Exception) -> None:
 
 
 @contextmanager
-def _schedule_file(schedule: ScheduleSource) -> Iterator[Path]:
+def _schedule_file(
+    schedule: ScheduleSource, *, target: str | None = None
+) -> Iterator[Path]:
     """Yield a filesystem path to the schedule, materializing inline text.
 
-    `transform-preload-library` takes file paths, not inline IR. When the
-    user passes a raw MLIR string we drop it into a tempfile for the
-    duration of the pass run; when they pass a `Path`, we resolve it to
-    absolute + check it exists so the error is a clean `FileNotFoundError`
-    instead of whatever MLIR prints when it can't open the file.
-    `Path` values with characters the MLIR option parser treats as
-    delimiters (`,`, `}`, `=`) will still break the pipeline string —
-    that's a thin footgun we document rather than paper over.
-    Default is the packaged `front_to_hc.mlir` resource, which on an
-    installed wheel may live inside a zip — resources.files() +
-    read_text() handles both cases.
+    `transform-preload-library` takes file paths, not inline IR. We
+    always read the schedule into memory so we can apply the
+    `__HC_TARGET__` substitution before handing it to the pass manager;
+    every code path then writes a tempfile the driver controls. This
+    sidesteps the old `Path`-direct mode's footgun where a path
+    containing a character the MLIR option parser treated as a
+    delimiter (`,`, `}`, `=`) would break the pipeline string — the
+    tempfile path we generate is always safe.
     """
 
-    if isinstance(schedule, Path):
-        resolved = schedule.resolve()
-        if not resolved.is_file():
-            raise FileNotFoundError(
-                f"schedule file not found: {schedule} (resolved to {resolved})"
-            )
-        yield resolved
-        return
-    if isinstance(schedule, str):
-        text = schedule
-    elif schedule is None:
-        text = _default_schedule_text()
-    else:
-        raise TypeError(
-            f"schedule must be Path | str | None, got {type(schedule).__name__}"
-        )
+    text = _resolve_schedule_text(schedule)
+    text = _substitute_target(text, target)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".mlir", delete=True, encoding="utf-8"
     ) as f:
         f.write(text)
         f.flush()
         yield Path(f.name)
+
+
+def _resolve_schedule_text(schedule: ScheduleSource) -> str:
+    if schedule is None:
+        return _default_schedule_text()
+    if isinstance(schedule, Path):
+        resolved = schedule.resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"schedule file not found: {schedule} (resolved to {resolved})"
+            )
+        return resolved.read_text(encoding="utf-8")
+    if isinstance(schedule, str):
+        return schedule
+    raise TypeError(
+        f"schedule must be Path | str | None, got {type(schedule).__name__}"
+    )
+
+
+def _substitute_target(text: str, target: str | None) -> str:
+    # `None` collapses to empty so the recipe interpreter's empty-target
+    # "run all" behaviour is the default; substituting unconditionally
+    # also keeps custom schedules without the placeholder untouched.
+    value = "" if target is None else _validate_target(target)
+    return text.replace(_TARGET_PLACEHOLDER, value)
+
+
+def _validate_target(target: str) -> str:
+    if not isinstance(target, str):
+        raise TypeError(f"target must be str | None, got {type(target).__name__}")
+    bad = sorted({c for c in target if c in _TARGET_FORBIDDEN_CHARS})
+    if bad:
+        # Reject up front so callers see "your target string is bad"
+        # instead of "MLIR refused to parse this schedule" 200 lines
+        # later. The blacklist covers everything that would either
+        # close the substituted MLIR string literal early or insert
+        # whitespace that the transform option parser splits on.
+        raise ValueError(f"target contains forbidden characters {bad}: {target!r}")
+    return target
 
 
 def _default_schedule_text() -> str:

@@ -60,7 +60,8 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
-    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes" to %m13
+    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
+        with options = { "target" = "__HC_TARGET__" } to %m13
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m14 {
       transform.apply_patterns.canonicalization
@@ -70,6 +71,12 @@ module attributes {transform.with_named_sequence} {
   }
 }
 ```
+
+The `__HC_TARGET__` token is a substitution sentinel: the Python driver
+replaces it with the value of `hc.compile(target=...)` (empty string for
+the `None` default) before parsing the schedule. Custom schedules that
+keep the placeholder pick up the `target=` plumbing for free; ones that
+drop it own their own pass invocations.
 
 Bound symbolic expression materialization runs after type inference so it can
 see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope
@@ -110,6 +117,29 @@ Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked
 `{transform.readonly}` — the verifier refuses that combination.
 
+## Selecting a target
+
+`hc.compile(kernel_fn, symbols, target="amdgpu-gfx11")` substitutes the
+target string into the default schedule's `__HC_TARGET__` placeholder so
+`hc-interpret-intrinsic-recipes` only fires named sequences whose
+`hc.target` attribute matches. The `None` default (no target) substitutes
+the empty string, which makes the recipe interpreter apply every named
+sequence regardless of `hc.target` — the right behaviour while each
+intrinsic registers at most one recipe per compile. When multi-target
+lowerings co-exist in one module, pass an explicit `target=` so the
+interpreter picks the right recipe instead of running them all.
+
+Strings containing `"`, `\`, `\n`, or `\r` are rejected up front: those
+characters would either close the substituted MLIR string literal early
+or break the transform option parser. The handle echoes the value back
+as `CompiledKernel.target` for downstream stages and debugging.
+
+A target the schedule's recipes don't cover surfaces as a hard
+diagnostic from `hc-interpret-intrinsic-recipes` (`no intrinsic
+lowering recipe matched @<callee> for target '<t>'`) rather than a
+silent no-op — that's deliberate, since silent passthrough would just
+move the gap to the next pass.
+
 ## Overriding the schedule
 
 `hc.compile(kernel_fn, symbols, schedule=...)` accepts either:
@@ -117,15 +147,19 @@ fresh one, which is why the entry-block argument is not marked
 * `pathlib.Path` — read the schedule from that file. The path is
   resolved to absolute and checked for existence up front; a missing
   file raises `FileNotFoundError` immediately rather than surfacing as
-  a far-away MLIR diagnostic. Paths with characters the MLIR option
-  parser treats as delimiters (`,`, `}`, `=`) will still break the
-  pipeline — avoid them.
+  a far-away MLIR diagnostic. The driver reads the file content and
+  writes it to a tempfile it controls before handing it to the
+  pipeline, so weird characters in the user-supplied path no longer
+  bleed into the MLIR option parser.
 * `str` — always treated as inline transform-module text. A path that
   happens to be stored as a string will be fed to the parser verbatim,
   not opened; wrap it with `Path(...)` first.
 * `None` (default) — use the bundled schedule.
 
-Anything else is a `TypeError`.
+Anything else is a `TypeError`. Both file and string schedules go
+through the same `__HC_TARGET__` substitution as the default, so a
+custom schedule that wants the `target=` plumbing only needs to keep
+the placeholder where it makes sense.
 
 ### Example: skip `hc-promote-names`
 

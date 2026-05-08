@@ -155,7 +155,9 @@ def test_hc_register_dialects_exposes_transform_recipe_ops() -> None:
         context = ir.Context()
         hc.register_dialects(context)
         recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
-        module = ir.Module.parse(recipe.to_mlir(), context=context)
+        module = recipe.to_module(context=context)
+        text = recipe.to_mlir(context=context)
+        assert "transform.hc.create_op" in text
         print(json.dumps({"module": str(module)}))
         """)
 

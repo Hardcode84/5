@@ -129,10 +129,14 @@ def test_wmma_lowering_records_transform_recipe() -> None:
 
     create = create_steps[0]
     assert create.op_name == "amdgpu.wmma"
+    # The recipe runs after `hc-decompose-shaped-values`, which splits each
+    # shaped operand into a `.data` + `.mask` pair. Recipe-side names use
+    # the dotted form so they bind to the post-decomposition indices the
+    # interpreter actually sees; only the data fragments feed `amdgpu.wmma`.
     assert [value.name for value in create.operands] == [
-        "operand_a_frag",
-        "operand_b_frag",
-        "operand_acc_frag",
+        "operand_a_frag_data",
+        "operand_b_frag_data",
+        "operand_acc_frag_data",
     ]
     # `amdgpu.wmma` only takes `m`/`n`/`k` (i32). `arch`/`wave_size` ride
     # on the call site for dispatch but never make it onto the created op.
@@ -142,7 +146,12 @@ def test_wmma_lowering_records_transform_recipe() -> None:
         assert isinstance(value, TypedIntAttr), name
         assert value.width == 32, name
         assert value.value == 16, name
+    # Two replacement values: the freshly created `amdgpu.wmma` result for
+    # the accumulator data, and the original `acc_frag.mask` operand passed
+    # straight through (the matmul step preserves accumulator validity).
+    assert len(recipe.replacement) == 2
     assert recipe.replacement[0].name == "created0_0"
+    assert recipe.replacement[1].name == "operand_acc_frag_mask"
     text = recipe.to_mlir()
     assert 'transform.hc.create_op "amdgpu.wmma"' in text
     assert "transform.hc.require_intrinsic_attr" in text

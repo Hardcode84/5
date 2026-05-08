@@ -293,15 +293,19 @@ def _attach_intrinsic_hooks(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     def lower(*, target: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def register(cb: Callable[..., Any]) -> Callable[..., Any]:
+            metadata = intrinsic_fn.__hc_intrinsic__
             intrinsic_fn.__hc_lowerings__[target] = build_intrinsic_transform_recipe(
                 cb,
                 intrinsic_name=intrinsic_fn.__name__,
                 target=target,
-                operand_names=_intrinsic_operand_names(
-                    intrinsic_fn, intrinsic_fn.__hc_intrinsic__
-                ),
-                attr_names=intrinsic_fn.__hc_intrinsic__.const_attrs,
-                result_count=len(intrinsic_fn.__hc_intrinsic__.result_types),
+                operand_names=_intrinsic_operand_names(intrinsic_fn, metadata),
+                attr_names=metadata.const_attrs,
+                # Recipes run after `hc-decompose-shaped-values`, which splits
+                # every shaped result into a `.data` + `.mask` pair (matching
+                # the operand-side split). Mirror that here so the recipe sees
+                # the same number of result handles the actual call site
+                # exposes once it reaches the interpreter pass.
+                result_count=_intrinsic_result_count(metadata),
             )
             return cb
 
@@ -325,7 +329,9 @@ def _intrinsic_operand_names(
     fn: Callable[..., Any],
     metadata: IntrinsicMetadata,
 ) -> tuple[str, ...]:
-    result = []
+    operand_types = metadata.operand_types
+    result: list[str] = []
+    type_index = 0
     for param in inspect.signature(fn).parameters.values():
         if param.kind is inspect.Parameter.VAR_POSITIONAL:
             continue
@@ -336,8 +342,37 @@ def _intrinsic_operand_names(
             and param.name in metadata.const_attrs
         ):
             continue
-        result.append(param.name)
+        # Mirror the parameter-name split that `hc-decompose-shaped-values`
+        # performs on shaped operand types: a single `a_frag` declaration
+        # becomes `a_frag.data` + `a_frag.mask` at the call site once the
+        # decomposition pass runs. Recipes addressing operands by name need
+        # the same dotted form to land on the right index post-decompose;
+        # operands that aren't shaped (idx, undef, scalar) keep their name.
+        kind = (
+            None
+            if operand_types is None or type_index >= len(operand_types)
+            else operand_types[type_index]
+        )
+        if isinstance(kind, TensorTypeSpec | VectorTypeSpec):
+            result.append(f"{param.name}.data")
+            result.append(f"{param.name}.mask")
+        else:
+            result.append(param.name)
+        type_index += 1
     return tuple(result)
+
+
+def _intrinsic_result_count(metadata: IntrinsicMetadata) -> int:
+    # Same `.data`/`.mask` split that the decomposition pass applies to
+    # shaped result types, counted at recipe-build time so the recipe records
+    # one handle per post-decomposition result.
+    count = 0
+    for kind in metadata.result_types:
+        if isinstance(kind, TensorTypeSpec | VectorTypeSpec):
+            count += 2
+        else:
+            count += 1
+    return count
 
 
 class _KernelNamespace:

@@ -203,11 +203,16 @@ def _lower_wmma(t, call):
     # accumulator; the staged tiles, lane index, group token, and the
     # `arch`/`wave_size` const_kwargs ride on the call site purely to
     # gate dispatch. We touch the unused handles to surface a recipe-time
-    # error if the intrinsic signature ever drifts under us.
+    # error if the intrinsic signature ever drifts under us. The `.data`
+    # / `.mask` suffixes mirror `hc-decompose-shaped-values`: by the time
+    # `-hc-interpret-intrinsic-recipes` runs, every shaped operand has been
+    # split into a data + mask pair and the call site exposes both.
     _ = (
         call.operand("group"),
-        call.operand("a_tile"),
-        call.operand("b_tile"),
+        call.operand("a_tile.data"),
+        call.operand("a_tile.mask"),
+        call.operand("b_tile.data"),
+        call.operand("b_tile.mask"),
         call.operand("lane"),
         call.attr("arch"),
         call.attr("wave_size"),
@@ -221,13 +226,19 @@ def _lower_wmma(t, call):
     # mismatch counts as a value mismatch.
     t.require_attr(call, "arch", GFX_ARCH)
     t.require_attr(call, "wave_size", t.i64(WAVE_LANES))
+    # `amdgpu.wmma` returns a single fragment data vector. The call site
+    # post-decomposition has two results — `acc.data` (the new accumulator)
+    # and `acc.mask` (its validity bits). The mask channel is invariant
+    # across the matmul step (the per-lane accumulator stays valid wherever
+    # it was valid going in), so forward `acc_frag.mask` unchanged as the
+    # second replacement.
     op = t.create(
         "amdgpu.wmma",
         result_types=[call.result_type(0)],
         operands=[
-            call.operand("a_frag"),
-            call.operand("b_frag"),
-            call.operand("acc_frag"),
+            call.operand("a_frag.data"),
+            call.operand("b_frag.data"),
+            call.operand("acc_frag.data"),
         ],
         # `amdgpu.wmma` declares `m`, `n`, `k` as `i32` attributes with
         # confined value sets; emit them at the right width so the upstream
@@ -239,7 +250,7 @@ def _lower_wmma(t, call):
             "k": t.i32(WMMA_K),
         },
     )
-    return op.result(0)
+    return (op.result(0), call.operand("acc_frag.mask"))
 
 
 @kernel.func(scope=WorkItem)

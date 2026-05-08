@@ -20,3 +20,18 @@ target_include_directories(
 target_link_libraries(hc_rt_helpers PRIVATE Python3::Python)
 
 install(TARGETS hc_rt_helpers LIBRARY DESTINATION lib)
+
+# HIP launcher shim — Linux-only v0. We deliberately do NOT depend on a
+# system ROCm install (no `find_package(HIP)`, no `-lamdhip64`); the
+# shim dlopen's libamdhip64.so at runtime via `hc_rt_init`. That keeps
+# the wheel buildable on hosts without ROCm and importable on hosts
+# that have neither ROCm nor a GPU.
+add_library(hc_hip_runtime SHARED HipRuntime.cpp)
+target_include_directories(
+  hc_hip_runtime
+  PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+)
+target_link_libraries(hc_hip_runtime PRIVATE ${CMAKE_DL_LIBS})
+
+install(TARGETS hc_hip_runtime LIBRARY DESTINATION lib)

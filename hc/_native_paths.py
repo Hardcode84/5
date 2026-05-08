@@ -44,3 +44,16 @@ def runtime_helpers_lib_path() -> Path:
     if override:
         return Path(override).resolve()
     return package_native_lib_dir() / "libhc_rt_helpers.so"
+
+
+def hip_runtime_lib_path() -> Path:
+    """libhc_hip_runtime.so — exposes ``hc_rt_init / load_kernel /
+    launch_kernel`` to the JIT'd host wrapper. The shim has no
+    build-time ROCm dependency; ``hc_rt_init`` ``dlopen``'s
+    ``libamdhip64.so`` lazily, so the .so can be loaded on any host but
+    will only do useful work where an AMD HIP runtime is available.
+    """
+    override = os.environ.get("HC_RT_HIP_RUNTIME_PATH")
+    if override:
+        return Path(override).resolve()
+    return package_native_lib_dir() / "libhc_hip_runtime.so"

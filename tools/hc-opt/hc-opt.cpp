@@ -6,6 +6,7 @@
 #include "hc/Front/IR/HCFrontDialect.h"
 #include "hc/Front/Transforms/Passes.h"
 #include "hc/IR/HCDialect.h"
+#include "hc/TransformOps/HCTransformOps.h"
 #include "hc/Transforms/Passes.h"
 
 #include "mlir/InitAllDialects.h"
@@ -21,6 +22,7 @@ int main(int argc, char **argv) {
   mlir::hc::front::registerHCFrontToHCConversionPasses();
   mlir::hc::front::registerHCFrontTransformsPasses();
   mlir::hc::registerHCTransformsPasses();
+  mlir::hc::transform::registerTransformDialectExtension(registry);
   registry.insert<mlir::hc::HCDialect>();
   registry.insert<mlir::hc::front::HCFrontDialect>();
 

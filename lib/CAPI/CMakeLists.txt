@@ -18,5 +18,6 @@ add_mlir_public_c_api_library(HCCAPI
   MLIRHCDialect
   MLIRHCFrontToHC
   MLIRHCFrontTransforms
+  MLIRHCTransformOps
   MLIRHCTransforms
 )

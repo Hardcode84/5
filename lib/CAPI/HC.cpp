@@ -7,10 +7,12 @@
 #include "hc/Conversion/HCFrontToHC/HCFrontToHC.h"
 #include "hc/Front/Transforms/Passes.h"
 #include "hc/IR/HCDialect.h"
+#include "hc/TransformOps/HCTransformOps.h"
 #include "hc/Transforms/Passes.h"
 
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Registration.h"
+#include "mlir/CAPI/Support.h"
 
 #include <mutex>
 
@@ -26,4 +28,8 @@ void mlirRegisterHCAllPasses(void) {
     mlir::hc::front::registerHCFrontTransformsPasses();
     mlir::hc::registerHCTransformsPasses();
   });
+}
+
+void mlirRegisterHCTransformDialectExtension(MlirDialectRegistry registry) {
+  mlir::hc::transform::registerTransformDialectExtension(*unwrap(registry));
 }

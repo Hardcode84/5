@@ -29,6 +29,12 @@ MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HC, hc);
 // themselves once before `mlirRegisterHCAllPasses`.
 MLIR_CAPI_EXPORTED void mlirRegisterHCAllPasses(void);
 
+// Append HC's Transform dialect extension to an MLIR dialect registry. The
+// extension injects `transform.hc.*` recipe ops into the upstream Transform
+// dialect; append it before parsing transform libraries that use those ops.
+MLIR_CAPI_EXPORTED void
+mlirRegisterHCTransformDialectExtension(MlirDialectRegistry registry);
+
 #ifdef __cplusplus
 }
 #endif

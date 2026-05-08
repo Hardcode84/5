@@ -144,6 +144,27 @@ def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_hc_register_dialects_exposes_transform_recipe_ops() -> None:
+    result = _run_python("""
+        import json
+
+        from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
+        from hc.mlir import ir
+        from hc.mlir.dialects import hc
+
+        context = ir.Context()
+        hc.register_dialects(context)
+        recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
+        module = ir.Module.parse(recipe.to_mlir(), context=context)
+        print(json.dumps({"module": str(module)}))
+        """)
+
+    payload = json.loads(result.stdout)
+    assert "transform.hc.match_intrinsic_call" in payload["module"]
+    assert 'transform.hc.create_op "amdgpu.wmma"' in payload["module"]
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_register_passes_is_idempotent_across_contexts() -> None:
     # The CAPI shim wraps registration in a `std::once_flag`, but callers
     # invoking it from two ad-hoc contexts should still observe a coherent

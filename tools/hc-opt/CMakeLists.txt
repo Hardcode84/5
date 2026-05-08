@@ -11,6 +11,7 @@ target_link_libraries(
   MLIRHCFrontDialect
   MLIRHCFrontToHC
   MLIRHCFrontTransforms
+  MLIRHCTransformOps
   MLIRHCTransforms
   MLIROptLib
   MLIRRegisterAllDialects

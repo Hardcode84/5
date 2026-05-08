@@ -89,29 +89,92 @@ class IntrinsicTransformRecipe:
     def to_mlir(self) -> str:
         symbol = _symbol_part(f"{self.intrinsic_name}_{self.target}")
         lines = [
-            "transform.named_sequence "
+            "module attributes {transform.with_named_sequence} {",
+            "  transform.named_sequence "
             f"@__hc_lower_{symbol}(%root: !transform.any_op) {{",
-            "  %call = transform.hc.match_intrinsic_call %root "
-            f'{{callee = @{self.intrinsic_name}, target = "{self.target}"}}',
+            "    %call = transform.hc.match_intrinsic_call %root "
+            f'@{self.intrinsic_name} target = "{self.target}" '
+            ": (!transform.any_op) -> !transform.any_op",
         ]
-        for step in self.steps:
-            operands = ", ".join(value.to_mlir_name() for value in step.operands)
-            result_types = ", ".join(
-                _format_mlir_value(value) for value in step.result_types
-            )
-            attrs = ", ".join(
-                f"{name} = {_format_mlir_value(value)}" for name, value in step.attrs
-            )
-            lines.append(
-                f'  %{step.name} = transform.hc.create_op "{step.op_name}"'
-                f"({operands}) result_types({result_types}) attrs {{{attrs}}}"
-            )
+        lines.extend(f"    {line}" for line in self._input_handle_mlir())
+        lines.extend(f"    {self._create_step_mlir(step)}" for step in self.steps)
         if self.replacement:
-            results = ", ".join(value.to_mlir_name() for value in self.replacement)
-            lines.append(f"  transform.hc.replace_intrinsic_call %call with {results}")
-        lines.append("  transform.yield")
+            lines.append(f"    {self._replace_mlir()}")
+        lines.append("    transform.yield")
+        lines.append("  }")
         lines.append("}")
         return "\n".join(lines)
+
+    def _create_step_mlir(self, step: RecipeCreateStep) -> str:
+        result_types = _dynamic_result_types(step)
+        dynamic_attrs, static_attrs = _split_attrs(step)
+        operands = ", ".join(value.to_mlir_name() for value in step.operands)
+        result_type_names = ", ".join(value.to_mlir_name() for value in result_types)
+        dynamic_attr_names = ", ".join(f'"{name}"' for name, _value in dynamic_attrs)
+        dynamic_attr_values = ", ".join(
+            value.to_mlir_name() for _name, value in dynamic_attrs
+        )
+        prefix = _create_step_result_prefix(step, result_types)
+        return (
+            f'{prefix}transform.hc.create_op "{step.op_name}" at %call '
+            f"({operands}) result_types({result_type_names}) "
+            f"dynamic_attrs [{dynamic_attr_names}]({dynamic_attr_values})"
+            f"{_static_attrs_suffix(static_attrs)} : "
+            f"{_create_step_functional_type(step, result_types, dynamic_attrs)}"
+        )
+
+    def _replace_mlir(self) -> str:
+        results = ", ".join(value.to_mlir_name() for value in self.replacement)
+        operand_types = ["!transform.any_op"]
+        operand_types.extend("!transform.any_value" for _value in self.replacement)
+        return (
+            f"transform.hc.replace_intrinsic_call %call with {results} "
+            f": ({', '.join(operand_types)}) -> ()"
+        )
+
+    def _input_handle_mlir(self) -> tuple[str, ...]:
+        seen: set[tuple[str, str | int]] = set()
+        lines: list[str] = []
+        for value in self._input_handles():
+            key = (value.source, value.key)
+            if key in seen:
+                continue
+            seen.add(key)
+            if value.source == "operand":
+                lines.append(
+                    f"{value.to_mlir_name()} = transform.hc.get_intrinsic_operand "
+                    f'%call {{name = "{value.name.removeprefix("operand_")}"}} '
+                    ": (!transform.any_op) -> !transform.any_value"
+                )
+            elif value.source == "result_type":
+                lines.append(
+                    f"{value.to_mlir_name()} = "
+                    "transform.hc.get_intrinsic_result_type "
+                    f"%call {{index = {value.key} : i64}} "
+                    ": (!transform.any_op) -> !transform.type"
+                )
+            elif value.source == "attr":
+                lines.append(
+                    f"{value.to_mlir_name()} = transform.hc.get_intrinsic_attr "
+                    f'%call {{name = "{value.key}"}} '
+                    ": (!transform.any_op) -> !transform.any_param"
+                )
+        return tuple(lines)
+
+    def _input_handles(self) -> tuple[RecipeValue, ...]:
+        result: list[RecipeValue] = []
+        for step in self.steps:
+            result.extend(step.operands)
+            result.extend(
+                value for value in step.result_types if isinstance(value, RecipeValue)
+            )
+            result.extend(
+                value for _name, value in step.attrs if isinstance(value, RecipeValue)
+            )
+        result.extend(
+            value for value in self.replacement if value.source != "op_result"
+        )
+        return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -276,6 +339,67 @@ def _value_record(value: NormalizedRecipeAttr | NormalizedRecipeType) -> object:
     return value
 
 
+def _dynamic_result_types(step: RecipeCreateStep) -> tuple[RecipeValue, ...]:
+    result = []
+    for value in step.result_types:
+        if not isinstance(value, RecipeValue):
+            raise TypeError(
+                "textual intrinsic transform recipes require symbolic result types"
+            )
+        result.append(value)
+    return tuple(result)
+
+
+def _split_attrs(
+    step: RecipeCreateStep,
+) -> tuple[
+    tuple[tuple[str, RecipeValue], ...],
+    tuple[tuple[str, RecipeLiteral], ...],
+]:
+    dynamic_attrs = []
+    static_attrs = []
+    for name, value in step.attrs:
+        if isinstance(value, RecipeValue):
+            dynamic_attrs.append((name, value))
+        else:
+            static_attrs.append((name, value))
+    return tuple(dynamic_attrs), tuple(static_attrs)
+
+
+def _create_step_result_prefix(
+    step: RecipeCreateStep,
+    result_types: tuple[RecipeValue, ...],
+) -> str:
+    result_names = ", ".join(
+        step_result_name(step, index) for index in range(len(result_types))
+    )
+    return f"{result_names} = " if result_names else ""
+
+
+def _static_attrs_suffix(static_attrs: tuple[tuple[str, RecipeLiteral], ...]) -> str:
+    if not static_attrs:
+        return ""
+    attrs = ", ".join(
+        f"{name} = {_format_mlir_static_attr(value)}" for name, value in static_attrs
+    )
+    return f" static_attrs = {{{attrs}}}"
+
+
+def _create_step_functional_type(
+    step: RecipeCreateStep,
+    result_types: tuple[RecipeValue, ...],
+    dynamic_attrs: tuple[tuple[str, RecipeValue], ...],
+) -> str:
+    operand_types = ["!transform.any_op"]
+    operand_types.extend("!transform.any_value" for _value in step.operands)
+    operand_types.extend("!transform.type" for _value in result_types)
+    operand_types.extend("!transform.any_param" for _value in dynamic_attrs)
+    result_transform_types = ", ".join(
+        "!transform.any_value" for _value in result_types
+    )
+    return f"({', '.join(operand_types)}) -> ({result_transform_types})"
+
+
 def _format_mlir_value(value: NormalizedRecipeAttr | NormalizedRecipeType) -> str:
     if isinstance(value, RecipeValue):
         return value.to_mlir_name()
@@ -286,6 +410,30 @@ def _format_mlir_value(value: NormalizedRecipeAttr | NormalizedRecipeType) -> st
     if value is None:
         return "unit"
     return str(value)
+
+
+def _format_mlir_static_attr(value: NormalizedRecipeAttr) -> str:
+    if isinstance(value, RecipeValue):
+        return value.to_mlir_name()
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return f"{value} : i64"
+    if isinstance(value, float):
+        return str(value)
+    if isinstance(value, str):
+        return f'"{value}"'
+    if value is None:
+        return "unit"
+    raise TypeError(f"unsupported intrinsic recipe static attribute: {value!r}")
+
+
+def step_result_name(step: RecipeCreateStep, index: int) -> str:
+    return RecipeValue(
+        source="op_result",
+        key=f"{step.name}:{index}",
+        name=f"{step.name}_{index}",
+    ).to_mlir_name()
 
 
 def _symbol_part(value: str) -> str:

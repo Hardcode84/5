@@ -69,6 +69,30 @@ class RecipeCreateStep:
 
 
 @dataclass(frozen=True)
+class RecipeRequireAttrStep:
+    """Pre-rewrite assertion that a call's named attribute equals `expected`.
+
+    Lowers to `transform.hc.require_intrinsic_attr` in the named_sequence body.
+    Failure is definite (not silenceable): the apply aborts with a diagnostic
+    pinpointing the call site, instead of silently degrading to the generic
+    "no recipe matched" message that hides the underlying cause.
+    """
+
+    name: str
+    expected: RecipeLiteral
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "kind": "require_attr",
+            "name": self.name,
+            "expected": _value_record(self.expected),
+        }
+
+
+RecipeStep = RecipeCreateStep | RecipeRequireAttrStep
+
+
+@dataclass(frozen=True)
 class CreatedOpHandle:
     step: RecipeCreateStep
 
@@ -93,7 +117,7 @@ RecipeResultTypeValue = str | RecipeValueLike
 class IntrinsicTransformRecipe:
     intrinsic_name: str
     target: str
-    steps: tuple[RecipeCreateStep, ...]
+    steps: tuple[RecipeStep, ...]
     replacement: tuple[RecipeValue, ...]
 
     def to_record(self) -> dict[str, object]:
@@ -130,6 +154,8 @@ class IntrinsicTransformRecipe:
     def _input_handles(self) -> tuple[RecipeValue, ...]:
         result: list[RecipeValue] = []
         for step in self.steps:
+            if not isinstance(step, RecipeCreateStep):
+                continue
             result.extend(step.operands)
             result.extend(
                 value for value in step.result_types if isinstance(value, RecipeValue)
@@ -187,8 +213,13 @@ class IntrinsicRecipeCall:
 
 
 class IntrinsicRecipeBuilder:
-    def __init__(self) -> None:
-        self._steps: list[RecipeCreateStep] = []
+    def __init__(self, *, attr_names: frozenset[str] = frozenset()) -> None:
+        self._steps: list[RecipeStep] = []
+        # Snapshot of the intrinsic's declared `const_attrs`, used by
+        # `require_attr` to reject typos at recipe-build time. Empty for
+        # builders constructed directly (e.g. tests); only the
+        # `build_intrinsic_transform_recipe` entry point fills this in.
+        self._attr_names = attr_names
 
     @staticmethod
     def i32(value: int) -> TypedIntAttr:
@@ -213,7 +244,7 @@ class IntrinsicRecipeBuilder:
             raise ValueError("created op name must be non-empty")
         normalized_attrs = () if attrs is None else _normalize_attrs(attrs)
         step = RecipeCreateStep(
-            name=f"created{len(self._steps)}",
+            name=f"created{self._next_create_index()}",
             op_name=op_name,
             operands=tuple(_coerce_value(value) for value in operands),
             result_types=tuple(_coerce_type(value) for value in result_types),
@@ -221,6 +252,30 @@ class IntrinsicRecipeBuilder:
         )
         self._steps.append(step)
         return CreatedOpHandle(step)
+
+    def require_attr(
+        self,
+        call: IntrinsicRecipeCall,
+        name: str,
+        expected: RecipeLiteral,
+    ) -> None:
+        # The `call` parameter is the same view the recipe author already
+        # uses for `call.operand(...)`/`call.attr(...)`; we accept it for API
+        # symmetry and to validate the attribute exists on the intrinsic.
+        if not isinstance(call, IntrinsicRecipeCall):
+            raise TypeError(
+                "require_attr expects the recipe call view as its first argument"
+            )
+        if self._attr_names and name not in self._attr_names:
+            raise ValueError(f"unknown intrinsic constant attribute {name!r}")
+        if isinstance(expected, CreatedOpHandle | RecipeValue):
+            raise TypeError(
+                "require_attr expected value must be a literal, not a handle"
+            )
+        coerced = _coerce_attr_value(expected)
+        # Narrow back to literal: dynamic handles were rejected above.
+        assert not isinstance(coerced, RecipeValue)
+        self._steps.append(RecipeRequireAttrStep(name=name, expected=coerced))
 
     def finish(
         self,
@@ -236,6 +291,9 @@ class IntrinsicRecipeBuilder:
             replacement=_replacement_values(replacement),
         )
 
+    def _next_create_index(self) -> int:
+        return sum(1 for step in self._steps if isinstance(step, RecipeCreateStep))
+
 
 def build_intrinsic_transform_recipe(
     callback: Callable[[IntrinsicRecipeBuilder, IntrinsicRecipeCall], object],
@@ -246,7 +304,7 @@ def build_intrinsic_transform_recipe(
     attr_names: frozenset[str],
     result_count: int,
 ) -> IntrinsicTransformRecipe:
-    builder = IntrinsicRecipeBuilder()
+    builder = IntrinsicRecipeBuilder(attr_names=attr_names)
     call = IntrinsicRecipeCall(
         operand_names=tuple(operand_names),
         attr_names=attr_names,
@@ -372,11 +430,30 @@ class _TransformModuleBuilder:
             call = self._create_match_op(sequence.bodyTarget)
             self._create_input_handles(call.result)
             for step in self.recipe.steps:
-                self._create_payload_op(call.result, step)
+                self._emit_step(call.result, step)
             if self.recipe.replacement:
                 self._create_replace_op(call.result)
             self.transform.YieldOp([])
         return sequence
+
+    def _emit_step(self, call: Any, step: RecipeStep) -> None:
+        if isinstance(step, RecipeCreateStep):
+            self._create_payload_op(call, step)
+            return
+        if isinstance(step, RecipeRequireAttrStep):
+            self._create_require_attr_op(call, step)
+            return
+        raise TypeError(f"unsupported intrinsic recipe step: {step!r}")
+
+    def _create_require_attr_op(self, call: Any, step: RecipeRequireAttrStep) -> None:
+        self.ir.Operation.create(
+            "transform.hc.require_intrinsic_attr",
+            operands=[call],
+            attributes={
+                "name": self.ir.StringAttr.get(step.name, self.context),
+                "expected": self._literal_attr(step.expected),
+            },
+        )
 
     def _create_match_op(self, root: Any) -> Any:
         return self.ir.Operation.create(

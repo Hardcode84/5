@@ -345,6 +345,51 @@ void HCTransformReplaceIntrinsicCallOp::getEffects(
   xform::modifiesPayload(effects);
 }
 
+DiagnosedSilenceableFailure
+HCTransformRequireIntrinsicAttrOp::apply(xform::TransformRewriter &rewriter,
+                                         xform::TransformResults &results,
+                                         xform::TransformState &state) {
+  Operation *payloadOp = nullptr;
+  DiagnosedSilenceableFailure diag = requireSinglePayloadOp(
+      *this, getCall(), state, "intrinsic call", payloadOp);
+  if (!diag.succeeded())
+    return diag;
+  auto call = dyn_cast<hc::HCCallIntrinsicOp>(payloadOp);
+  if (!call)
+    return emitSilenceableError() << "expected an hc.call_intrinsic payload op";
+
+  StringRef name = getName();
+  Attribute expected = getExpected();
+  Attribute actual = call->getAttr(name);
+  if (!actual) {
+    auto fail = emitDefiniteFailure();
+    fail << "intrinsic call @" << call.getCallee()
+         << " missing required attribute '" << name << "'";
+    fail.attachNote(call.getLoc()) << "call site";
+    return fail;
+  }
+  if (actual != expected) {
+    auto fail = emitDefiniteFailure();
+    fail << "intrinsic call @" << call.getCallee() << " has " << name << " = "
+         << actual << ", expected " << expected;
+    fail.attachNote(call.getLoc()) << "call site";
+    return fail;
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
+void HCTransformRequireIntrinsicAttrOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  xform::onlyReadsHandle(getCallMutable(), effects);
+  // Conceptually this op only reads the payload — failure isn't a memory
+  // effect — but `onlyReadsPayload` lets the canonicalizer treat the op as
+  // dead when it has no SSA users (and a require op never does). Declaring
+  // payload as written keeps the op alive past `--canonicalize`/`--cse`,
+  // which the recipe IR has to survive so the interpreter can still see
+  // the assertion.
+  xform::modifiesPayload(effects);
+}
+
 namespace {
 class HCTransformDialectExtension
     : public xform::TransformDialectExtension<HCTransformDialectExtension> {

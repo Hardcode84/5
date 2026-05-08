@@ -101,6 +101,15 @@
 // CHECK: transform.hc.match_intrinsic_call
 // CHECK-SAME: @wmma_gfx11
 // CHECK-SAME: target = "amdgpu-gfx11"
+// Recipe-level pre-checks for the gfx11 dispatch invariants: target
+// dispatch already filters by `hc.target`, so these guard against a kernel
+// that accidentally calls `wmma_gfx11` with a drifted `arch`/`wave_size`.
+// CHECK: transform.hc.require_intrinsic_attr
+// CHECK-SAME: expected = "gfx11"
+// CHECK-SAME: name = "arch"
+// CHECK: transform.hc.require_intrinsic_attr
+// CHECK-SAME: expected = 32 : i64
+// CHECK-SAME: name = "wave_size"
 // CHECK: transform.hc.create_op "amdgpu.wmma"
 // `amdgpu.wmma` rejects unknown attributes (`arch`/`wave_size` ride on
 // the call site purely for dispatch), and its `m`/`n`/`k` slots are

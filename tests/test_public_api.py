@@ -105,19 +105,38 @@ def test_intrinsic_decorator_registers_hooks() -> None:
 
 def test_wmma_lowering_records_transform_recipe() -> None:
     from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
-    from hc._intrinsic_recipes import TypedIntAttr
+    from hc._intrinsic_recipes import (
+        RecipeCreateStep,
+        RecipeRequireAttrStep,
+        TypedIntAttr,
+    )
 
     recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
     assert recipe.intrinsic_name == "wmma_gfx11"
-    assert recipe.steps[0].op_name == "amdgpu.wmma"
-    assert [value.name for value in recipe.steps[0].operands] == [
+    require_steps = [s for s in recipe.steps if isinstance(s, RecipeRequireAttrStep)]
+    create_steps = [s for s in recipe.steps if isinstance(s, RecipeCreateStep)]
+    # The recipe asserts both `arch` and `wave_size` before letting the
+    # rewrite touch the call. Match the literal types/values the frontend
+    # emits at the call site (`arch` as a plain string, `wave_size` at i64
+    # because the call-site attribute is `wave_size = 32 : i64`).
+    require_by_name = {step.name: step for step in require_steps}
+    assert set(require_by_name) == {"arch", "wave_size"}
+    assert require_by_name["arch"].expected == "gfx11"
+    wave_expected = require_by_name["wave_size"].expected
+    assert isinstance(wave_expected, TypedIntAttr)
+    assert wave_expected.width == 64
+    assert wave_expected.value == 32
+
+    create = create_steps[0]
+    assert create.op_name == "amdgpu.wmma"
+    assert [value.name for value in create.operands] == [
         "operand_a_frag",
         "operand_b_frag",
         "operand_acc_frag",
     ]
     # `amdgpu.wmma` only takes `m`/`n`/`k` (i32). `arch`/`wave_size` ride
     # on the call site for dispatch but never make it onto the created op.
-    attrs = dict(recipe.steps[0].attrs)
+    attrs = dict(create.attrs)
     assert set(attrs) == {"m", "n", "k"}
     for name, value in attrs.items():
         assert isinstance(value, TypedIntAttr), name
@@ -126,6 +145,9 @@ def test_wmma_lowering_records_transform_recipe() -> None:
     assert recipe.replacement[0].name == "created0_0"
     text = recipe.to_mlir()
     assert 'transform.hc.create_op "amdgpu.wmma"' in text
+    assert "transform.hc.require_intrinsic_attr" in text
+    assert 'expected = "gfx11"' in text
+    assert "expected = 32 : i64" in text
     assert "k = 16 : i32" in text
     assert "m = 16 : i32" in text
     assert "n = 16 : i32" in text

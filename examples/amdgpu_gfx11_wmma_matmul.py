@@ -212,6 +212,15 @@ def _lower_wmma(t, call):
         call.attr("arch"),
         call.attr("wave_size"),
     )
+    # Pre-rewrite assertions: target-dispatch already filters by the recipe's
+    # `hc.target = "amdgpu-gfx11"`, but that says nothing about the call
+    # site's *actual* `arch`/`wave_size`. A kernel whose `GFX_ARCH` drifted
+    # to `"gfx12"` would otherwise smuggle a wrong-arch call into the
+    # `amdgpu.wmma` rewrite and surface as a far-downstream verifier crash.
+    # Match the `i64` width the frontend emits for `wave_size`; a width
+    # mismatch counts as a value mismatch.
+    t.require_attr(call, "arch", GFX_ARCH)
+    t.require_attr(call, "wave_size", t.i64(WAVE_LANES))
     op = t.create(
         "amdgpu.wmma",
         result_types=[call.result_type(0)],

@@ -100,6 +100,36 @@ def HCTransformCreateOp
   let hasVerifier = 1;
 }
 
+def HCTransformRequireIntrinsicAttrOp
+    : HCTransform_Op<"require_intrinsic_attr"> {
+  let summary = "Assert an intrinsic call's named attribute equals a literal";
+  let description = [{
+    Recipe-level pre-check: fails the apply with a definite diagnostic if the
+    `hc.call_intrinsic` payload does not carry the named attribute, or if it
+    carries a different value than `expected`. Comparison is by attribute
+    equality, so an `i32` vs `i64` mismatch counts as a value mismatch — write
+    the expected literal at the same width as the call site (e.g.
+    `wave_size = 32 : i64` paired with `expected = 32 : i64`). The op carries
+    no result handle: the caller already has the call handle and only wants
+    the apply to fail loudly when the assumption underlying the rewrite is
+    violated. Definite (not silenceable) failure is intentional — silenceable
+    would let the named-sequence application fall through and the surface
+    diagnostic would degrade to the generic "no recipe matched" message,
+    losing the "wrong arch" / "wrong wave_size" context.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$call,
+                       StrAttr:$name,
+                       AnyAttr:$expected);
+  // Keep both attributes inside attr-dict: `$expected` is `AnyAttr` and the
+  // built-in attribute printer can emit values whose textual form contains
+  // `:` (e.g. `32 : i64`), which would clash with the trailing `:` literal
+  // demanded by `type($call)` in any custom format.
+  let assemblyFormat = [{
+    $call attr-dict `:` type($call)
+  }];
+}
+
 def HCTransformReplaceIntrinsicCallOp
     : HCTransform_Op<"replace_intrinsic_call"> {
   let summary = "Replace an intrinsic call with payload values";

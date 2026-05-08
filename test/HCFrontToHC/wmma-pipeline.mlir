@@ -102,4 +102,11 @@
 // CHECK-SAME: @wmma_gfx11
 // CHECK-SAME: target = "amdgpu-gfx11"
 // CHECK: transform.hc.create_op "amdgpu.wmma"
+// `amdgpu.wmma` rejects unknown attributes (`arch`/`wave_size` ride on
+// the call site purely for dispatch), and its `m`/`n`/`k` slots are
+// declared as `i32` — pin both so a future recipe drift would surface
+// here instead of waiting for the upstream verifier to reject the freshly
+// created op.
+// CHECK-SAME: dynamic_attrs []()
+// CHECK-SAME: static_attrs = {k = 16 : i32, m = 16 : i32, n = 16 : i32}
 // CHECK: transform.hc.replace_intrinsic_call

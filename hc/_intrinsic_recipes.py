@@ -9,7 +9,26 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-RecipeLiteral = str | int | float | bool | None
+
+@dataclass(frozen=True)
+class TypedIntAttr:
+    """Width-annotated integer literal for recipe attributes.
+
+    Plain Python `int`s default to `i64` because nothing in the recipe layer
+    knows what the target op expects. Some upstream ops (notably
+    `amdgpu.wmma`'s `m`/`n`/`k`) require `i32`; rather than guessing per-op
+    in the lowering machinery, the recipe author opts in by wrapping the
+    literal with `t.i32(...)` / `t.i64(...)` builder helpers.
+    """
+
+    value: int
+    width: int = 64
+
+    def to_record(self) -> dict[str, object]:
+        return {"value": self.value, "width": self.width}
+
+
+RecipeLiteral = str | int | float | bool | TypedIntAttr | None
 
 
 @dataclass(frozen=True)
@@ -171,6 +190,17 @@ class IntrinsicRecipeBuilder:
     def __init__(self) -> None:
         self._steps: list[RecipeCreateStep] = []
 
+    @staticmethod
+    def i32(value: int) -> TypedIntAttr:
+        # Width-annotated literal; pair with a `static_attrs` slot whose
+        # target op expects an `i32` attribute (e.g. `amdgpu.wmma`'s
+        # `m`/`n`/`k`).
+        return TypedIntAttr(value=int(value), width=32)
+
+    @staticmethod
+    def i64(value: int) -> TypedIntAttr:
+        return TypedIntAttr(value=int(value), width=64)
+
     def create(
         self,
         op_name: str,
@@ -269,6 +299,8 @@ def _coerce_attr_value(value: RecipeAttrValue) -> NormalizedRecipeAttr:
         return _coerce_value(value)
     if isinstance(value, RecipeValue):
         return value
+    if isinstance(value, TypedIntAttr):
+        return value
     if value is None or isinstance(value, str | int | float | bool):
         return value
     raise TypeError(f"unsupported intrinsic recipe attribute value: {value!r}")
@@ -282,6 +314,8 @@ def _coerce_type(value: RecipeResultTypeValue) -> NormalizedRecipeType:
 
 def _value_record(value: NormalizedRecipeAttr | NormalizedRecipeType) -> object:
     if isinstance(value, RecipeValue):
+        return value.to_record()
+    if isinstance(value, TypedIntAttr):
         return value.to_record()
     return value
 
@@ -454,6 +488,14 @@ class _TransformModuleBuilder:
         return tuple(self._handles[_value_key(value)] for value in values)
 
     def _literal_attr(self, value: RecipeLiteral) -> Any:
+        if isinstance(value, TypedIntAttr):
+            return self.ir.IntegerAttr.get(
+                self.ir.IntegerType.get_signless(value.width, context=self.context),
+                value.value,
+            )
+        # `bool` must precede `int`: Python booleans are an int subclass and
+        # would otherwise serialize to a 64-bit integer attribute instead of
+        # the intended `i1`.
         if isinstance(value, bool):
             return self.ir.BoolAttr.get(value, context=self.context)
         if isinstance(value, int):

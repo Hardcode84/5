@@ -105,6 +105,7 @@ def test_intrinsic_decorator_registers_hooks() -> None:
 
 def test_wmma_lowering_records_transform_recipe() -> None:
     from examples.amdgpu_gfx11_wmma_matmul import wmma_gfx11
+    from hc._intrinsic_recipes import TypedIntAttr
 
     recipe = wmma_gfx11.__hc_lowerings__["amdgpu-gfx11"]
     assert recipe.intrinsic_name == "wmma_gfx11"
@@ -114,10 +115,20 @@ def test_wmma_lowering_records_transform_recipe() -> None:
         "operand_b_frag",
         "operand_acc_frag",
     ]
-    assert recipe.steps[0].attrs[0][0] == "arch"
-    assert recipe.steps[0].attrs[0][1].name == "attr_arch"
+    # `amdgpu.wmma` only takes `m`/`n`/`k` (i32). `arch`/`wave_size` ride
+    # on the call site for dispatch but never make it onto the created op.
+    attrs = dict(recipe.steps[0].attrs)
+    assert set(attrs) == {"m", "n", "k"}
+    for name, value in attrs.items():
+        assert isinstance(value, TypedIntAttr), name
+        assert value.width == 32, name
+        assert value.value == 16, name
     assert recipe.replacement[0].name == "created0_0"
-    assert 'transform.hc.create_op "amdgpu.wmma"' in recipe.to_mlir()
+    text = recipe.to_mlir()
+    assert 'transform.hc.create_op "amdgpu.wmma"' in text
+    assert "k = 16 : i32" in text
+    assert "m = 16 : i32" in text
+    assert "n = 16 : i32" in text
 
 
 def test_index_map_records_callables() -> None:

@@ -199,11 +199,18 @@ def _verify_wmma(sig, target):
 
 @wmma_gfx11.lower(target="amdgpu-gfx11")
 def _lower_wmma(t, call):
+    # `amdgpu.wmma` only consumes the per-lane fragment vectors and the
+    # accumulator; the staged tiles, lane index, group token, and the
+    # `arch`/`wave_size` const_kwargs ride on the call site purely to
+    # gate dispatch. We touch the unused handles to surface a recipe-time
+    # error if the intrinsic signature ever drifts under us.
     _ = (
         call.operand("group"),
         call.operand("a_tile"),
         call.operand("b_tile"),
         call.operand("lane"),
+        call.attr("arch"),
+        call.attr("wave_size"),
     )
     op = t.create(
         "amdgpu.wmma",
@@ -213,12 +220,14 @@ def _lower_wmma(t, call):
             call.operand("b_frag"),
             call.operand("acc_frag"),
         ],
+        # `amdgpu.wmma` declares `m`, `n`, `k` as `i32` attributes with
+        # confined value sets; emit them at the right width so the upstream
+        # verifier doesn't reject the freshly created op for "expected
+        # 'i32' but got 'i64'".
         attrs={
-            "arch": call.attr("arch"),
-            "wave_size": call.attr("wave_size"),
-            "m": WMMA_M,
-            "n": WMMA_N,
-            "k": WMMA_K,
+            "m": t.i32(WMMA_M),
+            "n": t.i32(WMMA_N),
+            "k": t.i32(WMMA_K),
         },
     )
     return op.result(0)

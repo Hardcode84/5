@@ -26,7 +26,7 @@ def _sample_lock(
     return LlvmLock(
         repo="https://example.com/llvm-project.git",
         revision=revision,
-        projects=("mlir",),
+        projects=("mlir", "lld"),
         targets=("host", "AMDGPU"),
         build_type="Release",
         build_shared_libs=False,
@@ -65,7 +65,7 @@ def test_load_llvm_lock_reads_repo_pin() -> None:
 
     assert lock.repo == "https://github.com/llvm/llvm-project.git"
     assert len(lock.revision) == 40
-    assert lock.projects == ("mlir",)
+    assert lock.projects == ("mlir", "lld")
     assert lock.targets == ("host", "AMDGPU")
 
 
@@ -107,6 +107,7 @@ def test_export_toolchain_environment_sets_mlir_config_dirs(tmp_path: Path) -> N
     assert env["HC_LLVM_INSTALL_DIR"] == str(install_root)
     assert env["LLVM_DIR"] == str(install_root / "lib" / "cmake" / "llvm")
     assert env["MLIR_DIR"] == str(install_root / "lib" / "cmake" / "mlir")
+    assert env["HC_LLD"] == str(install_root / "bin" / "ld.lld")
 
 
 def test_replace_install_root_creates_missing_install_parent(tmp_path: Path) -> None:

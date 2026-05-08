@@ -2,7 +2,8 @@
   "repo": "https://github.com/llvm/llvm-project.git",
   "revision": "6d3d88f74c405db660a20103905787fc67087287",
   "projects": [
-    "mlir"
+    "mlir",
+    "lld"
   ],
   "targets": [
     "host",

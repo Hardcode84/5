@@ -79,6 +79,11 @@ def export_toolchain_environment(
     exported["HC_LLVM_INSTALL_DIR"] = str(install_root)
     exported["LLVM_DIR"] = str(install_root / "lib" / "cmake" / "llvm")
     exported["MLIR_DIR"] = str(install_root / "lib" / "cmake" / "mlir")
+    # Pinned ld.lld used by HC's gpu-module-to-binary path. We never fall back
+    # to a system rocm install — if the toolchain rebuild missed lld, downstream
+    # consumers should fail loudly rather than silently link against whatever
+    # the host happens to have.
+    exported["HC_LLD"] = str(install_root / "bin" / "ld.lld")
     return exported
 
 

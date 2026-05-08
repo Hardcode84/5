@@ -11,7 +11,9 @@
 // static shape carriers, split semantic shaped values into bare data/masks,
 // inline helpers, normalize supported scope regions, run the standard cleanup
 // pair, wrap kernels in upstream GPU launches, lower launch-body scalar/control
-// flow, then clean up again.
+// flow, clean up, interpret target lowering recipes (which rewrites every
+// `hc.call_intrinsic` and DCEs the matching `hc.intrinsic` decls), then a
+// final canonicalize/cse to fold the recipe's bridging UCCs into identity.
 // `hc.compile` loads this via `-transform-preload-library` and runs it with
 // `-transform-interpreter`; callers wanting a different order can pass
 // `schedule=<path-or-text>` to override.
@@ -58,6 +60,28 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
+    // Default `target=""` runs every named sequence in the sibling
+    // `__hc_intrinsic_lowerings__` module — which is the right behaviour
+    // today because each intrinsic registers at most one recipe per
+    // compile. If/when multiple targets per intrinsic land in the same
+    // module, this option will need a real value (probably plumbed
+    // through from `hc.compile(target=...)`); keeping the empty default
+    // surfaces that need as a recipe-application conflict rather than
+    // silently picking one. The pass is also a no-op for kernels that
+    // never use intrinsics: no lowerings module, no calls, nothing to
+    // diagnose.
+    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes" to %m13
+        : (!transform.any_op) -> !transform.any_op
+    // Final cleanup pair folds away every `unrealized_conversion_cast`
+    // the recipe-side `transform.hc.cast_value` planted around the
+    // freshly created upstream payload op. The launch-body pass left a
+    // matching cast on the surrounding side of each call boundary, so
+    // the chain `upstream → bare → upstream` collapses to identity here
+    // and the post-interpretation IR ends up bare-type-free.
+    transform.apply_patterns to %m14 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m14 : !transform.any_op
     transform.yield
   }
 }

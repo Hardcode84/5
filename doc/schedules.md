@@ -60,6 +60,12 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
+    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes" to %m13
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m14 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m14 : !transform.any_op
     transform.yield
   }
 }
@@ -87,17 +93,18 @@ HC body before `hc-lower-kernels-to-gpu-launch` wraps each `hc.kernel` in a host
 scalar/index subset inside that launch to upstream `arith`/`scf` operations and
 lowers static bare tensors to workgroup-memory `memref`s. Bare vectors lower to
 upstream `vector` values, and final masked stores become guarded memref writes.
-Intrinsic boundaries remain HC ops with explicit casts for later slices; a final
-cleanup pass pair folds the launch-body arithmetic where possible. Target
-lowering of `hc.call_intrinsic` is owned by `-hc-interpret-intrinsic-recipes`,
-which walks the sibling `module @__hc_intrinsic_lowerings__` planted by the
-frontend emitter, applies each `transform.named_sequence` whose `hc.target`
-matches the requested target, and erases the spent lowerings module. The
-bundled schedule does not yet include that pass — once the wmma → upstream
-path lands, the schedule grows an `apply_registered_pass
-"hc-interpret-intrinsic-recipes"` step after `hc-lower-launch-body`. See
-**Intrinsics** in `doc/lowering.md` for the recipe authoring + transform-op
-surface.
+Intrinsic boundaries remain HC ops with explicit casts at that point; the final
+`hc-interpret-intrinsic-recipes` step then walks the sibling
+`module @__hc_intrinsic_lowerings__` the frontend emitter planted, applies
+every `transform.named_sequence` whose `hc.target` matches the requested
+target (the default empty target runs every recipe — fine while each
+intrinsic registers at most one recipe per compile), erases the spent
+lowerings module, and DCEs `hc.intrinsic` decls whose last call site was
+rewritten. The trailing canonicalize/cse pair folds the recipe-inserted
+bridging UCCs into identity (they pair with the existing UCCs the
+launch-body pass plants on either side of every call boundary), leaving the
+final IR free of HC ops and bridging machinery. See **Intrinsics** in
+`doc/lowering.md` for the recipe authoring + transform-op surface.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

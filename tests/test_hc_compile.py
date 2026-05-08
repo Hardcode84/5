@@ -633,47 +633,47 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
                 assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.hc_ir_text is not None
-                assert "!hc.tensor<" not in handle.hc_ir_text, handle.hc_ir_text
-                assert "!hc.vector<" not in handle.hc_ir_text, handle.hc_ir_text
+                # Default schedule now runs all the way through
+                # `hc-interpret-intrinsic-recipes` + a final canonicalize
+                # pair, so the post-compile IR is hc.*-free: every
+                # semantic and bare HC type, every HC op (region scope,
+                # load/store, intrinsic call, even the intrinsic decl),
+                # and the recipe-inserted bridging UCCs all fold away.
+                # `!hc.` covers every HC type spelling; matching just
+                # `hc.` would false-positive on substrings inside
+                # surrounding upstream tokens.
+                assert "!hc." not in handle.hc_ir_text, handle.hc_ir_text
+                stray_hc_ops = [
+                    line for line in handle.hc_ir_text.splitlines()
+                    if " hc." in line or line.lstrip().startswith("hc.")
+                ]
+                assert not stray_hc_ops, stray_hc_ops
+                # The recipe's bridging casts pair with the launch-body
+                # UCCs on either side of the call; canonicalize collapses
+                # the upstream → bare → upstream chain to identity, so
+                # no UCCs survive the final cleanup.
+                assert "unrealized_conversion_cast" not in handle.hc_ir_text
+                # Positive structural assertions: kernel becomes a host
+                # `func.func` with a `gpu.launch` body, the K loop is a
+                # real `scf.for`, tile staging uses upstream
+                # vector/memref ops, and the WMMA intrinsic landed as a
+                # plain upstream `amdgpu.wmma` between `vector<...>`
+                # operands.
+                assert "func.func @tiled_gfx11_wmma_matmul" in handle.hc_ir_text
+                assert "gpu.launch" in handle.hc_ir_text
                 assert "scf.for" in handle.hc_ir_text, handle.hc_ir_text
-                assert "hc.for_range" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "vector.transfer_read" in handle.hc_ir_text
                 assert "vector.transfer_write" in handle.hc_ir_text
                 assert "memref.alloca" in handle.hc_ir_text
                 assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
-                assert "hc.load " not in handle.hc_ir_text
-                assert "hc.buffer_view" not in handle.hc_ir_text
-                assert "hc.store" not in handle.hc_ir_text
                 assert "memref.store" in handle.hc_ir_text
-                assert "scf.if" in handle.hc_ir_text
                 assert "vector.extract" in handle.hc_ir_text
-                assert '-> (!hc.bare_tensor<f16, ["16", "16"]>' not in (
-                    handle.hc_ir_text
-                )
-                assert "hc.workitem_region" not in handle.hc_ir_text
-                assert "hc.call @" not in handle.hc_ir_text
-                intrinsic = re.search(
-                    r'hc\\.call_intrinsic @wmma_gfx11\\([^\\n]+\\) '
-                    r'\\{arch = "gfx11", wave_size = 32 : i64\\} : '
-                    r'\\((?P<args>[^\\n]+)\\) -> \\((?P<results>[^\\n]+)\\)',
+                wmma = re.search(
+                    r"amdgpu\\.wmma 16x16x16 %\\S+ \\* %\\S+ \\+ %\\S+ : "
+                    r"vector<16xf16>, vector<16xf16>, vector<8xf32>",
                     handle.hc_ir_text,
                 )
-                assert intrinsic, handle.hc_ir_text
-                intrinsic_args = intrinsic.group("args")
-                assert '!hc.bare_tensor<f16, ["16", "16"]>' in intrinsic_args
-                assert (
-                    '!hc.bare_tensor<!hc.pred, ["16", "16"]>' in intrinsic_args
-                )
-                assert '!hc.bare_vector<f16, ["16"]>' in intrinsic_args
-                assert '!hc.bare_vector<!hc.pred, ["16"]>' in intrinsic_args
-                assert '!hc.bare_vector<f32, ["8"]>' in intrinsic_args
-                assert '!hc.bare_vector<!hc.pred, ["8"]>' in intrinsic_args
-                assert "index" in intrinsic_args
-                assert '!hc.idx<"$WI0">' not in intrinsic_args
-                assert intrinsic.group("results") == (
-                    '!hc.bare_vector<f32, ["8"]>, '
-                    '!hc.bare_vector<!hc.pred, ["8"]>'
-                )
+                assert wmma, handle.hc_ir_text
 
                 loads = re.findall(
                     r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',

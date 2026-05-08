@@ -858,16 +858,24 @@ def mfma(a, b, acc, *, blocksz):
     return acc + (a @ b)
 
 @mfma.lower(target="amdgpu")
-def _(ctx, a, b, acc, *, blocksz):
-    op = ctx.builder.create(
+def _lower(t, call):
+    op = t.create(
         "amdgpu.mfma",
-        results=[ctx.result_type(0)],
-        operands=[a, b, acc],
-        attrs={"blocksz": blocksz},
-        loc=ctx.loc,
+        result_types=[call.result_type(0)],
+        operands=[call.operand("a"), call.operand("b"), call.operand("acc")],
+        attrs={"blocksz": call.attr("blocksz")},
     )
     return op.result(0)
 ```
+
+The lowering callback receives a recipe builder `t` plus a typed call view
+`call`. Operand handles come from `call.operand(name_or_index)`, result
+types from `call.result_type(index)`, and any of the intrinsic's declared
+`const_attrs` are reachable as `call.attr(name)`. `t.create(...)` returns
+a handle whose `.result(i)` is the SSA value that replaces the matched
+call's `i`-th result. Use `t.i32(value)` / `t.i64(value)` to opt into
+specific integer attribute widths when the target op declares confined
+integer attributes (plain Python `int`s default to `i64`).
 
 `@kernel.intrinsic(...)` declares a callable symbol that may be used in kernel
 code like any other function. The declaration specifies the scope in which the
@@ -887,16 +895,19 @@ while the Python API keeps the decorator name `const_attrs`.
 Use `tensor_type(shape, dtype)`, `vector_type(shape, dtype)`, `idx_type()`, or
 `undef_type()` for entries that must remain progressive-typing wildcards.
 
-The intrinsic body defines fallback semantics. If no target-specific lowering
-matches the current compilation target, the compiler lowers the intrinsic body
-as ordinary kernel code. The intrinsic body must therefore itself be valid
-kernel code in the declared scope.
+The intrinsic body defines fallback semantics that the host-side simulator
+runs unchanged when executing in Python. The body uses NumPy and the
+simulator's mask/tensor types and may be written in plain Python; it does
+not have to be valid kernel code, since the compiler does not lower it.
 
-Target-specific lowerings are attached with `@name.lower(target=...)`. A
-matching lowering overrides the fallback body for that target and may emit
-arbitrary MLIR directly through `ctx.builder`. Lowerings must preserve the
-observable semantics of the fallback body, including result type, logical
-shape, masking, and layout behavior.
+Target-specific lowerings are attached with `@name.lower(target=...)` and
+own the compile path: each lowering builds an MLIR transform recipe that
+rewrites a matching call site into target-specific payload. Lowerings
+must preserve the observable semantics of the simulator fallback body,
+including result type, logical shape, masking, and layout behavior. If no
+matching lowering is registered for the current target, the compiler
+fails with `no intrinsic lowering recipe matched @<callee> for target
+'<t>'`.
 
 An intrinsic body may also be empty:
 ```python
@@ -904,8 +915,9 @@ An intrinsic body may also be empty:
 def vendor_only(a, b):
     pass
 ```
-If no matching lowering is available for such an intrinsic, the launch fails
-before execution.
+A simulator invocation with no fallback body and no matching lowering
+fails before execution; a compile invocation with no matching lowering
+fails with the same uncovered-call diagnostic as above.
 
 Implementations may additionally provide optional verification and inference
 hooks for intrinsics. Verification hooks may reject invalid target/type/layout

@@ -88,7 +88,16 @@ scalar/index subset inside that launch to upstream `arith`/`scf` operations and
 lowers static bare tensors to workgroup-memory `memref`s. Bare vectors lower to
 upstream `vector` values, and final masked stores become guarded memref writes.
 Intrinsic boundaries remain HC ops with explicit casts for later slices; a final
-cleanup pass pair folds the launch-body arithmetic where possible.
+cleanup pass pair folds the launch-body arithmetic where possible. Target
+lowering of `hc.call_intrinsic` is owned by `-hc-interpret-intrinsic-recipes`,
+which walks the sibling `module @__hc_intrinsic_lowerings__` planted by the
+frontend emitter, applies each `transform.named_sequence` whose `hc.target`
+matches the requested target, and erases the spent lowerings module. The
+bundled schedule does not yet include that pass — once the wmma → upstream
+path lands, the schedule grows an `apply_registered_pass
+"hc-interpret-intrinsic-recipes"` step after `hc-lower-launch-body`. See
+**Intrinsics** in `doc/lowering.md` for the recipe authoring + transform-op
+surface.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked

@@ -315,17 +315,33 @@ hc.call_intrinsic @wmma_gfx11(..., %a_filled, %b_filled, %acc_data, %lane)
   {arch = "gfx11", wave_size = 32 : i64}
 ```
 
-to the target-specific operation selected for gfx11. Prefer an upstream
-`amdgpu` op if it models this instruction. If the exact operation is not
-available, introduce the smallest ROCDL/LLVM intrinsic wrapper needed to
-represent the backend instruction.
+to the target-specific operation selected for gfx11 by running the
+intrinsic's lowering recipe. Recipes are authored in Python via
+`@<intrinsic>.lower(target=...)` and emitted as
+`transform.named_sequence` ops inside a sibling
+`module @__hc_intrinsic_lowerings__` (see the **Intrinsics** section in
+`doc/lowering.md` for the recipe authoring + transform-op surface). The
+`-hc-interpret-intrinsic-recipes` pass walks that module, applies the
+named sequences whose `hc.target` matches the requested target (e.g.
+`"amdgpu-gfx11"`), erases the spent lowerings module, and surfaces an
+uncovered-call diagnostic if any `hc.call_intrinsic` remains.
 
-The lowering should verify:
+For gfx11 the canonical recipe targets upstream `amdgpu.wmma`. If a
+future target needs an intrinsic the upstream `amdgpu` dialect doesn't
+model, the recipe can emit a ROCDL/LLVM wrapper instead — the
+interpreter pass is target-agnostic.
 
-* `arch == "gfx11"`,
-* `wave_size == 32`,
-* input fragments have the expected bare vector data types,
-* the result is `!hc.bare_vector<f32, ["8"]>`.
+The recipe layer relies on three independent verifiers, by design:
+
+* `hc.intrinsic` const_kwargs gating ensures every call site carries
+  `arch` and `wave_size` attributes; missing entries fail at IR verify
+  time.
+* The simulator-side `@<intrinsic>.verify` hook validates `arch == "gfx11"`,
+  `wave_size == 32`, and the expected f16/f32 vector shapes when running
+  Python.
+* The target op's own verifier (`amdgpu.wmma` here) rejects mismatched
+  vector lengths or out-of-range `m`/`n`/`k` when the recipe constructs
+  the payload op.
 
 The intrinsic boundary should be unmasked unless a future target intrinsic
 explicitly models masked execution.
@@ -371,8 +387,14 @@ A practical first implementation could be:
 5. `ConvertHCMemoryOps`
    * Lower tile loads, buffer views, vectorization, inactive-lane handling, and
      stores using the explicit predicate values.
-6. `ConvertHCWmmaIntrinsics`
-   * Lower `wmma_gfx11` to `amdgpu` / `rocdl`.
+6. `HCInterpretIntrinsicRecipes`
+   * Walks the sibling `module @__hc_intrinsic_lowerings__` planted by the
+     frontend emitter, applies each `transform.named_sequence` whose
+     `hc.target` matches the requested target (e.g. `wmma_gfx11` →
+     `amdgpu.wmma`), and erases the spent lowerings module. Any
+     `hc.call_intrinsic` left at this point is a hard error: the user
+     either asked for a target with no recipe or registered a recipe that
+     skipped the call.
 7. `ConvertHCPredicates`
    * Lower `!hc.pred` scalar and bare predicate containers to upstream `i1`
      scalar/vector values once HC-level predicate simplification is complete.

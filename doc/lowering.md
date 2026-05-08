@@ -1144,15 +1144,129 @@ semantics, though compile time, debug information, and diagnostics may differ.
 
 ### Intrinsics
 
-`@kernel.intrinsic` definitions should first lower to `hc_front.intrinsic`.
-Later MLIR passes should:
+`@kernel.intrinsic` definitions cross two tracks that share a name but never
+share a body:
 
-* apply verify/infer hooks,
-* lower intrinsic calls to `hc.intrinsic.call` or directly to target-specific
-  IR when appropriate,
-* preserve the language-visible semantics of the intrinsic contract and
-  fallback body when one is present,
-* otherwise lower the fallback body as ordinary kernel code.
+* **Simulator fallback** — the function body of `@kernel.intrinsic` is a
+  pure-Python implementation the host-side simulator runs unchanged. It
+  uses NumPy and the simulator's mask/tensor types and is *never*
+  compiled. The fallback body lowers to `hc_front.intrinsic` for IR
+  fidelity but its contents are deliberately discarded by
+  `ConvertHCFrontToHC`: the resulting `hc.intrinsic` is a declaration-only
+  shell carrying signature, scope, effects, and `const_kwargs`.
+* **Compiler lowering recipes** — separate Python callables registered via
+  `@<intrinsic>.lower(target="...")`. Each recipe constructs a transform
+  IR program that rewrites a matching `hc.call_intrinsic` into target-
+  specific payload (e.g. `amdgpu.wmma` for gfx11). Recipes ride through the
+  pipeline as real MLIR ops, not as serialized strings.
+
+Keeping these tracks separate is the contract that lets the simulator stay
+expressive (Python+NumPy, full Python types) while the compiler stays
+structural (MLIR transform IR, verifier-checked).
+
+#### Authoring recipes
+
+Each recipe callback receives a builder `t` and a typed call view `call`:
+
+```python
+@wmma_gfx11.lower(target="amdgpu-gfx11")
+def _lower_wmma(t, call):
+    op = t.create(
+        "amdgpu.wmma",
+        result_types=[call.result_type(0)],
+        operands=[
+            call.operand("a_frag"),
+            call.operand("b_frag"),
+            call.operand("acc_frag"),
+        ],
+        attrs={"m": t.i32(16), "n": t.i32(16), "k": t.i32(16)},
+    )
+    return op.result(0)
+```
+
+* `call.operand(name_or_index)` — a runtime SSA operand handle.
+* `call.result_type(index)` — the call's result type as a transform type
+  parameter.
+* `call.attr(name)` — a value of one of the declared `const_kwargs`.
+* `t.i32(value)` / `t.i64(value)` — width-annotated integer literal
+  helpers (plain Python `int`s default to `i64`; widths matter when the
+  target op declares confined integer attributes).
+* `t.create(name, operands=..., result_types=..., attrs=...)` — emit a
+  payload op; returns a handle whose `.result(i)` is the replacement for
+  the matched call's `i`-th result.
+* The callback returns the SSA values that replace the matched call.
+
+Operand-shape and attribute-value validation falls out of the target op's
+own verifier: when the recipe constructs `amdgpu.wmma`, the upstream
+verifier rejects mismatched vector lengths or out-of-range `m`/`n`/`k`.
+
+#### Generic HC transform ops
+
+The recipe layer compiles the Python callback into a stable set of HC
+transform ops (defined in `hc/include/hc/TransformOps/HCTransformOps.td`):
+
+* `transform.hc.match_intrinsic_call %root @callee target = "..."` — walk
+  payload and surface every `hc.call_intrinsic` calling `@callee`.
+* `transform.hc.get_intrinsic_operand`,
+  `transform.hc.get_intrinsic_result_type`,
+  `transform.hc.get_intrinsic_attr` — thread call operands, result types,
+  and constant kwargs into transform handles.
+* `transform.hc.create_op "<op_name>" at %call (operands) result_types(types)
+  dynamic_attrs [names](values) static_attrs = {...}` — emit a payload op
+  at the call site; consumes operand/type/attr handles.
+* `transform.hc.replace_intrinsic_call %call with %values` — RAUW the
+  matched call with the freshly created payload values.
+
+The transform op surface is intentionally narrow. Anything more
+target-specific lives in the recipe body, not in the op set, so adding a
+new target requires a new recipe rather than new ops.
+
+#### Embedding and lifecycle
+
+The frontend emitter packs every registered recipe into a sibling
+top-level module:
+
+```mlir
+module {
+  hc_front.kernel "..." { ... }
+  hc_front.intrinsic "wmma_gfx11" attributes {...} { ... }
+
+  module @__hc_intrinsic_lowerings__ attributes {transform.with_named_sequence} {
+    transform.named_sequence @__hc_lower_wmma_gfx11_amdgpu_gfx11(
+        %arg0: !transform.any_op) attributes {hc.target = "amdgpu-gfx11"} {
+      // match_intrinsic_call → get_intrinsic_* → create_op → replace
+    }
+  }
+}
+```
+
+The conversion pass (`ConvertHCFrontToHC`) only collects `hc_front.*`
+ops, so the lowerings module passes through untouched and the named
+sequences travel alongside the kernel into the `hc` dialect.
+
+#### Pipeline placement
+
+`-hc-interpret-intrinsic-recipes` is the consumer. It runs *after*
+`-hc-lower-launch-body`, when scalar, vector, memref, and mask types have
+been materialized — the recipe authors see the same operand types the
+target op expects:
+
+1. find sibling `module @__hc_intrinsic_lowerings__`;
+2. select named sequences by `hc.target` attribute (the pass's `target`
+   option); empty target runs every sequence and is mostly useful for
+   tests;
+3. invoke `transform::applyTransformNamedSequence` on each;
+4. erase the spent lowerings module so downstream passes don't trip over
+   stray transform IR;
+5. walk the payload one final time and emit a clear `no intrinsic
+   lowering recipe matched @<callee> for target '<t>'` diagnostic for
+   every surviving `hc.call_intrinsic`. Silent passthrough would just
+   relocate the gap to the next pass.
+
+Earlier `hc` passes (verify/infer hooks, type inference, decomposition,
+launch wrapping) operate on the structural `hc.intrinsic` *declaration*
+without touching the recipes — the recipes describe the target rewriting
+contract, not how to type-check the intrinsic itself.
 
 ## Recommended first implementation order
 

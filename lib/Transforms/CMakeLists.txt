@@ -6,6 +6,7 @@ add_mlir_library(MLIRHCTransforms
   HCDecomposeShapedValuesPass.cpp
   HCInferTypesPass.cpp
   HCInlineHelpersPass.cpp
+  HCInterpretIntrinsicRecipesPass.cpp
   HCLowerBarePredicatesPass.cpp
   HCLowerKernelsToGPULaunchPass.cpp
   HCLowerLaunchBodyPass.cpp
@@ -26,11 +27,14 @@ add_mlir_library(MLIRHCTransforms
   MLIRFuncDialect
   MLIRGPUDialect
   MLIRHCDialect
+  MLIRHCTransformOps
   MLIRIR
   MLIRMemRefDialect
   MLIRPass
   MLIRSCFDialect
   MLIRSupport
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
   MLIRTransforms
   MLIRVectorDialect
 )

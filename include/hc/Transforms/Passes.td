@@ -171,6 +171,43 @@ def HCLowerKernelsToGPULaunch
   ];
 }
 
+def HCInterpretIntrinsicRecipes
+    : Pass<"hc-interpret-intrinsic-recipes", "::mlir::ModuleOp"> {
+  let summary = "Apply embedded intrinsic transform recipes to payload IR.";
+  let description = [{
+    Looks up a sibling top-level `builtin.module @__hc_intrinsic_lowerings__`
+    (carrying `transform.with_named_sequence`) and applies every
+    `transform.named_sequence` whose `hc.target` matches the requested target
+    string against the surrounding module. The recipes were planted by the
+    frontend emitter (`hc/_frontend_mlir.py`) and stick to MLIR transform IR
+    end-to-end — no string round-trip.
+
+    Recipes are expected to follow the standard hc transform-op shape: a
+    `transform.hc.match_intrinsic_call` to find the call site, optional
+    `transform.hc.get_intrinsic_*` handle ops to thread operands, result
+    types, and attributes into a `transform.hc.create_op`, then a
+    `transform.hc.replace_intrinsic_call` that swaps the original
+    `hc.call_intrinsic` for the freshly constructed payload.
+
+    After applying every selected sequence, the lowerings module is erased
+    and the pass walks the payload one final time. Any surviving
+    `hc.call_intrinsic` is a hard error: the user asked for target `T` but
+    nothing under `__hc_intrinsic_lowerings__` knew how to lower the call,
+    so we surface the gap here instead of letting it slip into the next
+    pass as an unrecognized op.
+  }];
+  let options = [
+    Option<"target", "target", "std::string", "\"\"",
+           "Filter named sequences by their `hc.target` attribute. The "
+           "empty string runs every sequence and is mostly useful for "
+           "single-target tests.">
+  ];
+  let dependentDialects = [
+    "::mlir::hc::HCDialect",
+    "::mlir::transform::TransformDialect"
+  ];
+}
+
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";

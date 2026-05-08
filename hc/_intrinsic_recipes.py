@@ -86,10 +86,27 @@ class IntrinsicTransformRecipe:
         }
 
     def to_module(self, *, context: Any | None = None) -> Any:
-        return _TransformModuleBuilder(self, context=context).build()
+        # Standalone form: a fresh `transform.with_named_sequence` module
+        # carrying just this recipe. Useful for tests, dumps, and any caller
+        # that wants the recipe in isolation rather than packed alongside
+        # peers in a shared lowerings module.
+        return _TransformModuleBuilder(self, context=context).build_module()
 
     def to_mlir(self, *, context: Any | None = None) -> str:
         return str(self.to_module(context=context))
+
+    def append_named_sequence(
+        self, target_block: Any, *, context: Any | None = None
+    ) -> Any:
+        # Pack this recipe as a `transform.named_sequence` inside an existing
+        # block — typically the body block of a shared `__hc_intrinsic_lowerings__`
+        # module that aggregates every recipe from one frontend lowering pass.
+        return _TransformModuleBuilder(self, context=context).append_named_sequence(
+            target_block
+        )
+
+    def sequence_symbol_name(self) -> str:
+        return _recipe_symbol_name(self)
 
     def _input_handles(self) -> tuple[RecipeValue, ...]:
         result: list[RecipeValue] = []
@@ -283,7 +300,7 @@ class _TransformModuleBuilder:
         hc.register_dialects(self.context)
         self._handles: dict[tuple[str, str | int], Any] = {}
 
-    def build(self) -> Any:
+    def build_module(self) -> Any:
         with self.context, self.ir.Location.unknown(self.context):
             module = self.ir.Module.create()
             module.operation.attributes["transform.with_named_sequence"] = (
@@ -294,12 +311,28 @@ class _TransformModuleBuilder:
             module.operation.verify()
             return module
 
-    def _build_named_sequence(self) -> None:
+    def append_named_sequence(self, target_block: Any) -> Any:
+        # The caller owns the parent module's `transform.with_named_sequence`
+        # marker; we only emit the named_sequence op. Symbol uniqueness comes
+        # from `_recipe_symbol_name(recipe)`, which encodes intrinsic + target.
+        with (
+            self.context,
+            self.ir.Location.unknown(self.context),
+            self.ir.InsertionPoint(target_block),
+        ):
+            return self._build_named_sequence()
+
+    def _build_named_sequence(self) -> Any:
         any_op_type = self.transform.AnyOpType.get(self.context)
         sequence = self.transform.NamedSequenceOp(
             _recipe_symbol_name(self.recipe),
             [any_op_type],
             [],
+        )
+        # Outer `hc.target` lets the eventual interpreter pass index into the
+        # lowerings module by target string without parsing each body.
+        sequence.operation.attributes["hc.target"] = self.ir.StringAttr.get(
+            self.recipe.target, self.context
         )
         with self.ir.InsertionPoint(sequence.body):
             call = self._create_match_op(sequence.bodyTarget)
@@ -309,6 +342,7 @@ class _TransformModuleBuilder:
             if self.recipe.replacement:
                 self._create_replace_op(call.result)
             self.transform.YieldOp([])
+        return sequence
 
     def _create_match_op(self, root: Any) -> Any:
         return self.ir.Operation.create(

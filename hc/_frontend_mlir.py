@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from ._frontend import FrontendEmitError
 from ._intrinsic_contracts import validate_intrinsic_type_contract_record
+from ._intrinsic_recipes import IntrinsicTransformRecipe
 from .mlir import ir
 from .mlir.dialects import hc_front
 
@@ -59,6 +60,12 @@ class HCFrontEmitter:
         self._blocks: list[Any] = []
         self._frames: list[_Frame] = []
         self._value_type = hc_front.ValueType.get(self._context)
+        # Lazily-created sibling top-level `builtin.module` that aggregates
+        # `transform.named_sequence` recipes for every intrinsic-with-lowerings
+        # encountered during this lowering. Stays None when no intrinsic
+        # surfaces target lowerings, keeping the dump stable for unrelated
+        # tests.
+        self._intrinsic_lowerings_block: Any | None = None
 
     @property
     def module(self) -> Any:
@@ -69,6 +76,7 @@ class HCFrontEmitter:
     def begin_module(self, *, filename: str) -> None:
         self._filename = filename
         self._frames = []
+        self._intrinsic_lowerings_block = None
         with ir.Location.unknown(self._context):
             self._module = ir.Module.create()
         self._blocks = [self._module.body]
@@ -771,6 +779,7 @@ class HCFrontEmitter:
         self._set_optional_type_contract_attr(
             op, "result_types", metadata.get("result_types")
         )
+        self._emit_intrinsic_lowering_recipes(metadata.get("lowering_recipes"))
 
     def _set_optional_type_contract_attr(
         self,
@@ -803,6 +812,52 @@ class HCFrontEmitter:
         if isinstance(expr, str):
             entries["expr"] = self._string_attr(expr)
         return ir.DictAttr.get(entries, context=self._context)
+
+    def _emit_intrinsic_lowering_recipes(self, value: object) -> None:
+        # Recipes ride along as real `transform.named_sequence` ops inside a
+        # sibling top-level `builtin.module @__hc_intrinsic_lowerings__`. The
+        # transform interpreter pass walks them by symbol; symbol names encode
+        # `<intrinsic>_<target>` so we don't need a string DictAttr to carry
+        # the binding.
+        if value is None:
+            return
+        if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+            raise RuntimeError(
+                "frontend metadata 'lowering_recipes' must be a sequence"
+            )
+        for recipe in value:
+            if not isinstance(recipe, IntrinsicTransformRecipe):
+                raise RuntimeError(
+                    f"expected intrinsic transform recipe, got {recipe!r}"
+                )
+            recipe.append_named_sequence(
+                self._ensure_intrinsic_lowerings_block(),
+                context=self._context,
+            )
+
+    def _ensure_intrinsic_lowerings_block(self) -> Any:
+        if self._intrinsic_lowerings_block is not None:
+            return self._intrinsic_lowerings_block
+        if self._module is None:
+            raise RuntimeError(
+                "frontend lowering must open a module before recording recipes"
+            )
+        with ir.Location.unknown(self._context):
+            with ir.InsertionPoint(self._module.body):
+                module_op = ir.Operation.create(
+                    "builtin.module",
+                    regions=1,
+                    attributes={
+                        "sym_name": ir.StringAttr.get(
+                            "__hc_intrinsic_lowerings__",
+                            self._context,
+                        ),
+                        "transform.with_named_sequence": ir.UnitAttr.get(self._context),
+                    },
+                )
+            block = module_op.regions[0].blocks.append()
+        self._intrinsic_lowerings_block = block
+        return block
 
     def _set_optional_i32_attr(self, op: Any, name: str, value: object) -> None:
         # Symmetrical with sibling _set_optional_* helpers: loud on bad

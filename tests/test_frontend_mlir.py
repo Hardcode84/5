@@ -109,6 +109,20 @@ def _metadata_intrinsic(group, *, wave_size, arch):  # pragma: no cover - metada
     ...
 
 
+@_metadata_intrinsic.lower(target="amdgpu-gfx11")
+def _lower_metadata_intrinsic(t, call):  # pragma: no cover - recipe-only
+    op = t.create(
+        "test.metadata_intrinsic",
+        operands=[call.operand("group")],
+        result_types=[call.result_type(0)],
+        attrs={
+            "arch": call.attr("arch"),
+            "wave_size": call.attr("wave_size"),
+        },
+    )
+    return op.result(0)
+
+
 @lru_cache(maxsize=1)
 def _ensure_hc_front_bindings_available() -> None:
     llvm_install_root = ensure_llvm_toolchain()
@@ -340,6 +354,27 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         assert result_types[0]["kind"].value == "vector"
         assert _string_array_values(result_types[0]["shape"]) == ["8"]
         assert result_types[0]["dtype"].value == "float32"
+        # No `lowering_recipes` attribute lives on the intrinsic op. The
+        # recipes ride along as real `transform.named_sequence` ops inside a
+        # sibling top-level `builtin.module @__hc_intrinsic_lowerings__`.
+        assert "lowering_recipes" not in intrinsic_op.attributes
+        siblings = list(module.body.operations)
+        lowerings = next(op for op in siblings if op.operation.name == "builtin.module")
+        assert lowerings.operation.attributes["sym_name"].value == (
+            "__hc_intrinsic_lowerings__"
+        )
+        assert "transform.with_named_sequence" in lowerings.operation.attributes
+        sequences = list(lowerings.regions[0].blocks[0].operations)
+        assert len(sequences) == 1
+        sequence = sequences[0]
+        assert sequence.operation.name == "transform.named_sequence"
+        assert sequence.operation.attributes["sym_name"].value == (
+            "__hc_lower_metadata_intrinsic_amdgpu_gfx11"
+        )
+        assert sequence.operation.attributes["hc.target"].value == ("amdgpu-gfx11")
+        body_text = str(sequence)
+        assert "transform.hc.match_intrinsic_call" in body_text
+        assert "test.metadata_intrinsic" in body_text
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

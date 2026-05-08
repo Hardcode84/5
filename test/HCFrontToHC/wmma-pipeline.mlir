@@ -89,3 +89,17 @@
 // CHECK-SAME: parameters = ["group", "a_tile", "b_tile", "a_frag", "b_frag", "acc_frag", "lane", "wave_size", "arch"]
 // CHECK-SAME: keyword_only = ["lane", "wave_size", "arch"]
 // CHECK-NEXT: }
+
+// Target lowerings ride along as real `transform.named_sequence` ops in a
+// sibling top-level module. The interpreter pass walks them by symbol;
+// keeping the recipe IR first-class means the verifier checks structure
+// instead of trusting an opaque string.
+// CHECK-LABEL: module @__hc_intrinsic_lowerings__
+// CHECK-SAME: attributes {transform.with_named_sequence}
+// CHECK: transform.named_sequence @__hc_lower_wmma_gfx11_amdgpu_gfx11
+// CHECK-SAME: hc.target = "amdgpu-gfx11"
+// CHECK: transform.hc.match_intrinsic_call
+// CHECK-SAME: @wmma_gfx11
+// CHECK-SAME: target = "amdgpu-gfx11"
+// CHECK: transform.hc.create_op "amdgpu.wmma"
+// CHECK: transform.hc.replace_intrinsic_call

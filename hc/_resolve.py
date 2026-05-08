@@ -298,19 +298,27 @@ def _fn_name(fn: Any) -> str:
 def _classify_module(module: Any, fns: tuple[Any, ...]) -> None:
     from .mlir import ir as _ir
 
-    # ``lower_functions_to_front_ir`` emits one top-level op per ``fn`` in the
-    # order of ``fns`` (see hc/_frontend.py). Pair by index rather than by IR
-    # ``sym_name``: two helpers with the same ``__name__`` would collide in a
-    # name-keyed dict and silently mis-resolve the wrong region.
+    # ``lower_functions_to_front_ir`` emits one top-level op per ``fn`` in
+    # the order of ``fns`` (see hc/_frontend.py), interleaved with optional
+    # support modules that the frontend appends as siblings (e.g. the
+    # ``__hc_intrinsic_lowerings__`` transform module that carries target
+    # recipes). Filter the latter out before pairing — they have no Python
+    # fn behind them and need no classification.
     ctx = module.context
-    toplevels = list(module.body.operations)
+    toplevels = [op for op in module.body.operations if _classifiable_toplevel(op)]
     if len(toplevels) != len(fns):
         raise FrontendError(
-            f"hc_front module has {len(toplevels)} top-level ops but the "
-            f"resolver collected {len(fns)} Python fns; emission order broke"
+            f"hc_front module has {len(toplevels)} classifiable top-level ops "
+            f"but the resolver collected {len(fns)} Python fns; emission order "
+            "broke"
         )
     for toplevel, fn in zip(toplevels, fns, strict=True):
         _OpClassifier(fn=fn, ctx=ctx, ir=_ir).classify(toplevel)
+
+
+def _classifiable_toplevel(op: Any) -> bool:
+    name = str(op.operation.name)
+    return name.startswith("hc_front.")
 
 
 class _OpClassifier:

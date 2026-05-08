@@ -40,14 +40,18 @@
 //    here.
 //
 // Intrinsic bodies are discarded. `@kernel.intrinsic`-decorated Python
-// bodies are simulator fallbacks with no compilation meaning; the
-// lowered `hc.intrinsic` is a declaration (signature + scope/effects/
-// const_kwargs + empty entry block with param args, zero body ops —
-// no `hc.assign` either, since there is no body scan downstream for
-// them to seed). A consequence worth spelling out: this pass does
-// *not* validate the contents of an intrinsic body. Malformed ops
-// inside a simulator fallback pass through as-is until the source op
-// is erased.
+// bodies are simulator fallbacks with no compilation meaning; target
+// lowering recipes ride alongside as a sibling top-level `builtin.module`
+// (`@__hc_intrinsic_lowerings__`) carrying a `transform.named_sequence`
+// per `(intrinsic, target)` pair. That sibling is not an `hc_front.*` op,
+// so this pass leaves it untouched — the eventual interpreter pass picks
+// the recipes up by walking the tagged module. The lowered `hc.intrinsic`
+// is a declaration (signature + scope/effects/const_kwargs + empty entry
+// block with param args, zero body ops — no `hc.assign` either, since
+// there is no body scan downstream for them to seed). A consequence worth
+// spelling out: this pass does *not* validate the contents of an
+// intrinsic body. Malformed ops inside a simulator fallback pass through
+// as-is until the source op is erased.
 //
 // Explicitly deferred to later passes:
 //  * loop-carried iter_arg analysis (`-hc-promote-names`).

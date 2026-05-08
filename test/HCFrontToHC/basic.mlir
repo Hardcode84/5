@@ -217,6 +217,26 @@ module {
     hc_front.return %sum
   }
 
+  // Target lowering recipes ride along as real `transform.named_sequence`
+  // ops in a sibling top-level module. The conversion pass leaves that
+  // module untouched (it's not an `hc_front.*` op), so verifying it is
+  // present on the output is enough to prove the carry-through is wired.
+  //
+  // The body is intentionally empty here — handwritten IR may still tag
+  // the intrinsic with metadata even when the matching named_sequence is
+  // declared in a hand-rolled lowerings module elsewhere; we don't try to
+  // generate one in basic round-trip fixtures.
+  // CHECK-LABEL: hc.intrinsic @intr_with_recipes
+  // CHECK-SAME: scope = <"WorkItem">
+  // CHECK-NOT: lowering_recipes
+  hc_front.intrinsic "intr_with_recipes" attributes {
+    decorators = ["kernel.intrinsic"],
+    parameters = [{name = "group", passing = "positional"}],
+    scope = "WorkItem"
+  } {
+    hc_front.return
+  }
+
   // The frontend emits operand-less `hc_front.return` for Python `return None`
   // in kernels; conversion must keep the resulting `hc.return` operand-less.
   // CHECK-LABEL: hc.kernel @return_none

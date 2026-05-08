@@ -1175,7 +1175,7 @@ def _collect_toplevel_metadata(fn: Any) -> dict[str, object]:
         return _serialize_func_metadata(func_meta)
     intrinsic_meta = getattr(fn, "__hc_intrinsic__", None)
     if intrinsic_meta is not None:
-        return _serialize_intrinsic_metadata(intrinsic_meta)
+        return _serialize_intrinsic_metadata(intrinsic_meta, fn)
     return {}
 
 
@@ -1203,7 +1203,7 @@ def _serialize_func_metadata(meta: Any) -> dict[str, object]:
     return result
 
 
-def _serialize_intrinsic_metadata(meta: Any) -> dict[str, object]:
+def _serialize_intrinsic_metadata(meta: Any, fn: Any) -> dict[str, object]:
     result: dict[str, object] = {}
     scope = _scope_text(meta.scope)
     if scope is not None:
@@ -1220,7 +1220,17 @@ def _serialize_intrinsic_metadata(meta: Any) -> dict[str, object]:
         result["result_types"] = tuple(
             serialize_intrinsic_type_spec(item) for item in meta.result_types
         )
+    recipes = _intrinsic_lowering_recipes(fn)
+    if recipes:
+        result["lowering_recipes"] = recipes
     return result
+
+
+def _intrinsic_lowering_recipes(fn: Any) -> tuple[Any, ...]:
+    lowerings = getattr(fn, "__hc_lowerings__", None)
+    if not lowerings:
+        return ()
+    return tuple(recipe for _target, recipe in sorted(lowerings.items()))
 
 
 def _shape_tuple(values: Iterable[Any]) -> tuple[str, ...]:

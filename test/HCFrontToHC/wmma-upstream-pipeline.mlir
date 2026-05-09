@@ -6,18 +6,27 @@
 // Mirrors `hc/schedules/front_to_hc.mlir` as a hand-rolled `hc-opt` pass list
 // so this LIT can run from any builder that has `hc-opt` in PATH and proves
 // every milestone the bead checklist requires:
-//   * `hc.kernel` becomes a host `func.func` with a `gpu.launch` body
+//   * `hc.kernel` becomes a host `func.func` calling `gpu.launch_func`
 //   * buffer ABI arguments become upstream `memref` types
-//   * `hc.for_range` becomes `scf.for` with carried `vector` iter args
-//   * decomposition + launch-body lowering wipe semantic `!hc.tensor<...>` /
-//     `!hc.vector<...>` containers
-//   * masks reach upstream `vector<NxI1>` and feed `arith.select` paths
-//   * the WMMA intrinsic lowers to `amdgpu.wmma` after the recipe runs
-//   * no `hc.*` ops survive the final canonicalize/cse pair (the intrinsic
-//     decl is DCE'd by `-hc-interpret-intrinsic-recipes` once its last call
-//     is rewritten, and the launch-body UCC-wrapped operand types fold away
-//     when the recipe-inserted bare↔upstream casts pair with the existing
-//     UCCs and canonicalize collapses the chains to identity)
+//   * `gpu-kernel-outlining` relocates the launch body into a sibling
+//     `gpu.module @<kernel>_kernel` containing a `gpu.func`, and
+//     `rocdl-attach-target` stamps it with `#rocdl.target<chip = "gfx1100">`
+//   * inside the gpu.module: `hc.for_range` becomes `scf.for` with carried
+//     `vector` iter args; decomposition + launch-body lowering wipe
+//     semantic `!hc.tensor<...>` / `!hc.vector<...>` containers; masks
+//     reach upstream `vector<NxI1>` and feed `arith.select` paths; the
+//     WMMA intrinsic lowers to `amdgpu.wmma`
+//   * no `hc.*` ops survive (the intrinsic decl is DCE'd by
+//     `-hc-interpret-intrinsic-recipes` once its last call is rewritten,
+//     and the launch-body UCC-wrapped operand types fold away when the
+//     recipe-inserted bare↔upstream casts pair with the existing UCCs and
+//     canonicalize collapses the chains to identity)
+//
+// The remaining gpu.module body lowering chain (amdgpu/scf/memref/vector
+// → llvm-dialect inside the module) and `hc-lower-gpu-to-binary` are
+// deliberately not yet exercised here — they need the ROCDL-equivalent
+// of `gpu-lower-to-nvvm-pipeline`, which is a substantially separate
+// piece of work tracked as a follow-up bead.
 //
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
 // RUN:   | hc-opt --hc-front-fold-region-defs --hc-front-inline \
@@ -30,25 +39,38 @@
 // RUN:        --canonicalize --cse \
 // RUN:        --hc-interpret-intrinsic-recipes='target=amdgpu-gfx11' \
 // RUN:        --canonicalize --cse \
+// RUN:        --gpu-kernel-outlining --canonicalize --cse \
+// RUN:        --rocdl-attach-target=chip=gfx1100 --canonicalize --cse \
 // RUN:   | FileCheck %s --implicit-check-not='hc.' --implicit-check-not='!hc.'
 
-// `hc.kernel` is gone; the kernel landed as a host `func.func` taking the
-// flattened buffer-ABI arguments as upstream dynamic memrefs. The
-// `--implicit-check-not='hc.'` guard above pins zero residual HC ops or
-// types — both `hc.call_intrinsic`/`hc.intrinsic` and the `!hc.bare_vector`
-// types the launch-body pass plants at the call boundary should be folded
-// away by the recipe interpretation + canonicalize pair.
+// Host wrapper: `hc.kernel` is gone, the kernel landed as a host
+// `func.func` taking the flattened buffer-ABI arguments as upstream
+// dynamic memrefs and dispatching the device body via `gpu.launch_func`.
+// The `--implicit-check-not='hc.'` guard above pins zero residual HC
+// ops or types — both `hc.call_intrinsic`/`hc.intrinsic` and the
+// `!hc.bare_vector` types the launch-body pass plants at the call
+// boundary should be folded away by the recipe interpretation +
+// canonicalize pair.
 // CHECK-LABEL: func.func @tiled_gfx11_wmma_matmul(
 // CHECK-SAME: %{{[^:]+}}: memref<?x?xf16>
 // CHECK-SAME: %{{[^:]+}}: memref<?x?xf16>
 // CHECK-SAME: %{{[^:]+}}: memref<?x?xf32>
 
-// The kernel body becomes a `gpu.launch`; block/thread counts come from
-// `work_shape / group_shape`, not raw `work_shape` — `arith.ceildivui` /
-// `arith.muli` show that the pipeline computed them.
+// Block/thread counts come from `work_shape / group_shape`, not raw
+// `work_shape` — `arith.ceildivui` / `arith.muli` show that the
+// pipeline computed them — and feed straight into `gpu.launch_func`.
 // CHECK: arith.ceildivui
-// CHECK: gpu.launch blocks(%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
-// CHECK-SAME: threads(%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+// CHECK: gpu.launch_func @tiled_gfx11_wmma_matmul_kernel::@tiled_gfx11_wmma_matmul_kernel
+// CHECK-SAME: blocks in (%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+// CHECK-SAME: threads in (%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+
+// Sibling `gpu.module` carrying the rocdl target attribute that
+// downstream binary emission keys off, and a `gpu.func` holding the
+// device body. `gpu-kernel-outlining` relocates everything below; the
+// host above keeps just the launch.
+// CHECK-LABEL: gpu.module @tiled_gfx11_wmma_matmul_kernel
+// CHECK-SAME: [#rocdl.target<chip = "gfx1100">]
+// CHECK: gpu.func @tiled_gfx11_wmma_matmul_kernel(
 
 // The K loop survives as a real `scf.for` carrying the accumulator
 // fragment as the iter arg. The mask channel folded away after the recipe
@@ -89,11 +111,10 @@
 // CHECK: memref.store %{{[^,]+}}, %{{[^[]+}}[%{{[^,]+}}, %{{[^]]+}}]
 // CHECK-SAME: : memref<?x?xf32>
 
-// `gpu.terminator` closes the launch and the kernel returns. The recipe
-// module is gone (the interpreter erased it after applying every
-// matching sequence) and the `hc.intrinsic @wmma_gfx11` decl is gone
-// (the interpreter sweeps unused decls once their last call site is
-// rewritten). Anything left over in either category would have been
-// caught by the `--implicit-check-not='hc.'` directive above.
-// CHECK: gpu.terminator
-// CHECK: return
+// `gpu.return` closes the kernel function. The recipe module is gone
+// (the interpreter erased it after applying every matching sequence)
+// and the `hc.intrinsic @wmma_gfx11` decl is gone (the interpreter
+// sweeps unused decls once their last call site is rewritten).
+// Anything left over in either category would have been caught by the
+// `--implicit-check-not='hc.'` directive above.
+// CHECK: gpu.return

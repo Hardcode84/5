@@ -627,94 +627,109 @@ def test_compile_surfaces_pipeline_failure_non_fatal(tmp_path: Path) -> None:
     assert result.stdout.strip().endswith("OK"), result.stdout
 
 
+# End-to-end assertion script for the canonical WMMA pipeline. Pinned at
+# module level (rather than dropped inline into the test) so lizard's
+# function-length lint stays happy and the assertions read in one piece
+# rather than wrapped in `textwrap.dedent` boilerplate.
+_WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
+    import re
+
+    import hc
+    from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
+
+
+    def main() -> None:
+        handle = hc.compile(tiled_gfx11_wmma_matmul)
+        expected = {
+            "tiled_gfx11_wmma_matmul",
+            "init_wmma_acc",
+            "issue_wmma_tile",
+            "store_wmma_tile",
+            "load_wmma_a_fragment",
+            "load_wmma_b_fragment",
+            "wmma_gfx11",
+        }
+        assert set(handle.front_ir_symbols) == expected, handle.front_ir_symbols
+        assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
+        assert handle.hc_ir is not None, handle.pipeline_diagnostics
+        assert handle.hc_ir_text is not None
+        # Default schedule now runs all the way through
+        # `hc-interpret-intrinsic-recipes` + canonicalize +
+        # gpu-kernel-outlining + rocdl-attach-target, so the post-compile
+        # IR is hc.*-free: every semantic and bare HC type, every HC op
+        # (region scope, load/store, intrinsic call, even the intrinsic
+        # decl), and the recipe-inserted bridging UCCs all fold away.
+        # `!hc.` covers every HC type spelling; matching just `hc.` would
+        # false-positive on substrings inside surrounding upstream tokens.
+        assert "!hc." not in handle.hc_ir_text, handle.hc_ir_text
+        stray_hc_ops = [
+            line for line in handle.hc_ir_text.splitlines()
+            if " hc." in line or line.lstrip().startswith("hc.")
+        ]
+        assert not stray_hc_ops, stray_hc_ops
+        # The recipe's bridging casts pair with the launch-body UCCs on
+        # either side of the call; canonicalize collapses the upstream →
+        # bare → upstream chain to identity, so no UCCs survive cleanup.
+        assert "unrealized_conversion_cast" not in handle.hc_ir_text
+        # Positive structural assertions: kernel-outlining split the
+        # launch into a host `func.func` calling `gpu.launch_func`, with
+        # the device body relocated into a sibling
+        # `gpu.module @<kernel>_kernel` stamped with the gfx1100 rocdl
+        # target. The K loop is still a real `scf.for`, tile staging
+        # uses upstream vector/memref ops, and the WMMA intrinsic landed
+        # as a plain upstream `amdgpu.wmma` between `vector<...>`
+        # operands — those all live inside the gpu.module now, waiting
+        # for the body lowering chain that the binary emission bead
+        # will add.
+        assert "func.func @tiled_gfx11_wmma_matmul" in handle.hc_ir_text
+        assert "gpu.launch_func" in handle.hc_ir_text
+        assert "gpu.launch " not in handle.hc_ir_text, handle.hc_ir_text
+        assert (
+            "gpu.module @tiled_gfx11_wmma_matmul_kernel" in handle.hc_ir_text
+        ), handle.hc_ir_text
+        assert (
+            '#rocdl.target<chip = "gfx1100">' in handle.hc_ir_text
+        ), handle.hc_ir_text
+        assert "gpu.func @" in handle.hc_ir_text
+        assert "scf.for" in handle.hc_ir_text, handle.hc_ir_text
+        assert "vector.transfer_read" in handle.hc_ir_text
+        assert "vector.transfer_write" in handle.hc_ir_text
+        assert "memref.alloca" in handle.hc_ir_text
+        assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
+        assert "memref.store" in handle.hc_ir_text
+        assert "vector.extract" in handle.hc_ir_text
+        wmma = re.search(
+            r"amdgpu\\.wmma 16x16x16 %\\S+ \\* %\\S+ \\+ %\\S+ : "
+            r"vector<16xf16>, vector<16xf16>, vector<8xf32>",
+            handle.hc_ir_text,
+        )
+        assert wmma, handle.hc_ir_text
+
+        loads = re.findall(
+            r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',
+            handle.front_ir_text,
+        )
+        assert loads, "expected at least one load-context name op"
+        for line in loads:
+            assert "ref = {" in line, line
+        print("OK")
+
+
+    if __name__ == "__main__":
+        main()
+    """)
+
+
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> None:
     # End-to-end assertion that what the resolver stamps flows through
     # ``hc.compile``: ``front_ir_symbols`` exposes the closed dep set and
     # every load-context ``hc_front.name`` carries a ``ref`` attribute.
     # The real WMMA example is the richest fixture we have for this check.
-    #
     script = tmp_path / "compile_wmma.py"
     script.write_text(
-        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
-            import re
-
-            import hc
-            from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
-
-
-            def main() -> None:
-                handle = hc.compile(tiled_gfx11_wmma_matmul)
-                expected = {
-                    "tiled_gfx11_wmma_matmul",
-                    "init_wmma_acc",
-                    "issue_wmma_tile",
-                    "store_wmma_tile",
-                    "load_wmma_a_fragment",
-                    "load_wmma_b_fragment",
-                    "wmma_gfx11",
-                }
-                assert set(handle.front_ir_symbols) == expected, (
-                    handle.front_ir_symbols
-                )
-                assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
-                assert handle.hc_ir is not None, handle.pipeline_diagnostics
-                assert handle.hc_ir_text is not None
-                # Default schedule now runs all the way through
-                # `hc-interpret-intrinsic-recipes` + a final canonicalize
-                # pair, so the post-compile IR is hc.*-free: every
-                # semantic and bare HC type, every HC op (region scope,
-                # load/store, intrinsic call, even the intrinsic decl),
-                # and the recipe-inserted bridging UCCs all fold away.
-                # `!hc.` covers every HC type spelling; matching just
-                # `hc.` would false-positive on substrings inside
-                # surrounding upstream tokens.
-                assert "!hc." not in handle.hc_ir_text, handle.hc_ir_text
-                stray_hc_ops = [
-                    line for line in handle.hc_ir_text.splitlines()
-                    if " hc." in line or line.lstrip().startswith("hc.")
-                ]
-                assert not stray_hc_ops, stray_hc_ops
-                # The recipe's bridging casts pair with the launch-body
-                # UCCs on either side of the call; canonicalize collapses
-                # the upstream → bare → upstream chain to identity, so
-                # no UCCs survive the final cleanup.
-                assert "unrealized_conversion_cast" not in handle.hc_ir_text
-                # Positive structural assertions: kernel becomes a host
-                # `func.func` with a `gpu.launch` body, the K loop is a
-                # real `scf.for`, tile staging uses upstream
-                # vector/memref ops, and the WMMA intrinsic landed as a
-                # plain upstream `amdgpu.wmma` between `vector<...>`
-                # operands.
-                assert "func.func @tiled_gfx11_wmma_matmul" in handle.hc_ir_text
-                assert "gpu.launch" in handle.hc_ir_text
-                assert "scf.for" in handle.hc_ir_text, handle.hc_ir_text
-                assert "vector.transfer_read" in handle.hc_ir_text
-                assert "vector.transfer_write" in handle.hc_ir_text
-                assert "memref.alloca" in handle.hc_ir_text
-                assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
-                assert "memref.store" in handle.hc_ir_text
-                assert "vector.extract" in handle.hc_ir_text
-                wmma = re.search(
-                    r"amdgpu\\.wmma 16x16x16 %\\S+ \\* %\\S+ \\+ %\\S+ : "
-                    r"vector<16xf16>, vector<16xf16>, vector<8xf32>",
-                    handle.hc_ir_text,
-                )
-                assert wmma, handle.hc_ir_text
-
-                loads = re.findall(
-                    r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',
-                    handle.front_ir_text,
-                )
-                assert loads, "expected at least one load-context name op"
-                for line in loads:
-                    assert "ref = {" in line, line
-                print("OK")
-
-
-            if __name__ == "__main__":
-                main()
-            """)
+        f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        + _WMMA_COMPILE_SMOKE_SCRIPT
     )
 
     result = _run_compile_smoke(script)

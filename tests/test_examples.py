@@ -41,6 +41,12 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
 
     captured = capsys.readouterr()
     assert "func.func @tiled_gfx11_wmma_matmul" in captured.out
-    assert "gpu.launch" in captured.out
+    # The default schedule outlines the launch into `gpu.launch_func`
+    # (host) + `gpu.module @<kernel>_kernel` (device) and stamps the
+    # module with the gfx1100 rocdl target. Pin both halves so the
+    # dump test fails loudly if outlining/attach-target ever drops out.
+    assert "gpu.launch_func" in captured.out
+    assert "gpu.module @tiled_gfx11_wmma_matmul_kernel" in captured.out
+    assert '#rocdl.target<chip = "gfx1100">' in captured.out
     assert "hc.kernel" not in captured.out
     assert "hc_front." not in captured.out

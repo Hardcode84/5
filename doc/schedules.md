@@ -67,16 +67,43 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m14 : !transform.any_op
+    %m15 = transform.apply_registered_pass "gpu-kernel-outlining" to %m14
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m15 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m15 : !transform.any_op
+    %m16 = transform.apply_registered_pass "rocdl-attach-target"
+        with options = { "chip" = "__HC_CHIP__" } to %m15
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m16 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m16 : !transform.any_op
     transform.yield
   }
 }
 ```
 
-The `__HC_TARGET__` token is a substitution sentinel: the Python driver
-replaces it with the value of `hc.compile(target=...)` (empty string for
-the `None` default) before parsing the schedule. Custom schedules that
-keep the placeholder pick up the `target=` plumbing for free; ones that
-drop it own their own pass invocations.
+The `__HC_TARGET__` and `__HC_CHIP__` tokens are substitution sentinels:
+the Python driver replaces them before parsing the schedule.
+`__HC_TARGET__` takes the value of `hc.compile(target=...)` (empty string
+for the `None` default). `__HC_CHIP__` takes the AMDGPU chip name resolved
+from the same `target=` (e.g. `amdgpu-gfx11` -> `gfx1100`); a bare
+`gfx<chip>` works verbatim; anything else falls back to the default chip.
+Custom schedules that keep the placeholders pick up the `target=` plumbing
+for free; ones that drop them own their own pass invocations.
+
+The closing trio splits each `gpu.launch` into a `gpu.module @<kernel>_kernel`
++ `gpu.func` + `gpu.launch_func` (`gpu-kernel-outlining`) and stamps the
+module with `#rocdl.target<chip = "...">` (`rocdl-attach-target`) so the
+binary-emission pass downstream has the chip info it needs. The actual
+`gpu.module` body lowering chain (amdgpu/scf/memref/vector → llvm-dialect
+inside the module) and `hc-lower-gpu-to-binary` are not yet in the default
+schedule — they need a ROCDL-equivalent of upstream's
+`gpu-lower-to-nvvm-pipeline` (workgroup memref address-space mapping,
+kernel ABI, scf/vector lowering inside `gpu.module`) which is a
+substantively separate piece of work tracked as a follow-up.
 
 Bound symbolic expression materialization runs after type inference so it can
 see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope
@@ -129,6 +156,15 @@ intrinsic registers at most one recipe per compile. When multi-target
 lowerings co-exist in one module, pass an explicit `target=` so the
 interpreter picks the right recipe instead of running them all.
 
+The same `target=` value is mapped to an AMDGPU chip name and substituted
+into `__HC_CHIP__` so `rocdl-attach-target` can stamp every `gpu.module`
+with `#rocdl.target<chip = "...">`. The current map covers `amdgpu-gfx11`
+-> `gfx1100`; a bare `gfx<chip>` string is accepted verbatim for
+chips the project hasn't catalogued yet. With `target=None` the chip
+falls back to `gfx1100`, which is harmless because `rocdl-attach-target`
+only runs on payloads that produced a `gpu.module` (i.e. non-trivial
+kernels — and those will need to opt into a real target soon enough).
+
 Strings containing `"`, `\`, `\n`, or `\r` are rejected up front: those
 characters would either close the substituted MLIR string literal early
 or break the transform option parser. The handle echoes the value back
@@ -157,9 +193,9 @@ move the gap to the next pass.
 * `None` (default) — use the bundled schedule.
 
 Anything else is a `TypeError`. Both file and string schedules go
-through the same `__HC_TARGET__` substitution as the default, so a
-custom schedule that wants the `target=` plumbing only needs to keep
-the placeholder where it makes sense.
+through the same `__HC_TARGET__` and `__HC_CHIP__` substitutions as the
+default, so a custom schedule that wants the `target=` plumbing only
+needs to keep the placeholders where it makes sense.
 
 ### Example: skip `hc-promote-names`
 

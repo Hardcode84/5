@@ -46,6 +46,38 @@ _TARGET_PLACEHOLDER = "__HC_TARGET__"
 # garbled MLIR diagnostic.
 _TARGET_FORBIDDEN_CHARS = frozenset('"\\\n\r')
 
+# Sister sentinel for the AMDGPU chip name (e.g. "gfx1100") that
+# downstream gpu lowering passes need spelled out — `rocdl-attach-target`,
+# `convert-amdgpu-to-rocdl`, etc. The default schedule plants this in
+# `rocdl-attach-target`'s `chip=` option. A user-provided schedule that
+# omits the placeholder silently ignores the value.
+_CHIP_PLACEHOLDER = "__HC_CHIP__"
+# Same character blacklist as `_TARGET_FORBIDDEN_CHARS` — gfx-style
+# chip names are alphanumeric anyway, but being explicit lets callers
+# pass arbitrary strings (custom kernels, future targets) without
+# tripping the MLIR option parser.
+_CHIP_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
+
+# Default chip when the caller doesn't pass `target=`. The bigger
+# pipeline doesn't actually use the chip until `rocdl-attach-target`
+# fires, which only matters for kernels that reach `gpu.module` (i.e.
+# anything with non-trivial body). For trivial / fully-folded kernels
+# the value is moot. Keep it pointed at the gfx11 part the WMMA work
+# is built around so the default produces sensible IR for every
+# kernel the project currently exercises end-to-end.
+_DEFAULT_CHIP = "gfx1100"
+
+# `target=` strings to AMDGPU chip names. The mapping is intentionally
+# narrow — every entry is a target the project has actively exercised
+# end-to-end. Unknown targets (including the bare gfx-style names like
+# `gfx1100`) fall through to a sanity check that accepts any
+# `gfx`-prefixed string verbatim, so callers running on a chip we
+# haven't catalogued yet can still get a working schedule by passing
+# `target="gfx<chip>"` directly.
+_TARGET_CHIP_MAP: dict[str, str] = {
+    "amdgpu-gfx11": "gfx1100",
+}
+
 ScheduleSource = Path | str | None
 
 # hc's own passes register exactly once per process. Upstream passes are
@@ -97,6 +129,15 @@ def run_front_to_hc(
     regardless of `hc.target`. A user-provided schedule that does not
     contain the placeholder silently ignores the value — the override
     owns its own pass invocations.
+
+    The `__HC_CHIP__` placeholder is filled in the same pass: `target=`
+    is mapped through `_TARGET_CHIP_MAP` (e.g. `"amdgpu-gfx11"` →
+    `"gfx1100"`) to the AMDGPU chip name `rocdl-attach-target` and
+    `convert-amdgpu-to-rocdl` need. Passing a bare `gfx<chip>` string
+    works too — anything starting with `gfx` is accepted verbatim. With
+    `target=None` the chip falls back to `_DEFAULT_CHIP`, which is fine
+    because chip-keyed passes are no-ops on a payload that never grew
+    a `gpu.module` (trivial/fully-folded kernels).
     """
 
     from .mlir import ir
@@ -222,6 +263,7 @@ def _schedule_file(
 
     text = _resolve_schedule_text(schedule)
     text = _substitute_target(text, target)
+    text = _substitute_chip(text, target)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".mlir", delete=True, encoding="utf-8"
     ) as f:
@@ -267,6 +309,38 @@ def _validate_target(target: str) -> str:
         # whitespace that the transform option parser splits on.
         raise ValueError(f"target contains forbidden characters {bad}: {target!r}")
     return target
+
+
+def _substitute_chip(text: str, target: str | None) -> str:
+    chip = _resolve_chip(target)
+    return text.replace(_CHIP_PLACEHOLDER, chip)
+
+
+def _resolve_chip(target: str | None) -> str:
+    """Map the user-facing `target=` to an AMDGPU chip name.
+
+    `None` -> `_DEFAULT_CHIP`; named target -> table lookup; bare
+    `gfx<chip>` -> verbatim. Anything else is rejected — better to fail
+    here than to feed `rocdl-attach-target` a chip it can't parse.
+    """
+
+    if target is None:
+        return _DEFAULT_CHIP
+    if not isinstance(target, str):
+        raise TypeError(f"target must be str | None, got {type(target).__name__}")
+    bad = sorted({c for c in target if c in _CHIP_FORBIDDEN_CHARS})
+    if bad:
+        raise ValueError(f"target contains forbidden characters {bad}: {target!r}")
+    if target in _TARGET_CHIP_MAP:
+        return _TARGET_CHIP_MAP[target]
+    if target.startswith("gfx"):
+        return target
+    # Unknown logical target — recipe interpretation will simply not
+    # match anything (and surface its own diagnostic), so picking the
+    # default chip here keeps the schedule's GPU lowering passes
+    # well-formed enough to run without producing confusing
+    # second-order diagnostics from chip parsing.
+    return _DEFAULT_CHIP
 
 
 def _default_schedule_text() -> str:

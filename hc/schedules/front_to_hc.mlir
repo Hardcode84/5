@@ -170,8 +170,18 @@ module attributes {transform.with_named_sequence} {
     // `hc-lower-gpu-to-binary` (both wired by the appended GPU
     // lowering pipeline in `hc/_pipeline.py`) key off this attribute.
     // Pass is a no-op on payloads with no `gpu.module`.
+    //
+    // `features` carries the LLVM AMDGPU `target-features` string for
+    // the chip — currently just the wavefront size. gfx10+ chips need
+    // `+wavefrontsize32` for WMMA to lower to the right per-lane
+    // fragment layout; without it the AMDGPU backend defaults to
+    // wave64 and the matmul produces silently-wrong numerics. The
+    // Python driver picks the feature string from the resolved chip
+    // family (`_resolve_features` in `hc/_pipeline.py`) and substitutes
+    // it in here. Empty string is the right default for chips that
+    // only run wave64.
     %m17 = transform.apply_registered_pass "rocdl-attach-target"
-        with options = { "chip" = "__HC_CHIP__" } to %m16
+        with options = { "chip" = "__HC_CHIP__", "features" = "__HC_FEATURES__" } to %m16
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m17 {
       transform.apply_patterns.canonicalization

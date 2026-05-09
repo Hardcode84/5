@@ -109,6 +109,18 @@ _TARGET_CHIP_MAP: dict[str, str] = {
 _LLD_PLACEHOLDER = "__HC_LLD__"
 _LLD_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
+# Sister sentinel for the AMDGPU LLVM target-features string. The
+# wavefront size in particular is part of this string (e.g.
+# `+wavefrontsize32`), and chips in the gfx10/gfx11/gfx12 families need
+# the wave32 feature explicitly to lower WMMA correctly — the LLVM
+# AMDGPU defaults for those chips compile to wave64 otherwise, which
+# silently produces garbage WMMA results because the per-lane fragment
+# layout differs. Older chips (gfx9 and below) only ever ran wave64; we
+# leave the features string empty for those so the LLVM defaults still
+# apply.
+_FEATURES_PLACEHOLDER = "__HC_FEATURES__"
+_FEATURES_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
+
 # Device-side lowering chain appended after the user's schedule fires.
 # Two things matter about the order:
 #
@@ -371,6 +383,7 @@ def _schedule_file(
     text = _resolve_schedule_text(schedule)
     text = _substitute_target(text, target)
     text = _substitute_chip(text, target)
+    text = _substitute_features(text, target)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".mlir", delete=True, encoding="utf-8"
     ) as f:
@@ -474,6 +487,52 @@ def _resolve_chip(target: str | None) -> str:
     # well-formed enough to run without producing confusing
     # second-order diagnostics from chip parsing.
     return _DEFAULT_CHIP
+
+
+def _substitute_features(text: str, target: str | None) -> str:
+    return text.replace(_FEATURES_PLACEHOLDER, _resolve_features(target))
+
+
+def _resolve_features(target: str | None) -> str:
+    """Pick the LLVM AMDGPU `target-features` string for `target`.
+
+    The only feature we set today is the wavefront size: gfx10+ chips
+    must compile in wave32 mode for WMMA to produce the per-lane
+    fragment layout the kernels assume, and the LLVM AMDGPU backend
+    defaults to wave64 for every chip when the feature string is empty.
+    Older chips (gfx9 and below) only ever ran wave64 and don't expose
+    a wave32 mode, so we leave their features empty and let the LLVM
+    defaults stand.
+    """
+
+    chip = _resolve_chip(target)
+    family = _gfx_family(chip)
+    if family is not None and family >= 10:
+        return "+wavefrontsize32"
+    return ""
+
+
+def _gfx_family(chip: str) -> int | None:
+    # Pull the major version out of `gfx<major><minor><stepping>`. We
+    # only need the major to decide between wave32 and wave64, so the
+    # tail (which varies in width across families — gfx900, gfx1100,
+    # gfx12_50_) doesn't matter. Returns `None` for anything that
+    # doesn't look like a `gfx<digits>` chip so the caller can fall
+    # back to "no features"; that path also covers `_DEFAULT_CHIP`
+    # changes that drift away from the gfx scheme.
+    if not chip.startswith("gfx"):
+        return None
+    rest = chip[3:]
+    digits: list[str] = []
+    for char in rest:
+        if not char.isdigit():
+            break
+        digits.append(char)
+    if not digits:
+        return None
+    if len(digits) <= 2:
+        return int(digits[0])
+    return int("".join(digits[:-2]))
 
 
 def _default_schedule_text() -> str:

@@ -23,7 +23,11 @@
 // CHECK: %[[ORIGIN:[^ ]+]] = hc.tuple{{.*}} -> tuple<!hc.undef, !hc.undef>
 // CHECK: %[[ROW0:[^ ]+]] = hc.getitem %[[ORIGIN]]
 // CHECK: %[[COL0:[^ ]+]] = hc.getitem %[[ORIGIN]]
-// CHECK: %[[ACC0:[^ ]+]] = hc.call @init_wmma_acc(%[[GROUP]]) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> !hc.undef
+// `init_wmma_acc` carries (group, c, row0, col0) so it can stamp the
+// per-element output-validity mask onto the seed accumulator at
+// construction time -- see the bounds-aware accumulator notes in the
+// example kernel.
+// CHECK: %[[ACC0:[^ ]+]] = hc.call @init_wmma_acc(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]]) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef) -> !hc.undef
 // CHECK: %[[AK:[^ ]+]] = hc.buffer_dim %[[A]], axis = 1 : !hc.buffer<f16, ["M", "K"]> -> !hc.undef
 // CHECK: %[[ACC_FINAL:[^ ]+]]:3 = hc.for_range {{.*}} to %[[AK]] step {{.*}} iter_args({{.*}}, {{.*}}, %[[ACC0]]) : {{.*}} -> (!hc.undef, !hc.undef, !hc.undef) {
 // CHECK: ^bb0(%[[K0:arg[0-9]+]]: !hc.undef,
@@ -36,11 +40,17 @@
 // CHECK: hc.yield {{.*}} : !hc.undef, !hc.undef, !hc.undef
 // CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef, !hc.undef) -> ()
 
+// `init_wmma_acc` reads the per-lane output slice of `c` (`hc.vload` on a
+// strided `hc.buffer_view`) so the accumulator seed inherits the
+// bounds-aware mask the vload's clip-and-pad rule produces. The mask
+// rides through every k-tile iteration and gates the eventual
+// `group.store`, keeping right/bottom-edge tiles from writing OOB.
 // CHECK-LABEL: hc.func @init_wmma_acc
-// CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>) -> !hc.undef
+// CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: %{{.*}} = hc.workitem_region captures = ["group"] -> (!hc.undef)
-// CHECK: hc.vzeros shape %{{.*}}, dtype = f32 : ({{.*}}) -> !hc.undef
+// CHECK: %{{.*}} = hc.workitem_region captures = ["col0", "group", "c", "row0"] -> (!hc.undef)
+// CHECK: hc.vload {{.*}} : ({{.*}}) -> !hc.undef
+// CHECK: hc.buffer_view
 // CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 

@@ -107,7 +107,11 @@ def test_export_toolchain_environment_sets_mlir_config_dirs(tmp_path: Path) -> N
     assert env["HC_LLVM_INSTALL_DIR"] == str(install_root)
     assert env["LLVM_DIR"] == str(install_root / "lib" / "cmake" / "llvm")
     assert env["MLIR_DIR"] == str(install_root / "lib" / "cmake" / "mlir")
-    assert env["HC_LLD"] == str(install_root / "bin" / "ld.lld")
+    # `HC_LLD` is intentionally not exported here. The pipeline resolves
+    # ld.lld from the bundled `hc/_native/bin/ld.lld` and propagates it
+    # through the `hc-lower-gpu-to-binary` pass option; the env var is
+    # only a manual escape hatch for direct `hc-opt` users.
+    assert "HC_LLD" not in env
 
 
 def test_replace_install_root_creates_missing_install_parent(tmp_path: Path) -> None:

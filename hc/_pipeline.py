@@ -24,6 +24,13 @@ interpreter's per-pass `PassManager`. Custom schedules still get the
 chain appended — overriding it would mean composing your own
 binary-emission stage and is out of scope for `schedule=`.
 
+The `ld.lld` path used by `hc-lower-gpu-to-binary` is resolved
+Python-side from `_native_paths.lld_path` (bundled binary in
+`hc/_native/bin/`, with an `HC_LLD` env override for source-tree
+work) and propagated through the `--lld-path=` pass option. The
+driver does not set or rely on `HC_LLD`; the pipeline is
+self-contained.
+
 Failure is non-fatal: on a pipeline error the result carries
 `module=None` + captured diagnostic strings. Callers inspect the
 result rather than wrapping in `try`.
@@ -31,7 +38,6 @@ result rather than wrapping in `try`.
 
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -39,6 +45,8 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any
+
+from ._native_paths import lld_path
 
 _ENTRY_POINT = "__transform_main"
 _DEFAULT_SCHEDULE_PACKAGE = "hc.schedules"
@@ -92,11 +100,12 @@ _TARGET_CHIP_MAP: dict[str, str] = {
 
 # Sister sentinel for `ld.lld` that `hc-lower-gpu-to-binary` invokes to
 # link the AMDGPU object into an HSACO blob. Substituted Python-side
-# from `_resolve_lld` (HC_LLD env -> empty). An empty substitution
-# leaves the pass to fall back to its own resolution chain (`HC_LLD`
-# env -> `$PATH`-search), so a sysadmin who set `HC_LLD` outside the
-# build tree gets the same answer either way; the placeholder exists
-# so the schedule string remains parseable when a path was resolved.
+# with the bundled-or-overridden path returned by `_native_paths.lld_path`
+# (the wheel ships `ld.lld` in `hc/_native/bin/`; `HC_LLD` overrides for
+# source-tree work against a freshly-built toolchain that hasn't been
+# re-staged). The pipeline propagates the resolved path through the
+# pass's `--lld-path=` option so `hc.compile` never depends on the
+# environment to locate the linker.
 _LLD_PLACEHOLDER = "__HC_LLD__"
 _LLD_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
@@ -212,11 +221,13 @@ def run_front_to_hc(
     passes are no-ops on a payload that never grew a `gpu.module`
     (trivial/fully-folded kernels).
 
-    `__HC_LLD__` is filled from the `HC_LLD` env var (set by
-    `build_tools/llvm_toolchain.py` and pre-populated by `pip install`
-    via the build backend). When the env is unset, the placeholder
-    collapses to the empty string and `hc-lower-gpu-to-binary` falls
-    through to its own resolution (`HC_LLD` env -> `$PATH`).
+    `__HC_LLD__` is filled with the path returned by
+    `hc._native_paths.lld_path` — bundled `hc/_native/bin/ld.lld` by
+    default, or `$HC_LLD` when set (source-tree work against a freshly
+    built toolchain). The build never sets `HC_LLD`; the pipeline
+    propagates the resolved path through the pass's `--lld-path=`
+    option, so `hc.compile` is self-contained and doesn't lean on the
+    environment to find the linker.
     """
 
     from .mlir import ir
@@ -407,26 +418,28 @@ def _substitute_chip(text: str, target: str | None) -> str:
 
 
 def _substitute_lld(text: str) -> str:
-    # Empty resolves to the pass's own fallback (HC_LLD env -> $PATH).
-    # Substituting in the resolved path eagerly when we have one keeps
-    # the pipeline string self-contained for callers that capture it
-    # for replay/debug; a missing HC_LLD falls through to the pass's
-    # own resolution and surfaces the same diagnostic users already see
-    # from manual `hc-opt --hc-lower-gpu-to-binary` invocations.
+    # Resolve eagerly so the pipeline string is self-contained — the
+    # whole point of this substitution is to propagate the linker path
+    # through the pass's `--lld-path=` option instead of leaving the
+    # pass to consult `HC_LLD` / `$PATH` at run time. We do not validate
+    # that the resolved path actually exists: if the wheel is mis-staged
+    # the C++ pass will surface a clear "ld.lld not found" diagnostic
+    # naming the missing path, which is more actionable than a Python
+    # IO error from this layer.
     return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
 
 
 def _resolve_lld() -> str:
-    raw = os.environ.get("HC_LLD", "")
-    if not raw:
-        return ""
+    raw = str(lld_path())
     bad = sorted({c for c in raw if c in _LLD_FORBIDDEN_CHARS})
     if bad:
         # Reject up front for the same reason `_validate_target` does:
         # MLIR's option parser doesn't survive embedded quotes/newlines
         # and the resulting diagnostic is much harder to debug than
         # this exception.
-        raise ValueError(f"HC_LLD env contains forbidden characters {bad}: {raw!r}")
+        raise ValueError(
+            f"resolved ld.lld path contains forbidden characters {bad}: {raw!r}"
+        )
     return raw
 
 

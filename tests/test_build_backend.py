@@ -79,7 +79,7 @@ def _record_package_native_install(
     monkeypatch.setattr(
         build_backend,
         "_install_package_native_artifacts",
-        lambda root: calls.append(("native-package", root)),
+        lambda root, llvm_root=None: calls.append(("native-package", root, llvm_root)),
     )
 
 
@@ -142,7 +142,7 @@ def test_build_wheel_bootstraps_ixsimpl_llvm_and_native_tools(
         ("llvm", llvm_install_root),
         ("native-build", llvm_install_root, True),
         ("native-env", native_install_root),
-        ("native-package", native_install_root),
+        ("native-package", native_install_root, llvm_install_root),
         ("wheel", str(tmp_path)),
     ]
 
@@ -203,7 +203,7 @@ def test_build_backend_bootstraps_llvm_after_prior_skip(
         ("llvm", llvm_install_root),
         ("native-build", llvm_install_root, True),
         ("native-env", native_install_root),
-        ("native-package", native_install_root),
+        ("native-package", native_install_root, llvm_install_root),
         "wheel",
     ]
 
@@ -213,6 +213,7 @@ def test_install_package_native_artifacts_copies_runtime_tree(
     tmp_path: Path,
 ) -> None:
     native_install_root = tmp_path / "native-install"
+    llvm_install_root = tmp_path / "llvm-install"
     package_native_root = tmp_path / "package" / "_native"
     (native_install_root / "bin").mkdir(parents=True)
     (native_install_root / "bin" / "hc-opt").write_text("hc-opt\n", encoding="utf-8")
@@ -223,10 +224,14 @@ def test_install_package_native_artifacts_copies_runtime_tree(
     (hc_mlir / "__pycache__" / "ir.pyc").write_bytes(b"stale")
     (native_install_root / "lib").mkdir()
     (native_install_root / "lib" / "libHC.a").write_text("archive\n", encoding="utf-8")
+    (llvm_install_root / "bin").mkdir(parents=True)
+    (llvm_install_root / "bin" / "ld.lld").write_text("lld\n", encoding="utf-8")
 
     monkeypatch.setattr(build_backend, "_PACKAGE_NATIVE_ROOT", package_native_root)
 
-    build_backend._install_package_native_artifacts(native_install_root)
+    build_backend._install_package_native_artifacts(
+        native_install_root, llvm_install_root
+    )
 
     assert (package_native_root / "bin" / "hc-opt").read_text(
         encoding="utf-8"
@@ -240,10 +245,38 @@ def test_install_package_native_artifacts_copies_runtime_tree(
     assert (package_native_root / "lib" / "libHC.a").read_text(
         encoding="utf-8"
     ) == "archive\n"
+    # `ld.lld` is bundled into `_native/bin/` so the pipeline can resolve
+    # it via `_native_paths.lld_path` without depending on `HC_LLD`.
+    assert (package_native_root / "bin" / "ld.lld").read_text(
+        encoding="utf-8"
+    ) == "lld\n"
     manifest = json.loads(
         (package_native_root / "manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["source"] == str(native_install_root)
+
+
+def test_install_package_native_artifacts_skips_lld_when_no_llvm_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Build pathways that don't bootstrap LLVM (sdist, metadata-only)
+    # never see an install root; the artifact copier must skip the lld
+    # staging step rather than tripping its own validation.
+    native_install_root = tmp_path / "native-install"
+    package_native_root = tmp_path / "package" / "_native"
+    (native_install_root / "bin").mkdir(parents=True)
+    (native_install_root / "bin" / "hc-opt").write_text("hc-opt\n", encoding="utf-8")
+    hc_mlir = native_install_root / "python_packages" / "hc_front" / "hc_mlir"
+    hc_mlir.mkdir(parents=True)
+    (hc_mlir / "ir.py").write_text("IR = True\n", encoding="utf-8")
+
+    monkeypatch.setattr(build_backend, "_PACKAGE_NATIVE_ROOT", package_native_root)
+
+    build_backend._install_package_native_artifacts(native_install_root, None)
+
+    assert (package_native_root / "bin" / "hc-opt").exists()
+    assert not (package_native_root / "bin" / "ld.lld").exists()
 
 
 def test_build_sdist_skips_bootstrap(

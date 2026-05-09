@@ -68,7 +68,9 @@ def _ensure_build_dependencies_bootstrapped() -> Path | None:
         return None
 
 
-def _install_package_native_artifacts(native_install_root: Path) -> None:
+def _install_package_native_artifacts(
+    native_install_root: Path, llvm_install_root: Path | None = None
+) -> None:
     _validate_native_install(native_install_root)
     if _PACKAGE_NATIVE_ROOT.exists():
         shutil.rmtree(_PACKAGE_NATIVE_ROOT)
@@ -81,7 +83,27 @@ def _install_package_native_artifacts(native_install_root: Path) -> None:
                 _PACKAGE_NATIVE_ROOT / name,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+    if llvm_install_root is not None:
+        _stage_lld_into_native_bin(llvm_install_root)
     _write_native_manifest(native_install_root)
+
+
+def _stage_lld_into_native_bin(llvm_install_root: Path) -> None:
+    # Copy the pinned `ld.lld` from the LLVM toolchain install into
+    # `hc/_native/bin/ld.lld` so the runtime can resolve it via the
+    # bundled-resource path returned by `_native_paths.lld_path`,
+    # without needing the `HC_LLD` env var. The toolchain ships
+    # `ld.lld` as a symlink to `lld`; dereference the symlink so wheel
+    # installs work without preserving the link.
+    src = llvm_install_root / "bin" / "ld.lld"
+    if not src.exists():
+        raise RuntimeError(f"hc llvm toolchain is missing ld.lld; expected at {src}")
+    dest_bin = _PACKAGE_NATIVE_ROOT / "bin"
+    dest_bin.mkdir(parents=True, exist_ok=True)
+    dest = dest_bin / "ld.lld"
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    shutil.copy2(src.resolve(), dest)
 
 
 def _validate_native_install(native_install_root: Path) -> None:
@@ -112,7 +134,7 @@ def build_wheel(
 ) -> str:
     native_install_root = _ensure_build_dependencies_bootstrapped()
     if native_install_root is not None:
-        _install_package_native_artifacts(native_install_root)
+        _install_package_native_artifacts(native_install_root, _LLVM_INSTALL_ROOT)
     return _build_meta.build_wheel(
         wheel_directory,
         config_settings=config_settings,
@@ -127,7 +149,7 @@ def build_editable(
 ) -> str:
     native_install_root = _ensure_build_dependencies_bootstrapped()
     if native_install_root is not None:
-        _install_package_native_artifacts(native_install_root)
+        _install_package_native_artifacts(native_install_root, _LLVM_INSTALL_ROOT)
     return _build_meta.build_editable(
         wheel_directory,
         config_settings=config_settings,

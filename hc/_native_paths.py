@@ -57,3 +57,17 @@ def hip_runtime_lib_path() -> Path:
     if override:
         return Path(override).resolve()
     return package_native_lib_dir() / "libhc_hip_runtime.so"
+
+
+def lld_path() -> Path:
+    """ld.lld — invoked by `hc-lower-gpu-to-binary` to link the AMDGPU
+    object into an HSACO blob. Bundled in `hc/_native/bin/ld.lld` (copied
+    from the pinned LLVM toolchain at wheel/editable install time) so
+    the pipeline never has to look at `$PATH` or a system ROCm install.
+    `HC_LLD` overrides for source-tree development against a freshly
+    built toolchain that hasn't been re-staged into `_native/`.
+    """
+    override = os.environ.get("HC_LLD")
+    if override:
+        return Path(override).resolve()
+    return package_native_root() / "bin" / "ld.lld"

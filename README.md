@@ -50,9 +50,12 @@ trigger a one-time fresh LLVM/MLIR rebuild even if a previous pinned toolchain
 cache already exists.
 
 The lock also enables LLVM's `lld` so HC's GPU-binary path can drive a pinned
-`ld.lld` from the toolchain install (`$HC_LLD`) without depending on a
-host-side ROCm install. Adding `lld` to the project list rotates the
-toolchain key, so this change forces another one-time rebuild.
+`ld.lld` without depending on a host-side ROCm install. The build copies
+`ld.lld` into `hc/_native/bin/` and the pipeline propagates that path through
+`hc-lower-gpu-to-binary`'s `--lld-path=` option, so `hc.compile` is
+self-contained — no `HC_LLD` env var required. Adding `lld` to the project
+list rotates the toolchain key, so this change forces another one-time
+rebuild.
 
 Bootstrap assumes:
 

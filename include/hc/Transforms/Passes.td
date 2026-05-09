@@ -233,11 +233,15 @@ def HCLowerGPUToBinary
     `lld-path` resolves in this order:
 
       1. the option's value if non-empty,
-      2. the `HC_LLD` environment variable (set by our toolchain bootstrap),
+      2. the `HC_LLD` environment variable (escape hatch for direct
+         `hc-opt` invocations against a non-default toolchain),
       3. the first `ld.lld` on `$PATH`.
 
-    No ROCm install fallback — if none of those succeed we error out
-    rather than silently picking up a host's distro-installed lld.
+    The Python pipeline driver (`hc.compile`) always populates option
+    1 from the bundled `hc/_native/bin/ld.lld`, so `HC_LLD` and `$PATH`
+    only matter for callers reaching the pass directly via `hc-opt`.
+    No ROCm install fallback — if none of the three succeed we error
+    out rather than silently picking up a host's distro-installed lld.
 
     v0 deliberately does not link rocm-device-libs bitcode. The WMMA
     example doesn't reference `__ocml_*` / `__ockl_*`; kernels that do

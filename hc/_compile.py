@@ -4,20 +4,24 @@
 
 """Public `hc.compile` entry point.
 
-`hc.compile` runs the Python frontend and then drives an MLIR
-transform-dialect schedule over the resulting `hc_front` module,
-lowering it into the `hc` dialect. The default schedule lives at
-`hc/schedules/front_to_hc.mlir`; callers may override with their own
-file path or inline MLIR text via `schedule=`.
+`hc.compile` runs the Python frontend, drives an MLIR transform-dialect
+schedule over the resulting `hc_front` module to lower it into the `hc`
+dialect, and runs the GPU lowering chain to produce a self-contained
+LLVM IR module with the host wrapper plus an embedded HSACO blob. The
+default schedule lives at `hc/schedules/front_to_hc.mlir`; callers may
+override with their own file path or inline MLIR text via `schedule=`.
 
-Invoking the returned handle still raises `NotImplementedError` until
-specialization and launch stages land. `symbols=` bindings are recorded
-on the handle for later stages; the frontend itself emits purely
-symbolic IR either way.
+The returned handle is callable: invoking it with positional args lazily
+spins up an MLIR `ExecutionEngine` (loading the runtime helpers and HIP
+shim shared libraries), looks up the host wrapper, and dispatches via
+ctypes. Each argument is forwarded as a `PyObject *` and unpacked
+inside JIT'd code.
 
 On pipeline failure, the handle carries `hc_ir = None` and the captured
-diagnostics in `pipeline_diagnostics`; no exception is raised so
-callers can still inspect `front_ir_text` for debugging.
+diagnostics in `pipeline_diagnostics`; no exception is raised at compile
+time so callers can still inspect `front_ir_text` for debugging.
+Attempting to invoke such a handle raises `RuntimeError` with the
+captured diagnostics.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._invoke import InvokerCache, make_invoker
 from ._pipeline import ScheduleSource
 from .core import KernelMetadata
 
@@ -57,13 +62,65 @@ class CompiledKernel:
     # "any target"). Useful for downstream stages and debugging — the
     # actual recipe selection happened inside the pipeline.
     target: str | None = field(default=None)
+    # Lazy JIT cache. Lives in a mutable side-channel so the dataclass
+    # can stay frozen while the engine and cfunc materialize on first
+    # invoke. Excluded from compare/repr so two handles compiled from
+    # the same kernel still compare equal regardless of whether one of
+    # them has been invoked.
+    _invoker_cache: InvokerCache = field(
+        default_factory=InvokerCache, compare=False, repr=False
+    )
+
+    def invoke(self, *args: Any) -> None:
+        """Dispatch the JIT'd host wrapper, calling `hc_rt_helpers` inside.
+
+        Lazy-builds an MLIR `ExecutionEngine` (loading
+        `libhc_rt_helpers.so` + `libhc_hip_runtime.so` as shared libs so
+        their `_mlir_ciface_hc_get_*` and `hc_rt_*` symbols resolve via
+        the JIT's process-wide search) the first time it's called, and
+        caches the resulting invoker on the handle so subsequent calls
+        reuse the same JIT'd code. Each argument is a Python object:
+        tensor-like objects (anything with `data_ptr()` / `size(i)` /
+        `stride(i)`, e.g. `torch.Tensor`) for buffer slots, plain
+        `int`/`float` for scalar slots. The host wrapper unpacks each
+        slot inside JIT'd code, so the Python-side call is just a
+        ctypes thunk.
+
+        Raises `RuntimeError` if the pipeline failed (the handle has no
+        `hc_ir`) or if either runtime shared library is not present in
+        the install. Helper-side errors (missing `data_ptr()`, wrong
+        type, etc.) currently unwind via a C++ exception across the C
+        boundary — this is undefined behavior and tends to manifest as
+        a process abort; replacement with a sentinel-return + PyErr
+        contract is on the runtime-helpers backlog.
+        """
+        if self.hc_ir is None:
+            diagnostics = (
+                "\n  ".join(self.pipeline_diagnostics)
+                if self.pipeline_diagnostics
+                else "(no diagnostics captured)"
+            )
+            raise RuntimeError(
+                "hc.compile: pipeline failed to lower this kernel; "
+                "cannot invoke. Diagnostics:\n  " + diagnostics
+            )
+        if self._invoker_cache.invoker is None:
+            kernel_name = getattr(self.kernel, "__name__", None)
+            if not kernel_name:
+                raise RuntimeError(
+                    "hc.invoke: kernel has no __name__; cannot resolve "
+                    "the host wrapper symbol"
+                )
+            self._invoker_cache.invoker = make_invoker(self.hc_ir, kernel_name)
+        self._invoker_cache.invoker(*args)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "hc.compile only runs the Python frontend + hc_front -> hc "
-            "lowering today; the specialization and launch stages are not "
-            "implemented yet."
-        )
+        if kwargs:
+            raise TypeError(
+                "hc.compile: invoking a CompiledKernel with kwargs is not "
+                "supported yet; pass arguments positionally"
+            )
+        return self.invoke(*args)
 
     def __repr__(self) -> str:
         name = getattr(self.kernel, "__name__", "<kernel>")

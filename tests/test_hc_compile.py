@@ -227,7 +227,12 @@ def test_symbol_name_rejects_arbitrary_dot_name_objects() -> None:
 # --- CompiledKernel handle -------------------------------------------------
 
 
-def test_compiled_kernel_call_raises_until_pipeline_lands() -> None:
+def test_compiled_kernel_call_raises_when_pipeline_did_not_run() -> None:
+    # Handle with `hc_ir = None` means the lowering pipeline either
+    # failed (diagnostics captured) or was never run (constructed
+    # directly in tests). Either way the call surface is the same:
+    # surface a `RuntimeError` instead of segfaulting on a missing
+    # module.
     def kfn() -> None:
         return None
 
@@ -238,7 +243,7 @@ def test_compiled_kernel_call_raises_until_pipeline_lands() -> None:
         front_ir_text="",
     )
 
-    with pytest.raises(NotImplementedError, match="frontend"):
+    with pytest.raises(RuntimeError, match="pipeline failed"):
         handle()
 
 
@@ -276,8 +281,6 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
     # schedule.
     script = tmp_path / "smoke.py"
     script.write_text(textwrap.dedent("""
-            from contextlib import suppress
-
             import hc
             from hc import Buffer, CompiledKernel, CurrentGroup, kernel
 
@@ -296,11 +299,6 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
                 assert "hc_front.kernel" in handle.front_ir_text
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.pipeline_diagnostics == ()
-                with suppress(NotImplementedError):
-                    handle()
-                    raise AssertionError(
-                        "handle() should raise NotImplementedError"
-                    )
                 print("OK")
 
 
@@ -839,3 +837,120 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
 
     result = _run_compile_smoke(script)
     assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
+    # End-to-end: compile a no-op kernel that needs only the runtime
+    # helpers (no `gpu.launch_func` survives the pipeline because the
+    # body is empty), then invoke it through the JIT'd host wrapper. The
+    # call must succeed without an actual GPU because the helpers are
+    # all that runs.
+    #
+    # We deliberately use a kernel that bottoms out at the runtime
+    # helpers — this exercises the whole invoke path (engine create,
+    # shared-lib load, packed-args wrapper lookup, ctypes thunk) without
+    # depending on libamdhip64.so being installed. WMMA-on-hardware
+    # smoke is a separate task.
+    script = tmp_path / "compile_invoke.py"
+    script.write_text(textwrap.dedent("""
+            import numpy as np
+
+            import hc
+            from hc import Buffer, CurrentGroup, kernel
+
+
+            class _TensorView:
+                # Minimal duck-type the runtime helpers require — we
+                # depend on `data_ptr()` / `size(i)` / `stride(i)`
+                # because those are the names BufferUtils.cpp looks up.
+                def __init__(self, arr):
+                    self._arr = arr
+
+                def data_ptr(self):
+                    return int(self._arr.ctypes.data)
+
+                def size(self, dim):
+                    return int(self._arr.shape[dim])
+
+                def stride(self, dim):
+                    return int(self._arr.strides[dim] // self._arr.itemsize)
+
+
+            sym = hc.sym
+
+
+            @kernel(work_shape=(sym.W,), literals={sym.W})
+            def trivial(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                # Empty body — the lowered IR boils down to a host
+                # wrapper that calls the runtime helpers and returns.
+                return None
+
+
+            def main() -> None:
+                handle = hc.compile(trivial, {sym.W: 128})
+                arr = np.zeros(128, dtype=np.float32)
+                view = _TensorView(arr)
+
+                handle(view)
+                # Cache populated on the first call; second call must
+                # reuse the same invoker (no fresh engine spin-up).
+                cached = handle._invoker_cache.invoker
+                assert cached is not None, "expected invoker cache populated"
+                handle(view)
+                assert handle._invoker_cache.invoker is cached
+
+                try:
+                    handle(view, view)
+                except TypeError as exc:
+                    assert "takes 1 argument(s), got 2" in str(exc), str(exc)
+                else:
+                    raise AssertionError("expected TypeError on wrong arg count")
+
+                try:
+                    handle()
+                except TypeError as exc:
+                    assert "takes 1 argument(s), got 0" in str(exc), str(exc)
+                else:
+                    raise AssertionError("expected TypeError on wrong arg count")
+
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+def test_compile_invoke_raises_when_pipeline_failed() -> None:
+    # `invoke` on a handle whose pipeline failed must surface the
+    # captured diagnostics instead of segfaulting on a missing module.
+    handle = CompiledKernel(
+        kernel=lambda: None,
+        bindings={},
+        front_ir=None,
+        front_ir_text="",
+        hc_ir=None,
+        hc_ir_text=None,
+        pipeline_diagnostics=("simulated failure",),
+    )
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        handle.invoke()
+
+
+def test_compile_invoke_rejects_kwargs() -> None:
+    # Positional-only ABI for now — the host wrapper has no notion of
+    # named arguments. Reject loudly instead of silently dropping kwargs.
+    handle = CompiledKernel(
+        kernel=lambda: None,
+        bindings={},
+        front_ir=None,
+        front_ir_text="",
+        hc_ir=object(),
+        hc_ir_text="",
+    )
+    with pytest.raises(TypeError, match="positionally"):
+        handle(x=1)

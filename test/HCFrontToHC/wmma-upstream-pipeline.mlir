@@ -27,14 +27,28 @@
 // `sed` keeps only the prefix up through `bin = "` on the gpu.binary line.
 //
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
-// RUN:   | hc-opt --pass-pipeline='builtin.module(hc-front-fold-region-defs,hc-front-inline,convert-hc-front-to-hc,hc-promote-names,hc-infer-types,hc-materialize-bound-exprs,hc-verify-static-shapes,hc-decompose-shaped-values{strict=false},hc-inline-helpers,hc-materialize-bound-exprs,canonicalize,hc-normalize-scope-regions,canonicalize,cse,hc-lower-kernels-to-gpu-launch,hc-lower-launch-body,canonicalize,cse,hc-interpret-intrinsic-recipes{target=amdgpu-gfx11},canonicalize,cse,gpu-launch-sink-index-computations,gpu-kernel-outlining,canonicalize,cse,transform-preload-library{transform-library-paths=%S/Inputs/wmma-upstream-pipeline-transforms.mlir},transform-interpreter,gpu.module(fold-memref-alias-ops),lower-affine,gpu.module(lower-affine),canonicalize,cse,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},lower-affine,gpu.module(lower-affine,convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),rocdl-attach-target{chip=gfx1100},gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,canonicalize,cse,hc-lower-gpu-to-binary{lld-path=%hc_lld},symbol-dce)' \
-// RUN:   | sed 's/\(bin = "\).*$/\1<HSACO>"]/' \
-// RUN:   | FileCheck %s --implicit-check-not='hc.' --implicit-check-not='!hc.' --implicit-check-not='gpu.module' --implicit-check-not='amdgpu.' --implicit-check-not='vector.transfer'
+// RUN:   | hc-opt --pass-pipeline='builtin.module(hc-front-fold-region-defs,hc-front-inline,convert-hc-front-to-hc,hc-promote-names,hc-infer-types,hc-materialize-bound-exprs,hc-verify-static-shapes,hc-decompose-shaped-values{strict=false},hc-inline-helpers,hc-materialize-bound-exprs,canonicalize,hc-normalize-scope-regions,canonicalize,cse,hc-lower-kernels-to-gpu-launch,hc-lower-launch-body,canonicalize,cse,hc-interpret-intrinsic-recipes{target=amdgpu-gfx11},canonicalize,cse,gpu-launch-sink-index-computations,gpu-kernel-outlining,canonicalize,cse,transform-preload-library{transform-library-paths=%S/Inputs/wmma-upstream-pipeline-transforms.mlir},transform-interpreter,gpu.module(fold-memref-alias-ops),lower-affine,gpu.module(lower-affine),canonicalize,cse,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},lower-affine,gpu.module(lower-affine,convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),rocdl-attach-target{chip=gfx1100},gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,canonicalize,cse,hc-lower-gpu-to-binary{lld-path=%hc_lld},hc-lower-launch-func-to-runtime,symbol-dce)' \
+// RUN:   | sed 's/\(@[A-Za-z0-9_]*_data[A-Za-z0-9_]* *(\)"[^"]*"/\1"<HSACO>"/' \
+// RUN:   | FileCheck %s --implicit-check-not='hc.' --implicit-check-not='!hc.' --implicit-check-not='gpu.' --implicit-check-not='amdgpu.' --implicit-check-not='vector.transfer'
 
 // Module carries the gpu.container_module attribute so the runtime side knows
-// to walk for gpu.binary ops to load. The `--implicit-check-not='gpu.module'`
-// directive above pins that the binary-emission pass swept the source module.
+// to walk for gpu.binary ops to load. The implicit-check-nots above pin that
+// `hc-lower-gpu-to-binary` swept every `gpu.module` and that
+// `hc-lower-launch-func-to-runtime` consumed every `gpu.binary` and
+// `gpu.launch_func` (`gpu.` matches all three; the only legitimate
+// remaining occurrence is the `gpu.container_module` attribute below,
+// matched here).
 // CHECK-LABEL: module attributes {gpu.container_module}
+
+// Per-callsite globals planted by `hc-lower-launch-func-to-runtime`:
+// the `_data` global carries the HSACO blob (sed-stripped to "<HSACO>"
+// above so the test doesn't drift with every llvm/lld bump), the
+// `_handle` global is a zero-init `!llvm.ptr` slot the runtime fills
+// on first launch, and the kernel name lands as a NUL-terminated C
+// string for `hipModuleGetFunction`.
+// CHECK-DAG: llvm.mlir.global internal constant @tiled_gfx11_wmma_matmul_kernel_data{{.*}}("<HSACO>")
+// CHECK-DAG: llvm.mlir.global internal constant @tiled_gfx11_wmma_matmul_kernel{{[_0-9]*}}("tiled_gfx11_wmma_matmul_kernel\00")
+// CHECK-DAG: llvm.mlir.global internal @tiled_gfx11_wmma_matmul_kernel_handle{{.*}}(#llvm.zero) {{.*}} : !llvm.ptr
 
 // Host wrapper landed as `llvm.func` after `gpu-to-llvm` flattened every
 // `func.func` in the module — descriptor-passing arity gives 5 i64s per
@@ -51,21 +65,18 @@
 
 // Block/thread counts come from `work_shape / group_shape` (the
 // `arith.ceildivui`/`arith.muli` chain became `llvm.udiv`/`llvm.mul`
-// after gpu-to-llvm) and feed straight into `gpu.launch_func`. The
-// launch dispatches into the binary stamped below.
+// after gpu-to-llvm) and feed straight through to `hc_rt_launch_kernel`.
+// The launch is no longer a `gpu.launch_func` op — it's a pair of HIP
+// shim calls: load the kernel module (single-flight via the handle
+// slot) then launch with the packed args.
 // CHECK: llvm.udiv
-// CHECK: gpu.launch_func @tiled_gfx11_wmma_matmul_kernel::@tiled_gfx11_wmma_matmul_kernel
-// CHECK-SAME:    blocks in (%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
-// CHECK-SAME:    threads in (%{{[^,]+}}, %{{[^,]+}}, %{{[^)]+}})
+// CHECK: llvm.call @hc_rt_load_kernel
+// CHECK-SAME: (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+// CHECK: llvm.call @hc_rt_launch_kernel
+// CHECK-SAME: (!llvm.ptr, !llvm.ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i64, !llvm.ptr, i32) -> ()
 
-// `hc-lower-gpu-to-binary` replaced the source `gpu.module` with a
-// sibling `gpu.binary` carrying the rocdl target attribute and a
-// `bin = "..."` HSACO blob. The blob bytes are opaque (changes with
-// every llvm/lld bump) — pin only the structure: the binary is
-// non-empty and the rocdl target attr survived the round trip. The
-// `--implicit-check-not='gpu.module'` and `--implicit-check-not='amdgpu.'`
-// directives above prove the source module is gone and no leftover
-// amdgpu.wmma op leaked back out.
-// CHECK: gpu.binary @tiled_gfx11_wmma_matmul_kernel
-// CHECK-SAME: #rocdl.target<chip = "gfx1100">
-// CHECK-SAME: bin = "
+// Runtime decls land at module scope — `FunctionCallBuilder::create`
+// only mints them on first use, so they prove both calls actually
+// fired (otherwise the decl would be missing entirely).
+// CHECK-DAG: llvm.func @hc_rt_load_kernel(!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
+// CHECK-DAG: llvm.func @hc_rt_launch_kernel(!llvm.ptr, !llvm.ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i64, !llvm.ptr, i32)

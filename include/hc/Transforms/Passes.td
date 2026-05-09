@@ -260,6 +260,57 @@ def HCLowerGPUToBinary
   ];
 }
 
+def HCLowerLaunchFuncToRuntime
+    : Pass<"hc-lower-launch-func-to-runtime", "::mlir::ModuleOp"> {
+  let summary = "Replace gpu.launch_func with hc_rt_* runtime calls and "
+                "embed the HSACO blob as an LLVM global.";
+  let description = [{
+    Final lowering before LLJIT: each `gpu.launch_func` becomes a pair
+    of calls into `libhc_hip_runtime.so` (`hc_rt_load_kernel` +
+    `hc_rt_launch_kernel`) and the matching `gpu.binary`'s HSACO blob
+    is materialised inline as an `llvm.mlir.global` so the JIT'd host
+    wrapper carries everything it needs to launch without touching the
+    filesystem.
+
+    For each `gpu.launch_func` the pass:
+
+      1. Looks up the sibling `gpu.binary` via `kernel_module_name`,
+         pulls the first `#gpu.object` (we only emit one per binary
+         today — single rocdl target), and reads its raw blob.
+      2. Emits two per-callsite globals at module scope (internal
+         linkage): a NUL-terminated string holding the HSACO blob
+         (`<kernel>_data`) and a zero-init `!llvm.ptr` slot
+         (`<kernel>_handle`) the runtime uses as a single-flight
+         `hipFunction_t` cache. Names are uniqued through `SymbolTable`
+         so multiple launches of the same kernel keep distinct slots
+         (matches wave's recipe; the cache slot is per-callsite, not
+         per-binary).
+      3. Packs kernel operands as alloca-per-arg + an array-of-pointer
+         (one `llvm.alloca` per arg storing its value, then an
+         `LLVM::ArrayType` of `!llvm.ptr` built via `insertvalue` and
+         spilled to a single alloca whose pointer is what the runtime
+         reads). This is the HIP `kernelParams` convention; the
+         `num_args` count is passed alongside the pointer for parity
+         with wave's signature.
+      4. Replaces the launch with `hc_rt_load_kernel(stream, &handle,
+         data, size, name)` followed by `hc_rt_launch_kernel(stream,
+         fn, smem, gx,gy,gz, bx,by,bz, cx,cy,cz, args, num_args)`.
+
+    Stream: v0 always passes a null pointer (HIP's default stream).
+    When the host wrapper grows an explicit stream argument (the
+    upcoming Python invoke surface bead), this pass will switch to
+    sourcing the stream from the enclosing function's first argument.
+
+    All consumed `gpu.binary` ops are erased after the walk completes.
+    Fails the pass if a launch's binary or selected object is missing,
+    or if the binary carries something other than a single object.
+  }];
+  let dependentDialects = [
+    "::mlir::LLVM::LLVMDialect",
+    "::mlir::gpu::GPUDialect"
+  ];
+}
+
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";

@@ -156,6 +156,12 @@ _GPU_LOWERING_PIPELINE = (
     "reconcile-unrealized-casts,"
     "canonicalize,cse,"
     f"hc-lower-gpu-to-binary{{lld-path={_LLD_PLACEHOLDER}}},"
+    # Replace `gpu.launch_func` with `hc_rt_load_kernel` +
+    # `hc_rt_launch_kernel` calls and embed each binary's HSACO blob
+    # as an LLVM global. Runs after `hc-lower-gpu-to-binary` so the
+    # `gpu.binary` ops it consumes already exist; the pass erases each
+    # binary after the last launch_func references it.
+    "hc-lower-launch-func-to-runtime,"
     "symbol-dce"
 )
 

@@ -641,6 +641,19 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
     from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
 
 
+    # `llvm.mlir.global ... constant @<name>("..."` carries the raw
+    # bytes of the HSACO blob and the kernel name string. Either body
+    # can contain literal "amdgpu", "gpu.module", etc. substrings (ELF
+    # section names, escaped payload) that would false-positive the
+    # negative scan below. Strip every quoted body on these lines so the
+    # check sees only structural IR.
+    _GLOBAL_RE = re.compile(
+        r'(llvm\\.mlir\\.global[^(]*\\([^()"]*)"[^"]*"'
+    )
+    def _strip_global_string_body(line: str) -> str:
+        return _GLOBAL_RE.sub(r'\\1"<stripped>"', line)
+
+
     def main() -> None:
         handle = hc.compile(tiled_gfx11_wmma_matmul)
         expected = {
@@ -656,59 +669,60 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
         assert handle.hc_ir is not None, handle.pipeline_diagnostics
         assert handle.hc_ir_text is not None
-        # Default schedule now runs all the way through to a sealed
-        # `gpu.binary` HSACO blob: front-end → kernels-to-launch →
-        # intrinsic recipes → canonicalize/cse → kernel outlining →
-        # alloca-to-global + vector-transfer reduction → rocdl attach →
-        # full ROCDL/LLVM lowering inside `gpu.module` → host wrapper
-        # `gpu-to-llvm` → `hc-lower-gpu-to-binary` → symbol-dce.
-        # No `hc.*` ops or types survive, no `gpu.module` survives
-        # (replaced by `gpu.binary`), no `amdgpu.*` op survives (lowered
-        # to `rocdl.wmma_*` then to LLVM intrinsics inside the binary),
-        # and no `vector.transfer_*` survives (reduced to vector.load/
-        # vector.store before the LLVM chain). The HSACO blob bytes
-        # themselves can carry literal "hc.", "gpu.module", "amdgpu."
-        # substrings (ELF section names + escaped payload), so the
-        # negative checks below scope to lines outside the bin = "..."
-        # payload — split each gpu.binary line on `bin = "` and only
-        # inspect the prefix.
-        ir_lines_no_bin = [
-            line.split('bin = "', 1)[0] if 'bin = "' in line else line
+        # Default schedule lowers all the way to a self-contained LLVM
+        # IR module: front-end → kernels-to-launch → intrinsic recipes
+        # → kernel outlining → alloca-to-global + vector-transfer
+        # reduction → rocdl attach → full ROCDL/LLVM lowering inside
+        # `gpu.module` → host `gpu-to-llvm` → `hc-lower-gpu-to-binary`
+        # (HSACO blob attached to a `gpu.binary`) →
+        # `hc-lower-launch-func-to-runtime` (HSACO embedded as an LLVM
+        # global, `gpu.launch_func` rewritten into `hc_rt_load_kernel`
+        # + `hc_rt_launch_kernel` calls, source `gpu.binary` erased) →
+        # symbol-dce. Nothing GPU-dialect-shaped survives in the post-
+        # pipeline IR — only `gpu.container_module` (the module
+        # attribute) is left, which the negative scan below excludes.
+        # The HSACO blob ships in a `_data` global; its bytes can
+        # carry literal "hc.", "amdgpu.", etc. substrings (ELF
+        # metadata + escaped payload), so we strip every global string
+        # body before the negative checks fire.
+        ir_lines_no_blob = [
+            _strip_global_string_body(line)
             for line in handle.hc_ir_text.splitlines()
         ]
-        ir_no_bin = "\\n".join(ir_lines_no_bin)
-        assert "!hc." not in ir_no_bin, ir_no_bin
+        ir_no_blob = "\\n".join(ir_lines_no_blob)
+        assert "!hc." not in ir_no_blob, ir_no_blob
         stray_hc_ops = [
-            line for line in ir_lines_no_bin
+            line for line in ir_lines_no_blob
             if " hc." in line or line.lstrip().startswith("hc.")
         ]
         assert not stray_hc_ops, stray_hc_ops
-        assert "gpu.module" not in ir_no_bin, ir_no_bin
-        assert "amdgpu." not in ir_no_bin, ir_no_bin
-        assert "vector.transfer" not in ir_no_bin, ir_no_bin
-        assert "unrealized_conversion_cast" not in ir_no_bin, ir_no_bin
+        assert "gpu.module" not in ir_no_blob, ir_no_blob
+        assert "gpu.binary" not in ir_no_blob, ir_no_blob
+        assert "gpu.launch" not in ir_no_blob, ir_no_blob
+        assert "amdgpu." not in ir_no_blob, ir_no_blob
+        assert "vector.transfer" not in ir_no_blob, ir_no_blob
+        assert "unrealized_conversion_cast" not in ir_no_blob, ir_no_blob
         # Positive structural assertions: host wrapper landed as
-        # `llvm.func` after `gpu-to-llvm`, dispatches via
-        # `gpu.launch_func` into the freshly minted `gpu.binary`
-        # carrying the gfx1100 rocdl target attribute and a non-empty
-        # HSACO blob.
+        # `llvm.func` after `gpu-to-llvm`, dispatches via the HIP shim
+        # (`hc_rt_load_kernel` + `hc_rt_launch_kernel`); the HSACO
+        # blob and per-callsite handle/name globals are at module
+        # scope.
         assert "module attributes {gpu.container_module}" in handle.hc_ir_text
         assert (
             "llvm.func @tiled_gfx11_wmma_matmul(" in handle.hc_ir_text
         ), handle.hc_ir_text
-        assert "gpu.launch_func" in handle.hc_ir_text
-        assert "gpu.launch " not in handle.hc_ir_text, handle.hc_ir_text
+        assert "@hc_rt_load_kernel" in handle.hc_ir_text, handle.hc_ir_text
+        assert "@hc_rt_launch_kernel" in handle.hc_ir_text, handle.hc_ir_text
         assert (
-            "gpu.binary @tiled_gfx11_wmma_matmul_kernel" in handle.hc_ir_text
+            "@tiled_gfx11_wmma_matmul_kernel_data" in handle.hc_ir_text
         ), handle.hc_ir_text
         assert (
-            '#rocdl.target<chip = "gfx1100">' in handle.hc_ir_text
+            "@tiled_gfx11_wmma_matmul_kernel_handle" in handle.hc_ir_text
         ), handle.hc_ir_text
-        # `bin = "..."` is the gpu.object printer's marker for a
-        # CompilationTarget::Binary blob — pin its presence as a stable
-        # proxy for "the HSACO is attached and the format is what we
-        # asked for", without trying to FileCheck the opaque bytes.
-        assert 'bin = "' in handle.hc_ir_text, handle.hc_ir_text
+        # NUL-terminated kernel name string lands as a separate global.
+        assert (
+            '"tiled_gfx11_wmma_matmul_kernel\\\\00"' in handle.hc_ir_text
+        ), handle.hc_ir_text
 
         loads = re.findall(
             r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',
@@ -767,13 +781,17 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
 
 
             def _check_compiled_to_binary(handle) -> None:
+                # After `hc-lower-launch-func-to-runtime` the HSACO
+                # ships in a `_data` global and the launch lands as a
+                # `hc_rt_launch_kernel` call — the recipe-fired signal
+                # is the per-callsite global + the runtime call.
                 assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
                 assert (
-                    "gpu.binary @tiled_gfx11_wmma_matmul_kernel"
+                    "@tiled_gfx11_wmma_matmul_kernel_data"
                     in handle.hc_ir_text
                 ), handle.hc_ir_text
                 assert (
-                    '#rocdl.target<chip = "gfx1100">' in handle.hc_ir_text
+                    "@hc_rt_launch_kernel" in handle.hc_ir_text
                 ), handle.hc_ir_text
 
 

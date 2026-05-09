@@ -799,6 +799,183 @@ static LogicalResult writeVectorToMemRef(OpBuilder &builder, Location loc,
   return success();
 }
 
+// Linearize the enclosing launch's 3-D thread id and block size into a single
+// `(tid, wgSize)` pair so the cooperative-copy loop only has to reason about
+// one dimension. The dim3 layout is the standard
+// `lin = (tz * by + ty) * bx + tx`. For the common `block_y = block_z = 1`
+// shape the y/z multiplications fold to identity and the resulting IR
+// collapses to plain `tx` / `bx`.
+static FailureOr<std::pair<Value, Value>>
+linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
+  auto launch = anchor->getParentOfType<gpu::LaunchOp>();
+  if (!launch)
+    return failure();
+  gpu::KernelDim3 tids = launch.getThreadIds();
+  // `getBlockSizeOperandValues` reaches the values defined above the launch
+  // (the operands that pin the block shape). Inside the body they're still
+  // dominating SSA values, and using the outer form keeps the cooperative
+  // loop's IR close to the values the materializeBoundExpr lowering already
+  // surfaces under the `$WGS*` symbols.
+  gpu::KernelDim3 sizes = launch.getBlockSizeOperandValues();
+  Value tzBy = arith::MulIOp::create(builder, loc, tids.z, sizes.y);
+  Value tzByPlusTy = arith::AddIOp::create(builder, loc, tzBy, tids.y);
+  Value rowSpan = arith::MulIOp::create(builder, loc, tzByPlusTy, sizes.x);
+  Value linearTid = arith::AddIOp::create(builder, loc, rowSpan, tids.x);
+  Value bxBy = arith::MulIOp::create(builder, loc, sizes.x, sizes.y);
+  Value wgSize = arith::MulIOp::create(builder, loc, bxBy, sizes.z);
+  return std::pair<Value, Value>{linearTid, wgSize};
+}
+
+// Cooperative copy from a slice of a device-memory memref into a workgroup-AS
+// LDS memref. Each thread of the enclosing wave is responsible for a strided
+// subset of the LDS tile's elements (`lane, lane + wgSize, lane + 2*wgSize,
+// ...`); a closing `gpu.barrier` makes the fully populated LDS visible to
+// every thread before it's read back as per-lane fragments.
+//
+// Why one element per thread per chunk (rather than vectorized 2/4/8-wide
+// loads): the prior lowering materialized the entire tile as a per-lane
+// `vector<MxNxT>` value, blew register pressure into the hundreds of SGPR
+// spills, and -- on real gfx11 hardware -- corrupted the WMMA inputs for
+// most lanes. Scalar per-element loads keep the per-lane register footprint
+// constant regardless of tile size; the compiler still coalesces the
+// uniform-stride global loads into wide accesses.
+//
+// OOB elements pad with zero (matching the prior `transfer_read` semantics).
+// The bounds check is per-element rather than at the tile level so partial
+// tiles at the edge of `M`/`N`/`K` get correct zero padding without
+// over-reading the source.
+static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
+                                         Operation *anchor, Value sourceMemRef,
+                                         ArrayRef<SliceAxis> axes, Value lds,
+                                         MemRefType ldsType) {
+  FailureOr<std::pair<Value, Value>> tidAndSize =
+      linearizedThreadAndSize(builder, loc, anchor);
+  if (failed(tidAndSize))
+    return failure();
+  Value linearTid = tidAndSize->first;
+  Value wgSize = tidAndSize->second;
+
+  ArrayRef<int64_t> ldsShape = ldsType.getShape();
+  int64_t totalElements = 1;
+  for (int64_t d : ldsShape)
+    totalElements *= d;
+
+  Value totalVal =
+      arith::ConstantIndexOp::create(builder, loc, totalElements).getResult();
+  Value c0 = zeroIndex(builder, loc);
+  Value c1 = oneIndex(builder, loc);
+
+  // Per-lane chunk count. `ceildiv` so the trailing partial chunk still runs
+  // (its in-range `scf.if` then gates the actual work for the lanes that
+  // would otherwise step past `totalVal`).
+  Value chunks =
+      arith::CeilDivUIOp::create(builder, loc, totalVal, wgSize).getResult();
+  Type elementType = ldsType.getElementType();
+  Value padding = constantSplat(builder, loc, elementType, 0);
+  if (!padding)
+    return failure();
+
+  scf::ForOp loop =
+      scf::ForOp::create(builder, loc, c0, chunks, c1, ValueRange{});
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(loop.getBody());
+
+    Value chunkIdx = loop.getInductionVar();
+    Value chunkOffset =
+        arith::MulIOp::create(builder, loc, chunkIdx, wgSize).getResult();
+    Value lin =
+        arith::AddIOp::create(builder, loc, chunkOffset, linearTid).getResult();
+    Value inRange = arith::CmpIOp::create(
+                        builder, loc, arith::CmpIPredicate::ult, lin, totalVal)
+                        .getResult();
+
+    auto rangeIf = scf::IfOp::create(builder, loc, TypeRange{}, inRange,
+                                     /*withElseRegion=*/false);
+    OpBuilder::InsertionGuard rangeGuard(builder);
+    builder.setInsertionPointToStart(&rangeIf.getThenRegion().front());
+
+    // Unlinearize `lin` into per-axis coordinates of the LDS tile. Walk the
+    // axes back-to-front so the innermost axis (fastest-varying) absorbs the
+    // remainder first; this matches the canonical row-major flatten order.
+    SmallVector<Value> coords(ldsShape.size());
+    Value remaining = lin;
+    for (int64_t axis = static_cast<int64_t>(ldsShape.size()) - 1; axis >= 0;
+         --axis) {
+      Value dim = arith::ConstantIndexOp::create(builder, loc, ldsShape[axis])
+                      .getResult();
+      coords[axis] =
+          arith::RemUIOp::create(builder, loc, remaining, dim).getResult();
+      if (axis > 0)
+        remaining =
+            arith::DivUIOp::create(builder, loc, remaining, dim).getResult();
+    }
+
+    // Translate LDS coords to source indices. Non-slice axes contribute their
+    // fixed offset; slice axes scale the LDS coord by the slice's stride and
+    // add the slice's base offset, matching the `axes`-driven addressing in
+    // the per-lane vector path below.
+    SmallVector<Value> srcIndices;
+    srcIndices.reserve(axes.size());
+    int64_t sliceCoordIdx = 0;
+    for (const SliceAxis &info : axes) {
+      if (!info.isSlice) {
+        srcIndices.push_back(info.offset);
+        continue;
+      }
+      Value coord = coords[sliceCoordIdx++];
+      Value scaled =
+          arith::MulIOp::create(builder, loc, coord, info.stride).getResult();
+      srcIndices.push_back(
+          arith::AddIOp::create(builder, loc, info.offset, scaled).getResult());
+    }
+
+    // Per-element bounds check on the source: every slice-axis index must be
+    // less than the source dim. Non-slice axes carry a fixed in-bounds offset
+    // by construction (the slice dialect rejects scalar subscripts past the
+    // end statically) so they don't need a runtime check.
+    Value inBounds =
+        arith::ConstantOp::create(builder, loc, builder.getBoolAttr(true))
+            .getResult();
+    for (auto [axisIdx, info] : llvm::enumerate(axes)) {
+      if (!info.isSlice)
+        continue;
+      Value extent = dim(builder, loc, sourceMemRef, axisIdx);
+      Value check =
+          arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
+                                srcIndices[axisIdx], extent)
+              .getResult();
+      inBounds =
+          arith::AndIOp::create(builder, loc, inBounds, check).getResult();
+    }
+
+    auto loadIf = scf::IfOp::create(builder, loc, TypeRange{elementType},
+                                    inBounds, /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard thenGuard(builder);
+      builder.setInsertionPointToStart(&loadIf.getThenRegion().front());
+      Value loaded =
+          memref::LoadOp::create(builder, loc, sourceMemRef, srcIndices)
+              .getResult();
+      scf::YieldOp::create(builder, loc, loaded);
+    }
+    {
+      OpBuilder::InsertionGuard elseGuard(builder);
+      builder.setInsertionPointToStart(&loadIf.getElseRegion().front());
+      scf::YieldOp::create(builder, loc, padding);
+    }
+
+    memref::StoreOp::create(builder, loc, loadIf.getResult(0), lds, coords);
+  }
+
+  // Make the cooperative writes visible to every thread before any per-lane
+  // reader sees the LDS tile. Without this, multi-wave workgroups race; for
+  // single-wave workgroups it's redundant but cheap and the canonicalizer
+  // doesn't (and shouldn't) drop the safety net.
+  gpu::BarrierOp::create(builder, loc);
+  return success();
+}
+
 static FailureOr<Value> materializeShapedResult(OpBuilder &builder,
                                                 Location loc,
                                                 Type convertedType,
@@ -1018,16 +1195,33 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
         }) != transferVectorType.getRank())
       return op.emitOpError("load result rank must match slice subscript rank");
 
+    // LDS-staged result: use a cooperative per-lane copy so each thread of
+    // the wave only handles its share of the tile elements. The previous
+    // path materialized the whole tile as a per-lane vector, then had every
+    // lane redundantly write it to the same LDS bytes -- correct on paper
+    // but it drove SGPR spills into the hundreds and corrupted WMMA inputs
+    // on real gfx11 hardware.
+    if (resultMemRefType) {
+      Value lds =
+          allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
+      if (failed(emitCooperativeCopy(rewriter, op.getLoc(), op.getOperation(),
+                                     memref, *axes, lds, resultMemRefType)))
+        return failure();
+      rewriter.replaceOp(op, lds);
+      return success();
+    }
+
+    // Per-lane vector result: every thread independently materializes its
+    // own fragment via `vector.transfer_read`. Strided slices fold the
+    // per-axis stride into a `memref.subview` so the step ends up encoded in
+    // the subview's affine layout; the read then walks zero offsets against
+    // the subview. Unit-stride slices skip the subview to keep the simpler
+    // IR shape existing tests pin down.
     Value padding = constantSplat(rewriter, op.getLoc(),
                                   transferVectorType.getElementType(), 0);
     if (!padding)
       return failure();
 
-    // Strided slices fold the per-axis stride into a `memref.subview` so the
-    // step ends up encoded in the subview's affine layout. `transfer_read`
-    // then walks the subview's logical shape contiguously and the underlying
-    // loads honour the original step. Unit-stride slices skip the subview to
-    // keep the simpler IR shape that existing tests pin down.
     Value transferSource = memref;
     SmallVector<Value> transferOffsets;
     AffineMap permutationMap = transferPermutationMap(

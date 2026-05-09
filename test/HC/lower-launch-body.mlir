@@ -55,12 +55,25 @@ module {
   }
 
   // CHECK-LABEL: func.func @tile_memory(
-  // CHECK: vector.transfer_read
-  // CHECK-SAME: vector<4x4xf32>
+  // The cooperative load lowers `hc.load` into a per-lane `scf.for` chunk
+  // loop that copies the source slice into LDS one element at a time, with
+  // a closing `gpu.barrier` to publish the writes to the rest of the wave.
   // CHECK: memref.alloca
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_write
+  // CHECK: arith.ceildivui
+  // CHECK: scf.for
+  // CHECK: arith.cmpi ult
+  // CHECK: scf.if
+  // CHECK: arith.remui
+  // CHECK: arith.divui
+  // CHECK: arith.cmpi ult
+  // CHECK: arith.andi
+  // CHECK: scf.if {{.*}} -> (f32)
+  // CHECK: memref.load
+  // CHECK-SAME: memref<?x?xf32>
+  // CHECK: memref.store
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: gpu.barrier
   // CHECK: vector.create_mask
   // CHECK-SAME: vector<4x4xi1>
   // CHECK: memref.alloca
@@ -138,12 +151,15 @@ module {
   }
 
   // CHECK-LABEL: func.func @tensor_mask_and_select(
-  // CHECK: vector.transfer_read
-  // CHECK-SAME: vector<4x4xf32>
+  // Cooperative load of the source slice into LDS, gated by a barrier.
   // CHECK: memref.alloca
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_write
+  // CHECK: scf.for
+  // CHECK: memref.load
+  // CHECK-SAME: memref<?x?xf32>
+  // CHECK: memref.store
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: gpu.barrier
   // CHECK: vector.create_mask
   // CHECK-SAME: vector<4x4xi1>
   // CHECK: memref.alloca

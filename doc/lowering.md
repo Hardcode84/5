@@ -788,11 +788,16 @@ which runs whichever of those layers is wired up today and returns a
 module under `front_ir` / `front_ir_text`, the post-pipeline `hc` module
 under `hc_ir` / `hc_ir_text` (or `None` on pipeline failure), and any
 MLIR diagnostics emitted during the pipeline run under
-`pipeline_diagnostics`. Invoking the compiled handle launches — until
-specialization and launch stages land, invocation raises
-`NotImplementedError`. Partial `symbols` maps are legal; unbound literals
-stay symbolic and later stages refine them. Bindings are recorded on the
-handle for later stages to consume.
+`pipeline_diagnostics`. `compiled.invoke(*args, stream=None)` runs the
+kernel: it lazy-builds an `hc.execution_engine.ExecutionEngine`, JITs
+the post-pipeline LLVM-dialect module, and calls the host wrapper with
+each user argument as a `PyObject *` (the wrapper unpacks tensors via
+the `_mlir_ciface_hc_get_*` helpers from `libhc_rt_helpers.so` and
+dispatches the GPU launch through the `hc_rt_load_kernel` /
+`hc_rt_launch_kernel` shim from `libhc_hip_runtime.so`); see the
+"End-to-end execution" section below. Partial `symbols` maps are legal;
+unbound literals stay symbolic and later stages refine them. Bindings
+are recorded on the handle for later stages to consume.
 
 The `hc_front -> hc` stage runs under a transform-dialect schedule, not
 a fixed pass list — see [`doc/schedules.md`](schedules.md). The default
@@ -1013,6 +1018,69 @@ required by a given backend have been supplied, `hc` should lower to a mix of:
 * `scf.*`
 * other standard dialects as needed,
 * target-specific dialects or backend IR.
+
+### End-to-end execution
+
+For the gfx11 WMMA path the lowering chain runs end-to-end today:
+`hc.compile(kernel_fn, target="amdgpu-gfx11").invoke(*args)` JITs a host
+wrapper that drives the AMDGPU device binary through the bundled HIP
+shim, with no external ROCm install on the host. The pieces are:
+
+1. **Schedule + GPU lowering pipeline.** The transform schedule
+   (`hc/schedules/front_to_hc.mlir`) lowers `hc_front` to `hc`,
+   replaces every `hc.kernel` with a `gpu.launch` (`hc-lower-kernels-to-gpu-launch`)
+   wrapping a `func.func` host wrapper, lowers `hc` ops in the launch
+   body to upstream dialects (`hc-lower-launch-body`, including the
+   cooperative LDS-staged copy for `group.load`), and stamps each
+   outlined `gpu.module` with a `#rocdl.target` carrying the resolved
+   chip and `target-features` (the wave32 feature is mandatory on
+   gfx10+ — without it WMMA silently miscompiles to a wave64 fragment
+   layout). The Python driver in `hc/_pipeline.py` then appends a
+   fixed device-side chain (`convert-amdgpu-to-rocdl`,
+   `convert-gpu-to-rocdl`, `gpu-to-llvm`, ...), terminated by:
+   * `hc-lower-gpu-to-binary` — runs the LLVM AMDGPU backend on each
+     `gpu.module`, links the resulting object with the bundled
+     `ld.lld` (resolved Python-side from `_native_paths.lld_path`,
+     no external `rocm-llvm` lookup), and replaces the module with a
+     `gpu.binary` op holding the HSACO blob.
+   * `hc-lower-launch-func-to-runtime` — embeds each HSACO as an
+     LLVM private global and rewrites every `gpu.launch_func` into
+     paired `hc_rt_load_kernel` (cached, returns an opaque
+     `hipFunction_t`) + `hc_rt_launch_kernel` calls. After this pass
+     the post-pipeline module is pure LLVM dialect with externs for
+     the runtime helpers and HIP shim — no `gpu.binary`, no
+     `gpu.launch_func`, no MLIR-side device modules.
+2. **Runtime helpers (`libhc_rt_helpers.so`).** The host wrapper
+   takes one `PyObject *` per user argument and unpacks each one
+   through the `_mlir_ciface_hc_get_buffer` / `_mlir_ciface_hc_get_int64`
+   / `_mlir_ciface_hc_get_float64` / `_mlir_ciface_hc_get_dim` /
+   `_mlir_ciface_hc_get_stride` helpers. These borrow the buffer
+   protocol / `__cuda_array_interface__` view of the object — they
+   do not allocate, copy, or take ownership; the caller keeps the
+   tensor alive across the launch.
+3. **HIP shim (`libhc_hip_runtime.so`).** Statically dlopens
+   `libamdhip64.so` on first use (`hc_rt_init`, mutex-serialized and
+   double-checked, idempotent) and exposes `hc_rt_load_kernel` /
+   `hc_rt_launch_kernel` against the function-pointer cache it
+   populates. There is no link-time dependency on ROCm: the shim
+   resolves HIP symbols at runtime and reports a clean error if HIP
+   is unavailable.
+4. **JIT (`hc.execution_engine.ExecutionEngine`).** `compiled.invoke`
+   resolves the runtime helper + HIP shim symbol addresses with
+   `ctypes` (no `LoadLibraryPermanently` side effects) and hands them
+   to `ExecutionEngineOptions.set_symbol_map` so the JIT'd host
+   wrapper binds against the in-process implementations. It then
+   `lookup`s `@<kernel_name>` and calls it through a
+   `ctypes.CFUNCTYPE(None, py_object * N)` thunk — bypassing the
+   upstream MLIR engine's packed-args wrapper entirely. Engine and
+   cfunc are cached per `CompiledKernel`, so the second `invoke` on
+   the same handle skips JIT.
+
+`tests/test_examples.py::test_gfx11_wmma_example_invokes_on_real_hardware`
+is the executable specification of this chain: it compiles the WMMA
+matmul example for `amdgpu-gfx11`, runs it through the full stack on a
+gfx11 GPU (gated on `HC_RT_RUN_HIP_INVOKE_TEST=1`), and checks the
+result against a numpy reference.
 
 ## MLIR strategy
 

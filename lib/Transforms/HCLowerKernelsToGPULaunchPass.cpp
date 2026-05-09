@@ -14,6 +14,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -274,19 +276,6 @@ private:
   const BoundValues &boundValues;
 };
 
-static void bindBufferShapeSymbols(OpBuilder &builder, Location loc,
-                                   BufferType type, Value hostArg,
-                                   BoundValues &boundValues) {
-  for (auto [index, dim] : llvm::enumerate(type.getShape().getDims())) {
-    std::optional<StringRef> symbol = exactSymbolName(dim);
-    if (!symbol)
-      continue;
-    Value dimValue =
-        memref::DimOp::create(builder, loc, hostArg, index).getResult();
-    boundValues.bind(*symbol, dimValue);
-  }
-}
-
 static void bindScalarSymbol(Type originalType, Value hostArg,
                              BoundValues &boundValues) {
   auto idx = dyn_cast<IdxType>(originalType);
@@ -296,6 +285,124 @@ static void bindScalarSymbol(Type originalType, Value hostArg,
   if (ixs_node_tag(node) != IXS_SYM)
     return;
   boundValues.bind(StringRef(ixs_node_sym_name(node)), hostArg);
+}
+
+// Idempotently declare an `extern "C"` runtime helper at module scope. The
+// `llvm.emit_c_interface` attribute is what makes `convert-func-to-llvm`
+// (a) emit an external `_mlir_ciface_<name>` decl that matches the C ABI
+// exported by `libhc_rt_helpers.so`, and (b) generate a private body for
+// `<name>` that handles memref descriptor sret packing and forwards to the
+// cwrapper. Call sites in this pass therefore use the unmangled `@<name>`.
+static func::FuncOp ensureRuntimeHelper(ModuleOp module, StringRef name,
+                                        ArrayRef<Type> inputs,
+                                        ArrayRef<Type> results) {
+  if (auto existing = module.lookupSymbol<func::FuncOp>(name))
+    return existing;
+  MLIRContext *ctx = module.getContext();
+  OpBuilder builder(ctx);
+  builder.setInsertionPointToStart(module.getBody());
+  auto fnType = FunctionType::get(ctx, inputs, results);
+  auto func = func::FuncOp::create(builder, module.getLoc(), name, fnType);
+  func.setVisibility(SymbolTable::Visibility::Private);
+  func->setAttr("llvm.emit_c_interface", UnitAttr::get(ctx));
+  return func;
+}
+
+// Pre-declare every helper the host wrapper might reach for. Cheap and idem-
+// potent; cleaner than per-call existence checks scattered through the body.
+static void ensureRuntimeHelpers(ModuleOp module) {
+  MLIRContext *ctx = module.getContext();
+  Type ptr = LLVM::LLVMPointerType::get(ctx);
+  Type i32 = IntegerType::get(ctx, 32);
+  Type i64 = IntegerType::get(ctx, 64);
+  Type f64 = Float64Type::get(ctx);
+  Type byteRef =
+      MemRefType::get({ShapedType::kDynamic}, IntegerType::get(ctx, 8));
+  ensureRuntimeHelper(module, "hc_get_buffer", {ptr}, {byteRef});
+  ensureRuntimeHelper(module, "hc_get_dim", {ptr, i32}, {i64});
+  ensureRuntimeHelper(module, "hc_get_stride", {ptr, i32}, {i64});
+  ensureRuntimeHelper(module, "hc_get_int64", {ptr}, {i64});
+  ensureRuntimeHelper(module, "hc_get_float64", {ptr}, {f64});
+}
+
+// `_mlir_ciface_hc_get_dim(%pyobj, %dim_idx)` returns i64; we want index for
+// downstream symbol arithmetic and `memref.view`. The cast is folded away by
+// `arith-to-llvm` later when both sides are the platform pointer width.
+static Value callGetDim(OpBuilder &builder, Location loc, ModuleOp module,
+                        Value pyArg, unsigned dimIndex) {
+  auto fn = module.lookupSymbol<func::FuncOp>("hc_get_dim");
+  Type i32 = IntegerType::get(builder.getContext(), 32);
+  Value dimAttr = arith::ConstantIntOp::create(builder, loc, i32,
+                                               static_cast<int64_t>(dimIndex));
+  auto call =
+      func::CallOp::create(builder, loc, fn, ValueRange{pyArg, dimAttr});
+  return arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
+                                    call.getResult(0))
+      .getResult();
+}
+
+// Materialize a typed memref from a `PyObject *` argument. Two-step: first
+// pull a 1D byte buffer descriptor via `_mlir_ciface_hc_get_buffer`, then
+// re-type via `memref.view` using the previously-resolved per-dim index
+// values. v0 assumes contiguous row-major packing — non-contiguous strides
+// will silently produce wrong indexing; tracked separately for follow-up.
+static Value buildTypedBuffer(OpBuilder &builder, Location loc, ModuleOp module,
+                              Value pyArg, MemRefType resultType,
+                              ArrayRef<Value> shapeValues) {
+  auto fn = module.lookupSymbol<func::FuncOp>("hc_get_buffer");
+  auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg});
+  Value byteBuf = call.getResult(0);
+  Value byteOffset =
+      arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+
+  // Only the dynamic axes are passed as `sizes` operands to `memref.view`;
+  // static literals are baked into the result type. Walk `shapeValues` in
+  // step with the result type's shape to filter accordingly.
+  SmallVector<Value> dynamicSizes;
+  for (auto [dim, value] :
+       llvm::zip_equal(resultType.getShape(), shapeValues)) {
+    if (dim == ShapedType::kDynamic)
+      dynamicSizes.push_back(value);
+  }
+  return memref::ViewOp::create(builder, loc, resultType, byteBuf, byteOffset,
+                                dynamicSizes)
+      .getResult();
+}
+
+// Pull a scalar argument of arbitrary HC scalar ABI type out of a PyObject.
+// `targetType` is the post-`convertScalarABIType` MLIR type expected by the
+// kernel body (e.g. `index`, `i32`, `f16`). We always go through i64/f64 on
+// the wire and then narrow / convert in-IR — matches wave's helper surface
+// and keeps the C ABI tiny.
+static FailureOr<Value> buildScalar(OpBuilder &builder, Location loc,
+                                    ModuleOp module, Value pyArg,
+                                    Type targetType) {
+  if (isa<FloatType>(targetType)) {
+    auto fn = module.lookupSymbol<func::FuncOp>("hc_get_float64");
+    auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg});
+    Value f64Value = call.getResult(0);
+    if (isa<Float64Type>(targetType))
+      return f64Value;
+    return arith::TruncFOp::create(builder, loc, targetType, f64Value)
+        .getResult();
+  }
+  if (isa<IndexType>(targetType) || isa<IntegerType>(targetType)) {
+    auto fn = module.lookupSymbol<func::FuncOp>("hc_get_int64");
+    auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg});
+    Value i64Value = call.getResult(0);
+    if (isa<IndexType>(targetType))
+      return arith::IndexCastOp::create(builder, loc, targetType, i64Value)
+          .getResult();
+    auto intType = cast<IntegerType>(targetType);
+    if (intType.getWidth() == 64)
+      return i64Value;
+    if (intType.getWidth() < 64)
+      return arith::TruncIOp::create(builder, loc, targetType, i64Value)
+          .getResult();
+    return arith::ExtSIOp::create(builder, loc, targetType, i64Value)
+        .getResult();
+  }
+  return failure();
 }
 
 static LogicalResult lowerShapeDim(ExprLowerer &lowerer, ShapeAttr shape,
@@ -345,8 +452,7 @@ static LogicalResult lowerLaunchGeometry(OpBuilder &builder, Location loc,
 static LogicalResult cloneKernelBodyIntoLaunch(OpBuilder &builder,
                                                HCKernelOp kernel,
                                                gpu::LaunchOp launch,
-                                               ValueRange hostArgs,
-                                               ArrayRef<unsigned> hostArgFor) {
+                                               ArrayRef<Value> kernelABIArgs) {
   Block &kernelBlock = kernel.getBody().front();
   Operation *returnLike = nullptr;
   if (!kernelBlock.empty()) {
@@ -379,11 +485,11 @@ static LogicalResult cloneKernelBodyIntoLaunch(OpBuilder &builder,
                                                        arg.getType(), undef)
                         .getResult(0);
     } else {
-      Value hostArg = hostArgs[hostArgFor[index]];
-      replacement = hostArg.getType() == arg.getType()
-                        ? hostArg
+      Value abiValue = kernelABIArgs[index];
+      replacement = abiValue.getType() == arg.getType()
+                        ? abiValue
                         : UnrealizedConversionCastOp::create(
-                              builder, arg.getLoc(), arg.getType(), hostArg)
+                              builder, arg.getLoc(), arg.getType(), abiValue)
                               .getResult(0);
     }
     mapping.map(arg, replacement);
@@ -401,38 +507,99 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   MLIRContext *ctx = kernel.getContext();
   Location loc = kernel.getLoc();
   Block &kernelBlock = kernel.getBody().front();
+  ModuleOp module = kernel->getParentOfType<ModuleOp>();
+  if (!module)
+    return kernel.emitOpError("must be nested in a module");
 
-  SmallVector<Type> hostInputTypes;
-  SmallVector<unsigned> hostArgFor(kernelBlock.getNumArguments());
+  // Per-arg conversion bookkeeping. `kernelABITypes[i]` is the post-
+  // `convertABIType` type the kernel body expects; `hostArgFor[i]` is the
+  // index of the matching `PyObject *` slot in the host wrapper signature
+  // (or sentinel for `!hc.group` args, which aren't user-visible).
+  SmallVector<Type> kernelABITypes(kernelBlock.getNumArguments());
+  SmallVector<unsigned> hostArgFor(kernelBlock.getNumArguments(),
+                                   std::numeric_limits<unsigned>::max());
+  unsigned hostArgCount = 0;
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
-    if (isa<GroupType>(arg.getType())) {
-      hostArgFor[index] = std::numeric_limits<unsigned>::max();
+    if (isa<GroupType>(arg.getType()))
       continue;
-    }
     Type converted = convertABIType(arg.getType());
     if (!converted)
       return kernel.emitOpError("unsupported kernel ABI argument type ")
              << arg.getType();
-    hostArgFor[index] = hostInputTypes.size();
-    hostInputTypes.push_back(converted);
+    kernelABITypes[index] = converted;
+    hostArgFor[index] = hostArgCount++;
   }
 
+  ensureRuntimeHelpers(module);
+
+  // Host wrapper takes one `PyObject *` per non-group kernel arg. We don't
+  // expose a leading stream pointer yet — the launcher uses a default stream
+  // baked into the HIP runtime shim. Threading an explicit stream is a
+  // separate piece of plumbing once we have a Python side that materializes
+  // one per-context.
   OpBuilder builder(kernel);
+  Type ptrType = LLVM::LLVMPointerType::get(ctx);
+  SmallVector<Type> hostInputTypes(hostArgCount, ptrType);
   auto fnType = FunctionType::get(ctx, hostInputTypes, {});
   auto hostFunc =
       func::FuncOp::create(builder, loc, kernel.getSymName(), fnType);
   Block *entry = hostFunc.addEntryBlock();
   builder.setInsertionPointToStart(entry);
 
+  // Two-pass arg materialization: scalar `idx` args first so a kernel that
+  // declares `M: idx` alongside `Buffer[M, K, ...]` binds `M` from the
+  // explicit scalar (authoritative) rather than from the buffer's dim. This
+  // matches the previous "first wins" behaviour now that we're free of
+  // lexical kernel-arg order.
+  SmallVector<Value> kernelABIArgs(kernelBlock.getNumArguments());
   BoundValues boundValues;
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
     if (isa<GroupType>(arg.getType()))
       continue;
-    Value hostArg = entry->getArgument(hostArgFor[index]);
-    if (auto buffer = dyn_cast<BufferType>(arg.getType()))
-      bindBufferShapeSymbols(builder, loc, buffer, hostArg, boundValues);
-    else
-      bindScalarSymbol(arg.getType(), hostArg, boundValues);
+    if (isa<BufferType>(arg.getType()))
+      continue;
+    Value pyArg = entry->getArgument(hostArgFor[index]);
+    FailureOr<Value> scalar =
+        buildScalar(builder, loc, module, pyArg, kernelABITypes[index]);
+    if (failed(scalar))
+      return kernel.emitOpError("unsupported scalar ABI argument type ")
+             << arg.getType();
+    kernelABIArgs[index] = *scalar;
+    bindScalarSymbol(arg.getType(), *scalar, boundValues);
+  }
+
+  // Buffer args. For each, harvest any free shape symbols from this buffer's
+  // shape (calling `_get_dim` once per first-occurrence symbol) and lower the
+  // full shape attr — including non-trivial exprs — through `ExprLowerer` so
+  // we can pass concrete dim values to `memref.view`.
+  for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
+    auto buffer = dyn_cast<BufferType>(arg.getType());
+    if (!buffer)
+      continue;
+    Value pyArg = entry->getArgument(hostArgFor[index]);
+    for (auto [dimIndex, dimAttr] :
+         llvm::enumerate(buffer.getShape().getDims())) {
+      std::optional<StringRef> symbol = exactSymbolName(dimAttr);
+      if (!symbol)
+        continue;
+      if (boundValues.lookup(*symbol))
+        continue;
+      Value dimValue = callGetDim(builder, loc, module, pyArg, dimIndex);
+      boundValues.bind(*symbol, dimValue);
+    }
+
+    SmallVector<Value> shapeValues;
+    ExprLowerer lowerer(builder, loc, boundValues);
+    for (Attribute dimAttr : buffer.getShape().getDims()) {
+      FailureOr<Value> dimValue = lowerer.lower(dimAttr);
+      if (failed(dimValue))
+        return kernel.emitOpError("failed to lower buffer shape dim for arg #")
+               << index;
+      shapeValues.push_back(*dimValue);
+    }
+    auto memrefType = cast<MemRefType>(kernelABITypes[index]);
+    kernelABIArgs[index] =
+        buildTypedBuffer(builder, loc, module, pyArg, memrefType, shapeValues);
   }
 
   SmallVector<Value> grid;
@@ -443,8 +610,7 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
 
   auto launch = gpu::LaunchOp::create(builder, loc, grid[0], grid[1], grid[2],
                                       block[0], block[1], block[2]);
-  if (failed(cloneKernelBodyIntoLaunch(builder, kernel, launch,
-                                       entry->getArguments(), hostArgFor)))
+  if (failed(cloneKernelBodyIntoLaunch(builder, kernel, launch, kernelABIArgs)))
     return failure();
 
   builder.setInsertionPointAfter(launch);

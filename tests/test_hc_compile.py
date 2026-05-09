@@ -703,13 +703,27 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert "vector.transfer" not in ir_no_blob, ir_no_blob
         assert "unrealized_conversion_cast" not in ir_no_blob, ir_no_blob
         # Positive structural assertions: host wrapper landed as
-        # `llvm.func` after `gpu-to-llvm`, dispatches via the HIP shim
-        # (`hc_rt_load_kernel` + `hc_rt_launch_kernel`); the HSACO
-        # blob and per-callsite handle/name globals are at module
-        # scope.
+        # `llvm.func` after `gpu-to-llvm`, takes one `PyObject *`
+        # (lowered to `!llvm.ptr`) per kernel argument, calls the
+        # `_mlir_ciface_hc_get_*` helpers (which `convert-func-to-llvm`
+        # routes via the public-name wrappers `@hc_get_*`) to unpack
+        # each tensor's data pointer + shape dims, then dispatches via
+        # the HIP shim (`hc_rt_load_kernel` + `hc_rt_launch_kernel`).
+        # The HSACO blob and per-callsite handle/name globals live at
+        # module scope.
         assert "module attributes {gpu.container_module}" in handle.hc_ir_text
         assert (
-            "llvm.func @tiled_gfx11_wmma_matmul(" in handle.hc_ir_text
+            "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "
+            "%arg1: !llvm.ptr, %arg2: !llvm.ptr)"
+            in handle.hc_ir_text
+        ), handle.hc_ir_text
+        assert "@hc_get_buffer" in handle.hc_ir_text, handle.hc_ir_text
+        assert (
+            "@_mlir_ciface_hc_get_buffer" in handle.hc_ir_text
+        ), handle.hc_ir_text
+        assert "@hc_get_dim" in handle.hc_ir_text, handle.hc_ir_text
+        assert (
+            "@_mlir_ciface_hc_get_dim" in handle.hc_ir_text
         ), handle.hc_ir_text
         assert "@hc_rt_load_kernel" in handle.hc_ir_text, handle.hc_ir_text
         assert "@hc_rt_launch_kernel" in handle.hc_ir_text, handle.hc_ir_text

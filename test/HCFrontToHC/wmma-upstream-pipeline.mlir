@@ -50,18 +50,33 @@
 // CHECK-DAG: llvm.mlir.global internal constant @tiled_gfx11_wmma_matmul_kernel{{[_0-9]*}}("tiled_gfx11_wmma_matmul_kernel\00")
 // CHECK-DAG: llvm.mlir.global internal @tiled_gfx11_wmma_matmul_kernel_handle{{.*}}(#llvm.zero) {{.*}} : !llvm.ptr
 
-// Host wrapper landed as `llvm.func` after `gpu-to-llvm` flattened every
-// `func.func` in the module — descriptor-passing arity gives 5 i64s per
-// dynamic memref (alloc ptr, aligned ptr, offset, dim0, dim1) plus 1 i64
-// for the strides we explicitly bake into the launch ABI. The
-// `--implicit-check-not='hc.'` guard above pins zero residual HC ops or
-// types, and `--implicit-check-not='vector.transfer'` proves every
+// Runtime helper wrappers planted by `hc-lower-kernels-to-gpu-launch` and
+// then cwrapper-rewritten by `convert-func-to-llvm`: the public-name
+// wrapper handles memref descriptor sret packing for `hc_get_buffer` and
+// passes scalars straight through; the matching `_mlir_ciface_*` symbol
+// is the one libhc_rt_helpers.so actually exports. The buffer wrapper's
+// signature includes the descriptor struct as the LLVM-ABI return; the
+// dim wrapper passes its i64 directly.
+// CHECK-DAG: llvm.func private @hc_get_buffer({{.*}}: !llvm.ptr) -> !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
+// CHECK-DAG: llvm.func @_mlir_ciface_hc_get_buffer(!llvm.ptr, !llvm.ptr)
+// CHECK-DAG: llvm.func private @hc_get_dim({{.*}}: !llvm.ptr, {{.*}}: i32) -> i64
+// CHECK-DAG: llvm.func @_mlir_ciface_hc_get_dim(!llvm.ptr, i32) -> i64
+
+// Host wrapper takes one PyObject* (lowered to `!llvm.ptr`) per kernel
+// argument — three buffers in the WMMA example — and immediately calls
+// the helpers to materialize each tensor's data pointer and shape dims.
+// The `--implicit-check-not='hc.'` guard above pins zero residual HC ops
+// or types, and `--implicit-check-not='vector.transfer'` proves every
 // transfer_read/write got reduced to vector.load/store before the rocdl
 // chain ran.
 // CHECK-LABEL: llvm.func @tiled_gfx11_wmma_matmul(
-// CHECK-SAME:    %{{[^:]+}}: !llvm.ptr
-// CHECK-SAME:    %{{[^:]+}}: !llvm.ptr
-// CHECK-SAME:    %{{[^:]+}}: i64
+// CHECK-SAME:    %[[A:[^:]+]]: !llvm.ptr
+// CHECK-SAME:    %[[B:[^:]+]]: !llvm.ptr
+// CHECK-SAME:    %[[C:[^:]+]]: !llvm.ptr
+// CHECK: llvm.call @hc_get_dim(%[[A]], %{{.*}}) : (!llvm.ptr, i32) -> i64
+// CHECK: llvm.call @hc_get_buffer(%[[A]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
+// CHECK: llvm.call @hc_get_buffer(%[[B]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
+// CHECK: llvm.call @hc_get_buffer(%[[C]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
 
 // Block/thread counts come from `work_shape / group_shape` (the
 // `arith.ceildivui`/`arith.muli` chain became `llvm.udiv`/`llvm.mul`

@@ -72,6 +72,17 @@ def runtime_symbol_map() -> dict[str, int]:
     """
     helpers = ctypes.CDLL(str(runtime_helpers_lib_path()))
     hip = ctypes.CDLL(str(hip_runtime_lib_path()))
+    # `hc_rt_load_kernel` (called from JIT'd host wrappers) needs the
+    # `g_hipModuleLoadData` / `g_hipModuleLaunchKernel` function pointers
+    # bound, otherwise the first launch dereferences a null function
+    # pointer and the process segfaults with no useful diagnostic. The
+    # shim's `hc_rt_init` is mutex-serialized and double-checked, so
+    # calling it eagerly here is safe and idempotent — once per process
+    # is enough, but once per invoker construction is also harmless and
+    # keeps the bootstrap close to the symbol resolution that needs it.
+    hip.hc_rt_init.argtypes = []
+    hip.hc_rt_init.restype = None
+    hip.hc_rt_init()
     symbols: dict[str, int] = {}
     for name in _RUNTIME_HELPER_SYMBOLS:
         symbols[name] = _symbol_address(helpers, name)

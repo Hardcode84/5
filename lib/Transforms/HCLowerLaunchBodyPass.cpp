@@ -793,6 +793,54 @@ static LogicalResult writeVectorToMemRef(OpBuilder &builder, Location loc,
   auto memrefType = dyn_cast<MemRefType>(memref.getType());
   if (!memrefType)
     return failure();
+
+  // i1 needs per-element stores: a `vector<NxI1>` lowers to a packed-bit
+  // store (LLVM packs the i1 lanes into the vector's bit width — N bits =
+  // ceil(N/8) bytes), but `memref<NxI1>` accessed at element granularity
+  // gets one i1 per *byte* (i1 has store size 1). The downstream
+  // per-element scalar loads emitted by `transfer_to_scf full_unroll =
+  // true` for the WMMA fragment paths reach past byte 0/1 into bytes the
+  // packed write never touched, then read uninitialized LDS for every
+  // lane whose `lane%16 >= 2`. Decompose the vector store into N scalar
+  // i1 stores so both ends of the wire agree on byte-per-element layout.
+  // For wider types (f16/f32) the packed-vector and per-element stores
+  // touch the same bytes, so the extra unroll just bloats IR — keep the
+  // single transfer_write there.
+  if (memrefType.getElementType().isInteger(1)) {
+    auto vectorType = dyn_cast<mlir::VectorType>(vector.getType());
+    if (!vectorType || vectorType.getRank() != memrefType.getRank() ||
+        vectorType.getShape() != memrefType.getShape())
+      return failure();
+    SmallVector<int64_t> shape(memrefType.getShape().begin(),
+                               memrefType.getShape().end());
+    int64_t total = 1;
+    for (int64_t d : shape)
+      total *= d;
+    SmallVector<Value> dimValues;
+    dimValues.reserve(shape.size());
+    for (int64_t d : shape)
+      dimValues.push_back(
+          arith::ConstantIndexOp::create(builder, loc, d).getResult());
+    for (int64_t lin = 0; lin < total; ++lin) {
+      // Walk linear index back into per-axis coords (last axis fastest).
+      SmallVector<Value> coords(shape.size());
+      SmallVector<int64_t> coordInts(shape.size());
+      int64_t remaining = lin;
+      for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
+           --axis) {
+        coordInts[axis] = remaining % shape[axis];
+        remaining /= shape[axis];
+        coords[axis] =
+            arith::ConstantIndexOp::create(builder, loc, coordInts[axis])
+                .getResult();
+      }
+      Value element = vector::ExtractOp::create(builder, loc, vector, coordInts)
+                          .getResult();
+      memref::StoreOp::create(builder, loc, element, memref, coords);
+    }
+    return success();
+  }
+
   vector::TransferWriteOp::create(
       builder, loc, vector, memref,
       zeroOffsets(builder, loc, memrefType.getRank()));
@@ -1008,6 +1056,48 @@ static FailureOr<Value> readMemRefAsVector(OpBuilder &builder, Location loc,
   auto memrefType = dyn_cast<MemRefType>(memref.getType());
   if (!memrefType || memrefType.getRank() != vectorType.getRank())
     return failure();
+
+  // Mirror `writeVectorToMemRef`'s i1 special case on the read side. LLVM
+  // packs `vector<NxI1>` into ceil(N/8) bytes (one bit per lane), but the
+  // matching memref uses one *byte* per element. A bare `vector.transfer_read
+  // : vector<NxI1>` therefore reads ceil(N/8) bytes from row 0 and reinterprets
+  // them as N bits — element 0 lands at the LSB of byte 0, element 1 at bit 1
+  // of byte 0 (which the byte-per-element store left zero), element 8 at bit 0
+  // of byte 1, and so on. Decompose into N scalar `memref.load`s + inserts so
+  // the read agrees with the write's byte-per-element layout. f16/f32 don't
+  // need this — vector and memref already touch the same bytes.
+  if (memrefType.getElementType().isInteger(1) &&
+      vectorType.getElementType().isInteger(1) &&
+      vectorType.getShape() == memrefType.getShape()) {
+    SmallVector<int64_t> shape(memrefType.getShape().begin(),
+                               memrefType.getShape().end());
+    int64_t total = 1;
+    for (int64_t d : shape)
+      total *= d;
+    Value result = arith::ConstantOp::create(builder, loc, vectorType,
+                                             builder.getZeroAttr(vectorType))
+                       .getResult();
+    for (int64_t lin = 0; lin < total; ++lin) {
+      SmallVector<Value> coords(shape.size());
+      SmallVector<int64_t> coordInts(shape.size());
+      int64_t remaining = lin;
+      for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
+           --axis) {
+        coordInts[axis] = remaining % shape[axis];
+        remaining /= shape[axis];
+        coords[axis] =
+            arith::ConstantIndexOp::create(builder, loc, coordInts[axis])
+                .getResult();
+      }
+      Value element =
+          memref::LoadOp::create(builder, loc, memref, coords).getResult();
+      result =
+          vector::InsertOp::create(builder, loc, element, result, coordInts)
+              .getResult();
+    }
+    return result;
+  }
+
   Value padding = constantSplat(builder, loc, vectorType.getElementType(), 0);
   if (!padding)
     return failure();
@@ -1240,11 +1330,63 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
         transferOffsets.push_back(axis.offset);
     }
 
-    Value loaded =
-        vector::TransferReadOp::create(
-            rewriter, op.getLoc(), transferVectorType, transferSource,
-            transferOffsets, std::optional<Value>(padding), permutationMap)
-            .getResult();
+    // i1 vectors must use per-element scalar loads. LLVM packs `vector<NxI1>`
+    // into ceil(N/8) bytes, so a single `vector.transfer_read` of i1 lowers
+    // to a 2-byte load that picks element 0 from bit 0 of byte 0 and element
+    // 8 from bit 0 of byte 1 — everything else aliases the byte-per-element
+    // memref's zero padding. Mirror `writeVectorToMemRef`'s i1 path: emit N
+    // `memref.load`s + `vector.insert`s so both ends agree on the
+    // byte-per-element layout. Only intercept the unit-stride path (the
+    // strided one already routes through a `memref.subview`, where the same
+    // logic still applies — handle it the same way).
+    Value loaded;
+    if (transferVectorType.getElementType().isInteger(1)) {
+      ArrayRef<int64_t> shape = transferVectorType.getShape();
+      int64_t total = 1;
+      for (int64_t d : shape)
+        total *= d;
+      Value zero =
+          arith::ConstantOp::create(rewriter, op.getLoc(), transferVectorType,
+                                    rewriter.getZeroAttr(transferVectorType))
+              .getResult();
+      Value vec = zero;
+      for (int64_t lin = 0; lin < total; ++lin) {
+        SmallVector<int64_t> resultCoords(shape.size());
+        int64_t remaining = lin;
+        for (int64_t a = static_cast<int64_t>(shape.size()) - 1; a >= 0; --a) {
+          resultCoords[a] = remaining % shape[a];
+          remaining /= shape[a];
+        }
+        SmallVector<Value> sourceCoords(transferOffsets.begin(),
+                                        transferOffsets.end());
+        for (size_t i = 0; i < permutationMap.getNumResults(); ++i) {
+          auto expr = permutationMap.getResult(i);
+          if (auto dim = llvm::dyn_cast<AffineDimExpr>(expr)) {
+            unsigned srcAxis = dim.getPosition();
+            Value off = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
+                                                       resultCoords[i])
+                            .getResult();
+            sourceCoords[srcAxis] =
+                arith::AddIOp::create(rewriter, op.getLoc(),
+                                      sourceCoords[srcAxis], off)
+                    .getResult();
+          }
+        }
+        Value elem = memref::LoadOp::create(rewriter, op.getLoc(),
+                                            transferSource, sourceCoords)
+                         .getResult();
+        vec = vector::InsertOp::create(rewriter, op.getLoc(), elem, vec,
+                                       resultCoords)
+                  .getResult();
+      }
+      loaded = vec;
+    } else {
+      loaded =
+          vector::TransferReadOp::create(
+              rewriter, op.getLoc(), transferVectorType, transferSource,
+              transferOffsets, std::optional<Value>(padding), permutationMap)
+              .getResult();
+    }
     FailureOr<Value> result =
         materializeShapedResult(rewriter, op.getLoc(), converted, loaded);
     if (failed(result))

@@ -78,7 +78,10 @@ module {
   // CHECK-SAME: vector<4x4xi1>
   // CHECK: memref.alloca
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_write
+  // i1 stores go through per-element vector.extract + memref.store rather than
+  // a packed vector.transfer_write — see the writeVectorToMemRef i1 case.
+  // CHECK: vector.extract
+  // CHECK: memref.store
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
   // CHECK: memref.subview
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>> to memref<4xf32,
@@ -86,8 +89,11 @@ module {
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>> to memref<4xi1,
   // CHECK: vector.transfer_read
   // CHECK-SAME: vector<4xf32>
-  // CHECK: vector.transfer_read
-  // CHECK-SAME: vector<4xi1>
+  // The per-lane i1 read mirrors the write: scalar memref.load + vector.insert
+  // instead of vector.transfer_read of vector<4xi1>.
+  // CHECK: memref.load
+  // CHECK-SAME: memref<4xi1
+  // CHECK: vector.insert
   // CHECK: vector.broadcast
   // CHECK-SAME: f32 to vector<4xf32>
   // CHECK: arith.select
@@ -164,10 +170,17 @@ module {
   // CHECK-SAME: vector<4x4xi1>
   // CHECK: memref.alloca
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_write
+  // i1 mask materializes via per-element vector.extract + memref.store; the
+  // matching read uses memref.load + vector.insert. Both ends agree on the
+  // byte-per-element layout LLVM emits for memref<NxI1>, sidestepping the
+  // bit-packed `vector<NxI1>` encoding the upstream lowering would otherwise
+  // pick for the contiguous transfer_write/read pair.
+  // CHECK: vector.extract
+  // CHECK: memref.store
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_read
+  // CHECK: memref.load
   // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
+  // CHECK: vector.insert
   // CHECK: vector.transfer_read
   // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
   // CHECK: arith.select

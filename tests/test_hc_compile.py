@@ -712,7 +712,7 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert "module attributes {gpu.container_module}" in handle.hc_ir_text
         assert (
             "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "
-            "%arg1: !llvm.ptr, %arg2: !llvm.ptr)"
+            "%arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr)"
             in handle.hc_ir_text
         ), handle.hc_ir_text
         assert "@hc_get_buffer" in handle.hc_ir_text, handle.hc_ir_text
@@ -900,6 +900,15 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
                 handle(view)
                 assert handle._invoker_cache.invoker is cached
 
+                # `stream=` is plumbed through to the host wrapper's
+                # leading slot. This kernel has no gpu.launch_func so
+                # the pointer never reaches the runtime — but the call
+                # must accept it (None or 0) without complaint, which
+                # is what tells us the ctypes thunk knows about the
+                # extra leading slot.
+                handle(view, stream=None)
+                handle(view, stream=0)
+
                 try:
                     handle(view, view)
                 except TypeError as exc:
@@ -942,8 +951,9 @@ def test_compile_invoke_raises_when_pipeline_failed() -> None:
 
 
 def test_compile_invoke_rejects_kwargs() -> None:
-    # Positional-only ABI for now — the host wrapper has no notion of
-    # named arguments. Reject loudly instead of silently dropping kwargs.
+    # Positional-only ABI for kernel arguments — the host wrapper has
+    # no notion of named arguments beyond the dedicated `stream=` slot.
+    # Reject other kwargs loudly instead of silently dropping them.
     handle = CompiledKernel(
         kernel=lambda: None,
         bindings={},
@@ -952,5 +962,5 @@ def test_compile_invoke_rejects_kwargs() -> None:
         hc_ir=object(),
         hc_ir_text="",
     )
-    with pytest.raises(TypeError, match="positionally"):
+    with pytest.raises(TypeError, match="must be positional"):
         handle(x=1)

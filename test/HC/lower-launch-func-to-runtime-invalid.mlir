@@ -20,7 +20,7 @@
 // point. The diagnostic attaches to the binary op (not the launch),
 // because the malformed thing is the binary's object array.
 module attributes {gpu.container_module} {
-  llvm.func @host_multi() {
+  llvm.func @host_multi(%stream: !llvm.ptr) {
     %c1 = llvm.mlir.constant(1 : index) : i64
     gpu.launch_func @multi::@entry blocks in (%c1, %c1, %c1) threads in (%c1, %c1, %c1) : i64
     llvm.return
@@ -30,4 +30,21 @@ module attributes {gpu.container_module} {
     #gpu.object<#rocdl.target<chip = "gfx1100">, bin = "blob-a">,
     #gpu.object<#rocdl.target<chip = "gfx1101">, bin = "blob-b">
   ]
+}
+
+// -----
+
+// Host wrapper with no leading `!llvm.ptr` stream arg. The pass relies
+// on the wrapper convention emitted by `hc-lower-kernels-to-gpu-launch`;
+// a launch_func that escaped its wrapper would otherwise crash on a
+// null `parentOfType` lookup. Pin the diagnostic so the failure mode
+// stays loud.
+module attributes {gpu.container_module} {
+  llvm.func @host_no_stream() {
+    %c1 = llvm.mlir.constant(1 : index) : i64
+    // expected-error @+1 {{gpu.launch_func is not nested inside an llvm.func with a leading stream argument}}
+    gpu.launch_func @bare::@entry blocks in (%c1, %c1, %c1) threads in (%c1, %c1, %c1) : i64
+    llvm.return
+  }
+  gpu.binary @bare [#gpu.object<#rocdl.target<chip = "gfx1100">, bin = "blob">]
 }

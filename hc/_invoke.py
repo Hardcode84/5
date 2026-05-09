@@ -97,15 +97,15 @@ def _missing_libs() -> list[str]:
 
 
 def _kernel_arg_count(module: Any, kernel_name: str) -> int:
-    """Read the host wrapper's PyObject* arity straight from the IR.
+    """Read the host wrapper's user-visible PyObject* arity from the IR.
 
-    The `llvm.func @<name>(...)` op in the post-pipeline module is the
-    source of truth — every operand is a `!llvm.ptr` (the lowering pass
-    only emits PyObject* host slots). Inspecting `kernel_fn.__hc_kernel__`
-    metadata + Python signature would re-derive the same number, but
-    it would have to keep its arg-skipping rules (`CurrentGroup` → drop)
-    in lockstep with the C++ pass; reading the IR keeps the two
-    decoupled.
+    The `llvm.func @<name>(...)` op in the post-pipeline module has a
+    leading `!llvm.ptr` stream slot followed by one `!llvm.ptr` per
+    user kernel argument. We return the user-visible count (total - 1)
+    so callers don't need to know about the stream slot at the
+    arg-validation level. Reading the IR (rather than re-deriving from
+    `kernel_fn.__hc_kernel__` + Python signature) keeps Python and C++
+    decoupled — the lowering pass owns the ABI, this just observes it.
     """
     body = module.body if hasattr(module, "body") else module
     target = "@" + kernel_name + "("
@@ -122,11 +122,15 @@ def _kernel_arg_count(module: Any, kernel_name: str) -> int:
             args_close = header.rindex(")")
             args_text = header[args_open + 1 : args_close].strip()
             if not args_text:
+                # Should be impossible — every host wrapper has at least
+                # the stream slot — but treat it as "0 user args" rather
+                # than crashing here; the call will surface the mismatch.
                 return 0
             # Split on top-level commas (no nested parens at this level —
             # arg types are all `!llvm.ptr`, attribute lists never use
             # `,` outside a `{...}` group which is also flat here).
-            return args_text.count(",") + 1
+            total = args_text.count(",") + 1
+            return max(total - 1, 0)
     raise RuntimeError(
         f"_invoke: host wrapper '@{kernel_name}' not found in compiled module"
     )
@@ -193,12 +197,16 @@ def make_invoker(
             "rename or DCE the wrapper)"
         )
 
-    # `void (PyObject*, PyObject*, ...)` — one slot per kernel arg, all
-    # passed by reference (a `py_object` _is_ a borrowed `PyObject *`).
-    func_type = ctypes.CFUNCTYPE(None, *([ctypes.py_object] * num_args))
+    # `void (void* stream, PyObject* arg0, PyObject* arg1, ...)` — the
+    # leading `c_void_p` is the HIP stream pointer (null = default
+    # stream); the rest are per-arg PyObject* slots, each passed by
+    # reference (a `py_object` _is_ a borrowed `PyObject *`).
+    func_type = ctypes.CFUNCTYPE(
+        None, ctypes.c_void_p, *([ctypes.py_object] * num_args)
+    )
     cfunc = func_type(func_ptr)
 
-    def invoke(*args: Any) -> None:
+    def invoke(*args: Any, stream: int | None = None) -> None:
         # Touching `engine` keeps it pinned in the closure so the JIT'd
         # code (and therefore `func_ptr`) stays valid for the lifetime
         # of this callable. Without the explicit reference the engine
@@ -210,7 +218,10 @@ def make_invoker(
                 f"hc.invoke: kernel '{kernel_name}' takes {num_args} "
                 f"argument(s), got {len(args)}"
             )
-        cfunc(*(ctypes.py_object(arg) for arg in args))
+        # `None` → null pointer → HIP default stream. An explicit `int`
+        # is the raw stream-handle address (for PyTorch users this is
+        # `torch.cuda.current_stream().cuda_stream`).
+        cfunc(stream, *(ctypes.py_object(arg) for arg in args))
 
     invoke.__name__ = f"invoke_{kernel_name}"
     invoke.__qualname__ = invoke.__name__

@@ -514,11 +514,12 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   // Per-arg conversion bookkeeping. `kernelABITypes[i]` is the post-
   // `convertABIType` type the kernel body expects; `hostArgFor[i]` is the
   // index of the matching `PyObject *` slot in the host wrapper signature
-  // (or sentinel for `!hc.group` args, which aren't user-visible).
+  // (or sentinel for `!hc.group` args, which aren't user-visible). The +1
+  // offset accounts for the leading stream pointer at slot 0.
   SmallVector<Type> kernelABITypes(kernelBlock.getNumArguments());
   SmallVector<unsigned> hostArgFor(kernelBlock.getNumArguments(),
                                    std::numeric_limits<unsigned>::max());
-  unsigned hostArgCount = 0;
+  unsigned userArgCount = 0;
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
     if (isa<GroupType>(arg.getType()))
       continue;
@@ -527,19 +528,20 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
       return kernel.emitOpError("unsupported kernel ABI argument type ")
              << arg.getType();
     kernelABITypes[index] = converted;
-    hostArgFor[index] = hostArgCount++;
+    hostArgFor[index] = 1 + userArgCount++;
   }
 
   ensureRuntimeHelpers(module);
 
-  // Host wrapper takes one `PyObject *` per non-group kernel arg. We don't
-  // expose a leading stream pointer yet — the launcher uses a default stream
-  // baked into the HIP runtime shim. Threading an explicit stream is a
-  // separate piece of plumbing once we have a Python side that materializes
-  // one per-context.
+  // Host wrapper signature: `(stream: !llvm.ptr, arg0: !llvm.ptr, ...)`.
+  // The leading stream pointer threads through to `hc_rt_load_kernel` /
+  // `hc_rt_launch_kernel` so callers can pin a launch to a specific HIP
+  // stream — passing a null pointer keeps the HIP default stream
+  // semantics. The lowering-to-runtime pass picks the stream up by
+  // walking back to this function's first argument.
   OpBuilder builder(kernel);
   Type ptrType = LLVM::LLVMPointerType::get(ctx);
-  SmallVector<Type> hostInputTypes(hostArgCount, ptrType);
+  SmallVector<Type> hostInputTypes(1 + userArgCount, ptrType);
   auto fnType = FunctionType::get(ctx, hostInputTypes, {});
   auto hostFunc =
       func::FuncOp::create(builder, loc, kernel.getSymName(), fnType);

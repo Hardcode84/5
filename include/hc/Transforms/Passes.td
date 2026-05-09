@@ -157,14 +157,17 @@ def HCLowerKernelsToGPULaunch
   let summary = "Wrap HC kernels in upstream GPU launch operations.";
   let description = [{
     Rewrites `hc.kernel` symbols into host `func.func` entry points that launch
-    the former kernel body with `gpu.launch`. The host wrapper signature is one
-    `!llvm.ptr` (`PyObject *`) per non-`!hc.group` kernel argument; the wrapper
-    body calls the `_mlir_ciface_hc_get_*` runtime helpers (declared as
-    `func.func private` with `llvm.emit_c_interface`) to unpack each PyObject
-    into a typed memref or scalar before computing launch geometry. Buffer
-    arguments come back as `memref<?xi8>` byte buffers and get re-typed via
-    `memref.view` using shape values pulled from the corresponding tensor
-    PyObject (or from sibling scalar `idx` arguments).
+    the former kernel body with `gpu.launch`. The host wrapper signature is a
+    leading `!llvm.ptr` stream pointer followed by one `!llvm.ptr`
+    (`PyObject *`) per non-`!hc.group` kernel argument; the wrapper body calls
+    the `_mlir_ciface_hc_get_*` runtime helpers (declared as `func.func
+    private` with `llvm.emit_c_interface`) to unpack each PyObject into a
+    typed memref or scalar before computing launch geometry. Buffer arguments
+    come back as `memref<?xi8>` byte buffers and get re-typed via `memref.view`
+    using shape values pulled from the corresponding tensor PyObject (or from
+    sibling scalar `idx` arguments). The stream pointer threads through to the
+    runtime launch calls in `hc-lower-launch-func-to-runtime`; passing null
+    keeps HIP's default-stream semantics.
 
     The original HC kernel body is kept inside the launch behind explicit cast
     boundaries for later memory and intrinsic lowering passes.

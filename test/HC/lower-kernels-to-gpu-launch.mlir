@@ -15,7 +15,11 @@
 module {
   // Static-shape buffer. No symbolic dims, so the wrapper only calls
   // `hc_get_buffer` and feeds zero dynamic sizes into `memref.view`.
+  // The leading `!llvm.ptr` is the stream slot — the launch-func-to-runtime
+  // pass picks it up later and threads it through hc_rt_load_kernel /
+  // hc_rt_launch_kernel; this pass just lays the slot down.
   // CHECK-LABEL: func.func @static_launch(
+  // CHECK-SAME: %{{[^:]+}}: !llvm.ptr,
   // CHECK-SAME: %[[A:.*]]: !llvm.ptr)
   hc.kernel @static_launch(
       %group: !hc.group<work_shape = #hc.shape<["64", "16"]>, group_shape = #hc.shape<["32", "8"]>>,
@@ -48,6 +52,7 @@ module {
   // shape symbol (`M` from axis 0, `N` from axis 1), index-casts the i64 to
   // index, and feeds both as dynamic sizes to `memref.view`.
   // CHECK-LABEL: func.func @dynamic_launch(
+  // CHECK-SAME: %{{[^:]+}}: !llvm.ptr,
   // CHECK-SAME: %[[A:.*]]: !llvm.ptr)
   hc.kernel @dynamic_launch(
       %group: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "N"]>, group_shape = #hc.shape<["32", "1"]>>,

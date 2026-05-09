@@ -10,13 +10,19 @@
 // global so the JIT'd module is fully self-contained — no
 // filesystem touches at launch time.
 //
+// The stream pointer is the first argument of the enclosing host
+// wrapper (laid down by `hc-lower-kernels-to-gpu-launch`). We grab it
+// from `parentOfType<LLVM::LLVMFuncOp>().getArgument(0)` rather than
+// re-deriving it from a side-channel attribute, because by the time
+// this pass runs the host wrapper has already been lowered through
+// convert-func-to-llvm and the convention "host wrapper's arg(0) is
+// the stream" is the cheapest invariant to enforce.
+//
 // We deliberately ship a smaller surface than wave's version: no
-// stream argument plumbing yet (we always pass null, i.e. the HIP
-// default stream — that comes back when the host wrapper grows an
-// explicit stream arg), no cluster size (gpu.launch_func today
-// never carries cluster dims through our pipeline; we hard-code 0
-// for cluster_{x,y,z}), and the binary always carries exactly one
-// `#gpu.object` (we only emit one per binary in the schedule).
+// cluster size (gpu.launch_func today never carries cluster dims
+// through our pipeline; we hard-code 0 for cluster_{x,y,z}), and the
+// binary always carries exactly one `#gpu.object` (we only emit one
+// per binary in the schedule).
 
 #include "hc/Transforms/Passes.h"
 
@@ -183,9 +189,17 @@ LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
                                   /*alignment=*/0);
   };
 
-  // Default HIP stream (null pointer). When the host wrapper grows an
-  // explicit stream arg, this becomes the function's first argument.
-  Value stream = LLVM::ZeroOp::create(builder, loc, ptrType);
+  // Stream comes from the host wrapper's leading `!llvm.ptr` arg. The
+  // host wrapper is the only function that contains gpu.launch_func ops
+  // in our pipeline, so an enclosing-LLVMFunc lookup is well-defined;
+  // missing one is a programmer error (the launch_func escaped its
+  // wrapper somehow), not a user-input failure.
+  auto enclosingFunc = op->getParentOfType<LLVM::LLVMFuncOp>();
+  if (!enclosingFunc || enclosingFunc.getNumArguments() == 0)
+    return op->emitError(
+        "hc-lower-launch-func-to-runtime: gpu.launch_func is not nested "
+        "inside an llvm.func with a leading stream argument");
+  Value stream = enclosingFunc.getArgument(0);
 
   // Per-callsite globals. Wave keeps the cache slot per-callsite (rather
   // than per-binary) to sidestep cross-callsite synchronisation; we

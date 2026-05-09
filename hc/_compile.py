@@ -71,20 +71,25 @@ class CompiledKernel:
         default_factory=InvokerCache, compare=False, repr=False
     )
 
-    def invoke(self, *args: Any) -> None:
+    def invoke(self, *args: Any, stream: int | None = None) -> None:
         """Dispatch the JIT'd host wrapper, calling `hc_rt_helpers` inside.
 
-        Lazy-builds an MLIR `ExecutionEngine` (loading
-        `libhc_rt_helpers.so` + `libhc_hip_runtime.so` as shared libs so
-        their `_mlir_ciface_hc_get_*` and `hc_rt_*` symbols resolve via
-        the JIT's process-wide search) the first time it's called, and
-        caches the resulting invoker on the handle so subsequent calls
-        reuse the same JIT'd code. Each argument is a Python object:
-        tensor-like objects (anything with `data_ptr()` / `size(i)` /
-        `stride(i)`, e.g. `torch.Tensor`) for buffer slots, plain
-        `int`/`float` for scalar slots. The host wrapper unpacks each
-        slot inside JIT'd code, so the Python-side call is just a
-        ctypes thunk.
+        Lazy-builds an `hc.execution_engine.ExecutionEngine` (with the
+        `_mlir_ciface_hc_get_*` and `hc_rt_*` symbols resolved out of
+        the bundled shared libraries and registered via `set_symbol_map`)
+        the first time it's called, and caches the resulting invoker on
+        the handle so subsequent calls reuse the same JIT'd code. Each
+        positional argument is a Python object: tensor-like objects
+        (anything with `data_ptr()` / `size(i)` / `stride(i)`, e.g.
+        `torch.Tensor`) for buffer slots, plain `int`/`float` for
+        scalar slots. The host wrapper unpacks each slot inside JIT'd
+        code, so the Python-side call is just a ctypes thunk.
+
+        `stream=` is the leading argument the host wrapper threads
+        through to `hc_rt_load_kernel` / `hc_rt_launch_kernel`; pass
+        `None` (the default) for HIP's default-stream semantics, or an
+        integer stream handle for explicit ordering. PyTorch users
+        usually want `torch.cuda.current_stream().cuda_stream`.
 
         Raises `RuntimeError` if the pipeline failed (the handle has no
         `hc_ir`) or if either runtime shared library is not present in
@@ -112,15 +117,16 @@ class CompiledKernel:
                     "the host wrapper symbol"
                 )
             self._invoker_cache.invoker = make_invoker(self.hc_ir, kernel_name)
-        self._invoker_cache.invoker(*args)
+        self._invoker_cache.invoker(*args, stream=stream)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: Any, stream: int | None = None, **kwargs: Any) -> Any:
         if kwargs:
             raise TypeError(
-                "hc.compile: invoking a CompiledKernel with kwargs is not "
-                "supported yet; pass arguments positionally"
+                "hc.compile: invoking a CompiledKernel with arbitrary kwargs "
+                "is not supported; only `stream=` is accepted, all other "
+                "arguments must be positional"
             )
-        return self.invoke(*args)
+        return self.invoke(*args, stream=stream)
 
     def __repr__(self) -> str:
         name = getattr(self.kernel, "__name__", "<kernel>")

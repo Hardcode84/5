@@ -56,7 +56,7 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     assert "module attributes {gpu.container_module}" in captured.out
     assert (
         "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "
-        "%arg1: !llvm.ptr, %arg2: !llvm.ptr)" in captured.out
+        "%arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr)" in captured.out
     )
     assert "@hc_get_buffer" in captured.out
     assert "@_mlir_ciface_hc_get_buffer" in captured.out

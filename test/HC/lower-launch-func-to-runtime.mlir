@@ -26,6 +26,9 @@
 //     launch via single-flight memoization.
 //   * the kernel-name global is NUL-terminated (HIP wants C strings).
 //   * the runtime decls land at module scope with the right ABI.
+//   * the stream is the host wrapper's leading `!llvm.ptr` arg, not a
+//     freshly minted `llvm.mlir.zero` — `hc-lower-kernels-to-gpu-launch`
+//     hands us that slot and we propagate it through both runtime calls.
 //   * the launch is gone, the binary is gone.
 
 // CHECK-LABEL: module attributes {gpu.container_module}
@@ -33,8 +36,7 @@
 // CHECK-DAG: llvm.mlir.global internal constant @entry{{.*}}("entry\00")
 // CHECK-DAG: llvm.mlir.global internal @entry_handle{{.*}}(#llvm.zero) {{.*}} : !llvm.ptr
 // CHECK-LABEL: llvm.func @host(
-// CHECK-SAME:    %[[BUF:.*]]: !llvm.ptr, %[[N:.*]]: i64
-// CHECK: %[[STREAM:.*]] = llvm.mlir.zero : !llvm.ptr
+// CHECK-SAME:    %[[STREAM:[^:]+]]: !llvm.ptr, %[[BUF:[^:]+]]: !llvm.ptr, %[[N:[^:]+]]: i64
 // CHECK: %[[HANDLE:.*]] = llvm.mlir.addressof @entry_handle{{.*}} : !llvm.ptr
 // CHECK: %[[NAME:.*]] = llvm.mlir.addressof @entry{{.*}} : !llvm.ptr
 // CHECK: %[[NAMEPTR:.*]] = llvm.getelementptr %[[NAME]]
@@ -60,7 +62,7 @@
 // CHECK-NOT: gpu.launch_func
 // CHECK-NOT: gpu.binary
 module attributes {gpu.container_module} {
-  llvm.func @host(%arg0: !llvm.ptr, %arg1: i64) {
+  llvm.func @host(%stream: !llvm.ptr, %arg0: !llvm.ptr, %arg1: i64) {
     %c1 = llvm.mlir.constant(1 : index) : i64
     %c4 = llvm.mlir.constant(4 : index) : i64
     gpu.launch_func @kernel::@entry blocks in (%c4, %c1, %c1) threads in (%c4, %c1, %c1) : i64
@@ -92,7 +94,7 @@ module attributes {gpu.container_module} {
 // CHECK-NOT: gpu.launch_func
 // CHECK-NOT: gpu.binary
 module attributes {gpu.container_module} {
-  llvm.func @host_two() {
+  llvm.func @host_two(%stream: !llvm.ptr) {
     %c1 = llvm.mlir.constant(1 : index) : i64
     %c2 = llvm.mlir.constant(2 : index) : i64
     gpu.launch_func @first::@first blocks in (%c2, %c1, %c1) threads in (%c1, %c1, %c1) : i64
@@ -125,7 +127,7 @@ module attributes {gpu.container_module} {
 // CHECK-NOT: gpu.launch_func
 // CHECK-NOT: gpu.binary
 module attributes {gpu.container_module} {
-  llvm.func @host_dup() {
+  llvm.func @host_dup(%stream: !llvm.ptr) {
     %c1 = llvm.mlir.constant(1 : index) : i64
     gpu.launch_func @kernel::@entry blocks in (%c1, %c1, %c1) threads in (%c1, %c1, %c1) : i64
     gpu.launch_func @kernel::@entry blocks in (%c1, %c1, %c1) threads in (%c1, %c1, %c1) : i64

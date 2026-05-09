@@ -62,14 +62,16 @@
 // CHECK-DAG: llvm.func private @hc_get_dim({{.*}}: !llvm.ptr, {{.*}}: i32) -> i64
 // CHECK-DAG: llvm.func @_mlir_ciface_hc_get_dim(!llvm.ptr, i32) -> i64
 
-// Host wrapper takes one PyObject* (lowered to `!llvm.ptr`) per kernel
-// argument — three buffers in the WMMA example — and immediately calls
-// the helpers to materialize each tensor's data pointer and shape dims.
-// The `--implicit-check-not='hc.'` guard above pins zero residual HC ops
-// or types, and `--implicit-check-not='vector.transfer'` proves every
+// Host wrapper takes a leading `!llvm.ptr` stream slot followed by one
+// PyObject* (lowered to `!llvm.ptr`) per kernel argument — three buffers
+// in the WMMA example — and immediately calls the helpers to materialize
+// each tensor's data pointer and shape dims. The
+// `--implicit-check-not='hc.'` guard above pins zero residual HC ops or
+// types, and `--implicit-check-not='vector.transfer'` proves every
 // transfer_read/write got reduced to vector.load/store before the rocdl
 // chain ran.
 // CHECK-LABEL: llvm.func @tiled_gfx11_wmma_matmul(
+// CHECK-SAME:    %[[STREAM:[^:]+]]: !llvm.ptr
 // CHECK-SAME:    %[[A:[^:]+]]: !llvm.ptr
 // CHECK-SAME:    %[[B:[^:]+]]: !llvm.ptr
 // CHECK-SAME:    %[[C:[^:]+]]: !llvm.ptr
@@ -83,11 +85,14 @@
 // after gpu-to-llvm) and feed straight through to `hc_rt_launch_kernel`.
 // The launch is no longer a `gpu.launch_func` op — it's a pair of HIP
 // shim calls: load the kernel module (single-flight via the handle
-// slot) then launch with the packed args.
+// slot) then launch with the packed args. Both calls receive the
+// host wrapper's leading stream slot as their first argument; passing
+// it through (rather than `llvm.mlir.zero`) lets the caller pin a
+// launch to a specific HIP stream.
 // CHECK: llvm.udiv
-// CHECK: llvm.call @hc_rt_load_kernel
+// CHECK: llvm.call @hc_rt_load_kernel(%[[STREAM]],
 // CHECK-SAME: (!llvm.ptr, !llvm.ptr, !llvm.ptr, i64, !llvm.ptr) -> !llvm.ptr
-// CHECK: llvm.call @hc_rt_launch_kernel
+// CHECK: llvm.call @hc_rt_launch_kernel(%[[STREAM]],
 // CHECK-SAME: (!llvm.ptr, !llvm.ptr, i32, i64, i64, i64, i64, i64, i64, i64, i64, i64, !llvm.ptr, i32) -> ()
 
 // Runtime decls land at module scope — `FunctionCallBuilder::create`

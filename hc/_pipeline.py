@@ -263,7 +263,7 @@ def run_front_to_hc(
 
     with (
         context,
-        _schedule_file(schedule, target=target) as schedule_path,
+        _schedule_file(schedule, target=target, context=context) as schedule_path,
         context.attach_diagnostic_handler(capture),
     ):
         pipeline = _pipeline_string(schedule_path, target=target)
@@ -350,9 +350,32 @@ def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
 
 
 def _build_pass_manager(pipeline: str, context: Any) -> Any:
+    from ._dump import dump_passes_enabled
     from .mlir import passmanager
 
-    return passmanager.PassManager.parse(pipeline, context=context)
+    pm = passmanager.PassManager.parse(pipeline, context=context)
+    if dump_passes_enabled():
+        # MLIR's IR printer can't be installed on a multi-threaded
+        # pass manager (LLVM ERRORs out at run time). Multi-threading
+        # is on by default; flipping it for the lifetime of the dump
+        # is fine — `HC_DUMP_PASSES` is opt-in debug, no one cares
+        # about the throughput hit.
+        context.enable_multithreading(False)
+        # Mirrors `mlir-opt --mlir-print-ir-after-all`. Catches every
+        # device-side pass appended by `_GPU_LOWERING_PIPELINE` plus the
+        # transform-interpreter pass itself. Per-pass output goes to
+        # stderr so a normal compile redirected to a file (e.g.
+        # `--dump-hc-ir > /tmp/hc.mlir`) keeps stdout clean. Per-pass
+        # transforms inside `transform.apply_registered_pass` aren't
+        # caught here — see `splice_dump_passes` in `_dump` for how the
+        # schedule itself is instrumented.
+        pm.enable_ir_printing(
+            print_before_all=False,
+            print_after_all=True,
+            print_module_scope=True,
+            print_after_change=True,
+        )
+    return pm
 
 
 def _capture_exception(diagnostics: list[str], exc: Exception) -> None:
@@ -366,7 +389,10 @@ def _capture_exception(diagnostics: list[str], exc: Exception) -> None:
 
 @contextmanager
 def _schedule_file(
-    schedule: ScheduleSource, *, target: str | None = None
+    schedule: ScheduleSource,
+    *,
+    target: str | None = None,
+    context: Any = None,
 ) -> Iterator[Path]:
     """Yield a filesystem path to the schedule, materializing inline text.
 
@@ -384,12 +410,36 @@ def _schedule_file(
     text = _substitute_target(text, target)
     text = _substitute_chip(text, target)
     text = _substitute_features(text, target)
+    text = _maybe_splice_dump_passes(text, context=context)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".mlir", delete=True, encoding="utf-8"
     ) as f:
         f.write(text)
         f.flush()
         yield Path(f.name)
+
+
+def _maybe_splice_dump_passes(text: str, *, context: Any) -> str:
+    # Only pay the parse/walk/restringify cost when the user asked for
+    # per-pass dumps. The splicer rewrites the schedule to interleave
+    # `transform.print` ops between every payload-mutating transform
+    # op so the interpreter dumps payload IR for free between passes —
+    # see `_dump.splice_dump_passes` for the rules. Borrows the
+    # caller's context (which has the transform dialect loaded via
+    # `prepared_context` / `_mlirRegisterEverything`) when given;
+    # falls back to a fresh `prepared_context` otherwise so this
+    # function stays usable from places that don't already hold one
+    # (tests, the `--dump-hc-ir` introspection path).
+    from ._dump import dump_passes_enabled, splice_dump_passes
+    from .mlir import ir
+
+    if not dump_passes_enabled():
+        return text
+    ctx = context if context is not None else prepared_context()
+    with ctx, ir.Location.unknown():
+        module = ir.Module.parse(text)
+        splice_dump_passes(module)
+        return str(module)
 
 
 def _resolve_schedule_text(schedule: ScheduleSource) -> str:

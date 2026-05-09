@@ -1082,6 +1082,36 @@ matmul example for `amdgpu-gfx11`, runs it through the full stack on a
 gfx11 GPU (gated on `HC_RT_RUN_HIP_INVOKE_TEST=1`), and checks the
 result against a numpy reference.
 
+### Per-pass IR dumps (`HC_DUMP_PASSES=1`)
+
+Setting `HC_DUMP_PASSES=1` in the environment turns on payload IR
+printing across the whole compile, in two surfaces:
+
+* The device-side `PassManager` (`_GPU_LOWERING_PIPELINE` in
+  `hc/_pipeline.py`) gets `enable_ir_printing(...)`. This is upstream
+  `--mlir-print-ir-after-all`; it dumps to **stderr** with the
+  conventional `// ----- // IR Dump After <PassName> ...` headers.
+  Catches every device-side pass (`fold-memref-alias-ops`, the
+  rocdl-conversion chain, `gpu-to-llvm`, `hc-lower-gpu-to-binary`,
+  `hc-lower-launch-func-to-runtime`, ...) and the
+  `transform-interpreter` pass itself.
+* The transform schedule (`hc/schedules/front_to_hc.mlir`) is
+  rewritten in memory before being handed to the interpreter: a
+  `transform.print` op is spliced in after every payload-mutating
+  transform op (`apply_registered_pass`, `apply_patterns`,
+  `apply_cse`, `apply_dce`). The interpreter then prints to
+  **stdout** with the `[[[ IR printer: after-<pass> ]]]` headers.
+  This works around the fact that the interpreter spawns throwaway
+  per-op `PassManager`s inside `apply_registered_pass` that don't
+  inherit instrumentation from the parent PM.
+
+Multi-threading is automatically disabled on the compile context
+when this knob is on (MLIR's IR printer requires it). Stdout is
+where the schedule's probe prints land, so combining
+`HC_DUMP_PASSES=1` with `--dump-hc-ir` interleaves the two streams
+on stdout — fine for grep, awkward for an editor; redirect to a
+file and search.
+
 ## MLIR strategy
 
 The fastest implementation path is still to emit textual MLIR.

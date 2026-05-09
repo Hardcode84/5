@@ -84,7 +84,16 @@ static MemRefType convertBufferABIType(BufferType type) {
     std::optional<int64_t> literal = integerLiteral(dim);
     dims.push_back(literal && *literal >= 0 ? *literal : ShapedType::kDynamic);
   }
-  return MemRefType::get(dims, elementType);
+  // All-dynamic strides + zero offset: the host wrapper pulls the actual
+  // per-axis element stride from the input PyObject via
+  // `_mlir_ciface_hc_get_stride`, so even a static-shape kernel can be
+  // launched on a transposed/sliced tensor without silently miscomputing.
+  // A `MemRefType::get` with no layout would imply identity (contiguous
+  // row-major) strides, which is exactly the wrong default.
+  SmallVector<int64_t> strides(dims.size(), ShapedType::kDynamic);
+  auto layout =
+      StridedLayoutAttr::get(type.getContext(), /*offset=*/0, strides);
+  return MemRefType::get(dims, elementType, layout);
 }
 
 static Type convertABIType(Type type) {
@@ -325,47 +334,93 @@ static void ensureRuntimeHelpers(ModuleOp module) {
   ensureRuntimeHelper(module, "hc_get_float64", {ptr}, {f64});
 }
 
-// `_mlir_ciface_hc_get_dim(%pyobj, %dim_idx)` returns i64; we want index for
-// downstream symbol arithmetic and `memref.view`. The cast is folded away by
-// `arith-to-llvm` later when both sides are the platform pointer width.
-static Value callGetDim(OpBuilder &builder, Location loc, ModuleOp module,
-                        Value pyArg, unsigned dimIndex) {
-  auto fn = module.lookupSymbol<func::FuncOp>("hc_get_dim");
+// Shared shape: each `_mlir_ciface_hc_get_*(pyobj, axis)` accessor returns
+// an i64 in element units that we want as `index` for memref descriptor
+// consumption. Lifted out so dim and stride don't drift apart.
+static Value callIndexAccessor(OpBuilder &builder, Location loc,
+                               ModuleOp module, StringRef name, Value pyArg,
+                               unsigned axisIndex) {
+  auto fn = module.lookupSymbol<func::FuncOp>(name);
   Type i32 = IntegerType::get(builder.getContext(), 32);
-  Value dimAttr = arith::ConstantIntOp::create(builder, loc, i32,
-                                               static_cast<int64_t>(dimIndex));
-  auto call =
-      func::CallOp::create(builder, loc, fn, ValueRange{pyArg, dimAttr});
+  Value axis = arith::ConstantIntOp::create(builder, loc, i32,
+                                            static_cast<int64_t>(axisIndex));
+  auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg, axis});
   return arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
                                     call.getResult(0))
       .getResult();
 }
 
-// Materialize a typed memref from a `PyObject *` argument. Two-step: first
-// pull a 1D byte buffer descriptor via `_mlir_ciface_hc_get_buffer`, then
-// re-type via `memref.view` using the previously-resolved per-dim index
-// values. v0 assumes contiguous row-major packing — non-contiguous strides
-// will silently produce wrong indexing; tracked separately for follow-up.
+static Value callGetDim(OpBuilder &builder, Location loc, ModuleOp module,
+                        Value pyArg, unsigned dimIndex) {
+  return callIndexAccessor(builder, loc, module, "hc_get_dim", pyArg, dimIndex);
+}
+
+static Value callGetStride(OpBuilder &builder, Location loc, ModuleOp module,
+                           Value pyArg, unsigned dimIndex) {
+  return callIndexAccessor(builder, loc, module, "hc_get_stride", pyArg,
+                           dimIndex);
+}
+
+// Materialize a typed memref from a `PyObject *` argument. Three steps:
+//   1. pull a 1D byte buffer descriptor via `_mlir_ciface_hc_get_buffer`,
+//   2. re-type it to the kernel's element type via `memref.view` (which is
+//      the only memref op upstream provides for byte→T bit-casts; the
+//      identity strides it bakes in are intermediate and discarded below),
+//   3. apply the real per-axis strides via `memref.reinterpret_cast` using
+//      values pulled from `_mlir_ciface_hc_get_stride`. This is what makes
+//      a transposed/sliced tensor (`numpy[..., ::2]`, `torch.transpose`)
+//      work — without it we'd silently miscompute against any
+//      non-contiguous input.
 static Value buildTypedBuffer(OpBuilder &builder, Location loc, ModuleOp module,
                               Value pyArg, MemRefType resultType,
                               ArrayRef<Value> shapeValues) {
   auto fn = module.lookupSymbol<func::FuncOp>("hc_get_buffer");
   auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg});
   Value byteBuf = call.getResult(0);
+
+  // `memref.view` rejects layout attrs on its result, so the intermediate
+  // typed view must drop the strided layout. Sizes flow through the same
+  // static/dynamic filter `view` requires (only dynamic dims as operands).
+  auto identityType =
+      MemRefType::get(resultType.getShape(), resultType.getElementType());
   Value byteOffset =
       arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-
-  // Only the dynamic axes are passed as `sizes` operands to `memref.view`;
-  // static literals are baked into the result type. Walk `shapeValues` in
-  // step with the result type's shape to filter accordingly.
   SmallVector<Value> dynamicSizes;
   for (auto [dim, value] :
        llvm::zip_equal(resultType.getShape(), shapeValues)) {
     if (dim == ShapedType::kDynamic)
       dynamicSizes.push_back(value);
   }
-  return memref::ViewOp::create(builder, loc, resultType, byteBuf, byteOffset,
-                                dynamicSizes)
+  Value typedView = memref::ViewOp::create(builder, loc, identityType, byteBuf,
+                                           byteOffset, dynamicSizes)
+                        .getResult();
+
+  // Sizes mirror the result type's shape: literal dims as IndexAttrs, dynamic
+  // dims pulled from the matching ExprLowerer-resolved `shapeValues` slot.
+  // The static/dynamic split has to match the result type's shape exactly
+  // (the verifier compares the static_sizes attr against the result type).
+  SmallVector<OpFoldResult> sizes;
+  sizes.reserve(resultType.getRank());
+  for (auto [dim, value] :
+       llvm::zip_equal(resultType.getShape(), shapeValues)) {
+    if (dim == ShapedType::kDynamic)
+      sizes.push_back(value);
+    else
+      sizes.push_back(builder.getIndexAttr(dim));
+  }
+
+  // Strides are always dynamic (we never bake them into the type). Numpy and
+  // torch report `tensor.stride(i)` in element units; `_mlir_ciface_hc_get_*`
+  // forwards that verbatim, which is exactly what `memref.reinterpret_cast`
+  // wants for its strides operand.
+  SmallVector<OpFoldResult> strides;
+  strides.reserve(resultType.getRank());
+  for (unsigned i = 0; i < resultType.getRank(); ++i)
+    strides.push_back(callGetStride(builder, loc, module, pyArg, i));
+
+  return memref::ReinterpretCastOp::create(builder, loc, resultType, typedView,
+                                           /*offset=*/builder.getIndexAttr(0),
+                                           sizes, strides)
       .getResult();
 }
 

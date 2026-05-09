@@ -934,6 +934,61 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
     assert result.stdout.strip().endswith("OK"), result.stdout
 
 
+def test_compile_invoke_accepts_non_contiguous_tensor(tmp_path: Path) -> None:
+    # The host wrapper pulls per-axis strides at runtime via
+    # `_mlir_ciface_hc_get_stride` and feeds them into
+    # `memref.reinterpret_cast`, so a numpy slice with stride > 1 must
+    # flow through without complaint. The pre-stride lowering used
+    # `memref.view` (which bakes identity strides) and would have
+    # silently miscomputed against this input. The kernel body is empty
+    # — we're not checking output values, just proving the strided
+    # descriptor reaches the typed memref intact.
+    script = tmp_path / "compile_invoke_strided.py"
+    script.write_text(textwrap.dedent("""
+            import numpy as np
+
+            import hc
+            from hc import Buffer, CurrentGroup, kernel
+
+
+            class _TensorView:
+                def __init__(self, arr):
+                    self._arr = arr
+
+                def data_ptr(self):
+                    return int(self._arr.ctypes.data)
+
+                def size(self, dim):
+                    return int(self._arr.shape[dim])
+
+                def stride(self, dim):
+                    return int(self._arr.strides[dim] // self._arr.itemsize)
+
+
+            sym = hc.sym
+
+
+            @kernel(work_shape=(sym.W,), literals={sym.W})
+            def trivial(group: CurrentGroup, x: Buffer[sym.W]) -> None:
+                return None
+
+
+            def main() -> None:
+                handle = hc.compile(trivial, {sym.W: 128})
+                strided_arr = np.zeros(256, dtype=np.float32)[::2]
+                assert strided_arr.strides[0] // strided_arr.itemsize == 2
+                handle(_TensorView(strided_arr))
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
 def test_compile_invoke_raises_when_pipeline_failed() -> None:
     # `invoke` on a handle whose pipeline failed must surface the
     # captured diagnostics instead of segfaulting on a missing module.

@@ -8,6 +8,7 @@ add_mlir_library(MLIRHCTransforms
   HCInlineHelpersPass.cpp
   HCInterpretIntrinsicRecipesPass.cpp
   HCLowerBarePredicatesPass.cpp
+  HCLowerGPUToBinaryPass.cpp
   HCLowerKernelsToGPULaunchPass.cpp
   HCLowerLaunchBodyPass.cpp
   HCMaterializeBoundExprsPass.cpp
@@ -24,15 +25,21 @@ add_mlir_library(MLIRHCTransforms
   LINK_LIBS PUBLIC
   MLIRAnalysis
   MLIRArithDialect
+  MLIRExecutionEngineUtils
   MLIRFuncDialect
   MLIRGPUDialect
   MLIRHCDialect
   MLIRHCTransformOps
   MLIRIR
+  MLIRLLVMDialect
   MLIRMemRefDialect
   MLIRPass
+  MLIRROCDLDialect
+  MLIRROCDLTarget
   MLIRSCFDialect
   MLIRSupport
+  MLIRTargetLLVM
+  MLIRTargetLLVMIRExport
   MLIRTransformDialect
   MLIRTransformDialectTransforms
   MLIRTransforms

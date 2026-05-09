@@ -208,6 +208,54 @@ def HCInterpretIntrinsicRecipes
   ];
 }
 
+def HCLowerGPUToBinary
+    : Pass<"hc-lower-gpu-to-binary", "::mlir::ModuleOp"> {
+  let summary = "Compile each gpu.module to a HSACO blob via our pinned ld.lld.";
+  let description = [{
+    For every `gpu.module` carrying exactly one `#rocdl.target<...>`
+    attribute the pass:
+
+      1. translates the module to LLVM IR (`translateModuleToLLVMIR`),
+      2. builds an `llvm::TargetMachine` from the rocdl target's triple/
+         chip/features and pins the IR's data layout + triple,
+      3. runs the standard optimize-then-codegen pipeline at the target's
+         opt level (`makeOptimizingTransformer`),
+      4. translates LLVM IR to ISA text
+         (`LLVM::ModuleToObject::translateModuleToISA`),
+      5. assembles ISA → ELF object via `ROCDL::assembleIsa`,
+      6. links the ELF → HSACO via `ROCDL::linkObjectCode`, calling our
+         pinned `ld.lld`.
+
+    The result is attached as a `gpu::ObjectAttr` on a sibling
+    `gpu.binary` op (CompilationTarget::Binary, with the original
+    rocdl target preserved), and the source `gpu.module` is erased.
+
+    `lld-path` resolves in this order:
+
+      1. the option's value if non-empty,
+      2. the `HC_LLD` environment variable (set by our toolchain bootstrap),
+      3. the first `ld.lld` on `$PATH`.
+
+    No ROCm install fallback — if none of those succeed we error out
+    rather than silently picking up a host's distro-installed lld.
+
+    v0 deliberately does not link rocm-device-libs bitcode. The WMMA
+    example doesn't reference `__ocml_*` / `__ockl_*`; kernels that do
+    will need a follow-up pass that resolves the device-libs path and
+    feeds bitcode files into the optimization pipeline before codegen.
+  }];
+  let options = [
+    Option<"lldPath", "lld-path", "std::string", "\"\"",
+           "Explicit path to ld.lld; falls back to HC_LLD then $PATH "
+           "if empty.">
+  ];
+  let dependentDialects = [
+    "::mlir::gpu::GPUDialect",
+    "::mlir::LLVM::LLVMDialect",
+    "::mlir::ROCDL::ROCDLDialect"
+  ];
+}
+
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";

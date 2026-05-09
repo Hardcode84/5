@@ -25,6 +25,11 @@ config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
 config.substitutions.append(("%python", sys.executable))
+# Tests for `-hc-lower-gpu-to-binary` need an explicit ld.lld path:
+# the pass refuses to rummage around in ROCM_PATH and we don't want
+# to depend on the test runner's $PATH layering being right. Point at
+# the ld.lld that lives in the same LLVM install we built against.
+config.substitutions.append(("%hc_lld", str(Path(config.llvm_tools_dir) / "ld.lld")))
 
 llvm_config.with_environment("PYTHONPATH", config.hc_src_root, append_path=True)
 llvm_config.with_environment(

@@ -1112,6 +1112,36 @@ where the schedule's probe prints land, so combining
 on stdout — fine for grep, awkward for an editor; redirect to a
 file and search.
 
+### Codegen artifacts (`HC_DUMP_DIR=PATH`)
+
+`HC_DUMP_PASSES` covers MLIR-level IR but stops at
+`hc-lower-gpu-to-binary` — past that the device chain is C++ inside
+the pass: LLVM IR optimization, ISA emission, AMDGPU MC assembly,
+ld.lld linking. Setting `HC_DUMP_DIR=/some/path` (the directory
+must exist) makes the pass write four artifacts per `gpu.module`:
+
+```
+<module>.0-pre-opt.ll      (LLVM IR before the optimizer runs)
+<module>.1-post-opt.ll     (LLVM IR after the standard pipeline)
+<module>.2-isa.s           (AMDGPU assembly out of translateModuleToISA)
+<module>.3-binary.hsaco    (linked HSACO blob — same bytes the runtime loads)
+```
+
+The numeric prefix sorts ls/glob output in pipeline order. Pre-opt
+gets dumped *before* the optimizer runs so it survives an optimizer
+crash — historically the most informative artifact when codegen
+miscompiles. The four artifacts are independent; they're useful for
+diffing against `roc-obj` / `llvm-objdump` output, comparing
+generated assembly to a reference `rocm`-installed compiler, and
+re-feeding hand-edited `.ll` / `.s` files into a downstream
+toolchain.
+
+Plumbing matches the `ld.lld` path: Python-side substitution into
+the pass's `dump-intermediates=` option via the `__HC_DUMP_DIR__`
+placeholder, so calling `hc.compile()` from Python is the only
+supported way to set it (no env-var lookup happens inside the C++
+pass — the pass option is the source of truth).
+
 ## MLIR strategy
 
 The fastest implementation path is still to emit textual MLIR.

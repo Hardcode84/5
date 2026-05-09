@@ -38,6 +38,7 @@ result rather than wrapping in `try`.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -109,6 +110,16 @@ _TARGET_CHIP_MAP: dict[str, str] = {
 _LLD_PLACEHOLDER = "__HC_LLD__"
 _LLD_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
+# Sister sentinel for the `--dump-intermediates=` option on
+# `hc-lower-gpu-to-binary`. Substituted Python-side from the
+# `HC_DUMP_DIR` env var; empty string when the env is unset (which
+# the pass interprets as "dumping disabled"). Same forbidden-char
+# blacklist as `_LLD_FORBIDDEN_CHARS` so a path containing `,` /
+# `}` / `=` doesn't break the option string.
+_DUMP_DIR_PLACEHOLDER = "__HC_DUMP_DIR__"
+_DUMP_DIR_FORBIDDEN_CHARS = _LLD_FORBIDDEN_CHARS
+_DUMP_DIR_ENV = "HC_DUMP_DIR"
+
 # Sister sentinel for the AMDGPU LLVM target-features string. The
 # wavefront size in particular is part of this string (e.g.
 # `+wavefrontsize32`), and chips in the gfx10/gfx11/gfx12 families need
@@ -167,7 +178,10 @@ _GPU_LOWERING_PIPELINE = (
     "convert-index-to-llvm,"
     "reconcile-unrealized-casts,"
     "canonicalize,cse,"
-    f"hc-lower-gpu-to-binary{{lld-path={_LLD_PLACEHOLDER}}},"
+    "hc-lower-gpu-to-binary{"
+    f"lld-path={_LLD_PLACEHOLDER} "
+    f"dump-intermediates={_DUMP_DIR_PLACEHOLDER}"
+    "},"
     # Replace `gpu.launch_func` with `hc_rt_load_kernel` +
     # `hc_rt_launch_kernel` calls and embed each binary's HSACO blob
     # as an LLVM global. Runs after `hc-lower-gpu-to-binary` so the
@@ -340,6 +354,7 @@ def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
     # entry points (per-target lowerings, say).
     gpu_lowering = _substitute_chip(_GPU_LOWERING_PIPELINE, target)
     gpu_lowering = _substitute_lld(gpu_lowering)
+    gpu_lowering = _substitute_dump_dir(gpu_lowering)
     return (
         "builtin.module("
         f"transform-preload-library{{transform-library-paths={schedule_path}}},"
@@ -496,6 +511,33 @@ def _substitute_lld(text: str) -> str:
     # naming the missing path, which is more actionable than a Python
     # IO error from this layer.
     return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
+
+
+def _substitute_dump_dir(text: str) -> str:
+    # Plumbs `HC_DUMP_DIR` into `hc-lower-gpu-to-binary`'s
+    # `--dump-intermediates=` option. Empty env -> empty value, which
+    # the pass interprets as "dumping disabled" and short-circuits to
+    # zero IO. We don't validate that the directory exists; the pass
+    # will fail loudly if it can't open the per-stage files for write,
+    # which is the right behaviour for an opt-in debug knob.
+    return text.replace(_DUMP_DIR_PLACEHOLDER, _resolve_dump_dir())
+
+
+def _resolve_dump_dir() -> str:
+    raw = os.environ.get(_DUMP_DIR_ENV, "")
+    if not raw:
+        return ""
+    bad = sorted({c for c in raw if c in _DUMP_DIR_FORBIDDEN_CHARS})
+    if bad:
+        # Same rationale as `_validate_target` / `_resolve_lld`: a path
+        # containing `,`, `}`, `=`, quotes, or newlines would either
+        # break MLIR's option parser or close the option string early.
+        # Reject Python-side so the user gets a clear ValueError
+        # instead of a confusing MLIR diagnostic.
+        raise ValueError(
+            f"{_DUMP_DIR_ENV} contains forbidden characters {bad}: {raw!r}"
+        )
+    return raw
 
 
 def _resolve_lld() -> str:

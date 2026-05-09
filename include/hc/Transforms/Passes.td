@@ -262,7 +262,15 @@ def HCLowerGPUToBinary
   let options = [
     Option<"lldPath", "lld-path", "std::string", "\"\"",
            "Explicit path to ld.lld; falls back to HC_LLD then $PATH "
-           "if empty.">
+           "if empty.">,
+    Option<"dumpIntermediates", "dump-intermediates", "std::string", "\"\"",
+           "Directory to write per-stage codegen artifacts into; empty "
+           "disables dumping. Per gpu.module the pass writes "
+           "<module>.0-pre-opt.ll (LLVM IR before optimization), "
+           "<module>.1-post-opt.ll (LLVM IR after optimization), "
+           "<module>.2-isa.s (AMDGPU assembly), and "
+           "<module>.3-binary.hsaco (linked HSACO blob). Pre-existing "
+           "files are overwritten; the directory must already exist.">
   ];
   let dependentDialects = [
     "::mlir::gpu::GPUDialect",

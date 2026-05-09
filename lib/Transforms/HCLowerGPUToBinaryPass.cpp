@@ -27,8 +27,11 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -74,7 +77,55 @@ private:
   // bead is explicit that we own our own lld and that consumers
   // should fail loudly rather than silently pick up a host install.
   std::string resolveLldPath(gpu::GPUModuleOp module);
+
+  // Write `bytes` to `<dumpIntermediates>/<moduleName>.<stage>` if the
+  // option is non-empty; no-op otherwise. Stage names embed an order
+  // prefix (`0-pre-opt.ll`, `1-post-opt.ll`, ...) so `ls` shows the
+  // pipeline order. Diagnostics on write failure attach to `module`
+  // and surface as a pass-level error — nobody opts into dumping
+  // expecting silent partial output.
+  LogicalResult dumpStage(gpu::GPUModuleOp module, StringRef stage,
+                          StringRef bytes);
+
+  // LLVM module convenience: serialises `m` to text and forwards to
+  // `dumpStage`. Kept separate so the call sites stay readable.
+  LogicalResult dumpLLVMModule(gpu::GPUModuleOp module, StringRef stage,
+                               const llvm::Module &m);
 };
+
+LogicalResult HCLowerGPUToBinaryPass::dumpStage(gpu::GPUModuleOp module,
+                                                StringRef stage,
+                                                StringRef bytes) {
+  if (dumpIntermediates.empty())
+    return success();
+
+  llvm::SmallString<128> path(dumpIntermediates);
+  llvm::sys::path::append(path, module.getName().str() + "." + stage.str());
+
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec, llvm::sys::fs::OF_None);
+  if (ec)
+    return module.emitError("hc-lower-gpu-to-binary: failed to open ")
+           << path << " for dump-intermediates: " << ec.message();
+  out.write(bytes.data(), bytes.size());
+  out.flush();
+  if (out.has_error())
+    return module.emitError("hc-lower-gpu-to-binary: write failed for ")
+           << path << " (dump-intermediates)";
+  return success();
+}
+
+LogicalResult HCLowerGPUToBinaryPass::dumpLLVMModule(gpu::GPUModuleOp module,
+                                                     StringRef stage,
+                                                     const llvm::Module &m) {
+  if (dumpIntermediates.empty())
+    return success();
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  m.print(os, /*AAW=*/nullptr);
+  os.flush();
+  return dumpStage(module, stage, text);
+}
 
 std::string HCLowerGPUToBinaryPass::resolveLldPath(gpu::GPUModuleOp module) {
   if (!lldPath.empty())
@@ -145,6 +196,13 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
   llvmModule->setDataLayout(targetMachine->createDataLayout());
   llvmModule->setTargetTriple(targetMachine->getTargetTriple());
 
+  // Dump the pre-optimization LLVM module first so it survives an
+  // optimizer crash — historically the most informative artifact when
+  // the backend miscompiles, since it shows what the optimizer was
+  // handed before fold-the-world set in.
+  if (failed(dumpLLVMModule(module, "0-pre-opt.ll", *llvmModule)))
+    return failure();
+
   // Step 3: optimize. Plain wrapper around LLVM's standard pipeline
   // at the target's opt level; matches wave's `optimizeModule`.
   auto optimizer =
@@ -159,6 +217,8 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
                           });
     return failure();
   }
+  if (failed(dumpLLVMModule(module, "1-post-opt.ll", *llvmModule)))
+    return failure();
 
   // Step 4: LLVM IR → ISA text.
   auto emitOpError = [&]() -> InFlightDiagnostic { return module.emitError(); };
@@ -166,6 +226,9 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
       LLVM::ModuleToObject::translateModuleToISA(*llvmModule, *targetMachine,
                                                  emitOpError);
   if (failed(isa))
+    return failure();
+  if (failed(dumpStage(module, "2-isa.s",
+                       StringRef((*isa).data(), (*isa).size()))))
     return failure();
 
   // Step 5: ISA → ELF object via the AMDGPU MC stack.
@@ -184,6 +247,9 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
   FailureOr<SmallVector<char, 0>> binary =
       ROCDL::linkObjectCode(*object, lld, emitOpError);
   if (failed(binary))
+    return failure();
+  if (failed(dumpStage(module, "3-binary.hsaco",
+                       StringRef(binary->data(), binary->size()))))
     return failure();
 
   // Attach the blob as a gpu.binary sibling and drop the source module.

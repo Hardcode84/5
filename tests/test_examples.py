@@ -111,6 +111,60 @@ def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> 
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_gfx11_wmma_example_writes_dump_intermediates(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`HC_DUMP_DIR` makes hc-lower-gpu-to-binary emit per-stage artifacts.
+
+    Compiling for `amdgpu-gfx11` runs the WMMA kernel through the full
+    device chain, which includes `hc-lower-gpu-to-binary`. With
+    `HC_DUMP_DIR` set Python-side, the pass should drop four files per
+    `gpu.module`: pre-opt LLVM IR, post-opt LLVM IR, ISA assembly, and
+    the linked HSACO blob. Doesn't need a real GPU — the LLD linker
+    runs at compile time, not on a HIP device. Pin both that the
+    files exist and that they look plausible (LLVM module headers,
+    nonzero ELF blob) so a regression in the placeholder substitution
+    or per-stage dump call site fails this test, not the harder-to-
+    diagnose downstream "where did my disassembly go" stage.
+    """
+
+    monkeypatch.setenv("HC_DUMP_DIR", str(tmp_path))
+
+    handle = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11")
+    assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
+
+    name = "tiled_gfx11_wmma_matmul_kernel"
+    pre = tmp_path / f"{name}.0-pre-opt.ll"
+    post = tmp_path / f"{name}.1-post-opt.ll"
+    isa = tmp_path / f"{name}.2-isa.s"
+    hsaco = tmp_path / f"{name}.3-binary.hsaco"
+    for p in (pre, post, isa, hsaco):
+        assert p.is_file(), f"missing {p.name}"
+        assert p.stat().st_size > 0, f"empty {p.name}"
+
+    # LLVM modules carry a `; ModuleID = '...'` header on line 1 and a
+    # `target triple = "amdgcn-amd-amdhsa"` line. Cheap shape check —
+    # we don't pin the IR contents (those drift with every llvm bump),
+    # just that the file is what we claimed it is.
+    pre_text = pre.read_text(encoding="utf-8")
+    post_text = post.read_text(encoding="utf-8")
+    assert pre_text.startswith("; ModuleID")
+    assert post_text.startswith("; ModuleID")
+    assert 'target triple = "amdgcn-amd-amdhsa"' in pre_text
+    assert 'target triple = "amdgcn-amd-amdhsa"' in post_text
+
+    # ISA is plain text from the AMDGPU MC stack; it must reference
+    # the kernel symbol so we know it's *this* kernel's assembly and
+    # not stale state from a previous run that landed in the dir.
+    isa_text = isa.read_text(encoding="utf-8")
+    assert name in isa_text
+
+    # HSACO is an ELF; magic bytes at offset 0 are 0x7f 'E' 'L' 'F'.
+    # File-typing the blob in full is overkill here.
+    assert hsaco.read_bytes()[:4] == b"\x7fELF"
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -15,6 +15,29 @@
 // lower-gpu-to-binary-invalid.mlir.
 
 // RUN: hc-opt --hc-lower-gpu-to-binary='lld-path=%hc_lld' --split-input-file %s | FileCheck %s
+// RUN: rm -rf %t.dump && mkdir -p %t.dump \
+// RUN:   && hc-opt --hc-lower-gpu-to-binary='lld-path=%hc_lld dump-intermediates=%t.dump' \
+// RUN:        --split-input-file %s -o /dev/null \
+// RUN:   && ls %t.dump | sort | FileCheck --check-prefix=DUMP %s
+//
+// Per gpu.module the pass writes four artifacts: pre-opt LLVM IR,
+// post-opt LLVM IR, ISA assembly, and the linked HSACO blob. The
+// names embed an order prefix so `ls | sort` matches the pipeline
+// order. With --split-input-file three modules go through the pass
+// (@kernel from the first split, @first / @second from the second),
+// so we expect 12 files — DUMP-NEXT pins them in lexical order.
+// DUMP: first.0-pre-opt.ll
+// DUMP-NEXT: first.1-post-opt.ll
+// DUMP-NEXT: first.2-isa.s
+// DUMP-NEXT: first.3-binary.hsaco
+// DUMP-NEXT: kernel.0-pre-opt.ll
+// DUMP-NEXT: kernel.1-post-opt.ll
+// DUMP-NEXT: kernel.2-isa.s
+// DUMP-NEXT: kernel.3-binary.hsaco
+// DUMP-NEXT: second.0-pre-opt.ll
+// DUMP-NEXT: second.1-post-opt.ll
+// DUMP-NEXT: second.2-isa.s
+// DUMP-NEXT: second.3-binary.hsaco
 
 // Trivial empty kernel: validates the entire pipeline runs and emits
 // a non-empty HSACO. The kernel has no body beyond `llvm.return` —

@@ -2,9 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Tests for the per-pass IR-dump knob (`HC_DUMP_PASSES`)."""
+"""Tests for the IR-dump knobs (`HC_DUMP_PASSES`, `HC_DUMP_DIR`)."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -14,9 +16,14 @@ from hc._dump import (
     splice_dump_passes,
 )
 from hc._pipeline import (
+    _DUMP_DIR_ENV,
+    _DUMP_DIR_PLACEHOLDER,
+    _GPU_LOWERING_PIPELINE,
     _maybe_splice_dump_passes,
+    _resolve_dump_dir,
     _resolve_schedule_text,
     _substitute_chip,
+    _substitute_dump_dir,
     _substitute_features,
     _substitute_target,
     prepared_context,
@@ -120,6 +127,65 @@ def test_maybe_splice_runs_when_env_set(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv(DUMP_PASSES_ENV, "1")
     out = _maybe_splice_dump_passes(_MINI_SCHEDULE, context=None)
     assert out.count("transform.print") == 4
+
+
+# --- HC_DUMP_DIR (`hc-lower-gpu-to-binary --dump-intermediates=`) ---
+
+
+def test_resolve_dump_dir_unset_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_DUMP_DIR_ENV, raising=False)
+    assert _resolve_dump_dir() == ""
+
+
+def test_resolve_dump_dir_returns_env_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(_DUMP_DIR_ENV, str(tmp_path))
+    assert _resolve_dump_dir() == str(tmp_path)
+
+
+@pytest.mark.parametrize("ch", ['"', "\\", "\n", "\r"])
+def test_resolve_dump_dir_rejects_forbidden_chars(
+    monkeypatch: pytest.MonkeyPatch, ch: str
+) -> None:
+    # Same character blacklist as the lld path: anything that would
+    # close the substituted MLIR option string early or insert
+    # whitespace the option parser splits on. We reject these here so
+    # the user gets a clean ValueError instead of a downstream MLIR
+    # parse failure with no breadcrumb to the env var.
+    monkeypatch.setenv(_DUMP_DIR_ENV, f"/tmp/with{ch}bad")
+    with pytest.raises(ValueError, match=_DUMP_DIR_ENV):
+        _resolve_dump_dir()
+
+
+def test_substitute_dump_dir_replaces_placeholder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(_DUMP_DIR_ENV, str(tmp_path))
+    text = f"x={_DUMP_DIR_PLACEHOLDER},"
+    assert _substitute_dump_dir(text) == f"x={tmp_path},"
+
+
+def test_substitute_dump_dir_empty_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_DUMP_DIR_ENV, raising=False)
+    text = f"x={_DUMP_DIR_PLACEHOLDER},"
+    # Empty value, not the placeholder. The pass interprets empty as
+    # "dumping disabled" and short-circuits to zero IO.
+    assert _substitute_dump_dir(text) == "x=,"
+
+
+def test_gpu_lowering_pipeline_carries_dump_dir_placeholder() -> None:
+    # Wired-in evidence that the device-side pipeline string we hand
+    # the PassManager actually contains the placeholder for
+    # _substitute_dump_dir to swap. If someone reorders or refactors
+    # the pipeline construction without keeping the placeholder, this
+    # test catches it before the env var silently no-ops.
+    assert _DUMP_DIR_PLACEHOLDER in _GPU_LOWERING_PIPELINE
+    assert "dump-intermediates=" + _DUMP_DIR_PLACEHOLDER in _GPU_LOWERING_PIPELINE
 
 
 def test_default_schedule_round_trips_through_splicer(

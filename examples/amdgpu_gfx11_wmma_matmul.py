@@ -15,6 +15,12 @@ helpers through the Python frontend and print the resulting combined
 Pass ``--dump-hc-ir`` to run the current frontend-to-``hc`` pipeline and print
 the resulting ``hc`` textual MLIR instead.
 
+Pass ``--run-on-hw`` to compile the kernel for ``amdgpu-gfx11`` and dispatch
+it through ``hc.compile().invoke()`` against ``torch.cuda`` tensors on a
+physical gfx11 GPU, comparing the result to ``reference_blocked_matmul``.
+Requires a working ROCm install with a gfx11 device visible to HIP and the
+``torch`` package on the path.
+
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
 accumulator distributed across workitems at the WorkGroup-level K loop
@@ -451,6 +457,56 @@ def make_demo_inputs(
     return a, b
 
 
+def run_on_hardware(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    rtol: float = 0.0,
+    atol: float = 2e-3,
+) -> np.ndarray:
+    """Compile for gfx11 and invoke through the bundled HIP shim.
+
+    Mirrors `tests/test_examples.py::test_gfx11_wmma_example_invokes_on_real_hardware`,
+    which is the executable spec for the same chain. We use `torch.cuda`
+    tensors for the device buffers because `Tensor.data_ptr()` returns a
+    HIP-allocated pointer that `_mlir_ciface_hc_get_buffer` plugs straight
+    into the kernel descriptor — the runtime helpers don't allocate or
+    copy on their own. Raises a clear `RuntimeError` (not `ImportError`)
+    when torch or torch.cuda is missing so callers see a single
+    actionable message instead of a stack trace.
+    """
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "--run-on-hw needs the `torch` package to allocate device "
+            "buffers; `pip install torch` (with a ROCm-enabled wheel) and "
+            "retry."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "--run-on-hw needs a HIP/ROCm device visible to torch.cuda; "
+            "torch.cuda.is_available() returned False."
+        )
+
+    import hc
+
+    m, _ = a.shape
+    _, n = b.shape
+    a_dev = torch.from_numpy(a).cuda()
+    b_dev = torch.from_numpy(b).cuda()
+    c_dev = torch.zeros(m, n, dtype=torch.float32, device="cuda")
+
+    compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11")
+    compiled.invoke(a_dev, b_dev, c_dev)
+
+    out = c_dev.cpu().numpy()
+    reference = reference_blocked_matmul(a, b)
+    np.testing.assert_allclose(out, reference, rtol=rtol, atol=atol)
+    return out
+
+
 def dump_front_ir() -> None:
     """Lower the kernel + its transitive deps to ``hc_front`` and print it.
 
@@ -512,6 +568,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "running the simulator"
         ),
     )
+    dump_group.add_argument(
+        "--run-on-hw",
+        action="store_true",
+        help=(
+            "compile for amdgpu-gfx11 and dispatch through "
+            "hc.compile().invoke() against torch.cuda tensors on a "
+            "physical gfx11 GPU instead of running the simulator; "
+            "needs torch + a HIP/ROCm device"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -526,6 +592,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     a, b = make_demo_inputs()
+    if args.run_on_hw:
+        out = run_on_hardware(a, b)
+        reference = reference_blocked_matmul(a, b)
+        max_diff = float(np.max(np.abs(out - reference)))
+        print("gfx11 WMMA tiled matmul example passed on real hardware.")
+        print(f"shape: A={a.shape}, B={b.shape}, C={out.shape}")
+        # Round-off vs the blocked f32 reference; expected to be on the
+        # order of f16 mantissa (~1e-3) for the demo's uniform [-1, 1]
+        # inputs once we cross the f16 -> f32 accumulation boundary.
+        print(f"max abs diff vs blocked fallback reference: {max_diff}")
+        return
+
     out = simulate_gfx11_wmma_matmul(a, b)
     reference = reference_blocked_matmul(a, b)
     np.testing.assert_allclose(out, reference, rtol=0.0, atol=2e-6)

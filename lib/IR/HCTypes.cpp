@@ -340,13 +340,25 @@ mlir::hc::getLaunchContextMetadata(Type contextType) {
   return std::nullopt;
 }
 
-mlir::LogicalResult
-mlir::hc::BufferType::verify(function_ref<InFlightDiagnostic()> emitError,
-                             Type elementType, ShapeAttr shape) {
-  (void)elementType;
+// Shaped-type verifiers share one signature: shape must be non-null,
+// layout (when present) is structurally validated by LayoutAttr's own
+// verifier — we don't enforce shape-rank vs shape_syms agreement here
+// because the canonicalize / flatten passes are the natural place to
+// reject mismatches (and to fold identity layouts back to absent).
+static mlir::LogicalResult
+verifyShapedTypeShell(function_ref<InFlightDiagnostic()> emitError,
+                      ShapeAttr shape, LayoutAttr /*layout*/) {
   if (!shape)
     return emitError() << "expected #hc.shape attribute";
   return success();
+}
+
+mlir::LogicalResult
+mlir::hc::BufferType::verify(function_ref<InFlightDiagnostic()> emitError,
+                             Type elementType, ShapeAttr shape,
+                             LayoutAttr layout) {
+  (void)elementType;
+  return verifyShapedTypeShell(emitError, shape, layout);
 }
 
 ShapeAttr mlir::hc::BufferType::getSymbolicShape() const { return getShape(); }
@@ -356,11 +368,10 @@ Type mlir::hc::BufferType::getSymbolicElementType() const {
 
 mlir::LogicalResult
 mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
-                             Type elementType, ShapeAttr shape) {
+                             Type elementType, ShapeAttr shape,
+                             LayoutAttr layout) {
   (void)elementType;
-  if (!shape)
-    return emitError() << "expected #hc.shape attribute";
-  return success();
+  return verifyShapedTypeShell(emitError, shape, layout);
 }
 
 ShapeAttr mlir::hc::TensorType::getSymbolicShape() const { return getShape(); }
@@ -370,11 +381,10 @@ Type mlir::hc::TensorType::getSymbolicElementType() const {
 
 mlir::LogicalResult
 mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
-                             Type elementType, ShapeAttr shape) {
+                             Type elementType, ShapeAttr shape,
+                             LayoutAttr layout) {
   (void)elementType;
-  if (!shape)
-    return emitError() << "expected #hc.shape attribute";
-  return success();
+  return verifyShapedTypeShell(emitError, shape, layout);
 }
 
 ShapeAttr mlir::hc::VectorType::getSymbolicShape() const { return getShape(); }
@@ -384,11 +394,10 @@ Type mlir::hc::VectorType::getSymbolicElementType() const {
 
 mlir::LogicalResult
 mlir::hc::BareTensorType::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 Type elementType, ShapeAttr shape) {
+                                 Type elementType, ShapeAttr shape,
+                                 LayoutAttr layout) {
   (void)elementType;
-  if (!shape)
-    return emitError() << "expected #hc.shape attribute";
-  return success();
+  return verifyShapedTypeShell(emitError, shape, layout);
 }
 
 ShapeAttr mlir::hc::BareTensorType::getSymbolicShape() const {
@@ -400,11 +409,10 @@ Type mlir::hc::BareTensorType::getSymbolicElementType() const {
 
 mlir::LogicalResult
 mlir::hc::BareVectorType::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 Type elementType, ShapeAttr shape) {
+                                 Type elementType, ShapeAttr shape,
+                                 LayoutAttr layout) {
   (void)elementType;
-  if (!shape)
-    return emitError() << "expected #hc.shape attribute";
-  return success();
+  return verifyShapedTypeShell(emitError, shape, layout);
 }
 
 ShapeAttr mlir::hc::BareVectorType::getSymbolicShape() const {

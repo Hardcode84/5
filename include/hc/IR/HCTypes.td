@@ -78,6 +78,20 @@ def HC_SliceType : HC_Type<"Slice", "slice",
   let hasCustomAssemblyFormat = 1;
 }
 
+// All five shaped types carry an optional `#hc.layout<...>` payload after
+// the shape. Absent layout is the v0 identity contract (canonical
+// row-major, identity offset, product-of-shape storage); explicit layouts
+// are interpreted by the canonicalize / flatten passes documented in
+// `doc/layouts.md`. Layouts attach to both semantic (`!hc.tensor`,
+// `!hc.vector`) and bare (`!hc.bare_tensor`, `!hc.bare_vector`) shapes
+// because the flatten pass needs them on either side of the
+// decompose-shaped-values boundary.
+
+// Each of the five shaped types below adds a `get(ctx, elem, shape)`
+// overload alongside the auto-generated 4-arg form so existing callers
+// that don't carry a layout don't need to spell `LayoutAttr{}`. Absent
+// layout is the v0 default and the canonical-fold target.
+
 def HC_BufferType : HC_Type<"Buffer", "buffer",
     [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
   let summary = "Semantic buffer type";
@@ -87,13 +101,23 @@ def HC_BufferType : HC_Type<"Buffer", "buffer",
     symbolic surface can evolve independently from the type shell, while the
     textual type syntax inlines the shape dimensions as `["M", "N + 1"]`.
     An empty shape is a rank-0 mutable scalar buffer, not missing metadata.
+    An optional `#hc.layout<...>` payload follows the shape; absent means
+    "default fully-strided np/torch layout" once host wrappers start
+    feeding strides in (see `doc/layouts.md`).
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    HC_InlineShapeAttrParameter:$shape
+    HC_InlineShapeAttrParameter:$shape,
+    OptionalParameter<"::mlir::hc::LayoutAttr">:$layout
   );
-  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let assemblyFormat = "`<` $elementType `,` $shape (`,` $layout^)? `>`";
   let genVerifyDecl = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::hc::ShapeAttr":$shape), [{
+      return $_get($_ctxt, elementType, shape, ::mlir::hc::LayoutAttr{});
+    }]>
+  ];
 }
 
 def HC_TensorType : HC_Type<"Tensor", "tensor",
@@ -102,14 +126,22 @@ def HC_TensorType : HC_Type<"Tensor", "tensor",
   let description = [{
     Initial semantic tensor type carrying an element type and a symbolic shape
     attribute. The textual type syntax inlines the shape dimensions as
-    `["M", "N + 1"]`.
+    `["M", "N + 1"]`. An optional `#hc.layout<...>` payload follows the
+    shape; absent means identity row-major.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    HC_InlineShapeAttrParameter:$shape
+    HC_InlineShapeAttrParameter:$shape,
+    OptionalParameter<"::mlir::hc::LayoutAttr">:$layout
   );
-  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let assemblyFormat = "`<` $elementType `,` $shape (`,` $layout^)? `>`";
   let genVerifyDecl = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::hc::ShapeAttr":$shape), [{
+      return $_get($_ctxt, elementType, shape, ::mlir::hc::LayoutAttr{});
+    }]>
+  ];
 }
 
 def HC_VectorType : HC_Type<"Vector", "vector",
@@ -119,14 +151,22 @@ def HC_VectorType : HC_Type<"Vector", "vector",
     Immutable fixed-size vector value. Carries an element type and a symbolic
     shape; activity mask semantics, the optional collective-return suffix, and
     layout metadata sit on top of this shell as they settle. Printed as
-    `!hc.vector<elem, ["A", "B"]>`.
+    `!hc.vector<elem, ["A", "B"]>`. An optional `#hc.layout<...>` payload
+    follows the shape; absent means identity row-major.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    HC_InlineShapeAttrParameter:$shape
+    HC_InlineShapeAttrParameter:$shape,
+    OptionalParameter<"::mlir::hc::LayoutAttr">:$layout
   );
-  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let assemblyFormat = "`<` $elementType `,` $shape (`,` $layout^)? `>`";
   let genVerifyDecl = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::hc::ShapeAttr":$shape), [{
+      return $_get($_ctxt, elementType, shape, ::mlir::hc::LayoutAttr{});
+    }]>
+  ];
 }
 
 def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
@@ -136,13 +176,22 @@ def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
     Raw shaped tensor container produced by HC normalization before upstream
     lowering. Unlike `!hc.tensor`, this type carries only data; validity travels
     as a parallel `!hc.bare_tensor<!hc.pred, ...>` value with the same shape.
+    An optional `#hc.layout<...>` payload follows the shape; absent means
+    identity row-major.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    HC_InlineShapeAttrParameter:$shape
+    HC_InlineShapeAttrParameter:$shape,
+    OptionalParameter<"::mlir::hc::LayoutAttr">:$layout
   );
-  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let assemblyFormat = "`<` $elementType `,` $shape (`,` $layout^)? `>`";
   let genVerifyDecl = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::hc::ShapeAttr":$shape), [{
+      return $_get($_ctxt, elementType, shape, ::mlir::hc::LayoutAttr{});
+    }]>
+  ];
 }
 
 def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
@@ -152,13 +201,22 @@ def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
     Raw shaped vector container produced by HC normalization before upstream
     lowering. Unlike `!hc.vector`, this type carries only data; validity travels
     as a parallel `!hc.bare_vector<!hc.pred, ...>` value with the same shape.
+    An optional `#hc.layout<...>` payload follows the shape; absent means
+    identity row-major.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    HC_InlineShapeAttrParameter:$shape
+    HC_InlineShapeAttrParameter:$shape,
+    OptionalParameter<"::mlir::hc::LayoutAttr">:$layout
   );
-  let assemblyFormat = "`<` $elementType `,` $shape `>`";
+  let assemblyFormat = "`<` $elementType `,` $shape (`,` $layout^)? `>`";
   let genVerifyDecl = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::Type":$elementType,
+                     "::mlir::hc::ShapeAttr":$shape), [{
+      return $_get($_ctxt, elementType, shape, ::mlir::hc::LayoutAttr{});
+    }]>
+  ];
 }
 
 def HC_GroupType : HC_Type<"Group", "group"> {

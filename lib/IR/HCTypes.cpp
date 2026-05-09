@@ -365,6 +365,12 @@ ShapeAttr mlir::hc::BufferType::getSymbolicShape() const { return getShape(); }
 Type mlir::hc::BufferType::getSymbolicElementType() const {
   return getElementType();
 }
+LayoutAttr mlir::hc::BufferType::getSymbolicLayout() const {
+  return getLayout();
+}
+Type mlir::hc::BufferType::cloneWithSymbolicLayout(LayoutAttr layout) const {
+  return BufferType::get(getContext(), getElementType(), getShape(), layout);
+}
 
 mlir::LogicalResult
 mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -378,6 +384,12 @@ ShapeAttr mlir::hc::TensorType::getSymbolicShape() const { return getShape(); }
 Type mlir::hc::TensorType::getSymbolicElementType() const {
   return getElementType();
 }
+LayoutAttr mlir::hc::TensorType::getSymbolicLayout() const {
+  return getLayout();
+}
+Type mlir::hc::TensorType::cloneWithSymbolicLayout(LayoutAttr layout) const {
+  return TensorType::get(getContext(), getElementType(), getShape(), layout);
+}
 
 mlir::LogicalResult
 mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -390,6 +402,12 @@ mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
 ShapeAttr mlir::hc::VectorType::getSymbolicShape() const { return getShape(); }
 Type mlir::hc::VectorType::getSymbolicElementType() const {
   return getElementType();
+}
+LayoutAttr mlir::hc::VectorType::getSymbolicLayout() const {
+  return getLayout();
+}
+Type mlir::hc::VectorType::cloneWithSymbolicLayout(LayoutAttr layout) const {
+  return VectorType::get(getContext(), getElementType(), getShape(), layout);
 }
 
 mlir::LogicalResult
@@ -406,6 +424,14 @@ ShapeAttr mlir::hc::BareTensorType::getSymbolicShape() const {
 Type mlir::hc::BareTensorType::getSymbolicElementType() const {
   return getElementType();
 }
+LayoutAttr mlir::hc::BareTensorType::getSymbolicLayout() const {
+  return getLayout();
+}
+Type mlir::hc::BareTensorType::cloneWithSymbolicLayout(
+    LayoutAttr layout) const {
+  return BareTensorType::get(getContext(), getElementType(), getShape(),
+                             layout);
+}
 
 mlir::LogicalResult
 mlir::hc::BareVectorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -420,6 +446,14 @@ ShapeAttr mlir::hc::BareVectorType::getSymbolicShape() const {
 }
 Type mlir::hc::BareVectorType::getSymbolicElementType() const {
   return getElementType();
+}
+LayoutAttr mlir::hc::BareVectorType::getSymbolicLayout() const {
+  return getLayout();
+}
+Type mlir::hc::BareVectorType::cloneWithSymbolicLayout(
+    LayoutAttr layout) const {
+  return BareVectorType::get(getContext(), getElementType(), getShape(),
+                             layout);
 }
 
 mlir::LogicalResult

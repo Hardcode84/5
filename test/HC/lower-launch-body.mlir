@@ -200,6 +200,94 @@ module {
     return
   }
 
+  // CHECK-LABEL: func.func @strided_vload(
+  // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
+  // The `step = !hc.idx<"2">` slice on the row axis must lower via a
+  // `memref.subview` that absorbs the stride into the result memref's
+  // affine layout; the subsequent `transfer_read` then reads from the
+  // subview at logical zero offsets.
+  // CHECK: %[[SUB:.*]] = memref.subview %[[A]][0, 0] [8, 1] [2, 1]
+  // CHECK-SAME: memref<?x?xf32> to memref<8x1xf32, strided<[?, 1]>>
+  // CHECK: vector.transfer_read %[[SUB]]
+  // CHECK-SAME: vector<8x1xf32>
+  // CHECK-NOT: hc.vload
+  func.func @strided_vload(%a: memref<?x?xf32>) {
+    %c1 = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %a
+        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %zero = hc.const<0 : i64> : !hc.idx<"0">
+      %one = hc.const<1 : i64> : !hc.idx<"1">
+      %two = hc.const<2 : i64> : !hc.idx<"2">
+      %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+      %eight = hc.const<8 : i64> : !hc.idx<"8">
+      %rows = hc.slice_expr(lower = %zero upper = %sixteen step = %two)
+          : (!hc.idx<"0">, !hc.idx<"16">, !hc.idx<"2">)
+            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>
+      %col = hc.slice_expr(lower = %zero upper = %one)
+          : (!hc.idx<"0">, !hc.idx<"1">)
+            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>
+      %shape = hc.tuple(%eight, %one)
+          : (!hc.idx<"8">, !hc.idx<"1">) -> tuple<!hc.idx<"8">, !hc.idx<"1">>
+      %vec = hc.vload %buffer[%rows, %col], shape %shape
+          : (!hc.buffer<f32, ["M", "N"]>,
+             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>,
+             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>,
+             tuple<!hc.idx<"8">, !hc.idx<"1">>)
+            -> !hc.bare_vector<f32, ["8", "1"]>
+      gpu.terminator
+    }
+    return
+  }
+
+  // CHECK-LABEL: func.func @strided_load_mask(
+  // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
+  // For a stride-2 slice into row axis of extent `M`, the in-bounds count
+  // is `ceildiv(M - offset, 2)` rather than `M - offset`. Unit-stride
+  // axes still emit the simpler `extent - offset` form (no extra ops).
+  // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
+  // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
+  // CHECK-DAG: %[[C2:.*]] = arith.constant 2 : index
+  // CHECK: %[[M:.*]] = memref.dim %[[A]], %[[C0]]
+  // CHECK: %[[REM_M:.*]] = arith.subi %[[M]], %{{.*}} : index
+  // CHECK: %[[STEPM1:.*]] = arith.subi %{{.*}}, %{{.*}} : index
+  // CHECK: %[[ADJ:.*]] = arith.addi %[[REM_M]], %[[STEPM1]] : index
+  // CHECK: %[[ROWSZ:.*]] = arith.divsi %[[ADJ]], %{{.*}} : index
+  // CHECK: %[[N:.*]] = memref.dim %[[A]], %[[C1]]
+  // CHECK: %[[COLSZ:.*]] = arith.subi %[[N]], %{{.*}} : index
+  // CHECK: vector.create_mask %[[ROWSZ]], %[[COLSZ]] : vector<8x1xi1>
+  // CHECK-NOT: hc.load_mask
+  func.func @strided_load_mask(%a: memref<?x?xf32>) {
+    %c1 = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %a
+        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %zero = hc.const<0 : i64> : !hc.idx<"0">
+      %one = hc.const<1 : i64> : !hc.idx<"1">
+      %two = hc.const<2 : i64> : !hc.idx<"2">
+      %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+      %eight = hc.const<8 : i64> : !hc.idx<"8">
+      %rows = hc.slice_expr(lower = %zero upper = %sixteen step = %two)
+          : (!hc.idx<"0">, !hc.idx<"16">, !hc.idx<"2">)
+            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>
+      %col = hc.slice_expr(lower = %zero upper = %one)
+          : (!hc.idx<"0">, !hc.idx<"1">)
+            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>
+      %shape = hc.tuple(%eight, %one)
+          : (!hc.idx<"8">, !hc.idx<"1">) -> tuple<!hc.idx<"8">, !hc.idx<"1">>
+      %mask = hc.load_mask %buffer[%rows, %col], shape %shape
+          : (!hc.buffer<f32, ["M", "N"]>,
+             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>,
+             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>,
+             tuple<!hc.idx<"8">, !hc.idx<"1">>)
+            -> !hc.bare_vector<!hc.pred, ["8", "1"]>
+      gpu.terminator
+    }
+    return
+  }
+
   // CHECK-LABEL: func.func @masked_vector_store(
   // CHECK: vector.extract
   // CHECK-SAME: f32 from vector<4xf32>

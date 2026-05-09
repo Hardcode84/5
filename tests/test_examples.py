@@ -7,11 +7,13 @@ import os
 import numpy as np
 import pytest
 
+import hc.simulator as sim
 from examples.amdgpu_gfx11_wmma_matmul import (
     dump_hc_ir,
     make_demo_inputs,
     reference_blocked_matmul,
     simulate_gfx11_wmma_matmul,
+    tiled_gfx11_wmma_matmul,
 )
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
@@ -31,6 +33,30 @@ def test_gfx11_wmma_example_matches_blocked_reference(m: int, n: int, k: int) ->
     reference = reference_blocked_matmul(a, b)
 
     np.testing.assert_allclose(out, reference, rtol=0.0, atol=2e-6)
+
+
+def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
+    # Off-tile shape: M=24, N=24 are not multiples of WMMA_M=WMMA_N=16, so the
+    # single right/bottom tile for each `(M, N)` covers a strict superset of
+    # the live region. Pad `c` with sentinel values around the live `(M, N)`
+    # extent and assert the kernel never touches the padding — this is the
+    # "no OOB writes" property the bounds-aware accumulator mask is meant
+    # to enforce.
+    sentinel = np.float32(-1234.5)
+    a, b = make_demo_inputs(m=24, n=24, k=32, seed=11)
+    padded = np.full((40, 40), sentinel, dtype=np.float32)
+    live = padded[:24, :24]
+    live[...] = 0  # accumulator-output contract: caller zero-fills `c`.
+
+    sim.launch(tiled_gfx11_wmma_matmul, a, b, live)
+
+    reference = reference_blocked_matmul(a, b)
+    np.testing.assert_allclose(live, reference, rtol=0.0, atol=2e-6)
+    # Tail region untouched: any fragment element whose `(row, col)` lies
+    # outside `c[:24, :24]` must be masked off by `init_wmma_acc` and thus
+    # skipped by the per-element store guards.
+    assert np.all(padded[24:, :] == sentinel)
+    assert np.all(padded[:24, 24:] == sentinel)
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

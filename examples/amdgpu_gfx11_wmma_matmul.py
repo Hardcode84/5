@@ -180,14 +180,27 @@ def wmma_gfx11(
     rows = _lane_output_rows(lane, wave_size)
     col = _lane_column(lane)
     values = np.empty((len(rows),), dtype=np.float32)
+    # `acc_frag.mask` carries the per-element output-validity bits stamped
+    # in `init_wmma_acc` (true iff the corresponding `c[row, col]` is in
+    # bounds) and forwarded through every iteration. Skip the multiply-add
+    # for masked-off lanes so the fallback does not touch the poison
+    # accumulator slots that bounds clipping leaves behind, and so the
+    # simulator path mirrors the hardware lowering where the same mask gates
+    # both the WMMA result and the eventual store.
+    acc_mask = acc_frag.mask
     for index in range(len(rows)):
-        accum = np.float32(acc_frag[index])
-        for k_idx in range(WMMA_K):
-            accum += np.float32(a_tile[rows[index], k_idx]) * np.float32(
-                b_tile[k_idx, col]
-            )
+        accum = np.float32(0)
+        if bool(acc_mask[index]):
+            accum = np.float32(acc_frag[index])
+            for k_idx in range(WMMA_K):
+                accum += np.float32(a_tile[rows[index], k_idx]) * np.float32(
+                    b_tile[k_idx, col]
+                )
         values[index] = accum
-    return group.vload(values, shape=(len(rows),))
+    # Forward `acc_frag.mask` so the WMMA result keeps the input mask on its
+    # output channel, matching what the hardware recipe does (see
+    # `_lower_wmma`'s second return value).
+    return group.vload(values, mask=acc_frag.mask)
 
 
 @wmma_gfx11.verify
@@ -290,11 +303,44 @@ def load_wmma_b_fragment(wi, b_tile):
 
 
 @kernel.func(scope=WorkGroup)
-def init_wmma_acc(group):
+def init_wmma_acc(group, c, row0, col0):
+    # Stamp the per-element output-validity mask onto the accumulator fragment
+    # at construction time. WMMA's recipe forwards the input acc fragment's
+    # mask onto the result, so a bounds-aware mask stamped here propagates
+    # through every loop iteration and the final `group.store` keeps a real
+    # per-element `scf.if` guard instead of canonicalize folding it to an
+    # unconditional store that walks past `c[M, N]` for off-tile shapes.
+    #
+    # Why init and not `issue_wmma_tile`: the bounds-stamp lowering uses a
+    # strided `hc.buffer_view` of `c`, and putting that op inside the body of
+    # the k-tile `for` loop trips an iterative-inference fixed-point issue in
+    # `hc-infer-types` (the buffer_view's inferred result type oscillates as
+    # the loop's iter-arg-derived facts re-enter inference). Doing it once
+    # before the loop sidesteps that issue while still pinning the mask into
+    # every accumulator carried around the loop.
     @group.workitems
     def init(wi):
-        _ = wi
-        return group.vzeros(shape=(WMMA_ACC_FRAGMENT,), dtype=np.float32)
+        lane = wi.local_id()[0]
+        # Per-lane output rows are `row0 + lane // 16 + i * (WAVE_LANES / 16)`
+        # for `i in [0, WMMA_ACC_FRAGMENT)`. `vload` of that exact strided
+        # slice gives us a vector whose mask channel is true iff the
+        # corresponding `(row, col)` is in bounds; OOB positions are zero
+        # by `vload`'s clip-and-pad rule, and the in-bounds positions hold
+        # whatever `c` currently contains. The kernel relies on the standard
+        # accumulator-output contract that `c` arrives zero-initialised, so
+        # the data channel is zero everywhere and we can use the loaded
+        # vector directly as the running accumulator without poisoning the
+        # WMMA `a*b + acc` math.
+        row_start, row_stop, row_step = _lane_output_row_slice_args(lane, WAVE_LANES)
+        col = col0 + _lane_column(lane)
+        bounds = group.vload(
+            c[row0 + row_start : row0 + row_stop : row_step, col : col + 1],
+            shape=(WMMA_ACC_FRAGMENT, 1),
+        )
+        # `bounds[:, 0]` collapses the singleton column axis; the result has
+        # the per-lane fragment's `(WMMA_ACC_FRAGMENT,)` shape and inherits
+        # the bounds-aware mask from the vload.
+        return bounds[:, 0]
 
     return init()
 
@@ -306,9 +352,10 @@ def issue_wmma_tile(group, a_tile, b_tile, acc):
         lane = wi.local_id()[0]
         a_frag = load_wmma_a_fragment(wi, a_tile)
         b_frag = load_wmma_b_fragment(wi, b_tile)
-        # A 2D launch keeps a trailing singleton collective axis from
-        # `group_shape=(WAVE_LANES, 1)`. Collapse it here so WMMA still sees the
-        # per-lane `(WMMA_ACC_FRAGMENT,)` vector it expects.
+        # `acc[:, lane, 0]` indexes out the trailing singleton collective axis
+        # so the WMMA input matches its declared `(WMMA_ACC_FRAGMENT,)` vector
+        # shape; the leading `:` keeps the fragment elements (and their
+        # bounds-aware mask, see `init_wmma_acc`).
         return wmma_gfx11(
             group,
             a_tile,
@@ -353,7 +400,7 @@ def tiled_gfx11_wmma_matmul(
     c: Buffer[M, N, np.float32],
 ) -> None:
     row0, col0 = _tile_origin(group.group_id[0], group.group_id[1])
-    acc = init_wmma_acc(group)
+    acc = init_wmma_acc(group, c, row0, col0)
 
     for k0 in range(0, a.shape[1], WMMA_K):
         a_tile = group.load(

@@ -921,6 +921,61 @@ static SmallVector<Value> storeIndicesForCoordinate(OpBuilder &builder,
   return indices;
 }
 
+static bool isUnitStride(Value stride) {
+  APInt step;
+  return matchPattern(stride, m_ConstantInt(&step)) && step.getSExtValue() == 1;
+}
+
+static bool hasNonUnitStrideSlice(ArrayRef<SliceAxis> axes) {
+  return llvm::any_of(axes, [](const SliceAxis &axis) {
+    return axis.isSlice && !isUnitStride(axis.stride);
+  });
+}
+
+// Fold a constant index `Value` into an `IntegerAttr` so subview-result-type
+// inference picks up a static stride/offset; non-constants stay as the SSA
+// value the caller supplied.
+static OpFoldResult asIndexFold(OpBuilder &builder, Value v) {
+  APInt constant;
+  if (matchPattern(v, m_ConstantInt(&constant)))
+    return builder.getIndexAttr(constant.getSExtValue());
+  return v;
+}
+
+// Encode the slice's per-axis offsets and strides into a `memref.subview` so
+// the resulting memref's affine layout reflects the strided access pattern;
+// the caller can then issue zero-offset transfers against the subview.
+// Constant offsets and strides are folded into static layout components so
+// the subview type stays as concrete as the slice expression allows.
+static Value makeStridedSubview(OpBuilder &builder, Location loc, Value memref,
+                                MemRefType memrefType,
+                                mlir::VectorType resultVectorType,
+                                ArrayRef<SliceAxis> axes) {
+  SmallVector<OpFoldResult> subOffsets;
+  SmallVector<OpFoldResult> subSizes;
+  SmallVector<OpFoldResult> subStrides;
+  subOffsets.reserve(axes.size());
+  subSizes.reserve(axes.size());
+  subStrides.reserve(axes.size());
+  int64_t sliceIdx = 0;
+  for (const SliceAxis &info : axes) {
+    subOffsets.push_back(asIndexFold(builder, info.offset));
+    if (info.isSlice) {
+      int64_t size = resultVectorType.getDimSize(sliceIdx++);
+      subSizes.push_back(builder.getIndexAttr(size));
+      subStrides.push_back(asIndexFold(builder, info.stride));
+    } else {
+      subSizes.push_back(builder.getIndexAttr(1));
+      subStrides.push_back(builder.getIndexAttr(1));
+    }
+  }
+  MemRefType subviewType = memref::SubViewOp::inferResultType(
+      memrefType, subOffsets, subSizes, subStrides);
+  return memref::SubViewOp::create(builder, loc, subviewType, memref,
+                                   subOffsets, subSizes, subStrides)
+      .getResult();
+}
+
 template <typename OpT>
 struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
@@ -954,7 +1009,8 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
           "expected ranked memref with one subscript per axis");
 
     FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                    /*requireUnitStride=*/false);
     if (failed(axes))
       return failure();
     if (llvm::count_if(*axes, [](const SliceAxis &axis) {
@@ -962,22 +1018,39 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
         }) != transferVectorType.getRank())
       return op.emitOpError("load result rank must match slice subscript rank");
 
-    SmallVector<Value> offsets;
-    offsets.reserve(axes->size());
-    for (const SliceAxis &axis : *axes)
-      offsets.push_back(axis.offset);
-
     Value padding = constantSplat(rewriter, op.getLoc(),
                                   transferVectorType.getElementType(), 0);
     if (!padding)
       return failure();
 
-    Value loaded = vector::TransferReadOp::create(
-                       rewriter, op.getLoc(), transferVectorType, memref,
-                       offsets, std::optional<Value>(padding),
-                       transferPermutationMap(rewriter.getContext(),
-                                              memrefType.getRank(), *axes))
-                       .getResult();
+    // Strided slices fold the per-axis stride into a `memref.subview` so the
+    // step ends up encoded in the subview's affine layout. `transfer_read`
+    // then walks the subview's logical shape contiguously and the underlying
+    // loads honour the original step. Unit-stride slices skip the subview to
+    // keep the simpler IR shape that existing tests pin down.
+    Value transferSource = memref;
+    SmallVector<Value> transferOffsets;
+    AffineMap permutationMap = transferPermutationMap(
+        rewriter.getContext(), memrefType.getRank(), *axes);
+    if (hasNonUnitStrideSlice(*axes)) {
+      transferSource = makeStridedSubview(
+          rewriter, op.getLoc(), memref, memrefType, transferVectorType, *axes);
+      auto subviewType = cast<MemRefType>(transferSource.getType());
+      transferOffsets =
+          zeroOffsets(rewriter, op.getLoc(), subviewType.getRank());
+      permutationMap = transferPermutationMap(rewriter.getContext(),
+                                              subviewType.getRank(), *axes);
+    } else {
+      transferOffsets.reserve(axes->size());
+      for (const SliceAxis &axis : *axes)
+        transferOffsets.push_back(axis.offset);
+    }
+
+    Value loaded =
+        vector::TransferReadOp::create(
+            rewriter, op.getLoc(), transferVectorType, transferSource,
+            transferOffsets, std::optional<Value>(padding), permutationMap)
+            .getResult();
     FailureOr<Value> result =
         materializeShapedResult(rewriter, op.getLoc(), converted, loaded);
     if (failed(result))
@@ -1013,7 +1086,8 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
           "expected ranked memref with one subscript per axis");
 
     FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                    /*requireUnitStride=*/false);
     if (failed(axes))
       return failure();
     if (llvm::count_if(*axes, [](const SliceAxis &axis) {
@@ -1021,13 +1095,31 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
         }) != maskType.getRank())
       return op.emitOpError("mask result rank must match slice subscript rank");
 
+    // The mask size is the count of strided positions that stay in-bounds.
+    // Unit-stride collapses to `extent - offset`; for wider strides the count
+    // becomes `ceildiv(extent - offset, stride)` so e.g. a stride-2 slice into
+    // an 8-row tail of a 24-row buffer reports 4 valid lanes, not 8.
+    // `vector.create_mask` signed-clamps the result to `[0, N]`, so a negative
+    // `extent - offset` (offset past the end) lands on a zero-clamped,
+    // all-false mask without an explicit guard here.
     SmallVector<Value> maskSizes;
     for (auto [axis, info] : llvm::enumerate(*axes)) {
       if (!info.isSlice)
         continue;
       Value extent = dim(rewriter, op.getLoc(), memref, axis);
-      maskSizes.push_back(
-          arith::SubIOp::create(rewriter, op.getLoc(), extent, info.offset));
+      Value remaining =
+          arith::SubIOp::create(rewriter, op.getLoc(), extent, info.offset);
+      Value size = remaining;
+      if (!isUnitStride(info.stride)) {
+        Value strideMinusOne =
+            arith::SubIOp::create(rewriter, op.getLoc(), info.stride,
+                                  oneIndex(rewriter, op.getLoc()));
+        Value adjusted = arith::AddIOp::create(rewriter, op.getLoc(), remaining,
+                                               strideMinusOne);
+        size = arith::DivSIOp::create(rewriter, op.getLoc(), adjusted,
+                                      info.stride);
+      }
+      maskSizes.push_back(size);
     }
 
     Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(), maskType,

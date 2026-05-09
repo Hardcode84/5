@@ -120,6 +120,17 @@ mlir::FailureOr<ExprHandle> composeExprCeil(Store &store, ExprHandle value,
                                             std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
                                            std::string *diagnostic = nullptr);
+
+/// Leaf constructors for symbolic expressions: `composeExprSym` returns
+/// the canonical handle for a bare symbol with the given name (e.g. "M",
+/// "i", "$STRIDE_0_a"). `composeExprInt` returns the canonical handle for
+/// an integer literal. Both go through the dialect-owned store so callers
+/// that build expressions structurally (without touching `parseExpr`'s
+/// text path) get the same hash-consed nodes any other producer would.
+mlir::FailureOr<ExprHandle> composeExprSym(Store &store, llvm::StringRef name,
+                                           std::string *diagnostic = nullptr);
+mlir::FailureOr<ExprHandle> composeExprInt(Store &store, int64_t value,
+                                           std::string *diagnostic = nullptr);
 mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
                                            PredCmpOp op, ExprHandle rhs,
                                            std::string *diagnostic = nullptr);

@@ -279,6 +279,26 @@ FailureOr<ExprHandle> mlir::hc::sym::composeExprNeg(Store &store,
                     "failed to compose hc.expr");
 }
 
+FailureOr<ExprHandle> mlir::hc::sym::composeExprSym(Store &store,
+                                                    llvm::StringRef name,
+                                                    std::string *diagnostic) {
+  // ixs_sym needs a NUL-terminated buffer; copy once instead of asking
+  // callers to do it.
+  std::string nulTerminated(name);
+  Session session(store);
+  ixs_node *node = ixs_sym(session.raw(), nulTerminated.c_str());
+  return finishExpr(session.raw(), node, diagnostic,
+                    "failed to construct hc.expr symbol");
+}
+
+FailureOr<ExprHandle> mlir::hc::sym::composeExprInt(Store &store, int64_t value,
+                                                    std::string *diagnostic) {
+  Session session(store);
+  ixs_node *node = ixs_int(session.raw(), value);
+  return finishExpr(session.raw(), node, diagnostic,
+                    "failed to construct hc.expr integer literal");
+}
+
 FailureOr<PredHandle>
 mlir::hc::sym::composePredCmp(Store &store, ExprHandle lhsHandle, PredCmpOp op,
                               ExprHandle rhsHandle, std::string *diagnostic) {

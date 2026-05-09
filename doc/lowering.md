@@ -327,7 +327,9 @@ Symbolic surface attributes:
   string
 * `#hc.effects<"Pure" | "Read" | "Write" | "ReadWrite">` — intrinsic effect
   class; verified similarly
-* `#hc.layout<...>` — reserved for `index_map(...)` descriptors; unused in v0
+* `#hc.layout<...>` — symbolic layout descriptor (shape_syms / index_syms /
+  params / storage_size / offset over `#hc.expr`); see `doc/layouts.md`
+  for the design and consumers
 
 The bound name on `hc.symbol` lives in the result type (`!hc.idx<"name">`);
 type uniquing gives symbol equality for free, so a dedicated

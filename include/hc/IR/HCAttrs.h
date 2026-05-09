@@ -7,6 +7,7 @@
 
 #include "hc/IR/HCSymbols.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
 
 namespace mlir {
 class AsmParser;

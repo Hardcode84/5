@@ -6,8 +6,10 @@
 
 #include "hc/IR/HCDialect.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
@@ -165,5 +167,198 @@ LogicalResult ScopeAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (name != "WorkGroup" && name != "SubGroup" && name != "WorkItem")
     return emitError() << "expected #hc.scope to be one of \"WorkGroup\", "
                           "\"SubGroup\", \"WorkItem\"";
+  return success();
+}
+
+namespace {
+
+ParseResult parseQuotedNameList(AsmParser &parser,
+                                SmallVectorImpl<Attribute> &out) {
+  if (parser.parseLSquare())
+    return failure();
+  if (succeeded(parser.parseOptionalRSquare()))
+    return success();
+  auto parseOne = [&]() -> ParseResult {
+    llvm::SMLoc loc = parser.getCurrentLocation();
+    std::string text;
+    OptionalParseResult parsed = parser.parseOptionalString(&text);
+    if (!parsed.has_value())
+      return parser.emitError(loc, "expected quoted name");
+    if (failed(*parsed))
+      return failure();
+    out.push_back(StringAttr::get(parser.getContext(), text));
+    return success();
+  };
+  if (parseOne())
+    return failure();
+  while (succeeded(parser.parseOptionalComma())) {
+    if (parseOne())
+      return failure();
+  }
+  return parser.parseRSquare();
+}
+
+void printQuotedNameList(AsmPrinter &printer, ArrayRef<Attribute> names) {
+  printer << "[";
+  llvm::interleaveComma(names, printer, [&](Attribute a) {
+    printer.printString(llvm::cast<StringAttr>(a).getValue());
+  });
+  printer << "]";
+}
+
+template <typename AttrT>
+ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
+                                StringRef field, AttrT &out) {
+  Attribute attr;
+  if (parser.parseAttribute(attr))
+    return failure();
+  out = llvm::dyn_cast<AttrT>(attr);
+  if (!out)
+    return parser.emitError(loc) << "expected " << field << " to be a "
+                                 << AttrT::getMnemonic() << " attribute";
+  return success();
+}
+
+} // namespace
+
+Attribute LayoutAttr::parse(AsmParser &parser, Type) {
+  if (parser.parseLess())
+    return {};
+
+  SmallVector<Attribute> shapeSyms;
+  SmallVector<Attribute> indexSyms;
+  DictionaryAttr params;
+  ExprAttr storageSize;
+  ExprAttr offset;
+  bool gotShape = false;
+  bool gotIndex = false;
+  bool gotParams = false;
+  bool gotStorage = false;
+  bool gotOffset = false;
+  llvm::SMLoc startLoc = parser.getCurrentLocation();
+
+  auto parseField = [&]() -> ParseResult {
+    StringRef name;
+    llvm::SMLoc nameLoc = parser.getCurrentLocation();
+    if (parser.parseKeyword(&name) || parser.parseEqual())
+      return failure();
+    if (name == "shape_syms") {
+      if (gotShape)
+        return parser.emitError(nameLoc, "duplicate field 'shape_syms'");
+      gotShape = true;
+      return parseQuotedNameList(parser, shapeSyms);
+    }
+    if (name == "index_syms") {
+      if (gotIndex)
+        return parser.emitError(nameLoc, "duplicate field 'index_syms'");
+      gotIndex = true;
+      return parseQuotedNameList(parser, indexSyms);
+    }
+    if (name == "params") {
+      if (gotParams)
+        return parser.emitError(nameLoc, "duplicate field 'params'");
+      gotParams = true;
+      llvm::SMLoc valueLoc = parser.getCurrentLocation();
+      Attribute attr;
+      if (parser.parseAttribute(attr))
+        return failure();
+      params = llvm::dyn_cast<DictionaryAttr>(attr);
+      if (!params)
+        return parser.emitError(valueLoc,
+                                "expected params to be a dictionary attribute");
+      return success();
+    }
+    if (name == "storage_size") {
+      if (gotStorage)
+        return parser.emitError(nameLoc, "duplicate field 'storage_size'");
+      gotStorage = true;
+      llvm::SMLoc valueLoc = parser.getCurrentLocation();
+      return parseTypedAttribute<ExprAttr>(parser, valueLoc, "storage_size",
+                                           storageSize);
+    }
+    if (name == "offset") {
+      if (gotOffset)
+        return parser.emitError(nameLoc, "duplicate field 'offset'");
+      gotOffset = true;
+      llvm::SMLoc valueLoc = parser.getCurrentLocation();
+      return parseTypedAttribute<ExprAttr>(parser, valueLoc, "offset", offset);
+    }
+    return parser.emitError(nameLoc)
+           << "unknown #hc.layout field '" << name << "'";
+  };
+
+  if (parser.parseCommaSeparatedList(parseField))
+    return {};
+  if (parser.parseGreater())
+    return {};
+
+  if (!gotShape || !gotIndex || !gotParams || !gotStorage || !gotOffset) {
+    parser.emitError(startLoc,
+                     "#hc.layout requires shape_syms, index_syms, params, "
+                     "storage_size, offset");
+    return {};
+  }
+
+  return LayoutAttr::getChecked([&] { return parser.emitError(startLoc); },
+                                parser.getContext(), shapeSyms, indexSyms,
+                                params, storageSize, offset);
+}
+
+void LayoutAttr::print(AsmPrinter &printer) const {
+  printer << "<shape_syms = ";
+  printQuotedNameList(printer, getShapeSyms());
+  printer << ", index_syms = ";
+  printQuotedNameList(printer, getIndexSyms());
+  printer << ", params = " << getParams();
+  printer << ", storage_size = " << getStorageSize();
+  printer << ", offset = " << getOffset();
+  printer << ">";
+}
+
+LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 ArrayRef<Attribute> shapeSyms,
+                                 ArrayRef<Attribute> indexSyms,
+                                 DictionaryAttr params, ExprAttr storageSize,
+                                 ExprAttr offset) {
+  // Single shared set: shape_syms / index_syms / params keys live in the
+  // same expression-symbol namespace at substitution time, so their names
+  // must be pairwise disjoint.
+  llvm::DenseSet<StringRef> seen;
+  auto checkNameList = [&](ArrayRef<Attribute> names,
+                           StringRef field) -> LogicalResult {
+    for (Attribute attr : names) {
+      auto str = llvm::dyn_cast_if_present<StringAttr>(attr);
+      if (!str)
+        return emitError() << "expected " << field
+                           << " entries to be string attributes";
+      if (str.getValue().empty())
+        return emitError() << field << " entries must be non-empty";
+      if (!seen.insert(str.getValue()).second)
+        return emitError() << "duplicate name '" << str.getValue()
+                           << "' across #hc.layout name lists";
+    }
+    return success();
+  };
+  if (failed(checkNameList(shapeSyms, "shape_syms")))
+    return failure();
+  if (failed(checkNameList(indexSyms, "index_syms")))
+    return failure();
+  if (!params)
+    return emitError() << "expected params to be a non-null dictionary";
+  for (NamedAttribute kv : params) {
+    StringRef key = kv.getName().getValue();
+    if (key.empty())
+      return emitError() << "params keys must be non-empty";
+    if (!llvm::isa<ExprAttr>(kv.getValue()))
+      return emitError() << "params value for '" << key
+                         << "' must be a #hc.expr attribute";
+    if (!seen.insert(key).second)
+      return emitError() << "duplicate name '" << key
+                         << "' across #hc.layout name lists";
+  }
+  if (!storageSize)
+    return emitError() << "missing storage_size";
+  if (!offset)
+    return emitError() << "missing offset";
   return success();
 }

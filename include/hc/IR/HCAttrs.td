@@ -134,6 +134,48 @@ def HC_NamedLayoutAttr : EnumAttr<HC_Dialect, HC_NamedLayout, "named_layout"> {
   let assemblyFormat = "$value";
 }
 
+def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
+  let summary = "Symbolic layout descriptor for shaped values.";
+  let description = [{
+    Captures `index_map(...)` from the source layer as a quintuple of
+    bound-name lists and `#hc.expr` payloads. Textual form, single-lined
+    here for clarity:
+
+      #hc.layout<shape_syms = ["W", "H"],
+                 index_syms = ["i", "j"],
+                 params = {row_stride = #hc.expr<"H + 4">},
+                 storage_size = #hc.expr<"W * row_stride">,
+                 offset = #hc.expr<"i * row_stride + j">>
+
+    Bound-name conventions: `shape_syms` are bound positionally to the
+    shape entries of the attached type; `index_syms` are bound at access
+    sites; `params` are derived expressions over `shape_syms` whose
+    names `storage_size` and `offset` may reference. Names listed in
+    `shape_syms` and `index_syms` must be unique within their list and
+    disjoint from each other; `params` keys must not collide with
+    either. Symbolic-engine-side substitution at the use site relies on
+    that disjointness.
+
+    All `#hc.expr` payloads go through the dialect symbolic store at
+    construction so type uniquing across ixsimpl-canonical equality
+    gives free layout equality.
+
+    No restriction on the offset / storage_size grammar in v1: we
+    accept what ixsimpl can chew and leave injectivity / size proofs
+    to the consumers (canonicalize, flatten). See `doc/layouts.md` for
+    the full design.
+  }];
+  let parameters = (ins
+    ArrayRefParameter<"::mlir::Attribute">:$shapeSyms,
+    ArrayRefParameter<"::mlir::Attribute">:$indexSyms,
+    "::mlir::DictionaryAttr":$params,
+    "::mlir::hc::ExprAttr":$storageSize,
+    "::mlir::hc::ExprAttr":$offset
+  );
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+}
+
 def HC_EffectClassPure : I32EnumAttrCase<"Pure", 0, "pure">;
 def HC_EffectClassRead : I32EnumAttrCase<"Read", 1, "read">;
 def HC_EffectClassWrite : I32EnumAttrCase<"Write", 2, "write">;

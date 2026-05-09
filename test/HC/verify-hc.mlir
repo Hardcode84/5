@@ -892,3 +892,47 @@ hc.kernel @bad {
   }
   hc.return
 }
+
+// -----
+
+// #hc.layout requires every keyword field; missing one is a parser-time error
+// rather than a verify-time one.
+// CHECK: error: #hc.layout requires shape_syms, index_syms, params, storage_size, offset
+module attributes {
+  test.layout = #hc.layout<shape_syms = ["W"], index_syms = ["i"], params = {},
+                           storage_size = #hc.expr<"W">>
+} {}
+
+// -----
+
+// Names must be pairwise disjoint across shape_syms, index_syms, and params:
+// they share one expression-symbol namespace at substitution time.
+// CHECK: error: duplicate name 'i' across #hc.layout name lists
+module attributes {
+  test.layout = #hc.layout<shape_syms = ["i", "H"], index_syms = ["i", "j"],
+                           params = {},
+                           storage_size = #hc.expr<"H">,
+                           offset = #hc.expr<"i">>
+} {}
+
+// -----
+
+// params keys live in the same namespace as shape_syms / index_syms.
+// CHECK: error: duplicate name 'W' across #hc.layout name lists
+module attributes {
+  test.layout = #hc.layout<shape_syms = ["W"], index_syms = ["i"],
+                           params = {W = #hc.expr<"4">},
+                           storage_size = #hc.expr<"W">,
+                           offset = #hc.expr<"i">>
+} {}
+
+// -----
+
+// params values must be #hc.expr; verifier rejects anything else.
+// CHECK: error: params value for 'row_stride' must be a #hc.expr attribute
+module attributes {
+  test.layout = #hc.layout<shape_syms = ["W"], index_syms = ["i"],
+                           params = {row_stride = 4 : i64},
+                           storage_size = #hc.expr<"W">,
+                           offset = #hc.expr<"i">>
+} {}

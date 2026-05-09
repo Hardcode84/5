@@ -315,10 +315,13 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
     # Happy path for the transform-schedule driver: compile a trivial
-    # kernel and assert the `hc_ir_text` snapshot has reached the default
-    # GPU-launch wrapper stage (not hc_front.*), with no captured diagnostics.
-    # This is the gate we care about for the CompiledKernel contract now that
-    # the pipeline stage actually runs.
+    # kernel and assert the `hc_ir_text` snapshot has reached the
+    # post-`gpu-to-llvm` stage where the host wrapper is `llvm.func`,
+    # with no captured diagnostics. This trivial kernel never lays down
+    # a `gpu.launch` (no real compute), so the schedule's gpu-outlining
+    # path is a no-op and there's no `gpu.binary` to assert — the
+    # surviving signal is "host-side IR is fully LLVM and the original
+    # `hc_front.*` is gone".
     script = tmp_path / "compile_pipeline.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -337,7 +340,7 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
                 assert isinstance(handle, CompiledKernel)
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert handle.hc_ir_text is not None
-                assert "func.func @foo" in handle.hc_ir_text, handle.hc_ir_text
+                assert "llvm.func @foo" in handle.hc_ir_text, handle.hc_ir_text
                 assert "hc.kernel" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "hc_front." not in handle.hc_ir_text, handle.hc_ir_text
                 # `front_ir_text` must remain the pre-pipeline snapshot
@@ -653,57 +656,59 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
         assert handle.hc_ir is not None, handle.pipeline_diagnostics
         assert handle.hc_ir_text is not None
-        # Default schedule now runs all the way through
-        # `hc-interpret-intrinsic-recipes` + canonicalize +
-        # gpu-kernel-outlining + rocdl-attach-target, so the post-compile
-        # IR is hc.*-free: every semantic and bare HC type, every HC op
-        # (region scope, load/store, intrinsic call, even the intrinsic
-        # decl), and the recipe-inserted bridging UCCs all fold away.
-        # `!hc.` covers every HC type spelling; matching just `hc.` would
-        # false-positive on substrings inside surrounding upstream tokens.
-        assert "!hc." not in handle.hc_ir_text, handle.hc_ir_text
+        # Default schedule now runs all the way through to a sealed
+        # `gpu.binary` HSACO blob: front-end → kernels-to-launch →
+        # intrinsic recipes → canonicalize/cse → kernel outlining →
+        # alloca-to-global + vector-transfer reduction → rocdl attach →
+        # full ROCDL/LLVM lowering inside `gpu.module` → host wrapper
+        # `gpu-to-llvm` → `hc-lower-gpu-to-binary` → symbol-dce.
+        # No `hc.*` ops or types survive, no `gpu.module` survives
+        # (replaced by `gpu.binary`), no `amdgpu.*` op survives (lowered
+        # to `rocdl.wmma_*` then to LLVM intrinsics inside the binary),
+        # and no `vector.transfer_*` survives (reduced to vector.load/
+        # vector.store before the LLVM chain). The HSACO blob bytes
+        # themselves can carry literal "hc.", "gpu.module", "amdgpu."
+        # substrings (ELF section names + escaped payload), so the
+        # negative checks below scope to lines outside the bin = "..."
+        # payload — split each gpu.binary line on `bin = "` and only
+        # inspect the prefix.
+        ir_lines_no_bin = [
+            line.split('bin = "', 1)[0] if 'bin = "' in line else line
+            for line in handle.hc_ir_text.splitlines()
+        ]
+        ir_no_bin = "\\n".join(ir_lines_no_bin)
+        assert "!hc." not in ir_no_bin, ir_no_bin
         stray_hc_ops = [
-            line for line in handle.hc_ir_text.splitlines()
+            line for line in ir_lines_no_bin
             if " hc." in line or line.lstrip().startswith("hc.")
         ]
         assert not stray_hc_ops, stray_hc_ops
-        # The recipe's bridging casts pair with the launch-body UCCs on
-        # either side of the call; canonicalize collapses the upstream →
-        # bare → upstream chain to identity, so no UCCs survive cleanup.
-        assert "unrealized_conversion_cast" not in handle.hc_ir_text
-        # Positive structural assertions: kernel-outlining split the
-        # launch into a host `func.func` calling `gpu.launch_func`, with
-        # the device body relocated into a sibling
-        # `gpu.module @<kernel>_kernel` stamped with the gfx1100 rocdl
-        # target. The K loop is still a real `scf.for`, tile staging
-        # uses upstream vector/memref ops, and the WMMA intrinsic landed
-        # as a plain upstream `amdgpu.wmma` between `vector<...>`
-        # operands — those all live inside the gpu.module now, waiting
-        # for the body lowering chain that the binary emission bead
-        # will add.
-        assert "func.func @tiled_gfx11_wmma_matmul" in handle.hc_ir_text
+        assert "gpu.module" not in ir_no_bin, ir_no_bin
+        assert "amdgpu." not in ir_no_bin, ir_no_bin
+        assert "vector.transfer" not in ir_no_bin, ir_no_bin
+        assert "unrealized_conversion_cast" not in ir_no_bin, ir_no_bin
+        # Positive structural assertions: host wrapper landed as
+        # `llvm.func` after `gpu-to-llvm`, dispatches via
+        # `gpu.launch_func` into the freshly minted `gpu.binary`
+        # carrying the gfx1100 rocdl target attribute and a non-empty
+        # HSACO blob.
+        assert "module attributes {gpu.container_module}" in handle.hc_ir_text
+        assert (
+            "llvm.func @tiled_gfx11_wmma_matmul(" in handle.hc_ir_text
+        ), handle.hc_ir_text
         assert "gpu.launch_func" in handle.hc_ir_text
         assert "gpu.launch " not in handle.hc_ir_text, handle.hc_ir_text
         assert (
-            "gpu.module @tiled_gfx11_wmma_matmul_kernel" in handle.hc_ir_text
+            "gpu.binary @tiled_gfx11_wmma_matmul_kernel" in handle.hc_ir_text
         ), handle.hc_ir_text
         assert (
             '#rocdl.target<chip = "gfx1100">' in handle.hc_ir_text
         ), handle.hc_ir_text
-        assert "gpu.func @" in handle.hc_ir_text
-        assert "scf.for" in handle.hc_ir_text, handle.hc_ir_text
-        assert "vector.transfer_read" in handle.hc_ir_text
-        assert "vector.transfer_write" in handle.hc_ir_text
-        assert "memref.alloca" in handle.hc_ir_text
-        assert "#gpu.address_space<workgroup>" in handle.hc_ir_text
-        assert "memref.store" in handle.hc_ir_text
-        assert "vector.extract" in handle.hc_ir_text
-        wmma = re.search(
-            r"amdgpu\\.wmma 16x16x16 %\\S+ \\* %\\S+ \\+ %\\S+ : "
-            r"vector<16xf16>, vector<16xf16>, vector<8xf32>",
-            handle.hc_ir_text,
-        )
-        assert wmma, handle.hc_ir_text
+        # `bin = "..."` is the gpu.object printer's marker for a
+        # CompilationTarget::Binary blob — pin its presence as a stable
+        # proxy for "the HSACO is attached and the format is what we
+        # asked for", without trying to FileCheck the opaque bytes.
+        assert 'bin = "' in handle.hc_ir_text, handle.hc_ir_text
 
         loads = re.findall(
             r'(hc_front\\.name "[\\w_]+" \\{ctx = "load"[^\\n]*)\\n',
@@ -738,9 +743,9 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_target_selects_recipe(tmp_path: Path) -> None:
-    # Three-way subprocess check on the new `target=` plumbing:
+    # Three-way subprocess check on the `target=` plumbing:
     #   * `target=None` — recipe still fires (default empty target runs
-    #     every named sequence) and `amdgpu.wmma` lands.
+    #     every named sequence) so the pipeline reaches a `gpu.binary`.
     #   * `target="amdgpu-gfx11"` — explicit match, same outcome plus
     #     the handle echoes the value back.
     #   * `target="amdgpu-gfx12"` — no recipe matches, so
@@ -748,6 +753,12 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
     #     intrinsic lowering recipe matched" diagnostic instead of
     #     silently passing the call through to whichever stage runs
     #     next.
+    #
+    # Pre-binary-emission this test pinned `amdgpu.wmma` as proof the
+    # recipe fired. Now that the schedule lowers all the way through
+    # to HSACO, `amdgpu.*` ops are gone — the structural signal of
+    # success is `gpu.binary @<kernel>_kernel` with the rocdl target
+    # attribute attached.
     script = tmp_path / "compile_target.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
@@ -755,18 +766,27 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
             from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
 
 
+            def _check_compiled_to_binary(handle) -> None:
+                assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
+                assert (
+                    "gpu.binary @tiled_gfx11_wmma_matmul_kernel"
+                    in handle.hc_ir_text
+                ), handle.hc_ir_text
+                assert (
+                    '#rocdl.target<chip = "gfx1100">' in handle.hc_ir_text
+                ), handle.hc_ir_text
+
+
             def main() -> None:
                 default = hc.compile(tiled_gfx11_wmma_matmul)
                 assert default.target is None, default.target
-                assert default.hc_ir_text is not None
-                assert "amdgpu.wmma" in default.hc_ir_text
+                _check_compiled_to_binary(default)
 
                 matched = hc.compile(
                     tiled_gfx11_wmma_matmul, target="amdgpu-gfx11"
                 )
                 assert matched.target == "amdgpu-gfx11", matched.target
-                assert matched.hc_ir_text is not None
-                assert "amdgpu.wmma" in matched.hc_ir_text
+                _check_compiled_to_binary(matched)
                 assert "target='amdgpu-gfx11'" in repr(matched), repr(matched)
 
                 missed = hc.compile(

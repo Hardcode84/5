@@ -13,22 +13,46 @@
 // pair, wrap kernels in upstream GPU launches, lower launch-body scalar/control
 // flow, clean up, interpret target lowering recipes (which rewrites every
 // `hc.call_intrinsic` and DCEs the matching `hc.intrinsic` decls), then a
-// canonicalize/cse pair to fold the recipe's bridging UCCs into identity. The
-// closing trio splits each `gpu.launch` into a `gpu.module` + `gpu.func` +
-// `gpu.launch_func`, stamps the `gpu.module` with a `#rocdl.target` so the
-// downstream binary-emission pass has the chip info it needs, and runs a final
-// canonicalize/cse cleanup. The actual `gpu.module` body lowering chain
-// (amdgpu/scf/memref/vector → llvm-dialect inside the module) and the
-// `hc-lower-gpu-to-binary` step are deliberately *not* in the default
-// schedule today — they need a ROCDL-equivalent of upstream's
-// `gpu-lower-to-nvvm-pipeline` composition (workgroup memref address-space
-// mapping, kernel ABI, scf/vector lowering inside `gpu.module`) to land
-// without breaking every non-trivial kernel. Until then this schedule stops
-// at the `gpu.module` boundary; callers wanting to push further can pass
-// `schedule=<path-or-text>` and own the rest themselves.
+// canonicalize/cse pair to fold the recipe's bridging UCCs into identity.
+//
+// The closing chunk produces the device-side artefacts the GPU lowering
+// pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
+// `hc/_pipeline.py`) needs:
+//
+//   * `gpu-launch-sink-index-computations` rewrites every constant index
+//     consumer inside `gpu.launch` so the outliner can lift the constants into
+//     the `gpu.func` body instead of promoting them to kernel arguments.
+//     Runtime-typed kernel arguments end up as `memref.dim`'s axis operand
+//     downstream, which AMDGPU codegen can't lower (LLVM emits
+//     `dynamic_stackalloc` for the descriptor reads). Sinking is the simplest
+//     way to keep those axis values literal.
+//
+//   * `gpu-kernel-outlining` splits each `gpu.launch` into a sibling
+//     `gpu.module @<kernel>_kernel` + `gpu.func` + `gpu.launch_func`.
+//
+//   * `transform.memref.alloca_to_global` lifts every `memref.alloca` (always
+//     workgroup-AS in our pipeline) to a `memref.global` + `memref.get_global`
+//     pair anchored at the `gpu.module` symbol table. This is the only
+//     upstream-supported way to teach `convert-gpu-to-rocdl` about workgroup
+//     memory — its TypeConverter only knows about workgroup AS for
+//     get_global/global pairs, not arbitrary allocas.
+//
+//   * `apply_patterns.vector.lower_transfer` + `transfer_to_scf` reduce the
+//     remaining `vector.transfer_read/write` ops on workgroup memrefs to plain
+//     `vector.load/store`. Without this the rocdl conversion can't lower them
+//     (vector → llvm patterns don't carry the workgroup-AS mapping that
+//     `convert-gpu-to-rocdl` plants on its TypeConverter).
+//
+//   * `rocdl-attach-target` stamps each `gpu.module` with `#rocdl.target` so
+//     `convert-amdgpu-to-rocdl`, `gpu-to-llvm`, and `hc-lower-gpu-to-binary`
+//     can route off it.
+//
 // `hc.compile` loads this via `-transform-preload-library` and runs it with
 // `-transform-interpreter`; callers wanting a different order can pass
-// `schedule=<path-or-text>` to override.
+// `schedule=<path-or-text>` to override. The Python driver still appends the
+// GPU lowering chain after the schedule fires, so an override only needs to
+// produce `gpu.module` ops carrying `#rocdl.target` for the rest of the
+// pipeline to take over.
 module attributes {transform.with_named_sequence} {
   // `%m` is consumed by the registered frontend/HC passes; the verifier
   // requires the entry block argument to reflect that by omitting the
@@ -96,31 +120,63 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m14 : !transform.any_op
+    // Sink constant index ops into `gpu.launch` so the outliner inlines them
+    // into `gpu.func` instead of routing them through kernel arguments.
+    // memref.dim's axis operand is the canonical victim — runtime-typed axes
+    // hit `dynamic_stackalloc` in AMDGPU codegen, so we keep them literal.
+    %m15 = transform.apply_registered_pass "gpu-launch-sink-index-computations" to %m14
+        : (!transform.any_op) -> !transform.any_op
     // Outline each `gpu.launch` into `gpu.module @kernel_kernel` +
     // `gpu.func` + `gpu.launch_func`. No-op on payloads that never
     // produced a `gpu.launch` (trivial kernels), so leaving it
     // unconditional keeps the schedule shape regular for every input.
-    %m15 = transform.apply_registered_pass "gpu-kernel-outlining" to %m14
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m15 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m15 : !transform.any_op
-    // Stamp every freshly minted `gpu.module` with a `#rocdl.target`
-    // attribute. The chip is resolved Python-side from `hc.compile`'s
-    // `target=` (e.g. `amdgpu-gfx11` -> `gfx1100`); the empty
-    // `target=None` case maps to a sensible default chip in
-    // `_resolve_chip` so the substitution is always well-formed.
-    // Subsequent passes — `convert-amdgpu-to-rocdl`,
-    // `hc-lower-gpu-to-binary` — key off this attribute. Pass is a
-    // no-op on payloads with no `gpu.module`.
-    %m16 = transform.apply_registered_pass "rocdl-attach-target"
-        with options = { "chip" = "__HC_CHIP__" } to %m15
+    %m16 = transform.apply_registered_pass "gpu-kernel-outlining" to %m15
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m16 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m16 : !transform.any_op
+    // Promote every workgroup-AS `memref.alloca` to a `memref.global` +
+    // `memref.get_global` pair, anchored at the `gpu.module` symbol table.
+    // `convert-gpu-to-rocdl` only teaches its TypeConverter the
+    // workgroup-to-AS3 mapping for get_global/global, so an alloca that
+    // survives this point fails the conversion with "memory space conversion
+    // failed". `structured.match` returns an empty handle on payloads with no
+    // alloca (trivial kernels, host-only modules), and `alloca_to_global`
+    // is a no-op on an empty handle — so this stays well-formed regardless
+    // of whether anything actually got promoted.
+    %alloca = transform.structured.match ops{["memref.alloca"]} in %m16
+        : (!transform.any_op) -> !transform.op<"memref.alloca">
+    %get_global, %global = transform.memref.alloca_to_global %alloca
+        : (!transform.op<"memref.alloca">) -> (!transform.any_op, !transform.any_op)
+    // Reduce `vector.transfer_read/write` to `vector.load/store` so the
+    // downstream rocdl chain can lower them. Without this the vector ops
+    // survive into convert-vector-to-llvm, which doesn't get the
+    // workgroup-AS mapping its TypeConverter needs and silently emits
+    // "memory space conversion failed" notes. `lower_transfer` does the
+    // bulk of the rewrite; `transfer_to_scf full_unroll = true` strips the
+    // remaining rank-1 transfers into scalar loads/stores so the rest of
+    // the chain only sees ops it knows how to handle.
+    transform.apply_patterns to %m16 {
+      transform.apply_patterns.vector.lower_transfer max_transfer_rank = 1
+      transform.apply_patterns.vector.transfer_to_scf full_unroll = true
+    } : !transform.any_op
+    // Stamp every freshly minted `gpu.module` with a `#rocdl.target`
+    // attribute. The chip is resolved Python-side from `hc.compile`'s
+    // `target=` (e.g. `amdgpu-gfx11` -> `gfx1100`); the empty
+    // `target=None` case maps to a sensible default chip in
+    // `_resolve_chip` so the substitution is always well-formed.
+    // The downstream `convert-amdgpu-to-rocdl` and
+    // `hc-lower-gpu-to-binary` (both wired by the appended GPU
+    // lowering pipeline in `hc/_pipeline.py`) key off this attribute.
+    // Pass is a no-op on payloads with no `gpu.module`.
+    %m17 = transform.apply_registered_pass "rocdl-attach-target"
+        with options = { "chip" = "__HC_CHIP__" } to %m16
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m17 {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m17 : !transform.any_op
     transform.yield
   }
 }

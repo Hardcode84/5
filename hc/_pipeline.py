@@ -13,6 +13,17 @@ schedule file with `-transform-preload-library` and runs it through
 string) and users can swap in their own schedule without touching
 Python.
 
+After the schedule fires, the driver appends a fixed device-side
+lowering chain (`_GPU_LOWERING_PIPELINE`) that takes the
+`#rocdl.target`-stamped `gpu.module` ops to `gpu.binary` (HSACO) blobs
+via `hc-lower-gpu-to-binary`. The chain is appended as a raw
+`pass-pipeline` string rather than as more `transform.apply_registered_pass`
+nodes because some of the included passes (notably `gpu-to-llvm` via
+its `dlti` dependency) refuse to be loaded through the transform
+interpreter's per-pass `PassManager`. Custom schedules still get the
+chain appended — overriding it would mean composing your own
+binary-emission stage and is out of scope for `schedule=`.
+
 Failure is non-fatal: on a pipeline error the result carries
 `module=None` + captured diagnostic strings. Callers inspect the
 result rather than wrapping in `try`.
@@ -20,6 +31,7 @@ result rather than wrapping in `try`.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -78,6 +90,66 @@ _TARGET_CHIP_MAP: dict[str, str] = {
     "amdgpu-gfx11": "gfx1100",
 }
 
+# Sister sentinel for `ld.lld` that `hc-lower-gpu-to-binary` invokes to
+# link the AMDGPU object into an HSACO blob. Substituted Python-side
+# from `_resolve_lld` (HC_LLD env -> empty). An empty substitution
+# leaves the pass to fall back to its own resolution chain (`HC_LLD`
+# env -> `$PATH`-search), so a sysadmin who set `HC_LLD` outside the
+# build tree gets the same answer either way; the placeholder exists
+# so the schedule string remains parseable when a path was resolved.
+_LLD_PLACEHOLDER = "__HC_LLD__"
+_LLD_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
+
+# Device-side lowering chain appended after the user's schedule fires.
+# Two things matter about the order:
+#
+#   * `lower-affine` runs three times — once at top-level before the
+#     scf->cf step (the recipe interpreter and the launch-body lowering
+#     both leave affine.apply ops behind), once nested in `gpu.module`
+#     (because the top-level pass doesn't recurse into outlined
+#     modules), and a third time after `convert-amdgpu-to-rocdl` (which
+#     synthesises a fresh affine.apply per WMMA tile). Skipping any of
+#     the three leaves an `affine.apply` for `translateModuleToLLVMIR`
+#     to choke on.
+#
+#   * `convert-gpu-to-rocdl` MUST be nested inside `gpu.module` so its
+#     TypeConverter installs the workgroup-AS mapping that the rest of
+#     the inner conversions (vector/arith/index → llvm) need. Running
+#     it at top-level just emits "memory space conversion failed" and
+#     leaves the body in mixed dialect.
+#
+# The placeholders match the schedule's: `_substitute_chip` /
+# `_substitute_lld` swap them in before the pipeline string is
+# parsed.
+_GPU_LOWERING_PIPELINE = (
+    # Fold subview-into-load/store before the rocdl chain. Without this
+    # the descriptor materialisation for dynamic-offset subviews emits
+    # `llvm.alloca <count> x <type>` (a runtime alloca from AMDGPU's
+    # POV) that the backend then rejects as `dynamic_stackalloc`.
+    "gpu.module(fold-memref-alias-ops),"
+    "lower-affine,"
+    "gpu.module(lower-affine),"
+    "canonicalize,cse,"
+    "convert-scf-to-cf,"
+    f"convert-amdgpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
+    "lower-affine,"
+    "gpu.module("
+    "lower-affine,"
+    f"convert-gpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
+    "convert-arith-to-llvm,"
+    "convert-vector-to-llvm,"
+    "convert-index-to-llvm,"
+    "reconcile-unrealized-casts"
+    "),"
+    "gpu-to-llvm,"
+    "convert-vector-to-llvm,"
+    "convert-index-to-llvm,"
+    "reconcile-unrealized-casts,"
+    "canonicalize,cse,"
+    f"hc-lower-gpu-to-binary{{lld-path={_LLD_PLACEHOLDER}}},"
+    "symbol-dce"
+)
+
 ScheduleSource = Path | str | None
 
 # hc's own passes register exactly once per process. Upstream passes are
@@ -130,14 +202,21 @@ def run_front_to_hc(
     contain the placeholder silently ignores the value — the override
     owns its own pass invocations.
 
-    The `__HC_CHIP__` placeholder is filled in the same pass: `target=`
+    The `__HC_CHIP__` placeholder is filled in two places: the schedule
+    (for `rocdl-attach-target`) and the appended GPU lowering chain
+    (for `convert-amdgpu-to-rocdl` / `convert-gpu-to-rocdl`). `target=`
     is mapped through `_TARGET_CHIP_MAP` (e.g. `"amdgpu-gfx11"` →
-    `"gfx1100"`) to the AMDGPU chip name `rocdl-attach-target` and
-    `convert-amdgpu-to-rocdl` need. Passing a bare `gfx<chip>` string
-    works too — anything starting with `gfx` is accepted verbatim. With
-    `target=None` the chip falls back to `_DEFAULT_CHIP`, which is fine
-    because chip-keyed passes are no-ops on a payload that never grew
-    a `gpu.module` (trivial/fully-folded kernels).
+    `"gfx1100"`). Passing a bare `gfx<chip>` string works too — anything
+    starting with `gfx` is accepted verbatim. With `target=None` the chip
+    falls back to `_DEFAULT_CHIP`, which is fine because chip-keyed
+    passes are no-ops on a payload that never grew a `gpu.module`
+    (trivial/fully-folded kernels).
+
+    `__HC_LLD__` is filled from the `HC_LLD` env var (set by
+    `build_tools/llvm_toolchain.py` and pre-populated by `pip install`
+    via the build backend). When the env is unset, the placeholder
+    collapses to the empty string and `hc-lower-gpu-to-binary` falls
+    through to its own resolution (`HC_LLD` env -> `$PATH`).
     """
 
     from .mlir import ir
@@ -158,7 +237,7 @@ def run_front_to_hc(
         _schedule_file(schedule, target=target) as schedule_path,
         context.attach_diagnostic_handler(capture),
     ):
-        pipeline = _pipeline_string(schedule_path)
+        pipeline = _pipeline_string(schedule_path, target=target)
         try:
             pm = _build_pass_manager(pipeline, context)
             pm.run(front_module.operation)
@@ -215,17 +294,28 @@ def _ensure_passes_registered() -> None:
     _passes_registered = True
 
 
-def _pipeline_string(schedule_path: Path) -> str:
-    # Two passes: one reads the schedule from disk and merges its named
-    # sequences into the payload module, the other actually walks the
-    # sequence. The entry-point option is spelled redundantly because
+def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
+    # Two-stage pipeline:
+    #   1) `transform-preload-library` + `transform-interpreter` runs the
+    #      user-or-default schedule (front-to-hc, recipe interpretation,
+    #      kernel outlining, alloca-to-global, vector transfer lowering,
+    #      rocdl-attach-target).
+    #   2) The fixed `_GPU_LOWERING_PIPELINE` chain takes the
+    #      `#rocdl.target`-stamped `gpu.module` to a `gpu.binary` blob.
+    #      Appended as raw passes (not more transform.apply_registered_pass
+    #      ops) because `gpu-to-llvm` lazy-loads the `dlti` dialect, which
+    #      the transform interpreter's per-pass `PassManager` can't satisfy.
+    # The entry-point option is spelled redundantly because
     # `__transform_main` is also the upstream default, but being explicit
     # makes the pipeline self-documenting if we ever introduce secondary
     # entry points (per-target lowerings, say).
+    gpu_lowering = _substitute_chip(_GPU_LOWERING_PIPELINE, target)
+    gpu_lowering = _substitute_lld(gpu_lowering)
     return (
         "builtin.module("
         f"transform-preload-library{{transform-library-paths={schedule_path}}},"
-        f"transform-interpreter{{entry-point={_ENTRY_POINT}}}"
+        f"transform-interpreter{{entry-point={_ENTRY_POINT}}},"
+        f"{gpu_lowering}"
         ")"
     )
 
@@ -314,6 +404,30 @@ def _validate_target(target: str) -> str:
 def _substitute_chip(text: str, target: str | None) -> str:
     chip = _resolve_chip(target)
     return text.replace(_CHIP_PLACEHOLDER, chip)
+
+
+def _substitute_lld(text: str) -> str:
+    # Empty resolves to the pass's own fallback (HC_LLD env -> $PATH).
+    # Substituting in the resolved path eagerly when we have one keeps
+    # the pipeline string self-contained for callers that capture it
+    # for replay/debug; a missing HC_LLD falls through to the pass's
+    # own resolution and surfaces the same diagnostic users already see
+    # from manual `hc-opt --hc-lower-gpu-to-binary` invocations.
+    return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
+
+
+def _resolve_lld() -> str:
+    raw = os.environ.get("HC_LLD", "")
+    if not raw:
+        return ""
+    bad = sorted({c for c in raw if c in _LLD_FORBIDDEN_CHARS})
+    if bad:
+        # Reject up front for the same reason `_validate_target` does:
+        # MLIR's option parser doesn't survive embedded quotes/newlines
+        # and the resulting diagnostic is much harder to debug than
+        # this exception.
+        raise ValueError(f"HC_LLD env contains forbidden characters {bad}: {raw!r}")
+    return raw
 
 
 def _resolve_chip(target: str | None) -> str:

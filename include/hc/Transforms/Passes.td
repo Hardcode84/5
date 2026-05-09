@@ -74,6 +74,57 @@ def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
+  let summary = "Fold explicit identity layouts and collapse layout chains.";
+  let description = [{
+    Cleanup pass for the `#hc.layout<...>` attribute introduced in
+    `doc/layouts.md`. Three rewrites, in order:
+
+      1. Strip explicit identity layouts from shaped Values. A layout
+         is identity for an n-dim shape iff its shape_syms /
+         index_syms have rank n, params is empty, storage_size is
+         the product over shape_syms, and offset is the row-major
+         dot product over index_syms with strides taken from the
+         tail product of shape_syms, all under ixsimpl-canonical
+         form. Matching values get `setType` to the layout-less type
+         — the layout slot was made optional precisely so
+         "absent equals identity" is the canonical form.
+
+      2. ixsimpl-normalize layout payloads. This is structurally a
+         no-op because `LayoutAttr` normalizes through the symbolic
+         store at construction; the pass exercises the contract
+         under `--debug` and serves as the documented place to
+         reconstruct stale forms once a future API allows it.
+
+      3. Collapse `hc.as_layout(hc.as_layout(%v, L1), L2)` to
+         `hc.as_layout(%v, L2)`. The outer choice wins regardless of
+         L1 / L2 — semantically `as_layout` overwrites the prior
+         layout, not composes with it.
+
+    Runs after `hc-infer-types`; no IR-shape changes elsewhere. The
+    type-level fold also propagates to BlockArguments so function
+    signatures and region bodies stay coherent. Function-type
+    attributes (the cached signature on `hc.func` /
+    `hc.kernel` / `hc.intrinsic`) are rebuilt to match.
+
+    Implementation routes through MLIR's dialect-conversion driver so
+    the type rewrite stays consistent with how SCF / func / call
+    structural conversions are done elsewhere in the codebase. The
+    pass picks up `func` and `scf` dialect dependencies for that
+    reason — the populators they ship know how to clone-and-replace
+    `func.func` signatures, `scf.for` iter_args, etc., while keeping
+    the conversion driver's materialization tracking honest. Identity
+    materializations are registered on the converter because the
+    layout-stripped and layout-bearing forms are observationally
+    interchangeable.
+  }];
+  let dependentDialects = [
+    "::mlir::hc::HCDialect",
+    "::mlir::func::FuncDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def HCDecomposeShapedValues
     : Pass<"hc-decompose-shaped-values"> {
   let summary = "Split semantic tensor/vector values into bare data and masks.";

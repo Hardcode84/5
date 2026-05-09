@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 add_mlir_library(MLIRHCTransforms
+  HCCanonicalizeLayoutsPass.cpp
   HCDecomposeShapedValuesPass.cpp
   HCInferTypesPass.cpp
   HCInlineHelpersPass.cpp
@@ -28,6 +29,7 @@ add_mlir_library(MLIRHCTransforms
   MLIRArithDialect
   MLIRExecutionEngineUtils
   MLIRFuncDialect
+  MLIRFuncTransforms
   MLIRGPUDialect
   MLIRHCDialect
   MLIRHCTransformOps
@@ -38,6 +40,7 @@ add_mlir_library(MLIRHCTransforms
   MLIRROCDLDialect
   MLIRROCDLTarget
   MLIRSCFDialect
+  MLIRSCFTransforms
   MLIRSupport
   MLIRTargetLLVM
   MLIRTargetLLVMIRExport

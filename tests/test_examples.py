@@ -7,6 +7,7 @@ import os
 import numpy as np
 import pytest
 
+import hc
 import hc.simulator as sim
 from examples.amdgpu_gfx11_wmma_matmul import (
     dump_hc_ir,
@@ -19,6 +20,17 @@ from examples.amdgpu_gfx11_wmma_matmul import (
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
     reason="native hc_front dialect smoke tests disabled by env",
+)
+
+# Real-hardware end-to-end gate. Default-skipped — running it dlopens
+# `libamdhip64.so` (via `hc_rt_init`) and dispatches a kernel onto the
+# GPU bound by `HIP_VISIBLE_DEVICES`, so it only makes sense on a host
+# with a working ROCm runtime and a gfx11-class device. Mirror the opt-in
+# convention `tests/test_hip_runtime.py` already established for the
+# init-path test.
+_RUN_HIP_INVOKE_TESTS = pytest.mark.skipif(
+    os.environ.get("HC_RT_RUN_HIP_INVOKE_TEST") != "1",
+    reason="set HC_RT_RUN_HIP_INVOKE_TEST=1 on a host with a gfx11 GPU to run",
 )
 
 
@@ -57,6 +69,45 @@ def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
     # skipped by the per-element store guards.
     assert np.all(padded[24:, :] == sentinel)
     assert np.all(padded[:24, 24:] == sentinel)
+
+
+@_RUN_HIP_INVOKE_TESTS
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [(16, 16, 16), (32, 32, 32)],
+)
+def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> None:
+    """End-to-end acceptance for the gfx11 WMMA execution epic.
+
+    Compiles `tiled_gfx11_wmma_matmul` for `amdgpu-gfx11`, drives it
+    through the full ORC LLJIT + HIP shim stack (`hc.compile().invoke()`
+    -> JIT'd host wrapper -> `hc_rt_load_kernel` / `hc_rt_launch_kernel`
+    -> `libamdhip64`), and checks the result matches the numpy reference
+    to FP32 round-off. Requires GPU memory for the inputs/outputs;
+    `torch.cuda` is the path of least resistance because its
+    `Tensor.data_ptr()` returns a HIP-allocated device pointer that
+    `_mlir_ciface_hc_get_buffer` can plug straight into the kernel
+    descriptor — the runtime helpers don't allocate or copy on their
+    own. Skip cleanly if torch isn't installed so the gate stays usable
+    on minimal Python envs.
+    """
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("torch.cuda unavailable")
+
+    a, b = make_demo_inputs(m=m, n=n, k=k, seed=13)
+    expected = reference_blocked_matmul(a, b)
+
+    a_dev = torch.from_numpy(a).cuda()
+    b_dev = torch.from_numpy(b).cuda()
+    c_dev = torch.zeros(m, n, dtype=torch.float32, device="cuda")
+
+    compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11")
+    compiled.invoke(a_dev, b_dev, c_dev)
+
+    out = c_dev.cpu().numpy()
+    np.testing.assert_allclose(out, expected, rtol=0.0, atol=2e-3)
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

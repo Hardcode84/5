@@ -421,7 +421,7 @@ module {
 // -----
 
 // Layout is a typed enum now; parser rejects garbage (same story as `kind`).
-// CHECK: expected ::mlir::hc::Layout to be one of: row_major, col_major
+// CHECK: expected ::mlir::hc::NamedLayout to be one of: row_major, col_major
 module {
   func.func @bad(%v: !hc.undef) -> !hc.undef {
     %r = hc.as_layout %v, layout = weird : !hc.undef -> !hc.undef

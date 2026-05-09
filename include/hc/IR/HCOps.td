@@ -835,12 +835,15 @@ def HCAsLayoutOp : HC_Op<"as_layout",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Change the layout of a tensor or vector value.";
   let description = [{
-    `$layout` is a typed `#hc<layout ...>` enum attribute. v0 admits
+    `$layout` is a typed `#hc<named_layout ...>` enum attribute. v0 admits
     `row_major` and `col_major`; wrong spellings fail at parse, not verify.
     Lifted out of `attr-dict` so the surface reads like the other explicit
-    keyword-argument ops (`hc.reduce`, `hc.astype`).
+    keyword-argument ops (`hc.reduce`, `hc.astype`). The `named_layout`
+    enum is transitional: a follow-up canonicalization pass folds it into
+    the structured `#hc.layout<...>` attribute documented in
+    `doc/layouts.md`.
   }];
-  let arguments = (ins HC_ShapedValueType:$value, HC_LayoutAttr:$layout);
+  let arguments = (ins HC_ShapedValueType:$value, HC_NamedLayoutAttr:$layout);
   let results = (outs HC_ShapedValueType:$result);
   let assemblyFormat = [{
     $value `,` `layout` `=` $layout attr-dict `:`

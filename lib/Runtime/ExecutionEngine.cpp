@@ -2,16 +2,19 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implementation lives behind a tiny surface so we can grow it without
-// disturbing callers. v0 supports raw LLVM IR text only; the MLIR-text
-// path (parse + translate + load) follows once the host wrapper lands —
-// keeping it out of v0 lets the engine link without MLIR libs at all.
+// Two ingestion paths share one backend:
+//   `loadLLVMIR(text)` → parseAssembly → addLLVMModule
+//   `loadMLIR(text)`   → parseSourceString + translateModuleToLLVMIR →
+//   addLLVMModule
+// The MLIR path is what the post-pipeline host wrapper goes through;
+// the LLVM-text path stays around for hand-written IR experiments and
+// tests that don't want the dialect-translation cost.
 //
 // The compiler creator wires in `mlir::makeOptimizingTransformer` even
-// though we don't go through MLIR otherwise. It's just the convenient
-// path to the standard LLVM optimize-then-codegen pipeline at the
-// requested opt level; we depend on `MLIRExecutionEngineUtils` for that
-// helper alone.
+// though the LLVM-IR ingestion path doesn't go through MLIR otherwise.
+// It's just the convenient way to reach LLVM's standard
+// optimize-then-codegen pipeline at a chosen opt level; we depend on
+// `MLIRExecutionEngineUtils` for that helper alone.
 
 #include "hc/Runtime/ExecutionEngine.h"
 
@@ -22,6 +25,7 @@
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -29,7 +33,16 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Export.h"
 
 namespace {
 
@@ -50,6 +63,28 @@ void initializeNativeTargetOnce() {
 llvm::Error makeStringError(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
+}
+
+// Minimum dialect set the post-pipeline host wrapper needs: LLVM (for
+// the body) and the builtin/LLVM translations to lower the parsed
+// `ModuleOp` to `llvm::Module`. We deliberately stop there rather than
+// `registerAllDialects` — the lowering pipeline guarantees the IR is
+// pure LLVM dialect by the time it reaches us, and shrinking the
+// dialect surface keeps the wheel size honest. If a future pipeline
+// stage starts emitting something else, the parser will surface a
+// "unregistered dialect" diagnostic that points right at the gap.
+std::unique_ptr<mlir::MLIRContext> makeMLIRContext() {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::LLVM::LLVMDialect>();
+  mlir::registerBuiltinDialectTranslation(registry);
+  mlir::registerLLVMDialectTranslation(registry);
+  // Allow unknown attributes (e.g. `gpu.container_module` left on the
+  // module by upstream passes) to pass through the parser without us
+  // having to load the corresponding dialect — the attribute is just a
+  // marker, the translation step ignores it.
+  auto context = std::make_unique<mlir::MLIRContext>(registry);
+  context->allowUnregisteredDialects(true);
+  return context;
 }
 
 // Apply LLVM's standard optimize-then-emit pipeline at the JTM's chosen
@@ -123,10 +158,6 @@ ExecutionEngine::~ExecutionEngine() = default;
 
 llvm::Expected<ExecutionEngine::ModuleHandle>
 ExecutionEngine::loadLLVMIR(llvm::StringRef text) {
-  // Fresh context per load — TSM owns it, so it gets dropped when the
-  // module is released and concurrent loads don't contend on a shared
-  // context. Parsing has to happen against this owned context too, so
-  // the resulting Module's reference is valid for the TSM's lifetime.
   auto context = std::make_unique<llvm::LLVMContext>();
   llvm::SMDiagnostic diag;
   auto memoryBuffer = llvm::MemoryBuffer::getMemBuffer(
@@ -139,11 +170,41 @@ ExecutionEngine::loadLLVMIR(llvm::StringRef text) {
     diag.print("hc-jit", os);
     return makeStringError("failed to parse LLVM IR: " + os.str());
   }
+  return addLLVMModule(std::move(module), std::move(context));
+}
 
-  // Each module gets its own JITDylib so we can release them
-  // independently. The counter is monotonic — we never reuse names
-  // because deleting a dylib doesn't immediately free the name on the
-  // ExecutionSession side.
+llvm::Expected<ExecutionEngine::ModuleHandle>
+ExecutionEngine::loadMLIR(llvm::StringRef text) {
+  if (!mlirContext)
+    mlirContext = makeMLIRContext();
+
+  mlir::OwningOpRef<mlir::ModuleOp> moduleOp =
+      mlir::parseSourceString<mlir::ModuleOp>(text, mlirContext.get());
+  if (!moduleOp)
+    return makeStringError("failed to parse MLIR text into a ModuleOp");
+
+  // Translation needs its own `LLVMContext` so the resulting
+  // `llvm::Module` has the same lifetime story as the LLVM-IR ingestion
+  // path — owned by the `ThreadSafeModule` and released when the JIT
+  // dylib is torn down.
+  auto llvmContext = std::make_unique<llvm::LLVMContext>();
+  std::unique_ptr<llvm::Module> llvmModule =
+      mlir::translateModuleToLLVMIR(*moduleOp, *llvmContext);
+  if (!llvmModule)
+    return makeStringError(
+        "failed to translate MLIR module to LLVM IR (check that the input is "
+        "in LLVM dialect or any other dialect with a registered translation)");
+
+  return addLLVMModule(std::move(llvmModule), std::move(llvmContext));
+}
+
+llvm::Expected<ExecutionEngine::ModuleHandle>
+ExecutionEngine::addLLVMModule(std::unique_ptr<llvm::Module> module,
+                               std::unique_ptr<llvm::LLVMContext> context) {
+  // Fresh dylib per module so we can release them independently. The
+  // counter is monotonic — we never reuse names because deleting a
+  // dylib doesn't immediately free the name on the ExecutionSession
+  // side.
   std::string dylibName;
   llvm::orc::JITDylib *dylib = nullptr;
   while (true) {
@@ -158,8 +219,8 @@ ExecutionEngine::loadLLVMIR(llvm::StringRef text) {
   }
 
   // Process-wide symbol resolution lets the JIT find anything currently
-  // visible in the host process (libc, the runtime helpers we'll dlsym
-  // before construction, etc.) without us having to enumerate them.
+  // visible in the host process (libc, the runtime helpers the caller
+  // dlopens before invoke, etc.) without us having to enumerate them.
   auto dataLayout = jit->getDataLayout();
   dylib->addGenerator(llvm::cantFail(
       llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(

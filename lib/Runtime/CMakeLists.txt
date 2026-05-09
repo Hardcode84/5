@@ -72,7 +72,17 @@ target_link_libraries(hc_execution_engine PRIVATE
   LLVMExecutionEngine
   LLVMOrcJIT
   LLVMTarget
+
+  # MLIR ingestion path: parse LLVM-dialect text, translate to LLVM IR.
+  # Kept to the minimum dialect surface the post-pipeline host wrapper
+  # needs (LLVM only) so the wheel doesn't drag the rest of MLIR in.
+  MLIRBuiltinToLLVMIRTranslation
   MLIRExecutionEngineUtils
+  MLIRIR
+  MLIRLLVMDialect
+  MLIRLLVMToLLVMIRTranslation
+  MLIRParser
+  MLIRTargetLLVMIRExport
 )
 target_link_options(hc_execution_engine PRIVATE
   -Wl,--no-undefined

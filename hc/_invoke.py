@@ -9,28 +9,23 @@ one `PyObject *` per non-`!hc.group` kernel argument and unpacks each via
 `_mlir_ciface_hc_get_*` calls (provided by `libhc_rt_helpers.so`), then
 dispatches the actual GPU launch through the `hc_rt_load_kernel` /
 `hc_rt_launch_kernel` shim from `libhc_hip_runtime.so`. To make that
-runnable from Python we need to:
+runnable from Python:
 
-* JIT-compile the post-pipeline MLIR module with the LLVM-dialect → LLVM
-  IR translator wired up — `hc.mlir.execution_engine.ExecutionEngine`
-  does the translate-then-LLJIT dance for us in a single C API call.
-* Load both runtime shared libraries into the host process so the JIT's
-  process-symbol-search resolver finds `_mlir_ciface_hc_get_*` and
-  `hc_rt_*` by name (no need to enumerate). The MLIR engine's
-  `shared_libs=` parameter does this via LLVM's `LoadLibraryPermanently`.
-* Look up the packed-args wrapper that `ExecutionEngine` synthesizes
-  around our host wrapper — we have to go through it because the
-  Python binding only exposes the packed-lookup C API entry point.
-* Build a `void**` array per call where each slot points to a
-  `PyObject *` storage cell, then call the packed wrapper which loads
-  each slot and forwards to the real `@<kernel_name>` implementation.
+* Spin up our `hc_execution_engine` extension, register the runtime
+  helper + HIP shim symbols by ctypes-resolving them out of the bundled
+  `.so` files and handing them to `set_symbol_map` — explicit and
+  process-local, no `LoadLibraryPermanently` side effects.
+* `engine.load_mlir(text)` parses the post-pipeline LLVM-dialect text,
+  translates to LLVM IR, and JITs it. The engine returns the raw
+  unpacked address of `@<kernel_name>` from `lookup`, so we can call it
+  through a vanilla `ctypes.CFUNCTYPE(None, py_object * N)` thunk
+  without the upstream MLIR engine's packed-args wrapper indirection.
 
 Engine + cfunc creation is cached on the `CompiledKernel` via a tiny
-mutable side-channel; the dataclass itself stays frozen so unrelated
-fields are still safe to use as dict keys when their values permit.
-The cache is process-local — no global engine pool — so two compiled
-kernels keep their JIT'd code separate and a refcount drop releases
-the engine immediately.
+mutable side-channel; the dataclass itself stays frozen. The cache is
+process-local — no global engine pool — so two compiled kernels keep
+their JIT'd code separate and a refcount drop releases the engine
+immediately.
 """
 
 from __future__ import annotations
@@ -38,34 +33,67 @@ from __future__ import annotations
 import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ._native_paths import hip_runtime_lib_path, runtime_helpers_lib_path
 
-__all__ = ["InvokerCache", "make_invoker", "runtime_shared_libs"]
+__all__ = ["InvokerCache", "make_invoker", "runtime_symbol_map"]
+
+# Symbols the host wrapper calls. The lists are short enough to enumerate
+# explicitly — wave does the same — and listing them here doubles as
+# documentation of the runtime ABI surface.
+_RUNTIME_HELPER_SYMBOLS: tuple[str, ...] = (
+    "_mlir_ciface_hc_get_buffer",
+    "_mlir_ciface_hc_get_int64",
+    "_mlir_ciface_hc_get_float64",
+    "_mlir_ciface_hc_get_dim",
+    "_mlir_ciface_hc_get_stride",
+)
+
+_HIP_RUNTIME_SYMBOLS: tuple[str, ...] = (
+    "hc_rt_init",
+    "hc_rt_load_kernel",
+    "hc_rt_launch_kernel",
+)
 
 
-def runtime_shared_libs() -> list[str]:
-    """Paths to the runtime shared libraries the host wrapper links against.
+def runtime_symbol_map() -> dict[str, int]:
+    """Resolve all runtime helper + HIP shim symbols to their host addresses.
 
-    Order mirrors call-graph height — helpers first because the host
-    wrapper calls them on every arg, HIP runtime second because it only
-    fires when there is an actual `gpu.launch_func` to dispatch — but
-    LLVM's `LoadLibraryPermanently` does not care about order, so this
-    is purely for human-readability when the list shows up in error
-    messages.
+    The returned `{name: address}` dict is what
+    `ExecutionEngineOptions.set_symbol_map` expects: each address is
+    plumbed into the JIT's symbol table so unresolved externals in the
+    host wrapper (`@_mlir_ciface_hc_get_*`, `@hc_rt_*`) bind to the
+    real implementations. Loading the libraries via `ctypes.CDLL` keeps
+    them alive for the lifetime of the process — `RTLD_LOCAL` is fine
+    because the JIT only needs the addresses, not visibility against
+    `dlsym(NULL, ...)`.
     """
-    return [str(runtime_helpers_lib_path()), str(hip_runtime_lib_path())]
+    helpers = ctypes.CDLL(str(runtime_helpers_lib_path()))
+    hip = ctypes.CDLL(str(hip_runtime_lib_path()))
+    symbols: dict[str, int] = {}
+    for name in _RUNTIME_HELPER_SYMBOLS:
+        symbols[name] = _symbol_address(helpers, name)
+    for name in _HIP_RUNTIME_SYMBOLS:
+        symbols[name] = _symbol_address(hip, name)
+    return symbols
+
+
+def _symbol_address(lib: ctypes.CDLL, name: str) -> int:
+    raw = ctypes.cast(getattr(lib, name), ctypes.c_void_p).value
+    if raw is None:
+        raise RuntimeError(
+            f"hc.invoke: symbol '{name}' resolved to a null address inside "
+            f"{lib._name!r}; the shared library is built but the symbol is "
+            "missing — rebuild the runtime libs."
+        )
+    return int(raw)
 
 
 def _missing_libs() -> list[str]:
-    return [path for path in runtime_shared_libs() if not _path_exists(path)]
-
-
-def _path_exists(path: str) -> bool:
-    from pathlib import Path
-
-    return Path(path).exists()
+    paths = [str(runtime_helpers_lib_path()), str(hip_runtime_lib_path())]
+    return [path for path in paths if not Path(path).exists()]
 
 
 def _kernel_arg_count(module: Any, kernel_name: str) -> int:
@@ -82,14 +110,11 @@ def _kernel_arg_count(module: Any, kernel_name: str) -> int:
     body = module.body if hasattr(module, "body") else module
     target = "@" + kernel_name + "("
     for op in body.operations:
-        # `op.OPERATION_NAME` is a class attr on every dialect op binding;
-        # we cross-check via the textual op name instead of importing the
-        # `llvm` dialect class to keep the import surface narrow.
         if op.operation.name != "llvm.func":
             continue
         op_text = str(op.operation)
         # `llvm.func` headers always single-line in the printer (the body
-        # is in a region after `{`). Split on `(` to read the arg list.
+        # is in a region after `{`). Split on `{` to read the arg list.
         header_end = op_text.find("{")
         header = op_text if header_end == -1 else op_text[:header_end]
         if target in header:
@@ -141,46 +166,41 @@ def make_invoker(
             "package install:\n  "
             + "\n  ".join(missing)
             + "\nReinstall hc (the build copies the .so files under "
-            "hc/_native/lib/) or set HC_RT_HELPERS_PATH / "
-            "HC_RT_HIP_RUNTIME_PATH for source-tree development."
+            "hc/_native/lib/) or run `python -m build_tools.hc_native_tools` "
+            "from a checkout."
         )
 
     num_args = _kernel_arg_count(module, kernel_name)
 
-    from .mlir.execution_engine import ExecutionEngine
+    from .execution_engine import ExecutionEngine, ExecutionEngineOptions
 
-    engine = ExecutionEngine(
-        module,
-        opt_level=2,
-        shared_libs=runtime_shared_libs(),
-    )
-    # `raw_lookup(kernel_name)` resolves to `_mlir_<kernel_name>` — the
-    # packed-args wrapper that `ExecutionEngine` synthesizes around every
-    # public function in the JIT'd module. We deliberately call into the
-    # packed wrapper instead of the original `@<kernel_name>` because the
-    # MLIR ExecutionEngine Python binding only exposes the packed
-    # lookup; the unpacked `mlirExecutionEngineLookup` is in the C API
-    # but not in the nanobind module. Going through the wrapper costs
-    # one extra load per arg and a fixed per-call setup, neither of
-    # which matters at the granularity of a GPU launch.
-    packed_ptr = engine.raw_lookup(kernel_name)
-    if not packed_ptr:
+    options = ExecutionEngineOptions()
+    options.set_symbol_map(runtime_symbol_map())
+    engine = ExecutionEngine(options)
+
+    # `str(module)` is the post-pipeline LLVM-dialect IR; the engine
+    # parses + translates + JITs in one C++ trip. Going through MLIR
+    # (rather than asking the caller to translate first) keeps the
+    # invoke surface a single function call and matches what the rest
+    # of the pipeline emits.
+    handle = engine.load_mlir(str(module))
+    func_ptr = engine.lookup(handle, kernel_name)
+    if not func_ptr:
         raise RuntimeError(
-            f"hc.invoke: lookup of packed wrapper '_mlir_{kernel_name}' "
-            "returned a null pointer (the JIT loaded the module but the "
-            "symbol is not visible — check that the lowering pipeline "
-            "did not rename or DCE the host wrapper)"
+            f"hc.invoke: lookup of host wrapper '@{kernel_name}' returned "
+            "a null address (the JIT loaded the module but the symbol is "
+            "not visible — check that the lowering pipeline did not "
+            "rename or DCE the wrapper)"
         )
 
-    # Packed wrapper signature is `void(void**)` regardless of the original
-    # function's arity — the wrapper itself loads each arg from the
-    # `void**` array and forwards to the real implementation.
-    packed_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-    packed_call = packed_type(packed_ptr)
+    # `void (PyObject*, PyObject*, ...)` — one slot per kernel arg, all
+    # passed by reference (a `py_object` _is_ a borrowed `PyObject *`).
+    func_type = ctypes.CFUNCTYPE(None, *([ctypes.py_object] * num_args))
+    cfunc = func_type(func_ptr)
 
     def invoke(*args: Any) -> None:
         # Touching `engine` keeps it pinned in the closure so the JIT'd
-        # code (and therefore `packed_ptr`) stays valid for the lifetime
+        # code (and therefore `func_ptr`) stays valid for the lifetime
         # of this callable. Without the explicit reference the engine
         # would be reachable only via the cfunc, which ctypes does not
         # treat as a strong reference.
@@ -190,19 +210,7 @@ def make_invoker(
                 f"hc.invoke: kernel '{kernel_name}' takes {num_args} "
                 f"argument(s), got {len(args)}"
             )
-        # Per-arg storage cells holding each `PyObject *`, plus a
-        # `void**` array of pointers into those cells. The packed
-        # wrapper does `load PyObject*, argList[i]` so each cell must
-        # outlive the call (all stack-local here, fine) and `argList[i]`
-        # must point to it. Using `py_object` (rather than raw
-        # `c_void_p(id(obj))`) keeps a strong reference to each Python
-        # object for the duration of the call so the underlying object
-        # cannot be reclaimed mid-launch.
-        storages = [ctypes.py_object(arg) for arg in args]
-        packed = (ctypes.c_void_p * num_args)()
-        for index, storage in enumerate(storages):
-            packed[index] = ctypes.cast(ctypes.byref(storage), ctypes.c_void_p)
-        packed_call(packed)
+        cfunc(*(ctypes.py_object(arg) for arg in args))
 
     invoke.__name__ = f"invoke_{kernel_name}"
     invoke.__qualname__ = invoke.__name__

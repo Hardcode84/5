@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 from ._native_paths import package_native_root
 
@@ -64,6 +64,8 @@ _LAZY = _Lazy()
 
 
 # Type stubs so static type checkers and editors see the public surface.
+# Plain classes (not `Protocol`) because callers _do_ instantiate them at
+# runtime — `Protocol` would make mypy reject `ExecutionEngine(opts)`.
 if TYPE_CHECKING:
 
     class CodeGenOptLevel:
@@ -72,15 +74,19 @@ if TYPE_CHECKING:
         O2: CodeGenOptLevel
         O3: CodeGenOptLevel
 
-    class ExecutionEngineOptions(Protocol):
+    class ExecutionEngineOptions:
         jit_code_gen_opt_level: CodeGenOptLevel | None
+
+        def __init__(self) -> None: ...
 
         def set_symbol_map(self, symbols: dict[str, int]) -> None: ...
 
-    class ExecutionEngine(Protocol):
+    class ExecutionEngine:
         def __init__(self, options: ExecutionEngineOptions) -> None: ...
 
         def load_llvm_ir(self, text: str) -> int: ...
+
+        def load_mlir(self, text: str) -> int: ...
 
         def lookup(self, handle: int, name: str) -> int: ...
 

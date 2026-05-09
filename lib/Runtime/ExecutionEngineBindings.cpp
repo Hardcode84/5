@@ -99,6 +99,18 @@ NB_MODULE(hc_execution_engine, m) {
           "Parse LLVM IR text, JIT-compile it, and return an opaque "
           "module handle (an int).")
       .def(
+          "load_mlir",
+          [](hc::ExecutionEngine &self, const std::string &text) {
+            auto handle = unwrapExpected(self.loadMLIR(text),
+                                         "ExecutionEngine.load_mlir");
+            return reinterpret_cast<std::uintptr_t>(handle);
+          },
+          nb::arg("text"),
+          "Parse MLIR LLVM-dialect text, translate to LLVM IR, "
+          "JIT-compile it, and return an opaque module handle (an int). "
+          "The translation registry is set up for the builtin and LLVM "
+          "dialects; other dialect attributes pass through opaquely.")
+      .def(
           "lookup",
           [](const hc::ExecutionEngine &self, std::uintptr_t handle,
              const std::string &name) {

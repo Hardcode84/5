@@ -225,6 +225,53 @@ def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
+  let summary = "Rewrite per-element shaped arith / cmp / astype ops into "
+                "hc.generic.";
+  let description = [{
+    Funnels the per-element decomposition family into a single
+    body-driven `hc.generic` form so the post-flatten pipeline only
+    has to lower one shaped compute op. Pure source-level rewrite —
+    no memory effects, no vectorization choices, no codegen.
+
+    v0 covers the all-shaped (no scalar broadcast) cases for:
+
+      * binary arith / boolean: `hc.add`, `hc.sub`, `hc.mul`,
+        `hc.div`, `hc.mod`, `hc.and`, `hc.or`,
+      * unary arith / boolean: `hc.neg`, `hc.not`,
+      * comparisons: `hc.cmp.lt`, `hc.cmp.le`, `hc.cmp.gt`,
+        `hc.cmp.ge`, `hc.cmp.eq`, `hc.cmp.ne`,
+      * cast: `hc.astype`.
+
+    Each rewrite emits:
+
+      * one parallel iter sym per result axis (`i_0`, `i_1`, ...) —
+        distinct from the source-level symbol names operands carry,
+      * `iter_bounds` as `hc.undef_value` placeholders that
+        `hc-infer-generic-bounds` resolves from the operand shapes,
+      * shaped inputs as `ins` with identity per-axis offsets,
+      * a synthesised `hc.zeros` / `hc.vzeros` init as the single
+        `outs` with identity per-axis offsets,
+      * a body whose scalar arith mirrors the source op, terminated
+        by `hc.yield`.
+
+    Out of scope (op stays in place; downstream passes still
+    diagnose if the op is the only remaining consumer):
+
+      * Mixed scalar / shaped operands (broadcast). The body would
+        need a splat or a scalar capture pattern; deferred.
+      * `hc.select`. The false-value is a scalar inactive fill that
+        needs the same broadcast story.
+      * Nullary fills (`hc.zeros`, `hc.ones`, `hc.full`, `hc.const`,
+        `hc.empty`). The init scaffolding folds back on itself
+        unless we grow a `hc.generic` form whose init is implicit.
+      * Pre-inference `!hc.undef` operands.
+      * Operands with mismatched ranks or per-axis dim expressions
+        (no broadcast support yet).
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
   let description = [{

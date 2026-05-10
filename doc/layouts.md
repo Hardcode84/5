@@ -612,10 +612,16 @@ on later slices.
     round-trip LIT only — no rewriters or lowering changes here.
 13. **`hc-elementwise-to-generic`** — rewrite the per-element
     decomposed family (`hc.add`, `hc.sub`, `hc.mul`, `hc.div`,
-    `hc.cmp`, `hc.select`, `hc.astype`, `hc.zeros`, `hc.full`, ...)
-    into a single `hc.generic` with all-parallel iters and value-typed
-    outs. Pure source-level rewrite; runs pre-flatten so per-axis
-    offsets are identity over the operand shape.
+    `hc.mod`, `hc.and`, `hc.or`, `hc.neg`, `hc.not`, `hc.cmp.*`,
+    `hc.astype`) into a single `hc.generic` with all-parallel iters
+    and value-typed outs. Pure source-level rewrite; runs pre-flatten
+    so per-axis offsets are identity over the operand shape. Iter
+    bounds are emitted as `!hc.undef` placeholders that
+    `hc-infer-generic-bounds` later resolves from the operand shapes.
+    `hc.select`, scalar / shaped broadcast, and the nullary fills
+    (`hc.zeros`, `hc.full`, ...) are deferred — they need either an
+    init-scaffolding rework or a broadcast story this slice doesn't
+    pin down.
 14. **`hc-load-store-to-generic`** — rewrite `hc.load` / `hc.vload`
     into `hc.generic` with a ptr/buffer in and a value-typed out, and
     `hc.store` into `hc.generic` with a value-typed in and a

@@ -213,12 +213,15 @@ private:
       text += "_";
       text += Twine(element).str();
     }
+    // Bare symbol leaf — no need to round-trip through the parser to
+    // get one. composeExprSym builds the canonical hash-consed leaf
+    // directly.
     auto *dialect = ctx->getOrLoadDialect<HCDialect>();
     std::string diag;
     FailureOr<sym::ExprHandle> handle =
-        sym::parseExpr(dialect->getSymbolStore(), text, &diag);
+        sym::composeExprSym(dialect->getSymbolStore(), text, &diag);
     if (failed(handle))
-      llvm::report_fatal_error("failed to parse synthesized idx symbol");
+      llvm::report_fatal_error("failed to compose synthetic idx symbol");
     return IdxType::get(ctx, ExprAttr::get(ctx, *handle));
   }
 
@@ -897,7 +900,11 @@ static void collectSyntheticJoinSymbols(CallableOpT op, llvm::StringSet<> &seen,
   }
 }
 
-using SymbolSubstitution = std::pair<std::string, std::string>;
+// Both endpoints of every substitution are bare symbol leaves
+// (synthesizeIdxConflictType produces them, renumberSyntheticJoinSymbols
+// remaps them to "$join<index>" form). Carry the canonical handles
+// straight through instead of re-parsing on every rewrite.
+using SymbolSubstitution = std::pair<sym::ExprHandle, sym::ExprHandle>;
 
 static FailureOr<ixs_node *>
 rewriteIxsNode(MLIRContext *ctx, const ixs_node *node,
@@ -909,12 +916,8 @@ rewriteIxsNode(MLIRContext *ctx, const ixs_node *node,
   targets.reserve(substitutions.size());
   replacements.reserve(substitutions.size());
   for (const auto &[from, to] : substitutions) {
-    FailureOr<sym::ExprHandle> target = sym::parseExpr(store, from);
-    FailureOr<sym::ExprHandle> replacement = sym::parseExpr(store, to);
-    if (failed(target) || failed(replacement))
-      return failure();
-    targets.push_back(const_cast<ixs_node *>(target->raw()));
-    replacements.push_back(const_cast<ixs_node *>(replacement->raw()));
+    targets.push_back(const_cast<ixs_node *>(from.raw()));
+    replacements.push_back(const_cast<ixs_node *>(to.raw()));
   }
 
   sym::Session session(store);
@@ -1121,12 +1124,21 @@ static LogicalResult renumberSyntheticJoinSymbols(Operation *root) {
           collectSyntheticJoinSymbols(arg.getType(), seen, symbols);
   });
 
+  // Build the (from, to) handles once via composeExprSym — both ends
+  // are bare symbol leaves, no parser required, and the canonical
+  // handles are what ixs_subs_multi compares against during rewrite.
+  auto *dialect = root->getContext()->getOrLoadDialect<HCDialect>();
+  sym::Store &store = dialect->getSymbolStore();
   SmallVector<SymbolSubstitution> substitutions;
   substitutions.reserve(symbols.size());
   for (auto [index, symbol] : llvm::enumerate(symbols)) {
     SmallString<16> stable(kSyntheticJoinPrefix);
     stable += Twine(index).str();
-    substitutions.emplace_back(symbol, stable.str().str());
+    FailureOr<sym::ExprHandle> from = sym::composeExprSym(store, symbol);
+    FailureOr<sym::ExprHandle> to = sym::composeExprSym(store, stable);
+    if (failed(from) || failed(to))
+      return failure();
+    substitutions.emplace_back(*from, *to);
   }
   return renumberSyntheticJoinSymbols(root, substitutions);
 }

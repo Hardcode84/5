@@ -1779,24 +1779,43 @@ ParseResult parseGenericOperandClause(
              << keyword << " clause requires at least one entry";
     return success();
   }
+  MLIRContext *ctx = parser.getContext();
   auto parseOne = [&]() -> ParseResult {
     OpAsmParser::UnresolvedOperand op;
-    Attribute offsetAttr;
     Type ty;
-    // Parens around `#hc.expr<...>` shield the literal `:` separator from
-    // `parseExtendedAttr`, which would otherwise consume the trailing
-    // `:type` annotation as an attribute type. Same trick `hc.as_layout`
-    // uses for its structured layout payload.
-    auto offsetLoc = parser.getCurrentLocation();
+    // Per-axis offsets ride inside `[...]`. The bracket terminator
+    // shields the trailing `: type` from `parseExtendedAttr`, which
+    // would otherwise consume the colon as part of the attribute. Empty
+    // arrays are permitted at parse — the verifier flags rank mismatch
+    // with a clearer message than a parser-level "missing entry" would.
+    SmallVector<Attribute> axisOffsets;
+    auto parseAxis = [&]() -> ParseResult {
+      Attribute axisAttr;
+      auto attrLoc = parser.getCurrentLocation();
+      if (parser.parseAttribute(axisAttr))
+        return failure();
+      auto expr = llvm::dyn_cast<ExprAttr>(axisAttr);
+      if (!expr)
+        return parser.emitError(attrLoc) << "expected #hc.expr<...> attribute";
+      axisOffsets.push_back(expr);
+      return success();
+    };
     if (parser.parseOperand(op) || parser.parseKeyword("at") ||
-        parser.parseLParen() || parser.parseAttribute(offsetAttr) ||
-        parser.parseRParen() || parser.parseColonType(ty))
+        parser.parseLSquare())
       return failure();
-    auto offset = llvm::dyn_cast<ExprAttr>(offsetAttr);
-    if (!offset)
-      return parser.emitError(offsetLoc) << "expected #hc.expr<...> attribute";
+    if (failed(parser.parseOptionalRSquare())) {
+      if (parseAxis())
+        return failure();
+      while (succeeded(parser.parseOptionalComma()))
+        if (parseAxis())
+          return failure();
+      if (parser.parseRSquare())
+        return failure();
+    }
+    if (parser.parseColonType(ty))
+      return failure();
     ops.push_back(op);
-    offsets.push_back(offset);
+    offsets.push_back(ArrayAttr::get(ctx, axisOffsets));
     types.push_back(ty);
     return success();
   };
@@ -1812,12 +1831,16 @@ void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
                                OperandRange operands, ArrayAttr offsets) {
   p << ' ' << keyword << " (";
   llvm::interleaveComma(
-      llvm::zip_equal(operands, offsets.getAsRange<ExprAttr>()), p,
+      llvm::zip_equal(operands, offsets.getAsRange<ArrayAttr>()), p,
       [&](auto pair) {
-        auto [val, off] = pair;
-        p << val << " at (";
-        p.printAttribute(off);
-        p << ") : " << val.getType();
+        auto [val, perOperand] = pair;
+        p << val << " at [";
+        // `perOperand` is structured-bound from a generic-lambda parameter,
+        // so the compiler treats it as dependent and needs `.template` to
+        // resolve the member template.
+        llvm::interleaveComma(perOperand.template getAsRange<ExprAttr>(), p,
+                              [&](ExprAttr e) { p.printAttribute(e); });
+        p << "] : " << val.getType();
       });
   p << ")";
 }
@@ -1968,22 +1991,62 @@ LogicalResult HCGenericOp::verify() {
              << outVal.getType();
   }
 
+  // Per-operand offset arrays must agree on length with the operand's
+  // rank. `!hc.undef` operands have no shape — skip them; the bounds
+  // pass / inference fills the rank in once a concrete type lands.
+  auto checkOperandRank = [&](Value operand, ArrayAttr perOperandOffsets,
+                              StringRef role, size_t roleIdx) -> LogicalResult {
+    auto entries = llvm::dyn_cast<ArrayAttr>(perOperandOffsets);
+    if (!entries)
+      return emitOpError(role)
+             << "_offsets[" << roleIdx
+             << "] must be an array of #hc.expr<...> per axis";
+    auto shaped =
+        llvm::dyn_cast<SymbolicallyShapedTypeInterface>(operand.getType());
+    if (!shaped)
+      return success();
+    size_t rank = shaped.getSymbolicShape().getDims().size();
+    if (entries.size() != rank)
+      return emitOpError(role)
+             << " #" << roleIdx << " offset has " << entries.size()
+             << " axis entr" << (entries.size() == 1 ? "y" : "ies")
+             << ", operand rank is " << rank;
+    return success();
+  };
+  for (auto [i, in, off] :
+       llvm::enumerate(getIns(), insOffsets.getAsRange<ArrayAttr>()))
+    if (failed(checkOperandRank(in, off, "ins", i)))
+      return failure();
+  for (auto [i, out, off] :
+       llvm::enumerate(getOuts(), outsOffsets.getAsRange<ArrayAttr>()))
+    if (failed(checkOperandRank(out, off, "outs", i)))
+      return failure();
+
   // Reduction iters on output offsets would mean writing the same slot
   // twice along the reduction without specifying a combinator — the op
   // doesn't model that; the reduction value rides on the outs-as-init
-  // body-arg/yield channel instead.
-  for (auto [i, offAttr] :
-       llvm::enumerate(outsOffsets.getAsRange<ExprAttr>())) {
+  // body-arg/yield channel instead. Walk every per-axis entry.
+  for (auto [i, perOperand] :
+       llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>())) {
     StringRef bad;
-    sym::walkSymbolNames(offAttr.getValue(), [&](StringRef name) {
+    int64_t badAxis = -1;
+    for (auto [axis, axisAttr] :
+         llvm::enumerate(perOperand.getAsRange<ExprAttr>())) {
       if (!bad.empty())
-        return;
-      if (reductionSyms.contains(name))
-        bad = name;
-    });
+        break;
+      sym::walkSymbolNames(axisAttr.getValue(), [&](StringRef name) {
+        if (!bad.empty())
+          return;
+        if (reductionSyms.contains(name)) {
+          bad = name;
+          badAxis = static_cast<int64_t>(axis);
+        }
+      });
+    }
     if (!bad.empty())
       return emitOpError("output #")
-             << i << " offset references reduction iter '" << bad
+             << i << " axis " << badAxis
+             << " offset references reduction iter '" << bad
              << "'; only parallel iters may appear in output addressing";
   }
 

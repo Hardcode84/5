@@ -1101,17 +1101,26 @@ def HCGenericOp : HC_Op<"generic",
     `linalg.generic`'s "outs-as-init" contract: each output operand is the
     initial accumulator value and the produced result has the same type.
 
-    Operand addressing is symbolic: each input and output carries a
-    `#hc.expr` offset that is evaluated in a scope where the iter names are
-    bound to the current iter values and any other free symbols are bound
-    by the surrounding kernel scope. The op does not constrain offset
-    grammar; what `ixsimpl` accepts, the op accepts. The lowering owns
-    contiguity / linearity proofs.
+    Operand addressing is symbolic and per-axis: each input and output
+    carries an array of `#hc.expr` offsets, one entry per operand axis
+    (length = operand rank). Each axis expression is evaluated in a
+    scope where the iter names are bound to the current iter values
+    and any other free symbols are bound by the surrounding kernel
+    scope. The op stays logically nD on its operand axes regardless of
+    pipeline position; flatten composes per-axis offsets through the
+    operand's `#hc.layout` offset to produce a single composed
+    expression and rewrites the operand to its 1D bare form (where the
+    axis array becomes single-element). The op does not constrain
+    offset grammar; what `ixsimpl` accepts, the op accepts. The
+    lowering owns contiguity / linearity proofs.
 
     Verifier rules:
       - `iter_syms`, `iter_bounds`, `iter_kinds` are parallel arrays;
         names must be unique and non-empty.
-      - Per-operand offset arrays must match operand counts.
+      - Per-operand offset arrays must match operand counts; each
+        per-operand entry is itself an array of `#hc.expr` whose length
+        equals the operand's rank (`!hc.undef` operands escape the
+        rank check since they have no shape yet).
       - Body block has `ins.size() + outs.size()` arguments; each arg
         type must match the element type of the corresponding operand
         (`!hc.undef` operands escape the parity check).
@@ -1134,10 +1143,14 @@ def HCGenericOp : HC_Op<"generic",
                        "array of `#hc<iter_kind ...>` attributes">:$iter_kinds,
     Variadic<HC_DecomposableShapedValueType>:$ins,
     Variadic<HC_DecomposableShapedValueType>:$outs,
-    TypedArrayAttrBase<HC_ExprAttr,
-                       "array of `#hc.expr<...>` offsets">:$ins_offsets,
-    TypedArrayAttrBase<HC_ExprAttr,
-                       "array of `#hc.expr<...>` offsets">:$outs_offsets
+    TypedArrayAttrBase<
+        TypedArrayAttrBase<HC_ExprAttr, "per-axis `#hc.expr<...>` array">,
+        "array of per-operand per-axis `#hc.expr<...>` offset arrays"
+      >:$ins_offsets,
+    TypedArrayAttrBase<
+        TypedArrayAttrBase<HC_ExprAttr, "per-axis `#hc.expr<...>` array">,
+        "array of per-operand per-axis `#hc.expr<...>` offset arrays"
+      >:$outs_offsets
   );
   let results = (outs Variadic<HC_DecomposableShapedValueType>:$results);
   let regions = (region SizedRegion<1>:$body);

@@ -1038,7 +1038,7 @@ module {
     %r = hc.generic
         iter ()
         ins ()
-        outs (%c at (#hc.expr<"0">) : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c at [#hc.expr<"0">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f32, ["N"]>) {
     ^bb0(%cv: f32):
       hc.yield %cv : f32
@@ -1075,7 +1075,7 @@ module {
     %r = hc.generic
         iter (sequential i = %n : index)
         ins ()
-        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f32, ["N"]>) {
     ^bb0(%cv: f32):
       hc.yield %cv : f32
@@ -1088,22 +1088,24 @@ module {
 
 // Output offsets may reference parallel iters only — a reduction iter
 // would imply writing the same slot many times without specifying a
-// combinator, which the op does not model.
-// CHECK: error: 'hc.generic' op output #0 offset references reduction iter 'k'
+// combinator, which the op does not model. The diagnostic names the
+// offending axis on top of the operand index.
+// CHECK: error: 'hc.generic' op output #0 axis 1 offset references reduction iter 'k'
 module {
   func.func @bad(%m: index, %k: index,
                  %a: !hc.bare_tensor<f32, ["M"]>,
-                 %c: !hc.bare_tensor<f32, ["M*K"]>)
-      -> !hc.bare_tensor<f32, ["M*K"]> {
+                 %c: !hc.bare_tensor<f32, ["M", "K"]>)
+      -> !hc.bare_tensor<f32, ["M", "K"]> {
     %r = hc.generic
         iter (parallel i = %m : index, reduction k = %k : index)
-        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>)
-        outs (%c at (#hc.expr<"k + K*i">) : !hc.bare_tensor<f32, ["M*K"]>)
-        -> (!hc.bare_tensor<f32, ["M*K"]>) {
+        ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
+        outs (%c at [#hc.expr<"i">, #hc.expr<"k">]
+                 : !hc.bare_tensor<f32, ["M", "K"]>)
+        -> (!hc.bare_tensor<f32, ["M", "K"]>) {
     ^bb0(%av: f32, %cv: f32):
       hc.yield %cv : f32
     }
-    return %r : !hc.bare_tensor<f32, ["M*K"]>
+    return %r : !hc.bare_tensor<f32, ["M", "K"]>
   }
 }
 
@@ -1118,7 +1120,7 @@ module {
     %r = hc.generic
         iter (parallel i = %m : index, parallel i = %n : index)
         ins ()
-        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M*N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M*N"]>)
         -> (!hc.bare_tensor<f32, ["M*N"]>) {
     ^bb0(%cv: f32):
       hc.yield %cv : f32
@@ -1138,8 +1140,8 @@ module {
       -> !hc.bare_tensor<f32, ["N"]> {
     %r = hc.generic
         iter (parallel i = %n : index)
-        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
-        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f32, ["N"]>) {
     ^bb0(%cv: f32):
       hc.yield %cv : f32
@@ -1161,8 +1163,8 @@ module {
       -> !hc.bare_tensor<f32, ["N"]> {
     %r = hc.generic
         iter (parallel i = %n : index)
-        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f16, ["N"]>)
-        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f16, ["N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f32, ["N"]>) {
     ^bb0(%av: f32, %cv: f32):
       hc.yield %cv : f32
@@ -1184,8 +1186,8 @@ module {
     %r:2 = hc.generic
         iter (parallel i = %n : index)
         ins ()
-        outs (%c0 at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>,
-              %c1 at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c0 at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>,
+              %c1 at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>) {
     ^bb0(%c0v: f32, %c1v: f32):
       hc.yield %c0v : f32
@@ -1205,11 +1207,56 @@ module {
     %r = hc.generic
         iter (parallel i = %n : index)
         ins ()
-        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
         -> (!hc.bare_tensor<f16, ["N"]>) {
     ^bb0(%cv: f32):
       hc.yield %cv : f32
     }
     return %r : !hc.bare_tensor<f16, ["N"]>
+  }
+}
+
+// -----
+
+// Per-axis offset array length must equal the operand's rank. Two axis
+// entries on a 1D operand is the most likely surface mistake when callers
+// haven't yet reduced an nD layout via flatten.
+// CHECK: error: 'hc.generic' op outs #0 offset has 2 axis entries, operand rank is 1
+module {
+  func.func @bad(%n: index, %c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%c at [#hc.expr<"i">, #hc.expr<"0">]
+                 : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Same rank check on the input side, with a single axis count where two
+// were expected on a 2D operand.
+// CHECK: error: 'hc.generic' op ins #0 offset has 1 axis entry, operand rank is 2
+module {
+  func.func @bad(%m: index, %n: index,
+                 %a: !hc.bare_tensor<f32, ["M", "N"]>,
+                 %c: !hc.bare_tensor<f32, ["M"]>)
+      -> !hc.bare_tensor<f32, ["M"]> {
+    %r = hc.generic
+        iter (parallel i = %m : index, reduction j = %n : index)
+        ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M", "N"]>)
+        outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
+        -> (!hc.bare_tensor<f32, ["M"]>) {
+    ^bb0(%av: f32, %cv: f32):
+      %s = hc.add %cv, %av : (f32, f32) -> f32
+      hc.yield %s : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["M"]>
   }
 }

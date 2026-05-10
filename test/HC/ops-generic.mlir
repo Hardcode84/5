@@ -5,11 +5,12 @@
 // Round-trip coverage for `hc.generic`. Verifier negatives live in
 // `verify-hc.mlir` next to the rest of the dialect's "wrong spelling" pins.
 //
-// Per-operand `#hc.expr<...>` offsets sit inside parens (`at (#...)`) so
-// the parser's generic dialect-attr path doesn't eat the literal `:`
-// separator that introduces the operand type — same trick `hc.as_layout`
-// uses for its structured layout payload. The expression text below
-// matches ixsimpl's canonical form so the round-trip stays text-stable.
+// Per-operand offsets ride inside `[...]` — one `#hc.expr<...>` entry per
+// operand axis, length equal to the operand's rank. The bracket terminator
+// shields the trailing `: type` annotation from the generic dialect-attr
+// path, which would otherwise consume the `:` as part of the attribute.
+// Expression text below matches ixsimpl's canonical form so the round-trip
+// stays text-stable.
 //
 // RUN: hc-opt %s | hc-opt | FileCheck %s
 
@@ -18,8 +19,8 @@
 // CHECK-LABEL: func.func @elementwise_add
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index)
-// CHECK-SAME: ins (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
 // CHECK-SAME: -> (!hc.bare_tensor<f32, ["N"]>)
 // CHECK: ^bb0(%[[A:.+]]: f32, %[[C:.+]]: f32):
 // CHECK:   %[[S:.+]] = hc.add %[[C]], %[[A]] : (f32, f32) -> f32
@@ -30,8 +31,8 @@ func.func @elementwise_add(%n: index,
     -> !hc.bare_tensor<f32, ["N"]> {
   %r = hc.generic
       iter (parallel i = %n : index)
-      ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
-      outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+      ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
       -> (!hc.bare_tensor<f32, ["N"]>) {
   ^bb0(%av: f32, %cv: f32):
     %s = hc.add %cv, %av : (f32, f32) -> f32
@@ -40,29 +41,33 @@ func.func @elementwise_add(%n: index,
   return %r : !hc.bare_tensor<f32, ["N"]>
 }
 
-// Matmul-flavoured: two parallel + one reduction iter, two inputs, one
-// output. Output offset references only parallel iters; the reduction
-// iter `k` only appears in the input offsets.
+// nD matmul: 2D inputs and output with one per-axis `#hc.expr` entry per
+// operand axis. The reduction iter `k` only appears in the input axes;
+// outputs reference parallel iters only. This is the canonical pre-flatten
+// form of a matmul-shaped contraction.
 // CHECK-LABEL: func.func @matmul_like
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index, parallel j = %{{[^ ]+}} : index, reduction k = %{{[^ ]+}} : index)
-// CHECK-SAME: ins (%{{[^ ]+}} at (#hc.expr<"k + K*i">) : !hc.bare_tensor<f16, ["K*M"]>,
-// CHECK-SAME:      %{{[^ ]+}} at (#hc.expr<"j + N*k">) : !hc.bare_tensor<f16, ["K*N"]>)
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"j + N*i">) : !hc.bare_tensor<f32, ["M*N"]>)
-// CHECK-SAME: -> (!hc.bare_tensor<f32, ["M*N"]>)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">, #hc.expr<"k">] : !hc.bare_tensor<f16, ["M", "K"]>,
+// CHECK-SAME:      %{{[^ ]+}} at [#hc.expr<"k">, #hc.expr<"j">] : !hc.bare_tensor<f16, ["K", "N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M", "N"]>)
+// CHECK-SAME: -> (!hc.bare_tensor<f32, ["M", "N"]>)
 func.func @matmul_like(%m: index, %n: index, %k: index,
-                       %a: !hc.bare_tensor<f16, ["K*M"]>,
-                       %b: !hc.bare_tensor<f16, ["K*N"]>,
-                       %c: !hc.bare_tensor<f32, ["M*N"]>)
-    -> !hc.bare_tensor<f32, ["M*N"]> {
+                       %a: !hc.bare_tensor<f16, ["M", "K"]>,
+                       %b: !hc.bare_tensor<f16, ["K", "N"]>,
+                       %c: !hc.bare_tensor<f32, ["M", "N"]>)
+    -> !hc.bare_tensor<f32, ["M", "N"]> {
   %r = hc.generic
       iter (parallel i = %m : index,
             parallel j = %n : index,
             reduction k = %k : index)
-      ins (%a at (#hc.expr<"k + K*i">) : !hc.bare_tensor<f16, ["K*M"]>,
-           %b at (#hc.expr<"j + N*k">) : !hc.bare_tensor<f16, ["K*N"]>)
-      outs (%c at (#hc.expr<"j + N*i">) : !hc.bare_tensor<f32, ["M*N"]>)
-      -> (!hc.bare_tensor<f32, ["M*N"]>) {
+      ins (%a at [#hc.expr<"i">, #hc.expr<"k">]
+              : !hc.bare_tensor<f16, ["M", "K"]>,
+           %b at [#hc.expr<"k">, #hc.expr<"j">]
+              : !hc.bare_tensor<f16, ["K", "N"]>)
+      outs (%c at [#hc.expr<"i">, #hc.expr<"j">]
+               : !hc.bare_tensor<f32, ["M", "N"]>)
+      -> (!hc.bare_tensor<f32, ["M", "N"]>) {
   ^bb0(%av: f16, %bv: f16, %cv: f32):
     %ae = hc.astype %av, target = f32 : f16 -> f32
     %be = hc.astype %bv, target = f32 : f16 -> f32
@@ -70,28 +75,30 @@ func.func @matmul_like(%m: index, %n: index, %k: index,
     %s = hc.add %cv, %p : (f32, f32) -> f32
     hc.yield %s : f32
   }
-  return %r : !hc.bare_tensor<f32, ["M*N"]>
+  return %r : !hc.bare_tensor<f32, ["M", "N"]>
 }
 
-// Multiple outputs (softmax-style: tracking running max + running sum).
-// Each output gets its own offset and its own block-arg/yield slot.
+// Mixed ranks across operands (2D input, 1D outputs) and multiple outputs:
+// each output gets its own per-axis offset array and its own block-arg /
+// yield slot. Models a per-row (running max, running sum) sweep.
 // CHECK-LABEL: func.func @two_outputs
 // CHECK: %{{.+}}:2 = hc.generic
 // CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index, reduction j = %{{[^ ]+}} : index)
-// CHECK-SAME: ins (%{{[^ ]+}} at (#hc.expr<"j + N*i">) : !hc.bare_tensor<f32, ["M*N"]>)
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>,
-// CHECK-SAME:       %{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M", "N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>,
+// CHECK-SAME:       %{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
 // CHECK-SAME: -> (!hc.bare_tensor<f32, ["M"]>, !hc.bare_tensor<f32, ["M"]>)
 func.func @two_outputs(%m: index, %n: index,
-                       %x: !hc.bare_tensor<f32, ["M*N"]>,
+                       %x: !hc.bare_tensor<f32, ["M", "N"]>,
                        %mx: !hc.bare_tensor<f32, ["M"]>,
                        %sm: !hc.bare_tensor<f32, ["M"]>)
     -> (!hc.bare_tensor<f32, ["M"]>, !hc.bare_tensor<f32, ["M"]>) {
   %r:2 = hc.generic
       iter (parallel i = %m : index, reduction j = %n : index)
-      ins (%x at (#hc.expr<"j + N*i">) : !hc.bare_tensor<f32, ["M*N"]>)
-      outs (%mx at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>,
-            %sm at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>)
+      ins (%x at [#hc.expr<"i">, #hc.expr<"j">]
+              : !hc.bare_tensor<f32, ["M", "N"]>)
+      outs (%mx at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>,
+            %sm at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
       -> (!hc.bare_tensor<f32, ["M"]>, !hc.bare_tensor<f32, ["M"]>) {
   ^bb0(%xv: f32, %mxv: f32, %smv: f32):
     %nm = hc.add %mxv, %xv : (f32, f32) -> f32
@@ -108,14 +115,14 @@ func.func @two_outputs(%m: index, %n: index,
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index)
 // CHECK-SAME: ins ()
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
 func.func @fill_only(%n: index, %dst: !hc.bare_tensor<f32, ["N"]>)
     -> !hc.bare_tensor<f32, ["N"]> {
   %z = hc.const<0.0 : f32> : f32
   %r = hc.generic
       iter (parallel i = %n : index)
       ins ()
-      outs (%dst at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
       -> (!hc.bare_tensor<f32, ["N"]>) {
   ^bb0(%dv: f32):
     hc.yield %z : f32
@@ -127,16 +134,16 @@ func.func @fill_only(%n: index, %dst: !hc.bare_tensor<f32, ["N"]>)
 // constraint chaining.
 // CHECK-LABEL: func.func @vector_operands
 // CHECK: hc.generic
-// CHECK-SAME: ins (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_vector<f32, ["N"]>)
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.bare_vector<f32, ["N"]>)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_vector<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_vector<f32, ["N"]>)
 func.func @vector_operands(%n: index,
                            %a: !hc.bare_vector<f32, ["N"]>,
                            %c: !hc.bare_vector<f32, ["N"]>)
     -> !hc.bare_vector<f32, ["N"]> {
   %r = hc.generic
       iter (parallel i = %n : index)
-      ins (%a at (#hc.expr<"i">) : !hc.bare_vector<f32, ["N"]>)
-      outs (%c at (#hc.expr<"i">) : !hc.bare_vector<f32, ["N"]>)
+      ins (%a at [#hc.expr<"i">] : !hc.bare_vector<f32, ["N"]>)
+      outs (%c at [#hc.expr<"i">] : !hc.bare_vector<f32, ["N"]>)
       -> (!hc.bare_vector<f32, ["N"]>) {
   ^bb0(%av: f32, %cv: f32):
     %s = hc.add %cv, %av : (f32, f32) -> f32
@@ -145,19 +152,20 @@ func.func @vector_operands(%n: index,
   return %r : !hc.bare_vector<f32, ["N"]>
 }
 
-// Pre-inference flavour: `!hc.undef` operand types and block args round-
-// trip without engaging the parity check, so the frontend can emit the
-// op before type inference fills in the carrier types.
+// Pre-inference flavour: `!hc.undef` operand types escape both the
+// element-type parity check and the per-axis rank check, so the frontend
+// can emit the op before type inference fills in the carrier types.
+// Empty `[]` axis array doubles as the "no rank yet" placeholder.
 // CHECK-LABEL: func.func @progressive_undef
 // CHECK: hc.generic
-// CHECK-SAME: ins (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.undef)
-// CHECK-SAME: outs (%{{[^ ]+}} at (#hc.expr<"i">) : !hc.undef)
+// CHECK-SAME: ins (%{{[^ ]+}} at [] : !hc.undef)
+// CHECK-SAME: outs (%{{[^ ]+}} at [] : !hc.undef)
 func.func @progressive_undef(%n: index, %a: !hc.undef, %c: !hc.undef)
     -> !hc.undef {
   %r = hc.generic
       iter (parallel i = %n : index)
-      ins (%a at (#hc.expr<"i">) : !hc.undef)
-      outs (%c at (#hc.expr<"i">) : !hc.undef)
+      ins (%a at [] : !hc.undef)
+      outs (%c at [] : !hc.undef)
       -> (!hc.undef) {
   ^bb0(%av: !hc.undef, %cv: !hc.undef):
     hc.yield %cv : !hc.undef

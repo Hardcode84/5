@@ -285,7 +285,18 @@ postcondition).
 
 ## `hc.generic`
 
+`hc.generic` is the **universal compute surface** in HC: every
+shaped op (elementwise arith, fills, contractions, reductions,
+loads, stores) eventually lowers into a single `hc.generic` body.
+The op subsumes both `linalg.generic`'s tensor and memref regimes
+on the same op, with one twist — `outs` may **freely mix** value
+and ptr/buffer entries in the same op, so a fused
+"compute-and-spill" lands as one loop nest instead of two.
+
+Two forms share the surface:
+
 ```mlir
+// value form: outs are shaped values, op produces SSA results.
 %out = hc.generic
     iter_syms   = ["i", "j", "k"]
     iter_bounds = [%m, %n, %kn]
@@ -295,12 +306,42 @@ postcondition).
           %b : !hc.bare_tensor<f16, [%kn, %n]>
               at [#hc.expr<"k">, #hc.expr<"j">])
     outs (%c : !hc.bare_tensor<f32, [%m, %n]>
-              at [#hc.expr<"i">, #hc.expr<"j">]) {
+              at [#hc.expr<"i">, #hc.expr<"j">])
+    -> (!hc.bare_tensor<f32, [%m, %n]>) {
   ^bb0(%av: f16, %bv: f16, %cv: f32):
     %p  = arith.mulf %av, %bv : f16
     %pe = arith.extf %p : f16 to f32
     %s  = arith.addf %cv, %pe : f32
     hc.yield %s : f32
+}
+
+// in-place form: outs are ptr/buffer, op produces no SSA result and
+// carries MemWrite. Body-arg for the destination sources via an
+// implicit hc.ptr_load at the iteration's offset (same outs-as-init
+// semantics as the value form), the yield routes through an implicit
+// hc.ptr_store.
+hc.generic
+    iter_syms   = ["i"]
+    iter_bounds = [%n]
+    iter_kinds  = ["parallel"]
+    ins  (%src : !hc.bare_tensor<f32, [%n]> at [#hc.expr<"i">])
+    outs (%dst : !hc.ptr<global, f32>       at [#hc.expr<"i">]) {
+  ^bb0(%sv: f32, %dv: f32):
+    hc.yield %sv : f32
+}
+
+// mixed: produce a result tensor *and* spill a debug trace into LDS.
+%out = hc.generic
+    iter_syms   = ["i"]
+    iter_bounds = [%n]
+    iter_kinds  = ["parallel"]
+    ins  (%a : !hc.bare_tensor<f32, [%n]> at [#hc.expr<"i">])
+    outs (%c : !hc.bare_tensor<f32, [%n]> at [#hc.expr<"i">],
+          %trace : !hc.ptr<workgroup, f32> at [#hc.expr<"i">])
+    -> (!hc.bare_tensor<f32, [%n]>) {
+  ^bb0(%av: f32, %cv: f32, %tv: f32):
+    %r = arith.mulf %av, %av : f32
+    hc.yield %r, %r : f32, f32
 }
 ```
 
@@ -337,10 +378,33 @@ in the pipeline:
   The body's `hc.yield` produces the next value, which becomes the
   output's value at the parallel index. For reduction iters this is
   the carried accumulator; for pure-parallel ops the `cv` arg is
-  unused. Caller pre-fills outs with the reduction identity
-  (`hc.zeros`, `hc.full`) before the op.
+  unused. Caller pre-fills value-typed outs with the reduction
+  identity (`hc.zeros`, `hc.full`) before the op. Ptr/buffer-typed
+  outs source the carry via an implicit `hc.ptr_load` at the
+  iteration's offset, so the destination's existing memory is the
+  reduction init — same shape as `linalg.generic` over a memref dest.
 * **multiple outputs** are allowed and share the iteration space — fused
   reductions (sum + count for mean, max + argmax) become one op.
+* **polymorphic outs (value + ptr/buffer, mixed allowed).** Any subset
+  of `outs` may be ptr/buffer-typed (`!hc.ptr<...>` /
+  `!hc.bare_*<...>`); the rest stay value-typed. This subsumes
+  `linalg.generic`'s tensor/memref split into one op:
+  - **result count** equals the number of *value-typed* outs, in
+    declaration order. A pure-store generic (all-ptr outs) produces
+    zero results; a mixed generic produces a result for each
+    value-typed slot.
+  - **memory effects** are per-operand: every ptr/buffer in `ins`
+    contributes `MemoryEffects::Read` on its operand value;
+    every ptr/buffer in `outs` contributes `Read+Write` (the read
+    is for the carry). Value-typed outs contribute nothing — the op
+    is then pure on those slots.
+  - **body block args** still come `ins ++ outs` in declaration
+    order, one element-typed arg per operand regardless of operand
+    flavor (value or ptr/buffer).
+  - **`hc.yield`** produces exactly `outs.size()` values, type-matched
+    to each output's element type. The lowering routes value-typed
+    yields into the SSA result and ptr-typed yields into an implicit
+    `hc.ptr_store` at the operand's offset.
 
 Verifier rules:
 
@@ -350,15 +414,20 @@ Verifier rules:
   diagnostic names the offending iter and offset.
 * body block arg arity is `ins.size() + outs.size()`; the trailing
   `outs.size()` args are the carried output values, in declaration
-  order.
-* `hc.yield` produces exactly `outs.size()` values, type-matched to the
-  output element types.
+  order. Element type per arg = element type of the operand
+  (value-typed: the operand's element type; ptr-typed: the pointee
+  type).
+* `hc.yield` produces exactly `outs.size()` values, type-matched to
+  each output's element type.
+* result types match the value-typed outs in declaration order; the
+  ptr/buffer outs contribute no SSA result. A generic with no
+  value-typed outs produces zero results.
 
-This op is the single home for compute after flatten:
+This op is the single home for compute end-to-end:
 
 * the existing per-element decomposition of `hc.add`, `hc.mul`, ... on
   bare values lowers into a single `hc.generic` with all-parallel
-  iters;
+  iters and value-typed outs;
 * `hc.reduce` rewrites into `hc.generic` with one reduction iter and
   the appropriate identity fill on the output (`hc-shaped-compute-
   to-generic`);
@@ -366,10 +435,18 @@ This op is the single home for compute after flatten:
   one reduction iter on the K axis, plus an identity fill (`hc-
   shaped-compute-to-generic`); shape comes from the operand types
   directly, not from inference;
-* the cooperative copy helper becomes `hc.generic` with two different
-  offset expressions on input and output, all parallel iters;
+* `hc.load` / `hc.vload` rewrite into `hc.generic` with a ptr/buffer
+  input and a value-typed out of the loaded shape (all-parallel
+  iters, body forwards the loaded element);
+* `hc.store` rewrites into `hc.generic` with a value-typed input and
+  a ptr/buffer out (all-parallel iters, no SSA result, body
+  forwards the input element through `hc.yield`);
+* the cooperative copy helper becomes `hc.generic` with one
+  ptr/buffer input and one ptr/buffer output, all parallel iters;
 * `as_layout` reorderings — when they survive flatten — also become
-  `hc.generic` between two offset expressions.
+  `hc.generic` between two offset expressions;
+* fused compute-and-spill (e.g. matmul + LDS trace, GEMM + bias write)
+  lands as a single mixed-outs `hc.generic` instead of two ops.
 
 Mask handling stays out of v1: masks ride as ordinary bare-pred tensor
 inputs that the body inspects with `scf.if`. A typed mask slot on the
@@ -527,19 +604,41 @@ on later slices.
     `hc.astype`-promoted body), reduce sum on float / integer, and
     reduce max / min on float; integer max / min, `keepdims = true`,
     and rank-0 result are deferred follow-ups.
-12. **scalar `hc-lower-generic`** — lower `hc.generic` to a scalar
-    `scf.for` nest only. No vectorization yet. The per-element
-    decomposition of `hc.add` / `hc.mul` / ... on bare values
-    collapses onto this op alongside everything `hc-shaped-compute-
-    to-generic` already produced.
-13. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
+12. **`hc.generic` polymorphic outs** — extend the op so `outs` may
+    mix value and ptr/buffer entries. `MemoryEffectsOpInterface`
+    derives Read/Write per ptr-typed operand; result count tracks
+    value-typed outs only; body block-arg element types come from the
+    operand's element type or pointee type. Verifier updates and
+    round-trip LIT only — no rewriters or lowering changes here.
+13. **`hc-elementwise-to-generic`** — rewrite the per-element
+    decomposed family (`hc.add`, `hc.sub`, `hc.mul`, `hc.div`,
+    `hc.cmp`, `hc.select`, `hc.astype`, `hc.zeros`, `hc.full`, ...)
+    into a single `hc.generic` with all-parallel iters and value-typed
+    outs. Pure source-level rewrite; runs pre-flatten so per-axis
+    offsets are identity over the operand shape.
+14. **`hc-load-to-generic` / `hc-store-to-generic`** — rewrite
+    `hc.load` / `hc.vload` into `hc.generic` with a ptr/buffer in and
+    a value-typed out, and `hc.store` into `hc.generic` with a
+    value-typed in and a ptr/buffer out. Picks up the multi-index
+    offset arrays the per-access materialization slice
+    (`hc-flatten-with-layouts` follow-up) feeds it. Cooperative
+    copy helpers fold into a single ptr-in / ptr-out generic.
+15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
+    forms: value-out, ptr-out, mixed) to a scalar `scf.for` nest
+    only. No vectorization yet. Implicit `hc.ptr_load` for the
+    ptr-out carry and implicit `hc.ptr_store` on the yield.
+16. **retire per-op lowering paths** — once every shaped op funnels
+    into `hc.generic`, drop the dedicated lowering paths in
+    `hc-lower-launch-body` and the bare-value decomposition machinery
+    that fed them. Single codegen surface from this slice forward.
+17. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
     wholesale replacement of the cooperative-load/store machinery;
     memref drops out. WMMA still on its existing intrinsic path.
-14. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
+18. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
     runs end-to-end on the new stack.
-15. **symbolic stride vectorization** — same `hc-lower-generic`,
+19. **symbolic stride vectorization** — same `hc-lower-generic`,
     smarter codegen. The actual win.
 
 Slices 1–5 are pure additive (no observable behavior change beyond the
-strided buffer ABI, which preserves contiguous numerics). Slices 6–14
-are the risky middle. Slice 15 is what the design exists for.
+strided buffer ABI, which preserves contiguous numerics). Slices 6–18
+are the risky middle. Slice 19 is what the design exists for.

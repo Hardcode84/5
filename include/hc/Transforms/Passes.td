@@ -313,6 +313,80 @@ def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerGeneric : Pass<"hc-lower-generic"> {
+  let summary = "Lower hc.generic to scf.parallel / scf.for + hc.ptr_offset / "
+                "hc.ptr_load / hc.ptr_store.";
+  let description = [{
+    Scalar baseline (`U = 1`) of the unroll-and-merge codegen frame
+    documented in `doc/layouts.md`. Walks every `hc.generic` and
+    rewrites it as an outer `scf.parallel` over the parallel iters
+    plus an inner `scf.for` nest over the reduction iters with
+    `iter_args` carrying the per-output accumulators. Pure-parallel
+    ops collapse to a single `scf.parallel`; pure-reduction ops
+    collapse to a single `scf.for`.
+
+    Per-iteration body emission:
+
+      * For each `ins` operand: evaluate its single composed offset
+        expression to a `Value` of `index` type, emit
+        `hc.ptr_offset` then `hc.ptr_load`. The loaded value
+        replaces the corresponding body block argument.
+      * For each `outs` operand: load the initial accumulator once
+        per parallel-loop iteration via `hc.ptr_offset` +
+        `hc.ptr_load` at the operand's parallel-only offset, thread
+        it through the inner `scf.for`'s `iter_args`, and emit
+        `hc.ptr_store` after the reduction nest with the final
+        accumulator.
+      * Body region is cloned in place with the block arguments
+        remapped to the loaded values (ins) and the running carry
+        (outs). The cloned `hc.yield` provides the per-iteration
+        update for each output's accumulator.
+
+    Symbolic offsets lower through a structural ixsimpl walker:
+    `IXS_INT` / `IXS_RAT` (denominator 1) → `arith.constant`,
+    `IXS_SYM` → loop-scope lookup (iter sym → induction var, or
+    outer-scope sym → matching `!hc.idx<bare-sym>` SSA value),
+    `IXS_ADD` / `IXS_MUL` → `arith.addi` / `arith.muli`,
+    `IXS_MOD` → `arith.remsi`. Other tags (`IXS_FLOOR`, `IXS_CEIL`,
+    `IXS_PIECEWISE`, `IXS_MAX`, `IXS_MIN`) are not lowered in v0;
+    expressions containing them keep the `hc.generic` op around for
+    follow-up slices to handle.
+
+    `U = 1` scope — the unroll-and-merge partition search lives in
+    the vec slice (`hc-lower-generic` at `U > 1`), this commit pins
+    `p = (1, ..., 1)`. No partition enumeration, no merge probing,
+    no vector-typed loads/stores — every `hc.ptr_load` /
+    `hc.ptr_store` this pass emits is scalar.
+
+    Pre-flight bail (the op stays in place; downstream passes still
+    diagnose if the op is the only remaining consumer):
+
+      * Any operand is not `!hc.ptr<...>` — value-typed bare
+        carriers (`!hc.bare_tensor`, `!hc.bare_vector`),
+        `!hc.buffer`, and `!hc.undef` are out of v0 scope.
+      * Any operand has rank > 1 in its offset array — multi-axis
+        offsets need linearization through the operand's shape,
+        which in turn needs outer-scope shape-symbol bindings the
+        v0 walker doesn't reach to in every case. Handled when
+        `hc-flatten-with-layouts` lands and every op-time operand
+        is rank-1.
+      * Any iter bound is still a `hc.undef_value` placeholder.
+      * Any offset references a free symbol the outer-scope walker
+        can't resolve — the lookup walks parent ops looking for a
+        block argument or op result whose type is `!hc.idx<sym>`
+        with `sym` a bare-symbol expression matching the free name.
+      * `scf.if` anywhere in the body — residual case from the
+        predicated-bodies note in `doc/layouts.md`; rare in
+        practice once masked load/store sites route through the
+        predicated `hc.ptr_load_pred` / `hc.ptr_store_pred` ops.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
   let summary = "Type-only flatten: every shaped value becomes 1D, "
                 "no #hc.layout slot survives.";

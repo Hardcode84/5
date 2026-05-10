@@ -21,9 +21,13 @@
 // on dedicated hc ops (vec, astype, with_inactive, store).
 
 // CHECK-LABEL: hc.kernel @basic
-// CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>, %arg1: !hc.buffer<!hc.undef, ["M"]>, %arg2: !hc.buffer<!hc.undef, ["M"]>)
+// Buffer args carry the default fully-strided layout from the frontend
+// boundary on (slice 3 in `doc/layouts.md`): per-axis `$STRIDE_<i>_<argname>`
+// symbols pinned in `bound_symbols` so the host wrapper can bind them
+// against the `_mlir_ciface_hc_get_stride` runtime helper at launch.
+// CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>, %arg1: !hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0">>>, %arg2: !hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0">>>)
 // CHECK-SAME: attributes {
-// CHECK-SAME: bound_symbols = ["$WG0", "$WI0", "$SG0", "$WGS0", "$WO0", "$WS0", "$GSZ0", "$WV0", "M"]
+// CHECK-SAME: bound_symbols = ["$WG0", "$WI0", "$SG0", "$WGS0", "$WO0", "$WS0", "$GSZ0", "$WV0", "M", "$STRIDE_0_a", "$STRIDE_0_b"]
 // CHECK-SAME: group_shape = #hc.shape<["32"]>
 // CHECK-SAME: literals = ["TILE"]
 // CHECK-SAME: subgroup_size = 32 : i32
@@ -44,7 +48,7 @@ module {
     subgroup_size = 32 : i32,
     work_shape = ["M"]
   } {
-    // CHECK: %[[D:.*]] = hc.buffer_dim %arg1, axis = 0 : !hc.buffer<!hc.undef, ["M"]>
+    // CHECK: %[[D:.*]] = hc.buffer_dim %arg1, axis = 0 : !hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0">>>
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %axis = hc_front.constant<0 : i64>
@@ -79,13 +83,13 @@ module {
       %range_fn = hc_front.name "range" {ctx = "load", ref = {builtin = "range", kind = "builtin"}}
       %range_call = hc_front.call %range_fn(%lo, %hi, %st)
     } do {
-      // CHECK: hc.buffer_view %arg1[%{{.*}}] : (!hc.buffer<!hc.undef, ["M"]>, !hc.undef) -> !hc.undef
+      // CHECK: hc.buffer_view %arg1[%{{.*}}] : (!hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0">>>, !hc.undef) -> !hc.undef
       %iv = hc_front.name "i" {ctx = "load", ref = {kind = "iv"}}
       %a_ref = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
       %load = hc_front.subscript %a_ref[%iv]
       // CHECK: hc.const<2 : i64> : !hc.undef
       %c2 = hc_front.constant<2 : i64>
-      // CHECK: hc.store %arg2[%{{.*}}], %{{.*}} : (!hc.buffer<!hc.undef, ["M"]>, !hc.undef, !hc.undef) -> ()
+      // CHECK: hc.store %arg2[%{{.*}}], %{{.*}} : (!hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0">>>, !hc.undef, !hc.undef) -> ()
       %b_ref = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
       %b_idx = hc_front.target_subscript %b_ref[%iv]
       hc_front.assign %b_idx = %c2
@@ -250,7 +254,7 @@ module {
   }
 
   // CHECK-LABEL: hc.kernel @typed_buffer_param
-  // CHECK-SAME: (%{{.*}}: !hc.buffer<f32, ["M"]>)
+  // CHECK-SAME: (%{{.*}}: !hc.buffer<f32, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_x*i0">>>)
   hc_front.kernel "typed_buffer_param" attributes {
     parameters = [
       {dtype = "float32", kind = "buffer", name = "x", shape = ["M"]}
@@ -421,7 +425,10 @@ module {
   }
 
   // CHECK-LABEL: hc.kernel @zero_rank_buffer_param
-  // CHECK-SAME: (%{{.*}}: !hc.buffer<!hc.undef, []>)
+  // Rank-0 buffers still get the layout slot: empty shape_syms /
+  // index_syms, literal `0` offset and storage_size — the structural
+  // shell stays uniform across ranks.
+  // CHECK-SAME: (%{{.*}}: !hc.buffer<!hc.undef, [], <shape_syms = [], index_syms = [], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"0">>>)
   hc_front.kernel "zero_rank_buffer_param" attributes {
     parameters = [
       {annotation = "Buffer[()]", kind = "buffer", name = "cell", shape = []}

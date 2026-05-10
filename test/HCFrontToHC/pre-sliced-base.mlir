@@ -96,7 +96,7 @@ module {
   } {
     // CHECK: %[[ROW:.*]] = hc.slice_expr
     // CHECK: %[[COL:.*]] = hc.slice_expr
-    // CHECK: hc.store %arg1[%[[ROW]], %[[COL]]], %{{.*}} : (!hc.buffer<!hc.undef, ["M", "K"]>, !hc.undef, !hc.undef, !hc.undef) -> ()
+    // CHECK: hc.store %arg1[%[[ROW]], %[[COL]]], %{{.*}} : (!hc.buffer<!hc.undef, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>, !hc.undef, !hc.undef, !hc.undef) -> ()
     %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
     %c = hc_front.name "c" {ctx = "load", ref = {kind = "param"}}
     %tile = hc_front.name "tile" {ctx = "load", ref = {kind = "param"}}

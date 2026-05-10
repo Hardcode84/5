@@ -9,9 +9,13 @@
 // CHECK-LABEL: hc.kernel @tiled_gfx11_wmma_matmul
 // CHECK: %[[LOOP:.*]]:6 = hc.for_range
 // CHECK-SAME: -> (!hc.bare_tensor<f16, ["16", "16"]>, !hc.bare_tensor<!hc.pred, ["16", "16"]>, !hc.bare_tensor<f16, ["16", "16"]>, !hc.bare_tensor<!hc.pred, ["16", "16"]>, !hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>)
-// CHECK: hc.load_mask %{{.*}} : (!hc.buffer<f16, ["M", "K"]>
+// Frontend pins the default fully-strided np/torch layout on every
+// buffer arg; per-axis stride symbols (`$STRIDE_<i>_<argname>`) are
+// namespaced by the parameter so two same-shape buffers don't share
+// strides at the boundary.
+// CHECK: hc.load_mask %{{.*}} : (!hc.buffer<f16, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>>
 // CHECK-SAME: -> !hc.bare_tensor<!hc.pred, ["16", "16"]>
-// CHECK: hc.load_mask %{{.*}} : (!hc.buffer<f16, ["K", "N"]>
+// CHECK: hc.load_mask %{{.*}} : (!hc.buffer<f16, ["K", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0 + $STRIDE_1_b*i1">>>
 // CHECK-SAME: -> !hc.bare_tensor<!hc.pred, ["16", "16"]>
 // CHECK: hc.select
 // CHECK-SAME: (!hc.bare_vector<!hc.pred, ["16"]>, !hc.bare_vector<f16, ["16"]>, f16) -> !hc.bare_vector<f16, ["16"]>

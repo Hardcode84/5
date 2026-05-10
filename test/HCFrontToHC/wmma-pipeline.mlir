@@ -13,8 +13,14 @@
 
 // CHECK: module {
 // CHECK-NEXT: hc.kernel @tiled_gfx11_wmma_matmul
-// CHECK-SAME: (%[[GROUP:arg[0-9]+]]: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %[[A:arg[0-9]+]]: !hc.buffer<f16, ["M", "K"]>, %[[B:arg[0-9]+]]: !hc.buffer<f16, ["K", "N"]>, %[[C:arg[0-9]+]]: !hc.buffer<f32, ["M", "N"]>)
-// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1", "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1", "$GSZ0", "$WV0", "M", "K", "N"]
+// Buffer args carry the default fully-strided layout (slice 3 in
+// `doc/layouts.md`). Per-axis `$STRIDE_<i>_<argname>` symbols join
+// `bound_symbols` next to the shape symbols their owning arg
+// introduced — `M` / `K` are seen first via `a`, then `a`'s strides;
+// `N` next via `b`, then `b`'s strides; `c` only contributes new
+// strides because `M` / `N` are already bound.
+// CHECK-SAME: (%[[GROUP:arg[0-9]+]]: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %[[A:arg[0-9]+]]: !hc.buffer<f16, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>>, %[[B:arg[0-9]+]]: !hc.buffer<f16, ["K", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0 + $STRIDE_1_b*i1">>>, %[[C:arg[0-9]+]]: !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>)
+// CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1", "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1", "$GSZ0", "$WV0", "M", "K", "$STRIDE_0_a", "$STRIDE_1_a", "N", "$STRIDE_0_b", "$STRIDE_1_b", "$STRIDE_0_c", "$STRIDE_1_c"]
 // CHECK-SAME: group_shape = #hc.shape<["32", "1"]>
 // CHECK-SAME: subgroup_size = 32 : i32
 // CHECK-SAME: work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>
@@ -27,18 +33,18 @@
 // per-element output-validity mask onto the seed accumulator at
 // construction time -- see the bounds-aware accumulator notes in the
 // example kernel.
-// CHECK: %[[ACC0:[^ ]+]] = hc.call @init_wmma_acc(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]]) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef) -> !hc.undef
-// CHECK: %[[AK:[^ ]+]] = hc.buffer_dim %[[A]], axis = 1 : !hc.buffer<f16, ["M", "K"]> -> !hc.undef
+// CHECK: %[[ACC0:[^ ]+]] = hc.call @init_wmma_acc(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]]) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>, !hc.undef, !hc.undef) -> !hc.undef
+// CHECK: %[[AK:[^ ]+]] = hc.buffer_dim %[[A]], axis = 1 : !hc.buffer<f16, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>> -> !hc.undef
 // CHECK: %[[ACC_FINAL:[^ ]+]]:3 = hc.for_range {{.*}} to %[[AK]] step {{.*}} iter_args({{.*}}, {{.*}}, %[[ACC0]]) : {{.*}} -> (!hc.undef, !hc.undef, !hc.undef) {
 // CHECK: ^bb0(%[[K0:arg[0-9]+]]: !hc.undef,
 // CHECK: %[[A_ROW:[^ ]+]] = hc.slice_expr
 // CHECK: %[[K_SLICE:[^ ]+]] = hc.slice_expr
-// CHECK: hc.load %[[A]][%[[A_ROW]], %[[K_SLICE]]], shape %{{.*}} : (!hc.buffer<f16, ["M", "K"]>, !hc.undef, !hc.undef, {{.*}}) -> !hc.undef
+// CHECK: hc.load %[[A]][%[[A_ROW]], %[[K_SLICE]]], shape %{{.*}} : (!hc.buffer<f16, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>>, !hc.undef, !hc.undef, {{.*}}) -> !hc.undef
 // CHECK: %[[B_COL:[^ ]+]] = hc.slice_expr
-// CHECK: hc.load %[[B]][%[[K_SLICE]], %[[B_COL]]], shape %{{.*}} : (!hc.buffer<f16, ["K", "N"]>, !hc.undef, !hc.undef, {{.*}}) -> !hc.undef
+// CHECK: hc.load %[[B]][%[[K_SLICE]], %[[B_COL]]], shape %{{.*}} : (!hc.buffer<f16, ["K", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0 + $STRIDE_1_b*i1">>>, !hc.undef, !hc.undef, {{.*}}) -> !hc.undef
 // CHECK: hc.call @issue_wmma_tile(%[[GROUP]], {{.*}}) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.undef, !hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.yield {{.*}} : !hc.undef, !hc.undef, !hc.undef
-// CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"]>, !hc.undef, !hc.undef, !hc.undef) -> ()
+// CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>, !hc.undef, !hc.undef, !hc.undef) -> ()
 
 // `init_wmma_acc` reads the per-lane output slice of `c` (`hc.vload` on a
 // strided `hc.buffer_view`) so the accumulator seed inherits the

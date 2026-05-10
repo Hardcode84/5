@@ -621,11 +621,52 @@ static void appendShapeBoundSymbols(MLIRContext *ctx, ShapeAttr shape,
     appendExprBoundSymbols(ctx, dyn_cast<ExprAttr>(dim), seen, symbols);
 }
 
+// Free symbols inside a `#hc.layout<...>` payload that are *not*
+// declared as layout-internal placeholders (`shape_syms`, `index_syms`,
+// `params` keys) need to join the kernel's `bound_symbols` so the host
+// wrapper / scope binder knows to materialize them at launch — for the
+// default fully-strided buffer layout that's exactly the per-axis
+// `$STRIDE_<N>_<argname>` symbols emitted in `parameterTypeFromDict`.
+static void appendLayoutBoundSymbols(MLIRContext *ctx, LayoutAttr layout,
+                                     llvm::StringSet<> &seen,
+                                     SmallVectorImpl<Attribute> &symbols) {
+  if (!layout)
+    return;
+  llvm::StringSet<> layoutLocals;
+  for (Attribute name : layout.getShapeSyms())
+    if (auto str = dyn_cast<StringAttr>(name))
+      layoutLocals.insert(str.getValue());
+  for (Attribute name : layout.getIndexSyms())
+    if (auto str = dyn_cast<StringAttr>(name))
+      layoutLocals.insert(str.getValue());
+  for (NamedAttribute kv : layout.getParams())
+    layoutLocals.insert(kv.getName().getValue());
+
+  auto walk = [&](ExprAttr expr) {
+    if (!expr)
+      return;
+    sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+      if (layoutLocals.contains(name))
+        return;
+      appendBoundSymbol(ctx, name, seen, symbols);
+    });
+  };
+
+  walk(layout.getStorageSize());
+  walk(layout.getOffset());
+  for (NamedAttribute kv : layout.getParams())
+    if (auto expr = dyn_cast<ExprAttr>(kv.getValue()))
+      walk(expr);
+}
+
 static void appendInputTypeBoundSymbols(MLIRContext *ctx, Type type,
                                         llvm::StringSet<> &seen,
                                         SmallVectorImpl<Attribute> &symbols) {
-  if (auto buffer = dyn_cast<BufferType>(type))
-    return appendShapeBoundSymbols(ctx, buffer.getShape(), seen, symbols);
+  if (auto buffer = dyn_cast<BufferType>(type)) {
+    appendShapeBoundSymbols(ctx, buffer.getShape(), seen, symbols);
+    appendLayoutBoundSymbols(ctx, buffer.getLayout(), seen, symbols);
+    return;
+  }
   if (auto idx = dyn_cast<IdxType>(type))
     return appendExprBoundSymbols(ctx, idx.getExpr(), seen, symbols);
   if (auto pred = dyn_cast<PredType>(type))
@@ -716,6 +757,105 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
   return success();
 }
 
+// Default fully-strided np/torch-style layout for a buffer kernel
+// argument. Names per-axis stride symbols `$STRIDE_<axis>_<argname>`
+// so the host wrapper / scope binder can match them against the
+// runtime descriptor (slice 5 in `doc/layouts.md` wires up the
+// `_mlir_ciface_hc_get_stride` plumbing). The structural form keeps
+// `shape_syms` / `index_syms` as opaque placeholders (`d<i>` / `i<i>`)
+// — the bound-name contract documented on `HC_LayoutAttr` only requires
+// them to be unique and disjoint from `params` keys; their identity is
+// substituted at the use site by `doc/layouts.md`'s flatten pass.
+//
+// `storage_size` is informational for buffer layouts (the host owns the
+// allocation; the verifier doesn't enforce `storage_size >= max(offset)
+// + 1`), so emit a literal `0` and leave any precise bound for later
+// passes to compute if they need it.
+//
+// Built structurally via `composeExpr*` so the resulting handles
+// hash-cons against any other producer that builds the same expression
+// — never via `parseExpr` / string templating per the symbolic-engine
+// rules in `AGENTS.md`.
+static FailureOr<LayoutAttr>
+buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
+                                ShapeAttr shape) {
+  MLIRContext *ctx = sourceOp->getContext();
+  sym::Store &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  unsigned rank = static_cast<unsigned>(shape.getDims().size());
+
+  auto composeFail = [&](StringRef what, StringRef diag) {
+    return sourceOp->emitOpError("buffer parameter '")
+           << argName << "': failed to compose " << what
+           << " for default strided layout: " << diag;
+  };
+
+  SmallVector<Attribute> shapeSyms;
+  SmallVector<Attribute> indexSyms;
+  shapeSyms.reserve(rank);
+  indexSyms.reserve(rank);
+  for (unsigned i = 0; i < rank; ++i) {
+    SmallString<8> shapeName("d");
+    shapeName += Twine(i).str();
+    SmallString<8> indexName("i");
+    indexName += Twine(i).str();
+    shapeSyms.push_back(StringAttr::get(ctx, shapeName));
+    indexSyms.push_back(StringAttr::get(ctx, indexName));
+  }
+
+  std::string diag;
+  sym::ExprHandle offsetHandle;
+  if (rank == 0) {
+    FailureOr<sym::ExprHandle> zero = sym::composeExprInt(store, 0, &diag);
+    if (failed(zero))
+      return composeFail("rank-0 offset", diag);
+    offsetHandle = *zero;
+  } else {
+    SmallVector<sym::ExprHandle> terms;
+    terms.reserve(rank);
+    for (unsigned axis = 0; axis < rank; ++axis) {
+      SmallString<8> indexName("i");
+      indexName += Twine(axis).str();
+      FailureOr<sym::ExprHandle> idx =
+          sym::composeExprSym(store, indexName, &diag);
+      if (failed(idx))
+        return composeFail("index symbol", diag);
+
+      SmallString<32> strideName("$STRIDE_");
+      strideName += Twine(axis).str();
+      strideName += "_";
+      strideName += argName;
+      FailureOr<sym::ExprHandle> stride =
+          sym::composeExprSym(store, strideName, &diag);
+      if (failed(stride))
+        return composeFail("stride symbol", diag);
+
+      FailureOr<sym::ExprHandle> term = sym::composeExprBinary(
+          store, *idx, sym::ExprBinaryOp::Mul, *stride, &diag);
+      if (failed(term))
+        return composeFail("stride term", diag);
+      terms.push_back(*term);
+    }
+    sym::ExprHandle acc = terms[0];
+    for (unsigned axis = 1; axis < rank; ++axis) {
+      FailureOr<sym::ExprHandle> sum = sym::composeExprBinary(
+          store, acc, sym::ExprBinaryOp::Add, terms[axis], &diag);
+      if (failed(sum))
+        return composeFail("offset accumulator", diag);
+      acc = *sum;
+    }
+    offsetHandle = acc;
+  }
+
+  FailureOr<sym::ExprHandle> storageSizeHandle =
+      sym::composeExprInt(store, 0, &diag);
+  if (failed(storageSizeHandle))
+    return composeFail("storage_size literal", diag);
+
+  return LayoutAttr::get(
+      ctx, shapeSyms, indexSyms, DictionaryAttr::get(ctx, {}),
+      ExprAttr::get(ctx, *storageSizeHandle), ExprAttr::get(ctx, offsetHandle));
+}
+
 static FailureOr<Type>
 parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
                       LaunchMetadataAttrs defaultLaunchMetadata,
@@ -799,7 +939,18 @@ parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
   FailureOr<ShapeAttr> shape = stringArrayToShape(sourceOp, shapeAttr);
   if (failed(shape))
     return failure();
-  return Type(BufferType::get(ctx, elementType, *shape));
+  // Buffer args carry the default fully-strided np/torch layout from
+  // the boundary on. Per-axis stride symbols are namespaced by the
+  // arg name so two buffers with the same shape don't share strides;
+  // the host wrapper binds them at launch (slice 5 in
+  // `doc/layouts.md`). We also extend `kernel.bound_symbols` below to
+  // include the layout's free symbols so downstream passes know to
+  // materialize them.
+  FailureOr<LayoutAttr> layout =
+      buildDefaultStridedBufferLayout(sourceOp, name.getValue(), *shape);
+  if (failed(layout))
+    return failure();
+  return Type(BufferType::get(ctx, elementType, *shape, *layout));
 }
 
 static FailureOr<Type> typeFromContractDict(Operation *sourceOp,

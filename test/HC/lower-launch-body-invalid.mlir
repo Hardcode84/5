@@ -10,7 +10,7 @@ module {
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
       // CHECK: error: 'hc.idx_apply' op failed to lower idx_apply expression
-      %bad = hc.idx_apply () {symbols = []} : () -> !hc.idx<"M">
+      %bad = hc.idx_apply () : () -> !hc.idx<"M">
       gpu.terminator
     }
     return

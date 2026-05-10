@@ -28,6 +28,13 @@ static mlir::ParseResult parseHCAsLayoutAttr(mlir::OpAsmParser &parser,
                                              mlir::Attribute &layout);
 static void printHCAsLayoutAttr(mlir::OpAsmPrinter &printer,
                                 mlir::Operation *op, mlir::Attribute layout);
+static mlir::ParseResult parseApplyBindings(
+    mlir::OpAsmParser &parser,
+    llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &operands,
+    mlir::ArrayAttr &symbols);
+static void printApplyBindings(mlir::OpAsmPrinter &p, mlir::Operation *op,
+                               mlir::OperandRange operands,
+                               mlir::ArrayAttr symbols);
 
 #define GET_OP_CLASSES
 #include "hc/IR/HCOps.cpp.inc"
@@ -703,6 +710,47 @@ LogicalResult HCSymbolOp::verify() {
     return emitOpError("result must pin a symbolic expression "
                        "(e.g. `!hc.idx<\"M\">`)");
   return success();
+}
+
+// Custom `hc.idx_apply` / `hc.pred_apply` assembly directive that
+// pairs each operand with its bound symbol name in-line, rather
+// than threading the name list through `attr-dict` parallel to the
+// operands. Round-trip form:
+//
+//   hc.idx_apply (%a as "i", %b as "j") : (index, index) -> !hc.idx<"i + j">
+//   hc.idx_apply () : () -> !hc.idx<"M">      // every free sym ambient
+//
+// Operand types still come from the trailing `functional-type`
+// directive, so the binding parser only needs to capture
+// (operand, name) pairs and defer resolution.
+static ParseResult
+parseApplyBindings(OpAsmParser &parser,
+                   SmallVectorImpl<OpAsmParser::UnresolvedOperand> &operands,
+                   ArrayAttr &symbols) {
+  SmallVector<Attribute> symAttrs;
+  auto parseOne = [&]() -> ParseResult {
+    OpAsmParser::UnresolvedOperand operand;
+    StringAttr name;
+    if (parser.parseOperand(operand) || parser.parseKeyword("as") ||
+        parser.parseAttribute(name))
+      return failure();
+    operands.push_back(operand);
+    symAttrs.push_back(name);
+    return success();
+  };
+  if (parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren, parseOne))
+    return failure();
+  symbols = ArrayAttr::get(parser.getContext(), symAttrs);
+  return success();
+}
+
+static void printApplyBindings(OpAsmPrinter &p, Operation * /*op*/,
+                               OperandRange operands, ArrayAttr symbols) {
+  p << '(';
+  llvm::interleaveComma(llvm::zip(operands, symbols), p, [&](auto pair) {
+    p << std::get<0>(pair) << " as " << std::get<1>(pair);
+  });
+  p << ')';
 }
 
 // Shared check for `hc.idx_apply` / `hc.pred_apply`: ensures the

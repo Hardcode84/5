@@ -242,7 +242,7 @@ func.func @mismatched_dims_falls_through(%a: !hc.tensor<f32, ["M"]>,
 
 // CHECK-LABEL: func.func @infer_handoff
 // INFER-LABEL: func.func @infer_handoff
-// INFER: %{{[^ ]+}} = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
+// INFER: %{{[^ ]+}} = hc.idx_apply () : () -> !hc.idx<"M">
 // INFER: hc.generic iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"M">)
 // INFER-NOT: !hc.undef
 func.func @infer_handoff(%a: !hc.tensor<f32, ["M"]>,

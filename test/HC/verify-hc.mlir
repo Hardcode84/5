@@ -1341,27 +1341,16 @@ module {
 
 // -----
 
-// `hc.idx_apply`'s symbols list must line up element-wise with the
-// operand list — same number of entries, no missing or extra slot.
-// CHECK: error: 'hc.idx_apply' op symbols list has 2 entries but the op has 1 operand(s)
-module {
-  func.func @bad(%i: index) {
-    %off = hc.idx_apply (%i) {symbols = ["i", "K"]}
-         : (index) -> !hc.idx<"i + K">
-    return
-  }
-}
-
-// -----
-
-// Each entry of the symbols list must correspond to a free symbol of
-// the carried expression — the binding has nothing to do otherwise.
-// Listing 'q' against `!hc.idx<"i">` is a producer bug worth flagging.
+// Each `(operand as "name")` slot on `hc.idx_apply` must reference a
+// free symbol of the carried expression — the binding has nothing to
+// do otherwise. The custom assembly directive forces the operand and
+// symbol-list lengths to match, so the size-mismatch verifier branch
+// is unreachable from textual IR; the check still guards builder
+// misuse from C++ producers.
 // CHECK: error: 'hc.idx_apply' op symbol 'q' is not a free symbol of the carried expression / predicate
 module {
   func.func @bad(%i: index) {
-    %off = hc.idx_apply (%i) {symbols = ["q"]}
-         : (index) -> !hc.idx<"i">
+    %off = hc.idx_apply (%i as "q") : (index) -> !hc.idx<"i">
     return
   }
 }
@@ -1373,8 +1362,7 @@ module {
 // CHECK: error: 'hc.idx_apply' op duplicate symbol binding for 'i'
 module {
   func.func @bad(%i: index, %j: index) {
-    %off = hc.idx_apply (%i, %j) {symbols = ["i", "i"]}
-         : (index, index) -> !hc.idx<"i">
+    %off = hc.idx_apply (%i as "i", %j as "i") : (index, index) -> !hc.idx<"i">
     return
   }
 }
@@ -1386,8 +1374,7 @@ module {
 // CHECK: error: 'hc.idx_apply' op result must pin a symbolic expression
 module {
   func.func @bad(%i: index) {
-    %off = hc.idx_apply (%i) {symbols = ["i"]}
-         : (index) -> !hc.idx
+    %off = hc.idx_apply (%i as "i") : (index) -> !hc.idx
     return
   }
 }
@@ -1399,8 +1386,7 @@ module {
 // CHECK: error: 'hc.pred_apply' op result must pin a symbolic predicate
 module {
   func.func @bad(%i: index) {
-    %p = hc.pred_apply (%i) {symbols = ["i"]}
-       : (index) -> !hc.pred
+    %p = hc.pred_apply (%i as "i") : (index) -> !hc.pred
     return
   }
 }

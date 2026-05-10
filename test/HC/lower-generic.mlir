@@ -18,14 +18,14 @@
 // iteration.
 // CHECK-LABEL: func.func @elementwise_add_1d
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PCI:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[CV:[^ ]+]] = hc.ptr_load %[[PCI]]
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PAI:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PAI]]
 // CHECK:   %[[S:[^ ]+]] = hc.add %[[CV]], %[[AV]]
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PCS:[^ ]+]] = hc.ptr_offset
 // CHECK:   hc.ptr_store %[[S]], %[[PCS]]
 // CHECK:   scf.reduce
@@ -54,12 +54,12 @@ func.func @elementwise_add_1d(%n: index,
 // threads the running value through `iter_args`, then a final store
 // at the same constant offset.
 // CHECK-LABEL: func.func @reduce_sum_1d
-// CHECK: hc.idx_apply() {symbols = []}
+// CHECK: hc.idx_apply ()
 // CHECK-SAME: -> !hc.idx<"0">
 // CHECK: %[[INIT:[^ ]+]] = hc.ptr_load %{{[^ ]+}}
 // CHECK: %[[FINAL:[^ ]+]] = scf.for %[[K:[^ ]+]] =
 // CHECK-SAME: iter_args(%[[ACC:[^ ]+]] = %[[INIT]])
-// CHECK:   hc.idx_apply(%[[K]]) {symbols = ["k"]}
+// CHECK:   hc.idx_apply (%[[K]] as "k")
 // CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
 // CHECK:   %[[NEXT:[^ ]+]] = hc.add %[[ACC]], %[[AV]]
@@ -91,12 +91,12 @@ func.func @reduce_sum_1d(%n: index,
 // `["i"]` alone.
 // CHECK-LABEL: func.func @reduce_sum_2d_per_row
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK-SAME: -> !hc.idx<"i">
 // CHECK:   %[[INIT:[^ ]+]] = hc.ptr_load
 // CHECK:   %[[FINAL:[^ ]+]] = scf.for %[[J:[^ ]+]] =
 // CHECK-SAME: iter_args(%[[ACC:[^ ]+]] = %[[INIT]])
-// CHECK:     hc.idx_apply(%{{[^,]+}}, %{{[^)]+}}) {symbols = ["i", "j"]}
+// CHECK:     hc.idx_apply (%{{[^ ]+}} as "i", %{{[^ ]+}} as "j")
 // CHECK-SAME: -> !hc.idx<"j + N*i">
 // CHECK:     %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:     %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
@@ -130,13 +130,13 @@ func.func @reduce_sum_2d_per_row(%m: index, %nsym: !hc.idx<"N">,
 // both consume the same per-iteration in.
 // CHECK-LABEL: func.func @elementwise_two_outs
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PB:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[BV:[^ ]+]] = hc.ptr_load %[[PB]]
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PC:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[CV:[^ ]+]] = hc.ptr_load %[[PC]]
-// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   hc.idx_apply (%[[I]] as "i")
 // CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
 // CHECK:   %[[Y0:[^ ]+]] = hc.add %[[BV]], %[[AV]]

@@ -295,7 +295,8 @@ def HCIdxApplyOp : HC_Op<"idx_apply",
   );
   let results = (outs HC_IdxType:$result);
   let assemblyFormat = [{
-    `(` $operands `)` attr-dict `:` functional-type(operands, results)
+    custom<ApplyBindings>($operands, $symbols) attr-dict
+    `:` functional-type(operands, results)
   }];
   let hasVerifier = 1;
 }
@@ -320,7 +321,8 @@ def HCPredApplyOp : HC_Op<"pred_apply",
   );
   let results = (outs HC_PredType:$result);
   let assemblyFormat = [{
-    `(` $operands `)` attr-dict `:` functional-type(operands, results)
+    custom<ApplyBindings>($operands, $symbols) attr-dict
+    `:` functional-type(operands, results)
   }];
   let hasVerifier = 1;
 }

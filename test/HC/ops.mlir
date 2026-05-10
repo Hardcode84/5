@@ -47,13 +47,13 @@
 // CHECK: hc.func @typed_with_return(%arg0: i32) -> i32 {
 // CHECK-NEXT: hc.return %arg0 : i32
 // CHECK: hc.func @apply_bound {
-// CHECK: hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WI0">
-// CHECK: hc.pred_apply() {symbols = []} : () -> !hc.pred<"-32 + $WI0 < 0">
+// CHECK: hc.idx_apply () : () -> !hc.idx<"$WI0">
+// CHECK: hc.pred_apply () : () -> !hc.pred<"-32 + $WI0 < 0">
 // CHECK: hc.func @apply_ops(%[[I:[^:]+]]: index, %[[K:[^:]+]]: !hc.idx<"K">, %[[J:[^:]+]]: index) {
-// CHECK: hc.idx_apply(%[[I]], %[[K]], %[[J]]) {symbols = ["i", "K", "j"]}
+// CHECK: hc.idx_apply (%[[I]] as "i", %[[K]] as "K", %[[J]] as "j")
 // CHECK-SAME: : (index, !hc.idx<"K">, index) -> !hc.idx<"K + i*j">
-// CHECK: hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WG0">
-// CHECK: hc.pred_apply(%[[I]], %[[K]]) {symbols = ["i", "K"]}
+// CHECK: hc.idx_apply () : () -> !hc.idx<"$WG0">
+// CHECK: hc.pred_apply (%[[I]] as "i", %[[K]] as "K")
 // CHECK-SAME: : (index, !hc.idx<"K">) -> !hc.pred<"-K + i < 0">
 
 module {
@@ -137,8 +137,8 @@ module {
   }
 
   hc.func @apply_bound {
-    %idx = hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WI0">
-    %pred = hc.pred_apply() {symbols = []} : () -> !hc.pred<"$WI0 < 32">
+    %idx = hc.idx_apply () : () -> !hc.idx<"$WI0">
+    %pred = hc.pred_apply () : () -> !hc.pred<"$WI0 < 32">
     hc.return
   }
 
@@ -149,10 +149,10 @@ module {
   // launch-body lowering. Operands are either `index` or
   // `!hc.idx<...>` per `HC_SymBindingValueType`.
   hc.func @apply_ops(%i: index, %k: !hc.idx<"K">, %j: index) {
-    %off = hc.idx_apply (%i, %k, %j) {symbols = ["i", "K", "j"]}
+    %off = hc.idx_apply (%i as "i", %k as "K", %j as "j")
          : (index, !hc.idx<"K">, index) -> !hc.idx<"i*j + K">
-    %wg = hc.idx_apply () {symbols = []} : () -> !hc.idx<"$WG0">
-    %p = hc.pred_apply (%i, %k) {symbols = ["i", "K"]}
+    %wg = hc.idx_apply () : () -> !hc.idx<"$WG0">
+    %p = hc.pred_apply (%i as "i", %k as "K")
        : (index, !hc.idx<"K">) -> !hc.pred<"i < K">
     hc.return
   }

@@ -24,9 +24,9 @@ module {
       // CHECK: %[[ROW:.*]] = arith.muli %{{.*}}, %[[BX]] : index
       // CHECK: %[[LANE_TILE:.*]] = arith.divui %[[TX]], %{{.*}} : index
       // CHECK: %[[COL:.*]] = arith.addi %{{.*}}, %[[LANE_TILE]] : index
-      %row = hc.idx_apply () {symbols = []} : () -> !hc.idx<"16*$WG0">
-      %col = hc.idx_apply () {symbols = []} : () -> !hc.idx<"16*$WG1 + 1/16*$WI0">
-      %m = hc.idx_apply () {symbols = []} : () -> !hc.idx<"M">
+      %row = hc.idx_apply () : () -> !hc.idx<"16*$WG0">
+      %col = hc.idx_apply () : () -> !hc.idx<"16*$WG1 + 1/16*$WI0">
+      %m = hc.idx_apply () : () -> !hc.idx<"M">
       %n = hc.buffer_dim %buffer, axis = 1
           : !hc.buffer<f32, ["M", "N"]> -> !hc.idx<"N">
       %one = hc.const<1 : i64> : !hc.idx<"1">
@@ -135,7 +135,7 @@ module {
              !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"4">>,
              tuple<!hc.idx<"4">, !hc.idx<"4">>)
             -> !hc.bare_tensor<!hc.pred, ["4", "4"]>
-      %lane = hc.idx_apply () {symbols = []} : () -> !hc.idx<"$WI0">
+      %lane = hc.idx_apply () : () -> !hc.idx<"$WI0">
       %full = hc.slice_expr() : () -> !hc.slice
       %frag = hc.buffer_view %tile[%lane, %full]
           : (!hc.bare_tensor<f32, ["4", "4"]>, !hc.idx<"$WI0">, !hc.slice)
@@ -377,9 +377,9 @@ module {
           : memref<?xf32> to !hc.buffer<f32, ["M"]>
       %k = builtin.unrealized_conversion_cast %ext_k
           : index to !hc.idx<"K">
-      %off = hc.idx_apply (%k) {symbols = ["K"]}
+      %off = hc.idx_apply (%k as "K")
            : (!hc.idx<"K">) -> !hc.idx<"K + $WG0">
-      %p = hc.pred_apply (%k) {symbols = ["K"]}
+      %p = hc.pred_apply (%k as "K")
          : (!hc.idx<"K">) -> !hc.pred<"K < $WG0">
       gpu.terminator
     }

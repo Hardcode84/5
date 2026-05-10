@@ -15,8 +15,8 @@
 // identity-style in one input axis and the matching output axis;
 // the implied bounds (M and N) materialize as hc.idx values.
 // CHECK-LABEL: func.func @two_parallel_identity
-// CHECK: %[[M_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
-// CHECK: %[[N_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
+// CHECK: %[[M_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK: %[[N_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %[[M_BOUND]] : !hc.idx<"M">, parallel j = %[[N_BOUND]] : !hc.idx<"N">)
 func.func @two_parallel_identity(%a: !hc.bare_tensor<f32, ["M", "N"]>,
@@ -46,9 +46,9 @@ func.func @two_parallel_identity(%a: !hc.bare_tensor<f32, ["M", "N"]>,
 // pass walks ins as well as outs and doesn't trip on the reduction
 // label.
 // CHECK-LABEL: func.func @parallel_and_reduction
-// CHECK: %[[M_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
-// CHECK: %[[N_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
-// CHECK: %[[K_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"K">
+// CHECK: %[[M_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK: %[[N_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
+// CHECK: %[[K_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"K">
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %[[M_BOUND]] : !hc.idx<"M">, parallel j = %[[N_BOUND]] : !hc.idx<"N">, reduction k = %[[K_BOUND]] : !hc.idx<"K">)
 func.func @parallel_and_reduction(%a: !hc.bare_tensor<f16, ["M", "K"]>,
@@ -85,7 +85,7 @@ func.func @parallel_and_reduction(%a: !hc.bare_tensor<f16, ["M", "K"]>,
 // undef-defined ones and leaves the rest alone. Concrete `index` value
 // flows through unchanged; placeholder gets an idx-typed materialize.
 // CHECK-LABEL: func.func @partial_bounds
-// CHECK: %[[N_BOUND:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
+// CHECK: %[[N_BOUND:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index, parallel j = %[[N_BOUND]] : !hc.idx<"N">)
 func.func @partial_bounds(%m: index,

@@ -16,9 +16,9 @@
 // and `[k,j]`; outs `[i,j]`. Body keeps the body in HC scalar ops
 // so the round-trip stays canonical (no unintended arith mixin).
 // CHECK-LABEL: func.func @matmul_f32
-// CHECK-DAG: %[[M:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
-// CHECK-DAG: %[[N:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
-// CHECK-DAG: %[[K:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"K">
+// CHECK-DAG: %[[M:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK-DAG: %[[N:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
+// CHECK-DAG: %[[K:.+]] = hc.idx_apply () : () -> !hc.idx<"K">
 // CHECK: %[[SHAPE:.+]] = hc.tuple(%[[M]], %[[N]])
 // CHECK: %[[FILL:.+]] = hc.zeros shape %[[SHAPE]] {{.*}} -> !hc.tensor<f32, ["M", "N"]>
 // CHECK: hc.generic
@@ -88,8 +88,8 @@ func.func @matmul_i32(%a: !hc.tensor<i32, ["M", "K"]>,
 // Reduce sum along axis 0: parallel iter for `N`, reduction iter for
 // `M`. Output rank-1 over `N`. Identity fill is `hc.zeros`.
 // CHECK-LABEL: func.func @reduce_sum_axis0
-// CHECK-DAG: %[[NB:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
-// CHECK-DAG: %[[MB:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
+// CHECK-DAG: %[[NB:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
+// CHECK-DAG: %[[MB:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
 // CHECK: %[[SH:.+]] = hc.tuple(%[[NB]])
 // CHECK: %[[FILL:.+]] = hc.zeros shape %[[SH]] {{.*}} -> !hc.tensor<f32, ["N"]>
 // CHECK: hc.generic
@@ -112,8 +112,8 @@ func.func @reduce_sum_axis0(%a: !hc.tensor<f32, ["M", "N"]>)
 // `N`. Verifies the parallel-vs-reduction slot is keyed off `axis`,
 // not iter-sym index.
 // CHECK-LABEL: func.func @reduce_sum_axis1
-// CHECK-DAG: %[[MB:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"M">
-// CHECK-DAG: %[[NB:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N">
+// CHECK-DAG: %[[MB:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK-DAG: %[[NB:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %[[MB]] : !hc.idx<"M">, reduction r = %[[NB]] : !hc.idx<"N">)
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"r">] : !hc.tensor<f32, ["M", "N"]>)

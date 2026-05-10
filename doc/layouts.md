@@ -256,7 +256,21 @@ hc.alloc count = %n : index -> !hc.ptr<workgroup, f16>
 hc.ptr_offset %p, %i : (!hc.ptr<workgroup, f16>, index) -> !hc.ptr<workgroup, f16>
 %v = hc.ptr_load  %p          : !hc.ptr<workgroup, f16> -> f16
      hc.ptr_store %v, %p      : f16, !hc.ptr<workgroup, f16>
+
+// vector forms — same op, vector-typed result/operand:
+%vv = hc.ptr_load  %p         : !hc.ptr<workgroup, f16> -> vector<8xf16>
+      hc.ptr_store %vv, %p    : vector<8xf16>, !hc.ptr<workgroup, f16>
 ```
+
+`hc.ptr_load` / `hc.ptr_store` are **polymorphic on the result /
+operand type**: a scalar element type denotes a single-element
+load/store, a `vector<NxT>` denotes a contiguous N-element load/store
+starting at the pointer. Width is unconstrained at this op — target
+lowering at `hc-lower-to-llvm` splits oversized vectors into
+hardware-sized chunks (AMDGPU dwordx4, SPIR-V's natural vector width)
+without touching the IR before that. The vec lowering path
+(`hc-lower-generic` at `U > 1`) emits the wide form directly at
+merged contig groups.
 
 `hc.alloc` count is a single `index` SSA value. **In v1 the count is
 required to be statically known after specialization** — the verifier
@@ -467,30 +481,73 @@ concrete, so rewriters that emit fully-resolved ops pay nothing.
 
 Lowering — `hc-lower-generic`:
 
-Scalar baseline: nested `scf.for` over `iter_bounds`, reduction iters
-as the inner loops with `iter_args` carrying the accumulators, parallel
-iters as the outer loops with a load-once / store-once pattern.
-Pre-fill of the outs is read into the outermost `iter_args`; the body
-runs scalar; the result writes back at the parallel index.
+Loop nest shape: parallel iters become an outer `scf.parallel` with
+the parallel iters as multi-dim induction variables; reduction iters
+become an inner `scf.for` nest with `iter_args` carrying the
+accumulators. Pure-parallel ops collapse to a single `scf.parallel`
+with no inner loop. The body runs once per innermost iteration,
+sources value-typed `outs` carries via the `iter_args` chain (or via
+implicit `hc.ptr_load` at the operand offset for ptr/buffer-typed
+outs), and writes back at the parallel index after the reduction
+nest finishes.
 
-Vector codegen: for each operand on the chosen vectorization axis, the
-symbolic engine computes
-`Δ = offset(iter[axis] + 1) - offset(iter[axis])`. Three outcomes:
+Codegen frame: **unroll-and-merge**. The pass picks an iter-axis
+order and a partition `p` of an unroll budget across the iters,
+constrained by divisibility — every per-axis factor `p_i` must
+provably divide its axis bound `N_i`, queried via
+`ixs_check(cmp(ixs_mod(N_i, p_i), EQ, 0))`. The scalar baseline pins
+`p = (1, ..., 1)` (trivial divisibility, total unroll 1); the vector
+slice enumerates partitions with total unroll `prod(p_i) ≤ 32`
+subject to the divisibility filter. **No tail loop is emitted** —
+when divisibility doesn't hold for the larger factors the pass
+simply discards them and picks a smaller valid partition (e.g.
+`(8, 2)` instead of `(32, 1)`); when no axis divides above 1 the
+pass falls back to scalar `p = (1, ..., 1)`.
 
-* every `Δ == 1` on a *parallel* axis → contiguous vector load/store,
-  body lifts to vector arithmetic. Same op covers scalar fallback and
-  vectorized fast path.
-* `Δ == 1` on a *reduction* axis → vector load + `vector.reduction`
-  (horizontal reduce). The body's accumulator combinator picks the
-  reduction kind.
-* every `Δ` is a constant `s ≠ 1` → strided/shuffled load
-  (target-dependent: AMDGPU DS strided loads, fallback to gather).
-* unknown / mixed → scalar `scf.for` loop.
+For each surviving candidate `(order, partition)` the pass
+symbolically generates `prod(p_i)` per-operand offset expressions
+over the unrolled iter positions, then runs a pairwise contiguity
+probe — `ixs_check(cmp(offset[k+1] − offset[k], EQ, 1))` — to
+identify maximal contig groups in each operand's offset list. Score
+= total merged elements summed across all input/output operands.
+Pick the `(order, partition)` with the maximum score, ties broken
+lexicographically on the order.
+
+Search bounds: axis-order search is capped at `n ≤ 4`; for `n ≥ 5`
+the pass uses declaration order without permuting. Partition
+enumeration is bounded by `prod(p_i) ≤ 32` and pruned by the
+divisibility filter before the merge probe even runs.
+
+Emission: the body stays **elementwise scalar** at every total
+unroll. The pass clones the body `prod(p_i)` times in declaration
+order; reduction-axis unrolls thread the carry through all clones
+in sequence (single accumulator, sequential adds — LLVM and the
+loop vectorizer fuse to vector reductions if profitable). Loads and
+stores at the body boundary route through the merge result:
+
+* contig group of size `G > 1` → one vector-typed `hc.ptr_load` /
+  `hc.ptr_store` of width `G` for the whole group; individual body
+  copies read their lane via `vector.extract` / write via
+  `vector.insert` (or pack at the store boundary). Width is
+  **maximal at the merge** — target lowering splits oversized
+  vectors into hardware-sized chunks at the `hc-lower-to-llvm`
+  boundary, no target-aware width selection in this pass.
+* size-1 group → scalar-typed `hc.ptr_load` / `hc.ptr_store`.
+
+Because every chosen partition factor provably divides its axis
+bound, the unrolled main loop covers the entire iteration space
+exactly — no tail loop is ever emitted.
+
+Body vectorization (lifting scalar arith back to vector ops) is a
+follow-up — SLP / loop-vectorizer / target codegen handles the
+common cases. The pass commits to elementwise scalar arith
+internally; the only vectorization is at the memory boundary.
 
 The vectorization decision is a symbolic-engine question, not a
-heuristic. Layouts that ixsimpl can simplify produce vectorized code;
-layouts that defeat it produce correct scalar code with a clear "missed
-vectorization here" location for users to inspect.
+heuristic. Layouts that ixsimpl can simplify produce contig-merged
+loads/stores; layouts that defeat it produce correct scalar code
+with a clear "missed vectorization here" location for users to
+inspect.
 
 ## Pass pipeline (revised)
 
@@ -631,9 +688,13 @@ on later slices.
     ptr-in / ptr-out generic. Masked stores, tensor-dst stores, and
     `hc.load_mask` are deferred to follow-ups.
 15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
-    forms: value-out, ptr-out, mixed) to a scalar `scf.for` nest
-    only. No vectorization yet. Implicit `hc.ptr_load` for the
-    ptr-out carry and implicit `hc.ptr_store` on the yield.
+    forms: value-out, ptr-out, mixed) to an outer `scf.parallel`
+    over the parallel iters with an inner `scf.for` nest over the
+    reduction iters carrying the accumulator via `iter_args`. The
+    unroll-and-merge framework lands here at `U = 1` (degenerate
+    partition, no merges, all loads/stores scalar) so the vector
+    slice is a delta and not a rewrite. Implicit `hc.ptr_load` for
+    the ptr-out carry and implicit `hc.ptr_store` on the yield.
 16. **retire per-op lowering paths** — once every shaped op funnels
     into `hc.generic`, drop the dedicated lowering paths in
     `hc-lower-launch-body` and the bare-value decomposition machinery
@@ -644,7 +705,15 @@ on later slices.
 18. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
     runs end-to-end on the new stack.
 19. **symbolic stride vectorization** — same `hc-lower-generic`,
-    smarter codegen. The actual win.
+    enables axis-order search (capped at 4) and partition
+    enumeration with total unroll `prod(p_i) ≤ 32`, gated by an
+    `ixs_check`-driven divisibility filter on each axis bound; runs
+    the pairwise contiguity probe to find merged groups; emits
+    maximal-width vector-typed `hc.ptr_load` / `hc.ptr_store` at
+    each merged group while keeping the body elementwise scalar.
+    No tail loop — partitions that don't divide cleanly are pruned
+    in favor of smaller ones, degenerating to `p = (1, ..., 1)`
+    when no axis divides above 1. The actual win.
 
 Slices 1–5 are pure additive (no observable behavior change beyond the
 strided buffer ABI, which preserves contiguous numerics). Slices 6–18

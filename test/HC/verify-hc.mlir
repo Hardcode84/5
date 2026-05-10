@@ -938,3 +938,117 @@ module attributes {
                            storage_size = #hc.expr<"W">,
                            offset = #hc.expr<"i">>
 } {}
+
+// -----
+
+// `!hc.ptr` requires an address space. The parser surfaces a listed
+// alternatives diagnostic at the unknown keyword instead of pretending
+// there's a default class.
+// CHECK: error: expected `workgroup`, `global`, or `private`, got 'somewhere'
+module {
+  func.func @bad(%p: !hc.ptr<f16, addrspace = somewhere>) {
+    return
+  }
+}
+
+// -----
+
+// Mistyped field name on `!hc.ptr` rejects with the same located
+// diagnostic surface as other custom-format types.
+// CHECK: error: unknown !hc.ptr field 'space'
+module {
+  func.func @bad(%p: !hc.ptr<f16, space = workgroup>) {
+    return
+  }
+}
+
+// -----
+
+// Missing addrspace on a typed pointer: parser hits the closing `>`
+// where `, addrspace = ...` should be. The diagnostic comes from the
+// upstream comma parser; check on the prefix so a future tweak to the
+// MLIR token-name string still pins the failure to this location.
+// CHECK: error: expected ','
+module {
+  func.func @bad(%p: !hc.ptr<f16>) {
+    return
+  }
+}
+
+// -----
+
+// Empty `<>`: parser falls through to a type parse for the optional
+// element slot and the upstream type parser rejects the closing `>`.
+// CHECK: error: expected non-function type
+module {
+  func.func @bad(%p: !hc.ptr<>) {
+    return
+  }
+}
+
+// -----
+
+// `hc.ptr_offset` rejects address-space mismatches; mixing `workgroup`
+// and `global` would silently produce an invalid GPU pointer at
+// codegen.
+// CHECK: error: 'hc.ptr_offset' op address space mismatch: source workgroup vs result global
+module {
+  hc.func @bad(%p: !hc.ptr<f16, addrspace = workgroup>, %i: index) {
+    %r = hc.ptr_offset %p, %i
+        : (!hc.ptr<f16, addrspace = workgroup>, index)
+          -> !hc.ptr<f16, addrspace = global>
+    hc.return
+  }
+}
+
+// -----
+
+// Element-type mismatch on `hc.ptr_offset` — both pointers typed but
+// disagreeing on the element. Asymmetric typed/opaque is rejected by a
+// separate diagnostic below.
+// CHECK: error: 'hc.ptr_offset' op element type mismatch: source 'f16' vs result 'f32'
+module {
+  hc.func @bad(%p: !hc.ptr<f16, addrspace = workgroup>, %i: index) {
+    %r = hc.ptr_offset %p, %i
+        : (!hc.ptr<f16, addrspace = workgroup>, index)
+          -> !hc.ptr<f32, addrspace = workgroup>
+    hc.return
+  }
+}
+
+// -----
+
+// Asymmetric typed/opaque on `hc.ptr_offset`: dropping the element
+// type happens once at the LLVM-lowering boundary, not in the middle
+// of pointer arithmetic.
+// CHECK: error: 'hc.ptr_offset' op source and result must agree on whether the pointer is typed
+module {
+  hc.func @bad(%p: !hc.ptr<f16, addrspace = workgroup>, %i: index) {
+    %r = hc.ptr_offset %p, %i
+        : (!hc.ptr<f16, addrspace = workgroup>, index)
+          -> !hc.ptr<addrspace = workgroup>
+    hc.return
+  }
+}
+
+// -----
+
+// `hc.ptr_load` on a typed pointer enforces result-element parity.
+// CHECK: error: 'hc.ptr_load' op result type 'f32' must match pointer element type 'f16'
+module {
+  hc.func @bad(%p: !hc.ptr<f16, addrspace = workgroup>) {
+    %v = hc.ptr_load %p : !hc.ptr<f16, addrspace = workgroup> -> f32
+    hc.return
+  }
+}
+
+// -----
+
+// `hc.ptr_store` symmetrically enforces value-element parity.
+// CHECK: error: 'hc.ptr_store' op value type 'f32' must match pointer element type 'f16'
+module {
+  hc.func @bad(%p: !hc.ptr<f16, addrspace = workgroup>, %v: f32) {
+    hc.ptr_store %v, %p : f32, !hc.ptr<f16, addrspace = workgroup>
+    hc.return
+  }
+}

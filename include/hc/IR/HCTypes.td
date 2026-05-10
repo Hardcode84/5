@@ -219,6 +219,35 @@ def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
   ];
 }
 
+// Memory carrier type, the post-flatten replacement for the
+// memref-shaped storage we used to hand to the launch-body lowering.
+// Element type is optional: typed pointers (`!hc.ptr<f16, addrspace = ...>`)
+// preserve the element through to the SPIR-V boundary; opaque pointers
+// (`!hc.ptr<addrspace = ...>`) match the LLVM-17 opaque-pointer surface
+// the AMDGPU backend expects. Address space is required — there's no
+// "default" memory class on a GPU, so omitting it would just hide bugs.
+def HC_PtrType : HC_Type<"Ptr", "ptr"> {
+  let summary = "Memory pointer in a named address space (workgroup/global/private).";
+  let description = [{
+    Pointer to a single element of `$elementType` (or to opaque memory
+    when `$elementType` is absent), living in `$addrSpace`. See
+    `doc/layouts.md` for the role this plays in the post-flatten
+    pipeline. Element type carries through the dialect until the
+    `hc-lower-to-llvm` boundary drops it on the AMDGPU path; the
+    SPIR-V path keeps it.
+  }];
+  let parameters = (ins
+    OptionalParameter<"::mlir::Type">:$elementType,
+    "::mlir::hc::AddrSpace":$addrSpace
+  );
+  let hasCustomAssemblyFormat = 1;
+  let builders = [
+    TypeBuilder<(ins "::mlir::hc::AddrSpace":$addrSpace), [{
+      return $_get($_ctxt, ::mlir::Type{}, addrSpace);
+    }]>
+  ];
+}
+
 def HC_GroupType : HC_Type<"Group", "group"> {
   let summary = "Kernel launch-context token.";
   let description = [{
@@ -282,6 +311,7 @@ def HC_ValueType : AnyTypeOf<[
   HC_VectorType,
   HC_BareTensorType,
   HC_BareVectorType,
+  HC_PtrType,
   HC_GroupType,
   HC_WorkitemType,
   HC_SubgroupType,
@@ -398,6 +428,13 @@ def HC_GroupValueType : AnyTypeOf<[
   HC_GroupType,
   HC_WorkitemType,
   HC_SubgroupType,
+]>;
+
+// Pointer-shaped operand. `!hc.undef` is admitted so the pointer ops can
+// be emitted before type inference fills the addrspace/element in.
+def HC_PtrValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_PtrType,
 ]>;
 
 #endif // HC_IR_HCTYPES

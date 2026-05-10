@@ -951,6 +951,96 @@ def HCEmptyOp : HC_NullaryShapedAllocOp<"empty", 0> {
 }
 
 //===----------------------------------------------------------------------===//
+// Pointer-flavored memory carriers. The post-flatten pipeline drops nD shaped
+// values to a 1D bare carrier whose backing storage is one of these. The op
+// surface is intentionally tight (alloc / element-strided offset / scalar
+// load / scalar store): vector loads/stores live on `hc.elementwise` once
+// vectorization decides what to emit, not on per-element ops.
+//===----------------------------------------------------------------------===//
+
+def HCAllocOp : HC_Op<"alloc", [
+    MemoryEffects<[MemAlloc]>
+  ]> {
+  let summary = "Allocate `count` elements in the result pointer's address space.";
+  let description = [{
+    Produces a pointer to a fresh `count`-element buffer in the result
+    type's address space. `count` is specified as `index` in the model;
+    pre-inference IR may pass `!hc.undef` and let inference narrow it.
+
+    `doc/layouts.md` requires `count` to fold to a literal constant
+    after the literal-binding pass — the AMDGPU LDS lowering can only
+    materialize statically-sized regions in v1, and the verifier on the
+    LLVM-lowering boundary rejects allocations that didn't bind.
+    Structurally-pre-binding IR is allowed (the verifier here checks
+    only that a count is present); the lowering pass owns the post-bind
+    constness check.
+  }];
+  let arguments = (ins HC_ValueType:$count);
+  let results = (outs HC_PtrValueType:$result);
+  let assemblyFormat = [{
+    `count` `=` $count attr-dict `:`
+    type($count) `->` qualified(type($result))
+  }];
+}
+
+def HCPtrOffsetOp : HC_Op<"ptr_offset", [
+    Pure
+  ]> {
+  let summary = "Offset a pointer by an integer count of elements.";
+  let description = [{
+    Element-strided pointer arithmetic: the result points `index`
+    elements past `source`, where the element width is fixed by the
+    pointer type's `$elementType`. Opaque pointers stride by the
+    abstract "one element" the alloc that produced them was sized in;
+    the LLVM lowering reattaches a concrete element type at codegen.
+
+    The address space and element type are preserved through the
+    offset; mixing them is verifier-rejected.
+  }];
+  let arguments = (ins HC_PtrValueType:$source, HC_ValueType:$index);
+  let results = (outs HC_PtrValueType:$result);
+  let assemblyFormat = [{
+    $source `,` $index attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def HCPtrLoadOp : HC_Op<"ptr_load", [
+    MemoryEffects<[MemRead]>
+  ]> {
+  let summary = "Load a single element from `$source`.";
+  let description = [{
+    Scalar load from the address pointed to by `$source`. When the
+    pointer carries an explicit `$elementType`, the result type must
+    match; opaque pointers accept any scalar result type and propagate
+    the choice down to the load codegen.
+  }];
+  let arguments = (ins HC_PtrValueType:$source);
+  let results = (outs HC_ValueType:$result);
+  let assemblyFormat = [{
+    $source attr-dict `:` qualified(type($source)) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def HCPtrStoreOp : HC_Op<"ptr_store", [
+    MemoryEffects<[MemWrite]>
+  ]> {
+  let summary = "Store `$value` at the address pointed to by `$dest`.";
+  let description = [{
+    Scalar store. When `$dest` carries an explicit `$elementType`,
+    `$value`'s type must match; opaque pointers accept any scalar
+    value and the LLVM lowering reads the element type off the store.
+  }];
+  let arguments = (ins HC_ValueType:$value, HC_PtrValueType:$dest);
+  let assemblyFormat = [{
+    $value `,` $dest attr-dict `:`
+    type($value) `,` qualified(type($dest))
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // Reductions, matmul, astype.
 //===----------------------------------------------------------------------===//
 

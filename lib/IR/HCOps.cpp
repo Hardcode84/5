@@ -1480,6 +1480,79 @@ LogicalResult HCFullOp::verify() { return verifyTensorAllocScope(*this); }
 LogicalResult HCEmptyOp::verify() { return verifyTensorAllocScope(*this); }
 
 //===----------------------------------------------------------------------===//
+// hc.ptr_offset / hc.ptr_load / hc.ptr_store verifiers.
+//
+// All three share the rule that the pointer's `addrspace` and (when
+// present) `elementType` must agree with the matching operand/result.
+// Pre-inference IR with `!hc.undef` on either side escapes the parity
+// check, mirroring how the rest of the dialect tolerates the
+// progressive-typing placeholder.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Returns the `PtrType` payload, or null when the operand is still
+// `!hc.undef`. Anything else is an unreachable verifier-time bug because
+// `HC_PtrValueType` already restricted the constraint.
+PtrType ptrTypeOrUndef(Type type) {
+  if (isHCUndefType(type))
+    return {};
+  return llvm::cast<PtrType>(type);
+}
+
+// Element-type compatibility for ptr_load / ptr_store: typed pointers
+// require an exact match, opaque pointers (no element type on the
+// pointer) accept anything. `!hc.undef` on either side escapes — the
+// caller has already filtered out the `!hc.ptr` shell.
+LogicalResult checkScalarMatchesPointer(Operation *op, Type scalar, PtrType ptr,
+                                        StringRef role) {
+  if (!ptr || isHCUndefType(scalar))
+    return success();
+  Type elem = ptr.getElementType();
+  if (!elem || elem == scalar)
+    return success();
+  return op->emitOpError(role)
+         << " type " << scalar << " must match pointer element type " << elem;
+}
+
+} // namespace
+
+LogicalResult HCPtrOffsetOp::verify() {
+  PtrType source = ptrTypeOrUndef(getSource().getType());
+  PtrType result = ptrTypeOrUndef(getResult().getType());
+  if (!source || !result)
+    return success();
+  if (source.getAddrSpace() != result.getAddrSpace())
+    return emitOpError("address space mismatch: source ")
+           << stringifyAddrSpace(source.getAddrSpace()) << " vs result "
+           << stringifyAddrSpace(result.getAddrSpace());
+  Type sourceElem = source.getElementType();
+  Type resultElem = result.getElementType();
+  if (sourceElem && resultElem && sourceElem != resultElem)
+    return emitOpError("element type mismatch: source ")
+           << sourceElem << " vs result " << resultElem;
+  // Asymmetric element-type loss (typed source, opaque result, or vice
+  // versa) is rejected: the dropping happens at the LLVM-lowering
+  // boundary in one go, not piecemeal at every offset.
+  if (static_cast<bool>(sourceElem) != static_cast<bool>(resultElem))
+    return emitOpError(
+        "source and result must agree on whether the pointer is typed");
+  return success();
+}
+
+LogicalResult HCPtrLoadOp::verify() {
+  PtrType source = ptrTypeOrUndef(getSource().getType());
+  return checkScalarMatchesPointer(getOperation(), getResult().getType(),
+                                   source, "result");
+}
+
+LogicalResult HCPtrStoreOp::verify() {
+  PtrType dest = ptrTypeOrUndef(getDest().getType());
+  return checkScalarMatchesPointer(getOperation(), getValue().getType(), dest,
+                                   "value");
+}
+
+//===----------------------------------------------------------------------===//
 // SymbolUserOpInterface verification for call ops.
 //
 // Callee existence and op kind are cheap; signature parity is also verified

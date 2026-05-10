@@ -176,6 +176,25 @@ def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
   let genVerifyDecl = 1;
 }
 
+// Address space tag carried by `!hc.ptr` (and any future memory carrier
+// in this dialect). Workgroup / global / private are the three classes
+// the AMDGPU and SPIR-V backends actually distinguish; richer schemes
+// (constant, image, named driver classes) are not in v1 — extending the
+// enum later is additive.
+def HC_AddrSpaceWorkgroup : I32EnumAttrCase<"Workgroup", 0, "workgroup">;
+def HC_AddrSpaceGlobal    : I32EnumAttrCase<"Global", 1, "global">;
+def HC_AddrSpacePrivate   : I32EnumAttrCase<"Private", 2, "private">;
+
+def HC_AddrSpace : I32EnumAttr<"AddrSpace",
+    "Memory address space (workgroup/global/private).",
+    [HC_AddrSpaceWorkgroup, HC_AddrSpaceGlobal, HC_AddrSpacePrivate]> {
+  // No specialized attr companion: the enum surfaces only as a typed type
+  // parameter on `!hc.ptr`; we don't want stray `#hc<addr_space ...>`
+  // attributes growing other surfaces.
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::hc";
+}
+
 def HC_EffectClassPure : I32EnumAttrCase<"Pure", 0, "pure">;
 def HC_EffectClassRead : I32EnumAttrCase<"Read", 1, "read">;
 def HC_EffectClassWrite : I32EnumAttrCase<"Write", 2, "write">;

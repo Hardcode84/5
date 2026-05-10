@@ -195,6 +195,25 @@ def HC_AddrSpace : I32EnumAttr<"AddrSpace",
   let cppNamespace = "::mlir::hc";
 }
 
+// Iteration kind tag for `hc.generic`: parallel iters are independent and
+// vectorizable; reduction iters carry a sequential init across the loop.
+// The split mirrors `linalg.generic`'s `iterator_types` but stays inside the
+// dialect so the symbolic engine — not affine maps — owns offset analysis.
+def HC_IterKindParallel  : I32EnumAttrCase<"Parallel",  0, "parallel">;
+def HC_IterKindReduction : I32EnumAttrCase<"Reduction", 1, "reduction">;
+
+def HC_IterKind : I32EnumAttr<"IterKind",
+    "Iteration kind for `hc.generic` (parallel/reduction).",
+    [HC_IterKindParallel, HC_IterKindReduction]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::hc";
+}
+
+def HC_IterKindAttr : EnumAttr<HC_Dialect, HC_IterKind, "iter_kind"> {
+  let summary = "Iteration kind for `hc.generic` (parallel/reduction).";
+  let assemblyFormat = "$value";
+}
+
 def HC_EffectClassPure : I32EnumAttrCase<"Pure", 0, "pure">;
 def HC_EffectClassRead : I32EnumAttrCase<"Read", 1, "read">;
 def HC_EffectClassWrite : I32EnumAttrCase<"Write", 2, "write">;

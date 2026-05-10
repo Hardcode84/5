@@ -444,7 +444,8 @@ def HCYieldOp : HC_Op<"yield",
      DeclareOpInterfaceMethods<RegionBranchTerminatorOpInterface,
                                ["getSuccessorRegions"]>,
      ParentOneOf<["HCForRangeOp", "HCIfOp",
-                  "HCSubgroupRegionOp", "HCWorkitemRegionOp"]>]> {
+                  "HCSubgroupRegionOp", "HCWorkitemRegionOp",
+                  "HCGenericOp"]>]> {
   let summary =
       "Terminator for `hc.for_range` / `hc.if` / nested-scope regions.";
   let description = [{
@@ -1073,6 +1074,75 @@ def HCReduceOp : HC_Op<"reduce", [Pure]> {
     (`,` `keepdims` `=` $keepdims^)? attr-dict `:`
     type($value) `->` type($result)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// Generic compute op. Loosely mirrors `linalg.generic`: a body region of
+// scalar work, parameterized by a list of named iters with kinds
+// (parallel/reduction), driven over inputs and outputs whose addressing is
+// described by per-operand `#hc.expr` offsets resolved against the iter
+// names plus any outer-scope symbols. The post-flatten lowering is the only
+// op that combines symbolic offset analysis with body codegen, and the only
+// op authorized to emit vector loads/stores once the symbolic-stride pass
+// proves contiguity. See `doc/layouts.md` for the design.
+//===----------------------------------------------------------------------===//
+
+def HCGenericOp : HC_Op<"generic",
+    [SingleBlockImplicitTerminator<"HCYieldOp">,
+     AttrSizedOperandSegments]> {
+  let summary = "Generic compute over symbolically-addressed bare 1D values.";
+  let description = [{
+    Bodyful op that runs a scalar block over a Cartesian product of named
+    iters. Each iter has a name, an upper bound (lower bound 0, step 1), and
+    a kind: `parallel` iters are independent and a vectorization candidate;
+    `reduction` iters thread an output value across iterations as an
+    accumulator (the body reads the corresponding output block argument as
+    the running value and yields the updated value). Outputs follow
+    `linalg.generic`'s "outs-as-init" contract: each output operand is the
+    initial accumulator value and the produced result has the same type.
+
+    Operand addressing is symbolic: each input and output carries a
+    `#hc.expr` offset that is evaluated in a scope where the iter names are
+    bound to the current iter values and any other free symbols are bound
+    by the surrounding kernel scope. The op does not constrain offset
+    grammar; what `ixsimpl` accepts, the op accepts. The lowering owns
+    contiguity / linearity proofs.
+
+    Verifier rules:
+      - `iter_syms`, `iter_bounds`, `iter_kinds` are parallel arrays;
+        names must be unique and non-empty.
+      - Per-operand offset arrays must match operand counts.
+      - Body block has `ins.size() + outs.size()` arguments; each arg
+        type must match the element type of the corresponding operand
+        (`!hc.undef` operands escape the parity check).
+      - Each result type must equal the corresponding output operand's
+        type.
+      - Output offsets must reference only `parallel` iter names: a
+        reduction iter on an output offset would mean writing the same
+        slot twice without specifying combinator semantics, which the op
+        does not model.
+
+    Mask handling is deferred — pre-decomposition the input mask story
+    rides on `hc.load_mask` / `hc.store(mask=...)`; if `hc.generic`
+    grows mask operands it will be a separate slot, not piggybacked on
+    the offset array.
+  }];
+  let arguments = (ins
+    StrArrayAttr:$iter_syms,
+    Variadic<HC_ValueType>:$iter_bounds,
+    TypedArrayAttrBase<HC_IterKindAttr,
+                       "array of `#hc<iter_kind ...>` attributes">:$iter_kinds,
+    Variadic<HC_DecomposableShapedValueType>:$ins,
+    Variadic<HC_DecomposableShapedValueType>:$outs,
+    TypedArrayAttrBase<HC_ExprAttr,
+                       "array of `#hc.expr<...>` offsets">:$ins_offsets,
+    TypedArrayAttrBase<HC_ExprAttr,
+                       "array of `#hc.expr<...>` offsets">:$outs_offsets
+  );
+  let results = (outs Variadic<HC_DecomposableShapedValueType>:$results);
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def HCAsTypeOp : HC_Op<"astype", [Pure]> {

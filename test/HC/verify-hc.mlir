@@ -1024,3 +1024,192 @@ module {
     hc.return
   }
 }
+
+// -----
+
+// `hc.generic` requires at least one iter; an empty `iter ()` clause is
+// rejected at parse time before the verifier ever runs. The upstream
+// `parseKeyword` diagnostic fires first when the parser hits the
+// closing `)` instead of a kind keyword.
+// CHECK: error: custom op 'hc.generic' expected valid keyword
+module {
+  func.func @bad(%c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter ()
+        ins ()
+        outs (%c at (#hc.expr<"0">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// `outs ()` is parser-time-rejected because the body has nothing to
+// terminate against and the op would have no results.
+// CHECK: error: custom op 'hc.generic' outs clause requires at least one entry
+module {
+  func.func @bad(%n: index) {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs ()
+        -> () {
+      hc.yield
+    }
+    return
+  }
+}
+
+// -----
+
+// Bad iter kind keyword fails at parse with the listed alternatives.
+// CHECK: error: custom op 'hc.generic' expected `parallel` or `reduction`, got 'sequential'
+module {
+  func.func @bad(%n: index, %c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter (sequential i = %n : index)
+        ins ()
+        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Output offsets may reference parallel iters only — a reduction iter
+// would imply writing the same slot many times without specifying a
+// combinator, which the op does not model.
+// CHECK: error: 'hc.generic' op output #0 offset references reduction iter 'k'
+module {
+  func.func @bad(%m: index, %k: index,
+                 %a: !hc.bare_tensor<f32, ["M"]>,
+                 %c: !hc.bare_tensor<f32, ["M*K"]>)
+      -> !hc.bare_tensor<f32, ["M*K"]> {
+    %r = hc.generic
+        iter (parallel i = %m : index, reduction k = %k : index)
+        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M"]>)
+        outs (%c at (#hc.expr<"k + K*i">) : !hc.bare_tensor<f32, ["M*K"]>)
+        -> (!hc.bare_tensor<f32, ["M*K"]>) {
+    ^bb0(%av: f32, %cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["M*K"]>
+  }
+}
+
+// -----
+
+// Duplicate iter sym names: the symbolic engine binds them positionally
+// at access time, so two iters sharing a name is ambiguous.
+// CHECK: error: 'hc.generic' op duplicate iter sym 'i'
+module {
+  func.func @bad(%m: index, %n: index, %c: !hc.bare_tensor<f32, ["M*N"]>)
+      -> !hc.bare_tensor<f32, ["M*N"]> {
+    %r = hc.generic
+        iter (parallel i = %m : index, parallel i = %n : index)
+        ins ()
+        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["M*N"]>)
+        -> (!hc.bare_tensor<f32, ["M*N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["M*N"]>
+  }
+}
+
+// -----
+
+// Body block arg count must equal ins + outs (one scalar per operand).
+// CHECK: error: 'hc.generic' op body block takes 1 argument(s), expected 2 (one per ins/outs)
+module {
+  func.func @bad(%n: index,
+                 %a: !hc.bare_tensor<f32, ["N"]>,
+                 %c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Concrete operand element types must match the corresponding body
+// argument; `!hc.undef` would escape but `f32` body arg vs `f16` element
+// type doesn't.
+// CHECK: error: 'hc.generic' op body argument #0 type 'f32' does not match ins #0 element type 'f16'
+module {
+  func.func @bad(%n: index,
+                 %a: !hc.bare_tensor<f16, ["N"]>,
+                 %c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins (%a at (#hc.expr<"i">) : !hc.bare_tensor<f16, ["N"]>)
+        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%av: f32, %cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Yield arity must match the number of outputs; one missing operand and
+// the lowering can't tell which output got the new value.
+// CHECK: error: 'hc.generic' op hc.yield arity 1 != outs count 2
+module {
+  func.func @bad(%n: index,
+                 %c0: !hc.bare_tensor<f32, ["N"]>,
+                 %c1: !hc.bare_tensor<f32, ["N"]>)
+      -> (!hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>) {
+    %r:2 = hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%c0 at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>,
+              %c1 at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%c0v: f32, %c1v: f32):
+      hc.yield %c0v : f32
+    }
+    return %r#0, %r#1
+        : !hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Result types must equal outs operand types one-to-one.
+// CHECK: error: 'hc.generic' op result #0 type '!hc.bare_tensor<f16, ["N"]>' does not match outs operand type '!hc.bare_tensor<f32, ["N"]>'
+module {
+  func.func @bad(%n: index, %c: !hc.bare_tensor<f32, ["N"]>)
+      -> !hc.bare_tensor<f16, ["N"]> {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%c at (#hc.expr<"i">) : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f16, ["N"]>) {
+    ^bb0(%cv: f32):
+      hc.yield %cv : f32
+    }
+    return %r : !hc.bare_tensor<f16, ["N"]>
+  }
+}

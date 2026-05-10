@@ -5,6 +5,7 @@
 #include "hc/IR/HCOps.h"
 
 #include "hc/IR/HCDialect.h"
+#include "hc/IR/HCSymbols.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -1686,4 +1687,351 @@ void HCCallIntrinsicOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
   populateEffectsFromCallee<HCIntrinsicOp>(*this, effects);
+}
+
+//===----------------------------------------------------------------------===//
+// hc.generic parse/print/verify.
+//
+// Custom assembly format because the iter / ins / outs clauses interleave
+// SSA values, attributes, and types in a way the declarative format can't
+// express directly. The shape is:
+//
+//   hc.generic
+//       iter (parallel i = %m : index, reduction k = %kn : index)
+//       ins  (%a at #hc.expr<"i*K+k"> : !hc.bare_tensor<...>, ...)
+//       outs (%c at #hc.expr<"i*N+j"> : !hc.bare_tensor<...>)
+//       -> (!hc.bare_tensor<...>, ...)
+//       attributes { ... } {
+//     ^bb0(%av: f16, %bv: f16, %cv: f32):
+//       ...
+//       hc.yield %s : f32
+//   }
+//
+// `iter (...)` requires at least one entry; `outs (...)` requires at least
+// one output. `ins (...)` may be empty.
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// Symbolic-element extraction shared between the body-arg and yield checks.
+// `!hc.undef` returns null so callers escape parity for progressive typing.
+Type genericOperandElement(Type type) {
+  if (isHCUndefType(type))
+    return {};
+  if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type))
+    return shaped.getSymbolicElementType();
+  return {};
+}
+
+ParseResult parseGenericIterClause(
+    OpAsmParser &parser, SmallVectorImpl<Attribute> &iterSyms,
+    SmallVectorImpl<Attribute> &iterKinds,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &boundsOps,
+    SmallVectorImpl<Type> &boundsTypes) {
+  if (parser.parseKeyword("iter") || parser.parseLParen())
+    return failure();
+  // Empty `iter ()` is rejected at parse — the verifier would catch it
+  // anyway, but failing here gives a localized diagnostic.
+  MLIRContext *ctx = parser.getContext();
+  auto parseOne = [&]() -> ParseResult {
+    StringRef kindKw;
+    auto kindLoc = parser.getCurrentLocation();
+    if (parser.parseKeyword(&kindKw))
+      return failure();
+    auto kind = symbolizeIterKind(kindKw);
+    if (!kind)
+      return parser.emitError(kindLoc)
+             << "expected `parallel` or `reduction`, got '" << kindKw << "'";
+    iterKinds.push_back(IterKindAttr::get(ctx, *kind));
+    StringRef name;
+    auto nameLoc = parser.getCurrentLocation();
+    if (parser.parseKeyword(&name))
+      return failure();
+    if (name.empty())
+      return parser.emitError(nameLoc) << "iter sym name must be non-empty";
+    iterSyms.push_back(StringAttr::get(ctx, name));
+    OpAsmParser::UnresolvedOperand bound;
+    Type ty;
+    if (parser.parseEqual() || parser.parseOperand(bound) ||
+        parser.parseColonType(ty))
+      return failure();
+    boundsOps.push_back(bound);
+    boundsTypes.push_back(ty);
+    return success();
+  };
+  if (parseOne())
+    return failure();
+  while (succeeded(parser.parseOptionalComma()))
+    if (parseOne())
+      return failure();
+  return parser.parseRParen();
+}
+
+ParseResult parseGenericOperandClause(
+    OpAsmParser &parser, StringRef keyword, bool allowEmpty,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
+    SmallVectorImpl<Type> &types, SmallVectorImpl<Attribute> &offsets) {
+  if (parser.parseKeyword(keyword) || parser.parseLParen())
+    return failure();
+  if (succeeded(parser.parseOptionalRParen())) {
+    if (!allowEmpty)
+      return parser.emitError(parser.getCurrentLocation())
+             << keyword << " clause requires at least one entry";
+    return success();
+  }
+  auto parseOne = [&]() -> ParseResult {
+    OpAsmParser::UnresolvedOperand op;
+    Attribute offsetAttr;
+    Type ty;
+    // Parens around `#hc.expr<...>` shield the literal `:` separator from
+    // `parseExtendedAttr`, which would otherwise consume the trailing
+    // `:type` annotation as an attribute type. Same trick `hc.as_layout`
+    // uses for its structured layout payload.
+    auto offsetLoc = parser.getCurrentLocation();
+    if (parser.parseOperand(op) || parser.parseKeyword("at") ||
+        parser.parseLParen() || parser.parseAttribute(offsetAttr) ||
+        parser.parseRParen() || parser.parseColonType(ty))
+      return failure();
+    auto offset = llvm::dyn_cast<ExprAttr>(offsetAttr);
+    if (!offset)
+      return parser.emitError(offsetLoc) << "expected #hc.expr<...> attribute";
+    ops.push_back(op);
+    offsets.push_back(offset);
+    types.push_back(ty);
+    return success();
+  };
+  if (parseOne())
+    return failure();
+  while (succeeded(parser.parseOptionalComma()))
+    if (parseOne())
+      return failure();
+  return parser.parseRParen();
+}
+
+void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
+                               OperandRange operands, ArrayAttr offsets) {
+  p << ' ' << keyword << " (";
+  llvm::interleaveComma(
+      llvm::zip_equal(operands, offsets.getAsRange<ExprAttr>()), p,
+      [&](auto pair) {
+        auto [val, off] = pair;
+        p << val << " at (";
+        p.printAttribute(off);
+        p << ") : " << val.getType();
+      });
+  p << ")";
+}
+
+} // namespace
+
+ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
+  SmallVector<Attribute> iterSyms;
+  SmallVector<Attribute> iterKinds;
+  SmallVector<OpAsmParser::UnresolvedOperand> boundsOps;
+  SmallVector<Type> boundsTypes;
+  if (parseGenericIterClause(parser, iterSyms, iterKinds, boundsOps,
+                             boundsTypes))
+    return failure();
+
+  SmallVector<OpAsmParser::UnresolvedOperand> insOps;
+  SmallVector<Type> insTypes;
+  SmallVector<Attribute> insOffsets;
+  if (parseGenericOperandClause(parser, "ins", /*allowEmpty=*/true, insOps,
+                                insTypes, insOffsets))
+    return failure();
+
+  SmallVector<OpAsmParser::UnresolvedOperand> outsOps;
+  SmallVector<Type> outsTypes;
+  SmallVector<Attribute> outsOffsets;
+  if (parseGenericOperandClause(parser, "outs", /*allowEmpty=*/false, outsOps,
+                                outsTypes, outsOffsets))
+    return failure();
+
+  SmallVector<Type> resultTypes;
+  if (parser.parseArrow() || parser.parseLParen())
+    return failure();
+  if (failed(parser.parseOptionalRParen())) {
+    if (parser.parseTypeList(resultTypes) || parser.parseRParen())
+      return failure();
+  }
+
+  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, /*arguments=*/{},
+                         /*enableNameShadowing=*/false))
+    return failure();
+
+  // `resolveOperands` appends to `result.operands` in the call order; the
+  // ODS-declared operand groups (iter_bounds, ins, outs) must arrive in the
+  // same order so `operandSegmentSizes` reads them back consistently.
+  auto loc = parser.getCurrentLocation();
+  if (parser.resolveOperands(boundsOps, boundsTypes, loc, result.operands) ||
+      parser.resolveOperands(insOps, insTypes, loc, result.operands) ||
+      parser.resolveOperands(outsOps, outsTypes, loc, result.operands))
+    return failure();
+
+  MLIRContext *ctx = parser.getContext();
+  auto &builder = parser.getBuilder();
+  result.addAttribute(getIterSymsAttrName(result.name),
+                      ArrayAttr::get(ctx, iterSyms));
+  result.addAttribute(getIterKindsAttrName(result.name),
+                      ArrayAttr::get(ctx, iterKinds));
+  result.addAttribute(getInsOffsetsAttrName(result.name),
+                      ArrayAttr::get(ctx, insOffsets));
+  result.addAttribute(getOutsOffsetsAttrName(result.name),
+                      ArrayAttr::get(ctx, outsOffsets));
+  result.addAttribute(
+      getOperandSegmentSizesAttrName(result.name),
+      builder.getDenseI32ArrayAttr({static_cast<int32_t>(boundsOps.size()),
+                                    static_cast<int32_t>(insOps.size()),
+                                    static_cast<int32_t>(outsOps.size())}));
+  result.addTypes(resultTypes);
+  return success();
+}
+
+void HCGenericOp::print(OpAsmPrinter &p) {
+  p << " iter (";
+  llvm::interleaveComma(
+      llvm::zip_equal(getIterSymsAttr().getAsRange<StringAttr>(),
+                      getIterKindsAttr().getAsRange<IterKindAttr>(),
+                      getIterBounds()),
+      p, [&](auto t) {
+        auto [sym, kind, bound] = t;
+        p << stringifyIterKind(kind.getValue()) << ' ' << sym.getValue()
+          << " = " << bound << " : " << bound.getType();
+      });
+  p << ")";
+
+  printGenericOperandClause(p, "ins", getIns(), getInsOffsetsAttr());
+  printGenericOperandClause(p, "outs", getOuts(), getOutsOffsetsAttr());
+
+  p << " -> (";
+  llvm::interleaveComma(getResultTypes(), p, [&](Type t) { p.printType(t); });
+  p << ")";
+
+  p.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getIterSymsAttrName(), getIterKindsAttrName(),
+                       getInsOffsetsAttrName(), getOutsOffsetsAttrName(),
+                       getOperandSegmentSizesAttrName()});
+  p << ' ';
+  p.printRegion(getBody(), /*printEntryBlockArgs=*/true);
+}
+
+LogicalResult HCGenericOp::verify() {
+  ArrayAttr iterSyms = getIterSymsAttr();
+  ArrayAttr iterKinds = getIterKindsAttr();
+  OperandRange iterBounds = getIterBounds();
+  if (iterSyms.size() != iterBounds.size() ||
+      iterSyms.size() != iterKinds.size())
+    return emitOpError("iter_syms, iter_bounds, and iter_kinds must agree on "
+                       "iter count, got ")
+           << iterSyms.size() << ", " << iterBounds.size() << ", "
+           << iterKinds.size();
+  if (iterSyms.empty())
+    return emitOpError("must declare at least one iter");
+
+  llvm::StringSet<> seenSyms;
+  llvm::SmallDenseSet<StringRef> reductionSyms;
+  for (auto [symAttr, kindAttr] :
+       llvm::zip_equal(iterSyms.getAsRange<StringAttr>(),
+                       iterKinds.getAsRange<IterKindAttr>())) {
+    StringRef name = symAttr.getValue();
+    if (name.empty())
+      return emitOpError("iter sym names must be non-empty");
+    if (!seenSyms.insert(name).second)
+      return emitOpError("duplicate iter sym '") << name << "'";
+    if (kindAttr.getValue() == IterKind::Reduction)
+      reductionSyms.insert(name);
+  }
+
+  ArrayAttr insOffsets = getInsOffsetsAttr();
+  ArrayAttr outsOffsets = getOutsOffsetsAttr();
+  if (insOffsets.size() != getIns().size())
+    return emitOpError("ins_offsets count ")
+           << insOffsets.size() << " != ins count " << getIns().size();
+  if (outsOffsets.size() != getOuts().size())
+    return emitOpError("outs_offsets count ")
+           << outsOffsets.size() << " != outs count " << getOuts().size();
+
+  if (getOuts().empty())
+    return emitOpError("must declare at least one output");
+  if (getResults().size() != getOuts().size())
+    return emitOpError("results count ")
+           << getResults().size() << " != outs count " << getOuts().size();
+  for (auto [i, resTy, outVal] : llvm::enumerate(getResultTypes(), getOuts())) {
+    if (resTy != outVal.getType())
+      return emitOpError("result #")
+             << i << " type " << resTy << " does not match outs operand type "
+             << outVal.getType();
+  }
+
+  // Reduction iters on output offsets would mean writing the same slot
+  // twice along the reduction without specifying a combinator — the op
+  // doesn't model that; the reduction value rides on the outs-as-init
+  // body-arg/yield channel instead.
+  for (auto [i, offAttr] :
+       llvm::enumerate(outsOffsets.getAsRange<ExprAttr>())) {
+    StringRef bad;
+    sym::walkSymbolNames(offAttr.getValue(), [&](StringRef name) {
+      if (!bad.empty())
+        return;
+      if (reductionSyms.contains(name))
+        bad = name;
+    });
+    if (!bad.empty())
+      return emitOpError("output #")
+             << i << " offset references reduction iter '" << bad
+             << "'; only parallel iters may appear in output addressing";
+  }
+
+  Region &body = getBody();
+  if (body.empty())
+    return emitOpError("expected a body region with an entry block");
+  Block &entry = body.front();
+  size_t expectedArgs = getIns().size() + getOuts().size();
+  if (entry.getNumArguments() != expectedArgs)
+    return emitOpError("body block takes ")
+           << entry.getNumArguments() << " argument(s), expected "
+           << expectedArgs << " (one per ins/outs)";
+
+  auto checkArg = [&](size_t blockIdx, Value operand, StringRef role,
+                      size_t roleIdx) -> LogicalResult {
+    Type elem = genericOperandElement(operand.getType());
+    if (!elem)
+      return success();
+    Type blockArgType = entry.getArgument(blockIdx).getType();
+    if (isHCUndefType(blockArgType) || blockArgType == elem)
+      return success();
+    return emitOpError("body argument #")
+           << blockIdx << " type " << blockArgType << " does not match " << role
+           << " #" << roleIdx << " element type " << elem;
+  };
+  for (auto [i, in] : llvm::enumerate(getIns()))
+    if (failed(checkArg(i, in, "ins", i)))
+      return failure();
+  for (auto [i, out] : llvm::enumerate(getOuts()))
+    if (failed(checkArg(getIns().size() + i, out, "outs", i)))
+      return failure();
+
+  Operation *terminator = tryGetTerminator(entry);
+  auto yield = llvm::dyn_cast_or_null<HCYieldOp>(terminator);
+  if (!yield)
+    return emitOpError("body must terminate with `hc.yield`");
+  if (yield.getValues().size() != getOuts().size())
+    return emitOpError("hc.yield arity ")
+           << yield.getValues().size() << " != outs count " << getOuts().size();
+  for (auto [i, yv, outVal] : llvm::enumerate(yield.getValues(), getOuts())) {
+    Type yieldType = yv.getType();
+    Type outElem = genericOperandElement(outVal.getType());
+    if (!outElem || isHCUndefType(yieldType) || yieldType == outElem)
+      continue;
+    return emitOpError("hc.yield #")
+           << i << " type " << yieldType << " does not match outs #" << i
+           << " element type " << outElem;
+  }
+
+  return success();
 }

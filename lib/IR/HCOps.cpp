@@ -721,6 +721,67 @@ LogicalResult HCMaterializeBoundExprOp::verify() {
          << result;
 }
 
+// Shared check for `hc.idx_apply` / `hc.pred_apply`: ensures the
+// declared symbol list and the operand list line up, that no name
+// repeats, and that every listed name actually appears as a free
+// symbol in the carried expression / predicate. Names not listed
+// here remain ambient and are looked up from launch context during
+// lowering — we don't require all free symbols to be listed.
+template <typename WalkFreeSyms>
+static LogicalResult verifySymBindings(Operation *op, size_t numOperands,
+                                       ArrayAttr symbolsAttr,
+                                       WalkFreeSyms walkFreeSyms) {
+  if (symbolsAttr.size() != numOperands)
+    return op->emitOpError("symbols list has ")
+           << symbolsAttr.size() << " entries but the op has " << numOperands
+           << " operand(s)";
+
+  llvm::StringSet<> freeSyms;
+  walkFreeSyms([&](StringRef name) { freeSyms.insert(name); });
+
+  llvm::StringSet<> seen;
+  for (auto [idx, attr] : llvm::enumerate(symbolsAttr)) {
+    auto str = llvm::dyn_cast<StringAttr>(attr);
+    if (!str)
+      return op->emitOpError("symbols entry #")
+             << idx << " is not a StringAttr";
+    StringRef name = str.getValue();
+    if (name.empty())
+      return op->emitOpError("symbols entry #") << idx << " is empty";
+    if (!seen.insert(name).second)
+      return op->emitOpError("duplicate symbol binding for '") << name << "'";
+    if (!freeSyms.contains(name))
+      return op->emitOpError("symbol '")
+             << name
+             << "' is not a free symbol of the carried expression / predicate";
+  }
+  return success();
+}
+
+LogicalResult HCIdxApplyOp::verify() {
+  auto idx = llvm::dyn_cast<IdxType>(getResult().getType());
+  if (!idx || !idx.getExpr())
+    return emitOpError("result must pin a symbolic expression "
+                       "(e.g. `!hc.idx<\"i*K + j\">`)");
+  ExprAttr expr = idx.getExpr();
+  return verifySymBindings(*this, getOperands().size(), getSymbolsAttr(),
+                           [&](llvm::function_ref<void(StringRef)> sink) {
+                             sym::walkSymbolNames(expr.getValue(), sink);
+                           });
+}
+
+LogicalResult HCPredApplyOp::verify() {
+  auto pred = llvm::dyn_cast<PredType>(getResult().getType());
+  if (!pred || !pred.getPred())
+    return emitOpError("result must pin a symbolic predicate "
+                       "(e.g. `!hc.pred<\"i < K\">`)");
+  PredAttr predicate = pred.getPred();
+  return verifySymBindings(*this, getOperands().size(), getSymbolsAttr(),
+                           [&](llvm::function_ref<void(StringRef)> sink) {
+                             sym::walkSymbolNames(predicate.getValue(), sink);
+                           });
+}
+
 OpFoldResult HCConstOp::fold(FoldAdaptor /*adaptor*/) { return getValue(); }
 
 OpFoldResult HCUndefValueOp::fold(FoldAdaptor /*adaptor*/) {

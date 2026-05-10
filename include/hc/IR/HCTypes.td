@@ -387,6 +387,20 @@ def HC_PtrPredicateType : AnyTypeOf<[
   FixedVectorOfAnyRank<[I1]>,
 ]>;
 
+// Operand type for `hc.idx_apply` / `hc.pred_apply`: the SSA Value that
+// supplies the runtime integer for one explicitly-bound free symbol of
+// the carried expression / predicate. `index` is the natural form
+// (loop induction vars, `memref.dim` results, builtin arithmetic);
+// `!hc.idx<...>` is accepted so producers that already have a typed
+// symbolic SSA in hand don't have to round-trip through an
+// `unrealized_conversion_cast` to pass it as an operand. Lowering
+// converts both to `index` via the launch-body type converter before
+// substituting into the expression walk.
+def HC_SymBindingValueType : AnyTypeOf<[
+  Index,
+  HC_IdxType,
+]>;
+
 // Shaped values for ops that only make sense on tensors/vectors
 // (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
 // `!hc.undef` is admitted for the same pre-inference reason as above.

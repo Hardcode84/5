@@ -278,6 +278,65 @@ def HCMaterializeBoundExprOp : HC_Op<"materialize_bound_expr",
   let hasVerifier = 1;
 }
 
+def HCIdxApplyOp : HC_Op<"idx_apply",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary =
+      "Materialize an `!hc.idx<expr>` from explicitly bound operand values.";
+  let description = [{
+    Carries a symbolic expression on the result type (`!hc.idx<expr>`) and an
+    explicit binding of free symbols in `expr` to SSA operands. Each
+    `symbols[k]` names one free symbol of `expr` whose runtime integer is
+    supplied by `operands[k]`. Free symbols of `expr` not listed in `symbols`
+    are treated as ambient — resolved by lowering from the surrounding launch
+    context (`$WG*` / `$WI*` / `$WGS*`).
+
+    Operands are `index` or `!hc.idx<...>`; the `!hc.idx` form is accepted so
+    producers that already hold a typed symbolic SSA value can wire it in
+    without an explicit cast. The launch-body type converter folds both to
+    `index` before the expression walks the substituted operand.
+
+    Replaces the late-binding pattern of pairing a value-less
+    `hc.materialize_bound_expr` with ambient
+    `unrealized_conversion_cast %v : index to !hc.idx<sym>` carriers
+    walked from the parent `gpu.LaunchOp`. Same `expr`, but the operand
+    edge for every user-named symbol is now an explicit dataflow edge.
+  }];
+  let arguments = (ins
+    Variadic<HC_SymBindingValueType>:$operands,
+    StrArrayAttr:$symbols
+  );
+  let results = (outs HC_IdxType:$result);
+  let assemblyFormat = [{
+    `(` $operands `)` attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+def HCPredApplyOp : HC_Op<"pred_apply",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary =
+      "Materialize an `!hc.pred<pred>` from explicitly bound operand values.";
+  let description = [{
+    Predicate-side analogue of `hc.idx_apply`. Carries a symbolic predicate
+    on the result type (`!hc.pred<pred>`) and an explicit binding of free
+    symbols in `pred` to SSA operands. Operand semantics, the
+    listed-vs-ambient symbol split, and the lowering convention are identical
+    to `hc.idx_apply`; the only difference is that the result type is a
+    boolean-kind `!hc.pred<...>` rather than `!hc.idx<...>`. Operands remain
+    integer-kind because expression / predicate leaves are integer symbols
+    in either case.
+  }];
+  let arguments = (ins
+    Variadic<HC_SymBindingValueType>:$operands,
+    StrArrayAttr:$symbols
+  );
+  let results = (outs HC_PredType:$result);
+  let assemblyFormat = [{
+    `(` $operands `)` attr-dict `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
 def HCCastOp : HC_Op<"cast",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "User-visible value-level type conversion.";

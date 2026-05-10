@@ -653,6 +653,20 @@ HCMaterializeBoundExprOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
   return success();
 }
 
+LogicalResult HCIdxApplyOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+                                         SmallVectorImpl<Type> &resultTypes) {
+  // Result type is fully pinned by the carried `!hc.idx<expr>` and the
+  // declared symbols list; operand types contribute nothing further.
+  resultTypes.push_back(getResult().getType());
+  return success();
+}
+
+LogicalResult HCPredApplyOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
+                                          SmallVectorImpl<Type> &resultTypes) {
+  resultTypes.push_back(getResult().getType());
+  return success();
+}
+
 LogicalResult HCTupleOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   resultTypes.push_back(inferTupleResult(operandTypes, *this));

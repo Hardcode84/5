@@ -352,4 +352,36 @@ module {
     }
     return
   }
+
+  // `hc.idx_apply` substitutes its named operands into the carried
+  // expression while leaving unlisted free symbols (e.g. `$WG0` here)
+  // to the launch-context binding. The lowering composes the same
+  // arith ops as `hc.materialize_bound_expr` would for the same
+  // expression text, but the per-symbol SSA edges come straight from
+  // the op rather than via an ambient `unrealized_conversion_cast`
+  // walk over the launch.
+  // CHECK-LABEL: func.func @apply_offset(
+  // CHECK-SAME: %[[A:[^:]+]]: memref<?xf32>
+  // CHECK-SAME: %[[K:[^:)]+]]: index
+  // CHECK: gpu.launch blocks(%[[BX:[^,]+]], %{{[^,]+}}, %{{[^)]+}})
+  // CHECK: %[[OFF:.*]] = arith.addi %{{.*}}, %[[K]] : index
+  // CHECK: %[[CMP:.*]] = arith.cmpi slt, %{{.*}}, %{{.*}} : index
+  // CHECK-NOT: hc.idx_apply
+  // CHECK-NOT: hc.pred_apply
+  func.func @apply_offset(%a: memref<?xf32>, %ext_k: index) {
+    %c1 = arith.constant 1 : index
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %buffer = builtin.unrealized_conversion_cast %a
+          : memref<?xf32> to !hc.buffer<f32, ["M"]>
+      %k = builtin.unrealized_conversion_cast %ext_k
+          : index to !hc.idx<"K">
+      %off = hc.idx_apply (%k) {symbols = ["K"]}
+           : (!hc.idx<"K">) -> !hc.idx<"K + $WG0">
+      %p = hc.pred_apply (%k) {symbols = ["K"]}
+         : (!hc.idx<"K">) -> !hc.pred<"K < $WG0">
+      gpu.terminator
+    }
+    return
+  }
 }

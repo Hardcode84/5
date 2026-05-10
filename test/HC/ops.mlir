@@ -49,6 +49,12 @@
 // CHECK: hc.func @materialize_bound_expr {
 // CHECK: hc.materialize_bound_expr : !hc.idx<"$WI0">
 // CHECK: hc.materialize_bound_expr : !hc.pred<"-32 + $WI0 < 0">
+// CHECK: hc.func @apply_ops(%[[I:[^:]+]]: index, %[[K:[^:]+]]: !hc.idx<"K">, %[[J:[^:]+]]: index) {
+// CHECK: hc.idx_apply(%[[I]], %[[K]], %[[J]]) {symbols = ["i", "K", "j"]}
+// CHECK-SAME: : (index, !hc.idx<"K">, index) -> !hc.idx<"K + i*j">
+// CHECK: hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WG0">
+// CHECK: hc.pred_apply(%[[I]], %[[K]]) {symbols = ["i", "K"]}
+// CHECK-SAME: : (index, !hc.idx<"K">) -> !hc.pred<"-K + i < 0">
 
 module {
   func.func @use_types(
@@ -133,6 +139,21 @@ module {
   hc.func @materialize_bound_expr {
     %idx = hc.materialize_bound_expr : !hc.idx<"$WI0">
     %pred = hc.materialize_bound_expr : !hc.pred<"$WI0 < 32">
+    hc.return
+  }
+
+  // `idx_apply` / `pred_apply` carry an explicit symbol-to-operand
+  // binding alongside the symbolic expr / pred. Listed names get
+  // resolved from the matching operand; unlisted names (e.g. the
+  // launch-geometry `$WG0` below) stay ambient and are bound by the
+  // launch-body lowering. Operands are either `index` or
+  // `!hc.idx<...>` per `HC_SymBindingValueType`.
+  hc.func @apply_ops(%i: index, %k: !hc.idx<"K">, %j: index) {
+    %off = hc.idx_apply (%i, %k, %j) {symbols = ["i", "K", "j"]}
+         : (index, !hc.idx<"K">, index) -> !hc.idx<"i*j + K">
+    %wg = hc.idx_apply () {symbols = []} : () -> !hc.idx<"$WG0">
+    %p = hc.pred_apply (%i, %k) {symbols = ["i", "K"]}
+       : (index, !hc.idx<"K">) -> !hc.pred<"i < K">
     hc.return
   }
 }

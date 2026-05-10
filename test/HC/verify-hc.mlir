@@ -1341,6 +1341,73 @@ module {
 
 // -----
 
+// `hc.idx_apply`'s symbols list must line up element-wise with the
+// operand list — same number of entries, no missing or extra slot.
+// CHECK: error: 'hc.idx_apply' op symbols list has 2 entries but the op has 1 operand(s)
+module {
+  func.func @bad(%i: index) {
+    %off = hc.idx_apply (%i) {symbols = ["i", "K"]}
+         : (index) -> !hc.idx<"i + K">
+    return
+  }
+}
+
+// -----
+
+// Each entry of the symbols list must correspond to a free symbol of
+// the carried expression — the binding has nothing to do otherwise.
+// Listing 'q' against `!hc.idx<"i">` is a producer bug worth flagging.
+// CHECK: error: 'hc.idx_apply' op symbol 'q' is not a free symbol of the carried expression / predicate
+module {
+  func.func @bad(%i: index) {
+    %off = hc.idx_apply (%i) {symbols = ["q"]}
+         : (index) -> !hc.idx<"i">
+    return
+  }
+}
+
+// -----
+
+// Symbols must be unique within one op so the binding stays a function
+// from name to operand. Two slots claiming the same name would race.
+// CHECK: error: 'hc.idx_apply' op duplicate symbol binding for 'i'
+module {
+  func.func @bad(%i: index, %j: index) {
+    %off = hc.idx_apply (%i, %j) {symbols = ["i", "i"]}
+         : (index, index) -> !hc.idx<"i">
+    return
+  }
+}
+
+// -----
+
+// Bare `!hc.idx` (no pinned expression) carries no symbols to bind, so
+// the apply op has nothing to lower. The check mirrors the
+// `hc.materialize_bound_expr` pin requirement.
+// CHECK: error: 'hc.idx_apply' op result must pin a symbolic expression
+module {
+  func.func @bad(%i: index) {
+    %off = hc.idx_apply (%i) {symbols = ["i"]}
+         : (index) -> !hc.idx
+    return
+  }
+}
+
+// -----
+
+// `hc.pred_apply` enforces the same shape rules with a predicate-side
+// pin requirement on the result type.
+// CHECK: error: 'hc.pred_apply' op result must pin a symbolic predicate
+module {
+  func.func @bad(%i: index) {
+    %p = hc.pred_apply (%i) {symbols = ["i"]}
+       : (index) -> !hc.pred
+    return
+  }
+}
+
+// -----
+
 // The "outputs reference parallel iters only" rule applies to ptr-typed
 // outs too — a reduction iter on a memory destination's offset would
 // store the same address several times along the reduction without a

@@ -626,6 +626,67 @@ struct ConvertMaterializeBoundExprOp
   }
 };
 
+// Build a `BoundValues` for one `hc.idx_apply` / `hc.pred_apply` op.
+// Explicit operand bindings are authoritative (direct map insert
+// rather than `bind()`, which uses `try_emplace`); the ambient walk
+// fills in everything else for free symbols left unlisted (e.g.
+// launch geometry like `$WG0`).
+static BoundValues collectApplyBindings(Operation *op,
+                                        ConversionPatternRewriter &rewriter,
+                                        ArrayAttr symbols,
+                                        ValueRange convertedOperands) {
+  BoundValues boundValues = collectBoundValues(op, rewriter);
+  for (auto [attr, operand] : llvm::zip(symbols, convertedOperands)) {
+    StringRef name = cast<StringAttr>(attr).getValue();
+    if (name.empty())
+      continue;
+    boundValues.symbols[name] = indexCast(rewriter, op->getLoc(), operand);
+  }
+  return boundValues;
+}
+
+struct ConvertIdxApplyOp : public OpConversionPattern<HCIdxApplyOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCIdxApplyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto idx = dyn_cast<IdxType>(op.getResult().getType());
+    if (!idx || !idx.getExpr())
+      return op.emitOpError("expected `!hc.idx<expr>` result type");
+
+    BoundValues boundValues = collectApplyBindings(
+        op, rewriter, op.getSymbolsAttr(), adaptor.getOperands());
+    ExprLowerer lowerer(rewriter, op.getLoc(), boundValues);
+    FailureOr<Value> lowered = lowerer.lower(idx.getExpr());
+    if (failed(lowered))
+      return op.emitOpError("failed to lower idx_apply expression");
+    rewriter.replaceOp(op, *lowered);
+    return success();
+  }
+};
+
+struct ConvertPredApplyOp : public OpConversionPattern<HCPredApplyOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCPredApplyOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto pred = dyn_cast<PredType>(op.getResult().getType());
+    if (!pred || !pred.getPred())
+      return op.emitOpError("expected `!hc.pred<pred>` result type");
+
+    BoundValues boundValues = collectApplyBindings(
+        op, rewriter, op.getSymbolsAttr(), adaptor.getOperands());
+    ExprLowerer lowerer(rewriter, op.getLoc(), boundValues);
+    FailureOr<Value> lowered = lowerer.lower(pred.getPred());
+    if (failed(lowered))
+      return op.emitOpError("failed to lower pred_apply predicate");
+    rewriter.replaceOp(op, *lowered);
+    return success();
+  }
+};
+
 static FailureOr<TypedAttr> splatAttr(OpBuilder &builder, Type type,
                                       int64_t value) {
   Type elementType = type;
@@ -2119,8 +2180,8 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                MLIRContext *ctx,
                                                RewritePatternSet &patterns) {
   patterns.add<
-      ConvertMaterializeBoundExprOp, ConvertConstOp,
-      ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
+      ConvertMaterializeBoundExprOp, ConvertIdxApplyOp, ConvertPredApplyOp,
+      ConvertConstOp, ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
       ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
       ConvertIntBinaryOp<HCMulOp, arith::MulIOp>, ConvertDivOp,
       ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
@@ -2155,13 +2216,13 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
                          gpu::GPUDialect, memref::MemRefDialect,
                          scf::SCFDialect, vector::VectorDialect>();
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp>();
-  target.addIllegalOp<HCMaterializeBoundExprOp, HCConstOp, HCAddOp, HCSubOp,
-                      HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
-                      HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
-                      HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
-                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
-                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
+  target.addIllegalOp<
+      HCMaterializeBoundExprOp, HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp,
+      HCSubOp, HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
+      HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp,
+      HCLoadOp, HCVLoadOp, HCLoadMaskOp, HCBufferViewOp, HCVecOp, HCVZerosOp,
+      HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp,
+      HCEmptyOp, HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

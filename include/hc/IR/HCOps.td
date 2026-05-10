@@ -835,18 +835,25 @@ def HCAsLayoutOp : HC_Op<"as_layout",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Change the layout of a tensor or vector value.";
   let description = [{
-    `$layout` is a typed `#hc<named_layout ...>` enum attribute. v0 admits
-    `row_major` and `col_major`; wrong spellings fail at parse, not verify.
-    Lifted out of `attr-dict` so the surface reads like the other explicit
-    keyword-argument ops (`hc.reduce`, `hc.astype`). The `named_layout`
-    enum is transitional: a follow-up canonicalization pass folds it into
-    the structured `#hc.layout<...>` attribute documented in
-    `doc/layouts.md`.
+    `$layout` is either the legacy `#hc<named_layout ...>` enum
+    (`row_major` / `col_major`) or the structured `#hc.layout<...>`
+    descriptor documented in `doc/layouts.md`. Both spellings are
+    accepted in surface IR; the named-enum form is transitional and a
+    follow-up canonicalization pass folds it into the structured
+    representation. Wrong spellings fail at parse: an unknown keyword
+    after `layout =` rejects with a located diagnostic listing the
+    accepted forms.
+
+    Lifted out of `attr-dict` so the surface reads like the other
+    explicit keyword-argument ops (`hc.reduce`, `hc.astype`).
   }];
-  let arguments = (ins HC_ShapedValueType:$value, HC_NamedLayoutAttr:$layout);
+  let arguments = (ins
+    HC_ShapedValueType:$value,
+    AnyAttrOf<[HC_NamedLayoutAttr, HC_LayoutAttr]>:$layout
+  );
   let results = (outs HC_ShapedValueType:$result);
   let assemblyFormat = [{
-    $value `,` `layout` `=` $layout attr-dict `:`
+    $value `,` `layout` `=` custom<HCAsLayoutAttr>($layout) attr-dict `:`
     type($value) `->` type($result)
   }];
 }

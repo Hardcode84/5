@@ -92,6 +92,20 @@ func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
   return
 }
 
+// CHECK-LABEL: func.func @as_layout_structured
+// Both attribute kinds round-trip on the same op surface; the named-enum
+// keyword for back-compat, the structured `#hc.layout<...>` for the
+// `doc/layouts.md` direction. Structured spellings are wrapped in
+// `(...)` to disambiguate from the trailing `: type` on the op.
+// CHECK: hc.as_layout %{{.*}}, layout = (#hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">>) : !hc.undef -> !hc.undef
+func.func @as_layout_structured(%v: !hc.undef) -> !hc.undef {
+  %r = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0"], index_syms = ["i0"], params = {},
+    storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">
+  >) : !hc.undef -> !hc.undef
+  return %r : !hc.undef
+}
+
 // CHECK-LABEL: func.func @allocators
 // CHECK: hc.vzeros shape %{{.*}} : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
 // CHECK: hc.vones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>

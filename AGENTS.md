@@ -115,6 +115,7 @@ Code comments, docstrings, and commit messages share the same voice: terse, dry,
 - Use `cast<Type>(arg)` syntax.
 - Prefer `llvm::seq` to C-style counted loops.
 - For MLIR/C++ debug logging, include `llvm/Support/DebugLog.h` and use `LDBG()` / `LDBG_OS()` instead of raw `LLVM_DEBUG(llvm::dbgs() << ...)`.
+- Mark TU-local free functions `static` even inside an `namespace { ... }`. Anonymous namespaces house struct/class definitions; free functions get an explicit `static` so the storage class is visible at the signature and not implied from a brace fifty lines up. Templates keep `template <...>` first then `static`; `[[noreturn]]` stays leftmost.
 
 ### MLIR
 

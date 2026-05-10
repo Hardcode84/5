@@ -51,7 +51,7 @@ struct CanonicalRowMajor {
   sym::ExprHandle storage;
 };
 
-FailureOr<CanonicalRowMajor>
+static FailureOr<CanonicalRowMajor>
 buildCanonicalRowMajor(sym::Store &store, ArrayRef<Attribute> shapeSyms,
                        ArrayRef<Attribute> indexSyms) {
   auto liftSym = [&](Attribute name) -> FailureOr<sym::ExprHandle> {
@@ -142,7 +142,7 @@ buildCanonicalRowMajor(sym::Store &store, ArrayRef<Attribute> shapeSyms,
 // Absent layout (`!layout`) is the v0 identity by definition; this helper
 // only fires for the explicit case so the pass can decide whether to
 // strip the slot.
-bool isIdentityLayout(LayoutAttr layout, ShapeAttr shape) {
+static bool isIdentityLayout(LayoutAttr layout, ShapeAttr shape) {
   if (!layout)
     return false;
   if (!shape)

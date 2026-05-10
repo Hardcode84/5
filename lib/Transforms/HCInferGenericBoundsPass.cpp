@@ -47,7 +47,7 @@ struct ImpliedBound {
 // for non-shaped operands (e.g. `!hc.undef`) or non-`#hc.expr` shape
 // entries. Either case means the operand can't bind anything here, and
 // we move on to the next pair.
-ExprAttr operandDimExpr(Value operand, size_t axis) {
+static ExprAttr operandDimExpr(Value operand, size_t axis) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(operand.getType());
   if (!shaped)
     return {};
@@ -61,16 +61,16 @@ ExprAttr operandDimExpr(Value operand, size_t axis) {
 // symbol `iterSym` under ixsimpl-canonical form. Built via the
 // hash-consed compose API so pointer equality is the comparison;
 // affine and scaled patterns deliberately fall through the floor for
-// now (the bead description calls out the v0 limit).
-bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
-                         StringRef iterSym) {
+// now — a richer matcher is the obvious next axis to grow.
+static bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
+                                StringRef iterSym) {
   auto bareHandle = sym::composeExprSym(store, iterSym);
   if (failed(bareHandle))
     return false;
   return offset.getValue() == *bareHandle;
 }
 
-LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
+static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
   ArrayAttr iterSyms = op.getIterSymsAttr();
   OperandRange iterBounds = op.getIterBounds();
   ArrayAttr insOffsets = op.getInsOffsetsAttr();

@@ -20,7 +20,7 @@ using namespace mlir::hc::sym;
 
 namespace {
 
-std::string joinSessionErrors(ixs_session *session) {
+static std::string joinSessionErrors(ixs_session *session) {
   std::string message;
   llvm::raw_string_ostream os(message);
   size_t nerrors = ixs_session_nerrors(session);
@@ -32,7 +32,7 @@ std::string joinSessionErrors(ixs_session *session) {
   return message;
 }
 
-std::string renderNode(const ixs_node *node) {
+static std::string renderNode(const ixs_node *node) {
   assert(node && "expected non-null ixsimpl node");
   auto *rawNode = const_cast<ixs_node *>(node);
   // The vendored ixsimpl printer is a pure read-only walk over the immutable
@@ -46,17 +46,17 @@ std::string renderNode(const ixs_node *node) {
   return text;
 }
 
-HCDialect &getHCDialect(MLIRContext *context) {
+static HCDialect &getHCDialect(MLIRContext *context) {
   return *context->getOrLoadDialect<HCDialect>();
 }
 
-void setDiagnostic(std::string *diagnostic, std::string message) {
+static void setDiagnostic(std::string *diagnostic, std::string message) {
   if (diagnostic)
     *diagnostic = std::move(message);
 }
 
-ixs_node *importNode(Session &session, const ixs_node *node,
-                     std::string *diagnostic, const char *kind) {
+static ixs_node *importNode(Session &session, const ixs_node *node,
+                            std::string *diagnostic, const char *kind) {
   if (!node) {
     setDiagnostic(diagnostic, std::string("cannot compose null ") + kind);
     return nullptr;
@@ -67,8 +67,8 @@ ixs_node *importNode(Session &session, const ixs_node *node,
   return imported;
 }
 
-void walkSymbolNamesImpl(const ixs_node *node,
-                         llvm::function_ref<void(StringRef)> callback) {
+static void walkSymbolNamesImpl(const ixs_node *node,
+                                llvm::function_ref<void(StringRef)> callback) {
   if (!node)
     return;
 
@@ -87,9 +87,9 @@ void walkSymbolNamesImpl(const ixs_node *node,
   }
 }
 
-FailureOr<ExprHandle> finishExpr(ixs_session *session, ixs_node *node,
-                                 std::string *diagnostic,
-                                 const char *fallback) {
+static FailureOr<ExprHandle> finishExpr(ixs_session *session, ixs_node *node,
+                                        std::string *diagnostic,
+                                        const char *fallback) {
   if (!node) {
     setDiagnostic(diagnostic, fallback);
     return failure();
@@ -102,9 +102,9 @@ FailureOr<ExprHandle> finishExpr(ixs_session *session, ixs_node *node,
   return ExprHandle(node);
 }
 
-FailureOr<PredHandle> finishPred(ixs_session *session, ixs_node *node,
-                                 std::string *diagnostic,
-                                 const char *fallback) {
+static FailureOr<PredHandle> finishPred(ixs_session *session, ixs_node *node,
+                                        std::string *diagnostic,
+                                        const char *fallback) {
   if (!node) {
     setDiagnostic(diagnostic, fallback);
     return failure();

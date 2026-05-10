@@ -58,7 +58,7 @@ namespace {
 // Check whether a `hc_front.call`'s callee is a `ref.kind = "inline"`
 // name op. Absent defining op / absent ref / different kind all
 // collapse to false — non-inline calls are outside this pass's scope.
-bool isInlineCall(hc_front::CallOp call) {
+static bool isInlineCall(hc_front::CallOp call) {
   auto nameOp = call.getCallee().getDefiningOp<hc_front::NameOp>();
   if (!nameOp)
     return false;
@@ -74,7 +74,7 @@ bool isInlineCall(hc_front::CallOp call) {
 // nested regions (a previously-inlined call's `hc_front.inlined_region`
 // or a `hc_front.if` body, etc.) have their own returns that aren't
 // *this* function's return.
-FailureOr<hc_front::ReturnOp> findSingleReturn(hc_front::FuncOp func) {
+static FailureOr<hc_front::ReturnOp> findSingleReturn(hc_front::FuncOp func) {
   hc_front::ReturnOp found;
   Block &entry = func.getBody().front();
   for (Operation &op : entry) {

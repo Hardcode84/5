@@ -35,13 +35,14 @@ hipModuleUnload_t g_hipModuleUnload = nullptr;
 hipModuleLoadData_t g_hipModuleLoadData = nullptr;
 hipModuleGetFunction_t g_hipModuleGetFunction = nullptr;
 
-void *symbolOrNull(ModuleHandle module, const char *name) {
+static void *symbolOrNull(ModuleHandle module, const char *name) {
 #if defined(__linux__)
   return dlsym(module, name);
 #endif
 }
 
-template <typename Fn> Fn requireSymbol(ModuleHandle module, const char *name) {
+template <typename Fn>
+static Fn requireSymbol(ModuleHandle module, const char *name) {
   void *raw = symbolOrNull(module, name);
   if (!raw)
     throw std::runtime_error(
@@ -54,8 +55,8 @@ template <typename Fn> Fn requireSymbol(ModuleHandle module, const char *name) {
 // name and the human-readable message, including the location where the
 // call originated (so a launch failure points at the launch site rather
 // than the helper).
-[[noreturn]] void throwHipError(hipError_t code, const char *expression,
-                                const char *file, int line) {
+[[noreturn]] static void throwHipError(hipError_t code, const char *expression,
+                                       const char *file, int line) {
   std::ostringstream msg;
   msg << "hc_rt: HIP error " << code;
   if (g_hipGetErrorName) {

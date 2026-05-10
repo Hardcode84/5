@@ -1495,7 +1495,7 @@ namespace {
 // Returns the `PtrType` payload, or null when the operand is still
 // `!hc.undef`. Anything else is an unreachable verifier-time bug because
 // `HC_PtrValueType` already restricted the constraint.
-PtrType ptrTypeOrUndef(Type type) {
+static PtrType ptrTypeOrUndef(Type type) {
   if (isHCUndefType(type))
     return {};
   return llvm::cast<PtrType>(type);
@@ -1505,8 +1505,8 @@ PtrType ptrTypeOrUndef(Type type) {
 // require an exact match, opaque pointers (no element type on the
 // pointer) accept anything. `!hc.undef` on either side escapes — the
 // caller has already filtered out the `!hc.ptr` shell.
-LogicalResult checkScalarMatchesPointer(Operation *op, Type scalar, PtrType ptr,
-                                        StringRef role) {
+static LogicalResult checkScalarMatchesPointer(Operation *op, Type scalar,
+                                               PtrType ptr, StringRef role) {
   if (!ptr || isHCUndefType(scalar))
     return success();
   Type elem = ptr.getElementType();
@@ -1715,7 +1715,7 @@ namespace {
 
 // Symbolic-element extraction shared between the body-arg and yield checks.
 // `!hc.undef` returns null so callers escape parity for progressive typing.
-Type genericOperandElement(Type type) {
+static Type genericOperandElement(Type type) {
   if (isHCUndefType(type))
     return {};
   if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type))
@@ -1723,7 +1723,7 @@ Type genericOperandElement(Type type) {
   return {};
 }
 
-ParseResult parseGenericIterClause(
+static ParseResult parseGenericIterClause(
     OpAsmParser &parser, SmallVectorImpl<Attribute> &iterSyms,
     SmallVectorImpl<Attribute> &iterKinds,
     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &boundsOps,
@@ -1767,7 +1767,7 @@ ParseResult parseGenericIterClause(
   return parser.parseRParen();
 }
 
-ParseResult parseGenericOperandClause(
+static ParseResult parseGenericOperandClause(
     OpAsmParser &parser, StringRef keyword, bool allowEmpty,
     SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
     SmallVectorImpl<Type> &types, SmallVectorImpl<Attribute> &offsets) {
@@ -1827,8 +1827,9 @@ ParseResult parseGenericOperandClause(
   return parser.parseRParen();
 }
 
-void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
-                               OperandRange operands, ArrayAttr offsets) {
+static void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
+                                      OperandRange operands,
+                                      ArrayAttr offsets) {
   p << ' ' << keyword << " (";
   llvm::interleaveComma(
       llvm::zip_equal(operands, offsets.getAsRange<ArrayAttr>()), p,

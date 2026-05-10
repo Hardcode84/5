@@ -167,8 +167,8 @@ using StoreParser = FailureOr<HandleT> (*)(sym::Store &, llvm::StringRef,
 // returns `success` iff the next token is a string literal, so we can branch
 // on it without lookahead hacks.
 template <typename AttrT, typename HandleT, StoreParser<HandleT> ParseFn>
-FailureOr<AttrT> parseInlineOrAttrForm(AsmParser &parser,
-                                       llvm::StringRef what) {
+static FailureOr<AttrT> parseInlineOrAttrForm(AsmParser &parser,
+                                              llvm::StringRef what) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   std::string text;
   if (succeeded(parser.parseOptionalString(&text))) {
@@ -195,15 +195,15 @@ FailureOr<AttrT> parseInlineOrAttrForm(AsmParser &parser,
   return attr;
 }
 
-void printInlineNode(AsmPrinter &printer, MLIRContext *ctx,
-                     const ixs_node *node) {
+static void printInlineNode(AsmPrinter &printer, MLIRContext *ctx,
+                            const ixs_node *node) {
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   printer.printString(store.render(node));
 }
 
 template <typename AttrT>
-FailureOr<AttrT> parseTypedAttr(AsmParser &parser, StringRef key,
-                                StringRef expected) {
+static FailureOr<AttrT> parseTypedAttr(AsmParser &parser, StringRef key,
+                                       StringRef expected) {
   Attribute attr;
   if (parser.parseAttribute(attr))
     return failure();

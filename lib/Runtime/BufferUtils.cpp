@@ -56,7 +56,7 @@ private:
 // Fetch the latest Python error (if any), wrap it in a C++ exception, and
 // clear it from the interpreter. The host wrapper does not catch this; it
 // unwinds back through ctypes which surfaces a Python `RuntimeError`.
-[[noreturn]] void raisePythonError(const char *context) {
+[[noreturn]] static void raisePythonError(const char *context) {
   std::string message(context);
   if (PyErr_Occurred()) {
     PyObject *type = nullptr;
@@ -84,7 +84,8 @@ private:
 // Call `obj.<method>(int_arg)` and convert the result via PyLong_AsLongLong.
 // Used by both `get_dim` and `get_stride` — they share the entire flow
 // modulo the method name.
-int64_t callIntegerAccessor(PyObject *obj, const char *method, int32_t index) {
+static int64_t callIntegerAccessor(PyObject *obj, const char *method,
+                                   int32_t index) {
   PyRef bound(PyObject_GetAttrString(obj, method));
   if (!bound)
     raisePythonError(

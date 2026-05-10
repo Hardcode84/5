@@ -50,7 +50,7 @@ namespace {
 // AMDGPU initializers are gated on the build's target list; calling
 // them more than once is safe and they bail out cheaply if the target
 // is already registered.
-void initializeAMDGPUTargetOnce() {
+static void initializeAMDGPUTargetOnce() {
   static const bool done = []() {
     LLVMInitializeAMDGPUTarget();
     LLVMInitializeAMDGPUTargetInfo();

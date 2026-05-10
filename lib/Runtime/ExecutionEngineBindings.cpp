@@ -34,7 +34,7 @@ namespace {
 // formatter runs (see ExecutionEngine::lookup for the long-form
 // explanation).
 template <typename T>
-T unwrapExpected(llvm::Expected<T> expected, const char *context) {
+static T unwrapExpected(llvm::Expected<T> expected, const char *context) {
   if (expected)
     return std::move(*expected);
   std::string message;

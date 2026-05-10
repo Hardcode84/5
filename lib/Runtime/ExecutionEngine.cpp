@@ -50,7 +50,7 @@ namespace {
 // target's codegen + asm printer + asm parser registered before any
 // compile happens; doing it lazily here keeps callers from having to
 // remember it.
-void initializeNativeTargetOnce() {
+static void initializeNativeTargetOnce() {
   static const bool done = []() {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
@@ -60,7 +60,7 @@ void initializeNativeTargetOnce() {
   (void)done;
 }
 
-llvm::Error makeStringError(const llvm::Twine &message) {
+static llvm::Error makeStringError(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
 }
@@ -73,7 +73,7 @@ llvm::Error makeStringError(const llvm::Twine &message) {
 // dialect surface keeps the wheel size honest. If a future pipeline
 // stage starts emitting something else, the parser will surface a
 // "unregistered dialect" diagnostic that points right at the gap.
-std::unique_ptr<mlir::MLIRContext> makeMLIRContext() {
+static std::unique_ptr<mlir::MLIRContext> makeMLIRContext() {
   mlir::DialectRegistry registry;
   registry.insert<mlir::LLVM::LLVMDialect>();
   mlir::registerBuiltinDialectTranslation(registry);

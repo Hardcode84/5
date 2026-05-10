@@ -51,8 +51,9 @@ namespace {
 // Wave's helper, copied verbatim: keep symbol uniqueness scoped to the
 // module's symbol table so multiple launches of the same kernel each
 // get their own `_data` / `_handle` globals.
-SmallString<128> getUniqueLLVMGlobalName(ModuleOp mod, SymbolTable &table,
-                                         const llvm::Twine &srcName) {
+static SmallString<128> getUniqueLLVMGlobalName(ModuleOp mod,
+                                                SymbolTable &table,
+                                                const llvm::Twine &srcName) {
   unsigned counter = 0;
   return SymbolTable::generateSymbolName<128>(
       srcName.str(),
@@ -94,9 +95,9 @@ struct FunctionCallBuilder {
 // Mint a fresh internal-linkage global with the given element type and a
 // `zeroinitializer` body, return its address. Used for the per-callsite
 // `hipFunction_t` cache slot the runtime fills on first launch.
-Value createKernelHandle(OpBuilder &builder, SymbolTable &symbolTable,
-                         Type globalType, ModuleOp mod,
-                         const llvm::Twine &name) {
+static Value createKernelHandle(OpBuilder &builder, SymbolTable &symbolTable,
+                                Type globalType, ModuleOp mod,
+                                const llvm::Twine &name) {
   Type ptrType = LLVM::LLVMPointerType::get(builder.getContext());
   Location loc = builder.getUnknownLoc();
   LLVM::GlobalOp handle;
@@ -115,7 +116,7 @@ Value createKernelHandle(OpBuilder &builder, SymbolTable &symbolTable,
 // Pull the raw blob out of a `gpu.binary`. We require exactly one object
 // (the schedule produces one `#gpu.object` per binary — single rocdl
 // target). Anything else is a hard error rather than picking blindly.
-gpu::ObjectAttr getSelectedObject(gpu::BinaryOp op) {
+static gpu::ObjectAttr getSelectedObject(gpu::BinaryOp op) {
   ArrayRef<Attribute> objects = op.getObjectsAttr().getValue();
   if (objects.size() != 1) {
     op->emitError("hc-lower-launch-func-to-runtime: gpu.binary must carry "
@@ -130,7 +131,7 @@ gpu::ObjectAttr getSelectedObject(gpu::BinaryOp op) {
   return result;
 }
 
-gpu::ObjectAttr getBinary(gpu::LaunchFuncOp op) {
+static gpu::ObjectAttr getBinary(gpu::LaunchFuncOp op) {
   auto kernelBinary = SymbolTable::lookupNearestSymbolFrom<gpu::BinaryOp>(
       op, op.getKernelModuleName());
   if (!kernelBinary) {

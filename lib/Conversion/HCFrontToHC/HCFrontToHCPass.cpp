@@ -249,7 +249,8 @@ private:
 // `hc_front` uses for `work_shape` / `group_shape`) into a `#hc.shape<...>`
 // attribute. Returns null on a malformed dimension so the caller can emit a
 // diagnostic against the source op.
-FailureOr<ShapeAttr> stringArrayToShape(Operation *sourceOp, ArrayAttr array) {
+static FailureOr<ShapeAttr> stringArrayToShape(Operation *sourceOp,
+                                               ArrayAttr array) {
   MLIRContext *ctx = sourceOp->getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   SmallVector<Attribute> dims;
@@ -275,8 +276,8 @@ FailureOr<ShapeAttr> stringArrayToShape(Operation *sourceOp, ArrayAttr array) {
   return ShapeAttr::get(ctx, dims);
 }
 
-FailureOr<ExprAttr> stringToExpr(Operation *sourceOp, StringAttr text,
-                                 StringRef attrName) {
+static FailureOr<ExprAttr> stringToExpr(Operation *sourceOp, StringAttr text,
+                                        StringRef attrName) {
   MLIRContext *ctx = sourceOp->getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   std::string diag;
@@ -312,7 +313,7 @@ static bool unresolvedFrontFuncDeclaresNoResults(Operation *anchor,
 // The front-end emits `effects = "pure"` / `"read"` / `"write"` /
 // `"read_write"` as a plain string. Translate into the typed `HC_EffectsAttr`
 // that `hc.func` / `hc.intrinsic` want.
-std::optional<EffectClass> parseEffectClass(StringRef text) {
+static std::optional<EffectClass> parseEffectClass(StringRef text) {
   return llvm::StringSwitch<std::optional<EffectClass>>(text)
       .Case("pure", EffectClass::Pure)
       .Case("read", EffectClass::Read)
@@ -334,7 +335,8 @@ std::optional<EffectClass> parseEffectClass(StringRef text) {
 // fabricating an arbitrary type.
 //===----------------------------------------------------------------------===//
 
-std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
+static std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx,
+                                                 StringRef name) {
   return llvm::StringSwitch<std::optional<Type>>(name)
       .Cases({"float16", "half"}, Float16Type::get(ctx))
       .Cases({"float32", "single"}, Float32Type::get(ctx))
@@ -377,7 +379,7 @@ std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx, StringRef name) {
 // bracket the safe range, and treat i1 separately as NumPy's `bool_`
 // truthiness rather than bit-pattern truncation — `APInt(1, 2)` would
 // store 0 (low bit), flipping the user's boolean under our feet.
-Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
+static Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
   if (auto ft = dyn_cast<FloatType>(targetTy)) {
     if (auto f = dyn_cast<FloatAttr>(src))
       return FloatAttr::get(ft, f.getValueAsDouble());
@@ -428,7 +430,8 @@ Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
 // — not the original buffer's next axis. Splicing two index lists
 // together would silently misaddress in the general slice/slice case,
 // so we stop at one level and let the caller diagnose.
-Value peelBufferView(Value handle, SmallVectorImpl<Value> &extraIndices) {
+static Value peelBufferView(Value handle,
+                            SmallVectorImpl<Value> &extraIndices) {
   if (!extraIndices.empty())
     return handle;
   auto view = handle.getDefiningOp<HCBufferViewOp>();
@@ -446,8 +449,8 @@ Value peelBufferView(Value handle, SmallVectorImpl<Value> &extraIndices) {
 // typing.
 //===----------------------------------------------------------------------===//
 
-Value emitBinop(OpBuilder &builder, Location loc, StringRef kind, Value lhs,
-                Value rhs, Type undef, Operation *sourceOp) {
+static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
+                       Value lhs, Value rhs, Type undef, Operation *sourceOp) {
   if (kind == "Add")
     return HCAddOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Sub")

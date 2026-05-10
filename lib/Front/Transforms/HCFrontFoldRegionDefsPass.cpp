@@ -58,7 +58,7 @@ namespace {
 // `ref.kind = "local"`). `dead` is an out-param set on every success;
 // it is initialized here so a future caller that forgets to seed it
 // still reads a defined value on any `nullptr` return.
-Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
+static Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
   dead = false;
   if (call->getUses().empty()) {
     dead = true;
@@ -78,7 +78,7 @@ Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
   return ret;
 }
 
-template <typename RegionOpT> void foldAfterRegion(RegionOpT regionOp) {
+template <typename RegionOpT> static void foldAfterRegion(RegionOpT regionOp) {
   std::optional<StringRef> regionNameOpt = regionOp.getName();
   if (!regionNameOpt || regionNameOpt->empty())
     return;

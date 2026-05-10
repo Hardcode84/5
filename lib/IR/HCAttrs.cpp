@@ -24,7 +24,8 @@ using namespace mlir::hc;
 
 namespace {
 
-ParseResult parseShapeDim(AsmParser &parser, SmallVectorImpl<Attribute> &dims) {
+static ParseResult parseShapeDim(AsmParser &parser,
+                                 SmallVectorImpl<Attribute> &dims) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   std::string text;
   OptionalParseResult parsedString = parser.parseOptionalString(&text);
@@ -44,8 +45,8 @@ ParseResult parseShapeDim(AsmParser &parser, SmallVectorImpl<Attribute> &dims) {
   return success();
 }
 
-FailureOr<ShapeAttr> parseShapeDims(AsmParser &parser,
-                                    bool openingBracketConsumed) {
+static FailureOr<ShapeAttr> parseShapeDims(AsmParser &parser,
+                                           bool openingBracketConsumed) {
   SmallVector<Attribute> dims;
   if (openingBracketConsumed) {
     if (failed(parser.parseOptionalRSquare())) {
@@ -66,7 +67,7 @@ FailureOr<ShapeAttr> parseShapeDims(AsmParser &parser,
   return ShapeAttr::get(parser.getContext(), dims);
 }
 
-void printShapeDims(AsmPrinter &printer, ShapeAttr shape) {
+static void printShapeDims(AsmPrinter &printer, ShapeAttr shape) {
   auto &store =
       shape.getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
   printer << "[";
@@ -172,8 +173,8 @@ LogicalResult ScopeAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 
 namespace {
 
-ParseResult parseQuotedNameList(AsmParser &parser,
-                                SmallVectorImpl<Attribute> &out) {
+static ParseResult parseQuotedNameList(AsmParser &parser,
+                                       SmallVectorImpl<Attribute> &out) {
   if (parser.parseLSquare())
     return failure();
   if (succeeded(parser.parseOptionalRSquare()))
@@ -198,7 +199,8 @@ ParseResult parseQuotedNameList(AsmParser &parser,
   return parser.parseRSquare();
 }
 
-void printQuotedNameList(AsmPrinter &printer, ArrayRef<Attribute> names) {
+static void printQuotedNameList(AsmPrinter &printer,
+                                ArrayRef<Attribute> names) {
   printer << "[";
   llvm::interleaveComma(names, printer, [&](Attribute a) {
     printer.printString(llvm::cast<StringAttr>(a).getValue());
@@ -207,8 +209,8 @@ void printQuotedNameList(AsmPrinter &printer, ArrayRef<Attribute> names) {
 }
 
 template <typename AttrT>
-ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
-                                StringRef field, AttrT &out) {
+static ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
+                                       StringRef field, AttrT &out) {
   Attribute attr;
   if (parser.parseAttribute(attr))
     return failure();

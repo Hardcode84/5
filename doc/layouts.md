@@ -29,9 +29,10 @@ Four legs:
 3. **Memory carrier** — bare 1D tensor lowers to `(!hc.ptr, count)` and
    then to `!llvm.ptr` (AMDGPU) or a typed SPIR-V pointer. Bare 1D
    vector lowers to upstream `vector<NxT>`.
-4. **Elementwise op** — `hc.elementwise` plays the `linalg.generic` role
-   but indexes operands with `#hc.expr` instead of `affine_map`. Its
-   lowering uses the symbolic engine to decide vectorization.
+4. **Generic compute op** — `hc.generic` plays the `linalg.generic`
+   role but indexes operands with `#hc.expr` instead of `affine_map`,
+   and supports parallel + reduction iter kinds. Lowering uses the
+   symbolic engine to decide vectorization.
 
 ## `#hc.layout<...>` attribute
 
@@ -182,9 +183,9 @@ For every shaped value with a non-default layout:
    short SSA chains, not opaque expression trees.
 3. `hc.as_layout`: if the source and destination layouts agree on the
    carrier (the offset expressions are equal under ixsimpl), it becomes
-   a no-op cast. Otherwise it expands into an `hc.elementwise` copy
-   whose input and output use the two different offset expressions over
-   the same iteration space.
+   a no-op cast. Otherwise it expands into an `hc.generic` copy whose
+   input and output use the two different offset expressions over the
+   same iteration space.
 4. The `i1` mask byte-per-element behavior currently hand-coded in
    `HCLowerLaunchBodyPass.cpp` falls out as a default: `i1` shaped types
    pick a `byte-per-element` layout out of the box, and the manual
@@ -192,7 +193,7 @@ For every shaped value with a non-default layout:
 
 Post-flatten invariant: no layout attribute survives on any shaped
 type. Every shaped value is 1D, every access carries the offset
-explicitly. This is the boundary the pointer/elementwise lowering
+explicitly. This is the boundary the pointer / `hc.generic` lowering
 operates against.
 
 ## `hc.ptr` and memory ops
@@ -245,49 +246,93 @@ The 1D bare vector → upstream `vector<NxT>` mapping is unchanged; `N`
 must be statically resolved by this point (already an inference
 postcondition).
 
-## `hc.elementwise`
+## `hc.generic`
 
 ```mlir
-%out = hc.elementwise
-    iter_syms   = ["i", "j"]
-    iter_bounds = [%w, %h]
-    ins  (%a : !hc.bare_tensor<f16, [%n_a]> at #hc.expr<"i * Sa + j">,
-          %b : !hc.bare_tensor<f16, [%n_b]> at #hc.expr<"j * Sb + i">)
-    outs (%c : !hc.bare_tensor<f16, [%n_c]> at #hc.expr<"i * Sc + j">) {
-  ^bb0(%av: f16, %bv: f16):
-    %s = arith.addf %av, %bv : f16
-    hc.yield %s : f16
+%out = hc.generic
+    iter_syms   = ["i", "j", "k"]
+    iter_bounds = [%m, %n, %kn]
+    iter_kinds  = ["parallel", "parallel", "reduction"]
+    ins  (%a : !hc.bare_tensor<f16, [%na]> at #hc.expr<"i * K + k">,
+          %b : !hc.bare_tensor<f16, [%nb]> at #hc.expr<"k * N + j">)
+    outs (%c : !hc.bare_tensor<f32, [%nc]> at #hc.expr<"i * N + j">) {
+  ^bb0(%av: f16, %bv: f16, %cv: f32):
+    %p  = arith.mulf %av, %bv : f16
+    %pe = arith.extf %p : f16 to f32
+    %s  = arith.addf %cv, %pe : f32
+    hc.yield %s : f32
 }
 ```
 
-Same idea as `linalg.generic` but with the affine-map slot replaced by
-a per-operand `#hc.expr` over `iter_syms ∪ shape_syms ∪ params`. The
-body operates on scalar SSA values; `hc.yield` returns one value per
-output operand.
+Same shape as `linalg.generic` with the affine-map slot replaced by a
+per-operand `#hc.expr` over `iter_syms ∪ shape_syms ∪ params`. Three
+moving pieces beyond elementwise math:
 
-This op is the single home for elementwise math after flatten:
+* **`iter_kinds`** lists `parallel | reduction` per iter sym. Mixing
+  the two in one op is what makes it a contraction-shaped surface
+  (matmul, dot, reductions over arbitrary axes) instead of a pure
+  elementwise op.
+* **outs as init**: each output operand carries the iteration-start
+  value through the body (block arg, last `outs.size()` positions).
+  The body's `hc.yield` produces the next value, which becomes the
+  output's value at the parallel index. For reduction iters this is
+  the carried accumulator; for pure-parallel ops the `cv` arg is
+  unused. Caller pre-fills outs with the reduction identity (`hc.zeros`,
+  `hc.full`) before the op.
+* **multiple outputs** are allowed and share the iteration space — fused
+  reductions (sum + count for mean, max + argmax) become one op.
+
+Verifier rules:
+
+* output offset expressions reference parallel iters only. A reduction
+  iter in an output offset is the most likely surface mistake; the
+  diagnostic names the offending iter and offset.
+* body block arg arity is `ins.size() + outs.size()`; the trailing
+  `outs.size()` args are the carried output values, in declaration
+  order.
+* `hc.yield` produces exactly `outs.size()` values, type-matched to the
+  output element types.
+
+This op is the single home for compute after flatten:
 
 * the existing per-element decomposition of `hc.add`, `hc.mul`, ... on
-  bare values lowers into a single `hc.elementwise`;
-* mask-aware stores (the guarded scalar-store path in the current
-  launch-body lowering) become `hc.elementwise` with a predicate
-  operand and an `scf.if` in the body;
-* the cooperative copy helper becomes `hc.elementwise` with two
-  different offset expressions on input and output;
+  bare values lowers into a single `hc.generic` with all-parallel
+  iters;
+* `hc.reduce` lowers into `hc.generic` with one reduction iter and the
+  appropriate identity-fill on the output;
+* `hc.matmul` lowers into `hc.generic` with one reduction iter (the K
+  axis), shape inferred from operand offsets;
+* the cooperative copy helper becomes `hc.generic` with two different
+  offset expressions on input and output, all parallel iters;
 * `as_layout` reorderings — when they survive flatten — also become
-  `hc.elementwise` between two offset expressions.
+  `hc.generic` between two offset expressions.
 
-Lowering — `hc-lower-elementwise`:
+Mask handling stays out of v1: masks ride as ordinary bare-pred tensor
+inputs that the body inspects with `scf.if`. A typed mask slot on the
+op surface is a follow-up if vectorization needs it as a first-class
+operand later.
 
-For each operand, the symbolic engine computes
-`Δ_axis = offset(iter[axis] + 1) - offset(iter[axis])` over the chosen
-vectorization axis. Three outcomes:
+Lowering — `hc-lower-generic`:
 
-* every `Δ == 1` → emit a contiguous vector load/store, lift the body
-  to vector arithmetic. This is the payoff: the same op covers scalar
-  fallback and vectorized fast path.
-* every `Δ` is a constant `s ≠ 1` → emit a strided/shuffled load
-  (target-dependent: AMDGPU has DS strided loads, fallback to gather).
+Scalar baseline (slice 8): nested `scf.for` over `iter_bounds`,
+reduction iters as the inner loops with `iter_args` carrying the
+accumulators, parallel iters as the outer loops with a load-once /
+store-once pattern. Pre-fill of the outs is read into the outermost
+`iter_args`; the body runs scalar; the result writes back at the
+parallel index.
+
+Vector codegen (later slice): for each operand on the chosen
+vectorization axis, the symbolic engine computes
+`Δ = offset(iter[axis] + 1) - offset(iter[axis])`. Three outcomes:
+
+* every `Δ == 1` on a *parallel* axis → contiguous vector load/store,
+  body lifts to vector arithmetic. Same op covers scalar fallback and
+  vectorized fast path.
+* `Δ == 1` on a *reduction* axis → vector load + `vector.reduction`
+  (horizontal reduce). The body's accumulator combinator picks the
+  reduction kind.
+* every `Δ` is a constant `s ≠ 1` → strided/shuffled load
+  (target-dependent: AMDGPU DS strided loads, fallback to gather).
 * unknown / mixed → scalar `scf.for` loop.
 
 The vectorization decision is a symbolic-engine question, not a
@@ -304,7 +349,7 @@ hc-decompose-shaped-values        layout flows on data and mask halves
 hc-canonicalize-layouts           identity → absent, ixsimpl normalize, fold double as_layout
 hc-flatten-with-layouts           nD+layout → 1D no-layout, offsets at access sites
 hc-lower-launch-body              operate on 1D bare values; emit hc.alloc / hc.ptr_*
-hc-lower-elementwise              symbolic stride analysis; scalar or vector codegen
+hc-lower-generic                  symbolic stride analysis; scalar or vector codegen
 hc-lower-to-llvm                  hc.ptr → llvm.ptr, hc.alloc → addrspace globals/allocas
 ```
 
@@ -333,7 +378,7 @@ take over their indexing/memory work.
 * **User-supplied buffer layouts.** The IR slot is there from day one;
   the frontend / host wrapper only learn to consume the default strided
   layout in v1.
-* **Layout-aware fusion.** Combining adjacent `hc.elementwise` ops with
+* **Layout-aware fusion.** Combining adjacent `hc.generic` ops with
   compatible offset expressions across the iteration space.
 * **Auto-padding.** The user explicitly writes `H + 4` today. A
   heuristic that picks a padding stride to avoid bank conflicts is
@@ -370,19 +415,22 @@ on later slices.
    path).
 6. **`hc.ptr` family** — `!hc.ptr<...>`, `hc.alloc`, `hc.ptr_offset`,
    `hc.ptr_load`, `hc.ptr_store`. Round-trip + LIT. No flatten yet, no
-   `elementwise` yet.
+   `hc.generic` yet.
 7. **`hc-flatten-with-layouts`** — nD+layout → 1D-flat. Output uses
    bare types + per-access offset expressions; not yet on `hc.ptr`.
    Covers buffer, tensor, vector, and their bare counterparts uniformly.
-8. **`hc.elementwise` op + scalar `hc-lower-elementwise`** — define
-   the op, lower it to a scalar `scf.for` loop only. No vectorization
-   yet.
+8. **`hc.generic` op + scalar `hc-lower-generic`** — define the op
+   (parallel + reduction iter kinds, outs-as-init, multiple outputs),
+   lower it to a scalar `scf.for` loop only. No vectorization yet.
+   Existing per-element decomposition of `hc.add` / `hc.mul` / ... on
+   bare values, plus post-flatten rewrites of `hc.reduce` and
+   `hc.matmul`, all collapse onto this op.
 9. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
    wholesale replacement of the cooperative-load/store machinery;
    memref drops out. WMMA still on its existing intrinsic path.
 10. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
     runs end-to-end on the new stack.
-11. **symbolic stride vectorization** — same `hc-lower-elementwise`,
+11. **symbolic stride vectorization** — same `hc-lower-generic`,
     smarter codegen. The actual win.
 
 Slices 1–5 are pure additive (no observable behavior change beyond the

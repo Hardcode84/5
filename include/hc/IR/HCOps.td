@@ -954,7 +954,7 @@ def HCEmptyOp : HC_NullaryShapedAllocOp<"empty", 0> {
 // Pointer-flavored memory carriers. The post-flatten pipeline drops nD shaped
 // values to a 1D bare carrier whose backing storage is one of these. The op
 // surface is intentionally tight (alloc / element-strided offset / scalar
-// load / scalar store): vector loads/stores live on `hc.elementwise` once
+// load / scalar store): vector loads/stores live on `hc.generic` once
 // vectorization decides what to emit, not on per-element ops.
 //===----------------------------------------------------------------------===//
 

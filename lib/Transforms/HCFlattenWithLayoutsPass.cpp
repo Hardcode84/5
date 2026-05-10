@@ -61,6 +61,12 @@ namespace {
 // product of the original dimensions. Rank-0 falls out as the empty
 // product `1`.
 //
+// Caller's responsibility: the shape's entries must all be
+// `ExprAttr` (no `DynSizeAttr`). Buffers — the only flatten input
+// that legitimately carries a `?` post-collapse — handle that case
+// directly in the converter instead of routing through here, so
+// any `DynSize` here would mean a bug upstream and the cast asserts.
+//
 // All work goes through hash-consed ixsimpl handles via the
 // dialect-owned store: no rendering, no parsing, no string traffic.
 // `ixs_subs_multi` wants raw `ixs_node *` arrays for both targets
@@ -158,22 +164,28 @@ public:
       if (!originalShape)
         return std::nullopt;
 
-      // Buffers keep their nD shape (the buffer-side ABI slice owns
-      // 1D-collapse — the default strided layout's `storage_size = 0`
-      // placeholder would otherwise fold every buffer to `[0]`).
-      // The layout slot still drops to honor the
-      // *no-`#hc.layout`-survives* invariant.
+      MLIRContext *ctx = t.getContext();
+
+      // Buffers collapse to `[?]`: the host owns the allocation and
+      // the default strided layout's `storage_size = 0` placeholder
+      // is informational, so a `#hc.dyn` sentinel is the honest
+      // 1D form. Any consumer that needs a concrete extent reaches
+      // for the host descriptor instead of trying to derive it from
+      // the in-IR symbol set.
       if (isa<BufferType>(t)) {
-        if (!layout)
+        ShapeAttr collapsed = ShapeAttr::get(ctx, {DynSizeAttr::get(ctx)});
+        if (collapsed == originalShape && !layout)
           return Type(shaped);
-        return shaped.cloneWithSymbolicLayout(LayoutAttr{});
+        Type withShape = shaped.cloneWithSymbolicShape(collapsed);
+        auto reshaped = cast<SymbolicallyShapedTypeInterface>(withShape);
+        return reshaped.cloneWithSymbolicLayout(LayoutAttr{});
       }
 
-      bool alreadyFlat = !layout && originalShape.getDims().size() == 1;
+      bool alreadyFlat = !layout && originalShape.getDims().size() == 1 &&
+                         llvm::isa<ExprAttr>(originalShape.getDims().front());
       if (alreadyFlat)
         return Type(shaped);
 
-      MLIRContext *ctx = t.getContext();
       FailureOr<ExprAttr> storageSize =
           computeStorageSizeExpr(ctx, layout, originalShape);
       if (failed(storageSize))

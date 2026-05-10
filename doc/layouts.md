@@ -170,16 +170,15 @@ one.
 Position: after `hc-decompose-shaped-values`, before any pointer
 lowering.
 
-The pass is **type-only**: every shaped value (except buffers, see
-below) collapses to its 1D `storage_size_expr` form and loses its
-layout slot, but op surfaces stay untouched. Per-axis offset arrays
-on `hc.generic` keep their original logical rank, multi-index lists
-on `hc.load` / `hc.store` / `hc.vload` / `hc.buffer_view` stay
-as-is. Composing the layout offset into those access expressions is
-a separate slice — downstream fusion / vectorization wants the
-per-axis structure available, and the access expression
-materialization needs `hc.ptr` plumbing the type-only slice doesn't
-own.
+The pass is **type-only**: every shaped value collapses to its 1D
+form and loses its layout slot, but op surfaces stay untouched.
+Per-axis offset arrays on `hc.generic` keep their original logical
+rank, multi-index lists on `hc.load` / `hc.store` / `hc.vload` /
+`hc.buffer_view` stay as-is. Composing the layout offset into those
+access expressions is a separate slice — downstream fusion /
+vectorization wants the per-axis structure available, and the
+access expression materialization needs `hc.ptr` plumbing the
+type-only slice doesn't own.
 
 What runs:
 
@@ -189,20 +188,22 @@ What runs:
    original shape entries — or the dimension product when the type
    sits on the implicit identity-row-major contract (no explicit
    layout).
-2. The shape collapse and layout-slot strip propagate through every
+2. **Buffers** collapse to `<T, [?]>` — the `?` is the surface
+   spelling for the `#hc.dyn` sentinel. Buffer storage extent is
+   owned by the host descriptor (the verifier doesn't enforce
+   `storage_size >= max(offset) + 1` on buffers, the default
+   strided layout emits `storage_size = 0` as an informational
+   placeholder); a `#hc.dyn` shape entry says that out loud.
+   Consumers that need a concrete extent reach for the host
+   descriptor instead of the in-IR symbol set.
+3. The shape collapse and layout-slot strip propagate through every
    op via a `MatchAnyOpTypeTag` rebuild pattern scoped to the `hc`
    dialect. Body block args of `hc.generic` carry scalar element
    types and need no signature conversion. Function signatures /
    `func.return` / `func.call` / SCF structural ops route through
    the upstream populators.
-3. `hc.as_layout` drops unconditionally: both endpoints route
+4. `hc.as_layout` drops unconditionally: both endpoints route
    through the converter and the relabel becomes cosmetic.
-4. **Buffers are exempt** from the shape collapse: the default
-   strided buffer layout's `storage_size` is the literal `0`
-   placeholder (the host owns the allocation), so 1D-collapsing
-   would fold every buffer to `[0]`. Buffer types keep their
-   original nD shape and lose only the layout slot for now; the
-   buffer-side ABI slice picks a real `storage_size_expr`.
 
 Deferred slices (out of scope here):
 
@@ -227,9 +228,10 @@ Deferred slices (out of scope here):
   then the manual extract/insert sequences stay.
 
 Post-flatten *type* invariant: no layout attribute survives on any
-shaped type, every non-buffer shaped value is 1D. Op-level
-structural invariants (multi-index access, per-axis offsets) carry
-through unchanged for the follow-up slice to consume.
+shaped type, every shaped value is 1D (buffers spell the unknown
+extent as `#hc.dyn`). Op-level structural invariants (multi-index
+access, per-axis offsets) carry through unchanged for the follow-up
+slice to consume.
 
 ## `hc.ptr` and memory ops
 
@@ -492,15 +494,16 @@ on later slices.
    `hc.ptr_load`, `hc.ptr_store`. Round-trip + LIT. No flatten yet, no
    `hc.generic` yet.
 7. **`hc-flatten-with-layouts`** — type-only collapse: every shaped
-   value (except buffers) becomes 1D `<T, [storage_size_expr]>` and
-   loses its layout slot. Op surfaces stay untouched: per-axis offset
-   arrays on `hc.generic` and multi-index lists on `hc.load` /
-   `hc.store` / `hc.vload` / `hc.buffer_view` carry through at their
-   original logical rank for downstream fusion / vectorization to
-   consume. Buffer 1D-collapse, per-access offset materialization,
-   `hc.as_layout` structural-difference handling, and `i1`
-   byte-per-element retirement are separate slices documented under
-   the pass section above.
+   value becomes 1D and loses its layout slot. Tensors / vectors get
+   `<T, [storage_size_expr]>`; buffers get `<T, [?]>` (`#hc.dyn`
+   sentinel) because their storage extent is host-owned. Op surfaces
+   stay untouched: per-axis offset arrays on `hc.generic` and
+   multi-index lists on `hc.load` / `hc.store` / `hc.vload` /
+   `hc.buffer_view` carry through at their original logical rank for
+   downstream fusion / vectorization to consume. Per-access offset
+   materialization, `hc.as_layout` structural-difference handling,
+   and `i1` byte-per-element retirement are separate slices
+   documented under the pass section above.
 8. **`hc.generic` op surface** — define the op (parallel + reduction
    iter kinds, outs-as-init, multiple outputs, per-operand `#hc.expr`
    offset slot, SSA `iter_bounds`). No lowering yet, no per-axis array

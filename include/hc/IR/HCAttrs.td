@@ -57,11 +57,31 @@ def HC_PredAttr : HC_Attr<"Pred", "pred"> {
   }];
 }
 
+def HC_DynSizeAttr : HC_Attr<"DynSize", "dyn"> {
+  let summary = "Sentinel `?` for an unknown / host-owned shape entry.";
+  let description = [{
+    Marker attribute that fills the slot of a regular `#hc.expr` dimension when
+    the size is not knowable inside the compiler — e.g. a buffer argument whose
+    backing storage is owned by the host descriptor and not derivable from the
+    in-IR symbol set. Renders as `?` inside `#hc.shape<[...]>` and on the
+    surface form of any shaped type.
+
+    The attribute participates in `ShapeAttr.dims` alongside `ExprAttr` so
+    every shape-entry walker has to discriminate explicitly: there is no
+    `composeExprBinary` / `walkSymbolNames` overload for `DynSize`, by design.
+    Consumers that need a concrete size must reach for the host descriptor.
+  }];
+  let parameters = (ins);
+  let assemblyFormat = "";
+}
+
 def HC_ShapeAttr : HC_Attr<"Shape", "shape"> {
   let summary = "Shape tuple built from symbolic expression dimensions";
   let description = [{
-    Stores `#hc.expr` dimension attributes internally while printing them as a
-    compact list of symbolic strings, for example `#hc.shape<["M", "N + 1"]>`.
+    Stores per-dimension attributes internally while printing them as a compact
+    list, for example `#hc.shape<["M", "N + 1", "?"]>`. Each entry is either a
+    concrete `#hc.expr` (printed without the `#hc.expr<...>` wrapper) or a
+    `#hc.dyn` sentinel rendered as `?`.
   }];
   let parameters = (ins ArrayRefParameter<"Attribute">:$dims);
   let hasCustomAssemblyFormat = 1;

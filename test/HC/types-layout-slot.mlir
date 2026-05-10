@@ -107,6 +107,21 @@ func.func @padded_layout(
   return
 }
 
+// `?` is the surface spelling for `#hc.dyn`, the sentinel a shape entry
+// uses when its size isn't derivable from the in-IR symbol set
+// (canonical case: a buffer arg whose backing storage extent is owned
+// by the host descriptor). Round-trips on every shaped shell that
+// carries a `ShapeAttr`.
+// CHECK-LABEL: @dyn_size_round_trip
+// CHECK-SAME: !hc.buffer<f32, ["?"]>
+// CHECK-SAME: !hc.tensor<f16, ["?", "M"]>
+// CHECK-SAME: !hc.bare_tensor<f16, ["M", "?"]>
+func.func @dyn_size_round_trip(%a: !hc.buffer<f32, ["?"]>,
+                               %b: !hc.tensor<f16, ["?", "M"]>,
+                               %c: !hc.bare_tensor<f16, ["M", "?"]>) {
+  return
+}
+
 // Two equivalent spellings of the same layout (W vs 0+W, i vs i+0) hash
 // to the same LayoutAttr in the type uniquer, so the two operands
 // declared with each spelling print as the same type. This is the

@@ -34,6 +34,14 @@ static ParseResult parseShapeDim(AsmParser &parser,
   if (failed(*parsedString))
     return failure();
 
+  // The lone `"?"` spelling lifts a `#hc.dyn` sentinel into the shape
+  // entry — used for buffer 1D-collapse and any other shape slot whose
+  // size is host-owned / not derivable from the in-IR symbol set.
+  if (text == "?") {
+    dims.push_back(DynSizeAttr::get(parser.getContext()));
+    return success();
+  }
+
   std::string diagnostic;
   auto *dialect = parser.getContext()->getOrLoadDialect<HCDialect>();
   FailureOr<sym::ExprHandle> handle =
@@ -72,6 +80,10 @@ static void printShapeDims(AsmPrinter &printer, ShapeAttr shape) {
       shape.getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
   printer << "[";
   llvm::interleaveComma(shape.getDims(), printer, [&](Attribute dim) {
+    if (llvm::isa<DynSizeAttr>(dim)) {
+      printer.printString("?");
+      return;
+    }
     printer.printString(store.render(llvm::cast<ExprAttr>(dim).getNode()));
   });
   printer << "]";
@@ -146,8 +158,9 @@ void ShapeAttr::print(AsmPrinter &printer) const {
 LogicalResult ShapeAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                                 ArrayRef<Attribute> dims) {
   for (Attribute dim : dims) {
-    if (!llvm::isa<ExprAttr>(dim))
-      return emitError() << "expected shape dims to be #hc.expr attributes";
+    if (!llvm::isa<ExprAttr, DynSizeAttr>(dim))
+      return emitError()
+             << "expected shape dims to be #hc.expr or #hc.dyn attributes";
   }
   return success();
 }

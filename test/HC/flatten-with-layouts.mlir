@@ -3,21 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // `hc-flatten-with-layouts`:
-//   * collapses every shaped type (except buffers) to its 1D
-//     `storage_size_expr` form, where the size comes from the layout's
-//     `storage_size` after binding `shape_syms` to the original shape
-//     entries — or from the dimension product when the type sits on
-//     the implicit identity-row-major contract,
+//   * collapses every shaped type to its 1D form. Tensors / vectors
+//     (semantic and bare) get a concrete `storage_size_expr` from
+//     the layout's `storage_size` after binding `shape_syms` to the
+//     original shape entries — or from the dimension product when
+//     the type sits on the implicit identity-row-major contract.
+//     Buffers collapse to `[?]` (`#hc.dyn` sentinel) because the
+//     host owns the allocation and the in-IR symbol set doesn't
+//     have enough to name the storage extent.
 //   * strips every `#hc.layout` slot off `SymbolicallyShapedTypeInterface`
 //     types, including the non-identity ones `hc-canonicalize-layouts`
 //     deliberately leaves alone (col-major, padded, params-bearing,
-//     default strided buffer args),
-//   * leaves buffer *shape* alone (their default strided layout's
-//     `storage_size = 0` placeholder would fold every buffer to
-//     `[0]`; the buffer-side ABI slice owns the buffer 1D-collapse),
-//     but still drops the layout slot to honor the no-layout invariant,
+//     default strided buffer args).
 //   * folds `hc.as_layout` ops to their operand once both endpoints
-//     are converted (the relabel becomes cosmetic),
+//     are converted (the relabel becomes cosmetic).
 //   * propagates the collapse through tuple types and the upstream
 //     func / scf / call signature populators.
 //
@@ -37,9 +36,10 @@
 // RUN:   | FileCheck %s --implicit-check-not='#hc.layout' --implicit-check-not='hc.as_layout'
 
 // CHECK-LABEL: @strided_buffer_arg
-// CHECK-SAME: %arg0: !hc.buffer<f16, ["M", "K"]>
+// CHECK-SAME: %arg0: !hc.buffer<f16, ["?"]>
 // Default fully-strided np/torch layout the frontend pins on every
-// buffer argument. Buffer shape stays nD; only the layout slot drops.
+// buffer argument. Buffer shape collapses to the `[?]` sentinel
+// because the host owns the allocation; the layout slot drops.
 func.func @strided_buffer_arg(
     %a: !hc.buffer<f16, ["M", "K"],
                    #hc.layout<shape_syms = ["d0", "d1"],
@@ -56,9 +56,10 @@ func.func @strided_buffer_arg(
 // whether the layout was identity or padded / col-major. Tensors and
 // vectors (semantic and bare) collapse to a single-entry shape using
 // the layout's `storage_size` after binding to the original shape;
-// buffers keep their nD shape per the buffer-side carve-out.
+// buffers collapse to `[?]` because their storage extent is
+// host-owned.
 // CHECK-LABEL: @all_five_non_identity
-// CHECK-SAME: %arg0: !hc.buffer<f32, ["M", "K"]>
+// CHECK-SAME: %arg0: !hc.buffer<f32, ["?"]>
 // CHECK-SAME: %arg1: !hc.tensor<f16, ["K*M"]>
 // CHECK-SAME: %arg2: !hc.vector<f32, ["8"]>
 // CHECK-SAME: %arg3: !hc.bare_tensor<f16, ["M*(K + pad)"]>
@@ -151,12 +152,13 @@ func.func @as_layout_named_collapses(
 
 // -----
 
-// 1D layout-less IR is a fixed point: the converter reports every
-// shaped type legal-on-arrival and the function signature isn't
-// rebuilt. Coverage gate against accidental retypes that would
-// surface as `unrealized_conversion_cast` ops on the arg boundary.
+// 1D layout-less IR is a fixed point for non-buffers: the converter
+// reports the tensor type legal-on-arrival and skips the rebuild.
+// Buffers always collapse to the `[?]` sentinel even when the input
+// already has a single named dim — the storage extent is host-owned
+// regardless of how the surface IR spells it.
 // CHECK-LABEL: @already_flat
-// CHECK-SAME: %arg0: !hc.buffer<f16, ["M"]>
+// CHECK-SAME: %arg0: !hc.buffer<f16, ["?"]>
 // CHECK-SAME: %arg1: !hc.tensor<f16, ["M"]>
 // CHECK-NEXT: return
 // CHECK-NOT: unrealized_conversion_cast
@@ -170,9 +172,9 @@ func.func @already_flat(
 
 // Layout buried inside a tuple still flattens on every leg. The
 // 1D tensor collapses to its single-entry shape (storage = d0 = M);
-// the buffer keeps its 1D shape and loses its layout.
+// the buffer collapses to the `[?]` sentinel.
 // CHECK-LABEL: @layout_in_tuple
-// CHECK-SAME: %arg0: tuple<!hc.tensor<f16, ["M"]>, !hc.buffer<f32, ["N"]>>
+// CHECK-SAME: %arg0: tuple<!hc.tensor<f16, ["M"]>, !hc.buffer<f32, ["?"]>>
 func.func @layout_in_tuple(
     %a: tuple<
           !hc.tensor<f16, ["M"], #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"d0">, offset = #hc.expr<"d0 - 1 - i0">>>,

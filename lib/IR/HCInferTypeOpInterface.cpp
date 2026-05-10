@@ -11,7 +11,9 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <cstdint>
 #include <optional>
 
 using namespace mlir;
@@ -21,28 +23,6 @@ namespace {
 
 static sym::Store &symbolStore(MLIRContext *ctx) {
   return ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
-}
-
-template <typename AttrT, typename HandleT,
-          FailureOr<HandleT> (*Parse)(sym::Store &, StringRef, std::string *)>
-static FailureOr<AttrT> parseSymbolicAttr(Twine text, Operation *diagOp,
-                                          StringRef kind) {
-  MLIRContext *ctx = diagOp->getContext();
-  SmallString<64> storage;
-  StringRef rendered = text.toStringRef(storage);
-  std::string diag;
-  FailureOr<HandleT> handle = Parse(symbolStore(ctx), rendered, &diag);
-  if (failed(handle)) {
-    diagOp->emitOpError("failed to infer symbolic ")
-        << kind << " '" << rendered << "': " << diag;
-    return failure();
-  }
-  return AttrT::get(ctx, *handle);
-}
-
-static FailureOr<ExprAttr> parseExprAttr(Twine text, Operation *diagOp) {
-  return parseSymbolicAttr<ExprAttr, sym::ExprHandle, sym::parseExpr>(
-      text, diagOp, "expression");
 }
 
 static std::optional<ExprAttr> idxExprAttr(Type type) {
@@ -110,10 +90,48 @@ static FailureOr<PredAttr> composePredAttr(ExprAttr lhs, sym::PredCmpOp op,
   return PredAttr::get(ctx, *handle);
 }
 
+// Leaf builders. These exist so the per-op inference helpers below
+// can stay terse and so we go through the same hash-consed leaves
+// any other producer in the dialect would — `composeExprInt(0)` and
+// `composeExprSym("$WG0")` give back canonical handles, and pointer
+// equality on those is the right comparison everywhere downstream.
+static FailureOr<ExprAttr> composeIntExprAttr(int64_t value,
+                                              Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle =
+      sym::composeExprInt(symbolStore(ctx), value, &diag);
+  if (failed(emitComposeError(diagOp, "expression", handle, diag)))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
+static FailureOr<ExprAttr> composeSymExprAttr(StringRef name,
+                                              Operation *diagOp) {
+  MLIRContext *ctx = diagOp->getContext();
+  std::string diag;
+  FailureOr<sym::ExprHandle> handle =
+      sym::composeExprSym(symbolStore(ctx), name, &diag);
+  if (failed(emitComposeError(diagOp, "expression", handle, diag)))
+    return failure();
+  return ExprAttr::get(ctx, *handle);
+}
+
 static FailureOr<Type> inferIntegerAttrAsIdx(IntegerAttr value, Operation *op) {
-  SmallString<32> text;
-  value.getValue().toStringSigned(text);
-  FailureOr<ExprAttr> expr = parseExprAttr(text, op);
+  // ixsimpl's `IXS_INT` carries int64; reject wider IntegerAttrs up front
+  // instead of letting them silently truncate. The previous textual round-
+  // trip masked this — the integer was rendered with `toStringSigned` and
+  // re-parsed, where ixsimpl would either accept the truncation or fail
+  // with a generic diagnostic.
+  std::optional<int64_t> intValue = value.getValue().trySExtValue();
+  if (!intValue) {
+    SmallString<32> rendered;
+    value.getValue().toStringSigned(rendered);
+    op->emitOpError("integer constant ")
+        << rendered << " does not fit in int64 for symbolic inference";
+    return failure();
+  }
+  FailureOr<ExprAttr> expr = composeIntExprAttr(*intValue, op);
   if (failed(expr))
     return failure();
   return Type(IdxType::get(op->getContext(), *expr));
@@ -248,11 +266,11 @@ static Type inferBufferDim(Type bufferType, int64_t axis, Operation *op) {
 }
 
 static FailureOr<ExprAttr> defaultZeroExpr(Operation *op) {
-  return parseExprAttr("0", op);
+  return composeIntExprAttr(0, op);
 }
 
 static FailureOr<ExprAttr> defaultOneExpr(Operation *op) {
-  return parseExprAttr("1", op);
+  return composeIntExprAttr(1, op);
 }
 
 static FailureOr<ExprAttr> composeSubExprAttr(ExprAttr lhs, ExprAttr rhs,
@@ -486,7 +504,14 @@ static LogicalResult appendPrefixedIdxTypes(Operation *op, StringRef prefix,
                                             SmallVectorImpl<Type> &types) {
   MLIRContext *ctx = op->getContext();
   for (unsigned axis = 0; axis < count; ++axis) {
-    FailureOr<ExprAttr> expr = parseExprAttr(Twine(prefix) + Twine(axis), op);
+    // Bypass the parser entirely: launch-axis names like "$WG0" are a
+    // single symbol leaf, not an expression in need of tokenizing. A
+    // bad character in `prefix` (which comes from a programmatic
+    // LaunchGeoMethodInfo field) would silently produce a wrong tree
+    // through parseExpr; composeExprSym builds the leaf directly.
+    SmallString<32> name(prefix);
+    llvm::raw_svector_ostream(name) << axis;
+    FailureOr<ExprAttr> expr = composeSymExprAttr(name, op);
     if (failed(expr))
       return failure();
     types.push_back(IdxType::get(ctx, *expr));
@@ -520,7 +545,7 @@ static FailureOr<Type> groupSizeType(ShapeAttr shape, Operation *op) {
   if (!shape)
     return Type(getUnpinnedIdxType(ctx));
   if (shape.getDims().empty()) {
-    FailureOr<ExprAttr> one = parseExprAttr("1", op);
+    FailureOr<ExprAttr> one = composeIntExprAttr(1, op);
     if (failed(one))
       return failure();
     return Type(IdxType::get(ctx, *one));

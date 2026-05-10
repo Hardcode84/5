@@ -705,22 +705,6 @@ LogicalResult HCSymbolOp::verify() {
   return success();
 }
 
-LogicalResult HCMaterializeBoundExprOp::verify() {
-  Type result = getResult().getType();
-  if (auto idx = llvm::dyn_cast<IdxType>(result)) {
-    if (idx.getExpr())
-      return success();
-    return emitOpError("result must pin a bound symbolic expression");
-  }
-  if (auto pred = llvm::dyn_cast<PredType>(result)) {
-    if (pred.getPred())
-      return success();
-    return emitOpError("result must pin a bound symbolic predicate");
-  }
-  return emitOpError("result must be a pinned `!hc.idx` or `!hc.pred`, got ")
-         << result;
-}
-
 // Shared check for `hc.idx_apply` / `hc.pred_apply`: ensures the
 // declared symbol list and the operand list line up, that no name
 // repeats, and that every listed name actually appears as a free

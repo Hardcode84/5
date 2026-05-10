@@ -18,12 +18,15 @@
 // iteration.
 // CHECK-LABEL: func.func @elementwise_add_1d
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   %[[PCI:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PCI:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[CV:[^ ]+]] = hc.ptr_load %[[PCI]]
-// CHECK:   %[[PAI:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PAI:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PAI]]
 // CHECK:   %[[S:[^ ]+]] = hc.add %[[CV]], %[[AV]]
-// CHECK:   %[[PCS:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PCS:[^ ]+]] = hc.ptr_offset
 // CHECK:   hc.ptr_store %[[S]], %[[PCS]]
 // CHECK:   scf.reduce
 // CHECK-NOT: hc.generic
@@ -51,10 +54,13 @@ func.func @elementwise_add_1d(%n: index,
 // threads the running value through `iter_args`, then a final store
 // at the same constant offset.
 // CHECK-LABEL: func.func @reduce_sum_1d
+// CHECK: hc.idx_apply() {symbols = []}
+// CHECK-SAME: -> !hc.idx<"0">
 // CHECK: %[[INIT:[^ ]+]] = hc.ptr_load %{{[^ ]+}}
 // CHECK: %[[FINAL:[^ ]+]] = scf.for %[[K:[^ ]+]] =
 // CHECK-SAME: iter_args(%[[ACC:[^ ]+]] = %[[INIT]])
-// CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[K]]
+// CHECK:   hc.idx_apply(%[[K]]) {symbols = ["k"]}
+// CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
 // CHECK:   %[[NEXT:[^ ]+]] = hc.add %[[ACC]], %[[AV]]
 // CHECK:   scf.yield %[[NEXT]] : f32
@@ -77,20 +83,21 @@ func.func @reduce_sum_1d(%n: index,
 
 // -----
 
-// Per-row reduction (parallel + reduction) using an outer-scope
-// shape-symbol binding. The iter bound for `j` is typed
-// `!hc.idx<"N">`, which the lowering picks up as the runtime value
-// of the free symbol "N" when evaluating the input's `i*N + j`
-// linear offset. Lowers to an outer `scf.parallel(i)` with an inner
-// `scf.for(j)` reducing into the per-row accumulator.
+// Per-row reduction (parallel + reduction). Iter syms `i` and `j`
+// surface as explicit operand bindings in the per-row offset's
+// `hc.idx_apply`; the shape sym `N` stays unlisted and gets
+// resolved ambiently by the launch-body lowering downstream. The
+// out offset only references the parallel iter, so its apply lists
+// `["i"]` alone.
 // CHECK-LABEL: func.func @reduce_sum_2d_per_row
-// CHECK: %[[N:[^ ]+]] = builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.idx<"N"> to index
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   %[[PD0:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
-// CHECK:   %[[INIT:[^ ]+]] = hc.ptr_load %[[PD0]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK-SAME: -> !hc.idx<"i">
+// CHECK:   %[[INIT:[^ ]+]] = hc.ptr_load
 // CHECK:   %[[FINAL:[^ ]+]] = scf.for %[[J:[^ ]+]] =
 // CHECK-SAME: iter_args(%[[ACC:[^ ]+]] = %[[INIT]])
-// CHECK:     arith.muli {{.*}}%[[N]]
+// CHECK:     hc.idx_apply(%{{[^,]+}}, %{{[^)]+}}) {symbols = ["i", "j"]}
+// CHECK-SAME: -> !hc.idx<"j + N*i">
 // CHECK:     %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:     %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
 // CHECK:     %[[NEXT:[^ ]+]] = hc.add %[[ACC]], %[[AV]]
@@ -123,11 +130,14 @@ func.func @reduce_sum_2d_per_row(%m: index, %nsym: !hc.idx<"N">,
 // both consume the same per-iteration in.
 // CHECK-LABEL: func.func @elementwise_two_outs
 // CHECK: scf.parallel (%[[I:[^)]+]])
-// CHECK:   %[[PB:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PB:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[BV:[^ ]+]] = hc.ptr_load %[[PB]]
-// CHECK:   %[[PC:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PC:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[CV:[^ ]+]] = hc.ptr_load %[[PC]]
-// CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset %{{[^,]+}}, %[[I]]
+// CHECK:   hc.idx_apply(%[[I]]) {symbols = ["i"]}
+// CHECK:   %[[PA:[^ ]+]] = hc.ptr_offset
 // CHECK:   %[[AV:[^ ]+]] = hc.ptr_load %[[PA]]
 // CHECK:   %[[Y0:[^ ]+]] = hc.add %[[BV]], %[[AV]]
 // CHECK:   %[[Y1:[^ ]+]] = hc.mul %[[CV]], %[[AV]]

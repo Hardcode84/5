@@ -1382,8 +1382,7 @@ module {
 // -----
 
 // Bare `!hc.idx` (no pinned expression) carries no symbols to bind, so
-// the apply op has nothing to lower. The check mirrors the
-// `hc.materialize_bound_expr` pin requirement.
+// the apply op has nothing to lower. The check pins this at op level.
 // CHECK: error: 'hc.idx_apply' op result must pin a symbolic expression
 module {
   func.func @bad(%i: index) {

@@ -137,8 +137,13 @@ static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
   for (auto [slot, iterIdx] : llvm::enumerate(placeholderIters)) {
     ImpliedBound bound = bindings[slot].front();
     auto idxType = IdxType::get(op.getContext(), bound.dim);
+    // No explicit operand bindings: the dim expression's free
+    // symbols are kernel / launch-context names whose runtime SSA
+    // isn't known here. They stay ambient and the launch-body
+    // lowering binds them through its existing walk.
     auto materialized =
-        HCMaterializeBoundExprOp::create(builder, op.getLoc(), idxType);
+        HCIdxApplyOp::create(builder, op.getLoc(), idxType, ValueRange{},
+                             builder.getStrArrayAttr({}));
     op.setOperand(
         static_cast<unsigned>(iterBounds.getBeginOperandIndex() + iterIdx),
         materialized.getResult());

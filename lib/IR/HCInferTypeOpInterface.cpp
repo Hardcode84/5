@@ -646,13 +646,6 @@ LogicalResult HCSymbolOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
   return success();
 }
 
-LogicalResult
-HCMaterializeBoundExprOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
-                                       SmallVectorImpl<Type> &resultTypes) {
-  resultTypes.push_back(getResult().getType());
-  return success();
-}
-
 LogicalResult HCIdxApplyOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
                                          SmallVectorImpl<Type> &resultTypes) {
   // Result type is fully pinned by the carried `!hc.idx<expr>` and the

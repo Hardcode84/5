@@ -264,13 +264,13 @@ func.func @generic_keeps_per_axis_offsets(
 // -----
 
 // Layouted load: `hc.load` with a 2D index list and a row-major
-// `#hc.layout` collapses to a single `hc.materialize_bound_expr` of
+// `#hc.layout` collapses to a single `hc.idx_apply` of
 // the substituted offset, then a one-index `hc.load`. ixsimpl
 // canonicalizes `i0 * d1 + i1` with `d0->M, d1->N, i0->i, i1->j` to
 // `j + N*i`.
 // CHECK-LABEL: @load_with_layout_composes
 // CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
-// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: %[[OFF:.*]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"j + N*i">
 // CHECK: hc.load %[[B]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<f32, ["M*N"]>
 func.func @load_with_layout_composes(
     %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
@@ -294,7 +294,7 @@ func.func @load_with_layout_composes(
 // canonicalizes the resulting `0 + i*N + j` to `j + N*i`.
 // CHECK-LABEL: @vload_identity_row_major
 // CHECK-SAME: %[[T:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
-// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: %[[OFF:.*]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"j + N*i">
 // CHECK: hc.vload %[[T]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.bare_tensor<f32, ["M*N"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_vector<f32, ["M*N"]>
 func.func @vload_identity_row_major(
     %t: !hc.bare_tensor<f32, ["M", "N"]>,
@@ -315,7 +315,7 @@ func.func @vload_identity_row_major(
 // `[0:8:1]` slice — the substitution sets `i1->0` and the composed
 // offset reduces to `N*row`.
 // CHECK-LABEL: @load_with_slice_lower_bound
-// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"N*row">
+// CHECK: %[[OFF:.*]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"N*row">
 // CHECK: hc.load %{{[^[]+}}[%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"N*row">, tuple<!hc.idx<"N">>) -> !hc.bare_tensor<f32, ["8"]>
 func.func @load_with_slice_lower_bound(
     %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
@@ -347,7 +347,7 @@ func.func @load_with_slice_lower_bound(
 // CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
 // CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_tensor<f32, ["16"]>
 // CHECK-SAME: %[[MASK:[^:]+]]: !hc.bare_tensor<!hc.pred, ["16"]>
-// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: %[[OFF:.*]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"j + N*i">
 // CHECK: hc.store %[[B]][%[[OFF]]], %[[SRC]], mask %[[MASK]]
 func.func @store_with_mask_composes(
     %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
@@ -369,7 +369,7 @@ func.func @store_with_mask_composes(
 // rewrite. Verified separately because it gets emitted next to
 // `hc.load` post-decompose and would diverge silently if missed.
 // CHECK-LABEL: @load_mask_composes
-// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: %[[OFF:.*]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"j + N*i">
 // CHECK: hc.load_mask %{{[^[]+}}[%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<!hc.pred, ["M*N"]>
 func.func @load_mask_composes(
     %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
@@ -394,7 +394,7 @@ func.func @load_mask_composes(
 // well-formed at the type level.
 // CHECK-LABEL: @load_unbound_index_falls_through
 // CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
-// CHECK-NOT: hc.materialize_bound_expr
+// CHECK-NOT: hc.idx_apply
 // CHECK: hc.load %[[B]][%{{[^,]+}}, %{{[^]]+}}], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, index, index, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<f32, ["M*N"]>
 func.func @load_unbound_index_falls_through(
     %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,

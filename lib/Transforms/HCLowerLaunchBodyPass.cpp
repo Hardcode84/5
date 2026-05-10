@@ -598,34 +598,6 @@ struct ConvertIntrinsicSignatureOp : public OpConversionPattern<HCIntrinsicOp> {
   }
 };
 
-struct ConvertMaterializeBoundExprOp
-    : public OpConversionPattern<HCMaterializeBoundExprOp> {
-  using Base::Base;
-
-  LogicalResult
-  matchAndRewrite(HCMaterializeBoundExprOp op, OpAdaptor /*adaptor*/,
-                  ConversionPatternRewriter &rewriter) const override {
-    BoundValues boundValues = collectBoundValues(op, rewriter);
-    ExprLowerer lowerer(rewriter, op.getLoc(), boundValues);
-
-    if (auto idx = dyn_cast<IdxType>(op.getResult().getType())) {
-      FailureOr<Value> lowered = lowerer.lower(idx.getExpr());
-      if (failed(lowered))
-        return op.emitOpError("failed to lower bound index expression");
-      rewriter.replaceOp(op, *lowered);
-      return success();
-    }
-    if (auto pred = dyn_cast<PredType>(op.getResult().getType())) {
-      FailureOr<Value> lowered = lowerer.lower(pred.getPred());
-      if (failed(lowered))
-        return op.emitOpError("failed to lower bound predicate expression");
-      rewriter.replaceOp(op, *lowered);
-      return success();
-    }
-    return failure();
-  }
-};
-
 // Build a `BoundValues` for one `hc.idx_apply` / `hc.pred_apply` op.
 // Explicit operand bindings are authoritative (direct map insert
 // rather than `bind()`, which uses `try_emplace`); the ambient walk
@@ -2180,8 +2152,8 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                MLIRContext *ctx,
                                                RewritePatternSet &patterns) {
   patterns.add<
-      ConvertMaterializeBoundExprOp, ConvertIdxApplyOp, ConvertPredApplyOp,
-      ConvertConstOp, ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
+      ConvertIdxApplyOp, ConvertPredApplyOp, ConvertConstOp,
+      ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
       ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
       ConvertIntBinaryOp<HCMulOp, arith::MulIOp>, ConvertDivOp,
       ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
@@ -2216,13 +2188,13 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
                          gpu::GPUDialect, memref::MemRefDialect,
                          scf::SCFDialect, vector::VectorDialect>();
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp>();
-  target.addIllegalOp<
-      HCMaterializeBoundExprOp, HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp,
-      HCSubOp, HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
-      HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp,
-      HCLoadOp, HCVLoadOp, HCLoadMaskOp, HCBufferViewOp, HCVecOp, HCVZerosOp,
-      HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp,
-      HCEmptyOp, HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
+  target.addIllegalOp<HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp,
+                      HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
+                      HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
+                      HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
+                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
+                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
+                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

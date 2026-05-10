@@ -195,8 +195,8 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
 
   // The init's shape tuple needs SSA dim values. Reuse the iter
   // bounds — they're undef-typed today; bound inference replaces
-  // them with `hc.materialize_bound_expr` once we know the dim
-  // expressions, which the init shape then picks up uniformly.
+  // them with empty-binding `hc.idx_apply` ops once we know the
+  // dim expressions, which the init shape then picks up uniformly.
   Value shapeTuple = buildShapeTuple(builder, loc, iterBounds);
   Value initOut = emitInit(builder, loc, spec.resultTy, shapeTuple);
 

@@ -4,7 +4,14 @@
 //
 // Implements `-hc-materialize-bound-exprs`, the HC-to-HC boundary that severs
 // launch/bound symbolic SSA values from their producer chains before scope
-// normalization.
+// normalization. Replaces every reachable `!hc.idx<expr>` / `!hc.pred<pred>`
+// SSA value whose carried expression depends only on bound (launch geometry
+// or kernel-declared ABI) symbols with a fresh `hc.idx_apply` / `hc.pred_apply`
+// of the same type. The replacement carries no operand bindings — the listed
+// symbols stay ambient and the launch-body lowering resolves them later from
+// launch context. Cutting the SSA chain here lets scope normalization erase
+// the now-unused workitem / subgroup / group producer operations without
+// dragging dependent index / predicate values along.
 
 #include "hc/Transforms/Passes.h"
 
@@ -98,8 +105,16 @@ static bool shouldMaterializeValue(Value value,
   if (!shouldMaterializeType(value.getType(), boundSymbols) ||
       value.use_empty())
     return false;
-  if (auto result = dyn_cast<OpResult>(value))
-    return !isa<HCMaterializeBoundExprOp>(result.getOwner());
+  if (auto result = dyn_cast<OpResult>(value)) {
+    // Already-severed values (an empty-symbol `idx_apply` /
+    // `pred_apply` carrying just a type) are the post-pass fixed
+    // point — re-severing them would loop without progress.
+    Operation *owner = result.getOwner();
+    if (auto idx = dyn_cast<HCIdxApplyOp>(owner))
+      return !idx.getOperands().empty() || !idx.getSymbols().empty();
+    if (auto pred = dyn_cast<HCPredApplyOp>(owner))
+      return !pred.getOperands().empty() || !pred.getSymbols().empty();
+  }
   return true;
 }
 
@@ -157,31 +172,74 @@ static void materializeValue(Value value, OpBuilder &builder) {
       loc = parent->getLoc();
   }
 
-  auto materialized =
-      HCMaterializeBoundExprOp::create(builder, loc, value.getType());
-  value.replaceAllUsesExcept(materialized.getResult(), materialized);
+  // Empty operand / symbol lists: the new value carries the type
+  // only, severing the SSA chain just like the legacy
+  // `materialize_bound_expr`. Lowering binds the type's free symbols
+  // ambiently from the surrounding launch context.
+  Type type = value.getType();
+  ArrayAttr emptySymbols = builder.getStrArrayAttr({});
+  Value replacement;
+  if (isa<IdxType>(type)) {
+    replacement =
+        HCIdxApplyOp::create(builder, loc, type, ValueRange{}, emptySymbols)
+            .getResult();
+  } else {
+    replacement =
+        HCPredApplyOp::create(builder, loc, type, ValueRange{}, emptySymbols)
+            .getResult();
+  }
+  value.replaceAllUsesExcept(replacement, replacement.getDefiningOp());
 }
 
+// Validates that every severed apply op's residual ambient symbols
+// are declared on the enclosing kernel's `bound_symbols` attribute.
+// Any free symbol the op explicitly binds via its `symbols` list is
+// resolved structurally and doesn't need to appear in the kernel's
+// declaration; only ambient names go through this check.
 static LogicalResult
 verifyMaterializedExprSymbols(Operation *root,
                               const BoundSymbolSet &boundSymbols) {
-  WalkResult status =
-      root->walk([&](HCMaterializeBoundExprOp op) -> WalkResult {
-        Type result = op.getResult().getType();
-        Attribute expr;
-        if (auto idx = dyn_cast<IdxType>(result))
-          expr = idx.getExpr();
-        else if (auto pred = dyn_cast<PredType>(result))
-          expr = pred.getPred();
-        if (!expr)
-          return WalkResult::advance();
-        std::string undeclared = firstUndeclaredSymbol(expr, boundSymbols);
-        if (undeclared.empty())
-          return WalkResult::advance();
-        op->emitOpError("references undeclared bound symbol '")
-            << undeclared << "'";
-        return WalkResult::interrupt();
-      });
+  auto check = [&](Operation *op, Attribute exprAttr,
+                   ArrayAttr explicitSymbols) -> WalkResult {
+    if (!exprAttr)
+      return WalkResult::advance();
+    llvm::StringSet<> bound;
+    for (Attribute attr : explicitSymbols)
+      if (auto str = dyn_cast<StringAttr>(attr))
+        bound.insert(str.getValue());
+    std::string undeclared;
+    auto checkName = [&](StringRef name) {
+      if (!undeclared.empty())
+        return;
+      if (bound.contains(name))
+        return;
+      if (!isBoundSymbolName(name, boundSymbols))
+        undeclared = name.str();
+    };
+    if (auto expr = dyn_cast<ExprAttr>(exprAttr))
+      sym::walkSymbolNames(expr.getValue(), checkName);
+    if (auto pred = dyn_cast<PredAttr>(exprAttr))
+      sym::walkSymbolNames(pred.getValue(), checkName);
+    if (undeclared.empty())
+      return WalkResult::advance();
+    op->emitOpError("references undeclared bound symbol '")
+        << undeclared << "'";
+    return WalkResult::interrupt();
+  };
+
+  WalkResult status = root->walk([&](Operation *op) -> WalkResult {
+    if (auto idx = dyn_cast<HCIdxApplyOp>(op)) {
+      auto idxType = dyn_cast<IdxType>(idx.getResult().getType());
+      return check(op, idxType ? idxType.getExpr() : Attribute{},
+                   idx.getSymbolsAttr());
+    }
+    if (auto pred = dyn_cast<HCPredApplyOp>(op)) {
+      auto predType = dyn_cast<PredType>(pred.getResult().getType());
+      return check(op, predType ? predType.getPred() : Attribute{},
+                   pred.getSymbolsAttr());
+    }
+    return WalkResult::advance();
+  });
   return failure(status.wasInterrupted());
 }
 

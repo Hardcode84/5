@@ -264,20 +264,6 @@ def HCSymbolOp : HC_Op<"symbol",
   let hasFolder = 1;
 }
 
-def HCMaterializeBoundExprOp : HC_Op<"materialize_bound_expr",
-    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
-  let summary = "Materialize a bound symbolic expression as SSA.";
-  let description = [{
-    Inserted after type inference for pinned `!hc.idx` / `!hc.pred`
-    expressions that depend only on launch/bound symbols and constants. This
-    breaks the dependence on the original symbolic producer chain before scope
-    normalization erases launch-context tokens.
-  }];
-  let results = (outs HC_ValueType:$result);
-  let assemblyFormat = "attr-dict `:` qualified(type($result))";
-  let hasVerifier = 1;
-}
-
 def HCIdxApplyOp : HC_Op<"idx_apply",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary =
@@ -295,11 +281,13 @@ def HCIdxApplyOp : HC_Op<"idx_apply",
     without an explicit cast. The launch-body type converter folds both to
     `index` before the expression walks the substituted operand.
 
-    Replaces the late-binding pattern of pairing a value-less
-    `hc.materialize_bound_expr` with ambient
-    `unrealized_conversion_cast %v : index to !hc.idx<sym>` carriers
-    walked from the parent `gpu.LaunchOp`. Same `expr`, but the operand
-    edge for every user-named symbol is now an explicit dataflow edge.
+    An empty `symbols` / empty `operands` apply is the value-less
+    severing form: it carries the type only and falls entirely
+    through ambient launch-context binding. Producer passes use this
+    form when the SSA values for free symbols aren't yet available
+    at the rewrite point (kernel ABI shape syms, stride params);
+    sites that already hold the runtime SSA bind it explicitly so
+    every user-named symbol becomes a real dataflow edge.
   }];
   let arguments = (ins
     Variadic<HC_SymBindingValueType>:$operands,

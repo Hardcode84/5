@@ -24,9 +24,9 @@ module {
       // CHECK: %[[ROW:.*]] = arith.muli %{{.*}}, %[[BX]] : index
       // CHECK: %[[LANE_TILE:.*]] = arith.divui %[[TX]], %{{.*}} : index
       // CHECK: %[[COL:.*]] = arith.addi %{{.*}}, %[[LANE_TILE]] : index
-      %row = hc.materialize_bound_expr : !hc.idx<"16*$WG0">
-      %col = hc.materialize_bound_expr : !hc.idx<"16*$WG1 + 1/16*$WI0">
-      %m = hc.materialize_bound_expr : !hc.idx<"M">
+      %row = hc.idx_apply () {symbols = []} : () -> !hc.idx<"16*$WG0">
+      %col = hc.idx_apply () {symbols = []} : () -> !hc.idx<"16*$WG1 + 1/16*$WI0">
+      %m = hc.idx_apply () {symbols = []} : () -> !hc.idx<"M">
       %n = hc.buffer_dim %buffer, axis = 1
           : !hc.buffer<f32, ["M", "N"]> -> !hc.idx<"N">
       %one = hc.const<1 : i64> : !hc.idx<"1">
@@ -47,7 +47,8 @@ module {
             : (!hc.idx<"$join0">, !hc.idx<"1">) -> !hc.idx<"1 + $join0">
         hc.yield
       }
-      // CHECK-NOT: hc.materialize_bound_expr
+      // CHECK-NOT: hc.idx_apply
+      // CHECK-NOT: hc.pred_apply
       // CHECK-NOT: hc.for_range
       gpu.terminator
     }
@@ -134,7 +135,7 @@ module {
              !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"4">>,
              tuple<!hc.idx<"4">, !hc.idx<"4">>)
             -> !hc.bare_tensor<!hc.pred, ["4", "4"]>
-      %lane = hc.materialize_bound_expr : !hc.idx<"$WI0">
+      %lane = hc.idx_apply () {symbols = []} : () -> !hc.idx<"$WI0">
       %full = hc.slice_expr() : () -> !hc.slice
       %frag = hc.buffer_view %tile[%lane, %full]
           : (!hc.bare_tensor<f32, ["4", "4"]>, !hc.idx<"$WI0">, !hc.slice)
@@ -356,7 +357,7 @@ module {
   // `hc.idx_apply` substitutes its named operands into the carried
   // expression while leaving unlisted free symbols (e.g. `$WG0` here)
   // to the launch-context binding. The lowering composes the same
-  // arith ops as `hc.materialize_bound_expr` would for the same
+  // arith ops an empty-binding `hc.idx_apply` would for the same
   // expression text, but the per-symbol SSA edges come straight from
   // the op rather than via an ambient `unrealized_conversion_cast`
   // walk over the launch.

@@ -36,14 +36,17 @@ using namespace mlir::hc;
 namespace {
 
 // Wrap a single dim attr (taken from an operand's symbolic shape) as
-// an `hc.materialize_bound_expr` of `!hc.idx<dim>` typed so later
-// bound-resolution sees a fully-typed source. The rewriter has full
-// structural knowledge of the iteration space, so the bounds-
-// inference pass would be a no-op if it ran after this one.
+// an `hc.idx_apply` carrying `!hc.idx<dim>` so later bound-resolution
+// sees a fully-typed source. No listed symbols: the dim's free
+// names (shape syms) are ambient and get bound by the launch-body
+// lowering. The rewriter has full structural knowledge of the
+// iteration space, so the bounds-inference pass would be a no-op if
+// it ran after this one.
 static Value materializeIdxBound(OpBuilder &builder, Location loc,
                                  ExprAttr dim) {
   auto idxTy = IdxType::get(builder.getContext(), dim);
-  return HCMaterializeBoundExprOp::create(builder, loc, idxTy);
+  return HCIdxApplyOp::create(builder, loc, idxTy, ValueRange{},
+                              builder.getStrArrayAttr({}));
 }
 
 // Build a `tuple<idx<...>, idx<...>, ...>` SSA value from the

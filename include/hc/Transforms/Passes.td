@@ -135,10 +135,11 @@ def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
     decomposition that lands later) are syntactic shorthands the
     frontend keeps for ergonomics.
 
-    Each rewrite emits its iter bounds as `hc.materialize_bound_expr`
-    on `!hc.idx<dim>` sourced directly from operand shapes — the
-    rewriter has full structural knowledge of the iteration space and
-    the bounds-inference pass would be a no-op if it ran after.
+    Each rewrite emits its iter bounds as an empty-binding
+    `hc.idx_apply` carrying `!hc.idx<dim>` sourced directly from
+    operand shapes — the rewriter has full structural knowledge of
+    the iteration space and the bounds-inference pass would be a
+    no-op if it ran after.
 
     `hc.matmul lhs, rhs : (T<M,K>, T<K,N>) -> T<M,N>` → an `hc.zeros`
     fill on the result type plus an `hc.generic` with two parallel
@@ -202,11 +203,12 @@ def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
     the per-axis offset on the memory operand to identity over the
     iter syms — same body, no addressing addend.
 
-    Iter bounds are emitted as `hc.materialize_bound_expr` on
-    `!hc.idx<dim>` sourced directly from the op's tile shape, so the
-    later `hc-infer-generic-bounds` pass would be a no-op if it ran
-    after this one. Iter sym names use `i_<k>` to stay distinct from
-    the symbolic names the access op's index operands carry.
+    Iter bounds are emitted as empty-binding `hc.idx_apply` ops
+    carrying `!hc.idx<dim>` sourced directly from the op's tile
+    shape, so the later `hc-infer-generic-bounds` pass would be a
+    no-op if it ran after this one. Iter sym names use `i_<k>` to
+    stay distinct from the symbolic names the access op's index
+    operands carry.
 
     Out of scope (no rewrite, op survives for downstream diagnostics):
 
@@ -296,9 +298,9 @@ def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
          store). Conflicts diagnose and name the offending operand
          pair.
 
-      3. The first agreed bound is materialized via
-         `hc.materialize_bound_expr` typed `!hc.idx<dim>` and used to
-         replace the placeholder operand on the op. The original
+      3. The first agreed bound is materialized via an empty-binding
+         `hc.idx_apply` carrying `!hc.idx<dim>` and used to replace
+         the placeholder operand on the op. The original
          `hc.undef_value` op is left for canonicalization / DCE if no
          other use survives.
 
@@ -484,13 +486,18 @@ def HCLowerBarePredicates
 
 def HCMaterializeBoundExprs
     : Pass<"hc-materialize-bound-exprs"> {
-  let summary = "Materialize bound symbolic HC expressions as SSA values.";
+  let summary = "Sever bound symbolic HC expressions from their producer chains.";
   let description = [{
     Replaces uses of values typed as pinned `!hc.idx<expr>` or
-    `!hc.pred<pred>` with `hc.materialize_bound_expr` when every symbolic leaf
-    is a bound symbol or the expression is constant-only. The original producer
-    is left in place for canonicalization/DCE, which lets this pass break
-    dependence on launch-context query chains before scope normalization.
+    `!hc.pred<pred>` with an empty-binding `hc.idx_apply` /
+    `hc.pred_apply` (no listed symbols, no operand SSA edges) when
+    every symbolic leaf is a bound symbol or the expression is
+    constant-only. The original producer is left in place for
+    canonicalization/DCE, which lets this pass break dependence on
+    launch-context query chains before scope normalization. The
+    severed apply ops resolve their pinned expressions ambiently
+    against the surrounding launch context at the launch-body
+    lowering boundary.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }

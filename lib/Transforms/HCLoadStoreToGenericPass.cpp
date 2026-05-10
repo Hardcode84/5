@@ -34,14 +34,16 @@ using namespace mlir::hc;
 
 namespace {
 
-// Materialize one bound dim as `!hc.idx<dim>` SSA. Mirrors the helper
-// in `hc-shaped-compute-to-generic` — the rewriter has full structural
-// knowledge of the iteration space, so the bounds-inference pass is a
-// no-op if it ever runs after.
+// Materialize one bound dim as `!hc.idx<dim>` SSA via an
+// `hc.idx_apply` with no listed symbols (free shape names stay
+// ambient). Mirrors the helper in `hc-shaped-compute-to-generic` —
+// the rewriter has full structural knowledge of the iteration space,
+// so the bounds-inference pass is a no-op if it ever runs after.
 static Value materializeIdxBound(OpBuilder &builder, Location loc,
                                  ExprAttr dim) {
   auto idxTy = IdxType::get(builder.getContext(), dim);
-  return HCMaterializeBoundExprOp::create(builder, loc, idxTy);
+  return HCIdxApplyOp::create(builder, loc, idxTy, ValueRange{},
+                              builder.getStrArrayAttr({}));
 }
 
 // Build a `tuple<idx<...>, ...>` SSA tuple from the per-axis bounds —

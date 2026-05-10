@@ -9,8 +9,8 @@ module {
     %c1 = arith.constant 1 : index
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      // CHECK: error: 'hc.materialize_bound_expr' op failed to lower bound index expression
-      %bad = hc.materialize_bound_expr : !hc.idx<"M">
+      // CHECK: error: 'hc.idx_apply' op failed to lower idx_apply expression
+      %bad = hc.idx_apply () {symbols = []} : () -> !hc.idx<"M">
       gpu.terminator
     }
     return

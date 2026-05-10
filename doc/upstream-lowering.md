@@ -217,9 +217,11 @@ cross-function lowering of vector fragments. Later, helpers can become private
 Use `index`-typed SSA for launch geometry and buffer coordinates.
 
 * `!hc.idx<expr>` becomes `index` for SSA operands and intrinsic contracts.
-* `hc.materialize_bound_expr` lowers launch symbols such as `$WG0` / `$WI0`
-  from `gpu.launch` block/thread ids and ABI symbols such as `M` / `N` from
-  `memref.dim`.
+* `hc.idx_apply` / `hc.pred_apply` lower their pinned expression
+  through any explicitly bound operand SSA, then resolve any unlisted
+  free symbols ambiently — launch symbols such as `$WG0` / `$WI0`
+  from `gpu.launch` block/thread ids, ABI symbols such as `M` / `N`
+  from `memref.dim`.
 * `hc.const`, simple index arithmetic/comparisons, `hc.buffer_dim`, and
   `hc.for_range` lower to `arith`, `memref.dim`, and `scf.for`.
 * `hc.slice_expr` and tile shape tuples remain HC carriers for the memory

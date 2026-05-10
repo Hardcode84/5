@@ -512,8 +512,8 @@ Scans every `hc.generic` and fills any `iter_bounds` operand whose
 defining op is `hc.undef`. The procedure: for each iter sym `s`,
 collect every `(operand, axis)` pair where `s` appears in the offset
 expression at position `axis`; match the operand's shape entry at that
-axis against `[0, s)`; emit a `materialize_bound_expr` (or directly a
-shape-symbol-reference) producing the resolved bound. Conflicts (two
+axis against `[0, s)`; emit an empty-binding `hc.idx_apply` (or
+directly a shape-symbol-reference) producing the resolved bound. Conflicts (two
 operands implying different bounds for the same iter) are diagnostics,
 not silent picks. The pass is no-op if every bound is already
 concrete, so rewriters that emit fully-resolved ops pay nothing.

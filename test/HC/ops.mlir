@@ -46,9 +46,9 @@
 // CHECK: hc.func @tile_helper {
 // CHECK: hc.func @typed_with_return(%arg0: i32) -> i32 {
 // CHECK-NEXT: hc.return %arg0 : i32
-// CHECK: hc.func @materialize_bound_expr {
-// CHECK: hc.materialize_bound_expr : !hc.idx<"$WI0">
-// CHECK: hc.materialize_bound_expr : !hc.pred<"-32 + $WI0 < 0">
+// CHECK: hc.func @apply_bound {
+// CHECK: hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WI0">
+// CHECK: hc.pred_apply() {symbols = []} : () -> !hc.pred<"-32 + $WI0 < 0">
 // CHECK: hc.func @apply_ops(%[[I:[^:]+]]: index, %[[K:[^:]+]]: !hc.idx<"K">, %[[J:[^:]+]]: index) {
 // CHECK: hc.idx_apply(%[[I]], %[[K]], %[[J]]) {symbols = ["i", "K", "j"]}
 // CHECK-SAME: : (index, !hc.idx<"K">, index) -> !hc.idx<"K + i*j">
@@ -136,9 +136,9 @@ module {
     hc.return %a : i32
   }
 
-  hc.func @materialize_bound_expr {
-    %idx = hc.materialize_bound_expr : !hc.idx<"$WI0">
-    %pred = hc.materialize_bound_expr : !hc.pred<"$WI0 < 32">
+  hc.func @apply_bound {
+    %idx = hc.idx_apply() {symbols = []} : () -> !hc.idx<"$WI0">
+    %pred = hc.pred_apply() {symbols = []} : () -> !hc.pred<"$WI0 < 32">
     hc.return
   }
 

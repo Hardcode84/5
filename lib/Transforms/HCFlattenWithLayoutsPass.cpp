@@ -18,7 +18,7 @@
 // to a single 1D base-offset SSA value computed from the operand's
 // layout. The composition runs *during* conversion so the layout is
 // still on the (pre-conversion) operand type when we read it. Common
-// cases lower to one `hc.materialize_bound_expr` typed
+// cases lower to one empty-binding `hc.idx_apply` carrying
 // `!hc.idx<offset_expr>`; the per-element traversal of the loaded
 // tile (which depends on the storage being contiguous from that base)
 // is the consuming pass's problem. `hc.buffer_view` and `hc.vec` stay
@@ -239,9 +239,9 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
   // intentionally don't expand here — they survive as free symbols in
   // the resulting offset, the same way `computeStorageSizeExpr` lets
   // them survive in the post-flatten storage size. Whoever resolves
-  // those symbols downstream (launch context for stride params,
-  // materialize_bound_expr lowering for closed-form ones) does it
-  // uniformly across both surfaces.
+  // those symbols downstream (launch context for stride params, the
+  // launch-body lowering's idx_apply walk for closed-form ones) does
+  // it uniformly across both surfaces.
   SmallVector<ixs_node *> targets;
   SmallVector<ixs_node *> replacements;
   targets.reserve(shapeSyms.size() + indexSyms.size());
@@ -281,15 +281,20 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
 }
 
 // Materialize the composed offset as an SSA value typed
-// `!hc.idx<offset_expr>` via `hc.materialize_bound_expr`. The
-// downstream `hc-materialize-bound-exprs` pass resolves the type's
-// pinned expression against the in-scope symbol bindings (kernel
-// shape symbols, stride params, etc.) when it lowers the
-// materialize op into concrete SSA arithmetic.
+// `!hc.idx<offset_expr>` via an `hc.idx_apply` with no listed
+// symbols. The op's free symbols (shape syms, stride params, iter
+// syms) all stay ambient and get bound by the launch-body lowering
+// from the surrounding launch context. Threading explicit operand
+// bindings here is a future refinement: the rewriter has the iter-
+// sym SSA right at hand on the `indices` operands, but the shape /
+// stride bindings come from buffer-dim / launch-walk machinery the
+// caller doesn't currently see.
 static Value materializeOffsetSSA(ConversionPatternRewriter &rewriter,
                                   Location loc, ExprAttr offsetExpr) {
   auto idxType = IdxType::get(rewriter.getContext(), offsetExpr);
-  return HCMaterializeBoundExprOp::create(rewriter, loc, idxType).getResult();
+  return HCIdxApplyOp::create(rewriter, loc, idxType, ValueRange{},
+                              rewriter.getStrArrayAttr({}))
+      .getResult();
 }
 
 // Per-access-op helper: extracts each index operand's symbolic expr,

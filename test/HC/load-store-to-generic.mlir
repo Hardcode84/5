@@ -14,8 +14,8 @@
 // identity offsets. Body forwards the loaded element through
 // `hc.yield`.
 // CHECK-LABEL: func.func @load_basic
-// CHECK-DAG: %[[A:.+]] = hc.materialize_bound_expr : !hc.idx<"A">
-// CHECK-DAG: %[[B:.+]] = hc.materialize_bound_expr : !hc.idx<"B">
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"A">
+// CHECK-DAG: %[[B:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"B">
 // CHECK: %[[SH:.+]] = hc.tuple(%[[A]], %[[B]])
 // CHECK: %[[FILL:.+]] = hc.zeros shape %[[SH]] {{.*}} -> !hc.tensor<f32, ["A", "B"]>
 // CHECK: %[[OUT:.+]] = hc.generic
@@ -43,8 +43,8 @@ func.func @load_basic(%buf: !hc.buffer<f32, ["M", "N"]>,
 // init is `hc.vzeros` because the result is a vector. Confirms the
 // init-op picker keys off the result type, not the source.
 // CHECK-LABEL: func.func @vload_basic
-// CHECK-DAG: %[[A:.+]] = hc.materialize_bound_expr : !hc.idx<"A">
-// CHECK-DAG: %[[B:.+]] = hc.materialize_bound_expr : !hc.idx<"B">
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"A">
+// CHECK-DAG: %[[B:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"B">
 // CHECK: %[[FILL:.+]] = hc.vzeros shape %{{[^ ]+}} {{.*}} -> !hc.vector<f32, ["A", "B"]>
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %[[A]] : !hc.idx<"A">, parallel i_1 = %[[B]] : !hc.idx<"B">)
@@ -70,8 +70,8 @@ func.func @vload_basic(%src: !hc.tensor<f32, ["M", "N"]>,
 // addressing. Body still forwards the source element so the
 // downstream `hc.ptr_store` materialisation has the value to write.
 // CHECK-LABEL: func.func @store_buffer
-// CHECK-DAG: %[[A:.+]] = hc.materialize_bound_expr : !hc.idx<"A">
-// CHECK-DAG: %[[B:.+]] = hc.materialize_bound_expr : !hc.idx<"B">
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"A">
+// CHECK-DAG: %[[B:.+]] = hc.idx_apply() {symbols = []} : () -> !hc.idx<"B">
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %[[A]] : !hc.idx<"A">, parallel i_1 = %[[B]] : !hc.idx<"B">)
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["A", "B"]>)

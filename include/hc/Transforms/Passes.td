@@ -719,11 +719,15 @@ def HCLowerLaunchBody
     Converts the HC subset that remains inside `gpu.launch` after kernel
     wrapping. Bound symbolic expressions become upstream SSA values derived
     from launch ids and buffer dimensions, simple arithmetic lowers to `arith`,
-    `hc.for_range`/`hc.if` become `scf` control flow, static bare tensors lower
-    to workgroup `memref` storage, and bare vectors lower to upstream `vector`
-    values. Final masked stores lower to guarded memref writes. Intrinsic
-    boundaries remain HC operations with explicit casts until their dedicated
-    lowering slice.
+    `hc.for_range`/`hc.if` become `scf` control flow, static bare tensors
+    materialize as `hc.alloc` + `hc.ptr_*` against `!hc.ptr<workgroup, T>`
+    (the `hc-lower-to-llvm` slice owns the final memory lowering), and bare
+    vectors lower to upstream `vector` values. Final masked stores lower to
+    `hc.ptr_store_pred` (vector form) or guarded scalar stores. Kernel
+    argument memrefs flow through unchanged — the host-side switch to
+    `!hc.ptr<global>` lives in the launch-helper / host-wrapper slice. WMMA
+    intrinsic boundaries stay on their existing `hc.call_intrinsic` path
+    until the matching recipe runs.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -733,6 +737,61 @@ def HCLowerLaunchBody
     "::mlir::memref::MemRefDialect",
     "::mlir::scf::SCFDialect",
     "::mlir::vector::VectorDialect"
+  ];
+}
+
+def HCLowerToLLVM
+    : Pass<"hc-lower-to-llvm"> {
+  let summary = "Lower hc.ptr / hc.alloc / hc.ptr_* to LLVM dialect.";
+  let description = [{
+    Final lowering for the `!hc.ptr` family — see `doc/layouts.md`
+    "hc.ptr and memory ops" for the contract. Operates on whatever scope
+    it's invoked in (`builtin.module` for unit LITs, `gpu.module` inside
+    the canonical AMDGPU pipeline) and rewrites the dialect surface
+    launch-body and `hc-lower-generic` produce.
+
+    Type conversion: `!hc.ptr<addr_space, T?>` → `!llvm.ptr<addr_space>`
+    (LLVM has been opaque-pointers-only since LLVM 17; the carried element
+    type is dropped here and recovered from the access op).
+
+    Op rewrites:
+
+      * `hc.alloc count = N : index -> !hc.ptr<workgroup, T>` —
+        materializes a sibling `llvm.mlir.global private`
+        `!llvm.array<N x T>` in addrspace 3 at the nearest enclosing
+        symbol-table op, then plants `llvm.mlir.addressof` at the use
+        site. `N` must be a constant integer (the doc invariant); a
+        non-constant count diagnoses.
+      * `hc.alloc count = N : index -> !hc.ptr<private, T>` —
+        `llvm.alloca N x T` in addrspace 5 at the use site (runtime
+        count is fine; the alloca's lifetime is per-call).
+      * `hc.alloc count = N : index -> !hc.ptr<global, T>` — diagnoses;
+        global-AS allocations come from the host (kernel arg) and have
+        no in-kernel materialization.
+      * `hc.ptr_offset %p, %i` — `llvm.getelementptr` with the carried
+        element type as the GEP element. Index is `index`-cast to `i64`
+        for the GEP index list.
+      * `hc.ptr_load %p : ... -> T` — `llvm.load` of the access type
+        (scalar or `vector<NxT>`); identical surface either way.
+      * `hc.ptr_store %v, %p` — `llvm.store` of the access type.
+      * `hc.ptr_load_pred` / `hc.ptr_store_pred` — vector form lowers
+        to `llvm.intr.masked.load` / `llvm.intr.masked.store`. Scalar
+        form lowers to `scf.if` + `llvm.load`/`llvm.store` + the
+        passthrough as the else-yield (load) or no-op else (store).
+
+    Element type comes from the pointer for typed `!hc.ptr<AS, T>` and
+    from the access op's value type for opaque pointers — load/store
+    always know the access type at their op.
+
+    Out of scope (kept until follow-ups): kernel-arg `!hc.ptr<global>`
+    boundary plumbing (gated on the host-wrapper migration), private-AS
+    optimization, host-side stride binding fold-through.
+  }];
+  let dependentDialects = [
+    "::mlir::LLVM::LLVMDialect",
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::scf::SCFDialect"
   ];
 }
 

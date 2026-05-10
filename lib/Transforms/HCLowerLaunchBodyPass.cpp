@@ -2,8 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-launch-body`, the launch-body lowering slice that runs
+// Implements `-hc-lower-launch-body`, the launch-body lowering pass that runs
 // after HC kernels have been wrapped in `gpu.launch`.
+//
+// Workgroup-AS storage no longer materializes as `memref<..., workgroup>` —
+// the launch-body emits `hc.alloc`/`hc.ptr_*` against `!hc.ptr<workgroup, T>`
+// and the downstream `hc-lower-to-llvm` finishes the LLVM-dialect lowering.
+// Kernel-argument memrefs flow through unchanged; the host-wrapper switch to
+// `!hc.ptr<global>` is owned by a separate pass. The doc invariant scopes the
+// retirement to the workgroup-AS family — see `doc/layouts.md` "hc.ptr and
+// memory ops" for the contract.
 
 #include "hc/Transforms/Passes.h"
 
@@ -102,18 +110,34 @@ staticIntegerShape(SymbolicallyShapedTypeInterface shaped) {
   return *dims;
 }
 
+// Bare tensors collapse to `!hc.ptr<workgroup, T>` — the launch-body owns
+// the workgroup tile only as opaque-flat storage; the rank and layout were
+// frontend semantics, and once memory is in hand the lowering treats every
+// LDS allocation as a flat element-typed buffer. Static dims are required
+// because `hc.alloc` workgroup needs a constant element count downstream.
 static Type convertBareTensorType(BareTensorType type) {
   auto shaped = cast<SymbolicallyShapedTypeInterface>(type);
   Type element = convertElementType(shaped.getSymbolicElementType());
   if (!element)
     return {};
-  FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(shaped);
-  if (failed(dims))
+  if (failed(staticIntegerShape(shaped)))
     return {};
-  Attribute memorySpace = gpu::AddressSpaceAttr::get(
-      type.getContext(), gpu::AddressSpace::Workgroup);
-  return MemRefType::get(*dims, element, MemRefLayoutAttrInterface{},
-                         memorySpace);
+  return PtrType::get(type.getContext(), AddrSpace::Workgroup, element);
+}
+
+// Total element count for the workgroup tile — product of static dims.
+static FailureOr<int64_t> bareTensorElementCount(BareTensorType type) {
+  FailureOr<SmallVector<int64_t>> dims =
+      staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(type));
+  if (failed(dims))
+    return failure();
+  int64_t total = 1;
+  for (int64_t d : *dims) {
+    if (d < 0)
+      return failure();
+    total *= d;
+  }
+  return total;
 }
 
 static Type convertBareVectorType(BareVectorType type) {
@@ -790,93 +814,70 @@ collectAxes(Operation *op, ValueRange indices, OpBuilder &builder,
   return axes;
 }
 
-static AffineMap transferPermutationMap(MLIRContext *ctx, int64_t sourceRank,
-                                        ArrayRef<SliceAxis> axes) {
-  SmallVector<AffineExpr> results;
-  results.reserve(axes.size());
-  for (auto [axis, info] : llvm::enumerate(axes))
-    if (info.isSlice)
-      results.push_back(getAffineDimExpr(axis, ctx));
-  return AffineMap::get(sourceRank, 0, results, ctx);
+// Allocate a flat `!hc.ptr<workgroup, T>` sized for `count` elements. The
+// downstream `hc-lower-to-llvm` rewrites the alloc into a sibling
+// addrspace(3) global; rank-erasure happens at this boundary because the
+// AMDGPU LDS surface is one-dimensional anyway.
+static Value allocateWorkgroupPtr(OpBuilder &builder, Location loc,
+                                  PtrType ptrType, int64_t count) {
+  Value countValue =
+      arith::ConstantIndexOp::create(builder, loc, count).getResult();
+  return HCAllocOp::create(builder, loc, ptrType, countValue).getResult();
 }
 
-static SmallVector<Value> zeroOffsets(OpBuilder &builder, Location loc,
-                                      int64_t rank) {
-  SmallVector<Value> offsets;
-  offsets.reserve(rank);
-  for (int64_t axis = 0; axis != rank; ++axis)
-    offsets.push_back(zeroIndex(builder, loc));
-  return offsets;
+// Walk linear `lin` into per-axis coords for `shape` (last axis fastest).
+// Returns the constant-index `Value` per axis.
+static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
+                                            int64_t lin,
+                                            ArrayRef<int64_t> shape) {
+  SmallVector<Value> coords(shape.size());
+  int64_t remaining = lin;
+  for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
+       --axis) {
+    coords[axis] =
+        arith::ConstantIndexOp::create(builder, loc, remaining % shape[axis])
+            .getResult();
+    remaining /= shape[axis];
+  }
+  return coords;
 }
 
-static mlir::VectorType vectorTypeForMemRef(MemRefType memrefType) {
-  if (!memrefType.hasStaticShape())
-    return {};
-  return mlir::VectorType::get(memrefType.getShape(),
-                               memrefType.getElementType());
-}
-
-static Value allocateWorkgroupMemRef(OpBuilder &builder, Location loc,
-                                     MemRefType type) {
-  return memref::AllocaOp::create(builder, loc, type).getResult();
-}
-
-static LogicalResult writeVectorToMemRef(OpBuilder &builder, Location loc,
-                                         Value vector, Value memref) {
-  auto memrefType = dyn_cast<MemRefType>(memref.getType());
-  if (!memrefType)
+// Per-element store from a multi-dim `vector<...xT>` value into a flat
+// `!hc.ptr<workgroup, T>` buffer. Emits one `hc.ptr_offset` + `hc.ptr_store`
+// per lane in row-major order. We unconditionally use the per-element form
+// (rather than a single vector-typed `hc.ptr_store`) so the matching reads
+// can also be per-element scalars and the i1 byte-vs-bit discrepancy LLVM
+// has between scalar and vector i1 stores never bites.
+static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
+                                               Value vector, Value ptr,
+                                               ArrayRef<int64_t> shape) {
+  auto vectorType = dyn_cast<mlir::VectorType>(vector.getType());
+  if (!vectorType || vectorType.getShape() != shape)
+    return failure();
+  auto ptrType = dyn_cast<PtrType>(ptr.getType());
+  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Workgroup)
     return failure();
 
-  // i1 needs per-element stores: a `vector<NxI1>` lowers to a packed-bit
-  // store (LLVM packs the i1 lanes into the vector's bit width — N bits =
-  // ceil(N/8) bytes), but `memref<NxI1>` accessed at element granularity
-  // gets one i1 per *byte* (i1 has store size 1). The downstream
-  // per-element scalar loads emitted by `transfer_to_scf full_unroll =
-  // true` for the WMMA fragment paths reach past byte 0/1 into bytes the
-  // packed write never touched, then read uninitialized LDS for every
-  // lane whose `lane%16 >= 2`. Decompose the vector store into N scalar
-  // i1 stores so both ends of the wire agree on byte-per-element layout.
-  // For wider types (f16/f32) the packed-vector and per-element stores
-  // touch the same bytes, so the extra unroll just bloats IR — keep the
-  // single transfer_write there.
-  if (memrefType.getElementType().isInteger(1)) {
-    auto vectorType = dyn_cast<mlir::VectorType>(vector.getType());
-    if (!vectorType || vectorType.getRank() != memrefType.getRank() ||
-        vectorType.getShape() != memrefType.getShape())
-      return failure();
-    SmallVector<int64_t> shape(memrefType.getShape().begin(),
-                               memrefType.getShape().end());
-    int64_t total = 1;
-    for (int64_t d : shape)
-      total *= d;
-    SmallVector<Value> dimValues;
-    dimValues.reserve(shape.size());
-    for (int64_t d : shape)
-      dimValues.push_back(
-          arith::ConstantIndexOp::create(builder, loc, d).getResult());
-    for (int64_t lin = 0; lin < total; ++lin) {
-      // Walk linear index back into per-axis coords (last axis fastest).
-      SmallVector<Value> coords(shape.size());
-      SmallVector<int64_t> coordInts(shape.size());
-      int64_t remaining = lin;
-      for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
-           --axis) {
-        coordInts[axis] = remaining % shape[axis];
-        remaining /= shape[axis];
-        coords[axis] =
-            arith::ConstantIndexOp::create(builder, loc, coordInts[axis])
-                .getResult();
-      }
-      Value element = vector::ExtractOp::create(builder, loc, vector, coordInts)
-                          .getResult();
-      memref::StoreOp::create(builder, loc, element, memref, coords);
+  int64_t total = 1;
+  for (int64_t d : shape)
+    total *= d;
+  for (int64_t lin = 0; lin != total; ++lin) {
+    SmallVector<Value> coords = unlinearizeCoords(builder, loc, lin, shape);
+    SmallVector<int64_t> coordInts(shape.size());
+    int64_t remaining = lin;
+    for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
+         --axis) {
+      coordInts[axis] = remaining % shape[axis];
+      remaining /= shape[axis];
     }
-    return success();
+    Value element =
+        vector::ExtractOp::create(builder, loc, vector, coordInts).getResult();
+    Value linVal =
+        arith::ConstantIndexOp::create(builder, loc, lin).getResult();
+    Value addr =
+        HCPtrOffsetOp::create(builder, loc, ptrType, ptr, linVal).getResult();
+    HCPtrStoreOp::create(builder, loc, element, addr);
   }
-
-  vector::TransferWriteOp::create(
-      builder, loc, vector, memref,
-      zeroOffsets(builder, loc, memrefType.getRank()));
   return success();
 }
 
@@ -908,7 +909,7 @@ linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
 }
 
 // Cooperative copy from a slice of a device-memory memref into a workgroup-AS
-// LDS memref. Each thread of the enclosing wave is responsible for a strided
+// LDS pointer. Each thread of the enclosing wave is responsible for a strided
 // subset of the LDS tile's elements (`lane, lane + wgSize, lane + 2*wgSize,
 // ...`); a closing `gpu.barrier` makes the fully populated LDS visible to
 // every thread before it's read back as per-lane fragments.
@@ -925,10 +926,17 @@ linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
 // The bounds check is per-element rather than at the tile level so partial
 // tiles at the edge of `M`/`N`/`K` get correct zero padding without
 // over-reading the source.
+//
+// LDS writes route through `hc.ptr_offset` + `hc.ptr_store` against the
+// flat workgroup buffer. The linear index already in hand from the
+// per-thread chunk loop *is* the flat offset; the per-axis coords only
+// participate in computing the source index back into the kernel-arg
+// memref.
 static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
                                          Operation *anchor, Value sourceMemRef,
                                          ArrayRef<SliceAxis> axes, Value lds,
-                                         MemRefType ldsType) {
+                                         ArrayRef<int64_t> ldsShape,
+                                         Type elementType) {
   FailureOr<std::pair<Value, Value>> tidAndSize =
       linearizedThreadAndSize(builder, loc, anchor);
   if (failed(tidAndSize))
@@ -936,7 +944,6 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
   Value linearTid = tidAndSize->first;
   Value wgSize = tidAndSize->second;
 
-  ArrayRef<int64_t> ldsShape = ldsType.getShape();
   int64_t totalElements = 1;
   for (int64_t d : ldsShape)
     totalElements *= d;
@@ -951,10 +958,11 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
   // would otherwise step past `totalVal`).
   Value chunks =
       arith::CeilDivUIOp::create(builder, loc, totalVal, wgSize).getResult();
-  Type elementType = ldsType.getElementType();
   Value padding = constantSplat(builder, loc, elementType, 0);
   if (!padding)
     return failure();
+
+  auto ptrType = cast<PtrType>(lds.getType());
 
   scf::ForOp loop =
       scf::ForOp::create(builder, loc, c0, chunks, c1, ValueRange{});
@@ -1046,7 +1054,9 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
       scf::YieldOp::create(builder, loc, padding);
     }
 
-    memref::StoreOp::create(builder, loc, loadIf.getResult(0), lds, coords);
+    Value addr =
+        HCPtrOffsetOp::create(builder, loc, ptrType, lds, lin).getResult();
+    HCPtrStoreOp::create(builder, loc, loadIf.getResult(0), addr);
   }
 
   // Make the cooperative writes visible to every thread before any per-lane
@@ -1057,104 +1067,271 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
   return success();
 }
 
-static FailureOr<Value> materializeShapedResult(OpBuilder &builder,
-                                                Location loc,
-                                                Type convertedType,
-                                                Value vector) {
+// Walk back through an `unrealized_conversion_cast` to recover a workgroup-AS
+// `!hc.ptr` value. Counterpart to `sourceMemRef` for the launch-body's LDS
+// path; kernel-arg pointers go through `sourceMemRef` and stay as memrefs
+// for now. Returns null if `value` doesn't ultimately derive from a
+// workgroup ptr.
+static Value sourcePtr(Value value) {
+  auto cast = value.getDefiningOp<UnrealizedConversionCastOp>();
+  if (cast && cast.getInputs().size() == 1 && cast.getOutputs().size() == 1) {
+    Value input = cast.getInputs().front();
+    if (auto ptr = dyn_cast<PtrType>(input.getType()))
+      if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+        return input;
+  }
+  if (auto ptr = dyn_cast<PtrType>(value.getType()))
+    if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+      return value;
+  return {};
+}
+
+// Captures the underlying `!hc.ptr<workgroup, T>` source plus an indexing
+// pattern that maps result-vector lanes back to source-tile flat offsets.
+// Materialized eagerly from a (possibly view-laden) bare-tensor SSA value;
+// see `resolvePtrViewSource`. The trivial pattern (no `hc.buffer_view` in
+// the chain) carries one full-slice `SliceAxis` per source dim — gives the
+// per-element loop a single shape to iterate without a separate "no view"
+// path.
+struct PtrViewSource {
+  Value sourcePtr;
+  PtrType ptrType;
+  SmallVector<int64_t> sourceShape;
+  SmallVector<SliceAxis> axes;
+};
+
+// Walk back through a single `hc.buffer_view` to find the underlying
+// workgroup ptr and the index pattern. The buffer_view ops sit in the
+// pre-conversion IR — `getRemappedValue` walks `replaceOp` records to
+// produce the post-conversion ptr for the source tile, which by this point
+// has been lowered (or is being lowered in this same partial-conversion
+// pass). Two-deep view chains (`view(view(...))`) are vanishingly rare in
+// the surface; if they ever show up we'd unroll the chain here.
+//
+// For non-view sources (`hc.alloc`, cooperative-copy result, fresh LDS from
+// a `select`), we synthesize a trivial axis pattern (every axis a full
+// slice over the source's static dim). That keeps the loader uniform — the
+// strided per-element loop with trivial axes degenerates to the same flat
+// `0..N` iteration the no-view path would emit.
+static FailureOr<PtrViewSource>
+resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
+  if (auto bv = original.getDefiningOp<HCBufferViewOp>()) {
+    Value sourceTile = bv.getBuffer();
+    auto bareSrc = dyn_cast<BareTensorType>(sourceTile.getType());
+    if (!bareSrc)
+      return failure();
+    FailureOr<SmallVector<int64_t>> sourceShape =
+        staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bareSrc));
+    if (failed(sourceShape))
+      return failure();
+    Value remappedSrc = rewriter.getRemappedValue(sourceTile);
+    if (!remappedSrc)
+      return failure();
+    Value srcPtr = sourcePtr(remappedSrc);
+    if (!srcPtr)
+      return failure();
+    auto srcPtrType = dyn_cast<PtrType>(srcPtr.getType());
+    if (!srcPtrType || srcPtrType.getAddrSpace() != AddrSpace::Workgroup)
+      return failure();
+    // Walk through remapped index operands so the per-axis offset/stride
+    // values come out as `index`-typed SSA the per-element loop can plug
+    // into `arith.muli`/`arith.addi` directly. The pre-conversion form
+    // here is `!hc.idx<...>` / `!hc.slice<...>` from the buffer_view's
+    // original operands, so we have to remap each index value (the slice
+    // op's `lower`/`upper`/`step` are the slice op's own operands and get
+    // remapped on its lowering, which has already happened by the time
+    // any ptr-view consumer runs).
+    SmallVector<Value> remappedIndices;
+    remappedIndices.reserve(bv.getIndices().size());
+    for (Value idx : bv.getIndices()) {
+      Value remapped = rewriter.getRemappedValue(idx);
+      if (!remapped)
+        return failure();
+      remappedIndices.push_back(remapped);
+    }
+    FailureOr<SmallVector<SliceAxis>> axes =
+        collectAxes(bv.getOperation(), remappedIndices, rewriter,
+                    /*requireUnitStride=*/true);
+    if (failed(axes))
+      return failure();
+    if (axes->size() != sourceShape->size())
+      return bv.emitOpError("expected one view subscript per source axis");
+    return PtrViewSource{srcPtr, srcPtrType, *sourceShape, std::move(*axes)};
+  }
+
+  Value remapped = rewriter.getRemappedValue(original);
+  if (!remapped)
+    return failure();
+  Value srcPtr = sourcePtr(remapped);
+  if (!srcPtr)
+    return failure();
+  auto srcPtrType = dyn_cast<PtrType>(srcPtr.getType());
+  if (!srcPtrType || srcPtrType.getAddrSpace() != AddrSpace::Workgroup)
+    return failure();
+  auto bare = dyn_cast<BareTensorType>(original.getType());
+  if (!bare)
+    return failure();
+  FailureOr<SmallVector<int64_t>> shape =
+      staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bare));
+  if (failed(shape))
+    return failure();
+
+  SmallVector<SliceAxis> trivialAxes;
+  trivialAxes.reserve(shape->size());
+  Value zero = zeroIndex(rewriter, original.getLoc());
+  Value one = oneIndex(rewriter, original.getLoc());
+  for (size_t i = 0; i < shape->size(); ++i) {
+    SliceAxis ax;
+    ax.offset = zero;
+    ax.stride = one;
+    ax.isSlice = true;
+    trivialAxes.push_back(ax);
+  }
+  return PtrViewSource{srcPtr, srcPtrType, *shape, std::move(trivialAxes)};
+}
+
+// Per-element load of a multi-dim `vector<...xT>` from a workgroup ptr,
+// honoring any `hc.buffer_view` index pattern in the source chain. Lane V
+// reads from the source's flat offset `base + sum_k(view_idx[k] *
+// source_stride[slice_axis_k])` — base is the contribution of scalar source
+// axes, the slice contribution scales the lane coord by the source's
+// row-major stride at that source axis. For trivial (full-slice) patterns,
+// this collapses to the contiguous `0..N-1` linear walk a no-view source
+// wants. For strided patterns (column-of-2D-tile in WMMA), it threads each
+// lane through a separate `hc.ptr_offset` + `hc.ptr_load`.
+//
+// The per-element shape preserves the byte-per-element layout the
+// cooperative store and other consumers use, sidestepping the i1
+// packed/unpacked discrepancy LLVM has between scalar and vector i1 stores.
+static FailureOr<Value>
+loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
+                      Value original, mlir::VectorType vectorType,
+                      ArrayRef<int64_t> viewShape) {
+  FailureOr<PtrViewSource> src = resolvePtrViewSource(original, rewriter);
+  if (failed(src))
+    return failure();
+  if (vectorType.getShape() != viewShape)
+    return failure();
+
+  SmallVector<int64_t> sourceStrides(src->sourceShape.size(), 1);
+  for (int64_t axis = static_cast<int64_t>(src->sourceShape.size()) - 2;
+       axis >= 0; --axis)
+    sourceStrides[axis] = sourceStrides[axis + 1] * src->sourceShape[axis + 1];
+
+  SmallVector<int64_t> sliceAxisPositions;
+  for (int64_t i = 0; i < static_cast<int64_t>(src->axes.size()); ++i)
+    if (src->axes[i].isSlice)
+      sliceAxisPositions.push_back(i);
+  if (sliceAxisPositions.size() != viewShape.size())
+    return failure();
+
+  Value baseOffset = zeroIndex(rewriter, loc);
+  for (size_t i = 0; i < src->axes.size(); ++i) {
+    if (src->axes[i].isSlice)
+      continue;
+    Value strideVal =
+        arith::ConstantIndexOp::create(rewriter, loc, sourceStrides[i])
+            .getResult();
+    Value contrib =
+        arith::MulIOp::create(rewriter, loc, src->axes[i].offset, strideVal)
+            .getResult();
+    baseOffset =
+        arith::AddIOp::create(rewriter, loc, baseOffset, contrib).getResult();
+  }
+
+  int64_t total = 1;
+  for (int64_t d : viewShape)
+    total *= d;
+  Type elementType = vectorType.getElementType();
+  Value result = arith::ConstantOp::create(rewriter, loc, vectorType,
+                                           rewriter.getZeroAttr(vectorType))
+                     .getResult();
+  for (int64_t lin = 0; lin != total; ++lin) {
+    SmallVector<int64_t> coordInts(viewShape.size());
+    int64_t remaining = lin;
+    for (int64_t axis = static_cast<int64_t>(viewShape.size()) - 1; axis >= 0;
+         --axis) {
+      coordInts[axis] = remaining % viewShape[axis];
+      remaining /= viewShape[axis];
+    }
+    Value flat = baseOffset;
+    for (size_t vi = 0; vi < sliceAxisPositions.size(); ++vi) {
+      int64_t srcAxisPos = sliceAxisPositions[vi];
+      const SliceAxis &ax = src->axes[srcAxisPos];
+      Value coordVal =
+          arith::ConstantIndexOp::create(rewriter, loc, coordInts[vi])
+              .getResult();
+      Value scaledStride =
+          arith::MulIOp::create(rewriter, loc, coordVal, ax.stride).getResult();
+      Value indexInSource =
+          arith::AddIOp::create(rewriter, loc, ax.offset, scaledStride)
+              .getResult();
+      Value srcStrideVal = arith::ConstantIndexOp::create(
+                               rewriter, loc, sourceStrides[srcAxisPos])
+                               .getResult();
+      Value contrib =
+          arith::MulIOp::create(rewriter, loc, indexInSource, srcStrideVal)
+              .getResult();
+      flat = arith::AddIOp::create(rewriter, loc, flat, contrib).getResult();
+    }
+    Value addr =
+        HCPtrOffsetOp::create(rewriter, loc, src->ptrType, src->sourcePtr, flat)
+            .getResult();
+    Value element =
+        HCPtrLoadOp::create(rewriter, loc, elementType, addr).getResult();
+    result = vector::InsertOp::create(rewriter, loc, element, result, coordInts)
+                 .getResult();
+  }
+  return result;
+}
+
+// Materialize a vector value as a workgroup-AS LDS tile of the given shape.
+// Allocates a flat `!hc.ptr<workgroup, T>` and writes the vector lanes
+// per-element. For the per-lane vector path the converted type is already
+// a `vector<...xT>` and we just pass the value through.
+static FailureOr<Value>
+materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
+                        Value vector, ArrayRef<int64_t> shape) {
   if (auto vectorType = dyn_cast_if_present<mlir::VectorType>(convertedType)) {
     if (vector.getType() != vectorType)
       return failure();
     return vector;
   }
 
-  auto memrefType = dyn_cast_if_present<MemRefType>(convertedType);
-  if (!memrefType)
+  auto ptrType = dyn_cast_if_present<PtrType>(convertedType);
+  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Workgroup)
     return failure();
-  mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
-  if (!vectorType || vector.getType() != vectorType)
+  int64_t total = 1;
+  for (int64_t d : shape)
+    total *= d;
+  Value lds = allocateWorkgroupPtr(builder, loc, ptrType, total);
+  if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
     return failure();
-
-  Value shared = allocateWorkgroupMemRef(builder, loc, memrefType);
-  if (failed(writeVectorToMemRef(builder, loc, vector, shared)))
-    return failure();
-  return shared;
+  return lds;
 }
 
-static FailureOr<Value> readMemRefAsVector(OpBuilder &builder, Location loc,
-                                           Value memref,
-                                           mlir::VectorType vectorType) {
-  memref = sourceMemRef(memref);
-  if (!memref)
-    return failure();
-  auto memrefType = dyn_cast<MemRefType>(memref.getType());
-  if (!memrefType || memrefType.getRank() != vectorType.getRank())
-    return failure();
-
-  // Mirror `writeVectorToMemRef`'s i1 special case on the read side. LLVM
-  // packs `vector<NxI1>` into ceil(N/8) bytes (one bit per lane), but the
-  // matching memref uses one *byte* per element. A bare `vector.transfer_read
-  // : vector<NxI1>` therefore reads ceil(N/8) bytes from row 0 and reinterprets
-  // them as N bits — element 0 lands at the LSB of byte 0, element 1 at bit 1
-  // of byte 0 (which the byte-per-element store left zero), element 8 at bit 0
-  // of byte 1, and so on. Decompose into N scalar `memref.load`s + inserts so
-  // the read agrees with the write's byte-per-element layout. f16/f32 don't
-  // need this — vector and memref already touch the same bytes.
-  if (memrefType.getElementType().isInteger(1) &&
-      vectorType.getElementType().isInteger(1) &&
-      vectorType.getShape() == memrefType.getShape()) {
-    SmallVector<int64_t> shape(memrefType.getShape().begin(),
-                               memrefType.getShape().end());
-    int64_t total = 1;
-    for (int64_t d : shape)
-      total *= d;
-    Value result = arith::ConstantOp::create(builder, loc, vectorType,
-                                             builder.getZeroAttr(vectorType))
-                       .getResult();
-    for (int64_t lin = 0; lin < total; ++lin) {
-      SmallVector<Value> coords(shape.size());
-      SmallVector<int64_t> coordInts(shape.size());
-      int64_t remaining = lin;
-      for (int64_t axis = static_cast<int64_t>(shape.size()) - 1; axis >= 0;
-           --axis) {
-        coordInts[axis] = remaining % shape[axis];
-        remaining /= shape[axis];
-        coords[axis] =
-            arith::ConstantIndexOp::create(builder, loc, coordInts[axis])
-                .getResult();
-      }
-      Value element =
-          memref::LoadOp::create(builder, loc, memref, coords).getResult();
-      result =
-          vector::InsertOp::create(builder, loc, element, result, coordInts)
-              .getResult();
-    }
-    return result;
-  }
-
-  Value padding = constantSplat(builder, loc, vectorType.getElementType(), 0);
-  if (!padding)
-    return failure();
-  return vector::TransferReadOp::create(
-             builder, loc, vectorType, memref,
-             zeroOffsets(builder, loc, memrefType.getRank()),
-             std::optional<Value>(padding))
-      .getResult();
-}
-
-static FailureOr<Value> shapedValueAsVector(OpBuilder &builder, Location loc,
-                                            Value value, Type convertedType) {
+// Read a converted shaped value as a multi-dim vector. The per-lane path
+// is a no-op (the value is already a vector); the LDS path expands into
+// per-element `hc.ptr_load`s, walking back through any `hc.buffer_view`
+// chain on the original source so strided views (column-of-2D, etc.)
+// produce correctly strided per-lane offsets.
+static FailureOr<Value> shapedValueAsVector(ConversionPatternRewriter &rewriter,
+                                            Location loc, Value original,
+                                            Value remapped, Type convertedType,
+                                            ArrayRef<int64_t> shape) {
   if (auto vectorType = dyn_cast<mlir::VectorType>(convertedType)) {
-    if (value.getType() == vectorType)
-      return value;
+    if (remapped.getType() == vectorType)
+      return remapped;
     return failure();
   }
-  auto memrefType = dyn_cast<MemRefType>(convertedType);
-  if (!memrefType)
+  auto ptrType = dyn_cast<PtrType>(convertedType);
+  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Workgroup)
     return failure();
-  mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
-  if (!vectorType)
+  Type elementType = ptrType.getElementType();
+  if (!elementType)
     return failure();
-  return readMemRefAsVector(builder, loc, value, vectorType);
+  mlir::VectorType vectorType = mlir::VectorType::get(shape, elementType);
+  return loadVectorFromPtrView(rewriter, loc, original, vectorType, shape);
 }
 
 static Value extractVectorElement(OpBuilder &builder, Location loc,
@@ -1221,59 +1398,28 @@ static SmallVector<Value> storeIndicesForCoordinate(OpBuilder &builder,
   return indices;
 }
 
-static bool isUnitStride(Value stride) {
-  APInt step;
-  return matchPattern(stride, m_ConstantInt(&step)) && step.getSExtValue() == 1;
-}
-
-static bool hasNonUnitStrideSlice(ArrayRef<SliceAxis> axes) {
-  return llvm::any_of(axes, [](const SliceAxis &axis) {
-    return axis.isSlice && !isUnitStride(axis.stride);
-  });
-}
-
-// Fold a constant index `Value` into an `IntegerAttr` so subview-result-type
-// inference picks up a static stride/offset; non-constants stay as the SSA
-// value the caller supplied.
-static OpFoldResult asIndexFold(OpBuilder &builder, Value v) {
-  APInt constant;
-  if (matchPattern(v, m_ConstantInt(&constant)))
-    return builder.getIndexAttr(constant.getSExtValue());
-  return v;
-}
-
-// Encode the slice's per-axis offsets and strides into a `memref.subview` so
-// the resulting memref's affine layout reflects the strided access pattern;
-// the caller can then issue zero-offset transfers against the subview.
-// Constant offsets and strides are folded into static layout components so
-// the subview type stays as concrete as the slice expression allows.
-static Value makeStridedSubview(OpBuilder &builder, Location loc, Value memref,
-                                MemRefType memrefType,
-                                mlir::VectorType resultVectorType,
-                                ArrayRef<SliceAxis> axes) {
-  SmallVector<OpFoldResult> subOffsets;
-  SmallVector<OpFoldResult> subSizes;
-  SmallVector<OpFoldResult> subStrides;
-  subOffsets.reserve(axes.size());
-  subSizes.reserve(axes.size());
-  subStrides.reserve(axes.size());
-  int64_t sliceIdx = 0;
+// Per-element scalar memref.load of one lane of the result vector.
+// `axes` carries the slice's per-axis offsets and strides (`offset + coord
+// * stride` for slice axes; just `offset` for scalar axes). The result
+// vector's coords identify which slice axis we're walking; non-slice
+// axes get the same `axes[k].offset` for every lane.
+static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
+                                               ArrayRef<SliceAxis> axes,
+                                               ArrayRef<int64_t> resultCoord) {
+  SmallVector<Value> indices;
+  indices.reserve(axes.size());
+  int64_t sliceCursor = 0;
   for (const SliceAxis &info : axes) {
-    subOffsets.push_back(asIndexFold(builder, info.offset));
-    if (info.isSlice) {
-      int64_t size = resultVectorType.getDimSize(sliceIdx++);
-      subSizes.push_back(builder.getIndexAttr(size));
-      subStrides.push_back(asIndexFold(builder, info.stride));
-    } else {
-      subSizes.push_back(builder.getIndexAttr(1));
-      subStrides.push_back(builder.getIndexAttr(1));
+    if (!info.isSlice) {
+      indices.push_back(info.offset);
+      continue;
     }
+    int64_t coord = resultCoord[sliceCursor++];
+    Value scaled = scaleIndexOffset(builder, loc, info.stride, coord);
+    indices.push_back(
+        arith::AddIOp::create(builder, loc, info.offset, scaled).getResult());
   }
-  MemRefType subviewType = memref::SubViewOp::inferResultType(
-      memrefType, subOffsets, subSizes, subStrides);
-  return memref::SubViewOp::create(builder, loc, subviewType, memref,
-                                   subOffsets, subSizes, subStrides)
-      .getResult();
+  return indices;
 }
 
 template <typename OpT>
@@ -1284,12 +1430,38 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
-    auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
+    auto resultPtrType = dyn_cast_if_present<PtrType>(converted);
     auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
-    mlir::VectorType transferVectorType =
-        resultMemRefType ? vectorTypeForMemRef(resultMemRefType)
-                         : resultVectorType;
-    if (!transferVectorType)
+
+    auto resultBareTensor = dyn_cast<BareTensorType>(op.getResult().getType());
+    auto resultBareVector = dyn_cast<BareVectorType>(op.getResult().getType());
+
+    // The shape we'll iterate over per-element comes from the original HC
+    // result type — the converted ptr is rank-erased, the vector type
+    // already carries it.
+    SmallVector<int64_t> resultShape;
+    if (resultBareTensor) {
+      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
+          cast<SymbolicallyShapedTypeInterface>(resultBareTensor));
+      if (failed(dims))
+        return failure();
+      resultShape = std::move(*dims);
+    } else if (resultBareVector) {
+      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
+          cast<SymbolicallyShapedTypeInterface>(resultBareVector));
+      if (failed(dims))
+        return failure();
+      resultShape = std::move(*dims);
+    } else {
+      return failure();
+    }
+
+    Type elementType;
+    if (resultPtrType)
+      elementType = resultPtrType.getElementType();
+    else if (resultVectorType)
+      elementType = resultVectorType.getElementType();
+    if (!elementType)
       return failure();
 
     Value source = [&]() -> Value {
@@ -1315,7 +1487,7 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
       return failure();
     if (llvm::count_if(*axes, [](const SliceAxis &axis) {
           return axis.isSlice;
-        }) != transferVectorType.getRank())
+        }) != static_cast<int64_t>(resultShape.size()))
       return op.emitOpError("load result rank must match slice subscript rank");
 
     // LDS-staged result: use a cooperative per-lane copy so each thread of
@@ -1324,110 +1496,58 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
     // lane redundantly write it to the same LDS bytes -- correct on paper
     // but it drove SGPR spills into the hundreds and corrupted WMMA inputs
     // on real gfx11 hardware.
-    if (resultMemRefType) {
+    if (resultPtrType) {
+      int64_t total = 1;
+      for (int64_t d : resultShape)
+        total *= d;
       Value lds =
-          allocateWorkgroupMemRef(rewriter, op.getLoc(), resultMemRefType);
+          allocateWorkgroupPtr(rewriter, op.getLoc(), resultPtrType, total);
       if (failed(emitCooperativeCopy(rewriter, op.getLoc(), op.getOperation(),
-                                     memref, *axes, lds, resultMemRefType)))
+                                     memref, *axes, lds, resultShape,
+                                     elementType)))
         return failure();
       rewriter.replaceOp(op, lds);
       return success();
     }
 
-    // Per-lane vector result: every thread independently materializes its
-    // own fragment via `vector.transfer_read`. Strided slices fold the
-    // per-axis stride into a `memref.subview` so the step ends up encoded in
-    // the subview's affine layout; the read then walks zero offsets against
-    // the subview. Unit-stride slices skip the subview to keep the simpler
-    // IR shape existing tests pin down.
-    Value padding = constantSplat(rewriter, op.getLoc(),
-                                  transferVectorType.getElementType(), 0);
-    if (!padding)
-      return failure();
-
-    Value transferSource = memref;
-    SmallVector<Value> transferOffsets;
-    AffineMap permutationMap = transferPermutationMap(
-        rewriter.getContext(), memrefType.getRank(), *axes);
-    if (hasNonUnitStrideSlice(*axes)) {
-      transferSource = makeStridedSubview(
-          rewriter, op.getLoc(), memref, memrefType, transferVectorType, *axes);
-      auto subviewType = cast<MemRefType>(transferSource.getType());
-      transferOffsets =
-          zeroOffsets(rewriter, op.getLoc(), subviewType.getRank());
-      permutationMap = transferPermutationMap(rewriter.getContext(),
-                                              subviewType.getRank(), *axes);
-    } else {
-      transferOffsets.reserve(axes->size());
-      for (const SliceAxis &axis : *axes)
-        transferOffsets.push_back(axis.offset);
-    }
-
-    // i1 vectors must use per-element scalar loads. LLVM packs `vector<NxI1>`
-    // into ceil(N/8) bytes, so a single `vector.transfer_read` of i1 lowers
-    // to a 2-byte load that picks element 0 from bit 0 of byte 0 and element
-    // 8 from bit 0 of byte 1 — everything else aliases the byte-per-element
-    // memref's zero padding. Mirror `writeVectorToMemRef`'s i1 path: emit N
-    // `memref.load`s + `vector.insert`s so both ends agree on the
-    // byte-per-element layout. Only intercept the unit-stride path (the
-    // strided one already routes through a `memref.subview`, where the same
-    // logic still applies — handle it the same way).
-    Value loaded;
-    if (transferVectorType.getElementType().isInteger(1)) {
-      ArrayRef<int64_t> shape = transferVectorType.getShape();
-      int64_t total = 1;
-      for (int64_t d : shape)
-        total *= d;
-      Value zero =
-          arith::ConstantOp::create(rewriter, op.getLoc(), transferVectorType,
-                                    rewriter.getZeroAttr(transferVectorType))
+    // Per-lane vector result: each thread materializes its own fragment via
+    // per-element scalar `memref.load`s + `vector.insert`s. The previous
+    // path used `vector.transfer_read` (with an optional `memref.subview`
+    // for non-unit stride); switching to per-element keeps a single shape
+    // for unit and non-unit stride, sidesteps the i1 packed-vs-byte
+    // discrepancy that `vector.transfer_read` of `vector<Nxi1>` triggered,
+    // and lets LLVM's SLP recombine adjacent scalar loads when the slice
+    // is unit-stride.
+    Value zero =
+        arith::ConstantOp::create(rewriter, op.getLoc(), resultVectorType,
+                                  rewriter.getZeroAttr(resultVectorType))
+            .getResult();
+    Value laneVec = zero;
+    for (ArrayRef<int64_t> resultCoord : staticVectorCoordinates(resultShape)) {
+      SmallVector<Value> indices =
+          kernelArgLaneIndices(rewriter, op.getLoc(), *axes, resultCoord);
+      Value elem =
+          memref::LoadOp::create(rewriter, op.getLoc(), memref, indices)
               .getResult();
-      Value vec = zero;
-      for (int64_t lin = 0; lin < total; ++lin) {
-        SmallVector<int64_t> resultCoords(shape.size());
-        int64_t remaining = lin;
-        for (int64_t a = static_cast<int64_t>(shape.size()) - 1; a >= 0; --a) {
-          resultCoords[a] = remaining % shape[a];
-          remaining /= shape[a];
-        }
-        SmallVector<Value> sourceCoords(transferOffsets.begin(),
-                                        transferOffsets.end());
-        for (size_t i = 0; i < permutationMap.getNumResults(); ++i) {
-          auto expr = permutationMap.getResult(i);
-          if (auto dim = llvm::dyn_cast<AffineDimExpr>(expr)) {
-            unsigned srcAxis = dim.getPosition();
-            Value off = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
-                                                       resultCoords[i])
-                            .getResult();
-            sourceCoords[srcAxis] =
-                arith::AddIOp::create(rewriter, op.getLoc(),
-                                      sourceCoords[srcAxis], off)
+      laneVec = vector::InsertOp::create(rewriter, op.getLoc(), elem, laneVec,
+                                         resultCoord)
                     .getResult();
-          }
-        }
-        Value elem = memref::LoadOp::create(rewriter, op.getLoc(),
-                                            transferSource, sourceCoords)
-                         .getResult();
-        vec = vector::InsertOp::create(rewriter, op.getLoc(), elem, vec,
-                                       resultCoords)
-                  .getResult();
-      }
-      loaded = vec;
-    } else {
-      loaded =
-          vector::TransferReadOp::create(
-              rewriter, op.getLoc(), transferVectorType, transferSource,
-              transferOffsets, std::optional<Value>(padding), permutationMap)
-              .getResult();
     }
-    FailureOr<Value> result =
-        materializeShapedResult(rewriter, op.getLoc(), converted, loaded);
-    if (failed(result))
-      return failure();
-    rewriter.replaceOp(op, *result);
+    rewriter.replaceOp(op, laneVec);
     return success();
   }
 };
+
+// Helper: probe whether `stride` is the constant 1. Used to decide between
+// `extent - offset` and `ceildiv(extent - offset, stride)` when sizing the
+// mask. (We dropped the `isUnitStride`/`hasNonUnitStrideSlice` helpers
+// elsewhere when the load path stopped routing through `memref.subview`,
+// but the mask sizing still needs the per-axis distinction.)
+static bool maskAxisIsUnitStride(const SliceAxis &axis) {
+  APInt step;
+  return matchPattern(axis.stride, m_ConstantInt(&step)) &&
+         step.getSExtValue() == 1;
+}
 
 struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
   using Base::Base;
@@ -1436,23 +1556,55 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
   matchAndRewrite(HCLoadMaskOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getMask().getType());
-    auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
-    auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
-    mlir::VectorType maskType = resultMemRefType
-                                    ? vectorTypeForMemRef(resultMemRefType)
-                                    : resultVectorType;
-    if (!maskType || !maskType.getElementType().isInteger(1))
-      return failure();
 
+    SmallVector<int64_t> maskShape;
+    if (auto resultBareTensor =
+            dyn_cast<BareTensorType>(op.getMask().getType())) {
+      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
+          cast<SymbolicallyShapedTypeInterface>(resultBareTensor));
+      if (failed(dims))
+        return failure();
+      maskShape = std::move(*dims);
+    } else if (auto resultBareVector =
+                   dyn_cast<BareVectorType>(op.getMask().getType())) {
+      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
+          cast<SymbolicallyShapedTypeInterface>(resultBareVector));
+      if (failed(dims))
+        return failure();
+      maskShape = std::move(*dims);
+    } else {
+      return failure();
+    }
+    mlir::VectorType maskVectorType =
+        mlir::VectorType::get(maskShape, rewriter.getI1Type());
+
+    // Compute slice extents from either a kernel-arg memref (`memref.dim`)
+    // or a workgroup-staged tile (its bare-tensor shape is statically known).
     Value memref = sourceMemRef(adaptor.getSource());
-    if (!memref)
-      return op.emitOpError(
-          "expected mask source to be a memref or memref ABI cast");
-    auto memrefType = dyn_cast<MemRefType>(memref.getType());
-    if (!memrefType || memrefType.getRank() !=
-                           static_cast<int64_t>(adaptor.getIndices().size()))
-      return op.emitOpError(
-          "expected ranked memref with one subscript per axis");
+    Value workgroupPtr;
+    SmallVector<int64_t> sourceStaticShape;
+    if (!memref) {
+      workgroupPtr = sourcePtr(adaptor.getSource());
+      if (!workgroupPtr)
+        return op.emitOpError(
+            "expected mask source to be a memref or workgroup ptr");
+      auto bare = dyn_cast<BareTensorType>(op.getSource().getType());
+      if (!bare)
+        return op.emitOpError(
+            "workgroup-source mask requires the original source to be a "
+            "bare tensor (the static shape supplies the extents)");
+      FailureOr<SmallVector<int64_t>> dims =
+          staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bare));
+      if (failed(dims))
+        return failure();
+      sourceStaticShape = std::move(*dims);
+    } else {
+      auto memrefType = dyn_cast<MemRefType>(memref.getType());
+      if (!memrefType || memrefType.getRank() !=
+                             static_cast<int64_t>(adaptor.getIndices().size()))
+        return op.emitOpError(
+            "expected ranked memref with one subscript per axis");
+    }
 
     FailureOr<SmallVector<SliceAxis>> axes =
         collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
@@ -1461,7 +1613,7 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
       return failure();
     if (llvm::count_if(*axes, [](const SliceAxis &axis) {
           return axis.isSlice;
-        }) != maskType.getRank())
+        }) != static_cast<int64_t>(maskShape.size()))
       return op.emitOpError("mask result rank must match slice subscript rank");
 
     // The mask size is the count of strided positions that stay in-bounds.
@@ -1475,11 +1627,18 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
     for (auto [axis, info] : llvm::enumerate(*axes)) {
       if (!info.isSlice)
         continue;
-      Value extent = dim(rewriter, op.getLoc(), memref, axis);
+      Value extent;
+      if (memref) {
+        extent = dim(rewriter, op.getLoc(), memref, axis);
+      } else {
+        extent = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
+                                                sourceStaticShape[axis])
+                     .getResult();
+      }
       Value remaining =
           arith::SubIOp::create(rewriter, op.getLoc(), extent, info.offset);
       Value size = remaining;
-      if (!isUnitStride(info.stride)) {
+      if (!maskAxisIsUnitStride(info)) {
         Value strideMinusOne =
             arith::SubIOp::create(rewriter, op.getLoc(), info.stride,
                                   oneIndex(rewriter, op.getLoc()));
@@ -1491,16 +1650,28 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
       maskSizes.push_back(size);
     }
 
-    Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(), maskType,
-                                              maskSizes);
-    FailureOr<Value> result =
-        materializeShapedResult(rewriter, op.getLoc(), converted, mask);
+    Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(),
+                                              maskVectorType, maskSizes);
+    FailureOr<Value> result = materializeShapedResult(
+        rewriter, op.getLoc(), converted, mask, maskShape);
     if (failed(result))
       return failure();
     rewriter.replaceOp(op, *result);
     return success();
   }
 };
+
+// Static shape from the original BareTensor or BareVector result type — used
+// to drive per-element materialization for the LDS path. Returns failure
+// for any type the converter wouldn't have produced a vector or workgroup
+// ptr from.
+static FailureOr<SmallVector<int64_t>> shapedResultShape(Type type) {
+  if (auto bt = dyn_cast<BareTensorType>(type))
+    return staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bt));
+  if (auto bv = dyn_cast<BareVectorType>(type))
+    return staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bv));
+  return failure();
+}
 
 struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
   using Base::Base;
@@ -1511,17 +1682,19 @@ struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
     Type converted = typeConverter->convertType(op.getMask().getType());
     if (!converted)
       return failure();
-    auto vectorType = dyn_cast<mlir::VectorType>(converted);
-    if (auto memrefType = dyn_cast<MemRefType>(converted))
-      vectorType = vectorTypeForMemRef(memrefType);
-    if (vectorType) {
+
+    FailureOr<SmallVector<int64_t>> shape =
+        shapedResultShape(op.getMask().getType());
+    if (succeeded(shape)) {
+      mlir::VectorType vectorType =
+          mlir::VectorType::get(*shape, rewriter.getI1Type());
       FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, 1);
       if (failed(attr))
         return failure();
       Value vector =
           arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      FailureOr<Value> result =
-          materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+      FailureOr<Value> result = materializeShapedResult(
+          rewriter, op.getLoc(), converted, vector, *shape);
       if (failed(result))
         return failure();
       rewriter.replaceOp(op, *result);
@@ -1545,17 +1718,22 @@ struct ConvertNullaryShapedConstantOp : public OpConversionPattern<OpT> {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
     if (!converted)
       return failure();
-    auto vectorType = dyn_cast<mlir::VectorType>(converted);
-    if (auto memrefType = dyn_cast<MemRefType>(converted))
-      vectorType = vectorTypeForMemRef(memrefType);
-    if (vectorType) {
+
+    FailureOr<SmallVector<int64_t>> shape =
+        shapedResultShape(op.getResult().getType());
+    if (succeeded(shape)) {
+      Type elementType =
+          isa<mlir::VectorType>(converted)
+              ? cast<mlir::VectorType>(converted).getElementType()
+              : cast<PtrType>(converted).getElementType();
+      mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
       FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
       if (failed(attr))
         return failure();
       Value vector =
           arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      FailureOr<Value> result =
-          materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+      FailureOr<Value> result = materializeShapedResult(
+          rewriter, op.getLoc(), converted, vector, *shape);
       if (failed(result))
         return failure();
       rewriter.replaceOp(op, *result);
@@ -1578,16 +1756,20 @@ struct ConvertFillShapedConstantOp : public OpConversionPattern<OpT> {
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
-    auto vectorType = dyn_cast_if_present<mlir::VectorType>(converted);
-    auto memrefType = dyn_cast_if_present<MemRefType>(converted);
-    if (!vectorType && memrefType)
-      vectorType = vectorTypeForMemRef(memrefType);
-    if (!vectorType)
+    if (!converted)
       return failure();
+    FailureOr<SmallVector<int64_t>> shape =
+        shapedResultShape(op.getResult().getType());
+    if (failed(shape))
+      return failure();
+    Type elementType = isa<mlir::VectorType>(converted)
+                           ? cast<mlir::VectorType>(converted).getElementType()
+                           : cast<PtrType>(converted).getElementType();
+    mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
     Value vector = vector::BroadcastOp::create(rewriter, op.getLoc(),
                                                vectorType, adaptor.getValue());
-    FailureOr<Value> result =
-        materializeShapedResult(rewriter, op.getLoc(), converted, vector);
+    FailureOr<Value> result = materializeShapedResult(
+        rewriter, op.getLoc(), converted, vector, *shape);
     if (failed(result))
       return failure();
     rewriter.replaceOp(op, *result);
@@ -1601,12 +1783,18 @@ struct ConvertEmptyOp : public OpConversionPattern<HCEmptyOp> {
   LogicalResult
   matchAndRewrite(HCEmptyOp op, OpAdaptor /*adaptor*/,
                   ConversionPatternRewriter &rewriter) const override {
-    auto memrefType = dyn_cast_if_present<MemRefType>(
+    auto ptrType = dyn_cast_if_present<PtrType>(
         typeConverter->convertType(op.getResult().getType()));
-    if (!memrefType)
+    if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Workgroup)
+      return failure();
+    auto bare = dyn_cast<BareTensorType>(op.getResult().getType());
+    if (!bare)
+      return failure();
+    FailureOr<int64_t> count = bareTensorElementCount(bare);
+    if (failed(count))
       return failure();
     rewriter.replaceOp(
-        op, allocateWorkgroupMemRef(rewriter, op.getLoc(), memrefType));
+        op, allocateWorkgroupPtr(rewriter, op.getLoc(), ptrType, *count));
     return success();
   }
 };
@@ -1619,11 +1807,23 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getResult().getType());
     auto vectorType = dyn_cast_if_present<mlir::VectorType>(converted);
-    if (isa<MemRefType>(adaptor.getValue().getType())) {
-      if (!vectorType)
+    if (!vectorType)
+      return failure();
+
+    // bare_tensor → bare_vector: the bare_tensor source converts to a
+    // workgroup ptr; load it into the per-lane vector via per-element
+    // `hc.ptr_load`s, walking back through any `hc.buffer_view` chain so
+    // strided views (e.g. column of a 2D tile) get correctly strided
+    // per-lane offsets.
+    if (auto ptrType = dyn_cast<PtrType>(adaptor.getValue().getType())) {
+      if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
-      FailureOr<Value> vector = readMemRefAsVector(
-          rewriter, op.getLoc(), adaptor.getValue(), vectorType);
+      FailureOr<SmallVector<int64_t>> shape =
+          shapedResultShape(op.getValue().getType());
+      if (failed(shape))
+        return failure();
+      FailureOr<Value> vector = loadVectorFromPtrView(
+          rewriter, op.getLoc(), op.getValue(), vectorType, *shape);
       if (failed(vector))
         return failure();
       rewriter.replaceOp(op, *vector);
@@ -1646,20 +1846,27 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
     if (!converted)
       return failure();
 
-    if (auto memrefType = dyn_cast<MemRefType>(converted)) {
-      mlir::VectorType vectorType = vectorTypeForMemRef(memrefType);
-      if (!vectorType)
+    // Bare-tensor result: condition + true value are workgroup ptrs, load
+    // them as vectors, blend, store the result back to a fresh LDS tile.
+    if (auto ptrType = dyn_cast<PtrType>(converted)) {
+      if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
-
+      FailureOr<SmallVector<int64_t>> shape =
+          shapedResultShape(op.getResult().getType());
+      if (failed(shape))
+        return failure();
+      Type elementType = ptrType.getElementType();
+      mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
       mlir::VectorType maskType =
-          mlir::VectorType::get(vectorType.getShape(), rewriter.getI1Type());
-      FailureOr<Value> condition = readMemRefAsVector(
-          rewriter, op.getLoc(), adaptor.getCondition(), maskType);
-      FailureOr<Value> trueValue = readMemRefAsVector(
-          rewriter, op.getLoc(), adaptor.getTrueValue(), vectorType);
+          mlir::VectorType::get(*shape, rewriter.getI1Type());
+
+      FailureOr<Value> condition = loadVectorFromPtrView(
+          rewriter, op.getLoc(), op.getCondition(), maskType, *shape);
+      FailureOr<Value> trueValue = loadVectorFromPtrView(
+          rewriter, op.getLoc(), op.getTrueValue(), vectorType, *shape);
       if (failed(condition) || failed(trueValue))
         return op.emitOpError(
-            "expected tensor select operands to lower to memrefs");
+            "expected tensor select operands to lower to workgroup ptrs");
 
       Value falseValue =
           vector::BroadcastOp::create(rewriter, op.getLoc(), vectorType,
@@ -1669,8 +1876,8 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
           arith::SelectOp::create(rewriter, op.getLoc(), vectorType, *condition,
                                   *trueValue, falseValue)
               .getResult();
-      FailureOr<Value> result =
-          materializeShapedResult(rewriter, op.getLoc(), converted, selected);
+      FailureOr<Value> result = materializeShapedResult(
+          rewriter, op.getLoc(), converted, selected, *shape);
       if (failed(result))
         return failure();
       rewriter.replaceOp(op, *result);
@@ -1713,8 +1920,13 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
       return failure();
 
     Type convertedSource = typeConverter->convertType(op.getSource().getType());
-    FailureOr<Value> source = shapedValueAsVector(
-        rewriter, op.getLoc(), adaptor.getSource(), convertedSource);
+    FailureOr<SmallVector<int64_t>> sourceShape =
+        shapedResultShape(op.getSource().getType());
+    if (failed(sourceShape))
+      return failure();
+    FailureOr<Value> source =
+        shapedValueAsVector(rewriter, op.getLoc(), op.getSource(),
+                            adaptor.getSource(), convertedSource, *sourceShape);
     if (failed(source))
       return op.emitOpError("expected store source to lower to a vector");
     auto sourceType = dyn_cast<mlir::VectorType>(source->getType());
@@ -1730,8 +1942,13 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
     Value mask;
     if (Value originalMask = op.getMask()) {
       Type convertedMask = typeConverter->convertType(originalMask.getType());
-      FailureOr<Value> maskVector = shapedValueAsVector(
-          rewriter, op.getLoc(), adaptor.getMask(), convertedMask);
+      FailureOr<SmallVector<int64_t>> maskShape =
+          shapedResultShape(originalMask.getType());
+      if (failed(maskShape))
+        return failure();
+      FailureOr<Value> maskVector =
+          shapedValueAsVector(rewriter, op.getLoc(), originalMask,
+                              adaptor.getMask(), convertedMask, *maskShape);
       if (failed(maskVector))
         return op.emitOpError("expected store mask to lower to a vector");
       auto maskType = dyn_cast<mlir::VectorType>(maskVector->getType());
@@ -1820,50 +2037,24 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
   matchAndRewrite(HCBufferViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getResult().getType());
-    if (auto sourceMemRefType =
-            dyn_cast<MemRefType>(adaptor.getBuffer().getType())) {
-      auto resultMemRefType = dyn_cast_if_present<MemRefType>(converted);
-      if (!resultMemRefType)
+    // bare_tensor → bare_tensor view: source is a workgroup ptr. The
+    // strided per-element loader (`loadVectorFromPtrView`) walks back
+    // through this op to reconstruct the source-axis pattern, so the
+    // buffer_view itself just needs to type-resolve cleanly. We pass the
+    // source ptr through unchanged; the op survives in the IR as a
+    // metadata anchor for the consumer chain walk and gets DCE'd once
+    // every consumer has lowered. (The result-ptr type matches the source
+    // because both are workgroup-AS, same element type, rank-erased.)
+    if (auto sourcePtrType = dyn_cast<PtrType>(adaptor.getBuffer().getType())) {
+      if (sourcePtrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
-      FailureOr<SmallVector<SliceAxis>> axes =
-          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
-      if (failed(axes))
+      auto resultPtrType = dyn_cast_if_present<PtrType>(converted);
+      if (!resultPtrType ||
+          resultPtrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
-      if (static_cast<int64_t>(axes->size()) != sourceMemRefType.getRank())
-        return op.emitOpError("expected one view subscript per memref axis");
-      if (!resultMemRefType.hasStaticShape())
+      if (resultPtrType.getElementType() != sourcePtrType.getElementType())
         return failure();
-      if (llvm::count_if(*axes, [](const SliceAxis &axis) {
-            return axis.isSlice;
-          }) != resultMemRefType.getRank())
-        return op.emitOpError(
-            "view result rank must match slice subscript rank");
-
-      SmallVector<OpFoldResult> offsets;
-      SmallVector<OpFoldResult> sizes;
-      SmallVector<OpFoldResult> strides;
-      offsets.reserve(axes->size());
-      sizes.reserve(axes->size());
-      strides.reserve(axes->size());
-      SmallVector<int64_t> resultShape;
-      resultShape.reserve(resultMemRefType.getRank());
-      int64_t resultAxis = 0;
-      for (const SliceAxis &info : *axes) {
-        offsets.push_back(info.offset);
-        strides.push_back(rewriter.getIndexAttr(1));
-        if (info.isSlice) {
-          int64_t size = resultMemRefType.getDimSize(resultAxis++);
-          resultShape.push_back(size);
-          sizes.push_back(rewriter.getIndexAttr(size));
-        } else {
-          sizes.push_back(rewriter.getIndexAttr(1));
-        }
-      }
-
-      MemRefType subviewType = memref::SubViewOp::inferRankReducedResultType(
-          resultShape, sourceMemRefType, offsets, sizes, strides);
-      rewriter.replaceOpWithNewOp<memref::SubViewOp>(
-          op, subviewType, adaptor.getBuffer(), offsets, sizes, strides);
+      rewriter.replaceOp(op, adaptor.getBuffer());
       return success();
     }
 
@@ -2187,7 +2378,11 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
                          gpu::GPUDialect, memref::MemRefDialect,
                          scf::SCFDialect, vector::VectorDialect>();
-  target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp>();
+  // HC ptr-family ops are produced by this pass (workgroup tiles) and must
+  // pass through to the downstream `hc-lower-to-llvm` slot.
+  target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,
+                    HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp, HCPtrLoadPredOp,
+                    HCPtrStorePredOp>();
   target.addIllegalOp<HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp,
                       HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
                       HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,

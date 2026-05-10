@@ -162,6 +162,11 @@ _GPU_LOWERING_PIPELINE = (
     "lower-affine,"
     "gpu.module(lower-affine),"
     "canonicalize,cse,"
+    # Lower the `!hc.ptr` family launch-body emits before the rocdl chain
+    # walks the gpu.module body — the convert-*-to-llvm passes nested in
+    # `gpu.module(...)` below have no idea about `hc.alloc`/`hc.ptr_*`,
+    # so they must be gone by the time we reach `convert-scf-to-cf`.
+    "hc-lower-to-llvm,"
     "convert-scf-to-cf,"
     f"convert-amdgpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
     "lower-affine,"

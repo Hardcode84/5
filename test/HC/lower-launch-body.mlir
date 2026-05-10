@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Workgroup-AS storage (`!hc.bare_tensor`) lowers to flat
+// `!hc.ptr<workgroup, T>` instead of `memref<..., workgroup>`. Kernel-argument
+// memrefs flow through unchanged. The `hc-lower-to-llvm` slice owns the
+// final memory lowering. See `doc/layouts.md` "hc.ptr and memory ops".
+//
 // RUN: hc-opt %s --hc-lower-launch-body | FileCheck %s
 
 module {
@@ -56,11 +61,12 @@ module {
   }
 
   // CHECK-LABEL: func.func @tile_memory(
-  // The cooperative load lowers `hc.load` into a per-lane `scf.for` chunk
-  // loop that copies the source slice into LDS one element at a time, with
-  // a closing `gpu.barrier` to publish the writes to the rest of the wave.
-  // CHECK: memref.alloca
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // The cooperative load is unchanged in shape but its LDS write target is
+  // now a flat `!hc.ptr<workgroup, f32>` — `hc.alloc` mints the storage,
+  // and the per-thread element loop lands a `hc.ptr_offset` + `hc.ptr_store`
+  // at the same linear position the chunk loop already computes. The
+  // closing `gpu.barrier` is the same publish-to-the-wave fence as before.
+  // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, f32>
   // CHECK: arith.ceildivui
   // CHECK: scf.for
   // CHECK: arith.cmpi ult
@@ -72,29 +78,39 @@ module {
   // CHECK: scf.if {{.*}} -> (f32)
   // CHECK: memref.load
   // CHECK-SAME: memref<?x?xf32>
-  // CHECK: memref.store
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<workgroup, f32>
+  // CHECK: hc.ptr_store
+  // CHECK-SAME: f32, !hc.ptr<workgroup, f32>
   // CHECK: gpu.barrier
   // CHECK: vector.create_mask
   // CHECK-SAME: vector<4x4xi1>
-  // CHECK: memref.alloca
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // i1 stores go through per-element vector.extract + memref.store rather than
-  // a packed vector.transfer_write — see the writeVectorToMemRef i1 case.
+  // The bare-tensor mask materializes as `!hc.ptr<workgroup, i1>` plus a
+  // `vector.extract` + `hc.ptr_offset` + `hc.ptr_store` per lane. There are
+  // 16 stores total (one for each (i, j) of the 4x4 mask); the LIT pins the
+  // first one explicitly and trusts the loop-unrolled rest to follow.
+  // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, i1>
   // CHECK: vector.extract
-  // CHECK: memref.store
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: memref.subview
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>> to memref<4xf32,
-  // CHECK: memref.subview
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>> to memref<4xi1,
-  // CHECK: vector.transfer_read
-  // CHECK-SAME: vector<4xf32>
-  // The per-lane i1 read mirrors the write: scalar memref.load + vector.insert
-  // instead of vector.transfer_read of vector<4xi1>.
-  // CHECK: memref.load
-  // CHECK-SAME: memref<4xi1
-  // CHECK: vector.insert
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<workgroup, i1>
+  // CHECK: hc.ptr_store
+  // CHECK-SAME: i1, !hc.ptr<workgroup, i1>
+  // The buffer_view selecting one row of the 4x4 tile is metadata-only —
+  // it carries the index pattern for the consumer (`hc.vec`) to walk back
+  // through; the lowering of the view itself is a passthrough of the
+  // source ptr. The consumer assembles the per-lane fragment by computing
+  // each lane's flat source offset (`lane*4` is the row's start, axis-1
+  // index varies 0..3) and emitting one `hc.ptr_offset` + `hc.ptr_load` +
+  // `vector.insert` per lane. Same shape for the f32 data and the i1 mask;
+  // we pin the first load + insert of each.
+  // CHECK: arith.constant dense<0.000000e+00> : vector<4xf32>
+  // CHECK: hc.ptr_offset %{{.*}}, %{{.*}} : (!hc.ptr<workgroup, f32>, index) -> !hc.ptr<workgroup, f32>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, f32> -> f32
+  // CHECK: vector.insert {{.*}} : f32 into vector<4xf32>
+  // CHECK: arith.constant dense<false> : vector<4xi1>
+  // CHECK: hc.ptr_offset %{{.*}}, %{{.*}} : (!hc.ptr<workgroup, i1>, index) -> !hc.ptr<workgroup, i1>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, i1> -> i1
+  // CHECK: vector.insert {{.*}} : i1 into vector<4xi1>
   // CHECK: vector.broadcast
   // CHECK-SAME: f32 to vector<4xf32>
   // CHECK: arith.select
@@ -106,6 +122,7 @@ module {
   // CHECK-NOT: hc.vec
   // CHECK-NOT: hc.select
   // CHECK-NOT: hc.full_mask
+  // CHECK-NOT: memref{{.*}}workgroup
   func.func @tile_memory(%a: memref<?x?xf32>) {
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
@@ -158,40 +175,47 @@ module {
   }
 
   // CHECK-LABEL: func.func @tensor_mask_and_select(
-  // Cooperative load of the source slice into LDS, gated by a barrier.
-  // CHECK: memref.alloca
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // Cooperative load into LDS — same shape as `tile_memory`, just a smaller
+  // wave. The cooperative loop's LDS writes target the freshly allocated
+  // workgroup ptr.
+  // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, f32>
   // CHECK: scf.for
   // CHECK: memref.load
   // CHECK-SAME: memref<?x?xf32>
-  // CHECK: memref.store
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<workgroup, f32>
+  // CHECK: hc.ptr_store
+  // CHECK-SAME: f32, !hc.ptr<workgroup, f32>
   // CHECK: gpu.barrier
-  // CHECK: vector.create_mask
-  // CHECK-SAME: vector<4x4xi1>
-  // CHECK: memref.alloca
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // i1 mask materializes via per-element vector.extract + memref.store; the
-  // matching read uses memref.load + vector.insert. Both ends agree on the
-  // byte-per-element layout LLVM emits for memref<NxI1>, sidestepping the
-  // bit-packed `vector<NxI1>` encoding the upstream lowering would otherwise
-  // pick for the contiguous transfer_write/read pair.
+  // The load_mask source is the LDS-staged tile, so the per-axis extents
+  // are the bare-tensor's static dims (constant 4 / 4) rather than
+  // `memref.dim` reads against a kernel-arg memref. The mask vector itself
+  // is created the same way and then materialized to a fresh workgroup ptr
+  // via `hc.alloc` + per-element `hc.ptr_store`.
+  // CHECK: vector.create_mask {{.*}} : vector<4x4xi1>
+  // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, i1>
   // CHECK: vector.extract
-  // CHECK: memref.store
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: memref.load
-  // CHECK-SAME: memref<4x4xi1, #gpu.address_space<workgroup>>
-  // CHECK: vector.insert
-  // CHECK: vector.transfer_read
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<workgroup, i1>
+  // CHECK: hc.ptr_store
+  // CHECK-SAME: i1, !hc.ptr<workgroup, i1>
+  // The all-tensor select reads both LDS tiles via per-element
+  // `hc.ptr_load`s, blends them in vector form, and writes the result back
+  // to a third workgroup ptr. The mask is read first (16 lanes), then the
+  // tile (16 lanes); we pin the first load of each.
+  // CHECK: arith.constant dense<false> : vector<4x4xi1>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, i1> -> i1
+  // CHECK: arith.constant dense<0.000000e+00> : vector<4x4xf32>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, f32> -> f32
+  // CHECK: vector.broadcast
   // CHECK: arith.select
   // CHECK-SAME: vector<4x4xi1>, vector<4x4xf32>
-  // CHECK: memref.alloca
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
-  // CHECK: vector.transfer_write
-  // CHECK-SAME: memref<4x4xf32, #gpu.address_space<workgroup>>
+  // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, f32>
+  // CHECK: hc.ptr_store
+  // CHECK-SAME: f32, !hc.ptr<workgroup, f32>
   // CHECK-NOT: hc.load_mask
   // CHECK-NOT: hc.select
+  // CHECK-NOT: memref{{.*}}workgroup
   func.func @tensor_mask_and_select(%a: memref<?x?xf32>) {
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
@@ -232,14 +256,18 @@ module {
 
   // CHECK-LABEL: func.func @strided_vload(
   // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
-  // The `step = !hc.idx<"2">` slice on the row axis must lower via a
-  // `memref.subview` that absorbs the stride into the result memref's
-  // affine layout; the subsequent `transfer_read` then reads from the
-  // subview at logical zero offsets.
-  // CHECK: %[[SUB:.*]] = memref.subview %[[A]][0, 0] [8, 1] [2, 1]
-  // CHECK-SAME: memref<?x?xf32> to memref<8x1xf32, strided<[?, 1]>>
-  // CHECK: vector.transfer_read %[[SUB]]
-  // CHECK-SAME: vector<8x1xf32>
+  // Per-lane vector loads from a kernel-arg memref now use per-element
+  // `memref.load`s — the prior `memref.subview` + `vector.transfer_read`
+  // shape is gone alongside `makeStridedSubview`. LLVM's SLP recombines the
+  // unit-stride lanes; the explicit per-element form keeps unit and
+  // non-unit stride paths uniform and sidesteps the bit/byte i1 mismatch
+  // `vector.transfer_read` of `vector<Nxi1>` triggered.
+  // CHECK: %[[V0:.*]] = memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<?x?xf32>
+  // CHECK: vector.insert %[[V0]], %{{.*}} [0, 0]
+  // CHECK: memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<?x?xf32>
+  // CHECK: vector.insert {{.*}} [1, 0]
+  // CHECK-NOT: memref.subview
+  // CHECK-NOT: vector.transfer_read
   // CHECK-NOT: hc.vload
   func.func @strided_vload(%a: memref<?x?xf32>) {
     %c1 = arith.constant 1 : index
@@ -319,6 +347,9 @@ module {
   }
 
   // CHECK-LABEL: func.func @masked_vector_store(
+  // Kernel-argument memref destination — masked store path is unchanged
+  // (per-element extract + scf.if + memref.store). The host-wrapper switch
+  // to `!hc.ptr<global>` lives in a follow-up bead.
   // CHECK: vector.extract
   // CHECK-SAME: f32 from vector<4xf32>
   // CHECK: vector.extract

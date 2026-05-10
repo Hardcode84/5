@@ -321,12 +321,19 @@ Address space lowering:
 * `private` → `llvm.alloca` in addrspace 5;
 * `global` → externally-supplied pointer (kernel argument).
 
-The 1D bare tensor → memory carrier transition replaces the entire
-`memref<...xT, #gpu.address_space<workgroup>>` family currently used by
-`HCLowerLaunchBodyPass.cpp`. The cooperative copy helper
-(`emitCooperativeCopy`) is rewritten on top of the new ptr ops; the
-end-of-pipeline lowers to `llvm.ptr` directly without a memref
-intermediate.
+The 1D bare tensor → memory carrier transition has retired the
+workgroup-AS `memref<...xT, #gpu.address_space<workgroup>>` family from
+`HCLowerLaunchBodyPass.cpp`. Workgroup-staged tiles, the cooperative
+copy helper (`emitCooperativeCopy`), and the per-op load/store/select
+patterns now emit `hc.alloc` + `hc.ptr_offset` + `hc.ptr_load[_pred]` /
+`hc.ptr_store[_pred]` directly. The end-of-pipeline `hc-lower-to-llvm`
+pass rewrites that family into `!llvm.ptr` (workgroup → addrspace-3
+`llvm.mlir.global private` + `llvm.mlir.addressof`, private →
+`llvm.alloca` addrspace-5, predicated forms → `scf.if` / masked
+intrinsics) without a memref intermediate. Kernel-argument memrefs
+remain on the existing memref-of-globals path; switching them over to
+`!hc.ptr<global>` is a separate task gated on the host-wrapper
+ABI work.
 
 The 1D bare vector → upstream `vector<NxT>` mapping is unchanged; `N`
 must be statically resolved by this point (already an inference

@@ -953,11 +953,13 @@ its v0 surface (rank-2 matmul / reduce, all-shaped per-element arith,
 pinned `!hc.idx<expr>` indices on load and store) — anything outside
 that surface flows through untouched and reaches the per-op handlers in
 `hc-lower-launch-body`. `hc-flatten-with-layouts` and `hc-lower-generic`
-share the same intent but are not wired in yet: they need
-`hc-lower-launch-body` to switch from `memref` to `hc.ptr` first
-([`doc/layouts.md`](layouts.md) covers the slice plan) so flatten
-doesn't strand free dim symbols on `!hc.buffer<..., ["?"]>` and
-lower-generic actually finds `!hc.ptr`-operand `hc.generic` to rewrite. Kernel lowering then
+share the same intent but are not wired in yet: their inputs aren't
+ready until the layout-flattening side of the work materializes the
+flattened tensor + per-symbol SSA values that lower-generic consumes.
+`hc-lower-launch-body` itself now emits the workgroup-AS family on
+`!hc.ptr<workgroup, T>` rather than `memref<..., #gpu.address_space<workgroup>>`
+([`doc/layouts.md`](layouts.md) covers the contract and the kernel-arg
+side that still flows through as `memref`). Kernel lowering then
 converts each semantic `hc.kernel` into a host `func.func` with a
 `gpu.launch`, exposing buffer ABI arguments as memrefs and leaving
 remaining HC body operations behind explicit conversion boundaries for
@@ -1061,7 +1063,9 @@ shim, with no external ROCm install on the host. The pieces are:
    chip and `target-features` (the wave32 feature is mandatory on
    gfx10+ — without it WMMA silently miscompiles to a wave64 fragment
    layout). The Python driver in `hc/_pipeline.py` then appends a
-   fixed device-side chain (`convert-amdgpu-to-rocdl`,
+   fixed device-side chain (`hc-lower-to-llvm` to take the
+   `!hc.ptr`/`hc.alloc` family launch-body emits down to LLVM IR
+   first, then `convert-amdgpu-to-rocdl`,
    `convert-gpu-to-rocdl`, `gpu-to-llvm`, ...), terminated by:
    * `hc-lower-gpu-to-binary` — runs the LLVM AMDGPU backend on each
      `gpu.module`, links the resulting object with the bundled

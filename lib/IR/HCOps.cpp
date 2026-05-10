@@ -1532,6 +1532,29 @@ static LogicalResult checkLoadStoreValueMatchesPointer(Operation *op,
          << " must match pointer element type " << ptrElem;
 }
 
+// Shape parity for the predicated ptr access ops: scalar value <-> i1
+// predicate; `vector<NxT>` value <-> `vector<Nxi1>` predicate (same N
+// and rank). `!hc.undef` on either side escapes the check, mirroring
+// the rest of the dialect's progressive-typing tolerance.
+static LogicalResult checkPredicateShapeMatchesValue(Operation *op,
+                                                     Type valueType,
+                                                     Type predicateType) {
+  if (isHCUndefType(valueType) || isHCUndefType(predicateType))
+    return success();
+  auto valueVec = llvm::dyn_cast<mlir::VectorType>(valueType);
+  auto predVec = llvm::dyn_cast<mlir::VectorType>(predicateType);
+  if (static_cast<bool>(valueVec) != static_cast<bool>(predVec))
+    return op->emitOpError(
+               "predicate shape must match value shape: scalar value "
+               "requires i1 predicate, vector value requires vector<...xi1> "
+               "predicate; got value type ")
+           << valueType << " and predicate type " << predicateType;
+  if (valueVec && predVec && valueVec.getShape() != predVec.getShape())
+    return op->emitOpError("predicate shape ")
+           << predicateType << " must match value shape " << valueType;
+  return success();
+}
+
 } // namespace
 
 LogicalResult HCPtrOffsetOp::verify() {
@@ -1567,6 +1590,24 @@ LogicalResult HCPtrStoreOp::verify() {
   PtrType dest = ptrTypeOrUndef(getDest().getType());
   return checkLoadStoreValueMatchesPointer(getOperation(), getValue().getType(),
                                            dest, "value");
+}
+
+LogicalResult HCPtrLoadPredOp::verify() {
+  PtrType source = ptrTypeOrUndef(getSource().getType());
+  if (failed(checkLoadStoreValueMatchesPointer(
+          getOperation(), getResult().getType(), source, "result")))
+    return failure();
+  return checkPredicateShapeMatchesValue(getOperation(), getResult().getType(),
+                                         getPredicate().getType());
+}
+
+LogicalResult HCPtrStorePredOp::verify() {
+  PtrType dest = ptrTypeOrUndef(getDest().getType());
+  if (failed(checkLoadStoreValueMatchesPointer(
+          getOperation(), getValue().getType(), dest, "value")))
+    return failure();
+  return checkPredicateShapeMatchesValue(getOperation(), getValue().getType(),
+                                         getPredicate().getType());
 }
 
 //===----------------------------------------------------------------------===//

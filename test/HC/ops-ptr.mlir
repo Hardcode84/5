@@ -126,6 +126,56 @@ func.func @ptr_load_store_opaque_vector(%p: !hc.ptr<global>) {
   return
 }
 
+// Predicated forms — scalar. Mirror the unconditional pair plus an i1
+// predicate operand and (for the load) a passthrough fill that the op
+// returns when the predicate is false. Pointer-element-type parity is
+// the same rule as the unconditional ops; predicate is i1 for scalar
+// values.
+// CHECK-LABEL: func.func @ptr_load_store_pred_typed_scalar
+// CHECK: %[[V:.*]] = hc.ptr_load_pred %{{.*}}, %{{.*}} passthrough %{{.*}} : !hc.ptr<workgroup, f16>, i1, f16 -> f16
+// CHECK: hc.ptr_store_pred %[[V]], %{{.*}}, %{{.*}} : f16, !hc.ptr<workgroup, f16>, i1
+func.func @ptr_load_store_pred_typed_scalar(%p: !hc.ptr<workgroup, f16>,
+                                             %pred: i1, %fill: f16) {
+  %v = hc.ptr_load_pred %p, %pred passthrough %fill
+      : !hc.ptr<workgroup, f16>, i1, f16 -> f16
+  hc.ptr_store_pred %v, %p, %pred : f16, !hc.ptr<workgroup, f16>, i1
+  return
+}
+
+// Predicated forms — vector. The predicate is `vector<Nxi1>` with N
+// matching the value's vector length; this is the surface the vec
+// lowering emits at merged contig groups when the body had a
+// per-lane mask. Parity check runs on the vector's element type, the
+// per-lane mask's lane count must match.
+// CHECK-LABEL: func.func @ptr_load_store_pred_typed_vector
+// CHECK: %[[V:.*]] = hc.ptr_load_pred %{{.*}}, %{{.*}} passthrough %{{.*}} : !hc.ptr<workgroup, f16>, vector<8xi1>, vector<8xf16> -> vector<8xf16>
+// CHECK: hc.ptr_store_pred %[[V]], %{{.*}}, %{{.*}} : vector<8xf16>, !hc.ptr<workgroup, f16>, vector<8xi1>
+func.func @ptr_load_store_pred_typed_vector(%p: !hc.ptr<workgroup, f16>,
+                                             %mask: vector<8xi1>,
+                                             %fill: vector<8xf16>) {
+  %v = hc.ptr_load_pred %p, %mask passthrough %fill
+      : !hc.ptr<workgroup, f16>, vector<8xi1>, vector<8xf16>
+      -> vector<8xf16>
+  hc.ptr_store_pred %v, %p, %mask
+      : vector<8xf16>, !hc.ptr<workgroup, f16>, vector<8xi1>
+  return
+}
+
+// Opaque pointer + predicated vector access: pointer-side parity is
+// skipped, predicate-shape parity still runs on the op.
+// CHECK-LABEL: func.func @ptr_load_store_pred_opaque_vector
+// CHECK: %[[V:.*]] = hc.ptr_load_pred %{{.*}}, %{{.*}} passthrough %{{.*}} : !hc.ptr<global>, vector<4xi1>, vector<4xf32> -> vector<4xf32>
+// CHECK: hc.ptr_store_pred %[[V]], %{{.*}}, %{{.*}} : vector<4xf32>, !hc.ptr<global>, vector<4xi1>
+func.func @ptr_load_store_pred_opaque_vector(%p: !hc.ptr<global>,
+                                              %mask: vector<4xi1>,
+                                              %fill: vector<4xf32>) {
+  %v = hc.ptr_load_pred %p, %mask passthrough %fill
+      : !hc.ptr<global>, vector<4xi1>, vector<4xf32> -> vector<4xf32>
+  hc.ptr_store_pred %v, %p, %mask
+      : vector<4xf32>, !hc.ptr<global>, vector<4xi1>
+  return
+}
+
 // Pointer values flow through `scf.for` iter_args because `!hc.ptr` is
 // a legal `HC_ValueType`; this is how the post-flatten lowering will
 // hand a sliding workgroup pointer through a cooperative-copy loop.

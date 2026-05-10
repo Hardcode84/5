@@ -1051,6 +1051,59 @@ module {
 
 // -----
 
+// Predicated load: pointer-element-type parity is reused from the
+// unconditional path.
+// CHECK: error: 'hc.ptr_load_pred' op result element type 'f32' must match pointer element type 'f16'
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>, %pred: i1, %fill: f32) {
+    %v = hc.ptr_load_pred %p, %pred passthrough %fill
+        : !hc.ptr<workgroup, f16>, i1, f32 -> f32
+    hc.return
+  }
+}
+
+// -----
+
+// Predicated load: scalar value paired with vector predicate is
+// rejected — predicate shape must mirror value shape.
+// CHECK: error: 'hc.ptr_load_pred' op predicate shape must match value shape
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>, %mask: vector<4xi1>, %fill: f16) {
+    %v = hc.ptr_load_pred %p, %mask passthrough %fill
+        : !hc.ptr<workgroup, f16>, vector<4xi1>, f16 -> f16
+    hc.return
+  }
+}
+
+// -----
+
+// Predicated load: vector value with mismatched-length predicate is
+// rejected — vector lane counts must match.
+// CHECK: error: 'hc.ptr_load_pred' op predicate shape 'vector<4xi1>' must match value shape 'vector<8xf16>'
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>, %mask: vector<4xi1>,
+               %fill: vector<8xf16>) {
+    %v = hc.ptr_load_pred %p, %mask passthrough %fill
+        : !hc.ptr<workgroup, f16>, vector<4xi1>, vector<8xf16>
+        -> vector<8xf16>
+    hc.return
+  }
+}
+
+// -----
+
+// Predicated store: vector value with scalar predicate is rejected.
+// CHECK: error: 'hc.ptr_store_pred' op predicate shape must match value shape
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>, %v: vector<4xf16>, %pred: i1) {
+    hc.ptr_store_pred %v, %p, %pred
+        : vector<4xf16>, !hc.ptr<workgroup, f16>, i1
+    hc.return
+  }
+}
+
+// -----
+
 // `hc.generic` requires at least one iter; an empty `iter ()` clause is
 // rejected at parse time before the verifier ever runs. The upstream
 // `parseKeyword` diagnostic fires first when the parser hits the

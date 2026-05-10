@@ -1054,6 +1054,78 @@ def HCPtrStoreOp : HC_Op<"ptr_store", [
   let hasVerifier = 1;
 }
 
+def HCPtrLoadPredOp : HC_Op<"ptr_load_pred", [
+    MemoryEffects<[MemRead]>,
+    AllTypesMatch<["passthrough", "result"]>
+  ]> {
+  let summary =
+      "Predicated load: load from `$source` when `$predicate` is true, "
+      "otherwise yield `$passthrough`.";
+  let description = [{
+    Predicated counterpart of `hc.ptr_load`. The result is the load's
+    value when the predicate is true; otherwise the result is the
+    `$passthrough` operand. For vector forms `$predicate` is a
+    per-lane mask (`vector<Nxi1>`) and the result is the elementwise
+    blend of the load and the passthrough — equivalent to upstream
+    `vector.maskedload`.
+
+    Shape parity: scalar `$result` requires `$predicate : i1` and a
+    scalar `$passthrough`; `vector<NxT>` `$result` requires
+    `$predicate : vector<Nxi1>` (same N) and a `vector<NxT>`
+    `$passthrough`. Pointer element-type parity follows the same rule
+    as `hc.ptr_load`: typed pointers require an exact match against
+    the result's element type.
+
+    `$passthrough` is required (no implicit poison/undef on the
+    masked-out lanes); the producer always supplies the desired
+    fill — typically a zero constant when the inactive value is
+    irrelevant.
+  }];
+  let arguments = (ins
+    HC_PtrValueType:$source,
+    HC_PtrPredicateType:$predicate,
+    HC_PtrAccessValueType:$passthrough
+  );
+  let results = (outs HC_PtrAccessValueType:$result);
+  let assemblyFormat = [{
+    $source `,` $predicate `passthrough` $passthrough attr-dict `:`
+    qualified(type($source)) `,` type($predicate) `,` type($passthrough)
+    `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def HCPtrStorePredOp : HC_Op<"ptr_store_pred", [
+    MemoryEffects<[MemWrite]>
+  ]> {
+  let summary =
+      "Predicated store: write `$value` to `$dest` when `$predicate` is "
+      "true, otherwise no-op.";
+  let description = [{
+    Predicated counterpart of `hc.ptr_store`. When `$predicate` is
+    true, `$value` is stored at `$dest`; when false, the op is a
+    no-op. For vector forms `$predicate` is a per-lane mask
+    (`vector<Nxi1>`) and only the lanes whose mask bit is true are
+    written — equivalent to upstream `vector.maskedstore`.
+
+    Shape parity: scalar `$value` requires `$predicate : i1`;
+    `vector<NxT>` `$value` requires `$predicate : vector<Nxi1>`
+    (same N). Pointer element-type parity follows the same rule as
+    `hc.ptr_store`: typed pointers require an exact match against
+    the value's element type.
+  }];
+  let arguments = (ins
+    HC_PtrAccessValueType:$value,
+    HC_PtrValueType:$dest,
+    HC_PtrPredicateType:$predicate
+  );
+  let assemblyFormat = [{
+    $value `,` $dest `,` $predicate attr-dict `:`
+    type($value) `,` qualified(type($dest)) `,` type($predicate)
+  }];
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Reductions, matmul, astype.
 //===----------------------------------------------------------------------===//

@@ -375,6 +375,18 @@ def HC_PtrAccessValueType : AnyTypeOf<[
   FixedVectorOfAnyRank<[AnyInteger, AnyFloat, Index]>,
 ]>;
 
+// Predicate-side type for `hc.ptr_load_pred` / `hc.ptr_store_pred`:
+// `i1` for scalar accesses, `vector<Nxi1>` for vector-form accesses
+// where N matches the value's vector length. The shape parity check
+// (scalar value <-> i1 predicate, vector<NxT> value <-> vector<Nxi1>
+// predicate of the same N) is enforced by the per-op verifier; this
+// constraint only restricts the type to one of the two flavours.
+def HC_PtrPredicateType : AnyTypeOf<[
+  HC_UndefType,
+  I1,
+  FixedVectorOfAnyRank<[I1]>,
+]>;
+
 // Shaped values for ops that only make sense on tensors/vectors
 // (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
 // `!hc.undef` is admitted for the same pre-inference reason as above.

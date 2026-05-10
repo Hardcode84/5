@@ -272,6 +272,41 @@ without touching the IR before that. The vec lowering path
 (`hc-lower-generic` at `U > 1`) emits the wide form directly at
 merged contig groups.
 
+The pair has predicated counterparts for masked memory access:
+
+```mlir
+// scalar predicated load: load if pred true, else passthrough.
+%v = hc.ptr_load_pred %p, %pred passthrough %fill
+    : !hc.ptr<workgroup, f16>, i1, f16 -> f16
+
+// vector predicated load: per-lane mask, per-lane passthrough.
+%vv = hc.ptr_load_pred %p, %mask passthrough %fillv
+    : !hc.ptr<workgroup, f16>, vector<8xi1>, vector<8xf16>
+    -> vector<8xf16>
+
+// scalar / vector predicated store: no-op on inactive lanes.
+hc.ptr_store_pred %v, %p, %pred : f16, !hc.ptr<workgroup, f16>, i1
+hc.ptr_store_pred %vv, %p, %mask
+    : vector<8xf16>, !hc.ptr<workgroup, f16>, vector<8xi1>
+```
+
+`hc.ptr_load_pred` / `hc.ptr_store_pred` mirror the polymorphic
+surface of the unconditional pair plus a predicate operand and (for
+the load) a mandatory `passthrough` fill. Shape parity is enforced
+by the verifier: scalar value ↔ `i1` predicate; `vector<NxT>` value
+↔ `vector<Nxi1>` predicate of the same N. The passthrough is
+required so producers commit to the inactive-lane value at the IR
+boundary (no implicit poison/undef); the common "zero on miss"
+spelling is one `arith.constant 0` away.
+
+Lowering at `hc-lower-generic` decomposes by partition width: at
+`U = 1` (scalar slice) the predicated forms lower to `scf.if` +
+`hc.ptr_load` / `hc.ptr_store`; at `U > 1` (vec slice, contig
+group) they lower directly to upstream `vector.maskedload` /
+`vector.maskedstore`. This is the v1 surface for masked memory —
+see the lowering section's "Predicated bodies" notes for how the
+search interacts with `scf.if` residuals.
+
 `hc.alloc` count is a single `index` SSA value. **In v1 the count is
 required to be statically known after specialization** — the verifier
 rejects allocations whose `count` is not a constant once the
@@ -462,10 +497,14 @@ This op is the single home for compute end-to-end:
 * fused compute-and-spill (e.g. matmul + LDS trace, GEMM + bias write)
   lands as a single mixed-outs `hc.generic` instead of two ops.
 
-Mask handling stays out of v1: masks ride as ordinary bare-pred tensor
-inputs that the body inspects with `scf.if`. A typed mask slot on the
-op surface is a follow-up if vectorization needs it as a first-class
-operand later.
+No typed mask slot on `hc.generic` itself in v1 — masks ride as
+ordinary bare-pred tensor inputs. Producers materializing masked
+memory access route through the predicated `hc.ptr_load_pred` /
+`hc.ptr_store_pred` ops at the body boundary so the lowering pass
+can vectorize masked code without falling back to `scf.if` shapes
+in the body (see the `hc.ptr` section). A typed mask slot on the
+op surface is a follow-up if a workload shows it's needed as a
+first-class operand.
 
 Bound inference — `hc-infer-generic-bounds`:
 
@@ -537,6 +576,29 @@ stores at the body boundary route through the merge result:
 Because every chosen partition factor provably divides its axis
 bound, the unrolled main loop covers the entire iteration space
 exactly — no tail loop is ever emitted.
+
+Predicated bodies — the dominant case is masked memory access,
+expressed via the first-class `hc.ptr_load_pred` / `hc.ptr_store_pred`
+ops (see the `hc.ptr` section above). The merge analyzer probes
+those ops the same as the unconditional pair (the predicate doesn't
+change offset arithmetic), and emission decomposes the chosen
+partition: scalar groups lower to `scf.if` + `hc.ptr_load` /
+`hc.ptr_store`, vector groups lower directly to upstream
+`vector.maskedload` / `vector.maskedstore`. Masked code stays
+vectorizable end-to-end without intermediate `scf.if` shapes
+defeating the search.
+
+`scf.if` *in the body* — i.e. control flow not lifted into a
+predicated memory op — remains as the residual case. A single
+`scf.if` anywhere in the body short-circuits the partition search
+to `(1, ..., 1)` and emits the scalar baseline with a "missed
+vectorization: scf.if in body" remark. This is conservative — a
+pure-arith `scf.if` (predicated select, predicated SSA carry
+update) would compose with merged loads/stores at the boundary —
+but the residual is rare in practice once masked load/store sites
+are routed through the predicated ops, and a smarter policy that
+bails only on `scf.if` whose regions have memory effects is a
+follow-up.
 
 Body vectorization (lifting scalar arith back to vector ops) is a
 follow-up — SLP / loop-vectorizer / target codegen handles the

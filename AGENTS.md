@@ -77,16 +77,17 @@ After running reviewers (multi-perspective or external):
 
 Cut-off for "immediate" is the next commit on this branch — not "this sprint", not "before merge". If a finding crosses a commit boundary, it's deferred; file the bead.
 
-## Code ↔ beads boundary
+## Code ↔ tracker boundary
 
-Beads live in `.beads/`; code lives in `lib/`, `include/`, `test/`, `tests/`. Keep them apart:
+Tracker artifacts (beads, design-doc delivery plans, sprint / milestone labels) live outside the source tree. Code lives in `lib/`, `include/`, `test/`, `tests/`. Keep them apart:
 
 - No bead ids (`5-1k7`, `4-96o`, etc.) in source files, comments, docstrings, tests, or commit messages. Issue ids belong in `.beads/`, PRs, and the tracker.
-- No "this bead does X" phrasing in code — say what the *code* does.
-- For deferred work, describe the gap conceptually (e.g. "needs a separate pass", "ODS result extension") instead of naming a bead that may move, merge, or close.
-- Bead ids rot. Code comments don't get updated when a bead gets renumbered or retired. The next reader in six months won't have `br show 5-2lf` memorised — and it may not even exist.
+- No delivery-plan ordinals (`slice 7`, `phase 2`, `milestone B`, ...) in source either. Numbering inside a design doc is a roadmap, not a stable contract — items renumber as the plan evolves and the references rot in place.
+- No "this bead does X" / "this is slice 4" phrasing in code — say what the *code* does, in its own terms.
+- For deferred work, describe the gap conceptually (e.g. "needs a separate pass", "ODS result extension") instead of naming a bead or slice that may move, merge, or close.
+- Volatile labels rot. Code comments don't get updated when a bead gets renumbered or retired or a delivery plan reorders. The next reader in six months won't have `br show 5-2lf` memorised, or remember which slice was which.
 
-If you need to cross-link, do it in the PR description or the bead itself, not in the source.
+Cross-links belong in the PR description, the bead, or the design doc — not in source. Bare references to a stable design doc by path (`doc/layouts.md` for the contract, not its slice list) are fine when they actually clarify intent.
 
 ## Tone
 

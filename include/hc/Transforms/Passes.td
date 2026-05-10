@@ -170,6 +170,61 @@ def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
   ];
 }
 
+def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
+  let summary = "Rewrite hc.load / hc.vload / hc.store into hc.generic.";
+  let description = [{
+    Funnels the remaining shaped memory ops into the body-driven
+    `hc.generic` surface so post-flatten codegen has a single op
+    family to lower. Counterpart to `hc-shaped-compute-to-generic` for
+    the load/store side; both run pre-flatten on semantic shaped types
+    so the per-axis offsets line up with the operand shapes before
+    `hc-flatten-with-layouts` composes them through the layout.
+
+    Rewrites:
+
+    `hc.load %buf[%i_0, ..., %i_n], shape %shape -> T<...>` → an
+    `hc.zeros` fill of the result shape plus an `hc.generic` with one
+    parallel iter per result axis. The buffer/tensor input carries
+    per-axis offsets `[i_0_expr + i_0, ..., i_n_expr + i_n]`,
+    where each `i_k_expr` is the access op's k-th index symbol. The
+    synthesised init is the `outs` operand with identity offsets. The
+    body forwards the loaded element through `hc.yield`. `hc.vload`
+    follows the same shape with a vector result.
+
+    `hc.store %dst[%i_0, ..., %i_n], %src` → an `hc.generic` with
+    `%src` as a value-typed `ins` (identity offsets) and `%dst` as a
+    ptr/buffer `outs` (per-axis offsets `[i_0_expr + i_0, ...]`). The
+    body forwards the source element through `hc.yield`; downstream
+    `hc-lower-generic` materialises the implicit `hc.ptr_store` at the
+    out's offset. No SSA result.
+
+    Empty index list (`hc.load %buf[]` / `hc.store %dst[]`) reduces
+    the per-axis offset on the memory operand to identity over the
+    iter syms — same body, no addressing addend.
+
+    Iter bounds are emitted as `hc.materialize_bound_expr` on
+    `!hc.idx<dim>` sourced directly from the op's tile shape, so the
+    later `hc-infer-generic-bounds` pass would be a no-op if it ran
+    after this one. Iter sym names use `i_<k>` to stay distinct from
+    the symbolic names the access op's index operands carry.
+
+    Out of scope (no rewrite, op survives for downstream diagnostics):
+
+      * Pre-inference operands typed `!hc.undef` — no shape to source
+        bounds from.
+      * Index operands not typed `!hc.idx<expr>` — the rewriter has
+        no symbolic name to bind to the iter sym, so the offset
+        composition would lose information.
+      * `hc.store` with a `mask` operand — masked stores need an
+        scf.if-shaped body the v0 rewrite doesn't emit; deferred.
+      * `hc.load_mask` — the bare-predicate companion stays a
+        primitive; only data movement gets rewritten here.
+      * `hc.buffer_view` and `hc.vec` — sub-view and broadcast
+        semantics that fall under separate slices.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
   let description = [{

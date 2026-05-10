@@ -10,6 +10,7 @@ add_mlir_library(MLIRHCTransforms
   HCInferTypesPass.cpp
   HCInlineHelpersPass.cpp
   HCInterpretIntrinsicRecipesPass.cpp
+  HCLoadStoreToGenericPass.cpp
   HCLowerBarePredicatesPass.cpp
   HCLowerGPUToBinaryPass.cpp
   HCLowerKernelsToGPULaunchPass.cpp

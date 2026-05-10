@@ -616,13 +616,14 @@ on later slices.
     into a single `hc.generic` with all-parallel iters and value-typed
     outs. Pure source-level rewrite; runs pre-flatten so per-axis
     offsets are identity over the operand shape.
-14. **`hc-load-to-generic` / `hc-store-to-generic`** — rewrite
-    `hc.load` / `hc.vload` into `hc.generic` with a ptr/buffer in and
-    a value-typed out, and `hc.store` into `hc.generic` with a
-    value-typed in and a ptr/buffer out. Picks up the multi-index
-    offset arrays the per-access materialization slice
-    (`hc-flatten-with-layouts` follow-up) feeds it. Cooperative
-    copy helpers fold into a single ptr-in / ptr-out generic.
+14. **`hc-load-store-to-generic`** — rewrite `hc.load` / `hc.vload`
+    into `hc.generic` with a ptr/buffer in and a value-typed out, and
+    `hc.store` into `hc.generic` with a value-typed in and a
+    ptr/buffer out. Picks up the multi-index offset arrays the
+    per-access materialization slice (`hc-flatten-with-layouts`
+    follow-up) feeds it. Cooperative copy helpers fold into a single
+    ptr-in / ptr-out generic. Masked stores, tensor-dst stores, and
+    `hc.load_mask` are deferred to follow-ups.
 15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
     forms: value-out, ptr-out, mixed) to a scalar `scf.for` nest
     only. No vectorization yet. Implicit `hc.ptr_load` for the

@@ -64,6 +64,13 @@ def SymbolicallyShapedTypeInterface
       "::mlir::Type",
       "cloneWithSymbolicLayout",
       (ins "::mlir::hc::LayoutAttr":$layout)
+    >,
+    InterfaceMethod<
+      "Return a copy of this type with the given symbolic shape; the "
+      "existing element type and layout slot are preserved.",
+      "::mlir::Type",
+      "cloneWithSymbolicShape",
+      (ins "::mlir::hc::ShapeAttr":$shape)
     >
   ];
 }

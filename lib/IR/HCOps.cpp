@@ -1995,32 +1995,28 @@ LogicalResult HCGenericOp::verify() {
   // Per-operand offset arrays must agree on length with the operand's
   // rank. `!hc.undef` operands have no shape — skip them; the bounds
   // pass / inference fills the rank in once a concrete type lands.
-  auto checkOperandRank = [&](Value operand, ArrayAttr perOperandOffsets,
-                              StringRef role, size_t roleIdx) -> LogicalResult {
+  // Each per-operand offset entry has to be a `#hc.expr` array. We
+  // intentionally do NOT enforce `entries.size() == operand.rank`:
+  // post-flatten an operand sits on its 1D storage shape but the
+  // per-axis offset array still describes the original nD logical
+  // access ("ops maintain their own nested structure" across the
+  // type-only flatten boundary). A richer post-flatten verifier
+  // that pins offsets-vs-iter-syms / offsets-vs-logical-shape lives
+  // in a follow-up.
+  auto checkPerOperandShape = [&](ArrayAttr perOperandOffsets, StringRef role,
+                                  size_t roleIdx) -> LogicalResult {
     auto entries = llvm::dyn_cast<ArrayAttr>(perOperandOffsets);
     if (!entries)
       return emitOpError(role)
              << "_offsets[" << roleIdx
              << "] must be an array of #hc.expr<...> per axis";
-    auto shaped =
-        llvm::dyn_cast<SymbolicallyShapedTypeInterface>(operand.getType());
-    if (!shaped)
-      return success();
-    size_t rank = shaped.getSymbolicShape().getDims().size();
-    if (entries.size() != rank)
-      return emitOpError(role)
-             << " #" << roleIdx << " offset has " << entries.size()
-             << " axis entr" << (entries.size() == 1 ? "y" : "ies")
-             << ", operand rank is " << rank;
     return success();
   };
-  for (auto [i, in, off] :
-       llvm::enumerate(getIns(), insOffsets.getAsRange<ArrayAttr>()))
-    if (failed(checkOperandRank(in, off, "ins", i)))
+  for (auto [i, off] : llvm::enumerate(insOffsets.getAsRange<ArrayAttr>()))
+    if (failed(checkPerOperandShape(off, "ins", i)))
       return failure();
-  for (auto [i, out, off] :
-       llvm::enumerate(getOuts(), outsOffsets.getAsRange<ArrayAttr>()))
-    if (failed(checkOperandRank(out, off, "outs", i)))
+  for (auto [i, off] : llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>()))
+    if (failed(checkPerOperandShape(off, "outs", i)))
       return failure();
 
   // Reduction iters on output offsets would mean writing the same slot

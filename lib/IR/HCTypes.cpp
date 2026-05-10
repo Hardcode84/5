@@ -371,6 +371,9 @@ LayoutAttr mlir::hc::BufferType::getSymbolicLayout() const {
 Type mlir::hc::BufferType::cloneWithSymbolicLayout(LayoutAttr layout) const {
   return BufferType::get(getContext(), getElementType(), getShape(), layout);
 }
+Type mlir::hc::BufferType::cloneWithSymbolicShape(ShapeAttr shape) const {
+  return BufferType::get(getContext(), getElementType(), shape, getLayout());
+}
 
 mlir::LogicalResult
 mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -390,6 +393,9 @@ LayoutAttr mlir::hc::TensorType::getSymbolicLayout() const {
 Type mlir::hc::TensorType::cloneWithSymbolicLayout(LayoutAttr layout) const {
   return TensorType::get(getContext(), getElementType(), getShape(), layout);
 }
+Type mlir::hc::TensorType::cloneWithSymbolicShape(ShapeAttr shape) const {
+  return TensorType::get(getContext(), getElementType(), shape, getLayout());
+}
 
 mlir::LogicalResult
 mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -408,6 +414,9 @@ LayoutAttr mlir::hc::VectorType::getSymbolicLayout() const {
 }
 Type mlir::hc::VectorType::cloneWithSymbolicLayout(LayoutAttr layout) const {
   return VectorType::get(getContext(), getElementType(), getShape(), layout);
+}
+Type mlir::hc::VectorType::cloneWithSymbolicShape(ShapeAttr shape) const {
+  return VectorType::get(getContext(), getElementType(), shape, getLayout());
 }
 
 mlir::LogicalResult
@@ -432,6 +441,10 @@ Type mlir::hc::BareTensorType::cloneWithSymbolicLayout(
   return BareTensorType::get(getContext(), getElementType(), getShape(),
                              layout);
 }
+Type mlir::hc::BareTensorType::cloneWithSymbolicShape(ShapeAttr shape) const {
+  return BareTensorType::get(getContext(), getElementType(), shape,
+                             getLayout());
+}
 
 mlir::LogicalResult
 mlir::hc::BareVectorType::verify(function_ref<InFlightDiagnostic()> emitError,
@@ -454,6 +467,10 @@ Type mlir::hc::BareVectorType::cloneWithSymbolicLayout(
     LayoutAttr layout) const {
   return BareVectorType::get(getContext(), getElementType(), getShape(),
                              layout);
+}
+Type mlir::hc::BareVectorType::cloneWithSymbolicShape(ShapeAttr shape) const {
+  return BareVectorType::get(getContext(), getElementType(), shape,
+                             getLayout());
 }
 
 mlir::LogicalResult

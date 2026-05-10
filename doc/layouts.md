@@ -170,31 +170,66 @@ one.
 Position: after `hc-decompose-shaped-values`, before any pointer
 lowering.
 
-For every shaped value with a non-default layout:
+The pass is **type-only**: every shaped value (except buffers, see
+below) collapses to its 1D `storage_size_expr` form and loses its
+layout slot, but op surfaces stay untouched. Per-axis offset arrays
+on `hc.generic` keep their original logical rank, multi-index lists
+on `hc.load` / `hc.store` / `hc.vload` / `hc.buffer_view` stay
+as-is. Composing the layout offset into those access expressions is
+a separate slice — downstream fusion / vectorization wants the
+per-axis structure available, and the access expression
+materialization needs `hc.ptr` plumbing the type-only slice doesn't
+own.
+
+What runs:
 
 1. The type changes from `<T, [d_0, ..., d_{n-1}], #hc.layout<L>>` to
    `<T, [storage_size_expr]>` (1D, no layout). `storage_size_expr` is
    the layout's `storage_size` after binding `shape_syms` to the
-   original shape entries.
-2. Every access op (`hc.load`, `hc.store`, `hc.vload`, `hc.buffer_view`,
-   `hc.vec`) is rewritten so its multi-index becomes a single 1D offset
-   computed by binding `index_syms` and inlining `offset(...)`. The
-   inlined expression goes through ixsimpl, so common cases collapse to
-   short SSA chains, not opaque expression trees.
-3. `hc.as_layout`: if the source and destination layouts agree on the
-   carrier (the offset expressions are equal under ixsimpl), it becomes
-   a no-op cast. Otherwise it expands into an `hc.generic` copy whose
-   input and output use the two different offset expressions over the
-   same iteration space.
-4. The `i1` mask byte-per-element behavior currently hand-coded in
-   `HCLowerLaunchBodyPass.cpp` falls out as a default: `i1` shaped types
-   pick a `byte-per-element` layout out of the box, and the manual
-   extract/insert sequences in the launch-body lowering retire.
+   original shape entries — or the dimension product when the type
+   sits on the implicit identity-row-major contract (no explicit
+   layout).
+2. The shape collapse and layout-slot strip propagate through every
+   op via a `MatchAnyOpTypeTag` rebuild pattern scoped to the `hc`
+   dialect. Body block args of `hc.generic` carry scalar element
+   types and need no signature conversion. Function signatures /
+   `func.return` / `func.call` / SCF structural ops route through
+   the upstream populators.
+3. `hc.as_layout` drops unconditionally: both endpoints route
+   through the converter and the relabel becomes cosmetic.
+4. **Buffers are exempt** from the shape collapse: the default
+   strided buffer layout's `storage_size` is the literal `0`
+   placeholder (the host owns the allocation), so 1D-collapsing
+   would fold every buffer to `[0]`. Buffer types keep their
+   original nD shape and lose only the layout slot for now; the
+   buffer-side ABI slice picks a real `storage_size_expr`.
 
-Post-flatten invariant: no layout attribute survives on any shaped
-type. Every shaped value is 1D, every access carries the offset
-explicitly. This is the boundary the pointer / `hc.generic` lowering
-operates against.
+Deferred slices (out of scope here):
+
+* **Per-access offset materialization.** Every access op
+  (`hc.load`, `hc.store`, `hc.vload`, `hc.buffer_view`, `hc.vec`)
+  gets its multi-index rewritten into a single 1D offset. v0
+  carries the multi-index forward as-is; lowering owns the
+  composition.
+* **`hc.as_layout` structural difference.** When source and
+  destination layouts disagree under ixsimpl equality, the op
+  becomes an `hc.generic` copy between the two offset expressions.
+  v0 always drops the op (correctness is preserved only when the
+  layouts agree on the underlying storage-size expression — strict
+  layout mismatches need the materialization slice).
+* **`hc.generic` operand offset composition.** Per-operand per-axis
+  `#hc.expr` arrays stay nD post-flatten; composing the layout
+  offset to produce a single 1D expression per operand is the
+  "compose layout into generic" slice.
+* **`i1` byte-per-element retirement.** The hand-coded `i1` mask
+  handling in `HCLowerLaunchBodyPass.cpp` needs flatten to emit a
+  byte-per-element layout for `i1` shaped types as a default. Until
+  then the manual extract/insert sequences stay.
+
+Post-flatten *type* invariant: no layout attribute survives on any
+shaped type, every non-buffer shaped value is 1D. Op-level
+structural invariants (multi-index access, per-axis offsets) carry
+through unchanged for the follow-up slice to consume.
 
 ## `hc.ptr` and memory ops
 
@@ -456,9 +491,16 @@ on later slices.
 6. **`hc.ptr` family** — `!hc.ptr<...>`, `hc.alloc`, `hc.ptr_offset`,
    `hc.ptr_load`, `hc.ptr_store`. Round-trip + LIT. No flatten yet, no
    `hc.generic` yet.
-7. **`hc-flatten-with-layouts`** — nD+layout → 1D-flat. Output uses
-   bare types + per-access offset expressions; not yet on `hc.ptr`.
-   Covers buffer, tensor, vector, and their bare counterparts uniformly.
+7. **`hc-flatten-with-layouts`** — type-only collapse: every shaped
+   value (except buffers) becomes 1D `<T, [storage_size_expr]>` and
+   loses its layout slot. Op surfaces stay untouched: per-axis offset
+   arrays on `hc.generic` and multi-index lists on `hc.load` /
+   `hc.store` / `hc.vload` / `hc.buffer_view` carry through at their
+   original logical rank for downstream fusion / vectorization to
+   consume. Buffer 1D-collapse, per-access offset materialization,
+   `hc.as_layout` structural-difference handling, and `i1`
+   byte-per-element retirement are separate slices documented under
+   the pass section above.
 8. **`hc.generic` op surface** — define the op (parallel + reduction
    iter kinds, outs-as-init, multiple outputs, per-operand `#hc.expr`
    offset slot, SSA `iter_bounds`). No lowering yet, no per-axis array

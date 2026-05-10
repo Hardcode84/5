@@ -212,40 +212,53 @@ def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
 }
 
 def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
-  let summary = "Strip surviving #hc.layout attrs off shaped types.";
+  let summary = "Type-only flatten: every shaped value becomes 1D, "
+                "no #hc.layout slot survives.";
   let description = [{
-    Establishes the post-flatten invariant *no `#hc.layout` attribute
-    survives on any shaped type* by routing every layout-bearing
-    `SymbolicallyShapedTypeInterface` value through MLIR's
-    dialect-conversion driver. The shape stays multi-rank here; the
-    1D collapse and per-access offset materialization land later, on
-    top of the pointer / elementwise memory carrier — they have
-    nowhere meaningful to go until those ops exist.
+    Establishes the post-flatten *type* invariant: every
+    `SymbolicallyShapedTypeInterface` value (except buffers) is 1D
+    and carries no `#hc.layout` attribute. Op surfaces stay
+    untouched — `hc.generic` keeps its per-axis offset arrays at
+    their original logical rank, `hc.load` / `hc.store` /
+    `hc.vload` / `hc.buffer_view` keep their multi-index lists.
+    Whoever turns those nD logical accesses into concrete 1D
+    addresses owns the layout->offset materialization in a
+    follow-up slice.
 
     What runs:
 
       1. A `TypeConverter` whose dispatch on the shaped-type interface
-         calls `cloneWithSymbolicLayout(LayoutAttr{})` to drop the slot.
-         Tuple and function types recurse so nested carriers get the same
-         fold without per-shell hand-rolling.
+         computes `storage_size_expr` (`layout.storage_size` after
+         binding `layout.shape_syms` to the original shape entries,
+         or the product of the original dimensions when no layout is
+         attached) and rebuilds the type with a single-entry shape
+         and a null layout slot. Tuple and function types recurse so
+         nested carriers get the same fold without per-shell
+         hand-rolling.
 
       2. Upstream populators thread the converter through `func.func` /
          `func.return` / `func.call` signatures and the SCF structural
          ops (`scf.for`, `scf.if`, `scf.while`, `scf.index_switch`).
 
-      3. `hc.as_layout` whose source is layout-bearing collapses to its
-         operand once both endpoints carry the layout-stripped form —
-         the op was a layout-only relabel, and after the strip both
-         sides are observationally identical.
+      3. `hc.as_layout` collapses to its operand once both endpoints
+         carry the converted form — the op was a layout-only relabel,
+         and after the type fold both sides are observationally
+         identical.
+
+    Buffer types are deliberately exempt: their default strided
+    layout's `storage_size` is the literal `0` placeholder the
+    frontend emits (the host owns the allocation), so 1D-collapsing
+    them would fold every buffer shape to `[0]`. They keep their
+    original nD shape and lose only the layout slot for now; a
+    separate slice owns the buffer-side ABI.
 
     Cooperates with `hc-canonicalize-layouts`: that pass folds
-    explicit *identity* layouts back to absent; this one folds *every
-    other* layout off too, on the way to the 1D-pointer world. Until
-    the 1D collapse + per-access offset materialization land, access
-    ops on layout-bearing sources stay in the unhandled set — the
-    conversion driver leaves them alone if their operand types don't
-    change, and fails loudly otherwise. Not yet wired into the
-    default `hc.compile` schedule for that reason.
+    explicit *identity* layouts back to absent; this one collapses
+    every shape (with or without an explicit layout) to its 1D
+    storage form. Not yet wired into the default `hc.compile`
+    schedule — downstream passes still expect nD operand types and
+    a layout-aware access path that the follow-up slice will
+    materialize.
   }];
   let dependentDialects = [
     "::mlir::hc::HCDialect",

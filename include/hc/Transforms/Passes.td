@@ -125,6 +125,47 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
   ];
 }
 
+def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
+  let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
+  let description = [{
+    Walks every `hc.generic` and resolves any `iter_bounds` operand
+    defined by `hc.undef_value` to a concrete `!hc.idx<...>` SSA value
+    derived from operand shapes. Inference must run before any pass that
+    composes per-axis offsets into a single linear expression — once the
+    per-axis structure is gone, recovering iter ranges from a composed
+    offset is intractable.
+
+    Per iter sym `s` with a placeholder bound:
+
+      1. For every (operand, axis) pair where the per-axis offset is
+         exactly the bare symbol `s` under ixsimpl-canonical form,
+         collect the operand's shape entry at `axis` as an implied
+         bound. Non-identity offsets (`s + 1`, `2*s`, ...) are not yet
+         understood and are skipped — the operand contributes no
+         binding for `s` through this axis.
+
+      2. Multiple identity occurrences must agree on the implied bound
+         expression (hash-consed pointer equality through the dialect
+         store). Conflicts diagnose and name the offending operand
+         pair.
+
+      3. The first agreed bound is materialized via
+         `hc.materialize_bound_expr` typed `!hc.idx<dim>` and used to
+         replace the placeholder operand on the op. The original
+         `hc.undef_value` op is left for canonicalization / DCE if no
+         other use survives.
+
+    A placeholder for which no identity occurrence is found diagnoses:
+    the user wrote a body the pass cannot infer bounds for, and going
+    further would let the placeholder leak past flatten where the lack
+    of an answer becomes much harder to localize. The pass is a no-op
+    when every bound on every `hc.generic` is already concrete, so
+    rewrites that emit fully-resolved ops (`hc.reduce` / `hc.matmul` →
+    `hc.generic`) pay nothing.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
   let summary = "Strip surviving #hc.layout attrs off shaped types.";
   let description = [{

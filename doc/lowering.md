@@ -893,6 +893,11 @@ folding / inline markers on is:
                               → hc-decompose-shaped-values(strict=false)
                               → hc-inline-helpers
                               → hc-materialize-bound-exprs
+                              → hc-canonicalize-layouts
+                              → hc-shaped-compute-to-generic
+                              → hc-elementwise-to-generic
+                              → hc-load-store-to-generic
+                              → hc-infer-generic-bounds
                               → hc-normalize-scope-regions
                               → hc-lower-kernels-to-gpu-launch
                               → hc-lower-launch-body
@@ -912,6 +917,11 @@ on the same pass list, so
            --hc-decompose-shaped-values=strict=false \
            --hc-inline-helpers --hc-materialize-bound-exprs \
            --canonicalize \
+           --hc-canonicalize-layouts \
+           --hc-shaped-compute-to-generic \
+           --hc-elementwise-to-generic \
+           --hc-load-store-to-generic \
+           --hc-infer-generic-bounds \
            --hc-normalize-scope-regions --canonicalize --cse \
            --hc-lower-kernels-to-gpu-launch \
            --hc-lower-launch-body --canonicalize --cse
@@ -934,10 +944,23 @@ away so the executable HC body is closer to per-workitem SPMD form before
 upstream lowering. Bound-expression materialization runs a second time after
 helper inlining because inlined helper bodies can expose fresh launch-geometry
 producer chains; DCE/canonicalization removes the dead scope-token producers
-before region normalization checks for remaining live scope-token uses.
-Kernel lowering then converts each semantic `hc.kernel` into a host
-`func.func` with a `gpu.launch`, exposing buffer ABI arguments as memrefs and
-leaving remaining HC body operations behind explicit conversion boundaries for
+before region normalization checks for remaining live scope-token uses. The
+generic-pipeline rewriters (`hc-canonicalize-layouts`,
+`hc-shaped-compute-to-generic`, `hc-elementwise-to-generic`,
+`hc-load-store-to-generic`, `hc-infer-generic-bounds`) run after the
+DCE pair: each one is conservative and only fires on inputs that match
+its v0 surface (rank-2 matmul / reduce, all-shaped per-element arith,
+pinned `!hc.idx<expr>` indices on load and store) — anything outside
+that surface flows through untouched and reaches the per-op handlers in
+`hc-lower-launch-body`. `hc-flatten-with-layouts` and `hc-lower-generic`
+share the same intent but are not wired in yet: they need
+`hc-lower-launch-body` to switch from `memref` to `hc.ptr` first
+([`doc/layouts.md`](layouts.md) covers the slice plan) so flatten
+doesn't strand free dim symbols on `!hc.buffer<..., ["?"]>` and
+lower-generic actually finds `!hc.ptr`-operand `hc.generic` to rewrite. Kernel lowering then
+converts each semantic `hc.kernel` into a host `func.func` with a
+`gpu.launch`, exposing buffer ABI arguments as memrefs and leaving
+remaining HC body operations behind explicit conversion boundaries for
 the subsequent upstream-lowering slices.
 
 ### SSA construction

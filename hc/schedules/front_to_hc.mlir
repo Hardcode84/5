@@ -9,11 +9,25 @@
 // helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
 // SSA, infer concrete HC value types, materialize bound symbolic values, verify
 // static shape carriers, split semantic shaped values into bare data/masks,
-// inline helpers, normalize supported scope regions, run the standard cleanup
-// pair, wrap kernels in upstream GPU launches, lower launch-body scalar/control
-// flow, clean up, interpret target lowering recipes (which rewrites every
+// inline helpers, fold identity layouts, funnel shaped compute / per-element
+// arith / load+store into `hc.generic`, infer placeholder iter bounds,
+// normalize supported scope regions, run the standard cleanup pair, wrap
+// kernels in upstream GPU launches, lower launch-body scalar/control flow,
+// clean up, interpret target lowering recipes (which rewrites every
 // `hc.call_intrinsic` and DCEs the matching `hc.intrinsic` decls), then a
 // canonicalize/cse pair to fold the recipe's bridging UCCs into identity.
+//
+// The generic-pipeline rewriters (`hc-shaped-compute-to-generic`,
+// `hc-elementwise-to-generic`, `hc-load-store-to-generic`,
+// `hc-infer-generic-bounds`) are conservative — they only fire on inputs
+// they can prove safe (rank-2 matmul / reduce, per-element on shaped
+// types, pinned `!hc.idx<expr>` indices on load and store). Inputs that
+// don't match (slice-indexed loads, intrinsic-mediated WMMA paths, ...)
+// flow through untouched and lower via the existing per-op handlers in
+// `hc-lower-launch-body`. `hc-flatten-with-layouts` and `hc-lower-generic`
+// are not wired in yet; their natural slot bookends `hc-lower-launch-body`
+// once that pass switches from `memref` to `hc.ptr` — see the comment
+// near the launch-body pass below.
 //
 // The closing chunk produces the device-side artefacts the GPU lowering
 // pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
@@ -82,7 +96,34 @@ module attributes {transform.with_named_sequence} {
     %m10 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m9
         : (!transform.any_op) -> !transform.any_op
     transform.apply_dce to %m10 : !transform.any_op
-    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10
+    // Layout cleanup. Identity layouts fold to absent so the post-decompose
+    // shape carriers stay layout-less wherever the user didn't pin a
+    // non-identity layout; `hc.as_layout` chains collapse to their outer
+    // arg. Non-identity layouts (col-major, padded, default-strided buffer
+    // args) survive structurally — `hc-flatten-with-layouts` is the one
+    // that erases the slot wholesale.
+    %m10a = transform.apply_registered_pass "hc-canonicalize-layouts" to %m10
+        : (!transform.any_op) -> !transform.any_op
+    // Funnel the shaped op surface into `hc.generic` so the post-flatten
+    // codegen has a single op family to lower. Each rewriter is
+    // conservative — `hc.matmul` / `hc.reduce` v0 wants rank-2 / single-axis
+    // shapes, the per-element family wants all-shaped operands, and
+    // load/store want pinned `!hc.idx<expr>` indices. Anything outside that
+    // surface (slice-indexed access, mixed-rank ops, masked stores, ...)
+    // stays in place and routes through the existing per-op handlers in
+    // `hc-lower-launch-body`. `hc-infer-generic-bounds` then resolves any
+    // `!hc.undef` iter bounds the per-element rewriter emitted from the
+    // operand shapes. Order: rewriters before bounds inference so the pass
+    // sees every fresh `hc.generic`.
+    %m10b = transform.apply_registered_pass "hc-shaped-compute-to-generic" to %m10a
+        : (!transform.any_op) -> !transform.any_op
+    %m10c = transform.apply_registered_pass "hc-elementwise-to-generic" to %m10b
+        : (!transform.any_op) -> !transform.any_op
+    %m10d = transform.apply_registered_pass "hc-load-store-to-generic" to %m10c
+        : (!transform.any_op) -> !transform.any_op
+    %m10e = transform.apply_registered_pass "hc-infer-generic-bounds" to %m10d
+        : (!transform.any_op) -> !transform.any_op
+    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10e
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m11 {
       transform.apply_patterns.canonicalization
@@ -96,6 +137,18 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
+    // `hc-flatten-with-layouts` and `hc-lower-generic` are deliberately
+    // not wired in here yet. Their intended slot is right next to
+    // `hc-lower-launch-body` — flatten before so the launch-body pass
+    // sees 1D shaped types and free layout symbols as ordinary SSA, and
+    // lower-generic after so any `hc.generic` with `!hc.ptr` operands
+    // collapses to the loop nest. Both depend on the launch-body pass
+    // moving from `memref` to `hc.ptr` first: without that, flatten
+    // produces buffers typed `!hc.buffer<..., ["?"]>` that the current
+    // `bindShapeSymbols` walk can't extract dim names from, and
+    // lower-generic finds nothing to lower because launch-body never
+    // produces `hc.generic` with ptr operands. A follow-up slice owns
+    // wiring both passes once the ptr migration lands.
     // The `__HC_TARGET__` placeholder is substituted by the Python
     // driver before the schedule is handed to the transform
     // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the

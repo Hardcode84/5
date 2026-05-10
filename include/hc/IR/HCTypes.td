@@ -237,13 +237,18 @@ def HC_PtrType : HC_Type<"Ptr", "ptr"> {
     SPIR-V path keeps it.
   }];
   let parameters = (ins
-    OptionalParameter<"::mlir::Type">:$elementType,
-    "::mlir::hc::AddrSpace":$addrSpace
+    EnumParameter<HC_AddrSpace>:$addrSpace,
+    OptionalParameter<"::mlir::Type">:$elementType
   );
-  let hasCustomAssemblyFormat = 1;
+  // Surface mirrors `!llvm.ptr<3>`: required address space first as a
+  // bare keyword, optional element type after the comma. Optional
+  // groups need a literal anchor for the parser to probe presence
+  // (the trailing `,` does that), so the optional positional element
+  // can't sit before the required one without going custom.
+  let assemblyFormat = "`<` $addrSpace (`,` $elementType^)? `>`";
   let builders = [
     TypeBuilder<(ins "::mlir::hc::AddrSpace":$addrSpace), [{
-      return $_get($_ctxt, ::mlir::Type{}, addrSpace);
+      return $_get($_ctxt, addrSpace, ::mlir::Type{});
     }]>
   ];
 }

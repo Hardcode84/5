@@ -201,21 +201,23 @@ Types and ops added to the `hc` dialect (no second dialect — keeping
 the surface small):
 
 ```mlir
-!hc.ptr<addrspace = workgroup | global | private>           // opaque
-!hc.ptr<f16, addrspace = workgroup>                         // typed (SPIR-V)
+!hc.ptr<workgroup | global | private>           // opaque
+!hc.ptr<workgroup, f16>                         // typed (SPIR-V)
 ```
 
-Element type is optional. AMDGPU/LLVM lowering uses the opaque form;
-SPIR-V lowering keeps the typed form. The element type is dropped at
-the lowering pass that emits `llvm.ptr` (LLVM has been opaque-pointers
-since 17). Any pass that needs the element type before that point gets
-it from the `hc.ptr_load` / `hc.ptr_store` op, which always carries it.
+Surface mirrors `!llvm.ptr<3>`: required address space first as a bare
+keyword, optional element type after the comma. Element type is
+optional — AMDGPU/LLVM lowering uses the opaque form, SPIR-V lowering
+keeps the typed form. The element type is dropped at the lowering pass
+that emits `llvm.ptr` (LLVM has been opaque-pointers since 17). Any
+pass that needs the element type before that point gets it from the
+`hc.ptr_load` / `hc.ptr_store` op, which always carries it.
 
 ```mlir
-hc.alloc count = %n : !hc.ptr<f16, addrspace = workgroup>
-hc.ptr_offset %p, %i : (!hc.ptr<addrspace=?>, index) -> !hc.ptr<addrspace=?>
-%v = hc.ptr_load  %p          : !hc.ptr<addrspace=?> -> f16
-     hc.ptr_store %v, %p      : (f16, !hc.ptr<addrspace=?>) -> ()
+hc.alloc count = %n : index -> !hc.ptr<workgroup, f16>
+hc.ptr_offset %p, %i : (!hc.ptr<workgroup, f16>, index) -> !hc.ptr<workgroup, f16>
+%v = hc.ptr_load  %p          : !hc.ptr<workgroup, f16> -> f16
+     hc.ptr_store %v, %p      : f16, !hc.ptr<workgroup, f16>
 ```
 
 `hc.alloc` count is a single `index` SSA value. **In v1 the count is

@@ -128,14 +128,13 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
 def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
   let summary = "Strip surviving #hc.layout attrs off shaped types.";
   let description = [{
-    First slice of `doc/layouts.md` slice 7. Establishes the post-flatten
-    invariant *no `#hc.layout` attribute survives on any shaped type* by
-    routing every layout-bearing `SymbolicallyShapedTypeInterface` value
-    through MLIR's dialect-conversion driver. The shape itself stays
-    multi-rank in this slice — the 1D collapse and per-access offset
-    materialization are scoped out as a follow-up because they need the
-    pointer / `hc.elementwise` ops (`doc/layouts.md` slices 6 and 8) to
-    have somewhere to land.
+    Establishes the post-flatten invariant *no `#hc.layout` attribute
+    survives on any shaped type* by routing every layout-bearing
+    `SymbolicallyShapedTypeInterface` value through MLIR's
+    dialect-conversion driver. The shape stays multi-rank here; the
+    1D collapse and per-access offset materialization land later, on
+    top of the pointer / elementwise memory carrier — they have
+    nowhere meaningful to go until those ops exist.
 
     What runs:
 
@@ -153,14 +152,14 @@ def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
          the op was a layout-only relabel, and after the strip both
          sides are observationally identical.
 
-    Cooperates with `hc-canonicalize-layouts`: the canonicalize pass
-    folds explicit *identity* layouts back to absent; this pass folds
-    *every other* layout off too, on the way to the 1D-pointer world.
-    Until the 1D-collapse follow-up lands, access ops on layout-bearing
-    sources stay in the unhandled set — the conversion driver leaves
-    them alone if their operand types don't change, and fails loudly
-    otherwise. Not yet wired into the default `hc.compile` schedule
-    for that reason.
+    Cooperates with `hc-canonicalize-layouts`: that pass folds
+    explicit *identity* layouts back to absent; this one folds *every
+    other* layout off too, on the way to the 1D-pointer world. Until
+    the 1D collapse + per-access offset materialization land, access
+    ops on layout-bearing sources stay in the unhandled set — the
+    conversion driver leaves them alone if their operand types don't
+    change, and fails loudly otherwise. Not yet wired into the
+    default `hc.compile` schedule for that reason.
   }];
   let dependentDialects = [
     "::mlir::hc::HCDialect",

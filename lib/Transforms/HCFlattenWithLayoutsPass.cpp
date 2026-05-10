@@ -2,13 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-flatten-with-layouts`, the first slice of the layout
-// flatten pass described in `doc/layouts.md` (slice 7). This commit
-// only establishes the *no-`#hc.layout`-survives* invariant: the
-// shape itself stays multi-rank for now. The 1D collapse + per-access
-// offset materialization is scoped out as a follow-up because it
-// needs the `hc.ptr` family and `hc.elementwise` op (slices 6 / 8) to
-// land somewhere meaningful.
+// Implements `-hc-flatten-with-layouts`. This pass only establishes
+// the *no-`#hc.layout`-survives* invariant on shaped types: the shape
+// itself stays multi-rank. The 1D collapse + per-access offset
+// materialization land later, on top of the pointer / elementwise
+// memory carrier — they have nowhere meaningful to go until those ops
+// exist.
 
 #include "hc/Transforms/Passes.h"
 

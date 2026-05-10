@@ -760,12 +760,12 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
 // Default fully-strided np/torch-style layout for a buffer kernel
 // argument. Names per-axis stride symbols `$STRIDE_<axis>_<argname>`
 // so the host wrapper / scope binder can match them against the
-// runtime descriptor (slice 5 in `doc/layouts.md` wires up the
-// `_mlir_ciface_hc_get_stride` plumbing). The structural form keeps
-// `shape_syms` / `index_syms` as opaque placeholders (`d<i>` / `i<i>`)
-// — the bound-name contract documented on `HC_LayoutAttr` only requires
-// them to be unique and disjoint from `params` keys; their identity is
-// substituted at the use site by `doc/layouts.md`'s flatten pass.
+// runtime descriptor — `_mlir_ciface_hc_get_stride` is the eventual
+// binding point. The structural form keeps `shape_syms` / `index_syms`
+// as opaque placeholders (`d<i>` / `i<i>`) — the bound-name contract
+// documented on `HC_LayoutAttr` only requires them to be unique and
+// disjoint from `params` keys; the layout-flatten pass substitutes
+// their identity at the use site.
 //
 // `storage_size` is informational for buffer layouts (the host owns the
 // allocation; the verifier doesn't enforce `storage_size >= max(offset)
@@ -942,10 +942,9 @@ parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
   // Buffer args carry the default fully-strided np/torch layout from
   // the boundary on. Per-axis stride symbols are namespaced by the
   // arg name so two buffers with the same shape don't share strides;
-  // the host wrapper binds them at launch (slice 5 in
-  // `doc/layouts.md`). We also extend `kernel.bound_symbols` below to
-  // include the layout's free symbols so downstream passes know to
-  // materialize them.
+  // the host wrapper binds them at launch. We also extend
+  // `kernel.bound_symbols` below to include the layout's free
+  // symbols so downstream passes know to leave them unmaterialized.
   FailureOr<LayoutAttr> layout =
       buildDefaultStridedBufferLayout(sourceOp, name.getValue(), *shape);
   if (failed(layout))

@@ -5,7 +5,7 @@
 // Implements `-hc-canonicalize-layouts`: strip explicit identity layouts
 // from shaped Values and collapse `hc.as_layout` chains. See the pass
 // description in `include/hc/Transforms/Passes.td` and the design in
-// `doc/layouts.md` (slice 4).
+// `doc/layouts.md`.
 
 #include "hc/Transforms/Passes.h"
 

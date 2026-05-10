@@ -20,11 +20,11 @@
 // for_range lowering from `range(...)`, and the dsl-method calls that land
 // on dedicated hc ops (vec, astype, with_inactive, store).
 
-// CHECK-LABEL: hc.kernel @basic
-// Buffer args carry the default fully-strided layout from the frontend
-// boundary on (slice 3 in `doc/layouts.md`): per-axis `$STRIDE_<i>_<argname>`
-// symbols pinned in `bound_symbols` so the host wrapper can bind them
-// against the `_mlir_ciface_hc_get_stride` runtime helper at launch.
+  // CHECK-LABEL: hc.kernel @basic
+  // Buffer args carry the default fully-strided layout from the
+  // frontend boundary on: per-axis `$STRIDE_<i>_<argname>` symbols
+  // pinned in `bound_symbols` so the host wrapper can bind them
+  // against the `_mlir_ciface_hc_get_stride` runtime helper at launch.
 // CHECK-SAME: (%arg0: !hc.group<work_shape = #hc.shape<["M"]>, group_shape = #hc.shape<["32"]>, subgroup_size = #hc.expr<"32">>, %arg1: !hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0">>>, %arg2: !hc.buffer<!hc.undef, ["M"], <shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0">>>)
 // CHECK-SAME: attributes {
 // CHECK-SAME: bound_symbols = ["$WG0", "$WI0", "$SG0", "$WGS0", "$WO0", "$WS0", "$GSZ0", "$WV0", "M", "$STRIDE_0_a", "$STRIDE_0_b"]

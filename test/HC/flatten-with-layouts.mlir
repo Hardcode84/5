@@ -13,9 +13,9 @@
 //     func / scf / call signature populators it shares with the
 //     canonicalize pass.
 //
-// Per `doc/layouts.md` the post-flatten invariant is *no `#hc.layout`
-// survives on any shaped type*; the implicit-check below pins that
-// for the entire test file.
+// Post-flatten invariant from `doc/layouts.md`: *no `#hc.layout`
+// survives on any shaped type*. The implicit-check below pins that
+// for the entire file.
 //
 // RUN: hc-opt -split-input-file -hc-flatten-with-layouts %s \
 // RUN:   | FileCheck %s --implicit-check-not='#hc.layout' --implicit-check-not='hc.as_layout'
@@ -23,9 +23,9 @@
 // CHECK-LABEL: @strided_buffer_arg
 // CHECK-SAME: %arg0: !hc.buffer<f16, ["M", "K"]>
 // Default fully-strided np/torch layout the frontend pins on every
-// buffer argument (slice 3 in `doc/layouts.md`). The canonicalize pass
-// keeps it because non-empty layouts on buffers are out of its scope;
-// flatten unconditionally strips it.
+// buffer argument. The canonicalize pass keeps it because non-empty
+// layouts on buffers are out of its scope; flatten unconditionally
+// strips it.
 func.func @strided_buffer_arg(
     %a: !hc.buffer<f16, ["M", "K"],
                    #hc.layout<shape_syms = ["d0", "d1"],

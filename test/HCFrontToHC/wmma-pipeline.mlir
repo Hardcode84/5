@@ -13,12 +13,12 @@
 
 // CHECK: module {
 // CHECK-NEXT: hc.kernel @tiled_gfx11_wmma_matmul
-// Buffer args carry the default fully-strided layout (slice 3 in
-// `doc/layouts.md`). Per-axis `$STRIDE_<i>_<argname>` symbols join
-// `bound_symbols` next to the shape symbols their owning arg
-// introduced — `M` / `K` are seen first via `a`, then `a`'s strides;
-// `N` next via `b`, then `b`'s strides; `c` only contributes new
-// strides because `M` / `N` are already bound.
+// Buffer args carry the default fully-strided layout the frontend
+// pins on every buffer parameter. Per-axis `$STRIDE_<i>_<argname>`
+// symbols join `bound_symbols` next to the shape symbols their
+// owning arg introduced — `M` / `K` are seen first via `a`, then
+// `a`'s strides; `N` next via `b`, then `b`'s strides; `c` only
+// contributes new strides because `M` / `N` are already bound.
 // CHECK-SAME: (%[[GROUP:arg[0-9]+]]: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %[[A:arg[0-9]+]]: !hc.buffer<f16, ["M", "K"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>>, %[[B:arg[0-9]+]]: !hc.buffer<f16, ["K", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_b*i0 + $STRIDE_1_b*i1">>>, %[[C:arg[0-9]+]]: !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>)
 // CHECK-SAME: bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "$SG0", "$SG1", "$WGS0", "$WGS1", "$WO0", "$WO1", "$WS0", "$WS1", "$GSZ0", "$WV0", "M", "K", "$STRIDE_0_a", "$STRIDE_1_a", "N", "$STRIDE_0_b", "$STRIDE_1_b", "$STRIDE_0_c", "$STRIDE_1_c"]
 // CHECK-SAME: group_shape = #hc.shape<["32", "1"]>

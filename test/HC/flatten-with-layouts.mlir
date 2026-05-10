@@ -260,3 +260,152 @@ func.func @generic_keeps_per_axis_offsets(
   }
   return %r : !hc.bare_tensor<f32, ["M", "N"]>
 }
+
+// -----
+
+// Layouted load: `hc.load` with a 2D index list and a row-major
+// `#hc.layout` collapses to a single `hc.materialize_bound_expr` of
+// the substituted offset, then a one-index `hc.load`. ixsimpl
+// canonicalizes `i0 * d1 + i1` with `d0->M, d1->N, i0->i, i1->j` to
+// `j + N*i`.
+// CHECK-LABEL: @load_with_layout_composes
+// CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
+// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: hc.load %[[B]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<f32, ["M*N"]>
+func.func @load_with_layout_composes(
+    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">,
+    %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
+  %shape = hc.tuple(%m, %n)
+      : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
+  %t = hc.load %buf[%i, %j], shape %shape
+      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+         !hc.idx<"i">, !hc.idx<"j">,
+         tuple<!hc.idx<"M">, !hc.idx<"N">>)
+        -> !hc.bare_tensor<f32, ["M", "N"]>
+  return
+}
+
+// -----
+
+// Layout-less identity row-major composition: a 2D `hc.vload` on a
+// layout-less `!hc.bare_tensor` falls back to the
+// `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` formula. ixsimpl
+// canonicalizes the resulting `0 + i*N + j` to `j + N*i`.
+// CHECK-LABEL: @vload_identity_row_major
+// CHECK-SAME: %[[T:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
+// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: hc.vload %[[T]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.bare_tensor<f32, ["M*N"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_vector<f32, ["M*N"]>
+func.func @vload_identity_row_major(
+    %t: !hc.bare_tensor<f32, ["M", "N"]>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">,
+    %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
+  %shape = hc.tuple(%m, %n)
+      : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
+  %v = hc.vload %t[%i, %j], shape %shape
+      : (!hc.bare_tensor<f32, ["M", "N"]>, !hc.idx<"i">, !hc.idx<"j">,
+         tuple<!hc.idx<"M">, !hc.idx<"N">>)
+        -> !hc.bare_vector<f32, ["M", "N"]>
+  return
+}
+
+// -----
+
+// Slice operands bind to the slice's lower bound. Here axis 1 is a
+// `[0:8:1]` slice — the substitution sets `i1->0` and the composed
+// offset reduces to `N*row`.
+// CHECK-LABEL: @load_with_slice_lower_bound
+// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"N*row">
+// CHECK: hc.load %{{[^[]+}}[%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"N*row">, tuple<!hc.idx<"N">>) -> !hc.bare_tensor<f32, ["8"]>
+func.func @load_with_slice_lower_bound(
+    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %row: !hc.idx<"row">,
+    %n: !hc.idx<"N">,
+    %step: !hc.idx<"1">) {
+  %col_lo = hc.const<0 : i64> : !hc.idx<"0">
+  %col_hi = hc.const<8 : i64> : !hc.idx<"8">
+  %s = hc.slice_expr(lower = %col_lo upper = %col_hi step = %step)
+      : (!hc.idx<"0">, !hc.idx<"8">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>
+  %shape = hc.tuple(%n) : (!hc.idx<"N">) -> tuple<!hc.idx<"N">>
+  %t = hc.load %buf[%row, %s], shape %shape
+      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+         !hc.idx<"row">,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>,
+         tuple<!hc.idx<"N">>)
+        -> !hc.bare_tensor<f32, ["8"]>
+  return
+}
+
+// -----
+
+// Store with mask: dest collapses through the layout, source/mask
+// collapse via the type converter, indices compose into a single base
+// offset. The mask passes through to the `mask` operand on the
+// rewritten op.
+// CHECK-LABEL: @store_with_mask_composes
+// CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_tensor<f32, ["16"]>
+// CHECK-SAME: %[[MASK:[^:]+]]: !hc.bare_tensor<!hc.pred, ["16"]>
+// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: hc.store %[[B]][%[[OFF]]], %[[SRC]], mask %[[MASK]]
+func.func @store_with_mask_composes(
+    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">,
+    %src: !hc.bare_tensor<f32, ["4", "4"]>,
+    %mask: !hc.bare_tensor<!hc.pred, ["4", "4"]>) {
+  hc.store %buf[%i, %j], %src, mask %mask
+      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+         !hc.idx<"i">, !hc.idx<"j">,
+         !hc.bare_tensor<f32, ["4", "4"]>,
+         !hc.bare_tensor<!hc.pred, ["4", "4"]>) -> ()
+  return
+}
+
+// -----
+
+// `hc.load_mask` rides the same composition path as the data load —
+// same multi-index addressing surface, same per-access offset
+// rewrite. Verified separately because it gets emitted next to
+// `hc.load` post-decompose and would diverge silently if missed.
+// CHECK-LABEL: @load_mask_composes
+// CHECK: %[[OFF:.*]] = hc.materialize_bound_expr : !hc.idx<"j + N*i">
+// CHECK: hc.load_mask %{{[^[]+}}[%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<!hc.pred, ["M*N"]>
+func.func @load_mask_composes(
+    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">,
+    %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
+  %shape = hc.tuple(%m, %n)
+      : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
+  %mask = hc.load_mask %buf[%i, %j], shape %shape
+      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+         !hc.idx<"i">, !hc.idx<"j">,
+         tuple<!hc.idx<"M">, !hc.idx<"N">>)
+        -> !hc.bare_tensor<!hc.pred, ["M", "N"]>
+  return
+}
+
+// -----
+
+// Indices that aren't pinned (raw `index` value here) leave the access
+// op alone — the rewrite needs a symbolic name to bind to the layout's
+// `index_sym`. The op stays on the multi-index surface and the
+// generic retype patches the operand type so the IR remains
+// well-formed at the type level.
+// CHECK-LABEL: @load_unbound_index_falls_through
+// CHECK-SAME: %[[B:[^:]+]]: !hc.buffer<f32, ["?"]>
+// CHECK-NOT: hc.materialize_bound_expr
+// CHECK: hc.load %[[B]][%{{[^,]+}}, %{{[^]]+}}], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, index, index, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<f32, ["M*N"]>
+func.func @load_unbound_index_falls_through(
+    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %i: index, %j: index,
+    %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
+  %shape = hc.tuple(%m, %n)
+      : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
+  %t = hc.load %buf[%i, %j], shape %shape
+      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+         index, index,
+         tuple<!hc.idx<"M">, !hc.idx<"N">>)
+        -> !hc.bare_tensor<f32, ["M", "N"]>
+  return
+}

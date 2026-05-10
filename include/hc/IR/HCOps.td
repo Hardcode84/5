@@ -1009,15 +1009,21 @@ def HCPtrOffsetOp : HC_Op<"ptr_offset", [
 def HCPtrLoadOp : HC_Op<"ptr_load", [
     MemoryEffects<[MemRead]>
   ]> {
-  let summary = "Load a single element from `$source`.";
+  let summary = "Load a scalar or contiguous-vector value from `$source`.";
   let description = [{
-    Scalar load from the address pointed to by `$source`. When the
-    pointer carries an explicit `$elementType`, the result type must
-    match; opaque pointers accept any scalar result type and propagate
-    the choice down to the load codegen.
+    Load from the address pointed to by `$source`. The result type is
+    either a scalar element type (single-element load) or
+    `vector<NxT>` (contiguous N-element load starting at `$source`).
+    When the pointer carries an explicit `$elementType`, the result's
+    element type — `T` for vector results, the result type itself for
+    scalars — must match; opaque pointers accept any element type and
+    propagate the choice down to the load codegen.
+
+    Vector width is unconstrained at this op; the `hc-lower-to-llvm`
+    boundary splits oversized vectors into hardware-sized chunks.
   }];
   let arguments = (ins HC_PtrValueType:$source);
-  let results = (outs HC_ValueType:$result);
+  let results = (outs HC_PtrAccessValueType:$result);
   let assemblyFormat = [{
     $source attr-dict `:` qualified(type($source)) `->` type($result)
   }];
@@ -1027,13 +1033,20 @@ def HCPtrLoadOp : HC_Op<"ptr_load", [
 def HCPtrStoreOp : HC_Op<"ptr_store", [
     MemoryEffects<[MemWrite]>
   ]> {
-  let summary = "Store `$value` at the address pointed to by `$dest`.";
+  let summary = "Store a scalar or contiguous-vector value at `$dest`.";
   let description = [{
-    Scalar store. When `$dest` carries an explicit `$elementType`,
-    `$value`'s type must match; opaque pointers accept any scalar
-    value and the LLVM lowering reads the element type off the store.
+    Store from `$value` into the address pointed to by `$dest`. The
+    value type is either a scalar element type (single-element store)
+    or `vector<NxT>` (contiguous N-element store starting at `$dest`).
+    When `$dest` carries an explicit `$elementType`, the value's
+    element type — `T` for vector values, the value type itself for
+    scalars — must match; opaque pointers accept any element type and
+    the LLVM lowering reads the element type off the store.
+
+    Vector width is unconstrained at this op; the `hc-lower-to-llvm`
+    boundary splits oversized vectors into hardware-sized chunks.
   }];
-  let arguments = (ins HC_ValueType:$value, HC_PtrValueType:$dest);
+  let arguments = (ins HC_PtrAccessValueType:$value, HC_PtrValueType:$dest);
   let assemblyFormat = [{
     $value `,` $dest attr-dict `:`
     type($value) `,` qualified(type($dest))

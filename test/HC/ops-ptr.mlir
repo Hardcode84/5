@@ -100,6 +100,32 @@ func.func @ptr_load_store_opaque(%p: !hc.ptr<global>) {
   return
 }
 
+// Vector form: `hc.ptr_load` / `hc.ptr_store` accept `vector<NxT>` to
+// denote a contiguous N-element access starting at the pointer. The
+// pointer's element type matches `T`, never the whole vector type.
+// Width is unconstrained at the op; the LLVM-lowering boundary owns
+// the hardware-width split. This is the surface the vec slice of
+// `hc-lower-generic` emits at merged contig groups.
+// CHECK-LABEL: func.func @ptr_load_store_typed_vector
+// CHECK: %[[V:.*]] = hc.ptr_load %{{.*}} : !hc.ptr<workgroup, f16> -> vector<8xf16>
+// CHECK: hc.ptr_store %[[V]], %{{.*}} : vector<8xf16>, !hc.ptr<workgroup, f16>
+func.func @ptr_load_store_typed_vector(%p: !hc.ptr<workgroup, f16>) {
+  %v = hc.ptr_load %p : !hc.ptr<workgroup, f16> -> vector<8xf16>
+  hc.ptr_store %v, %p : vector<8xf16>, !hc.ptr<workgroup, f16>
+  return
+}
+
+// Opaque pointer + vector value: parity check is skipped on the pointer
+// side, the vector width and element type are carried on the op.
+// CHECK-LABEL: func.func @ptr_load_store_opaque_vector
+// CHECK: %[[V:.*]] = hc.ptr_load %{{.*}} : !hc.ptr<global> -> vector<4xf32>
+// CHECK: hc.ptr_store %[[V]], %{{.*}} : vector<4xf32>, !hc.ptr<global>
+func.func @ptr_load_store_opaque_vector(%p: !hc.ptr<global>) {
+  %v = hc.ptr_load %p : !hc.ptr<global> -> vector<4xf32>
+  hc.ptr_store %v, %p : vector<4xf32>, !hc.ptr<global>
+  return
+}
+
 // Pointer values flow through `scf.for` iter_args because `!hc.ptr` is
 // a legal `HC_ValueType`; this is how the post-flatten lowering will
 // hand a sliding workgroup pointer through a cooperative-copy loop.

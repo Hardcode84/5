@@ -1485,6 +1485,10 @@ LogicalResult HCEmptyOp::verify() { return verifyTensorAllocScope(*this); }
 //
 // All three share the rule that the pointer's `addrspace` and (when
 // present) `elementType` must agree with the matching operand/result.
+// `hc.ptr_load` / `hc.ptr_store` accept scalar or `vector<NxT>` value
+// types — for vectors the parity check runs against the vector's
+// element type, the width is informational and stays unconstrained
+// here (the LLVM-lowering boundary owns hardware-width splitting).
 // Pre-inference IR with `!hc.undef` on either side escapes the parity
 // check, mirroring how the rest of the dialect tolerates the
 // progressive-typing placeholder.
@@ -1502,18 +1506,30 @@ static PtrType ptrTypeOrUndef(Type type) {
 }
 
 // Element-type compatibility for ptr_load / ptr_store: typed pointers
-// require an exact match, opaque pointers (no element type on the
-// pointer) accept anything. `!hc.undef` on either side escapes — the
-// caller has already filtered out the `!hc.ptr` shell.
-static LogicalResult checkScalarMatchesPointer(Operation *op, Type scalar,
-                                               PtrType ptr, StringRef role) {
-  if (!ptr || isHCUndefType(scalar))
+// require an exact match against the value's element type, opaque
+// pointers (no element type on the pointer) accept anything. The value
+// may be a scalar (its own type is the element type) or an upstream
+// `vector<NxT>` (the vector's element type is the element type — the
+// vector denotes a contiguous N-element access starting at the
+// pointer). `!hc.undef` on either side escapes — the caller has
+// already filtered out the `!hc.ptr` shell.
+static LogicalResult checkLoadStoreValueMatchesPointer(Operation *op,
+                                                       Type valueType,
+                                                       PtrType ptr,
+                                                       StringRef role) {
+  if (!ptr || isHCUndefType(valueType))
     return success();
-  Type elem = ptr.getElementType();
-  if (!elem || elem == scalar)
+  Type ptrElem = ptr.getElementType();
+  if (!ptrElem)
+    return success();
+  Type elementType = valueType;
+  if (auto vec = llvm::dyn_cast<mlir::VectorType>(valueType))
+    elementType = vec.getElementType();
+  if (elementType == ptrElem)
     return success();
   return op->emitOpError(role)
-         << " type " << scalar << " must match pointer element type " << elem;
+         << " element type " << elementType
+         << " must match pointer element type " << ptrElem;
 }
 
 } // namespace
@@ -1543,14 +1559,14 @@ LogicalResult HCPtrOffsetOp::verify() {
 
 LogicalResult HCPtrLoadOp::verify() {
   PtrType source = ptrTypeOrUndef(getSource().getType());
-  return checkScalarMatchesPointer(getOperation(), getResult().getType(),
-                                   source, "result");
+  return checkLoadStoreValueMatchesPointer(
+      getOperation(), getResult().getType(), source, "result");
 }
 
 LogicalResult HCPtrStoreOp::verify() {
   PtrType dest = ptrTypeOrUndef(getDest().getType());
-  return checkScalarMatchesPointer(getOperation(), getValue().getType(), dest,
-                                   "value");
+  return checkLoadStoreValueMatchesPointer(getOperation(), getValue().getType(),
+                                           dest, "value");
 }
 
 //===----------------------------------------------------------------------===//

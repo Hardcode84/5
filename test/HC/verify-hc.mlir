@@ -1006,7 +1006,7 @@ module {
 // -----
 
 // `hc.ptr_load` on a typed pointer enforces result-element parity.
-// CHECK: error: 'hc.ptr_load' op result type 'f32' must match pointer element type 'f16'
+// CHECK: error: 'hc.ptr_load' op result element type 'f32' must match pointer element type 'f16'
 module {
   hc.func @bad(%p: !hc.ptr<workgroup, f16>) {
     %v = hc.ptr_load %p : !hc.ptr<workgroup, f16> -> f32
@@ -1017,10 +1017,34 @@ module {
 // -----
 
 // `hc.ptr_store` symmetrically enforces value-element parity.
-// CHECK: error: 'hc.ptr_store' op value type 'f32' must match pointer element type 'f16'
+// CHECK: error: 'hc.ptr_store' op value element type 'f32' must match pointer element type 'f16'
 module {
   hc.func @bad(%p: !hc.ptr<workgroup, f16>, %v: f32) {
     hc.ptr_store %v, %p : f32, !hc.ptr<workgroup, f16>
+    hc.return
+  }
+}
+
+// -----
+
+// Vector load on a typed pointer: the vector's element type must match
+// the pointer's element type. Width is unconstrained.
+// CHECK: error: 'hc.ptr_load' op result element type 'f32' must match pointer element type 'f16'
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>) {
+    %v = hc.ptr_load %p : !hc.ptr<workgroup, f16> -> vector<4xf32>
+    hc.return
+  }
+}
+
+// -----
+
+// Vector store symmetrically: the vector's element type, not the
+// vector type itself, is checked against the pointer's element type.
+// CHECK: error: 'hc.ptr_store' op value element type 'f32' must match pointer element type 'f16'
+module {
+  hc.func @bad(%p: !hc.ptr<workgroup, f16>, %v: vector<4xf32>) {
+    hc.ptr_store %v, %p : vector<4xf32>, !hc.ptr<workgroup, f16>
     hc.return
   }
 }

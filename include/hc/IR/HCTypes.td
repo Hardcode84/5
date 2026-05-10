@@ -358,6 +358,23 @@ def HC_ScalarValueType : AnyTypeOf<[
   Index,
 ]>;
 
+// Value-side type for `hc.ptr_load` / `hc.ptr_store`: scalars (single-
+// element access) or upstream `vector<NxT>` (contiguous N-element access
+// starting at the pointer). Vector width is unconstrained at the op; the
+// LLVM lowering at the dialect boundary splits oversized vectors into
+// hardware-sized chunks. Kept distinct from `HC_ScalarValueType` because
+// only the pointer access ops grow this surface — the rest of `hc` keeps
+// its end-to-end scalar/HC-shaped invariant.
+def HC_PtrAccessValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_IdxType,
+  HC_PredType,
+  AnyInteger,
+  AnyFloat,
+  Index,
+  FixedVectorOfAnyRank<[AnyInteger, AnyFloat, Index]>,
+]>;
+
 // Shaped values for ops that only make sense on tensors/vectors
 // (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
 // `!hc.undef` is admitted for the same pre-inference reason as above.

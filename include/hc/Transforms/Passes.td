@@ -125,6 +125,51 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
   ];
 }
 
+def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
+  let summary = "Rewrite hc.matmul / hc.reduce into hc.generic + identity fill.";
+  let description = [{
+    Folds the source-level `hc.matmul` and `hc.reduce` ops into a
+    single body-driven `hc.generic` form. After this pass the
+    post-flatten compute surface is one op (`hc.generic`); the source
+    shapes (`hc.matmul`, `hc.reduce`, plus the per-element
+    decomposition that lands later) are syntactic shorthands the
+    frontend keeps for ergonomics.
+
+    Each rewrite emits its iter bounds as `hc.materialize_bound_expr`
+    on `!hc.idx<dim>` sourced directly from operand shapes — the
+    rewriter has full structural knowledge of the iteration space and
+    the bounds-inference pass would be a no-op if it ran after.
+
+    `hc.matmul lhs, rhs : (T<M,K>, T<K,N>) -> T<M,N>` → an `hc.zeros`
+    fill on the result type plus an `hc.generic` with two parallel
+    iters (M, N) and one reduction iter (K). Inputs are addressed
+    `[i,k]` and `[k,j]`, the output `[i,j]`. Body extends the inputs
+    to the result element type via `hc.astype` when they differ, then
+    runs `arith.mulf` + `arith.addf` (or `arith.muli` + `arith.addi`
+    for integers). v0 only handles rank-2 operands and identical
+    input element types; mixed-type and batched matmul are
+    follow-ups.
+
+    `hc.reduce val, kind = K, axis = a : T<...> -> T<...>` →
+    an identity fill (`hc.zeros` for sum, `hc.full` with -inf / +inf
+    for max / min on float operands) on the result shape, plus an
+    `hc.generic` with one reduction iter on `axis a` and parallel
+    iters on every other axis. Body picks the combinator: `arith.addf`
+    / `arith.maximumf` / `arith.minimumf` for floats; integer support
+    is sum-only in v0 (max / min identity for unsigned vs signed
+    needs a separate slot decision). `keepdims = true` is not yet
+    handled — the reshape it implies is a separate piece of work.
+
+    Operands typed `!hc.undef` (pre-inference) and any case the v0
+    matcher doesn't cover are left in place — downstream passes
+    diagnose if they were the last remaining consumer.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
   let description = [{

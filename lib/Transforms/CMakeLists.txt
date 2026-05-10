@@ -18,6 +18,7 @@ add_mlir_library(MLIRHCTransforms
   HCMaterializeBoundExprsPass.cpp
   HCNormalizeScopeRegionsPass.cpp
   HCPromoteNamesPass.cpp
+  HCShapedComputeToGenericPass.cpp
   HCVerifyStaticShapesPass.cpp
 
   ADDITIONAL_HEADER_DIRS

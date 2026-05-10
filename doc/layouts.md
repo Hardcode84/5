@@ -322,10 +322,13 @@ This op is the single home for compute after flatten:
 * the existing per-element decomposition of `hc.add`, `hc.mul`, ... on
   bare values lowers into a single `hc.generic` with all-parallel
   iters;
-* `hc.reduce` lowers into `hc.generic` with one reduction iter and the
-  appropriate identity-fill on the output;
-* `hc.matmul` lowers into `hc.generic` with one reduction iter (the K
-  axis), shape inferred from operand offsets;
+* `hc.reduce` rewrites into `hc.generic` with one reduction iter and
+  the appropriate identity fill on the output (`hc-shaped-compute-
+  to-generic`);
+* `hc.matmul` rewrites into `hc.generic` with two parallel iters and
+  one reduction iter on the K axis, plus an identity fill (`hc-
+  shaped-compute-to-generic`); shape comes from the operand types
+  directly, not from inference;
 * the cooperative copy helper becomes `hc.generic` with two different
   offset expressions on input and output, all parallel iters;
 * `as_layout` reorderings — when they survive flatten — also become
@@ -382,6 +385,7 @@ hc-front-to-hc                    capture layout= and as_layout(...)
 hc-infer-types                    propagate #hc.layout through the lattice
 hc-decompose-shaped-values        layout flows on data and mask halves
 hc-canonicalize-layouts           identity → absent, ixsimpl normalize, fold double as_layout
+hc-shaped-compute-to-generic      rewrite hc.matmul / hc.reduce into hc.generic + identity fill
 hc-infer-generic-bounds           fill !hc.undef iter_bounds on hc.generic from operand shapes
 hc-flatten-with-layouts           nD+layout → 1D no-layout, offsets at access sites
 hc-lower-launch-body              operate on 1D bare values; emit hc.alloc / hc.ptr_*
@@ -469,19 +473,28 @@ on later slices.
     shapes and per-axis offsets to fill any `!hc.undef`-typed
     `iter_bounds` on `hc.generic`. Conflicts diagnose; no-op when every
     bound is already concrete.
-11. **scalar `hc-lower-generic`** — lower `hc.generic` to a scalar
-    `scf.for` nest only. No vectorization yet. Existing per-element
-    decomposition of `hc.add` / `hc.mul` / ... on bare values, plus
-    post-flatten rewrites of `hc.reduce` and `hc.matmul`, all collapse
-    onto this op.
-12. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
+11. **`hc-shaped-compute-to-generic`** — rewrite `hc.matmul` and
+    `hc.reduce` into `hc.generic` + an identity fill on the result.
+    Runs pre-flatten on semantic shaped types so the per-axis offsets
+    line up with the operand shapes directly; flatten then composes
+    them through the layout the same way it composes any other
+    `hc.generic`. v0 supports rank-2 matmul (uniform arith family,
+    `hc.astype`-promoted body), reduce sum on float / integer, and
+    reduce max / min on float; integer max / min, `keepdims = true`,
+    and rank-0 result are deferred follow-ups.
+12. **scalar `hc-lower-generic`** — lower `hc.generic` to a scalar
+    `scf.for` nest only. No vectorization yet. The per-element
+    decomposition of `hc.add` / `hc.mul` / ... on bare values
+    collapses onto this op alongside everything `hc-shaped-compute-
+    to-generic` already produced.
+13. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
     wholesale replacement of the cooperative-load/store machinery;
     memref drops out. WMMA still on its existing intrinsic path.
-13. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
+14. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
     runs end-to-end on the new stack.
-14. **symbolic stride vectorization** — same `hc-lower-generic`,
+15. **symbolic stride vectorization** — same `hc-lower-generic`,
     smarter codegen. The actual win.
 
 Slices 1–5 are pure additive (no observable behavior change beyond the
-strided buffer ABI, which preserves contiguous numerics). Slices 6–13
-are the risky middle. Slice 14 is what the design exists for.
+strided buffer ABI, which preserves contiguous numerics). Slices 6–14
+are the risky middle. Slice 15 is what the design exists for.

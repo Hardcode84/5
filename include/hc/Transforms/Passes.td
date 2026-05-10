@@ -319,15 +319,29 @@ def HCLowerGeneric : Pass<"hc-lower-generic"> {
   let summary = "Lower hc.generic to scf.parallel / scf.for + hc.ptr_offset / "
                 "hc.ptr_load / hc.ptr_store.";
   let description = [{
-    Scalar baseline (`U = 1`) of the unroll-and-merge codegen frame
-    documented in `doc/layouts.md`. Walks every `hc.generic` and
-    rewrites it as an outer `scf.parallel` over the parallel iters
-    plus an inner `scf.for` nest over the reduction iters with
-    `iter_args` carrying the per-output accumulators. Pure-parallel
-    ops collapse to a single `scf.parallel`; pure-reduction ops
-    collapse to a single `scf.for`.
+    Unroll-and-merge codegen frame for `hc.generic`, documented in
+    `doc/layouts.md`. Walks every `hc.generic` and rewrites it as an
+    outer `scf.parallel` over the parallel iters plus an inner
+    `scf.for` nest over the reduction iters with `iter_args` carrying
+    the per-output accumulators. Pure-parallel ops collapse to a
+    single `scf.parallel`; pure-reduction ops collapse to a single
+    `scf.for`.
 
-    Per-iteration body emission:
+    The pass picks an `(axis-order, partition)` pair via a
+    divisibility-pruned merge-score search: every per-axis factor
+    `p_a` must provably divide its bound (probed via
+    `ixs_check(cmp(ixs_mod(N_a, p_a), EQ, 0))`), and each surviving
+    candidate is scored by the per-operand pairwise contig probe
+    (`ixs_check(cmp(off[k+1] - off[k], EQ, 1))`). The body stays
+    elementwise scalar at every total unroll: scalar contig groups
+    lower to scalar `hc.ptr_load` / `hc.ptr_store`, contig groups of
+    size > 1 lower to vector-typed `hc.ptr_load` / `hc.ptr_store` of
+    width `G` plumbed through `vector.extract` /
+    `vector.from_elements` at the body boundary. The trivial
+    `(1, ..., 1)` partition collapses verbatim to the scalar
+    baseline emission.
+
+    Per-iteration body emission (per partition lane):
 
       * For each `ins` operand: evaluate its single composed offset
         expression to a `Value` of `index` type, emit
@@ -344,21 +358,12 @@ def HCLowerGeneric : Pass<"hc-lower-generic"> {
         (outs). The cloned `hc.yield` provides the per-iteration
         update for each output's accumulator.
 
-    Symbolic offsets lower through a structural ixsimpl walker:
-    `IXS_INT` / `IXS_RAT` (denominator 1) → `arith.constant`,
-    `IXS_SYM` → loop-scope lookup (iter sym → induction var, or
-    outer-scope sym → matching `!hc.idx<bare-sym>` SSA value),
-    `IXS_ADD` / `IXS_MUL` → `arith.addi` / `arith.muli`,
-    `IXS_MOD` → `arith.remsi`. Other tags (`IXS_FLOOR`, `IXS_CEIL`,
-    `IXS_PIECEWISE`, `IXS_MAX`, `IXS_MIN`) are not lowered in v0;
-    expressions containing them keep the `hc.generic` op around for
-    follow-up slices to handle.
-
-    `U = 1` scope — the unroll-and-merge partition search lives in
-    the vec slice (`hc-lower-generic` at `U > 1`), this commit pins
-    `p = (1, ..., 1)`. No partition enumeration, no merge probing,
-    no vector-typed loads/stores — every `hc.ptr_load` /
-    `hc.ptr_store` this pass emits is scalar.
+    Per-operand offsets surface as `hc.idx_apply` carrying the
+    composed `ExprAttr` (with the per-lane delta substituted into
+    each iter sym) and binding the listed iter syms to the loop
+    induction vars. The launch-body lowering downstream walks the
+    expression and substitutes the listed operands plus any ambient
+    kernel-bound symbols (shape dims, stride params).
 
     Pre-flight bail (the op stays in place; downstream passes still
     diagnose if the op is the only remaining consumer):
@@ -385,7 +390,8 @@ def HCLowerGeneric : Pass<"hc-lower-generic"> {
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
     "::mlir::hc::HCDialect",
-    "::mlir::scf::SCFDialect"
+    "::mlir::scf::SCFDialect",
+    "::mlir::vector::VectorDialect"
   ];
 }
 

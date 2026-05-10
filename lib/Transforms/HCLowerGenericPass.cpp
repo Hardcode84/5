@@ -2,17 +2,33 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-generic`: scalar (U = 1) baseline of the
-// unroll-and-merge codegen frame for `hc.generic`. Lowers each op to
-// `scf.parallel` over the parallel iters with an optional nested
-// `scf.for` over the reduction iters whose `iter_args` carry the per-
-// output accumulators. Per-operand offset expressions surface as
-// `hc.idx_apply` carrying the original `ExprAttr` and binding the
-// op's iter syms to the loop induction vars; the launch-body
-// lowering downstream walks the expression and substitutes the
-// listed operands plus any ambient kernel-bound symbols (shape dims,
-// stride params). Pointer access lowers to `hc.ptr_offset` +
-// `hc.ptr_load` (ins, outs init) / `hc.ptr_store` (outs final).
+// Implements `-hc-lower-generic`: unroll-and-merge codegen for
+// `hc.generic`. The pass picks an axis order and a partition `p` of
+// an unroll budget across the iters, constrained by ixsimpl-provable
+// divisibility on each axis bound (no tail loop). For every surviving
+// candidate it symbolically generates per-lane offsets and probes
+// pairwise contiguity to find maximal contig groups; the
+// `(order, partition)` with the highest merge score wins. The body
+// stays elementwise scalar at every total unroll: scalar contig
+// groups lower to scalar `hc.ptr_load` / `hc.ptr_store`, contig
+// groups of size > 1 lower to vector-typed `hc.ptr_load` /
+// `hc.ptr_store` of width `G` plumbed through `vector.extract` /
+// `vector.from_elements` at the body boundary. The fallback at the
+// `(1, ..., 1)` partition matches the scalar baseline emission verb-
+// for-verb.
+//
+// Loop nest shape: outer `scf.parallel` over the parallel iters with
+// per-axis step `p_a`; inner `scf.for` nest over the reduction iters
+// with `iter_args` carrying one accumulator per (parallel-lane,
+// output) pair. Pure-parallel collapses to a single `scf.parallel`,
+// pure-reduction to a bare `scf.for` nest.
+//
+// Per-operand offset expressions surface as `hc.idx_apply` carrying
+// the original `ExprAttr` and binding the op's iter syms to the
+// loop induction vars (offset by the lane-local delta where the
+// partition unrolls); the launch-body lowering downstream walks the
+// expression and substitutes the listed operands plus any ambient
+// kernel-bound symbols (shape dims, stride params).
 
 #include "hc/Transforms/Passes.h"
 
@@ -24,12 +40,18 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+
+#include <algorithm>
+#include <array>
+#include <numeric>
 
 namespace mlir::hc {
 #define GEN_PASS_DEF_HCLOWERGENERIC
@@ -40,6 +62,383 @@ using namespace mlir;
 using namespace mlir::hc;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Tunables: total unroll budget (`prod(p_i)`) and the axis-order
+// permutation cap. Beyond `kAxisOrderCap` the pass uses declaration
+// order without permuting (the factorial growth dominates beyond
+// rank 4 and per-axis unrolls already cover the common cases).
+// `kFactorChoices` enumerates the per-axis factor candidates; powers
+// of two only — the merge probe doesn't gain from non-power-of-two
+// strides, and the divisibility filter rules out factors that don't
+// fit anyway.
+constexpr int kUnrollBudget = 32;
+constexpr int kAxisOrderCap = 4;
+static constexpr std::array<int, 6> kFactorChoices = {1, 2, 4, 8, 16, 32};
+
+// Per-axis info collected from the op. `boundExpr` is set when the
+// bound's SSA type is `!hc.idx<expr>`; otherwise the bound is opaque
+// (`index`) and the divisibility probe must conservatively reject any
+// factor > 1 on this axis.
+struct IterAxis {
+  size_t origIdx;
+  StringRef name;
+  IterKind kind;
+  Value bound;
+  std::optional<sym::ExprHandle> boundExpr;
+};
+
+using Partition = SmallVector<int, 4>;
+using AxisOrder = SmallVector<size_t, 4>;
+
+// Resolve a probably-comparison node to TRUE/FALSE/UNKNOWN. `ixs_cmp`
+// constant-folds to the `IXS_TRUE` / `IXS_FALSE` sentinel when both
+// sides reduce to constants — `ixs_check` only inspects bona-fide
+// `IXS_CMP` nodes and returns UNKNOWN on a sentinel, so the wrapper
+// peeks at the node tag first and falls back to interval propagation
+// otherwise. NULL is treated as UNKNOWN (e.g. construction OOM).
+static ixs_check_result resolveProbe(ixs_session *session, ixs_node *cmp) {
+  if (!cmp)
+    return IXS_CHECK_UNKNOWN;
+  switch (ixs_node_tag(cmp)) {
+  case IXS_TRUE:
+    return IXS_CHECK_TRUE;
+  case IXS_FALSE:
+    return IXS_CHECK_FALSE;
+  default:
+    return ixs_check(session, cmp, nullptr, 0);
+  }
+}
+
+// Probe: is `factor` provably a divisor of the axis bound? `factor == 1`
+// is trivially true. Without a `boundExpr` (plain `index` bound) the
+// probe is conservative and returns false — partitions with `p_a > 1`
+// then get filtered out, and the search picks a smaller partition.
+static bool probeDivisible(sym::Store &store,
+                           const std::optional<sym::ExprHandle> &boundExpr,
+                           int factor) {
+  if (factor <= 1)
+    return true;
+  if (!boundExpr)
+    return false;
+  sym::Session session(store);
+  ixs_node *bound = const_cast<ixs_node *>(boundExpr->raw());
+  ixs_node *factorNode = ixs_int(session.raw(), factor);
+  if (!factorNode)
+    return false;
+  ixs_node *modNode = ixs_mod(session.raw(), bound, factorNode);
+  if (!modNode)
+    return false;
+  ixs_node *zero = ixs_int(session.raw(), 0);
+  if (!zero)
+    return false;
+  ixs_node *cmp = ixs_cmp(session.raw(), modNode, IXS_CMP_EQ, zero);
+  return resolveProbe(session.raw(), cmp) == IXS_CHECK_TRUE;
+}
+
+// Probe: does `b - a == 1` hold symbolically? Used pairwise to find
+// maximal contig groups in a per-operand offset list. UNKNOWN is
+// treated as FALSE — the merge analyzer is conservative; an
+// uncertain group stays scalar.
+static bool probeContig(sym::Store &store, sym::ExprHandle a,
+                        sym::ExprHandle b) {
+  sym::Session session(store);
+  ixs_node *diff = ixs_sub(session.raw(), const_cast<ixs_node *>(b.raw()),
+                           const_cast<ixs_node *>(a.raw()));
+  if (!diff)
+    return false;
+  ixs_node *one = ixs_int(session.raw(), 1);
+  if (!one)
+    return false;
+  ixs_node *cmp = ixs_cmp(session.raw(), diff, IXS_CMP_EQ, one);
+  return resolveProbe(session.raw(), cmp) == IXS_CHECK_TRUE;
+}
+
+// Build the substitution `s_a -> s_a + delta_a` over the iter syms in
+// `names`, applied to `expr`. Used by the merge analyzer to compute
+// per-lane offsets symbolically. `delta_a == 0` entries are skipped
+// (no-op substitution). Returns `expr` unchanged on OOM / failure.
+static sym::ExprHandle substituteIterDeltas(sym::Store &store,
+                                            sym::ExprHandle expr,
+                                            ArrayRef<StringRef> names,
+                                            ArrayRef<int> delta) {
+  if (names.size() != delta.size())
+    return expr;
+  sym::Session session(store);
+  SmallVector<ixs_node *, 4> targets;
+  SmallVector<ixs_node *, 4> repls;
+  for (auto [n, d] : llvm::zip(names, delta)) {
+    if (d == 0)
+      continue;
+    SmallString<32> buf(n);
+    buf.push_back('\0');
+    ixs_node *symNode = ixs_sym(session.raw(), buf.data());
+    if (!symNode)
+      return expr;
+    ixs_node *deltaNode = ixs_int(session.raw(), d);
+    if (!deltaNode)
+      return expr;
+    ixs_node *shifted = ixs_add(session.raw(), symNode, deltaNode);
+    if (!shifted)
+      return expr;
+    targets.push_back(symNode);
+    repls.push_back(shifted);
+  }
+  if (targets.empty())
+    return expr;
+  ixs_node *out = ixs_subs_multi(
+      session.raw(), const_cast<ixs_node *>(expr.raw()),
+      static_cast<uint32_t>(targets.size()), targets.data(), repls.data());
+  if (!out)
+    return expr;
+  return sym::ExprHandle(out);
+}
+
+// Decompose lane index `k` (in `[0, prod(p))`) into per-axis deltas
+// using axis order `order`: `order[0]` is the most-major axis (varies
+// slowest), `order.back()` is the most-minor (varies fastest). Output
+// is in declaration order (indexed by `axes`) so callers can read
+// `delta[a]` directly without translating through `order`.
+static SmallVector<int, 4> decomposeLane(int k, ArrayRef<size_t> order,
+                                         ArrayRef<int> p) {
+  SmallVector<int, 4> delta(p.size(), 0);
+  for (int i = static_cast<int>(order.size()) - 1; i >= 0; --i) {
+    size_t a = order[i];
+    int pa = p[a];
+    delta[a] = k % pa;
+    k /= pa;
+  }
+  return delta;
+}
+
+// Maximal contig group in an offset list. Each `(start, size)` covers
+// lanes `[start, start + size)` whose pairwise offset diffs all
+// resolve to TRUE under the contig probe. Group sizes always include
+// at least one lane; size > 1 is the merge-eligible case.
+struct ContigGroup {
+  int start;
+  int size;
+};
+
+static SmallVector<ContigGroup>
+findContigGroups(sym::Store &store, ArrayRef<sym::ExprHandle> offsets) {
+  SmallVector<ContigGroup> groups;
+  if (offsets.empty())
+    return groups;
+  int n = static_cast<int>(offsets.size());
+  int gStart = 0;
+  for (int k = 1; k < n; ++k) {
+    if (!probeContig(store, offsets[k - 1], offsets[k])) {
+      groups.push_back({gStart, k - gStart});
+      gStart = k;
+    }
+  }
+  groups.push_back({gStart, n - gStart});
+  return groups;
+}
+
+// Enumerate axis orders. For `n <= kAxisOrderCap` the search yields
+// every permutation of `[0, n)`; for larger ranks only the
+// declaration-order identity is considered.
+static SmallVector<AxisOrder> enumerateAxisOrders(int n) {
+  AxisOrder ident(n);
+  std::iota(ident.begin(), ident.end(), size_t{0});
+  if (n > kAxisOrderCap)
+    return {ident};
+  SmallVector<AxisOrder> out;
+  AxisOrder cur = ident;
+  do {
+    out.push_back(cur);
+  } while (std::next_permutation(cur.begin(), cur.end()));
+  return out;
+}
+
+// Enumerate partitions of `kUnrollBudget` over `n` axes. Each per-axis
+// factor comes from `kFactorChoices`; the running product is bounded
+// by `budget`. Output includes the trivial `(1, ..., 1)` partition.
+static SmallVector<Partition> enumeratePartitions(int n, int budget) {
+  SmallVector<Partition> out;
+  if (n <= 0) {
+    out.push_back(Partition{});
+    return out;
+  }
+  Partition cur(n, 1);
+  std::function<void(int, int)> rec = [&](int axis, int rem) {
+    if (axis == n) {
+      out.push_back(cur);
+      return;
+    }
+    for (int f : kFactorChoices) {
+      if (f > rem)
+        break;
+      cur[axis] = f;
+      rec(axis + 1, rem / f);
+    }
+  };
+  rec(0, budget);
+  return out;
+}
+
+// Collect the per-axis info from the op. The bound's SSA type is
+// inspected for an `!hc.idx<expr>` payload — that's where the
+// divisibility probe gets a symbolic axis size from. Plain `index`
+// bounds yield an absent `boundExpr`.
+static SmallVector<IterAxis> collectIterAxes(HCGenericOp op) {
+  SmallVector<IterAxis> axes;
+  ArrayAttr symsAttr = op.getIterSymsAttr();
+  ArrayAttr kindsAttr = op.getIterKindsAttr();
+  ValueRange bounds = op.getIterBounds();
+  axes.reserve(symsAttr.size());
+  for (size_t i = 0; i < symsAttr.size(); ++i) {
+    IterAxis ax;
+    ax.origIdx = i;
+    ax.name = cast<StringAttr>(symsAttr[i]).getValue();
+    ax.kind = cast<IterKindAttr>(kindsAttr[i]).getValue();
+    ax.bound = bounds[i];
+    if (auto idxTy = dyn_cast<IdxType>(ax.bound.getType()))
+      if (ExprAttr e = idxTy.getExpr())
+        ax.boundExpr = e.getValue();
+    axes.push_back(ax);
+  }
+  return axes;
+}
+
+// Total partition product: how many body clones a candidate produces
+// per innermost loop iteration.
+static int prodOf(ArrayRef<int> p) {
+  int prod = 1;
+  for (int v : p)
+    prod *= v;
+  return prod;
+}
+
+// Subset prod over axes whose iter kind matches `kind`.
+static int prodOfKind(ArrayRef<IterAxis> axes, ArrayRef<int> p, IterKind kind) {
+  int prod = 1;
+  for (auto [ax, pa] : llvm::zip(axes, p))
+    if (ax.kind == kind)
+      prod *= pa;
+  return prod;
+}
+
+// Assemble per-lane offsets for one operand, given a global axis order
+// `order` and partition `p`. `mask` selects which axes to vary —
+// inputs use every axis (full `prod(p)` lanes), outputs use only
+// parallel axes (`prodPar` lanes; the verifier already guarantees the
+// outs offset is independent of reduction syms). Lanes are decomposed
+// in `order`'s rightmost-fastest convention against the surviving
+// (masked) axes only.
+static SmallVector<sym::ExprHandle>
+laneOffsets(sym::Store &store, ExprAttr origOffset, ArrayRef<IterAxis> axes,
+            ArrayRef<size_t> order, ArrayRef<int> p, ArrayRef<bool> includeAxis,
+            int laneCount) {
+  SmallVector<sym::ExprHandle> result;
+  result.reserve(laneCount);
+  SmallVector<size_t, 4> filteredOrder;
+  for (size_t a : order)
+    if (includeAxis[a])
+      filteredOrder.push_back(a);
+  SmallVector<int, 4> filteredP;
+  filteredP.reserve(filteredOrder.size());
+  for (size_t a : filteredOrder)
+    filteredP.push_back(p[a]);
+  SmallVector<StringRef, 4> names;
+  names.reserve(axes.size());
+  for (const IterAxis &ax : axes)
+    names.push_back(ax.name);
+  for (int lane = 0; lane < laneCount; ++lane) {
+    SmallVector<int, 4> deltaFiltered =
+        decomposeLane(lane, filteredOrder, filteredP);
+    SmallVector<int, 4> delta(axes.size(), 0);
+    for (auto [a, d] : llvm::zip(filteredOrder, deltaFiltered))
+      delta[a] = d;
+    result.push_back(
+        substituteIterDeltas(store, origOffset.getValue(), names, delta));
+  }
+  return result;
+}
+
+// Score a candidate `(order, partition)` by its merge potential:
+// per-operand contig-group analysis, sum of `(group_size - 1)` over
+// every group in every operand. A bigger total means more loads/
+// stores collapsed at the boundary. The trivial partition scores 0.
+// Pure-zero scores from non-trivial partitions still beat the
+// trivial one only when no smaller partition merges either; ties
+// resolve via the lex-order tiebreaker in the caller.
+static int scoreCandidate(HCGenericOp op, ArrayRef<IterAxis> axes,
+                          ArrayRef<size_t> order, ArrayRef<int> p,
+                          sym::Store &store) {
+  int prod = prodOf(p);
+  int prodPar = prodOfKind(axes, p, IterKind::Parallel);
+  SmallVector<bool, 4> insMask(axes.size(), true);
+  SmallVector<bool, 4> outsMask(axes.size(), false);
+  for (size_t i = 0; i < axes.size(); ++i)
+    if (axes[i].kind == IterKind::Parallel)
+      outsMask[i] = true;
+
+  int score = 0;
+  ArrayAttr insOff = op.getInsOffsetsAttr();
+  for (auto [i, in] : llvm::enumerate(op.getIns())) {
+    auto perOp = cast<ArrayAttr>(insOff[i]);
+    if (perOp.size() != 1)
+      return 0;
+    auto off = cast<ExprAttr>(perOp[0]);
+    auto offsets = laneOffsets(store, off, axes, order, p, insMask, prod);
+    for (const ContigGroup &g : findContigGroups(store, offsets))
+      score += g.size - 1;
+    (void)in;
+  }
+  ArrayAttr outsOff = op.getOutsOffsetsAttr();
+  for (auto [i, out] : llvm::enumerate(op.getOuts())) {
+    auto perOp = cast<ArrayAttr>(outsOff[i]);
+    if (perOp.size() != 1)
+      return 0;
+    auto off = cast<ExprAttr>(perOp[0]);
+    auto offsets = laneOffsets(store, off, axes, order, p, outsMask, prodPar);
+    // Outs init load + final store both ride this contig analysis;
+    // each merge eliminates two boundary ops, so the score weights
+    // accordingly.
+    for (const ContigGroup &g : findContigGroups(store, offsets))
+      score += 2 * (g.size - 1);
+    (void)out;
+  }
+  return score;
+}
+
+// Pick `(order, partition)` with the highest merge score. Filters out
+// candidates that violate the divisibility constraint on any axis
+// (per-axis factor must provably divide its bound). Ties resolve
+// lexicographically on `order` and then on `p`. Falls back to the
+// trivial partition `(1, ..., 1)` when no non-trivial candidate
+// survives — that case matches the scalar baseline emission.
+static std::pair<AxisOrder, Partition>
+selectBest(HCGenericOp op, ArrayRef<IterAxis> axes, sym::Store &store) {
+  int n = static_cast<int>(axes.size());
+  AxisOrder bestOrder(n);
+  std::iota(bestOrder.begin(), bestOrder.end(), size_t{0});
+  Partition bestP(n, 1);
+  int bestScore = -1;
+  for (const AxisOrder &order : enumerateAxisOrders(n)) {
+    for (const Partition &p : enumeratePartitions(n, kUnrollBudget)) {
+      bool ok = true;
+      for (size_t a = 0; a < axes.size(); ++a) {
+        if (!probeDivisible(store, axes[a].boundExpr, p[a])) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok)
+        continue;
+      int score = scoreCandidate(op, axes, order, p, store);
+      if (score > bestScore) {
+        bestScore = score;
+        bestOrder = order;
+        bestP = p;
+      }
+    }
+  }
+  return {bestOrder, bestP};
+}
 
 // Materialize a Value usable from index-consuming ops. Builtin
 // `index` values pass through; `!hc.idx<...>` SSA crosses via
@@ -165,104 +564,292 @@ static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
   return success();
 }
 
-// Single-operand load helper: emit the offset (as `hc.idx_apply` +
-// cast to index), then `hc.ptr_offset` + `hc.ptr_load`. Used at both
-// the outer (parallel-iter scope, for outs init) and inner (full-
-// iter scope, for ins per reduction iteration) levels.
-static Value emitPtrLoad(OpBuilder &builder, Location loc, Value ptr,
-                         ExprAttr expr, const llvm::StringMap<Value> &scope) {
-  Value off = emitOffset(builder, loc, expr, scope);
-  Value addr =
-      HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off).getResult();
-  Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
-  return HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
+// Materialize one lane's offset as `index`-typed SSA via
+// `hc.idx_apply`. The substituted expression carries the per-axis
+// `delta` baked in (each iter sym `s_a` shifted to `s_a + delta_a`),
+// so the apply binds the same loop induction vars as the trivial
+// case while spelling the lane-local offset; for `delta == 0` across
+// every axis the substitution is a no-op and emission collapses to
+// the scalar baseline verbatim.
+static Value emitLaneOffset(OpBuilder &builder, Location loc,
+                            ExprAttr origOffset,
+                            const llvm::StringMap<Value> &scope,
+                            sym::Store &store, ArrayRef<IterAxis> axes,
+                            ArrayRef<size_t> order, ArrayRef<int> p,
+                            ArrayRef<bool> includeAxis, int lane) {
+  SmallVector<size_t, 4> filteredOrder;
+  for (size_t a : order)
+    if (includeAxis[a])
+      filteredOrder.push_back(a);
+  SmallVector<int, 4> filteredP;
+  filteredP.reserve(filteredOrder.size());
+  for (size_t a : filteredOrder)
+    filteredP.push_back(p[a]);
+  SmallVector<int, 4> deltaFiltered =
+      decomposeLane(lane, filteredOrder, filteredP);
+  SmallVector<int, 4> delta(axes.size(), 0);
+  for (auto [a, d] : llvm::zip(filteredOrder, deltaFiltered))
+    delta[a] = d;
+  SmallVector<StringRef, 4> names;
+  names.reserve(axes.size());
+  for (const IterAxis &ax : axes)
+    names.push_back(ax.name);
+  sym::ExprHandle laneExpr =
+      substituteIterDeltas(store, origOffset.getValue(), names, delta);
+  ExprAttr laneAttr = ExprAttr::get(builder.getContext(), laneExpr);
+  return emitOffset(builder, loc, laneAttr, scope);
 }
 
-// Load every input operand using the supplied scope. The scope
-// must have bindings for every iter sym referenced in the ins
-// offsets; callers extend the parallel-iter scope with reduction-
-// iter induction vars before invoking this from the reduction
-// nest's innermost level. Symbols beyond the iter-sym set (e.g.
-// kernel shape dims) stay ambient through `idx_apply`'s unlisted
-// symbols.
-static SmallVector<Value> emitInsLoads(OpBuilder &builder, HCGenericOp op,
-                                       const llvm::StringMap<Value> &scope) {
-  Location loc = op.getLoc();
-  ArrayAttr insOff = op.getInsOffsetsAttr();
-  SmallVector<Value> out;
-  for (auto [i, inOperand] : llvm::enumerate(op.getIns()))
-    out.push_back(emitPtrLoad(builder, loc, inOperand,
-                              getOperandOffset(insOff, i), scope));
-  return out;
+// Fold a per-axis delta tuple back into a flat lane index restricted
+// to `subOrder` (a subsequence of `order`, in same direction). Used
+// to map a full lane (covering all axes) to its parallel-axis
+// projection — the slot in the iter_args carry where its accumulator
+// lives.
+static int computeSubLane(ArrayRef<int> delta, ArrayRef<size_t> subOrder,
+                          ArrayRef<int> p) {
+  int sub = 0;
+  int stride = 1;
+  for (int i = static_cast<int>(subOrder.size()) - 1; i >= 0; --i) {
+    size_t a = subOrder[i];
+    sub += delta[a] * stride;
+    stride *= p[a];
+  }
+  return sub;
 }
 
-// Load every output's initial accumulator at the parallel-iter
-// scope (the outs offset references parallel iters only by op
-// invariant, so the reduction iters need not be in scope here).
-static SmallVector<Value>
-emitOutsInitLoads(OpBuilder &builder, HCGenericOp op,
-                  const llvm::StringMap<Value> &scope) {
-  Location loc = op.getLoc();
-  ArrayAttr outsOff = op.getOutsOffsetsAttr();
-  SmallVector<Value> out;
-  for (auto [i, outOperand] : llvm::enumerate(op.getOuts()))
-    out.push_back(emitPtrLoad(builder, loc, outOperand,
-                              getOperandOffset(outsOff, i), scope));
-  return out;
-}
-
-// Emit `hc.ptr_store` for each output at the loop-scope offset
-// using the supplied accumulator values. Recomputes the address
-// (rather than reusing the load's address) so the final write
-// doesn't depend on hoisting the address through the inner
-// reduction loop — keeps the IR straightforward and CSE handles
-// the duplication later.
-static void emitOutsStores(OpBuilder &builder, HCGenericOp op,
-                           ValueRange finals,
-                           const llvm::StringMap<Value> &scope) {
-  Location loc = op.getLoc();
-  ArrayAttr outsOff = op.getOutsOffsetsAttr();
-  for (auto [i, outOperand] : llvm::enumerate(op.getOuts())) {
-    Value off = emitOffset(builder, loc, getOperandOffset(outsOff, i), scope);
-    Value addr = HCPtrOffsetOp::create(builder, loc, outOperand.getType(),
-                                       outOperand, off)
-                     .getResult();
-    HCPtrStoreOp::create(builder, loc, finals[i], addr);
+// Emit a contig group's load (scalar for `size == 1`, vector
+// `<G x T>` otherwise) and write the per-lane scalars into `out` at
+// indices `[start, start + size)`. Vector loads route through
+// `vector.extract` to recover lane-scoped scalars feeding the body.
+static void emitGroupLoad(OpBuilder &builder, Location loc, Value ptr,
+                          Type elemTy, Value baseAddr, const ContigGroup &g,
+                          MutableArrayRef<Value> out) {
+  if (g.size == 1) {
+    Value v = HCPtrLoadOp::create(builder, loc, elemTy, baseAddr).getResult();
+    out[g.start] = v;
+    return;
+  }
+  auto vecTy = mlir::VectorType::get({g.size}, elemTy);
+  Value vec = HCPtrLoadOp::create(builder, loc, vecTy, baseAddr).getResult();
+  for (int k = 0; k < g.size; ++k) {
+    Value lane =
+        vector::ExtractOp::create(builder, loc, vec, ArrayRef<int64_t>{k})
+            .getResult();
+    out[g.start + k] = lane;
   }
 }
 
-// Inner reduction nest. Builds a chain of `scf.for` ops one per
-// reduction iter, threading the outs accumulators through
-// `iter_args` at every level. The innermost loop body clones the
-// `hc.generic` body once with the current iter induction vars.
-// Returns the outermost reduction loop's results (the final
-// accumulator values).
+// Emit a contig group's store (scalar for `size == 1`, vector
+// `<G x T>` otherwise). Vector stores pack the per-lane scalars into
+// a vector via `vector.from_elements` at the boundary.
+static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
+                           Value baseAddr, const ContigGroup &g,
+                           ArrayRef<Value> laneVals) {
+  if (g.size == 1) {
+    HCPtrStoreOp::create(builder, loc, laneVals[g.start], baseAddr);
+    return;
+  }
+  SmallVector<Value> elems;
+  elems.reserve(g.size);
+  for (int k = 0; k < g.size; ++k)
+    elems.push_back(laneVals[g.start + k]);
+  auto vecTy = mlir::VectorType::get({g.size}, elemTy);
+  Value vec =
+      vector::FromElementsOp::create(builder, loc, vecTy, elems).getResult();
+  HCPtrStoreOp::create(builder, loc, vec, baseAddr);
+}
+
+// Emit per-lane loads for every input of `op`, returning a flat
+// `[in_idx][lane]` 2D buffer of SSA values. Per-input contig groups
+// drive load shape: scalar groups emit single `hc.ptr_load`, groups
+// of size > 1 emit vector loads + extracts. Lanes are decomposed
+// against every iter axis (mask = all-true).
+static SmallVector<SmallVector<Value>>
+emitInsLoadsLaned(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
+                  ArrayRef<size_t> order, ArrayRef<int> p,
+                  const llvm::StringMap<Value> &scope, sym::Store &store) {
+  Location loc = op.getLoc();
+  int prodAll = prodOf(p);
+  size_t numIns = op.getIns().size();
+  SmallVector<SmallVector<Value>> result(numIns);
+  ArrayAttr insOff = op.getInsOffsetsAttr();
+  SmallVector<bool, 4> allMask(axes.size(), true);
+  for (size_t ii = 0; ii < numIns; ++ii) {
+    ExprAttr origOff = getOperandOffset(insOff, ii);
+    SmallVector<sym::ExprHandle> offs =
+        laneOffsets(store, origOff, axes, order, p, allMask, prodAll);
+    auto groups = findContigGroups(store, offs);
+    Value ptr = op.getIns()[ii];
+    Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+    result[ii].resize(prodAll);
+    for (const ContigGroup &g : groups) {
+      Value off = emitLaneOffset(builder, loc, origOff, scope, store, axes,
+                                 order, p, allMask, g.start);
+      Value addr = HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                       .getResult();
+      emitGroupLoad(builder, loc, ptr, elemTy, addr, g, result[ii]);
+    }
+  }
+  return result;
+}
+
+// Emit per-output outs init loads at parallel-iter scope. Lanes
+// decompose only over the parallel axis subset (mask = parallel
+// axes), giving `prodPar` slots per output. Returned flat layout is
+// `[par_lane * numOuts + out_idx]` so it slots directly into
+// `scf.for`'s `iter_args`.
+static SmallVector<Value> emitOutsInitLoadsPartitioned(
+    OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
+    ArrayRef<size_t> order, ArrayRef<int> p,
+    const llvm::StringMap<Value> &scope, sym::Store &store) {
+  Location loc = op.getLoc();
+  int prodPar = prodOfKind(axes, p, IterKind::Parallel);
+  size_t numOuts = op.getOuts().size();
+  ArrayAttr outsOff = op.getOutsOffsetsAttr();
+  SmallVector<bool, 4> parMask(axes.size(), false);
+  for (size_t a = 0; a < axes.size(); ++a)
+    if (axes[a].kind == IterKind::Parallel)
+      parMask[a] = true;
+  SmallVector<SmallVector<Value>> perOut(numOuts);
+  for (size_t oi = 0; oi < numOuts; ++oi) {
+    ExprAttr origOff = getOperandOffset(outsOff, oi);
+    SmallVector<sym::ExprHandle> offs =
+        laneOffsets(store, origOff, axes, order, p, parMask, prodPar);
+    auto groups = findContigGroups(store, offs);
+    Value ptr = op.getOuts()[oi];
+    Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+    perOut[oi].resize(prodPar);
+    for (const ContigGroup &g : groups) {
+      Value off = emitLaneOffset(builder, loc, origOff, scope, store, axes,
+                                 order, p, parMask, g.start);
+      Value addr = HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                       .getResult();
+      emitGroupLoad(builder, loc, ptr, elemTy, addr, g, perOut[oi]);
+    }
+  }
+  SmallVector<Value> flat;
+  flat.reserve(prodPar * numOuts);
+  for (int pl = 0; pl < prodPar; ++pl)
+    for (size_t oi = 0; oi < numOuts; ++oi)
+      flat.push_back(perOut[oi][pl]);
+  return flat;
+}
+
+// Emit per-output outs stores at parallel-iter scope. Mirrors the
+// init-load path: contig groups of size > 1 pack per-lane scalars
+// via `vector.from_elements`, scalar groups emit one `hc.ptr_store`.
+static void emitOutsStoresPartitioned(OpBuilder &builder, HCGenericOp op,
+                                      ArrayRef<IterAxis> axes,
+                                      ArrayRef<size_t> order, ArrayRef<int> p,
+                                      ValueRange flatFinals,
+                                      const llvm::StringMap<Value> &scope,
+                                      sym::Store &store) {
+  Location loc = op.getLoc();
+  int prodPar = prodOfKind(axes, p, IterKind::Parallel);
+  size_t numOuts = op.getOuts().size();
+  ArrayAttr outsOff = op.getOutsOffsetsAttr();
+  SmallVector<bool, 4> parMask(axes.size(), false);
+  for (size_t a = 0; a < axes.size(); ++a)
+    if (axes[a].kind == IterKind::Parallel)
+      parMask[a] = true;
+  for (size_t oi = 0; oi < numOuts; ++oi) {
+    ExprAttr origOff = getOperandOffset(outsOff, oi);
+    SmallVector<sym::ExprHandle> offs =
+        laneOffsets(store, origOff, axes, order, p, parMask, prodPar);
+    auto groups = findContigGroups(store, offs);
+    Value ptr = op.getOuts()[oi];
+    Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+    SmallVector<Value> laneVals(prodPar);
+    for (int pl = 0; pl < prodPar; ++pl)
+      laneVals[pl] = flatFinals[pl * numOuts + oi];
+    for (const ContigGroup &g : groups) {
+      Value off = emitLaneOffset(builder, loc, origOff, scope, store, axes,
+                                 order, p, parMask, g.start);
+      Value addr = HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                       .getResult();
+      emitGroupStore(builder, loc, elemTy, addr, g, laneVals);
+    }
+  }
+}
+
+// Innermost body emission: loads ins for every lane, clones the body
+// `prod(p)` times in axis-order lex (rightmost varies fastest), and
+// threads the `prodPar * numOuts` accumulator through. Within one
+// invocation the body sees scalar ins (its lane's loaded value) and
+// scalar outs (the running accumulator at this body's parallel-lane
+// slot); the post-body `acc[parLane] = yielded` assignment makes the
+// reduction-axis unrolls compose into the same accumulator slot in
+// declaration order.
 static FailureOr<SmallVector<Value>>
-emitReductionNest(OpBuilder &builder, HCGenericOp op, ArrayRef<size_t> redIdx,
-                  ValueRange initAccs, llvm::StringMap<Value> scope) {
+emitInnerBodyClones(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
+                    ArrayRef<size_t> order, ArrayRef<int> p,
+                    ValueRange iterArgs, const llvm::StringMap<Value> &scope,
+                    sym::Store &store) {
+  int prodAll = prodOf(p);
+  int prodPar = prodOfKind(axes, p, IterKind::Parallel);
+  size_t numOuts = op.getOuts().size();
+  size_t numIns = op.getIns().size();
+
+  SmallVector<size_t, 4> parOrder;
+  for (size_t a : order)
+    if (axes[a].kind == IterKind::Parallel)
+      parOrder.push_back(a);
+
+  SmallVector<SmallVector<Value>> acc(prodPar, SmallVector<Value>(numOuts));
+  for (int pl = 0; pl < prodPar; ++pl)
+    for (size_t oi = 0; oi < numOuts; ++oi)
+      acc[pl][oi] = iterArgs[pl * numOuts + oi];
+
+  SmallVector<SmallVector<Value>> insLanes =
+      emitInsLoadsLaned(builder, op, axes, order, p, scope, store);
+
+  for (int lane = 0; lane < prodAll; ++lane) {
+    SmallVector<int, 4> delta = decomposeLane(lane, order, p);
+    int parLane = computeSubLane(delta, parOrder, p);
+    SmallVector<Value> insVals(numIns);
+    for (size_t ii = 0; ii < numIns; ++ii)
+      insVals[ii] = insLanes[ii][lane];
+    SmallVector<Value> outsVals = acc[parLane];
+    SmallVector<Value> yielded;
+    if (failed(cloneBody(builder, op, insVals, outsVals, yielded)))
+      return failure();
+    if (yielded.size() != numOuts)
+      return op.emitOpError("body yielded wrong arity");
+    acc[parLane] = std::move(yielded);
+  }
+
+  SmallVector<Value> flat;
+  flat.reserve(prodPar * numOuts);
+  for (int pl = 0; pl < prodPar; ++pl)
+    for (size_t oi = 0; oi < numOuts; ++oi)
+      flat.push_back(acc[pl][oi]);
+  return flat;
+}
+
+// Reduction nest with per-axis step `p[a]`. Each `scf.for` carries
+// the same `prodPar * numOuts` flat accumulator through `iter_args`;
+// the innermost level invokes `emitInnerBodyClones` to expand the
+// `prod(p)` body invocations and yields the updated accumulator.
+static FailureOr<SmallVector<Value>> emitReductionNestPartitioned(
+    OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
+    ArrayRef<size_t> order, ArrayRef<int> p, ArrayRef<size_t> redOrder,
+    ValueRange initAccs, llvm::StringMap<Value> scope, sym::Store &store) {
   Location loc = op.getLoc();
   Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-  Value c1 = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
-  ArrayAttr symsAttr = op.getIterSymsAttr();
   ValueRange bounds = op.getIterBounds();
-
   std::function<FailureOr<SmallVector<Value>>(size_t, ValueRange,
                                               llvm::StringMap<Value> &)>
       build = [&](size_t depth, ValueRange iterArgs,
                   llvm::StringMap<Value> &localScope)
       -> FailureOr<SmallVector<Value>> {
-    if (depth == redIdx.size()) {
-      SmallVector<Value> insVals = emitInsLoads(builder, op, localScope);
-      SmallVector<Value> outsArgs(iterArgs.begin(), iterArgs.end());
-      SmallVector<Value> yielded;
-      if (failed(cloneBody(builder, op, insVals, outsArgs, yielded)))
-        return failure();
-      return yielded;
-    }
-    size_t iter = redIdx[depth];
-    StringRef name = cast<StringAttr>(symsAttr[iter]).getValue();
-    Value bound = castIdxToIndex(builder, loc, bounds[iter]);
-    auto forOp = scf::ForOp::create(builder, loc, c0, bound, c1, iterArgs);
+    if (depth == redOrder.size())
+      return emitInnerBodyClones(builder, op, axes, order, p, iterArgs,
+                                 localScope, store);
+    size_t a = redOrder[depth];
+    StringRef name = axes[a].name;
+    Value bound = castIdxToIndex(builder, loc, bounds[a]);
+    Value step = arith::ConstantIndexOp::create(builder, loc, p[a]).getResult();
+    auto forOp = scf::ForOp::create(builder, loc, c0, bound, step, iterArgs);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(forOp.getBody());
     auto prev = localScope.lookup(name);
@@ -278,79 +865,99 @@ emitReductionNest(OpBuilder &builder, HCGenericOp op, ArrayRef<size_t> redIdx,
     return SmallVector<Value>(forOp.getResults().begin(),
                               forOp.getResults().end());
   };
-
   return build(0, initAccs, scope);
 }
 
-// Top-level: emit the parallel iters as an outer `scf.parallel`,
-// load the initial accumulators inside, run the reduction nest,
-// store the finals. Pure-parallel collapses to a single
-// `scf.parallel` with no inner reduction; pure-reduction collapses
-// to a bare reduction nest with no outer parallel. Iter-sym to
-// induction-var bindings live in `scope` and feed every offset's
-// `hc.idx_apply`.
-static LogicalResult lowerOne(HCGenericOp op) {
+// Top-level emit: outer `scf.parallel` over the parallel iters with
+// per-axis step `p[a]`, an inner reduction nest at `p[a]` step per
+// reduction axis, body cloned `prod(p)` times per innermost
+// iteration. The iter_args carry one accumulator per (parallel-lane,
+// output) pair; `emitOutsInitLoadsPartitioned` and
+// `emitOutsStoresPartitioned` handle the boundary loads / stores at
+// parallel-iter scope, with contig merging where the analyzer found
+// merge-eligible groups.
+static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
+                                        ArrayRef<size_t> order,
+                                        ArrayRef<int> p) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
-
-  ArrayAttr symsAttr = op.getIterSymsAttr();
-  ArrayAttr kindsAttr = op.getIterKindsAttr();
-  ValueRange bounds = op.getIterBounds();
+  MLIRContext *ctx = op.getContext();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
 
   SmallVector<size_t> parIdx, redIdx;
-  for (auto [i, kindAttr] :
-       llvm::enumerate(kindsAttr.getAsRange<IterKindAttr>())) {
-    if (kindAttr.getValue() == IterKind::Parallel)
-      parIdx.push_back(i);
-    else
-      redIdx.push_back(i);
-  }
+  for (size_t i = 0; i < axes.size(); ++i)
+    (axes[i].kind == IterKind::Parallel ? parIdx : redIdx).push_back(i);
 
-  auto buildPerParallel =
-      [&](OpBuilder &b, llvm::StringMap<Value> &localScope) -> LogicalResult {
-    SmallVector<Value> initOuts = emitOutsInitLoads(b, op, localScope);
+  SmallVector<size_t, 4> redOrder;
+  for (size_t a : order)
+    if (axes[a].kind == IterKind::Reduction)
+      redOrder.push_back(a);
+
+  ValueRange bounds = op.getIterBounds();
+
+  auto buildPerParallel = [&](OpBuilder &b,
+                              llvm::StringMap<Value> &scope) -> LogicalResult {
+    SmallVector<Value> initOuts =
+        emitOutsInitLoadsPartitioned(b, op, axes, order, p, scope, store);
     SmallVector<Value> finals;
-    if (redIdx.empty()) {
-      SmallVector<Value> insVals = emitInsLoads(b, op, localScope);
-      if (failed(cloneBody(b, op, insVals, initOuts, finals)))
+    if (redOrder.empty()) {
+      auto yielded =
+          emitInnerBodyClones(b, op, axes, order, p, initOuts, scope, store);
+      if (failed(yielded))
         return failure();
+      finals = std::move(*yielded);
     } else {
-      auto reduced = emitReductionNest(b, op, redIdx, initOuts, localScope);
+      auto reduced = emitReductionNestPartitioned(
+          b, op, axes, order, p, redOrder, initOuts, scope, store);
       if (failed(reduced))
         return failure();
       finals = std::move(*reduced);
     }
-    emitOutsStores(b, op, finals, localScope);
+    emitOutsStoresPartitioned(b, op, axes, order, p, finals, scope, store);
     return success();
   };
 
   if (parIdx.empty()) {
     llvm::StringMap<Value> scope;
-    if (failed(buildPerParallel(builder, scope)))
-      return failure();
-  } else {
-    Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-    Value c1 = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
-    SmallVector<Value> lowers(parIdx.size(), c0);
-    SmallVector<Value> uppers;
-    SmallVector<Value> steps(parIdx.size(), c1);
-    for (size_t pi : parIdx)
-      uppers.push_back(castIdxToIndex(builder, loc, bounds[pi]));
-
-    LogicalResult bodyStatus = success();
-    scf::ParallelOp::create(builder, loc, lowers, uppers, steps,
-                            [&](OpBuilder &b, Location, ValueRange ivs) {
-                              llvm::StringMap<Value> scope;
-                              for (auto [k, pi] : llvm::enumerate(parIdx)) {
-                                StringRef name =
-                                    cast<StringAttr>(symsAttr[pi]).getValue();
-                                scope[name] = ivs[k];
-                              }
-                              bodyStatus = buildPerParallel(b, scope);
-                            });
-    if (failed(bodyStatus))
-      return failure();
+    return buildPerParallel(builder, scope);
   }
+
+  Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  SmallVector<Value> lowers(parIdx.size(), c0);
+  SmallVector<Value> uppers;
+  SmallVector<Value> steps;
+  uppers.reserve(parIdx.size());
+  steps.reserve(parIdx.size());
+  for (size_t pi : parIdx) {
+    uppers.push_back(castIdxToIndex(builder, loc, bounds[pi]));
+    steps.push_back(
+        arith::ConstantIndexOp::create(builder, loc, p[pi]).getResult());
+  }
+
+  LogicalResult bodyStatus = success();
+  scf::ParallelOp::create(builder, loc, lowers, uppers, steps,
+                          [&](OpBuilder &b, Location, ValueRange ivs) {
+                            llvm::StringMap<Value> scope;
+                            for (auto [k, pi] : llvm::enumerate(parIdx))
+                              scope[axes[pi].name] = ivs[k];
+                            bodyStatus = buildPerParallel(b, scope);
+                          });
+  return bodyStatus;
+}
+
+// Top-level: pick `(order, partition)` via the divisibility-pruned
+// merge-score search, then dispatch to the partition-aware emitter.
+// The trivial `(1, ..., 1)` partition collapses through the same
+// path verb-for-verb to the scalar baseline (single scalar load /
+// store per operand, body cloned once per innermost iteration).
+static LogicalResult lowerOne(HCGenericOp op) {
+  MLIRContext *ctx = op.getContext();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  SmallVector<IterAxis> axes = collectIterAxes(op);
+  auto [order, p] = selectBest(op, axes, store);
+
+  if (failed(lowerWithPartition(op, axes, order, p)))
+    return failure();
 
   // v0 candidates are all-ptr-outs (zero SSA results), so erasing
   // is sufficient — no `replaceAllUsesWith` needed. The candidate

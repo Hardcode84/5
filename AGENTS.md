@@ -125,6 +125,13 @@ Code comments, docstrings, and commit messages share the same voice: terse, dry,
 - Use `return signalPassFailure();` to abort a failed pass.
 - Prefer named accessors to `getResult(0)` when possible.
 - In LIT tests, never use raw SSA names like `%0` or `%1` in `CHECK` lines. Capture them with placeholders such as `[[VAL:%.*]]` and reuse the placeholder.
+- For type-rewriting passes, drive the dialect-conversion infrastructure (`TypeConverter` + `applyPartialConversion`) instead of poking `Value::setType` from a walk; the conversion driver tracks materializations across boundaries that bare in-place mutation does not. Reuse upstream populators (`populateAnyFunctionOpInterfaceTypeConversionPattern`, `populateReturnOpTypeConversionPattern`, `populateCallOpTypeConversionPattern`, `scf::populateSCFStructuralTypeConversionsAndLegality`) rather than hand-rolling per-op clone-and-replace.
+
+### Symbolic expressions (ixsimpl)
+
+- Never build or compare `#hc.expr` / `#hc.pred` payloads via string formatting + `sym::parseExpr` / `sym::parsePred`. Use the structural compose API: `composeExprSym(store, name)`, `composeExprInt(store, value)`, `composeExprBinary(store, lhs, op, rhs)`, `composeExprNeg`, `composeExprCeil`, `composePredCmp`. Hash-consing in the dialect-owned store gives pointer equality on the canonical handle as the right comparison; building from text re-parses every leaf and is brittle to spelling drift.
+- `sym::parseExpr` / `sym::parsePred` are for the textual surface only — ODS parser hooks, attribute round-trip, frontend / Python ingestion. Production C++ paths inside passes build structurally.
+- Same rule applies to LIT helpers, generated code, and Python: don't `f"{a} + {b}"`-then-parse. Construct via the API and serialize at the boundary if needed.
 
 ## Testing
 

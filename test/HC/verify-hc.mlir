@@ -1215,3 +1215,72 @@ module {
     return %r : !hc.bare_tensor<f16, ["N"]>
   }
 }
+
+// -----
+
+// Result count must equal the number of *value-typed* outs. A ptr-typed
+// out lands its work in memory (Read+Write effect) and contributes no
+// SSA result, so spelling a result for a pure-store generic is wrong.
+// CHECK: error: 'hc.generic' op results count 1 != value-typed outs count 0 (ptr/buffer outs contribute no SSA result)
+module {
+  func.func @bad(%n: index,
+                 %src: !hc.bare_tensor<f32, ["N"]>,
+                 %dst: !hc.ptr<global, f32>)
+      -> !hc.bare_tensor<f32, ["N"]> {
+    %r = hc.generic
+        iter (parallel i = %n : index)
+        ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+        outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+        -> (!hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield %sv : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// On a typed ptr out, the body block-arg / yield element type is the
+// pointee, not the operand type itself. `f16` body arg vs `f32` pointee
+// is the same shape of mistake as the value-out parity error above; the
+// diagnostic just calls out the offending slot.
+// CHECK: error: 'hc.generic' op body argument #1 type 'f16' does not match outs #0 element type 'f32'
+module {
+  func.func @bad(%n: index,
+                 %src: !hc.bare_tensor<f32, ["N"]>,
+                 %dst: !hc.ptr<global, f32>) {
+    hc.generic
+        iter (parallel i = %n : index)
+        ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+        outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+        -> () {
+    ^bb0(%sv: f32, %dv: f16):
+      hc.yield %dv : f16
+    }
+    return
+  }
+}
+
+// -----
+
+// The "outputs reference parallel iters only" rule applies to ptr-typed
+// outs too — a reduction iter on a memory destination's offset would
+// store the same address several times along the reduction without a
+// combinator. Same diagnostic shape as for value-typed outs.
+// CHECK: error: 'hc.generic' op output #0 axis 1 offset references reduction iter 'k'
+module {
+  func.func @bad(%m: index, %k: index,
+                 %a: !hc.bare_tensor<f32, ["M"]>,
+                 %dst: !hc.ptr<global, f32>) {
+    hc.generic
+        iter (parallel i = %m : index, reduction k = %k : index)
+        ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
+        outs (%dst at [#hc.expr<"i">, #hc.expr<"k">] : !hc.ptr<global, f32>)
+        -> () {
+    ^bb0(%av: f32, %dv: f32):
+      hc.yield %av : f32
+    }
+    return
+  }
+}

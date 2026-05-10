@@ -172,3 +172,105 @@ func.func @progressive_undef(%n: index, %a: !hc.undef, %c: !hc.undef)
   }
   return %r : !hc.undef
 }
+
+// Pure-store form: ptr-typed out, zero SSA results. Mirrors
+// `linalg.generic` over a memref destination — the body sources the
+// carry via the implicit ptr_load on the operand and the yield routes
+// through an implicit ptr_store at the operand's offset. Op-level
+// memory effects (Read on src, Read+Write on dst) come from
+// `getEffects`; LIT only round-trips the surface.
+// CHECK-LABEL: func.func @ptr_only_store
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+// CHECK-SAME: -> ()
+// CHECK: ^bb0(%[[SV:.+]]: f32, %[[DV:.+]]: f32):
+// CHECK:   hc.yield %[[SV]] : f32
+func.func @ptr_only_store(%n: index,
+                          %src: !hc.bare_tensor<f32, ["N"]>,
+                          %dst: !hc.ptr<global, f32>) {
+  hc.generic
+      iter (parallel i = %n : index)
+      ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%sv: f32, %dv: f32):
+    hc.yield %sv : f32
+  }
+  return
+}
+
+// Mixed outs: one value-typed out (produces a result) and one ptr-typed
+// out (no result, in-place). Result count parity is against value-typed
+// outs only; the ptr slot still gets a body block-arg + a yield value
+// for the implicit store.
+// CHECK-LABEL: func.func @mixed_outs
+// CHECK: %{{.+}} = hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>,
+// CHECK-SAME:       %{{[^ ]+}} at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+// CHECK-SAME: -> (!hc.bare_tensor<f32, ["N"]>)
+// CHECK: ^bb0(%[[AV:.+]]: f32, %[[CV:.+]]: f32, %[[TV:.+]]: f32):
+// CHECK:   %[[R:.+]] = hc.mul %[[AV]], %[[AV]] : (f32, f32) -> f32
+// CHECK:   hc.yield %[[R]], %[[R]] : f32, f32
+func.func @mixed_outs(%n: index,
+                      %a: !hc.bare_tensor<f32, ["N"]>,
+                      %c: !hc.bare_tensor<f32, ["N"]>,
+                      %trace: !hc.ptr<workgroup, f32>)
+    -> !hc.bare_tensor<f32, ["N"]> {
+  %r = hc.generic
+      iter (parallel i = %n : index)
+      ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>,
+            %trace at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+      -> (!hc.bare_tensor<f32, ["N"]>) {
+  ^bb0(%av: f32, %cv: f32, %tv: f32):
+    %sq = hc.mul %av, %av : (f32, f32) -> f32
+    hc.yield %sq, %sq : f32, f32
+  }
+  return %r : !hc.bare_tensor<f32, ["N"]>
+}
+
+// Buffer-typed out is also a memory carrier (Read+Write effect on the
+// operand, no SSA result). Element type comes off the buffer's
+// `getElementType()` for the body-arg parity check, same as a shaped
+// value-typed out — just on the memref side of the polymorphism.
+// CHECK-LABEL: func.func @buffer_out
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.buffer<f32, ["N"]>)
+// CHECK-SAME: -> ()
+func.func @buffer_out(%n: index,
+                      %src: !hc.bare_tensor<f32, ["N"]>,
+                      %dst: !hc.buffer<f32, ["N"]>) {
+  hc.generic
+      iter (parallel i = %n : index)
+      ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.buffer<f32, ["N"]>)
+      -> () {
+  ^bb0(%sv: f32, %dv: f32):
+    hc.yield %sv : f32
+  }
+  return
+}
+
+// Opaque ptr (no `$elementType`) escapes the body-arg / yield element-type
+// parity checks, same as `!hc.undef`. The op surface lets the body adopt
+// any scalar element type and the lowering reads it off the yield.
+// CHECK-LABEL: func.func @opaque_ptr_out
+// CHECK: hc.generic
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.ptr<global>)
+// CHECK-SAME: -> ()
+func.func @opaque_ptr_out(%n: index, %dst: !hc.ptr<global>) {
+  %z = hc.const<0.0 : f32> : f32
+  hc.generic
+      iter (parallel i = %n : index)
+      ins ()
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global>)
+      -> () {
+  ^bb0(%dv: f32):
+    hc.yield %z : f32
+  }
+  return
+}

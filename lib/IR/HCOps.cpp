@@ -1714,13 +1714,30 @@ void HCCallIntrinsicOp::getEffects(
 namespace {
 
 // Symbolic-element extraction shared between the body-arg and yield checks.
-// `!hc.undef` returns null so callers escape parity for progressive typing.
+// Returns the body-arg "element" the operand contributes:
+//   - shaped HC types (incl. `!hc.buffer`)         -> shape's element type;
+//   - `!hc.ptr` with an explicit pointee           -> pointee type;
+//   - `!hc.ptr` opaque or `!hc.undef`              -> null escape.
+// Null is the "no parity check" sentinel for progressive typing and for
+// opaque pointers whose body type is decided at lowering time.
 static Type genericOperandElement(Type type) {
   if (isHCUndefType(type))
     return {};
   if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type))
     return shaped.getSymbolicElementType();
+  if (auto ptr = llvm::dyn_cast<PtrType>(type))
+    return ptr.getElementType();
   return {};
+}
+
+// Memory carriers (ptr / buffer) drive the per-operand effects on
+// `hc.generic` and bypass the SSA-result slot — value-semantic outs
+// produce results in declaration order, ptr/buffer outs do not.
+// `!hc.undef` is conservatively treated as value-typed: the frontend
+// emits undef before inference and pairs each with an explicit result;
+// classifying it as ptr-like would silently drop that result.
+static bool isMemoryCarrierOperand(Type type) {
+  return llvm::isa<PtrType, BufferType>(type);
 }
 
 static ParseResult parseGenericIterClause(
@@ -1982,10 +1999,20 @@ LogicalResult HCGenericOp::verify() {
 
   if (getOuts().empty())
     return emitOpError("must declare at least one output");
-  if (getResults().size() != getOuts().size())
+
+  // SSA results track value-typed outs in declaration order. Ptr/buffer
+  // outs land their work in memory through the implicit ptr_store on the
+  // yield (op-level effects say so) and contribute no result. A pure-store
+  // generic produces zero results; mixed produces one per value-typed out.
+  SmallVector<Value> valueOuts;
+  for (Value out : getOuts())
+    if (!isMemoryCarrierOperand(out.getType()))
+      valueOuts.push_back(out);
+  if (getResults().size() != valueOuts.size())
     return emitOpError("results count ")
-           << getResults().size() << " != outs count " << getOuts().size();
-  for (auto [i, resTy, outVal] : llvm::enumerate(getResultTypes(), getOuts())) {
+           << getResults().size() << " != value-typed outs count "
+           << valueOuts.size() << " (ptr/buffer outs contribute no SSA result)";
+  for (auto [i, resTy, outVal] : llvm::enumerate(getResultTypes(), valueOuts)) {
     if (resTy != outVal.getType())
       return emitOpError("result #")
              << i << " type " << resTy << " does not match outs operand type "
@@ -2094,4 +2121,26 @@ LogicalResult HCGenericOp::verify() {
   }
 
   return success();
+}
+
+// Per-operand effects: ptr/buffer in `ins` is a Read of the operand,
+// ptr/buffer in `outs` is Read+Write (the read sources the carry —
+// outs-as-init contract on a memory destination). Value-typed slots
+// contribute nothing, so a generic with all-value outs is pure on
+// memory and effect-aware passes (CSE, LICM, speculation) can move it
+// freely.
+void HCGenericOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  auto *resource = SideEffects::DefaultResource::get();
+  for (OpOperand &in : getInsMutable()) {
+    if (isMemoryCarrierOperand(in.get().getType()))
+      effects.emplace_back(MemoryEffects::Read::get(), &in, resource);
+  }
+  for (OpOperand &out : getOutsMutable()) {
+    if (isMemoryCarrierOperand(out.get().getType())) {
+      effects.emplace_back(MemoryEffects::Read::get(), &out, resource);
+      effects.emplace_back(MemoryEffects::Write::get(), &out, resource);
+    }
+  }
 }

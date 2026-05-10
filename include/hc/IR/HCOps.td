@@ -1089,17 +1089,36 @@ def HCReduceOp : HC_Op<"reduce", [Pure]> {
 
 def HCGenericOp : HC_Op<"generic",
     [SingleBlockImplicitTerminator<"HCYieldOp">,
-     AttrSizedOperandSegments]> {
-  let summary = "Generic compute over symbolically-addressed bare 1D values.";
+     AttrSizedOperandSegments,
+     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Generic compute with value or in-place outs.";
   let description = [{
     Bodyful op that runs a scalar block over a Cartesian product of named
     iters. Each iter has a name, an upper bound (lower bound 0, step 1), and
     a kind: `parallel` iters are independent and a vectorization candidate;
     `reduction` iters thread an output value across iterations as an
     accumulator (the body reads the corresponding output block argument as
-    the running value and yields the updated value). Outputs follow
-    `linalg.generic`'s "outs-as-init" contract: each output operand is the
-    initial accumulator value and the produced result has the same type.
+    the running value and yields the updated value).
+
+    Outs are polymorphic: each output operand may be either a value-semantic
+    shaped HC type (tensor / vector / bare carrier) or a memory carrier
+    (`!hc.ptr<...>`, `!hc.buffer<...>`); the two flavors mix freely on the
+    same op. This subsumes `linalg.generic`'s tensor / memref split into a
+    single surface — a fused "compute and spill" lands as one loop nest
+    instead of two. Per-operand effects:
+
+      * value-typed slots are pure (no effect),
+      * ptr/buffer in `ins` contributes `MemRead` on the operand,
+      * ptr/buffer in `outs` contributes `MemRead + MemWrite` (the read
+        backs the carry — same outs-as-init contract as the value form,
+        but sourced from the destination's existing memory).
+
+    Outputs follow `linalg.generic`'s "outs-as-init" contract: each output
+    operand is the initial accumulator value and the produced result has
+    the same type. SSA results track the *value-typed* outs in declaration
+    order; ptr/buffer outs contribute no SSA result. A pure-store generic
+    (all-ptr outs) produces zero results, mixed produces one per
+    value-typed slot.
 
     Operand addressing is symbolic and per-axis: each input and output
     carries an array of `#hc.expr` offsets, one entry per operand axis
@@ -1118,18 +1137,19 @@ def HCGenericOp : HC_Op<"generic",
       - `iter_syms`, `iter_bounds`, `iter_kinds` are parallel arrays;
         names must be unique and non-empty.
       - Per-operand offset arrays must match operand counts; each
-        per-operand entry is itself an array of `#hc.expr` whose length
-        equals the operand's rank (`!hc.undef` operands escape the
-        rank check since they have no shape yet).
+        per-operand entry is itself an array of `#hc.expr` (rank check
+        is deferred to a post-flatten verifier).
       - Body block has `ins.size() + outs.size()` arguments; each arg
         type must match the element type of the corresponding operand
-        (`!hc.undef` operands escape the parity check).
-      - Each result type must equal the corresponding output operand's
-        type.
+        (operand element type for shaped types / pointee type for ptrs;
+        `!hc.undef` operands and opaque ptrs escape the parity check).
+      - Result count equals the number of value-typed outs in
+        declaration order; each result type matches the corresponding
+        value-typed out's operand type.
       - Output offsets must reference only `parallel` iter names: a
         reduction iter on an output offset would mean writing the same
         slot twice without specifying combinator semantics, which the op
-        does not model.
+        does not model. Applies to both value- and ptr-typed outs.
 
     Mask handling is deferred — pre-decomposition the input mask story
     rides on `hc.load_mask` / `hc.store(mask=...)`; if `hc.generic`
@@ -1141,8 +1161,8 @@ def HCGenericOp : HC_Op<"generic",
     Variadic<HC_ValueType>:$iter_bounds,
     TypedArrayAttrBase<HC_IterKindAttr,
                        "array of `#hc<iter_kind ...>` attributes">:$iter_kinds,
-    Variadic<HC_DecomposableShapedValueType>:$ins,
-    Variadic<HC_DecomposableShapedValueType>:$outs,
+    Variadic<HC_GenericOperandType>:$ins,
+    Variadic<HC_GenericOperandType>:$outs,
     TypedArrayAttrBase<
         TypedArrayAttrBase<HC_ExprAttr, "per-axis `#hc.expr<...>` array">,
         "array of per-operand per-axis `#hc.expr<...>` offset arrays"
@@ -1152,7 +1172,7 @@ def HCGenericOp : HC_Op<"generic",
         "array of per-operand per-axis `#hc.expr<...>` offset arrays"
       >:$outs_offsets
   );
-  let results = (outs Variadic<HC_DecomposableShapedValueType>:$results);
+  let results = (outs Variadic<HC_GenericOperandType>:$results);
   let regions = (region SizedRegion<1>:$body);
   let hasVerifier = 1;
   let hasCustomAssemblyFormat = 1;

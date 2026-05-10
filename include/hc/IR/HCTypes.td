@@ -395,6 +395,26 @@ def HC_DecomposableShapedValueType : AnyTypeOf<[
   HC_BareVectorType,
 ]>;
 
+// Operand-type predicate for `hc.generic`. Widens
+// `HC_DecomposableShapedValueType` with the memory carriers
+// (`!hc.ptr<...>`, `!hc.buffer<...>`) so a generic body may freely
+// mix value-semantic results with in-place memory writes — the same
+// op covers both `linalg.generic`'s tensor regime (value outs) and
+// memref regime (ptr outs), and a mixed-flavor outs list is legal
+// (e.g. compute a result tensor while spilling a debug trace into LDS
+// in one fused loop nest). Per-operand effects are derived from
+// operand types in `getEffects`: value slots are pure, ptr/buffer
+// slots contribute Read (ins) or Read+Write (outs).
+def HC_GenericOperandType : AnyTypeOf<[
+  HC_UndefType,
+  HC_TensorType,
+  HC_VectorType,
+  HC_BareTensorType,
+  HC_BareVectorType,
+  HC_BufferType,
+  HC_PtrType,
+]>;
+
 // Buffer-rooted values. Used on the "handle" operand of data-movement and
 // subscript ops so a stray `!hc.pred` or scalar value cannot stand in for a
 // buffer even pre-inference.

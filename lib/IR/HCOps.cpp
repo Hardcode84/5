@@ -2172,28 +2172,49 @@ LogicalResult HCGenericOp::verify() {
   // Per-operand offset arrays must agree on length with the operand's
   // rank. `!hc.undef` operands have no shape — skip them; the bounds
   // pass / inference fills the rank in once a concrete type lands.
-  // Each per-operand offset entry has to be a `#hc.expr` array. We
-  // intentionally do NOT enforce `entries.size() == operand.rank`:
-  // post-flatten an operand sits on its 1D storage shape but the
-  // per-axis offset array still describes the original nD logical
-  // access ("ops maintain their own nested structure" across the
-  // type-only flatten boundary). A richer post-flatten verifier
-  // that pins offsets-vs-iter-syms / offsets-vs-logical-shape lives
+  // `!hc.ptr<...>` carries a single linear address by op contract, so
+  // its offset array is always length 1.
+  //
+  // Pre-flatten the rule reads as logical-rank parity (rank N operand,
+  // N axis exprs); post-flatten the operand collapses to its 1D
+  // storage form and `hc-flatten-with-layouts` composes the per-axis
+  // exprs through the operand's layout into a single 1D offset, so
+  // the same equation holds with rank 1 on both sides. A richer
+  // post-flatten verifier that pins offset-vs-iter-sym usage lives
   // in a follow-up.
-  auto checkPerOperandShape = [&](ArrayAttr perOperandOffsets, StringRef role,
+  auto operandRank = [](Type t) -> std::optional<size_t> {
+    if (isHCUndefType(t))
+      return std::nullopt;
+    if (llvm::isa<PtrType>(t))
+      return size_t{1};
+    if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
+      if (ShapeAttr shape = shaped.getSymbolicShape())
+        return shape.getDims().size();
+    return std::nullopt;
+  };
+  auto checkPerOperandShape = [&](ArrayAttr perOperandOffsets, Value operand,
+                                  StringRef role,
                                   size_t roleIdx) -> LogicalResult {
     auto entries = llvm::dyn_cast<ArrayAttr>(perOperandOffsets);
     if (!entries)
       return emitOpError(role)
              << "_offsets[" << roleIdx
              << "] must be an array of #hc.expr<...> per axis";
+    if (auto rank = operandRank(operand.getType()))
+      if (entries.size() != *rank)
+        return emitOpError(role)
+               << "_offsets[" << roleIdx << "] has " << entries.size()
+               << " axis expression(s), expected " << *rank
+               << " (one per operand axis)";
     return success();
   };
-  for (auto [i, off] : llvm::enumerate(insOffsets.getAsRange<ArrayAttr>()))
-    if (failed(checkPerOperandShape(off, "ins", i)))
+  for (auto [i, off, in] :
+       llvm::enumerate(insOffsets.getAsRange<ArrayAttr>(), getIns()))
+    if (failed(checkPerOperandShape(off, in, "ins", i)))
       return failure();
-  for (auto [i, off] : llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>()))
-    if (failed(checkPerOperandShape(off, "outs", i)))
+  for (auto [i, off, out] :
+       llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>(), getOuts()))
+    if (failed(checkPerOperandShape(off, out, "outs", i)))
       return failure();
 
   // Reduction iters on output offsets would mean writing the same slot

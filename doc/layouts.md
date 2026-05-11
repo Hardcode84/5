@@ -170,15 +170,17 @@ one.
 Position: after `hc-decompose-shaped-values`, before any pointer
 lowering.
 
-The pass is **type-only**: every shaped value collapses to its 1D
-form and loses its layout slot, but op surfaces stay untouched.
-Per-axis offset arrays on `hc.generic` keep their original logical
-rank, multi-index lists on `hc.load` / `hc.store` / `hc.vload` /
-`hc.buffer_view` stay as-is. Composing the layout offset into those
-access expressions is a separate slice — downstream fusion /
-vectorization wants the per-axis structure available, and the
-access expression materialization needs `hc.ptr` plumbing the
-type-only slice doesn't own.
+The pass collapses every shaped value to its 1D form and drops its
+layout slot. On `hc.generic` and per-access ops it also composes the
+per-operand offset addressing into the post-flatten 1D form: the
+per-axis `#hc.expr` array on each `hc.generic` operand becomes a
+single composed `#hc.expr` (substituted through the operand's
+`#hc.layout` offset, or identity row-major when no layout is
+attached); multi-index lists on `hc.load` / `hc.store` / `hc.vload`
+/ `hc.load_mask` collapse to a single `hc.idx_apply`-materialized
+1D base offset by the same path. `hc.buffer_view` stays as-is —
+its sub-view semantics differ from a single base offset and are
+deferred.
 
 What runs:
 
@@ -207,31 +209,32 @@ What runs:
 
 Deferred slices (out of scope here):
 
-* **Per-access offset materialization.** Every access op
-  (`hc.load`, `hc.store`, `hc.vload`, `hc.buffer_view`, `hc.vec`)
-  gets its multi-index rewritten into a single 1D offset. v0
-  carries the multi-index forward as-is; lowering owns the
-  composition.
 * **`hc.as_layout` structural difference.** When source and
   destination layouts disagree under ixsimpl equality, the op
   becomes an `hc.generic` copy between the two offset expressions.
   v0 always drops the op (correctness is preserved only when the
-  layouts agree on the underlying storage-size expression — strict
-  layout mismatches need the materialization slice).
-* **`hc.generic` operand offset composition.** Per-operand per-axis
-  `#hc.expr` arrays stay nD post-flatten; composing the layout
-  offset to produce a single 1D expression per operand is the
-  "compose layout into generic" slice.
+  layouts agree on the underlying storage-size expression).
+* **`hc.buffer_view` per-access offset composition.** A buffer
+  view slices a sub-region whose offset chain isn't a single base
+  expression in the parent's address space, so the load / store /
+  vload composers above don't fold through it. Today the chain
+  walk lives in `hc-lower-launch-body`; eventually flatten will
+  fuse the chain into the sliced operand's layout directly.
 * **`i1` byte-per-element retirement.** The hand-coded `i1` mask
   handling in `HCLowerLaunchBodyPass.cpp` needs flatten to emit a
   byte-per-element layout for `i1` shaped types as a default. Until
   then the manual extract/insert sequences stay.
 
-Post-flatten *type* invariant: no layout attribute survives on any
-shaped type, every shaped value is 1D (buffers spell the unknown
-extent as `#hc.dyn`). Op-level structural invariants (multi-index
-access, per-axis offsets) carry through unchanged for the follow-up
-slice to consume.
+Post-flatten invariants:
+
+* **Types.** No layout attribute survives on any shaped type, every
+  shaped value is 1D (buffers spell the unknown extent as `#hc.dyn`).
+* **Offsets.** `hc.generic`'s per-operand offset arrays carry one
+  composed `#hc.expr` per operand axis (one entry post-flatten on
+  the 1D operand); per-access ops carry a single 1D `!hc.idx<expr>`
+  base operand. Free symbols (iter syms, dim / stride params,
+  workgroup IDs) survive in the composed expressions for the
+  downstream lowering to bind.
 
 ## `hc.ptr` and memory ops
 
@@ -420,11 +423,13 @@ in the pipeline:
 * **per-axis offsets.** Each operand carries an array of `#hc.expr`
   with length equal to the operand's rank. Pre-flatten that's the
   operand's own nD shape; post-flatten the operand is 1D and the array
-  has a single entry — but the iter space stays nD and the per-axis
-  structure is preserved on the inputs/outputs the rewriter chose to
-  keep nD. Flatten composes each per-axis offset through the operand's
-  layout offset and rewrites the operand to its 1D form, leaving a
-  single composed expression in the offset slot.
+  has a single composed entry. Flatten substitutes the per-axis exprs
+  positionally into the operand's `#hc.layout` offset formula
+  (binding `index_syms` to the per-axis exprs and `shape_syms` to
+  the operand dim entries) — or falls back to identity row-major when
+  no layout is attached — to produce that single composed offset. The
+  iter space stays nD on `iter_syms`; only the per-operand addressing
+  collapses to 1D.
 * **SSA bounds with inference.** `iter_bounds` are SSA values
   (`HC_ValueType`), so dynamic, runtime-resolved bounds drop in
   naturally. Any subset may be a value of type `!hc.undef`; that's the
@@ -707,27 +712,30 @@ on later slices.
 6. **`hc.ptr` family** — `!hc.ptr<...>`, `hc.alloc`, `hc.ptr_offset`,
    `hc.ptr_load`, `hc.ptr_store`. Round-trip + LIT. No flatten yet, no
    `hc.generic` yet.
-7. **`hc-flatten-with-layouts`** — type-only collapse: every shaped
-   value becomes 1D and loses its layout slot. Tensors / vectors get
+7. **`hc-flatten-with-layouts`** — every shaped value becomes 1D
+   and loses its layout slot. Tensors / vectors get
    `<T, [storage_size_expr]>`; buffers get `<T, [?]>` (`#hc.dyn`
-   sentinel) because their storage extent is host-owned. Op surfaces
-   stay untouched: per-axis offset arrays on `hc.generic` and
-   multi-index lists on `hc.load` / `hc.store` / `hc.vload` /
-   `hc.buffer_view` carry through at their original logical rank for
-   downstream fusion / vectorization to consume. Per-access offset
-   materialization, `hc.as_layout` structural-difference handling,
+   sentinel) because their storage extent is host-owned. Operand
+   addressing also collapses post-flatten: `hc.generic`'s per-axis
+   `#hc.expr` arrays compose through the operand's `#hc.layout`
+   offset (or identity row-major when no layout is attached) into
+   a single 1D `#hc.expr` per operand; per-access multi-index
+   lists on `hc.load` / `hc.store` / `hc.vload` / `hc.load_mask`
+   collapse to a single `hc.idx_apply`-materialized base offset.
+   `hc.buffer_view`, `hc.as_layout` structural-difference handling,
    and `i1` byte-per-element retirement are separate slices
    documented under the pass section above.
 8. **`hc.generic` op surface** — define the op (parallel + reduction
    iter kinds, outs-as-init, multiple outputs, per-operand `#hc.expr`
    offset slot, SSA `iter_bounds`). No lowering yet, no per-axis array
    yet — single offset per operand is the v0 surface.
-9. **per-axis offset slot** — extend `hc.generic` so each operand
-   carries an `ArrayAttr<#hc.expr>` of length equal to the operand's
-   rank. Pre-flatten consumers emit nD per-axis arrays; post-flatten
-   collapses to one entry per operand. Verifier enforces the rank
-   match. Flatten composes per-axis offsets through the operand's
-   layout.
+9. **per-axis offset slot** — `hc.generic` carries an
+   `ArrayAttr<#hc.expr>` per operand of length equal to the
+   operand's rank. Pre-flatten the entries are the per-axis
+   addressing on the operand's logical nD shape; flatten composes
+   them through the operand's `#hc.layout` offset (or identity
+   row-major) into a single entry on the post-flatten 1D operand.
+   The verifier enforces rank parity in both regimes.
 10. **`hc-infer-generic-bounds`** — pre-flatten pass that walks operand
     shapes and per-axis offsets to fill any `!hc.undef`-typed
     `iter_bounds` on `hc.generic`. Conflicts diagnose; no-op when every

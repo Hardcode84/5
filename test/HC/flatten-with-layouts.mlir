@@ -29,13 +29,14 @@
 //   * propagates the collapse through tuple types and the upstream
 //     func / scf / call signature populators.
 //
-// Op-surface contract: per-axis offset arrays on `hc.generic` and
-// multi-index lists on `hc.load` / `hc.store` / `hc.vload` /
-// `hc.buffer_view` are NOT rewritten — downstream fusion /
-// vectorization needs the per-axis structure even after the operand
-// type collapses to 1D. The verifier on `hc.generic` accepts that
-// post-flatten shape (entries-per-operand stays at the original
-// logical rank).
+// Op-surface contract: per-axis offset arrays on `hc.generic` compose
+// through the operand's `#hc.layout` offset expression (or identity
+// row-major when the operand has no layout) into a single 1D offset
+// matching the post-flatten 1D operand. Multi-index lists on
+// `hc.load` / `hc.store` / `hc.vload` collapse the same way through
+// the per-access `Compose*Offsets` patterns. `hc.buffer_view` is
+// deferred — it produces a sub-view whose offset semantics differ
+// from a single-base-offset access.
 //
 // Post-flatten invariant from `doc/layouts.md`: *no `#hc.layout`
 // survives on any shaped type*. The implicit-check below pins that
@@ -280,19 +281,20 @@ func.func @padded_caller(
 
 // -----
 
-// Op-surface contract: `hc.generic` keeps its per-axis offset arrays
-// at the original logical rank even after the operand types collapse
-// to 1D. The verifier accepts the entries-per-operand stays at the
-// pre-flatten rank — the `[i, j]` offset array on a `bare_tensor`
-// that just became `["M*N"]` is the post-flatten shape.
-// CHECK-LABEL: @generic_keeps_per_axis_offsets
+// Op-surface contract: `hc.generic` per-operand per-axis offset arrays
+// compose through the operand's layout (or identity row-major for
+// layout-less types) into a single 1D offset on the post-flatten 1D
+// operand. `[i, j]` over `bare_tensor<f32, ["M","N"]>` (no layout) goes
+// through identity row-major — `i*N + j`, ixsimpl-canonicalized to
+// `j + N*i`.
+// CHECK-LABEL: @generic_composes_offsets_default_row_major
 // CHECK-SAME: %[[A:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
 // CHECK-SAME: !hc.idx<"M">, %{{[^:]+}}: !hc.idx<"N">,
 // CHECK-SAME: %[[C:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
 // CHECK: hc.generic
-// CHECK-SAME: ins (%[[A]] at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M*N"]>)
-// CHECK-SAME: outs (%[[C]] at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M*N"]>)
-func.func @generic_keeps_per_axis_offsets(
+// CHECK-SAME: ins (%[[A]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+// CHECK-SAME: outs (%[[C]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+func.func @generic_composes_offsets_default_row_major(
     %m: index, %n: index,
     %a: !hc.bare_tensor<f32, ["M", "N"]>,
     %c: !hc.bare_tensor<f32, ["M", "N"]>)
@@ -308,6 +310,62 @@ func.func @generic_keeps_per_axis_offsets(
     hc.yield %av : f32
   }
   return %r : !hc.bare_tensor<f32, ["M", "N"]>
+}
+
+// -----
+
+// With an explicit layout the composer substitutes both `index_syms`
+// (positional with the per-axis exprs) and `shape_syms` (positional
+// with the operand dims) into `layout.offset` through ixsimpl. The
+// rank-2 row-major `i0 * d1 + i1` over `[M, N]` indexed `[i, j]`
+// canonicalizes to `j + N*i` — same destination as the layout-less
+// case, but reached via the substitution path rather than the
+// identity-row-major fallback.
+// CHECK-LABEL: @generic_composes_offsets_layout
+// CHECK-SAME: %[[B:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
+// CHECK: hc.generic
+// CHECK-SAME: ins (%[[B]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+func.func @generic_composes_offsets_layout(
+    %m: index, %n: index,
+    %a: !hc.bare_tensor<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
+    %c: !hc.bare_tensor<f32, ["M", "N"]>)
+    -> !hc.bare_tensor<f32, ["M", "N"]> {
+  %r = hc.generic
+      iter (parallel i = %m : index, parallel j = %n : index)
+      ins (%a at [#hc.expr<"i">, #hc.expr<"j">]
+              : !hc.bare_tensor<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>)
+      outs (%c at [#hc.expr<"i">, #hc.expr<"j">]
+               : !hc.bare_tensor<f32, ["M", "N"]>)
+      -> (!hc.bare_tensor<f32, ["M", "N"]>) {
+  ^bb0(%av: f32, %cv: f32):
+    hc.yield %av : f32
+  }
+  return %r : !hc.bare_tensor<f32, ["M", "N"]>
+}
+
+// -----
+
+// Ptr-typed operands ride on a single 1D address by op contract — the
+// per-axis array is already length 1 pre-flatten. The composer leaves
+// it untouched while the operand passes through the converter.
+// CHECK-LABEL: @generic_ptr_out_passthrough
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+func.func @generic_ptr_out_passthrough(
+    %m: index, %n: index,
+    %a: !hc.bare_tensor<f32, ["M", "N"]>,
+    %dst: !hc.ptr<global, f32>) {
+  hc.generic
+      iter (parallel i = %m : index, parallel j = %n : index)
+      ins (%a at [#hc.expr<"i">, #hc.expr<"j">]
+              : !hc.bare_tensor<f32, ["M", "N"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%av: f32, %dv: f32):
+    hc.yield %av : f32
+  }
+  return
 }
 
 // -----

@@ -30,9 +30,12 @@
 // offset expression in `hc.idx_apply` explicitly, instead of leaving
 // the binding to the lowering pass.
 //
-// The op-level structural invariants stay nD: `hc.generic` keeps its
-// per-axis offset arrays at the original logical rank for downstream
-// fusion / vectorization, and the rewriter does not touch them.
+// `hc.generic` per-operand per-axis `#hc.expr` offset arrays compose
+// post-flatten: each operand's array of axis exprs goes through the
+// operand's pre-flatten layout offset (or identity row-major when
+// no layout is attached) into a single 1D `#hc.expr`, matching the
+// post-flatten 1D operand rank. The verifier on `hc.generic` enforces
+// rank parity in both regimes.
 //
 // Per-access ops (`hc.load`, `hc.vload`, `hc.store`, `hc.load_mask`)
 // also get rewritten in this pass: their multi-index lists collapse
@@ -1029,6 +1032,233 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
   }
 };
 
+// Compose the per-operand per-axis offset arrays on `hc.generic` into
+// single-entry arrays — the post-flatten contract per `doc/layouts.md`.
+// For each shaped operand the rewrite reads the operand's pre-flatten
+// layout / shape, treats the per-axis array as the access-site index
+// list, and composes a single 1D offset through ixsimpl using the same
+// machinery the per-access patterns above use. Without an explicit
+// layout the fallback is identity row-major over the operand's shape.
+//
+// Free symbols of the composed offset (iter syms, dim / stride params)
+// stay free — they're resolved by the surrounding kernel scope and the
+// downstream `hc-lower-generic` lowering. Operands that aren't shaped
+// (`!hc.ptr<...>`, `!hc.undef`) keep their offset arrays unchanged: a
+// ptr already rides on a single 1D address by ODS contract and undef
+// has no shape to compose against.
+//
+// The pattern also performs the type-only retype that `RetypeAnyHCOp`
+// would otherwise have done — the operand 1-to-N expansion is sliced
+// to its leading flat carrier per operand, result types run through
+// the converter, and trailing aux values flow into the result
+// expansions via the shared sym-name binding map. Doing both here
+// keeps the post-flatten op single-pass: nD offset arrays never live
+// alongside 1D operand types in the IR.
+//
+// On any rank mismatch / missing layout (buffer with no layout) the
+// rewrite bails. The verifier on `hc.generic` enforces
+// `len(offset array) == operand rank`, so a bailed op surfaces as a
+// downstream verification error rather than silent miscompile.
+struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
+  using ComposeAccessOffsetBase::ComposeAccessOffsetBase;
+  using Base = OpConversionPattern<HCGenericOp>;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(HCGenericOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    MLIRContext *ctx = op.getContext();
+    ArrayAttr insOffsets = op.getInsOffsetsAttr();
+    ArrayAttr outsOffsets = op.getOutsOffsetsAttr();
+
+    // Compose each per-operand offset array. Operands that aren't
+    // shaped (or are already-flat) pass through unchanged. Returns a
+    // failure to bail the whole rewrite to RetypeAnyHCOp; returns
+    // `false` to indicate "nothing changed for this operand".
+    bool composed = false;
+    auto composeOne = [&](Value origOperand,
+                          ArrayAttr perAxis) -> FailureOr<ArrayAttr> {
+      Type t = origOperand.getType();
+      auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(t);
+      if (!shaped)
+        return perAxis;
+      ShapeAttr shape = shaped.getSymbolicShape();
+      if (!shape)
+        return perAxis;
+      LayoutAttr layout = shaped.getSymbolicLayout();
+      // Layout-less operands (including buffers that haven't picked
+      // up the default strided layout — `hc-canonicalize-layouts`
+      // only attaches one for kernel-arg buffers) fall back to
+      // identity row-major, the canonical contract for layout-free
+      // shaped types. Same path `composeAccessOffsetExpr` takes for
+      // tensor / vector operands.
+      // Rank-0 has nothing to compose; ditto for an op produced with
+      // an empty offset array on the operand.
+      if (perAxis.empty())
+        return perAxis;
+
+      SmallVector<ExprAttr> perAxisExprs;
+      perAxisExprs.reserve(perAxis.size());
+      for (Attribute a : perAxis) {
+        auto expr = dyn_cast<ExprAttr>(a);
+        if (!expr)
+          return failure();
+        perAxisExprs.push_back(expr);
+      }
+      auto offset = composeAccessOffsetExpr(ctx, layout, shape, perAxisExprs);
+      if (failed(offset))
+        return failure();
+      auto result = ArrayAttr::get(ctx, ArrayRef<Attribute>{*offset});
+      // A rank-1 layout-less operand round-trips through identity
+      // row-major to itself; don't flip `composed` for an unchanged
+      // attribute or the pattern would claim a rewrite happened when
+      // nothing on the surface moved.
+      if (result != perAxis)
+        composed = true;
+      return result;
+    };
+
+    SmallVector<Attribute> newInsOffsets;
+    newInsOffsets.reserve(insOffsets.size());
+    for (auto [in, perAxis] :
+         llvm::zip_equal(op.getIns(), insOffsets.getAsRange<ArrayAttr>())) {
+      auto out = composeOne(in, perAxis);
+      if (failed(out))
+        return failure();
+      newInsOffsets.push_back(*out);
+    }
+
+    SmallVector<Attribute> newOutsOffsets;
+    newOutsOffsets.reserve(outsOffsets.size());
+    for (auto [out, perAxis] :
+         llvm::zip_equal(op.getOuts(), outsOffsets.getAsRange<ArrayAttr>())) {
+      auto composedAttr = composeOne(out, perAxis);
+      if (failed(composedAttr))
+        return failure();
+      newOutsOffsets.push_back(*composedAttr);
+    }
+
+    // Flat carrier slicing matches RetypeAnyHCOp's contract — each
+    // 1-to-N adapter range hands back the flat shaped value as the
+    // leading entry; trailing aux values feed the result-expansion
+    // binding map.
+    if (adaptor.getIterBounds().size() != op.getIterBounds().size())
+      return failure();
+    SmallVector<Value> iterBounds;
+    iterBounds.reserve(adaptor.getIterBounds().size());
+    for (ValueRange range : adaptor.getIterBounds()) {
+      if (range.size() != 1)
+        return failure();
+      iterBounds.push_back(range.front());
+    }
+
+    SmallVector<Value> flatIns;
+    flatIns.reserve(adaptor.getIns().size());
+    for (ValueRange range : adaptor.getIns()) {
+      if (range.empty())
+        return failure();
+      flatIns.push_back(range.front());
+    }
+    SmallVector<Value> flatOuts;
+    flatOuts.reserve(adaptor.getOuts().size());
+    for (ValueRange range : adaptor.getOuts()) {
+      if (range.empty())
+        return failure();
+      flatOuts.push_back(range.front());
+    }
+
+    // Pull the shape-preserving sym-name bindings off every operand
+    // expansion so result aux can be sourced from a matching name
+    // before falling back to an ambient `hc.idx_apply`.
+    llvm::StringMap<Value> bindings;
+    for (auto [orig, range] : llvm::zip_equal(op.getIns(), adaptor.getIns()))
+      noteOperandBindings(orig.getType(), range, bindings);
+    for (auto [orig, range] : llvm::zip_equal(op.getOuts(), adaptor.getOuts()))
+      noteOperandBindings(orig.getType(), range, bindings);
+
+    // Convert result types via the 1-to-N converter. The new op only
+    // carries the leading flat type per result; trailing aux values
+    // are SSA-generated alongside.
+    SmallVector<Type> flatResultTypes;
+    SmallVector<unsigned> resultWidths;
+    flatResultTypes.reserve(op.getNumResults());
+    resultWidths.reserve(op.getNumResults());
+    for (Type resultType : op.getResultTypes()) {
+      SmallVector<Type> converted;
+      if (failed(getTypeConverter()->convertType(resultType, converted)))
+        return failure();
+      if (converted.empty())
+        return failure();
+      flatResultTypes.push_back(converted.front());
+      resultWidths.push_back(converted.size());
+    }
+
+    // Bail if neither offsets nor types changed — failure here lets
+    // the driver short-circuit to the next pattern instead of looping
+    // on a no-op rewrite.
+    bool typesChanged = false;
+    for (auto [oldT, newT] :
+         llvm::zip_equal(op.getResultTypes(), flatResultTypes))
+      if (oldT != newT) {
+        typesChanged = true;
+        break;
+      }
+    if (!typesChanged)
+      for (auto [oldVal, range] :
+           llvm::zip(op.getOperands(), adaptor.getOperands()))
+        if (range.size() != 1 || oldVal.getType() != range.front().getType()) {
+          typesChanged = true;
+          break;
+        }
+    if (!composed && !typesChanged)
+      return failure();
+
+    auto newOp = HCGenericOp::create(
+        rewriter, op.getLoc(), flatResultTypes, op.getIterSymsAttr(),
+        ValueRange(iterBounds), op.getIterKindsAttr(), ValueRange(flatIns),
+        ValueRange(flatOuts), ArrayAttr::get(ctx, newInsOffsets),
+        ArrayAttr::get(ctx, newOutsOffsets));
+    // Carry over any extra discardable attributes (e.g. location-name
+    // hints) the original op picked up before we got here. The named
+    // attributes the builder wrote — iter_syms, iter_kinds, ins/outs
+    // offsets, segment sizes — already match.
+    StringSet<> handled = {
+        op.getIterSymsAttrName().getValue(),
+        op.getIterKindsAttrName().getValue(),
+        op.getInsOffsetsAttrName().getValue(),
+        op.getOutsOffsetsAttrName().getValue(),
+        op.getOperandSegmentSizesAttrName().getValue(),
+    };
+    for (NamedAttribute attr : op->getAttrs())
+      if (!handled.contains(attr.getName().getValue()))
+        newOp->setAttr(attr.getName(), attr.getValue());
+
+    rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
+                                newOp.getBody().end());
+    if (failed(
+            rewriter.convertRegionTypes(&newOp.getBody(), *getTypeConverter())))
+      return failure();
+
+    SmallVector<SmallVector<Value>> replacementStorage;
+    replacementStorage.reserve(op.getNumResults());
+    SmallVector<ValueRange> replacements;
+    replacements.reserve(op.getNumResults());
+    for (auto [newResult, origResult] :
+         llvm::zip_equal(newOp.getResults(), op.getResults())) {
+      auto aux = resolveResultAuxValues(rewriter, op.getLoc(),
+                                        origResult.getType(), bindings);
+      if (failed(aux))
+        return failure();
+      SmallVector<Value> bundle = {newResult};
+      llvm::append_range(bundle, *aux);
+      replacementStorage.push_back(std::move(bundle));
+      replacements.push_back(replacementStorage.back());
+    }
+    rewriter.replaceOpWithMultiple(op, replacements);
+    return success();
+  }
+};
+
 // Generic op-rebuild pattern for HC dialect ops. The function/SCF
 // populators retype signatures and structural ops, but ops in the
 // middle of the IR (`hc.generic`, `hc.load`, `hc.cast`, ...) need to
@@ -1263,11 +1493,12 @@ struct HCFlattenWithLayoutsPass final
     // Per-access-op patterns are listed first by intent — the
     // conversion driver still picks via benefit (2 vs the generic
     // retype's 1), but having them grouped reads as the design.
-    patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets,
-                 ComposeLoadMaskOffsets, ComposeStoreOffsets, DropAsLayout,
-                 RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
-                 ConvertHCSymbolSignatureOp<HCFuncOp>,
-                 ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
+    patterns
+        .add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeLoadMaskOffsets,
+             ComposeStoreOffsets, ComposeGenericOffsets, DropAsLayout,
+             RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
+             ConvertHCSymbolSignatureOp<HCFuncOp>,
+             ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
 
     target.markUnknownOpDynamicallyLegal([&](Operation *op) {
       if (auto fn = dyn_cast<FunctionOpInterface>(op))
@@ -1297,6 +1528,39 @@ struct HCFlattenWithLayoutsPass final
       if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
         if (auto fnType = intrinsic.getFunctionType())
           return checkSignature(*fnType);
+      // `hc.generic` legality also gates on offset-array rank parity:
+      // a type-only retype with no offset composition leaves nD arrays
+      // sitting on now-1D operands, which the post-flatten verifier
+      // rejects. Force the driver back through `ComposeGenericOffsets`
+      // when any operand's offset count diverges from its rank.
+      if (auto generic = dyn_cast<HCGenericOp>(op)) {
+        if (!converter.isLegal(op))
+          return false;
+        auto operandRank = [](Type t) -> std::optional<size_t> {
+          if (isHCUndefType(t))
+            return std::nullopt;
+          if (isa<PtrType>(t))
+            return size_t{1};
+          if (auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(t))
+            if (ShapeAttr shape = shaped.getSymbolicShape())
+              return shape.getDims().size();
+          return std::nullopt;
+        };
+        auto checkRoleParity = [&](OperandRange ops, ArrayAttr offsets) {
+          for (auto [val, off] :
+               llvm::zip_equal(ops, offsets.getAsRange<ArrayAttr>())) {
+            std::optional<size_t> rank = operandRank(val.getType());
+            if (rank && off.size() != *rank)
+              return false;
+          }
+          return true;
+        };
+        if (!checkRoleParity(generic.getIns(), generic.getInsOffsetsAttr()))
+          return false;
+        if (!checkRoleParity(generic.getOuts(), generic.getOutsOffsetsAttr()))
+          return false;
+        return true;
+      }
       // HC dialect ops are legal iff every operand and every result type
       // is already in its converted form. The `RetypeAnyHCOp` pattern
       // takes care of the rebuild when one side still carries the

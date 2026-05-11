@@ -1397,7 +1397,7 @@ module {
 // outs too — a reduction iter on a memory destination's offset would
 // store the same address several times along the reduction without a
 // combinator. Same diagnostic shape as for value-typed outs.
-// CHECK: error: 'hc.generic' op output #0 axis 1 offset references reduction iter 'k'
+// CHECK: error: 'hc.generic' op output #0 axis 0 offset references reduction iter 'k'
 module {
   func.func @bad(%m: index, %k: index,
                  %a: !hc.bare_tensor<f32, ["M"]>,
@@ -1405,10 +1405,57 @@ module {
     hc.generic
         iter (parallel i = %m : index, reduction k = %k : index)
         ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["M"]>)
-        outs (%dst at [#hc.expr<"i">, #hc.expr<"k">] : !hc.ptr<global, f32>)
+        outs (%dst at [#hc.expr<"i + k">] : !hc.ptr<global, f32>)
         -> () {
     ^bb0(%av: f32, %dv: f32):
       hc.yield %av : f32
+    }
+    return
+  }
+}
+
+// -----
+
+// Per-operand offset arrays must have one entry per operand axis. A
+// rank-2 operand with a single-axis offset is the canonical mismatch
+// — pre-flatten the per-axis array tracks the operand's logical rank,
+// post-flatten the operand collapses to 1D and the array composes to
+// a single entry; either way the lengths line up.
+// CHECK: error: 'hc.generic' op ins_offsets[0] has 1 axis expression(s), expected 2 (one per operand axis)
+module {
+  func.func @bad(%m: index, %n: index,
+                 %a: !hc.bare_tensor<f32, ["M", "N"]>,
+                 %c: !hc.bare_tensor<f32, ["M", "N"]>)
+      -> !hc.bare_tensor<f32, ["M", "N"]> {
+    %r = hc.generic
+        iter (parallel i = %m : index, parallel j = %n : index)
+        ins (%a at [#hc.expr<"i + j*M">] : !hc.bare_tensor<f32, ["M", "N"]>)
+        outs (%c at [#hc.expr<"i">, #hc.expr<"j">]
+                 : !hc.bare_tensor<f32, ["M", "N"]>)
+        -> (!hc.bare_tensor<f32, ["M", "N"]>) {
+    ^bb0(%av: f32, %cv: f32):
+      hc.yield %av : f32
+    }
+    return %r : !hc.bare_tensor<f32, ["M", "N"]>
+  }
+}
+
+// -----
+
+// Same rank-parity rule, but the failure is on a ptr-typed operand
+// where rank is 1 by op contract. A two-axis offset on a ptr would
+// mean the op was minted before flatten and then never composed —
+// surface that loudly.
+// CHECK: error: 'hc.generic' op outs_offsets[0] has 2 axis expression(s), expected 1 (one per operand axis)
+module {
+  func.func @bad(%n: index, %dst: !hc.ptr<global, f32>) {
+    hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%dst at [#hc.expr<"i">, #hc.expr<"i">] : !hc.ptr<global, f32>)
+        -> () {
+    ^bb0(%dv: f32):
+      hc.yield %dv : f32
     }
     return
   }

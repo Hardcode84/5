@@ -27,10 +27,8 @@
 // `hc-lower-launch-body`. `hc-lower-generic` runs immediately after
 // `hc-lower-launch-body` so any `hc.generic` whose operands are
 // `!hc.ptr` collapses to the loop nest. `hc-flatten-with-layouts`
-// is intentionally not in the chain here: its per-access offset
-// composer collapses load/store index lists to single-entry, which
-// the per-op launch-body patterns still expect at logical rank.
-// See the comment at the launch-body pass below.
+// is intentionally not in the chain here — see the comment at the
+// `hc-lower-generic` slot below for the contract gap that defers it.
 //
 // The closing chunk produces the device-side artefacts the GPU lowering
 // pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
@@ -39,26 +37,13 @@
 //   * `gpu-launch-sink-index-computations` rewrites every constant index
 //     consumer inside `gpu.launch` so the outliner can lift the constants into
 //     the `gpu.func` body instead of promoting them to kernel arguments.
-//     Runtime-typed kernel arguments end up as `memref.dim`'s axis operand
-//     downstream, which AMDGPU codegen can't lower (LLVM emits
-//     `dynamic_stackalloc` for the descriptor reads). Sinking is the simplest
-//     way to keep those axis values literal.
+//     Sinking the constants is cheap insurance against any axis-indexed
+//     consumer that would otherwise force runtime-typed dim values onto the
+//     kernel-arg list — keeps the dispatch regular regardless of which
+//     specific patterns ride downstream.
 //
 //   * `gpu-kernel-outlining` splits each `gpu.launch` into a sibling
 //     `gpu.module @<kernel>_kernel` + `gpu.func` + `gpu.launch_func`.
-//
-//   * `transform.memref.alloca_to_global` lifts every `memref.alloca` (always
-//     workgroup-AS in our pipeline) to a `memref.global` + `memref.get_global`
-//     pair anchored at the `gpu.module` symbol table. This is the only
-//     upstream-supported way to teach `convert-gpu-to-rocdl` about workgroup
-//     memory — its TypeConverter only knows about workgroup AS for
-//     get_global/global pairs, not arbitrary allocas.
-//
-//   * `apply_patterns.vector.lower_transfer` + `transfer_to_scf` reduce the
-//     remaining `vector.transfer_read/write` ops on workgroup memrefs to plain
-//     `vector.load/store`. Without this the rocdl conversion can't lower them
-//     (vector → llvm patterns don't carry the workgroup-AS mapping that
-//     `convert-gpu-to-rocdl` plants on its TypeConverter).
 //
 //   * `rocdl-attach-target` stamps each `gpu.module` with `#rocdl.target` so
 //     `convert-amdgpu-to-rocdl`, `gpu-to-llvm`, and `hc-lower-gpu-to-binary`
@@ -152,10 +137,11 @@ module attributes {transform.with_named_sequence} {
     // `hc-flatten-with-layouts` does NOT slot in here yet: its
     // per-access offset composer (`ComposeLoadOffsets` family)
     // collapses load/store/vload index lists from rank-N to a
-    // single 1D offset, while `hc-lower-launch-body`'s per-op
-    // patterns still expect a rank-N index list to match the
-    // rank-N kernel-arg memref. That contract gap blocks wiring
-    // flatten until launch-body learns the 1D-index path.
+    // single 1D offset, but the per-op patterns in
+    // `hc-lower-launch-body` and the `hc.generic` per-axis offset
+    // arrays this pass consumes still expect logical rank-N
+    // indexing — the offset-composition rewrite needs to reach
+    // those consumers before flatten can land in the schedule.
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13a {
@@ -202,31 +188,6 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m16 : !transform.any_op
-    // Promote every workgroup-AS `memref.alloca` to a `memref.global` +
-    // `memref.get_global` pair, anchored at the `gpu.module` symbol table.
-    // `convert-gpu-to-rocdl` only teaches its TypeConverter the
-    // workgroup-to-AS3 mapping for get_global/global, so an alloca that
-    // survives this point fails the conversion with "memory space conversion
-    // failed". `structured.match` returns an empty handle on payloads with no
-    // alloca (trivial kernels, host-only modules), and `alloca_to_global`
-    // is a no-op on an empty handle — so this stays well-formed regardless
-    // of whether anything actually got promoted.
-    %alloca = transform.structured.match ops{["memref.alloca"]} in %m16
-        : (!transform.any_op) -> !transform.op<"memref.alloca">
-    %get_global, %global = transform.memref.alloca_to_global %alloca
-        : (!transform.op<"memref.alloca">) -> (!transform.any_op, !transform.any_op)
-    // Reduce `vector.transfer_read/write` to `vector.load/store` so the
-    // downstream rocdl chain can lower them. Without this the vector ops
-    // survive into convert-vector-to-llvm, which doesn't get the
-    // workgroup-AS mapping its TypeConverter needs and silently emits
-    // "memory space conversion failed" notes. `lower_transfer` does the
-    // bulk of the rewrite; `transfer_to_scf full_unroll = true` strips the
-    // remaining rank-1 transfers into scalar loads/stores so the rest of
-    // the chain only sees ops it knows how to handle.
-    transform.apply_patterns to %m16 {
-      transform.apply_patterns.vector.lower_transfer max_transfer_rank = 1
-      transform.apply_patterns.vector.transfer_to_scf full_unroll = true
-    } : !transform.any_op
     // Stamp every freshly minted `gpu.module` with a `#rocdl.target`
     // attribute. The chip is resolved Python-side from `hc.compile`'s
     // `target=` (e.g. `amdgpu-gfx11` -> `gfx1100`); the empty

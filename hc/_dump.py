@@ -72,14 +72,12 @@ def splice_dump_passes(module: Any) -> int:
     label it with the pass name. For `transform.apply_patterns` /
     `apply_cse` / `apply_dce` — which mutate the payload referenced
     by their operand and don't produce a result handle — we hang it
-    off the operand. Other transform ops (`transform.yield`,
-    `transform.structured.match`, `transform.memref.alloca_to_global`,
-    nested apply-pattern descriptors like
-    `transform.apply_patterns.canonicalization`, ...) are skipped
-    because they don't represent an inspect-worthy mid-schedule
-    state — `apply_patterns.canonicalization` only describes a
-    pattern set, the parent `apply_patterns` is the actual
-    mutator and the one we probe.
+    off the operand. Other transform ops (`transform.yield`, nested
+    apply-pattern descriptors like `transform.apply_patterns.canonicalization`,
+    ...) are skipped because they don't represent an inspect-worthy
+    mid-schedule state — `apply_patterns.canonicalization` only
+    describes a pattern set, the parent `apply_patterns` is the
+    actual mutator and the one we probe.
 
     Returns the number of probes inserted, mostly for tests/asserts.
     Mutates `module` in place.

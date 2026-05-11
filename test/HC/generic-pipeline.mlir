@@ -21,6 +21,14 @@
 // `infer-generic-bounds.mlir`); the goal here is end-to-end composition.
 //
 // RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds)' --split-input-file | FileCheck %s
+//
+// Same chain plus `hc-flatten-with-layouts`. The generic-rewriter
+// outputs feed straight into the type-only flatten without needing
+// any per-pass adapter — every shaped operand/result collapses to its
+// 1D storage form, layout slots vanish, and the per-axis offset
+// arrays on `hc.generic` and the multi-index lists on access ops
+// stay at their original logical rank for downstream lowering.
+// RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds,hc-flatten-with-layouts)' --split-input-file | FileCheck %s --check-prefix=POSTFLATTEN --implicit-check-not='#hc.layout'
 
 // Matmul + elementwise add on the result. The matmul rewriter emits one
 // `hc.generic` with parallel-parallel-reduction iters and a `hc.zeros`
@@ -49,6 +57,18 @@
 // CHECK: ^bb0(%[[L:.+]]: f32, %[[R:.+]]: f32, %{{.+}}: f32):
 // CHECK:   %[[S:.+]] = hc.add %[[L]], %[[R]] : (f32, f32) -> f32
 // CHECK:   hc.yield %[[S]] : f32
+
+// Each shaped tensor arg expands 1-to-N into a flat carrier + one
+// `!hc.idx<sym>` per free dim symbol from its pre-flatten shape;
+// the `hc.generic` operand types collapse to their 1D storage form
+// while the per-axis offset arrays stay at the original logical rank
+// for downstream lowering. `hc.matmul` and the bias `hc.add` are
+// already gone after the rewriters above; the implicit-check banner
+// pins that no `#hc.layout` survives.
+// POSTFLATTEN-LABEL: func.func @matmul_then_add
+// POSTFLATTEN-SAME: -> (!hc.tensor<f32, ["M*N"]>, !hc.idx<"M">, !hc.idx<"N">)
+// POSTFLATTEN: hc.generic iter (parallel i = %{{.+}} : !hc.idx<"M">, parallel j = %{{.+}} : !hc.idx<"N">, reduction k = %{{.+}} : !hc.idx<"K">) ins (%{{.+}} at [#hc.expr<"i">, #hc.expr<"k">] : !hc.tensor<f32, ["K*M"]>, %{{.+}} at [#hc.expr<"k">, #hc.expr<"j">] : !hc.tensor<f32, ["K*N"]>) outs (%{{.+}} at [#hc.expr<"i">, #hc.expr<"j">] : !hc.tensor<f32, ["M*N"]>)
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">)
 func.func @matmul_then_add(%a: !hc.tensor<f32, ["M", "K"]>,
                            %b: !hc.tensor<f32, ["K", "N"]>,
                            %bias: !hc.tensor<f32, ["M", "N"]>)
@@ -77,6 +97,13 @@ func.func @matmul_then_add(%a: !hc.tensor<f32, ["M", "K"]>,
 // CHECK: ^bb0(%[[V:.+]]: f32, %[[ACC:.+]]: f32):
 // CHECK:   %[[S:.+]] = hc.add %[[ACC]], %[[V]]
 // CHECK:   hc.yield %[[S]]
+
+// Reduce already produces a 1D result type, so the result side
+// doesn't expand; the rank-2 input tensor expands 1-to-3 (flat +
+// dim aux for M and N).
+// POSTFLATTEN-LABEL: func.func @reduce_sum_axis1
+// POSTFLATTEN-SAME: !hc.tensor<f32, ["M*N"]>
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, reduction r = %{{.+}} : !hc.idx<"N">) ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"r">] : !hc.tensor<f32, ["M*N"]>) outs (%{{.+}} at [#hc.expr<"i_0">] : !hc.tensor<f32, ["M"]>)
 func.func @reduce_sum_axis1(%v: !hc.tensor<f32, ["M", "N"]>)
     -> !hc.tensor<f32, ["M"]> {
   %r = hc.reduce %v, kind = sum, axis = 1
@@ -98,6 +125,14 @@ func.func @reduce_sum_axis1(%v: !hc.tensor<f32, ["M", "N"]>)
 // CHECK-NOT: hc.add %{{[^ ]+}}, %{{[^ ]+}} : (!hc.tensor
 // CHECK-COUNT-2: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">)
+
+// All three operands and the result expand 1-to-3 (flat + dim aux
+// for M and N). Both `hc.generic`s carry rank-2 offset arrays on
+// 1D tensor operands.
+// POSTFLATTEN-LABEL: func.func @elementwise_chain
+// POSTFLATTEN-SAME: -> (!hc.tensor<f32, ["M*N"]>, !hc.idx<"M">, !hc.idx<"N">)
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">) ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>, %{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>) outs (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>)
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">) ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>, %{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>) outs (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["M*N"]>)
 func.func @elementwise_chain(%a: !hc.tensor<f32, ["M", "N"]>,
                              %b: !hc.tensor<f32, ["M", "N"]>,
                              %c: !hc.tensor<f32, ["M", "N"]>)
@@ -124,6 +159,16 @@ func.func @elementwise_chain(%a: !hc.tensor<f32, ["M", "N"]>,
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">]
 // CHECK: ^bb0(%[[V:.+]]: f32, %{{.+}}: f32):
 // CHECK:   hc.yield %[[V]] : f32
+
+// Buffer args collapse to `!hc.buffer<..., ["?"]>` (host owns the
+// allocation, the IR doesn't have enough symbols to name the
+// extent), with dim aux idxs trailing. The result tile is already
+// statically `[16, 16]`, so it collapses to flat `["256"]` with no
+// trailing aux.
+// POSTFLATTEN-LABEL: func.func @tiled_load
+// POSTFLATTEN-SAME: !hc.buffer<f32, ["?"]>
+// POSTFLATTEN-SAME: -> !hc.tensor<f32, ["256"]>
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"16">, parallel i_1 = %{{.+}} : !hc.idx<"16">) ins (%{{.+}} at [#hc.expr<"16*$WG0 + i_0">, #hc.expr<"i_1">] : !hc.buffer<f32, ["?"]>) outs (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["256"]>)
 func.func @tiled_load(%a: !hc.buffer<f32, ["M", "N"]>,
                       %row: !hc.idx<"16*$WG0">,
                       %col: !hc.idx<"0">)

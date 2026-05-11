@@ -24,10 +24,13 @@
 // types, pinned `!hc.idx<expr>` indices on load and store). Inputs that
 // don't match (slice-indexed loads, intrinsic-mediated WMMA paths, ...)
 // flow through untouched and lower via the existing per-op handlers in
-// `hc-lower-launch-body`. `hc-flatten-with-layouts` and `hc-lower-generic`
-// are not wired in yet; their natural slot bookends `hc-lower-launch-body`
-// once that pass switches from `memref` to `hc.ptr` — see the comment
-// near the launch-body pass below.
+// `hc-lower-launch-body`. `hc-lower-generic` runs immediately after
+// `hc-lower-launch-body` so any `hc.generic` whose operands are
+// `!hc.ptr` collapses to the loop nest. `hc-flatten-with-layouts`
+// is intentionally not in the chain here: its per-access offset
+// composer collapses load/store index lists to single-entry, which
+// the per-op launch-body patterns still expect at logical rank.
+// See the comment at the launch-body pass below.
 //
 // The closing chunk produces the device-side artefacts the GPU lowering
 // pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
@@ -137,18 +140,28 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
-    // `hc-flatten-with-layouts` and `hc-lower-generic` are deliberately
-    // not wired in here yet. Their intended slot is right next to
-    // `hc-lower-launch-body` — flatten before so the launch-body pass
-    // sees 1D shaped types and free layout symbols as ordinary SSA, and
-    // lower-generic after so any `hc.generic` with `!hc.ptr` operands
-    // collapses to the loop nest. Both depend on the launch-body pass
-    // moving from `memref` to `hc.ptr` first: without that, flatten
-    // produces buffers typed `!hc.buffer<..., ["?"]>` that the current
-    // `bindShapeSymbols` walk can't extract dim names from, and
-    // lower-generic finds nothing to lower because launch-body never
-    // produces `hc.generic` with ptr operands. A follow-up slice owns
-    // wiring both passes once the ptr migration lands.
+    // Lower every `hc.generic` whose operands have already been
+    // converted to `!hc.ptr` (by the launch-body pass above) to an
+    // outer `scf.parallel` over the parallel iters and an inner
+    // `scf.for` nest over reduction iters. v0 bails on any operand
+    // with a multi-axis offset array — until per-axis-array
+    // composition is wired up, the pass is a no-op for current
+    // inputs (the WMMA path lowers via `hc-interpret-intrinsic-recipes`,
+    // not generic). Wired here so the schedule shape stays pinned.
+    //
+    // `hc-flatten-with-layouts` does NOT slot in here yet: its
+    // per-access offset composer (`ComposeLoadOffsets` family)
+    // collapses load/store/vload index lists from rank-N to a
+    // single 1D offset, while `hc-lower-launch-body`'s per-op
+    // patterns still expect a rank-N index list to match the
+    // rank-N kernel-arg memref. That contract gap blocks wiring
+    // flatten until launch-body learns the 1D-index path.
+    %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13a {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m13a : !transform.any_op
     // The `__HC_TARGET__` placeholder is substituted by the Python
     // driver before the schedule is handed to the transform
     // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the
@@ -161,7 +174,7 @@ module attributes {transform.with_named_sequence} {
     // The pass is also a no-op for kernels that never use intrinsics:
     // no lowerings module, no calls, nothing to diagnose.
     %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
-        with options = { "target" = "__HC_TARGET__" } to %m13
+        with options = { "target" = "__HC_TARGET__" } to %m13a
         : (!transform.any_op) -> !transform.any_op
     // Cleanup pair folds away every `unrealized_conversion_cast` the
     // recipe-side `transform.hc.cast_value` planted around the freshly

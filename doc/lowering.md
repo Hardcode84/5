@@ -952,10 +952,18 @@ DCE pair: each one is conservative and only fires on inputs that match
 its v0 surface (rank-2 matmul / reduce, all-shaped per-element arith,
 pinned `!hc.idx<expr>` indices on load and store) — anything outside
 that surface flows through untouched and reaches the per-op handlers in
-`hc-lower-launch-body`. `hc-flatten-with-layouts` and `hc-lower-generic`
-share the same intent but are not wired in yet: their inputs aren't
-ready until the layout-flattening side of the work materializes the
-flattened tensor + per-symbol SSA values that lower-generic consumes.
+`hc-lower-launch-body`. `hc-lower-generic` is wired immediately after
+`hc-lower-launch-body` and lowers any `hc.generic` whose operands are
+already `!hc.ptr` (post-launch-body) to an outer `scf.parallel` over
+the parallel iters and an inner `scf.for` nest over reduction iters;
+v0 bails on inputs whose per-axis offset arrays haven't been collapsed
+to single-entry, so the pass is a no-op for current real workloads.
+`hc-flatten-with-layouts` is intentionally NOT in the schedule yet:
+its per-access offset composer (`ComposeLoadOffsets` and friends) folds
+load/store/vload index lists from rank-N to a single 1D offset, while
+the launch-body per-op patterns still expect a rank-N index list to
+match the rank-N kernel-arg memref. That contract gap blocks wiring
+flatten until launch-body learns the 1D-index path.
 `hc-lower-launch-body` itself now emits the workgroup-AS family on
 `!hc.ptr<workgroup, T>` rather than `memref<..., #gpu.address_space<workgroup>>`
 ([`doc/layouts.md`](layouts.md) covers the contract and the kernel-arg

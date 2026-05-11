@@ -1136,6 +1136,21 @@ struct RetypeAnyHCOp : public ConversionPattern {
          llvm::zip_equal(op->getRegions(), newOp->getRegions()))
       rewriter.inlineRegionBefore(oldRegion, newRegion, newRegion.end());
 
+    // Block arguments inside the inlined regions still carry the
+    // pre-flatten types — `inlineRegionBefore` doesn't run the
+    // converter on them. `hc.for_range` is the canonical victim:
+    // its body's iter-arg block args must match the converted
+    // `iter_inits` operand types or the parent verifier rejects the
+    // op. Run the converter across every region; for ops whose body
+    // block args don't get flattened (`hc.generic`'s scalar element
+    // types, etc.) this is a no-op.
+    for (Region &region : newOp->getRegions()) {
+      if (region.empty())
+        continue;
+      if (failed(rewriter.convertRegionTypes(&region, *getTypeConverter())))
+        return failure();
+    }
+
     // Pair each new flat result with its aux values for replacement.
     SmallVector<SmallVector<Value>> replacementStorage;
     replacementStorage.reserve(op->getNumResults());
@@ -1173,6 +1188,63 @@ struct RetypeAnyHCOp : public ConversionPattern {
   }
 };
 
+// Update the `function_type` attribute and body block arguments of a
+// HC dialect symbol op (`hc.intrinsic`, `hc.func`, `hc.kernel`) so the
+// signature stays in sync with the converted call sites and bodies.
+// Unlike `func.func`, these ops don't implement `FunctionOpInterface`,
+// so the upstream populator doesn't see them; without this pattern,
+// the verifier on `hc.call_intrinsic` / `hc.call` rejects the op once
+// the operand types diverge from the still-original declared
+// signature.
+//
+// The body block args are converted via `applySignatureConversion` so
+// the 1-to-N expansion the converter emits for shaped types (one flat
+// carrier + N aux `!hc.idx<sym>` for free dim/stride symbols) lands
+// as parallel block arguments — the same surface call sites get on
+// their operand expansion.
+template <typename SymbolOp>
+struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
+  using OpConversionPattern<SymbolOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(SymbolOp op,
+                  typename OpConversionPattern<SymbolOp>::OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    std::optional<FunctionType> fnType = op.getFunctionType();
+    if (!fnType)
+      return failure();
+
+    SmallVector<Type> ins;
+    if (failed(
+            this->getTypeConverter()->convertTypes(fnType->getInputs(), ins)))
+      return failure();
+    SmallVector<Type> outs;
+    if (failed(
+            this->getTypeConverter()->convertTypes(fnType->getResults(), outs)))
+      return failure();
+    auto newType = FunctionType::get(rewriter.getContext(), ins, outs);
+    if (newType == *fnType)
+      return failure();
+
+    Region &body = op.getBody();
+    rewriter.modifyOpInPlace(op, [&] {
+      op.setFunctionType(newType);
+      if (body.empty())
+        return;
+      TypeConverter::SignatureConversion conversion(fnType->getNumInputs());
+      for (auto [index, input] : llvm::enumerate(fnType->getInputs())) {
+        SmallVector<Type> converted;
+        if (failed(this->getTypeConverter()->convertType(input, converted)))
+          return;
+        conversion.addInputs(index, converted);
+      }
+      rewriter.applySignatureConversion(&body.front(), conversion,
+                                        this->getTypeConverter());
+    });
+    return success();
+  }
+};
+
 struct HCFlattenWithLayoutsPass final
     : public hc::impl::HCFlattenWithLayoutsBase<HCFlattenWithLayoutsPass> {
   void runOnOperation() final {
@@ -1191,9 +1263,11 @@ struct HCFlattenWithLayoutsPass final
     // Per-access-op patterns are listed first by intent — the
     // conversion driver still picks via benefit (2 vs the generic
     // retype's 1), but having them grouped reads as the design.
-    patterns
-        .add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeLoadMaskOffsets,
-             ComposeStoreOffsets, DropAsLayout, RetypeAnyHCOp>(converter, ctx);
+    patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets,
+                 ComposeLoadMaskOffsets, ComposeStoreOffsets, DropAsLayout,
+                 RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
+                 ConvertHCSymbolSignatureOp<HCFuncOp>,
+                 ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
 
     target.markUnknownOpDynamicallyLegal([&](Operation *op) {
       if (auto fn = dyn_cast<FunctionOpInterface>(op))
@@ -1207,6 +1281,22 @@ struct HCFlattenWithLayoutsPass final
       // the cosmetic relabel in place.
       if (isa<HCAsLayoutOp>(op))
         return false;
+      // HC's symbol-carrying ops carry their signature in a
+      // `function_type` attribute; `converter.isLegal(op)` only inspects
+      // operand/result types, which are zero on these ops. Match the
+      // upstream `FunctionOpInterface` legality rule explicitly.
+      auto checkSignature = [&](FunctionType fnType) {
+        return converter.isSignatureLegal(fnType);
+      };
+      if (auto kernel = dyn_cast<HCKernelOp>(op))
+        if (auto fnType = kernel.getFunctionType())
+          return checkSignature(*fnType);
+      if (auto fn = dyn_cast<HCFuncOp>(op))
+        if (auto fnType = fn.getFunctionType())
+          return checkSignature(*fnType);
+      if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
+        if (auto fnType = intrinsic.getFunctionType())
+          return checkSignature(*fnType);
       // HC dialect ops are legal iff every operand and every result type
       // is already in its converted form. The `RetypeAnyHCOp` pattern
       // takes care of the rebuild when one side still carries the

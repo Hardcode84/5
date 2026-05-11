@@ -24,11 +24,13 @@
 // types, pinned `!hc.idx<expr>` indices on load and store). Inputs that
 // don't match (slice-indexed loads, intrinsic-mediated WMMA paths, ...)
 // flow through untouched and lower via the existing per-op handlers in
-// `hc-lower-launch-body`. `hc-lower-generic` runs immediately after
-// `hc-lower-launch-body` so any `hc.generic` whose operands are
-// `!hc.ptr` collapses to the loop nest. `hc-flatten-with-layouts`
-// is intentionally not in the chain here — see the comment at the
-// `hc-lower-generic` slot below for the contract gap that defers it.
+// `hc-lower-launch-body`. `hc-flatten-with-layouts` follows the
+// generic rewriters and bounds inference: every shaped value
+// collapses to its 1D bare carrier and every `hc.generic` operand /
+// access op offset composes through the operand layout into a single
+// 1D `#hc.expr`. `hc-lower-generic` runs after `hc-lower-launch-body`
+// so any `hc.generic` whose operands are `!hc.ptr` collapses to the
+// `scf.parallel` / `scf.for` loop nest.
 //
 // The closing chunk produces the device-side artefacts the GPU lowering
 // pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
@@ -125,24 +127,33 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
+    // Flatten runs after `hc-lower-launch-body` so the collective
+    // scope regions (`hc.workitem_region` / `hc.subgroup_region`) and
+    // every per-op shaped-access path that lower-launch-body still
+    // owns (the WMMA recipe surface, cooperative-copy LDS staging,
+    // `hc.buffer_view` slice walks) are gone before the type-only
+    // 1-to-N converter touches the IR. Every shaped value collapses
+    // to its 1D bare carrier and every surviving `hc.generic`
+    // operand / per-access op offset composes through the operand
+    // layout into a single 1D `#hc.expr` for the lowering below.
+    %m13b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m13
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13b {
+      // `applyPartialConversion` plants `unrealized_conversion_cast`s
+      // on every boundary nothing else converted; fold them away here
+      // so downstream passes don't have to special-case the cast walk.
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m13b : !transform.any_op
     // Lower every `hc.generic` whose operands have already been
-    // converted to `!hc.ptr` (by the launch-body pass above) to an
-    // outer `scf.parallel` over the parallel iters and an inner
-    // `scf.for` nest over reduction iters. v0 bails on any operand
-    // with a multi-axis offset array — until per-axis-array
-    // composition is wired up, the pass is a no-op for current
-    // inputs (the WMMA path lowers via `hc-interpret-intrinsic-recipes`,
-    // not generic). Wired here so the schedule shape stays pinned.
-    //
-    // `hc-flatten-with-layouts` does NOT slot in here yet: its
-    // per-access offset composer (`ComposeLoadOffsets` family)
-    // collapses load/store/vload index lists from rank-N to a
-    // single 1D offset, but the per-op patterns in
-    // `hc-lower-launch-body` and the `hc.generic` per-axis offset
-    // arrays this pass consumes still expect logical rank-N
-    // indexing — the offset-composition rewrite needs to reach
-    // those consumers before flatten can land in the schedule.
-    %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13
+    // converted to `!hc.ptr` (by the launch-body pass above) and
+    // composed to a single 1D offset (by the flatten pass above) to
+    // an outer `scf.parallel` over the parallel iters and an inner
+    // `scf.for` nest over reduction iters. The pass bails on any
+    // generic that doesn't fit its v0 surface — for the WMMA path
+    // that means a no-op since the recipe is dispatched via
+    // `hc-interpret-intrinsic-recipes` instead of generic.
+    %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13a {
       transform.apply_patterns.canonicalization

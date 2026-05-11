@@ -952,19 +952,22 @@ generic-pipeline rewriters (`hc-canonicalize-layouts`,
 DCE pair: each one is conservative and only fires on inputs that match
 its v0 surface (rank-2 matmul / reduce, all-shaped per-element arith,
 pinned `!hc.idx<expr>` indices on load and store) — anything outside
-that surface flows through untouched and reaches the per-op handlers in
-`hc-lower-launch-body`. `hc-lower-generic` is wired immediately after
-`hc-lower-launch-body` and lowers any `hc.generic` whose operands are
-already `!hc.ptr` (post-launch-body) to an outer `scf.parallel` over
-the parallel iters and an inner `scf.for` nest over reduction iters;
-v0 bails on inputs whose per-axis offset arrays haven't been collapsed
-to single-entry, so the pass is a no-op for current real workloads.
-`hc-flatten-with-layouts` is intentionally NOT in the schedule yet:
-its per-access offset composer (`ComposeLoadOffsets` and friends) folds
-load/store/vload index lists from rank-N to a single 1D offset, while
-the launch-body per-op patterns still expect a rank-N index list to
-match the rank-N kernel-arg buffer carrier. That contract gap blocks
-wiring flatten until launch-body learns the 1D-index path.
+that surface flows through untouched and reaches the per-op handlers
+in `hc-lower-launch-body`. `hc-flatten-with-layouts` slots in
+immediately after `hc-lower-launch-body` and the canonicalize/CSE pair:
+by then the collective scope regions (`hc.workitem_region` /
+`hc.subgroup_region`) and the per-op shaped-access paths the
+launch-body pass owns (the WMMA recipe surface, cooperative-copy LDS
+staging, `hc.buffer_view` slice walks) are already gone, so the
+type-only 1-to-N converter sees a settled surface. Flatten then
+collapses every shaped value to its 1D bare carrier and composes
+per-access offsets and `hc.generic` per-axis offset arrays into a
+single 1D `#hc.expr` per operand. `hc-lower-generic` picks up
+generic candidates with the single composed offset per operand and
+lowers them to an outer `scf.parallel` over the parallel iters and
+an inner `scf.for` nest over reduction iters; the WMMA path takes
+the recipe surface instead of generic, so the pass is a no-op for
+that workload.
 `hc-lower-launch-body` is now memref-free end to end: workgroup-AS
 storage lands on `!hc.ptr<workgroup, T>` and kernel-arg loads/stores
 go through `hc.ptr_offset` + `hc.ptr_load[_pred]` /

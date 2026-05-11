@@ -52,13 +52,6 @@ static std::optional<StringRef> exactSymbolName(Attribute attr) {
   return StringRef(ixs_node_sym_name(node));
 }
 
-static std::optional<int64_t> integerLiteral(Attribute attr) {
-  auto expr = dyn_cast<ExprAttr>(attr);
-  if (!expr)
-    return std::nullopt;
-  return sym::getIntegerLiteralValue(expr.getValue());
-}
-
 static Type convertScalarABIType(Type type) {
   if (isa<IdxType>(type))
     return IndexType::get(type.getContext());
@@ -71,29 +64,18 @@ static Type convertScalarABIType(Type type) {
 
 static Type convertABIType(Type type);
 
-static MemRefType convertBufferABIType(BufferType type) {
+// Resolve the `!hc.ptr<global, T?>` payload type for a buffer ABI arg.
+// `T` is dropped when the buffer's element type isn't trivially representable
+// in MLIR (the only example today is `!hc.undef`); LLVM is opaque-pointers-only
+// post-llvm17 so the carried element type is purely a typing convenience for
+// the surrounding HC code.
+static PtrType convertBufferABIType(BufferType type) {
   Type elementType = type.getElementType();
   if (isa<UndefType>(elementType))
-    elementType = IntegerType::get(type.getContext(), 8);
+    elementType = nullptr;
   else if (Type converted = convertScalarABIType(elementType))
     elementType = converted;
-
-  SmallVector<int64_t> dims;
-  dims.reserve(type.getShape().getDims().size());
-  for (Attribute dim : type.getShape().getDims()) {
-    std::optional<int64_t> literal = integerLiteral(dim);
-    dims.push_back(literal && *literal >= 0 ? *literal : ShapedType::kDynamic);
-  }
-  // All-dynamic strides + zero offset: the host wrapper pulls the actual
-  // per-axis element stride from the input PyObject via
-  // `_mlir_ciface_hc_get_stride`, so even a static-shape kernel can be
-  // launched on a transposed/sliced tensor without silently miscomputing.
-  // A `MemRefType::get` with no layout would imply identity (contiguous
-  // row-major) strides, which is exactly the wrong default.
-  SmallVector<int64_t> strides(dims.size(), ShapedType::kDynamic);
-  auto layout =
-      StridedLayoutAttr::get(type.getContext(), /*offset=*/0, strides);
-  return MemRefType::get(dims, elementType, layout);
+  return PtrType::get(type.getContext(), AddrSpace::Global, elementType);
 }
 
 static Type convertABIType(Type type) {
@@ -325,9 +307,15 @@ static void ensureRuntimeHelpers(ModuleOp module) {
   Type i32 = IntegerType::get(ctx, 32);
   Type i64 = IntegerType::get(ctx, 64);
   Type f64 = Float64Type::get(ctx);
+  // `hc_get_ptr` is the descriptor-free entry — the host wrapper hands its
+  // result straight to `gpu.launch_func` as the buffer arg, no memref
+  // packing in between. Returns `!llvm.ptr` (matching the `data_ptr()` raw
+  // address). Kept alongside `hc_get_buffer` for any in-flight consumer
+  // still on the legacy memref envelope.
   Type byteRef =
       MemRefType::get({ShapedType::kDynamic}, IntegerType::get(ctx, 8));
   ensureRuntimeHelper(module, "hc_get_buffer", {ptr}, {byteRef});
+  ensureRuntimeHelper(module, "hc_get_ptr", {ptr}, {ptr});
   ensureRuntimeHelper(module, "hc_get_dim", {ptr, i32}, {i64});
   ensureRuntimeHelper(module, "hc_get_stride", {ptr, i32}, {i64});
   ensureRuntimeHelper(module, "hc_get_int64", {ptr}, {i64});
@@ -361,67 +349,63 @@ static Value callGetStride(OpBuilder &builder, Location loc, ModuleOp module,
                            dimIndex);
 }
 
-// Materialize a typed memref from a `PyObject *` argument. Three steps:
-//   1. pull a 1D byte buffer descriptor via `_mlir_ciface_hc_get_buffer`,
-//   2. re-type it to the kernel's element type via `memref.view` (which is
-//      the only memref op upstream provides for byte→T bit-casts; the
-//      identity strides it bakes in are intermediate and discarded below),
-//   3. apply the real per-axis strides via `memref.reinterpret_cast` using
-//      values pulled from `_mlir_ciface_hc_get_stride`. This is what makes
-//      a transposed/sliced tensor (`numpy[..., ::2]`, `torch.transpose`)
-//      work — without it we'd silently miscompute against any
-//      non-contiguous input.
-static Value buildTypedBuffer(OpBuilder &builder, Location loc, ModuleOp module,
-                              Value pyArg, MemRefType resultType,
-                              ArrayRef<Value> shapeValues) {
-  auto fn = module.lookupSymbol<func::FuncOp>("hc_get_buffer");
-  auto call = func::CallOp::create(builder, loc, fn, ValueRange{pyArg});
-  Value byteBuf = call.getResult(0);
+// Per-buffer kernel-arg materialization. The original `!hc.buffer<T, [dims]>`
+// block arg expands at the kernel boundary into:
+//   1. a `!hc.ptr<global, T?>` carrying the raw `data_ptr()` (one slot per
+//      buffer, regardless of rank).
+//   2. one `index` slot per axis, holding the dim value pulled from
+//      `_mlir_ciface_hc_get_dim` or resolved through `ExprLowerer` for
+//      non-trivial shape exprs.
+//   3. one `index` slot per axis, holding the per-axis element stride from
+//      `_mlir_ciface_hc_get_stride` — that's what makes a transposed /
+//      sliced input (`numpy[..., ::2]`, `torch.transpose`) compute the
+//      right offsets without us silently falling back to row-major.
+// The values are stitched into a single 1-to-N `unrealized_conversion_cast`
+// whose result type is the original `!hc.buffer<...>` so the kernel body's
+// existing buffer-typed code sees no immediate change. Launch-body walks
+// the cast back to (ptr, dims, strides) when it lowers `hc.load` /
+// `hc.store` to `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+struct BufferABIPack {
+  Value ptr;
+  SmallVector<Value> dims;
+  SmallVector<Value> strides;
+};
 
-  // `memref.view` rejects layout attrs on its result, so the intermediate
-  // typed view must drop the strided layout. Sizes flow through the same
-  // static/dynamic filter `view` requires (only dynamic dims as operands).
-  auto identityType =
-      MemRefType::get(resultType.getShape(), resultType.getElementType());
-  Value byteOffset =
-      arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-  SmallVector<Value> dynamicSizes;
-  for (auto [dim, value] :
-       llvm::zip_equal(resultType.getShape(), shapeValues)) {
-    if (dim == ShapedType::kDynamic)
-      dynamicSizes.push_back(value);
-  }
-  Value typedView = memref::ViewOp::create(builder, loc, identityType, byteBuf,
-                                           byteOffset, dynamicSizes)
-                        .getResult();
+// Materialize all the host-scope values that need to flow into the launch
+// region for a single buffer arg. The values are kept as a flat tuple
+// (ptr, dim0, dim1, ..., stride0, stride1, ...); the matching 1-to-N UCC
+// is built INSIDE the launch region by `cloneKernelBodyIntoLaunch` so that
+// `gpu-kernel-outlining` captures the raw ptr / dim / stride values (each
+// llvm-translatable) instead of the bridged `!hc.buffer<T, [dims]>` (not
+// translatable to LLVM).
+static BufferABIPack buildBufferPack(OpBuilder &builder, Location loc,
+                                     ModuleOp module, Value pyArg,
+                                     PtrType ptrType,
+                                     ArrayRef<Value> shapeValues) {
+  BufferABIPack pack;
 
-  // Sizes mirror the result type's shape: literal dims as IndexAttrs, dynamic
-  // dims pulled from the matching ExprLowerer-resolved `shapeValues` slot.
-  // The static/dynamic split has to match the result type's shape exactly
-  // (the verifier compares the static_sizes attr against the result type).
-  SmallVector<OpFoldResult> sizes;
-  sizes.reserve(resultType.getRank());
-  for (auto [dim, value] :
-       llvm::zip_equal(resultType.getShape(), shapeValues)) {
-    if (dim == ShapedType::kDynamic)
-      sizes.push_back(value);
-    else
-      sizes.push_back(builder.getIndexAttr(dim));
-  }
+  auto getPtr = module.lookupSymbol<func::FuncOp>("hc_get_ptr");
+  auto rawCall = func::CallOp::create(builder, loc, getPtr, ValueRange{pyArg});
+  Value rawPtr = rawCall.getResult(0);
+  pack.ptr = UnrealizedConversionCastOp::create(builder, loc, ptrType, rawPtr)
+                 .getResult(0);
 
-  // Strides are always dynamic (we never bake them into the type). Numpy and
-  // torch report `tensor.stride(i)` in element units; `_mlir_ciface_hc_get_*`
-  // forwards that verbatim, which is exactly what `memref.reinterpret_cast`
-  // wants for its strides operand.
-  SmallVector<OpFoldResult> strides;
-  strides.reserve(resultType.getRank());
-  for (unsigned i = 0; i < resultType.getRank(); ++i)
-    strides.push_back(callGetStride(builder, loc, module, pyArg, i));
+  pack.dims.assign(shapeValues.begin(), shapeValues.end());
+  pack.strides.reserve(shapeValues.size());
+  for (unsigned axis = 0; axis < shapeValues.size(); ++axis)
+    pack.strides.push_back(callGetStride(builder, loc, module, pyArg, axis));
+  return pack;
+}
 
-  return memref::ReinterpretCastOp::create(builder, loc, resultType, typedView,
-                                           /*offset=*/builder.getIndexAttr(0),
-                                           sizes, strides)
-      .getResult();
+static Value buildBufferUCC(OpBuilder &builder, Location loc, BufferType target,
+                            const BufferABIPack &pack) {
+  SmallVector<Value> inputs;
+  inputs.reserve(1 + pack.dims.size() + pack.strides.size());
+  inputs.push_back(pack.ptr);
+  inputs.append(pack.dims.begin(), pack.dims.end());
+  inputs.append(pack.strides.begin(), pack.strides.end());
+  return UnrealizedConversionCastOp::create(builder, loc, target, inputs)
+      .getResult(0);
 }
 
 // Pull a scalar argument of arbitrary HC scalar ABI type out of a PyObject.
@@ -504,10 +488,15 @@ static LogicalResult lowerLaunchGeometry(OpBuilder &builder, Location loc,
   return success();
 }
 
-static LogicalResult cloneKernelBodyIntoLaunch(OpBuilder &builder,
-                                               HCKernelOp kernel,
-                                               gpu::LaunchOp launch,
-                                               ArrayRef<Value> kernelABIArgs) {
+// `kernelABIArgs[i]` is non-null for scalar args (already correctly typed
+// for the kernel body's expectation). `bufferPacks[i]` is set for buffer
+// args; the bridging 1-to-N UCC is materialized inside the launch region
+// here (not at host scope) so `gpu-kernel-outlining` captures the raw
+// ptr/dim/stride values rather than the bridged `!hc.buffer<...>`.
+static LogicalResult
+cloneKernelBodyIntoLaunch(OpBuilder &builder, HCKernelOp kernel,
+                          gpu::LaunchOp launch, ArrayRef<Value> kernelABIArgs,
+                          ArrayRef<std::optional<BufferABIPack>> bufferPacks) {
   Block &kernelBlock = kernel.getBody().front();
   Operation *returnLike = nullptr;
   if (!kernelBlock.empty()) {
@@ -539,6 +528,9 @@ static LogicalResult cloneKernelBodyIntoLaunch(OpBuilder &builder,
       replacement = UnrealizedConversionCastOp::create(builder, arg.getLoc(),
                                                        arg.getType(), undef)
                         .getResult(0);
+    } else if (auto buffer = dyn_cast<BufferType>(arg.getType())) {
+      replacement =
+          buildBufferUCC(builder, arg.getLoc(), buffer, *bufferPacks[index]);
     } else {
       Value abiValue = kernelABIArgs[index];
       replacement = abiValue.getType() == arg.getType()
@@ -609,6 +601,8 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   // matches the previous "first wins" behaviour now that we're free of
   // lexical kernel-arg order.
   SmallVector<Value> kernelABIArgs(kernelBlock.getNumArguments());
+  SmallVector<std::optional<BufferABIPack>> bufferPacks(
+      kernelBlock.getNumArguments());
   BoundValues boundValues;
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
     if (isa<GroupType>(arg.getType()))
@@ -628,7 +622,7 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   // Buffer args. For each, harvest any free shape symbols from this buffer's
   // shape (calling `_get_dim` once per first-occurrence symbol) and lower the
   // full shape attr — including non-trivial exprs — through `ExprLowerer` so
-  // we can pass concrete dim values to `memref.view`.
+  // we can pass concrete dim values into the per-buffer 1-to-N cast.
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
     auto buffer = dyn_cast<BufferType>(arg.getType());
     if (!buffer)
@@ -654,9 +648,9 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
                << index;
       shapeValues.push_back(*dimValue);
     }
-    auto memrefType = cast<MemRefType>(kernelABITypes[index]);
-    kernelABIArgs[index] =
-        buildTypedBuffer(builder, loc, module, pyArg, memrefType, shapeValues);
+    auto ptrType = cast<PtrType>(kernelABITypes[index]);
+    bufferPacks[index] =
+        buildBufferPack(builder, loc, module, pyArg, ptrType, shapeValues);
   }
 
   SmallVector<Value> grid;
@@ -667,7 +661,8 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
 
   auto launch = gpu::LaunchOp::create(builder, loc, grid[0], grid[1], grid[2],
                                       block[0], block[1], block[2]);
-  if (failed(cloneKernelBodyIntoLaunch(builder, kernel, launch, kernelABIArgs)))
+  if (failed(cloneKernelBodyIntoLaunch(builder, kernel, launch, kernelABIArgs,
+                                       bufferPacks)))
     return failure();
 
   builder.setInsertionPointAfter(launch);

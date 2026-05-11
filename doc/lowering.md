@@ -962,16 +962,23 @@ to single-entry, so the pass is a no-op for current real workloads.
 its per-access offset composer (`ComposeLoadOffsets` and friends) folds
 load/store/vload index lists from rank-N to a single 1D offset, while
 the launch-body per-op patterns still expect a rank-N index list to
-match the rank-N kernel-arg memref. That contract gap blocks wiring
-flatten until launch-body learns the 1D-index path.
-`hc-lower-launch-body` itself now emits the workgroup-AS family on
-`!hc.ptr<workgroup, T>` rather than `memref<..., #gpu.address_space<workgroup>>`
-([`doc/layouts.md`](layouts.md) covers the contract and the kernel-arg
-side that still flows through as `memref`). Kernel lowering then
-converts each semantic `hc.kernel` into a host `func.func` with a
-`gpu.launch`, exposing buffer ABI arguments as memrefs and leaving
-remaining HC body operations behind explicit conversion boundaries for
-the subsequent upstream-lowering slices.
+match the rank-N kernel-arg buffer carrier. That contract gap blocks
+wiring flatten until launch-body learns the 1D-index path.
+`hc-lower-launch-body` is now memref-free end to end: workgroup-AS
+storage lands on `!hc.ptr<workgroup, T>` and kernel-arg loads/stores
+go through `hc.ptr_offset` + `hc.ptr_load[_pred]` /
+`hc.ptr_store[_pred]` against the `(ptr, dim*, stride*)` tuple
+`hc-lower-kernels-to-gpu-launch` plants at the host boundary
+([`doc/layouts.md`](layouts.md) covers both contracts). Kernel
+lowering then converts each semantic `hc.kernel` into a host
+`func.func` with a `gpu.launch`, exposing buffer ABI arguments as
+`!hc.ptr<global, T>` rather than memrefs and leaving remaining HC
+body operations behind explicit conversion boundaries for the
+subsequent upstream-lowering slices. `hc-lower-to-llvm` finishes the
+job: `!hc.ptr<global, T>` → `!llvm.ptr<1>` on `gpu.func` and
+`func.func` signatures, with an `llvm.addrspacecast` planted at the
+host boundary to bridge the generic pointer (returned by
+`hc_get_ptr`) to the global pointer the kernel consumes.
 
 ### SSA construction
 
@@ -1089,12 +1096,16 @@ shim, with no external ROCm install on the host. The pieces are:
      `gpu.launch_func`, no MLIR-side device modules.
 2. **Runtime helpers (`libhc_rt_helpers.so`).** The host wrapper
    takes one `PyObject *` per user argument and unpacks each one
-   through the `_mlir_ciface_hc_get_buffer` / `_mlir_ciface_hc_get_int64`
+   through the `_mlir_ciface_hc_get_ptr` / `_mlir_ciface_hc_get_int64`
    / `_mlir_ciface_hc_get_float64` / `_mlir_ciface_hc_get_dim` /
-   `_mlir_ciface_hc_get_stride` helpers. These borrow the buffer
-   protocol / `__cuda_array_interface__` view of the object — they
-   do not allocate, copy, or take ownership; the caller keeps the
-   tensor alive across the launch.
+   `_mlir_ciface_hc_get_stride` helpers. The buffer ABI uses the
+   pointer + per-axis dim/stride trio (no memref descriptor
+   envelope); `hc_get_buffer` is kept around for internal
+   transitional callers but is no longer on the kernel-arg path.
+   These helpers borrow the buffer protocol /
+   `__cuda_array_interface__` view of the object — they do not
+   allocate, copy, or take ownership; the caller keeps the tensor
+   alive across the launch.
 3. **HIP shim (`libhc_hip_runtime.so`).** Statically dlopens
    `libamdhip64.so` on first use (`hc_rt_init`, mutex-serialized and
    double-checked, idempotent) and exposes `hc_rt_load_kernel` /

@@ -216,18 +216,89 @@ struct BoundValues {
   }
 };
 
-static Value dim(OpBuilder &builder, Location loc, Value memref, int64_t axis) {
-  return memref::DimOp::create(builder, loc, memref, axis).getResult();
+// Kernel-arg fragment: the UCC at the launch boundary expands a single
+// `!hc.buffer<T, [dims]>` into 1 + 2N values — a global pointer, then per-axis
+// dim values, then per-axis element-stride values, in that order. The host
+// wrapper builds it (`hc-lower-kernels-to-gpu-launch`); launch-body sees the
+// UCC, walks back through it, and turns the per-element load/store into
+// `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+struct KernelArgSource {
+  Value ptr;
+  SmallVector<Value> dims;
+  SmallVector<Value> strides;
+
+  unsigned rank() const { return dims.size(); }
+};
+
+static std::optional<KernelArgSource> resolveKernelArg(Value source) {
+  auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
+  if (!cast || cast.getOutputs().size() != 1)
+    return std::nullopt;
+  if (cast.getInputs().size() < 1)
+    return std::nullopt;
+  if ((cast.getInputs().size() - 1) % 2 != 0)
+    return std::nullopt;
+
+  Value ptr = cast.getInputs().front();
+  auto ptrType = dyn_cast<PtrType>(ptr.getType());
+  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Global)
+    return std::nullopt;
+
+  unsigned rank = (cast.getInputs().size() - 1) / 2;
+  KernelArgSource info;
+  info.ptr = ptr;
+  info.dims.reserve(rank);
+  info.strides.reserve(rank);
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    Value dim = cast.getInputs()[1 + axis];
+    if (!dim.getType().isIndex())
+      return std::nullopt;
+    info.dims.push_back(dim);
+  }
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    Value stride = cast.getInputs()[1 + rank + axis];
+    if (!stride.getType().isIndex())
+      return std::nullopt;
+    info.strides.push_back(stride);
+  }
+  return info;
 }
 
-static void bindShapeSymbols(OpBuilder &builder, Location loc, BufferType type,
-                             Value memref, BoundValues &boundValues) {
+// Compose the linear element offset for a multi-axis access against a
+// kernel-arg buffer: `sum_axis(indices[axis] * strides[axis])`. The result
+// is in element units (matching torch/numpy `tensor.stride(i)` reporting),
+// not bytes — `hc.ptr_offset` does its own element-size scaling on the
+// way to LLVM.
+static Value linearizeKernelArgOffset(OpBuilder &builder, Location loc,
+                                      const KernelArgSource &source,
+                                      ValueRange indices) {
+  assert(indices.size() == source.rank() &&
+         "kernel-arg offset rank must match source rank");
+  Value offset;
+  for (auto [index, stride] : llvm::zip_equal(indices, source.strides)) {
+    Value term = arith::MulIOp::create(builder, loc, index, stride).getResult();
+    offset = offset
+                 ? arith::AddIOp::create(builder, loc, offset, term).getResult()
+                 : term;
+  }
+  if (!offset)
+    offset = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  return offset;
+}
+
+// Bind each free shape symbol from `type` to its matching dim value pulled
+// out of the kernel-arg UCC fragment. Replaces the prior `memref.dim`
+// chain — the dims now ride as explicit UCC inputs (one per axis).
+static void bindShapeSymbols(BufferType type, const KernelArgSource &source,
+                             BoundValues &boundValues) {
   for (auto [axis, attr] : llvm::enumerate(type.getShape().getDims())) {
     auto expr = dyn_cast<ExprAttr>(attr);
     std::optional<StringRef> symbol = exactSymbolName(expr);
     if (!symbol)
       continue;
-    boundValues.bind(*symbol, dim(builder, loc, memref, axis));
+    if (axis >= source.rank())
+      continue;
+    boundValues.bind(*symbol, source.dims[axis]);
   }
 }
 
@@ -261,18 +332,19 @@ static BoundValues collectBoundValues(Operation *anchor,
   bindLaunchDim3("$WGS", launch.getBlockSizeOperandValues(), boundValues);
 
   launch.walk([&](UnrealizedConversionCastOp cast) {
-    if (cast.getInputs().size() != 1 || cast.getOutputs().size() != 1)
+    if (cast.getOutputs().size() != 1)
       return;
-    Value input = cast.getInputs().front();
     Type outputType = cast.getOutputs().front().getType();
 
     if (auto buffer = dyn_cast<BufferType>(outputType)) {
-      if (isa<MemRefType>(input.getType()))
-        bindShapeSymbols(rewriter, anchor->getLoc(), buffer, input,
-                         boundValues);
+      if (auto info = resolveKernelArg(cast.getResult(0)))
+        bindShapeSymbols(buffer, *info, boundValues);
       return;
     }
 
+    if (cast.getInputs().size() != 1)
+      return;
+    Value input = cast.getInputs().front();
     if (std::optional<StringRef> symbol = exactSymbolName(outputType))
       boundValues.bind(*symbol, indexCast(rewriter, anchor->getLoc(), input));
   });
@@ -530,16 +602,6 @@ private:
   Location loc;
   const BoundValues &boundValues;
 };
-
-static Value sourceMemRef(Value source) {
-  auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
-  if (cast && cast.getInputs().size() == 1 && cast.getOutputs().size() == 1) {
-    Value input = cast.getInputs().front();
-    if (isa<MemRefType>(input.getType()))
-      return input;
-  }
-  return isa<MemRefType>(source.getType()) ? source : Value();
-}
 
 static Type convertIntrinsicBoundaryType(Type type,
                                          const TypeConverter &converter) {
@@ -930,13 +992,12 @@ linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
 // LDS writes route through `hc.ptr_offset` + `hc.ptr_store` against the
 // flat workgroup buffer. The linear index already in hand from the
 // per-thread chunk loop *is* the flat offset; the per-axis coords only
-// participate in computing the source index back into the kernel-arg
-// memref.
-static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
-                                         Operation *anchor, Value sourceMemRef,
-                                         ArrayRef<SliceAxis> axes, Value lds,
-                                         ArrayRef<int64_t> ldsShape,
-                                         Type elementType) {
+// participate in computing the source offset back into the kernel-arg
+// global pointer.
+static LogicalResult
+emitCooperativeCopy(OpBuilder &builder, Location loc, Operation *anchor,
+                    const KernelArgSource &source, ArrayRef<SliceAxis> axes,
+                    Value lds, ArrayRef<int64_t> ldsShape, Type elementType) {
   FailureOr<std::pair<Value, Value>> tidAndSize =
       linearizedThreadAndSize(builder, loc, anchor);
   if (failed(tidAndSize))
@@ -1029,7 +1090,7 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
     for (auto [axisIdx, info] : llvm::enumerate(axes)) {
       if (!info.isSlice)
         continue;
-      Value extent = dim(builder, loc, sourceMemRef, axisIdx);
+      Value extent = source.dims[axisIdx];
       Value check =
           arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
                                 srcIndices[axisIdx], extent)
@@ -1038,14 +1099,22 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
           arith::AndIOp::create(builder, loc, inBounds, check).getResult();
     }
 
+    // Predicated load against the kernel-arg ptr: in-bounds gives the
+    // tile element, OOB lanes pad with zero (matching the prior
+    // `transfer_read` semantics). The branchless `hc.ptr_load_pred` keeps
+    // the inner if-then-else flat for downstream LLVM SLP recombination.
+    auto sourcePtrType = cast<PtrType>(source.ptr.getType());
+    Value flatSrc = linearizeKernelArgOffset(builder, loc, source, srcIndices);
+    Value srcAddr =
+        HCPtrOffsetOp::create(builder, loc, sourcePtrType, source.ptr, flatSrc)
+            .getResult();
     auto loadIf = scf::IfOp::create(builder, loc, TypeRange{elementType},
                                     inBounds, /*withElseRegion=*/true);
     {
       OpBuilder::InsertionGuard thenGuard(builder);
       builder.setInsertionPointToStart(&loadIf.getThenRegion().front());
       Value loaded =
-          memref::LoadOp::create(builder, loc, sourceMemRef, srcIndices)
-              .getResult();
+          HCPtrLoadOp::create(builder, loc, elementType, srcAddr).getResult();
       scf::YieldOp::create(builder, loc, loaded);
     }
     {
@@ -1068,8 +1137,8 @@ static LogicalResult emitCooperativeCopy(OpBuilder &builder, Location loc,
 }
 
 // Walk back through an `unrealized_conversion_cast` to recover a workgroup-AS
-// `!hc.ptr` value. Counterpart to `sourceMemRef` for the launch-body's LDS
-// path; kernel-arg pointers go through `sourceMemRef` and stay as memrefs
+// `!hc.ptr` value. Counterpart to `resolveKernelArg` for the launch-body's
+// LDS path; kernel-arg buffers come in as ptr+dims+strides UCC bundles
 // for now. Returns null if `value` doesn't ultimately derive from a
 // workgroup ptr.
 static Value sourcePtr(Value value) {
@@ -1470,15 +1539,14 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
       else
         return adaptor.getSource();
     }();
-    Value memref = sourceMemRef(source);
-    if (!memref)
+    std::optional<KernelArgSource> kernelArg = resolveKernelArg(source);
+    if (!kernelArg)
       return op.emitOpError(
-          "expected load source to be a memref or memref ABI cast");
-    auto memrefType = dyn_cast<MemRefType>(memref.getType());
-    if (!memrefType || memrefType.getRank() !=
-                           static_cast<int64_t>(adaptor.getIndices().size()))
+          "expected load source to be a kernel-arg ptr ABI cast");
+    if (kernelArg->rank() != static_cast<unsigned>(adaptor.getIndices().size()))
       return op.emitOpError(
-          "expected ranked memref with one subscript per axis");
+          "expected kernel-arg source rank to match index rank");
+    auto sourcePtrType = cast<PtrType>(kernelArg->ptr.getType());
 
     FailureOr<SmallVector<SliceAxis>> axes =
         collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
@@ -1502,8 +1570,9 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
         total *= d;
       Value lds =
           allocateWorkgroupPtr(rewriter, op.getLoc(), resultPtrType, total);
+      KernelArgSource argCopy = *kernelArg;
       if (failed(emitCooperativeCopy(rewriter, op.getLoc(), op.getOperation(),
-                                     memref, *axes, lds, resultShape,
+                                     argCopy, *axes, lds, resultShape,
                                      elementType)))
         return failure();
       rewriter.replaceOp(op, lds);
@@ -1511,13 +1580,11 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
     }
 
     // Per-lane vector result: each thread materializes its own fragment via
-    // per-element scalar `memref.load`s + `vector.insert`s. The previous
-    // path used `vector.transfer_read` (with an optional `memref.subview`
-    // for non-unit stride); switching to per-element keeps a single shape
-    // for unit and non-unit stride, sidesteps the i1 packed-vs-byte
-    // discrepancy that `vector.transfer_read` of `vector<Nxi1>` triggered,
-    // and lets LLVM's SLP recombine adjacent scalar loads when the slice
-    // is unit-stride.
+    // per-element scalar `hc.ptr_offset` + `hc.ptr_load`s + `vector.insert`s.
+    // Switching to per-element keeps a single shape for unit and non-unit
+    // stride, sidesteps the i1 packed-vs-byte discrepancy that
+    // `vector.transfer_read` of `vector<Nxi1>` triggered, and lets LLVM's
+    // SLP recombine adjacent scalar loads when the slice is unit-stride.
     Value zero =
         arith::ConstantOp::create(rewriter, op.getLoc(), resultVectorType,
                                   rewriter.getZeroAttr(resultVectorType))
@@ -1526,9 +1593,13 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
     for (ArrayRef<int64_t> resultCoord : staticVectorCoordinates(resultShape)) {
       SmallVector<Value> indices =
           kernelArgLaneIndices(rewriter, op.getLoc(), *axes, resultCoord);
-      Value elem =
-          memref::LoadOp::create(rewriter, op.getLoc(), memref, indices)
-              .getResult();
+      Value flat =
+          linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
+      Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), sourcePtrType,
+                                         kernelArg->ptr, flat)
+                       .getResult();
+      Value elem = HCPtrLoadOp::create(rewriter, op.getLoc(), elementType, addr)
+                       .getResult();
       laneVec = vector::InsertOp::create(rewriter, op.getLoc(), elem, laneVec,
                                          resultCoord)
                     .getResult();
@@ -1578,16 +1649,18 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
     mlir::VectorType maskVectorType =
         mlir::VectorType::get(maskShape, rewriter.getI1Type());
 
-    // Compute slice extents from either a kernel-arg memref (`memref.dim`)
-    // or a workgroup-staged tile (its bare-tensor shape is statically known).
-    Value memref = sourceMemRef(adaptor.getSource());
+    // Compute slice extents from either a kernel-arg ptr (per-axis dims
+    // ride as UCC inputs) or a workgroup-staged tile (its bare-tensor
+    // shape is statically known).
+    std::optional<KernelArgSource> kernelArg =
+        resolveKernelArg(adaptor.getSource());
     Value workgroupPtr;
     SmallVector<int64_t> sourceStaticShape;
-    if (!memref) {
+    if (!kernelArg) {
       workgroupPtr = sourcePtr(adaptor.getSource());
       if (!workgroupPtr)
         return op.emitOpError(
-            "expected mask source to be a memref or workgroup ptr");
+            "expected mask source to be a kernel-arg ptr or workgroup ptr");
       auto bare = dyn_cast<BareTensorType>(op.getSource().getType());
       if (!bare)
         return op.emitOpError(
@@ -1598,12 +1671,9 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
       if (failed(dims))
         return failure();
       sourceStaticShape = std::move(*dims);
-    } else {
-      auto memrefType = dyn_cast<MemRefType>(memref.getType());
-      if (!memrefType || memrefType.getRank() !=
-                             static_cast<int64_t>(adaptor.getIndices().size()))
-        return op.emitOpError(
-            "expected ranked memref with one subscript per axis");
+    } else if (kernelArg->rank() !=
+               static_cast<unsigned>(adaptor.getIndices().size())) {
+      return op.emitOpError("expected kernel-arg ptr rank to match index rank");
     }
 
     FailureOr<SmallVector<SliceAxis>> axes =
@@ -1628,8 +1698,8 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
       if (!info.isSlice)
         continue;
       Value extent;
-      if (memref) {
-        extent = dim(rewriter, op.getLoc(), memref, axis);
+      if (kernelArg) {
+        extent = kernelArg->dims[axis];
       } else {
         extent = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
                                                 sourceStaticShape[axis])
@@ -1903,15 +1973,15 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
   LogicalResult
   matchAndRewrite(HCStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value memref = sourceMemRef(adaptor.getDest());
-    if (!memref)
+    std::optional<KernelArgSource> kernelArg =
+        resolveKernelArg(adaptor.getDest());
+    if (!kernelArg)
       return op.emitOpError(
-          "expected store destination to be a memref or memref ABI cast");
-    auto memrefType = dyn_cast<MemRefType>(memref.getType());
-    if (!memrefType || memrefType.getRank() !=
-                           static_cast<int64_t>(adaptor.getIndices().size()))
+          "expected store destination to be a kernel-arg ptr ABI cast");
+    if (kernelArg->rank() != static_cast<unsigned>(adaptor.getIndices().size()))
       return op.emitOpError(
-          "expected ranked memref with one subscript per axis");
+          "expected kernel-arg destination rank to match index rank");
+    auto destPtrType = cast<PtrType>(kernelArg->ptr.getType());
 
     FailureOr<SmallVector<SliceAxis>> axes =
         collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
@@ -1966,26 +2036,23 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
           extractVectorElement(rewriter, op.getLoc(), *source, coordinate);
       SmallVector<Value> indices =
           storeIndicesForCoordinate(rewriter, op.getLoc(), *axes, coordinate);
+      Value flat =
+          linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
+      Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), destPtrType,
+                                         kernelArg->ptr, flat)
+                       .getResult();
       if (!mask) {
-        memref::StoreOp::create(rewriter, op.getLoc(), element, memref,
-                                indices);
+        HCPtrStoreOp::create(rewriter, op.getLoc(), element, addr);
         continue;
       }
 
+      // Predicated store: emit `hc.ptr_store_pred` directly so the mask
+      // rides as a first-class operand instead of via an `scf.if` guard.
+      // Keeps masked stores legible for downstream patterns and matches
+      // the symmetric `hc.ptr_load_pred` we emit for masked loads.
       Value guard =
           extractVectorElement(rewriter, op.getLoc(), mask, coordinate);
-      auto ifOp = scf::IfOp::create(rewriter, op.getLoc(), TypeRange{}, guard,
-                                    /*withElseRegion=*/false);
-      Block &thenBlock = ifOp.getThenRegion().front();
-      Operation *terminator = thenBlock.empty() ? nullptr : &thenBlock.back();
-      if (terminator)
-        rewriter.setInsertionPoint(terminator);
-      else
-        rewriter.setInsertionPointToEnd(&thenBlock);
-      memref::StoreOp::create(rewriter, op.getLoc(), element, memref, indices);
-      if (!terminator)
-        scf::YieldOp::create(rewriter, op.getLoc());
-      rewriter.setInsertionPointAfter(ifOp);
+      HCPtrStorePredOp::create(rewriter, op.getLoc(), element, addr, guard);
     }
 
     rewriter.eraseOp(op);
@@ -2205,11 +2272,15 @@ struct ConvertBufferDimOp : public OpConversionPattern<HCBufferDimOp> {
     Type converted = typeConverter->convertType(op.getDim().getType());
     if (!converted || !converted.isIndex())
       return failure();
-    Value memref = sourceMemRef(adaptor.getBuffer());
-    if (!memref)
+    std::optional<KernelArgSource> kernelArg =
+        resolveKernelArg(adaptor.getBuffer());
+    if (!kernelArg)
+      return op.emitOpError("expected buffer to be a kernel-arg ptr ABI cast");
+    int64_t axis = op.getAxis();
+    if (axis < 0 || static_cast<unsigned>(axis) >= kernelArg->rank())
       return op.emitOpError(
-          "expected buffer to be a memref or memref ABI cast");
-    rewriter.replaceOp(op, dim(rewriter, op.getLoc(), memref, op.getAxis()));
+          "buffer_dim axis out of range for the kernel-arg source");
+    rewriter.replaceOp(op, kernelArg->dims[axis]);
     return success();
   }
 };

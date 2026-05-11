@@ -181,18 +181,23 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     # per kernel argument and calls the `_mlir_ciface_hc_get_*`
     # helpers (declared with `llvm.emit_c_interface` so the wrapper
     # mangling lands on the symbols that libhc_rt_helpers.so exports)
-    # to materialize each tensor's data pointer and shape dims before
-    # dispatching. Pin each load-bearing milestone so the dump test
-    # fails loudly if anything regresses.
+    # to materialize each tensor's data pointer, shape dims, and
+    # strides before dispatching. The pointer arrives via
+    # `hc_get_ptr` (raw `!llvm.ptr`, addrspace-cast on the way to the
+    # kernel) — `hc_get_buffer`'s memref-descriptor envelope is gone
+    # from the kernel-arg ABI. Pin each load-bearing milestone so the
+    # dump test fails loudly if anything regresses.
     assert "module attributes {gpu.container_module}" in captured.out
     assert (
         "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "
         "%arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr)" in captured.out
     )
-    assert "@hc_get_buffer" in captured.out
-    assert "@_mlir_ciface_hc_get_buffer" in captured.out
+    assert "@hc_get_ptr" in captured.out
+    assert "@_mlir_ciface_hc_get_ptr" in captured.out
     assert "@hc_get_dim" in captured.out
     assert "@_mlir_ciface_hc_get_dim" in captured.out
+    assert "@hc_get_stride" in captured.out
+    assert "@_mlir_ciface_hc_get_stride" in captured.out
     assert "@hc_rt_load_kernel" in captured.out
     assert "@hc_rt_launch_kernel" in captured.out
     assert "@tiled_gfx11_wmma_matmul_kernel_data" in captured.out

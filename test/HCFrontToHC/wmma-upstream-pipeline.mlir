@@ -52,20 +52,24 @@
 
 // Runtime helper wrappers planted by `hc-lower-kernels-to-gpu-launch` and
 // then cwrapper-rewritten by `convert-func-to-llvm`: the public-name
-// wrapper handles memref descriptor sret packing for `hc_get_buffer` and
-// passes scalars straight through; the matching `_mlir_ciface_*` symbol
-// is the one libhc_rt_helpers.so actually exports. The buffer wrapper's
-// signature includes the descriptor struct as the LLVM-ABI return; the
-// dim wrapper passes its i64 directly.
-// CHECK-DAG: llvm.func private @hc_get_buffer({{.*}}: !llvm.ptr) -> !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>
-// CHECK-DAG: llvm.func @_mlir_ciface_hc_get_buffer(!llvm.ptr, !llvm.ptr)
+// wrapper passes scalars / pointers straight through to the matching
+// `_mlir_ciface_*` symbol libhc_rt_helpers.so exports. The
+// `hc.ptr<global, T?>` kernel-arg ABI calls into `hc_get_ptr` — no
+// memref descriptor on the wire — and pulls dims/strides via the matching
+// scalar helpers. The legacy `hc_get_buffer` decl can still appear if any
+// transitional consumer needs it, but the host wrapper's runtime calls
+// are exclusively the descriptor-free variants.
+// CHECK-DAG: llvm.func private @hc_get_ptr({{.*}}: !llvm.ptr) -> !llvm.ptr
+// CHECK-DAG: llvm.func @_mlir_ciface_hc_get_ptr(!llvm.ptr) -> !llvm.ptr
 // CHECK-DAG: llvm.func private @hc_get_dim({{.*}}: !llvm.ptr, {{.*}}: i32) -> i64
 // CHECK-DAG: llvm.func @_mlir_ciface_hc_get_dim(!llvm.ptr, i32) -> i64
+// CHECK-DAG: llvm.func private @hc_get_stride({{.*}}: !llvm.ptr, {{.*}}: i32) -> i64
+// CHECK-DAG: llvm.func @_mlir_ciface_hc_get_stride(!llvm.ptr, i32) -> i64
 
 // Host wrapper takes a leading `!llvm.ptr` stream slot followed by one
 // PyObject* (lowered to `!llvm.ptr`) per kernel argument — three buffers
 // in the WMMA example — and immediately calls the helpers to materialize
-// each tensor's data pointer and shape dims. The
+// each tensor's data pointer, dims, and strides. The
 // `--implicit-check-not='hc.'` guard above pins zero residual HC ops or
 // types, and `--implicit-check-not='vector.transfer'` proves every
 // transfer_read/write got reduced to vector.load/store before the rocdl
@@ -76,9 +80,9 @@
 // CHECK-SAME:    %[[B:[^:]+]]: !llvm.ptr
 // CHECK-SAME:    %[[C:[^:]+]]: !llvm.ptr
 // CHECK: llvm.call @hc_get_dim(%[[A]], %{{.*}}) : (!llvm.ptr, i32) -> i64
-// CHECK: llvm.call @hc_get_buffer(%[[A]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
-// CHECK: llvm.call @hc_get_buffer(%[[B]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
-// CHECK: llvm.call @hc_get_buffer(%[[C]]) : (!llvm.ptr) -> !llvm.struct<{{.*}}>
+// CHECK: llvm.call @hc_get_ptr(%[[A]]) : (!llvm.ptr) -> !llvm.ptr
+// CHECK: llvm.call @hc_get_ptr(%[[B]]) : (!llvm.ptr) -> !llvm.ptr
+// CHECK: llvm.call @hc_get_ptr(%[[C]]) : (!llvm.ptr) -> !llvm.ptr
 
 // Block/thread counts come from `work_shape / group_shape` (the
 // `arith.ceildivui`/`arith.muli` chain became `llvm.udiv`/`llvm.mul`

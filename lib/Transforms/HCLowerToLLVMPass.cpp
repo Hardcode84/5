@@ -12,7 +12,11 @@
 #include "hc/IR/HCOps.h"
 #include "hc/IR/HCTypes.h"
 
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -318,6 +322,119 @@ struct ConvertPtrStorePredOp : public OpConversionPattern<HCPtrStorePredOp> {
   }
 };
 
+// Hand-rolled `gpu.func` signature converter. Upstream's
+// `populateAnyFunctionOpInterfaceTypeConversionPattern` walks
+// `FunctionOpInterface`, but `gpu.func` chooses *not* to implement that
+// interface (it has its own arg-attr / known-block-size storage that
+// doesn't fit the standard surface). The pattern below mirrors what the
+// generic helper does — convert the function's signature, apply a
+// signature conversion to the entry block — but specialised to
+// `gpu.GPUFuncOp` so the kernel's `!hc.ptr<global, T>` arg slots come
+// out as `!llvm.ptr` (the addrspace lives on the type itself) before
+// `convert-gpu-to-rocdl` walks the body.
+struct ConvertGPUFuncOpSignature : public OpConversionPattern<gpu::GPUFuncOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(gpu::GPUFuncOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    FunctionType fnType = op.getFunctionType();
+    TypeConverter::SignatureConversion conversion(fnType.getNumInputs());
+    SmallVector<Type> newInputs;
+    for (auto [index, input] : llvm::enumerate(fnType.getInputs())) {
+      Type converted = typeConverter->convertType(input);
+      if (!converted)
+        return failure();
+      conversion.addInputs(index, converted);
+      newInputs.push_back(converted);
+    }
+    SmallVector<Type> newResults;
+    if (failed(typeConverter->convertTypes(fnType.getResults(), newResults)))
+      return failure();
+
+    auto newType =
+        FunctionType::get(rewriter.getContext(), newInputs, newResults);
+    if (newType == fnType && op.getBody().empty())
+      return failure();
+
+    rewriter.modifyOpInPlace(op, [&] {
+      op.setFunctionType(newType);
+      if (!op.getBody().empty())
+        (void)rewriter.convertRegionTypes(&op.getBody(), *typeConverter,
+                                          &conversion);
+    });
+    return success();
+  }
+};
+
+// `gpu.launch_func` carries operands by position — once the matching
+// `gpu.func` (or `func.func` host wrapper) signature has converted, the
+// launch's operand types must follow or the verifier rejects the launch.
+// Update the operand list in place with the already-converted values
+// from the conversion adaptor; gpu-kernel-outlining keeps every other
+// shape attr stable.
+struct ConvertGPULaunchFuncOp : public OpConversionPattern<gpu::LaunchFuncOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(gpu::LaunchFuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    bool changed = false;
+    for (auto [oldOp, newOp] :
+         llvm::zip_equal(op.getKernelOperands(), adaptor.getKernelOperands())) {
+      if (oldOp.getType() != newOp.getType()) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed)
+      return failure();
+
+    rewriter.modifyOpInPlace(op, [&] {
+      op.getKernelOperandsMutable().assign(adaptor.getKernelOperands());
+    });
+    return success();
+  }
+};
+
+// `hc-lower-kernels-to-gpu-launch` plants an `unrealized_conversion_cast`
+// to bridge the host wrapper's raw `!llvm.ptr` (returned by `hc_get_ptr`)
+// to `!hc.ptr<global, T>` so the launch body can address it as a typed
+// HC pointer. Once the type converter rewrites the HC pointer to
+// `!llvm.ptr<1>`, the cast spans different addrspaces — an actual
+// `llvm.addrspacecast` is what AMDGPU expects, not a residual UCC pair.
+// Match the original UCC and rewrite it to an addrspacecast (or no-op
+// when the addrspaces already agree).
+struct ConvertPtrUCCToAddrSpaceCast
+    : public OpConversionPattern<UnrealizedConversionCastOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(UnrealizedConversionCastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
+      return failure();
+    if (!isa<PtrType>(op.getOutputs().front().getType()))
+      return failure();
+    Value input = adaptor.getInputs().front();
+    auto srcPtr = dyn_cast<LLVM::LLVMPointerType>(input.getType());
+    if (!srcPtr)
+      return failure();
+    auto dstPtr = dyn_cast<LLVM::LLVMPointerType>(
+        typeConverter->convertType(op.getOutputs().front().getType()));
+    if (!dstPtr)
+      return failure();
+    if (srcPtr == dstPtr) {
+      rewriter.replaceOp(op, input);
+      return success();
+    }
+    Value cast =
+        LLVM::AddrSpaceCastOp::create(rewriter, op.getLoc(), dstPtr, input);
+    rewriter.replaceOp(op, cast);
+    return success();
+  }
+};
+
 struct HCLowerToLLVMPass
     : public hc::impl::HCLowerToLLVMBase<HCLowerToLLVMPass> {
   using Base::Base;
@@ -331,16 +448,68 @@ struct HCLowerToLLVMPass
         .add<ConvertAllocOp, ConvertPtrOffsetOp, ConvertPtrLoadOp,
              ConvertPtrStoreOp, ConvertPtrLoadPredOp, ConvertPtrStorePredOp>(
             converter, ctx);
+    // Function-signature conversion: anything carrying `!hc.ptr<...>` in its
+    // signature gets the type-converter applied so the rest of the
+    // device-side / host-side llvm pipeline sees `!llvm.ptr` (with the
+    // matching addrspace baked into the LLVM type). `gpu.func` doesn't
+    // implement `FunctionOpInterface` upstream, so we handle it by hand;
+    // `func.func` flows through the standard helper.
+    populateAnyFunctionOpInterfaceTypeConversionPattern(patterns, converter);
+    populateReturnOpTypeConversionPattern(patterns, converter);
+    populateCallOpTypeConversionPattern(patterns, converter);
+    patterns.add<ConvertGPUFuncOpSignature, ConvertGPULaunchFuncOp,
+                 ConvertPtrUCCToAddrSpaceCast>(converter, ctx);
 
     ConversionTarget target(*ctx);
     target.addLegalDialect<LLVM::LLVMDialect, arith::ArithDialect,
                            scf::SCFDialect>();
-    target.addLegalOp<UnrealizedConversionCastOp>();
+    // UCCs are legal *unless* they bridge a `!llvm.ptr` to an `!hc.ptr`.
+    // Those need to become real `llvm.addrspacecast` ops so the addrspace
+    // semantics survive `reconcile-unrealized-casts` (which only collapses
+    // exact A→B→A cancelling chains, not A→B→C addrspace transitions).
+    target.addDynamicallyLegalOp<UnrealizedConversionCastOp>(
+        [](UnrealizedConversionCastOp op) {
+          if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
+            return true;
+          if (!isa<PtrType>(op.getOutputs().front().getType()))
+            return true;
+          return !isa<LLVM::LLVMPointerType>(op.getInputs().front().getType());
+        });
     // Scope this pass to the `!hc.ptr` family only. Other hc-dialect ops
     // (e.g. `hc.kernel` left behind by partial schedules) flow through
     // unchanged — earlier passes own their lowering.
     target.addIllegalOp<HCAllocOp, HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp,
                         HCPtrLoadPredOp, HCPtrStorePredOp>();
+    // Functions are legal once their signature has shed `!hc.ptr<...>`. The
+    // dynamic legality predicate keeps already-converted functions from
+    // re-entering the pattern set on every iteration.
+    auto signatureLegal = [&converter](Operation *fn) {
+      auto fnInterface = cast<FunctionOpInterface>(fn);
+      if (!converter.isSignatureLegal(
+              cast<FunctionType>(fnInterface.getFunctionType())))
+        return false;
+      for (Type type : fnInterface.getResultTypes())
+        if (!converter.isLegal(type))
+          return false;
+      return true;
+    };
+    target.addDynamicallyLegalOp<func::FuncOp>(signatureLegal);
+    target.addDynamicallyLegalOp<func::CallOp>([&converter](func::CallOp call) {
+      return converter.isSignatureLegal(call.getCalleeType()) &&
+             converter.isLegal(call.getOperands().getTypes());
+    });
+    target.addDynamicallyLegalOp<func::ReturnOp>(
+        [&converter](func::ReturnOp r) {
+          return converter.isLegal(r.getOperandTypes());
+        });
+    target.addDynamicallyLegalOp<gpu::GPUFuncOp>(
+        [&converter](gpu::GPUFuncOp f) {
+          return converter.isSignatureLegal(f.getFunctionType());
+        });
+    target.addDynamicallyLegalOp<gpu::LaunchFuncOp>(
+        [&converter](gpu::LaunchFuncOp launch) {
+          return converter.isLegal(launch.getKernelOperands().getTypes());
+        });
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

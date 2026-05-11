@@ -22,6 +22,7 @@ from hc._native_paths import runtime_helpers_lib_path
 
 _HELPER_NAMES = (
     "_mlir_ciface_hc_get_buffer",
+    "_mlir_ciface_hc_get_ptr",
     "_mlir_ciface_hc_get_int64",
     "_mlir_ciface_hc_get_float64",
     "_mlir_ciface_hc_get_dim",
@@ -94,6 +95,8 @@ def helpers() -> ctypes.CDLL:
         ctypes.py_object,
     ]
     lib._mlir_ciface_hc_get_buffer.restype = None
+    lib._mlir_ciface_hc_get_ptr.argtypes = [ctypes.py_object]
+    lib._mlir_ciface_hc_get_ptr.restype = ctypes.c_void_p
     lib._mlir_ciface_hc_get_int64.argtypes = [ctypes.py_object]
     lib._mlir_ciface_hc_get_int64.restype = ctypes.c_int64
     lib._mlir_ciface_hc_get_float64.argtypes = [ctypes.py_object]
@@ -123,6 +126,16 @@ def test_get_buffer_returns_data_pointer(helpers: ctypes.CDLL) -> None:
     assert descriptor.strides[0] == 1
     # The byte length is intentionally a sentinel; see BufferUtils.h.
     assert descriptor.sizes[0] == -1
+
+
+def test_get_ptr_returns_data_pointer(helpers: ctypes.CDLL) -> None:
+    # `hc_get_ptr` is the descriptor-free entry the `!hc.ptr<global, T?>`
+    # kernel-arg ABI calls into — it should return the same address as
+    # `data_ptr()` without the memref envelope.
+    array = np.arange(64, dtype=np.float16)
+    tensor = _NumpyTensor(array)
+    expected_ptr = int(array.ctypes.data)
+    assert helpers._mlir_ciface_hc_get_ptr(tensor) == expected_ptr
 
 
 def test_get_int64_round_trips_python_int(helpers: ctypes.CDLL) -> None:

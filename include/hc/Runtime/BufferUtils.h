@@ -49,7 +49,18 @@ extern "C" {
 // to a typed memref of the kernel's expected shape, so the byte length is
 // never consumed and computing it would just be an extra C-API roundtrip
 // per call.
+//
+// Legacy: kept for any pre-`hc.ptr` consumers still in flight. New code
+// should reach for `hc_get_ptr` below — it returns just the raw pointer
+// without the memref descriptor wrapper.
 void _mlir_ciface_hc_get_buffer(HcMemRef1Di8 *ret, PyObject *obj);
+
+// Read `obj.data_ptr()` and return the raw pointer. Used by the
+// `!hc.ptr<global, T?>` kernel-arg ABI: the host wrapper passes the
+// pointer to `gpu.launch_func` directly, with dim and stride values
+// arriving as separate scalar operands (`hc_get_dim` / `hc_get_stride`).
+// No memref descriptor is involved on either side.
+void *_mlir_ciface_hc_get_ptr(PyObject *obj);
 
 // Coerce a Python int to int64. Raises `std::runtime_error` (which the
 // JIT'd wrapper does not catch — surfaces back through the ctypes call as

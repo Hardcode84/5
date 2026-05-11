@@ -322,7 +322,8 @@ Address space lowering:
 * `global` → externally-supplied pointer (kernel argument).
 
 The 1D bare tensor → memory carrier transition has retired the
-workgroup-AS `memref<...xT, #gpu.address_space<workgroup>>` family from
+workgroup-AS `memref<...xT, #gpu.address_space<workgroup>>` family
+*and* the kernel-arg `memref<?x?xT>` envelope from
 `HCLowerLaunchBodyPass.cpp`. Workgroup-staged tiles, the cooperative
 copy helper (`emitCooperativeCopy`), and the per-op load/store/select
 patterns now emit `hc.alloc` + `hc.ptr_offset` + `hc.ptr_load[_pred]` /
@@ -330,10 +331,20 @@ patterns now emit `hc.alloc` + `hc.ptr_offset` + `hc.ptr_load[_pred]` /
 pass rewrites that family into `!llvm.ptr` (workgroup → addrspace-3
 `llvm.mlir.global private` + `llvm.mlir.addressof`, private →
 `llvm.alloca` addrspace-5, predicated forms → `scf.if` / masked
-intrinsics) without a memref intermediate. Kernel-argument memrefs
-remain on the existing memref-of-globals path; switching them over to
-`!hc.ptr<global>` is a separate task gated on the host-wrapper
-ABI work.
+intrinsics) without a memref intermediate. Kernel arguments now flow
+on the same `!hc.ptr<global, T>` carrier: `hc-lower-kernels-to-gpu-launch`
+materializes a `(ptr, dim*, stride*)` tuple per buffer at the host —
+`hc_get_ptr` for the data pointer, `hc_get_dim` / `hc_get_stride` for
+extents — and bridges back to `!hc.buffer<...>` via an N→1
+`unrealized_conversion_cast` planted inside the launch body so
+`gpu-kernel-outlining` captures the raw values. `hc-lower-launch-body`
+walks that UCC to recover the source ptr + per-axis strides and lowers
+every kernel-arg load/store via `hc.ptr_offset` + `hc.ptr_load[_pred]`
+/ `hc.ptr_store[_pred]`. The final `hc-lower-to-llvm` step rewrites
+`!hc.ptr<global, T>` to `!llvm.ptr<1>` on `gpu.func` and `func.func`
+signatures and emits an `llvm.addrspacecast` at the host boundary for
+the generic→global pointer transition. No memref reaches the LLVM
+backend.
 
 The 1D bare vector → upstream `vector<NxT>` mapping is unchanged; `N`
 must be statically resolved by this point (already an inference

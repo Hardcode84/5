@@ -3,16 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Workgroup-AS storage (`!hc.bare_tensor`) lowers to flat
-// `!hc.ptr<workgroup, T>` instead of `memref<..., workgroup>`. Kernel-argument
-// memrefs flow through unchanged. The `hc-lower-to-llvm` slice owns the
-// final memory lowering. See `doc/layouts.md` "hc.ptr and memory ops".
+// `!hc.ptr<workgroup, T>` instead of `memref<..., workgroup>`. Kernel-arg
+// buffers come in as `(ptr, dim, stride)` bundles UCC'd to
+// `!hc.buffer<...>`; the per-axis dim values feed `hc.buffer_dim` /
+// `hc.load_mask` extents and the stride values feed offset linearization
+// for `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+// See `doc/layouts.md` "hc.ptr and memory ops".
 //
 // RUN: hc-opt %s --hc-lower-launch-body | FileCheck %s
 
 module {
   // CHECK-LABEL: func.func @scalar_and_loop(
-  // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
-  func.func @scalar_and_loop(%a: memref<?x?xf32>) {
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[M:[^:]+]]: index,
+  // CHECK-SAME: %[[N:[^:]+]]: index,
+  // CHECK-SAME: %[[SM:[^:]+]]: index,
+  // CHECK-SAME: %[[SN:[^:]+]]: index)
+  func.func @scalar_and_loop(%ptr: !hc.ptr<global, f32>,
+                             %m: index, %n: index,
+                             %sm: index, %sn: index) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -22,30 +31,31 @@ module {
                threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
       // CHECK: gpu.launch blocks(%[[BX:[^,]+]], %{{[^,]+}}, %{{[^)]+}})
       // CHECK-SAME: threads(%[[TX:[^,]+]], %{{[^,]+}}, %{{[^)]+}})
-      %buffer = builtin.unrealized_conversion_cast %a
-          : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
-      // CHECK: %[[M:.*]] = memref.dim %[[A]], %{{.*}} : memref<?x?xf32>
-      // CHECK: %[[N:.*]] = memref.dim %[[A]], %{{.*}} : memref<?x?xf32>
+      %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+          : !hc.ptr<global, f32>, index, index, index, index
+          to !hc.buffer<f32, ["M", "N"]>
+      // The UCC dissolves: per-axis dim/stride values flow straight into
+      // the rest of the body without any `memref.dim` chain.
       // CHECK: %[[ROW:.*]] = arith.muli %{{.*}}, %[[BX]] : index
       // CHECK: %[[LANE_TILE:.*]] = arith.divui %[[TX]], %{{.*}} : index
       // CHECK: %[[COL:.*]] = arith.addi %{{.*}}, %[[LANE_TILE]] : index
       %row = hc.idx_apply () : () -> !hc.idx<"16*$WG0">
       %col = hc.idx_apply () : () -> !hc.idx<"16*$WG1 + 1/16*$WI0">
-      %m = hc.idx_apply () : () -> !hc.idx<"M">
-      %n = hc.buffer_dim %buffer, axis = 1
+      %ms = hc.idx_apply () : () -> !hc.idx<"M">
+      %ns = hc.buffer_dim %buffer, axis = 1
           : !hc.buffer<f32, ["M", "N"]> -> !hc.idx<"N">
       %one = hc.const<1 : i64> : !hc.idx<"1">
       %row_next = hc.add %row, %one
           : (!hc.idx<"16*$WG0">, !hc.idx<"1">) -> !hc.idx<"1 + 16*$WG0">
-      %shape = hc.tuple(%m, %n)
+      %shape = hc.tuple(%ms, %ns)
           : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
-      // CHECK: hc.tuple(%{{.*}}, %{{.*}}) : (index, index) -> tuple<index, index>
+      // CHECK: hc.tuple(%[[M]], %[[N]]) : (index, index) -> tuple<index, index>
       %slice = hc.slice_expr(lower = %row upper = %row_next step = %one)
           : (!hc.idx<"16*$WG0">, !hc.idx<"1 + 16*$WG0">, !hc.idx<"1">)
             -> !hc.slice<lower = !hc.idx<"16*$WG0">, upper = !hc.idx<"1 + 16*$WG0">, step = !hc.idx<"1">>
       // CHECK: hc.slice_expr(lower = %[[ROW]] upper = %{{[^ ]+}} step = %{{[^)]+}}) : (index, index, index)
-      // CHECK: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
-      hc.for_range %one to %n step %one
+      // CHECK: scf.for %{{.*}} = %{{.*}} to %[[N]] step %{{.*}} {
+      hc.for_range %one to %ns step %one
           : (!hc.idx<"1">, !hc.idx<"N">, !hc.idx<"1">) {
       ^bb0(%i: !hc.idx<"$join0">):
         %i_next = hc.add %i, %one
@@ -75,9 +85,17 @@ module {
   // CHECK: arith.divui
   // CHECK: arith.cmpi ult
   // CHECK: arith.andi
+  // The kernel-arg load now goes through `hc.ptr_offset` + `hc.ptr_load`
+  // against the global pointer — the source-side offset is the per-axis
+  // `index * stride` sum, not a `memref.load` index list. Pointer math
+  // is hoisted above the in-bounds `scf.if` (it's a no-trap operation
+  // on OOB indices); only the actual load and the OOB-pad fallback live
+  // inside the if's branches.
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<global, f32>
   // CHECK: scf.if {{.*}} -> (f32)
-  // CHECK: memref.load
-  // CHECK-SAME: memref<?x?xf32>
+  // CHECK: hc.ptr_load
+  // CHECK-SAME: !hc.ptr<global, f32> -> f32
   // CHECK: hc.ptr_offset
   // CHECK-SAME: !hc.ptr<workgroup, f32>
   // CHECK: hc.ptr_store
@@ -86,23 +104,13 @@ module {
   // CHECK: vector.create_mask
   // CHECK-SAME: vector<4x4xi1>
   // The bare-tensor mask materializes as `!hc.ptr<workgroup, i1>` plus a
-  // `vector.extract` + `hc.ptr_offset` + `hc.ptr_store` per lane. There are
-  // 16 stores total (one for each (i, j) of the 4x4 mask); the LIT pins the
-  // first one explicitly and trusts the loop-unrolled rest to follow.
+  // `vector.extract` + `hc.ptr_offset` + `hc.ptr_store` per lane.
   // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, i1>
   // CHECK: vector.extract
   // CHECK: hc.ptr_offset
   // CHECK-SAME: !hc.ptr<workgroup, i1>
   // CHECK: hc.ptr_store
   // CHECK-SAME: i1, !hc.ptr<workgroup, i1>
-  // The buffer_view selecting one row of the 4x4 tile is metadata-only —
-  // it carries the index pattern for the consumer (`hc.vec`) to walk back
-  // through; the lowering of the view itself is a passthrough of the
-  // source ptr. The consumer assembles the per-lane fragment by computing
-  // each lane's flat source offset (`lane*4` is the row's start, axis-1
-  // index varies 0..3) and emitting one `hc.ptr_offset` + `hc.ptr_load` +
-  // `vector.insert` per lane. Same shape for the f32 data and the i1 mask;
-  // we pin the first load + insert of each.
   // CHECK: arith.constant dense<0.000000e+00> : vector<4xf32>
   // CHECK: hc.ptr_offset %{{.*}}, %{{.*}} : (!hc.ptr<workgroup, f32>, index) -> !hc.ptr<workgroup, f32>
   // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, f32> -> f32
@@ -123,11 +131,14 @@ module {
   // CHECK-NOT: hc.select
   // CHECK-NOT: hc.full_mask
   // CHECK-NOT: memref{{.*}}workgroup
-  func.func @tile_memory(%a: memref<?x?xf32>) {
+  func.func @tile_memory(%ptr: !hc.ptr<global, f32>,
+                         %m: index, %n: index,
+                         %sm: index, %sn: index) {
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
-    %buffer = builtin.unrealized_conversion_cast %a
-        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"]>
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c4, %sy = %c1, %sz = %c1) {
       %zero = hc.const<0 : i64> : !hc.idx<"0">
@@ -175,23 +186,18 @@ module {
   }
 
   // CHECK-LABEL: func.func @tensor_mask_and_select(
-  // Cooperative load into LDS — same shape as `tile_memory`, just a smaller
-  // wave. The cooperative loop's LDS writes target the freshly allocated
-  // workgroup ptr.
   // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, f32>
   // CHECK: scf.for
-  // CHECK: memref.load
-  // CHECK-SAME: memref<?x?xf32>
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<global, f32>
+  // CHECK: scf.if {{.*}} -> (f32)
+  // CHECK: hc.ptr_load
+  // CHECK-SAME: !hc.ptr<global, f32> -> f32
   // CHECK: hc.ptr_offset
   // CHECK-SAME: !hc.ptr<workgroup, f32>
   // CHECK: hc.ptr_store
   // CHECK-SAME: f32, !hc.ptr<workgroup, f32>
   // CHECK: gpu.barrier
-  // The load_mask source is the LDS-staged tile, so the per-axis extents
-  // are the bare-tensor's static dims (constant 4 / 4) rather than
-  // `memref.dim` reads against a kernel-arg memref. The mask vector itself
-  // is created the same way and then materialized to a fresh workgroup ptr
-  // via `hc.alloc` + per-element `hc.ptr_store`.
   // CHECK: vector.create_mask {{.*}} : vector<4x4xi1>
   // CHECK: hc.alloc count = %{{.*}} : index -> !hc.ptr<workgroup, i1>
   // CHECK: vector.extract
@@ -199,10 +205,6 @@ module {
   // CHECK-SAME: !hc.ptr<workgroup, i1>
   // CHECK: hc.ptr_store
   // CHECK-SAME: i1, !hc.ptr<workgroup, i1>
-  // The all-tensor select reads both LDS tiles via per-element
-  // `hc.ptr_load`s, blends them in vector form, and writes the result back
-  // to a third workgroup ptr. The mask is read first (16 lanes), then the
-  // tile (16 lanes); we pin the first load of each.
   // CHECK: arith.constant dense<false> : vector<4x4xi1>
   // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<workgroup, i1> -> i1
   // CHECK: arith.constant dense<0.000000e+00> : vector<4x4xf32>
@@ -216,11 +218,14 @@ module {
   // CHECK-NOT: hc.load_mask
   // CHECK-NOT: hc.select
   // CHECK-NOT: memref{{.*}}workgroup
-  func.func @tensor_mask_and_select(%a: memref<?x?xf32>) {
+  func.func @tensor_mask_and_select(%ptr: !hc.ptr<global, f32>,
+                                    %m: index, %n: index,
+                                    %sm: index, %sn: index) {
     %c1 = arith.constant 1 : index
     %c4 = arith.constant 4 : index
-    %buffer = builtin.unrealized_conversion_cast %a
-        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"]>
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
       %zero = hc.const<0 : i64> : !hc.idx<"0">
@@ -255,24 +260,28 @@ module {
   }
 
   // CHECK-LABEL: func.func @strided_vload(
-  // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
-  // Per-lane vector loads from a kernel-arg memref now use per-element
-  // `memref.load`s — the prior `memref.subview` + `vector.transfer_read`
-  // shape is gone alongside `makeStridedSubview`. LLVM's SLP recombines the
-  // unit-stride lanes; the explicit per-element form keeps unit and
-  // non-unit stride paths uniform and sidesteps the bit/byte i1 mismatch
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>
+  // Per-lane vector loads from a kernel-arg ptr now use per-element
+  // `hc.ptr_offset` + `hc.ptr_load`s. LLVM's SLP recombines the unit-stride
+  // lanes; the explicit per-element form keeps unit and non-unit stride
+  // paths uniform and sidesteps the bit/byte i1 mismatch
   // `vector.transfer_read` of `vector<Nxi1>` triggered.
-  // CHECK: %[[V0:.*]] = memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<?x?xf32>
+  // CHECK: hc.ptr_offset %[[PTR]], %{{.*}} : (!hc.ptr<global, f32>, index) -> !hc.ptr<global, f32>
+  // CHECK: %[[V0:.*]] = hc.ptr_load %{{.*}} : !hc.ptr<global, f32> -> f32
   // CHECK: vector.insert %[[V0]], %{{.*}} [0, 0]
-  // CHECK: memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<?x?xf32>
+  // CHECK: hc.ptr_offset %[[PTR]], %{{.*}} : (!hc.ptr<global, f32>, index) -> !hc.ptr<global, f32>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<global, f32> -> f32
   // CHECK: vector.insert {{.*}} [1, 0]
   // CHECK-NOT: memref.subview
   // CHECK-NOT: vector.transfer_read
   // CHECK-NOT: hc.vload
-  func.func @strided_vload(%a: memref<?x?xf32>) {
+  func.func @strided_vload(%ptr: !hc.ptr<global, f32>,
+                           %m: index, %n: index,
+                           %sm: index, %sn: index) {
     %c1 = arith.constant 1 : index
-    %buffer = builtin.unrealized_conversion_cast %a
-        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"]>
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
       %zero = hc.const<0 : i64> : !hc.idx<"0">
@@ -300,26 +309,27 @@ module {
   }
 
   // CHECK-LABEL: func.func @strided_load_mask(
-  // CHECK-SAME: %[[A:.*]]: memref<?x?xf32>)
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[M:[^:]+]]: index,
+  // CHECK-SAME: %[[N:[^:]+]]: index,
   // For a stride-2 slice into row axis of extent `M`, the in-bounds count
   // is `ceildiv(M - offset, 2)` rather than `M - offset`. Unit-stride
-  // axes still emit the simpler `extent - offset` form (no extra ops).
-  // CHECK-DAG: %[[C0:.*]] = arith.constant 0 : index
-  // CHECK-DAG: %[[C1:.*]] = arith.constant 1 : index
-  // CHECK-DAG: %[[C2:.*]] = arith.constant 2 : index
-  // CHECK: %[[M:.*]] = memref.dim %[[A]], %[[C0]]
+  // axes still emit the simpler `extent - offset` form. The dim values
+  // come straight from the kernel-arg UCC (no `memref.dim` chain).
   // CHECK: %[[REM_M:.*]] = arith.subi %[[M]], %{{.*}} : index
   // CHECK: %[[STEPM1:.*]] = arith.subi %{{.*}}, %{{.*}} : index
   // CHECK: %[[ADJ:.*]] = arith.addi %[[REM_M]], %[[STEPM1]] : index
   // CHECK: %[[ROWSZ:.*]] = arith.divsi %[[ADJ]], %{{.*}} : index
-  // CHECK: %[[N:.*]] = memref.dim %[[A]], %[[C1]]
   // CHECK: %[[COLSZ:.*]] = arith.subi %[[N]], %{{.*}} : index
   // CHECK: vector.create_mask %[[ROWSZ]], %[[COLSZ]] : vector<8x1xi1>
   // CHECK-NOT: hc.load_mask
-  func.func @strided_load_mask(%a: memref<?x?xf32>) {
+  func.func @strided_load_mask(%ptr: !hc.ptr<global, f32>,
+                               %m: index, %n: index,
+                               %sm: index, %sn: index) {
     %c1 = arith.constant 1 : index
-    %buffer = builtin.unrealized_conversion_cast %a
-        : memref<?x?xf32> to !hc.buffer<f32, ["M", "N"]>
+    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"]>
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
       %zero = hc.const<0 : i64> : !hc.idx<"0">
@@ -347,21 +357,24 @@ module {
   }
 
   // CHECK-LABEL: func.func @masked_vector_store(
-  // Kernel-argument memref destination — masked store path is unchanged
-  // (per-element extract + scf.if + memref.store). The host-wrapper switch
-  // to `!hc.ptr<global>` lives in a follow-up bead.
+  // Kernel-argument ptr destination — masked store path emits per-element
+  // `hc.ptr_store_pred` against the global pointer with the per-lane
+  // mask carried as a first-class operand.
   // CHECK: vector.extract
   // CHECK-SAME: f32 from vector<4xf32>
+  // CHECK: hc.ptr_offset
+  // CHECK-SAME: !hc.ptr<global, f32>
   // CHECK: vector.extract
   // CHECK-SAME: i1 from vector<4xi1>
-  // CHECK: scf.if
-  // CHECK: memref.store
-  // CHECK-SAME: memref<?xf32>
+  // CHECK: hc.ptr_store_pred
+  // CHECK-SAME: f32, !hc.ptr<global, f32>, i1
   // CHECK-NOT: hc.store
-  func.func @masked_vector_store(%a: memref<?xf32>) {
+  func.func @masked_vector_store(%ptr: !hc.ptr<global, f32>,
+                                 %m: index, %sm: index) {
     %c1 = arith.constant 1 : index
-    %buffer = builtin.unrealized_conversion_cast %a
-        : memref<?xf32> to !hc.buffer<f32, ["M"]>
+    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %sm
+        : !hc.ptr<global, f32>, index, index
+        to !hc.buffer<f32, ["M"]>
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
       %data_vector = arith.constant dense<1.000000e+00> : vector<4xf32>
@@ -393,19 +406,24 @@ module {
   // the op rather than via an ambient `unrealized_conversion_cast`
   // walk over the launch.
   // CHECK-LABEL: func.func @apply_offset(
-  // CHECK-SAME: %[[A:[^:]+]]: memref<?xf32>
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[M:[^:]+]]: index,
+  // CHECK-SAME: %[[SM:[^:]+]]: index,
   // CHECK-SAME: %[[K:[^:)]+]]: index
   // CHECK: gpu.launch blocks(%[[BX:[^,]+]], %{{[^,]+}}, %{{[^)]+}})
   // CHECK: %[[OFF:.*]] = arith.addi %{{.*}}, %[[K]] : index
   // CHECK: %[[CMP:.*]] = arith.cmpi slt, %{{.*}}, %{{.*}} : index
   // CHECK-NOT: hc.idx_apply
   // CHECK-NOT: hc.pred_apply
-  func.func @apply_offset(%a: memref<?xf32>, %ext_k: index) {
+  func.func @apply_offset(%ptr: !hc.ptr<global, f32>,
+                          %m: index, %sm: index,
+                          %ext_k: index) {
     %c1 = arith.constant 1 : index
     gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
                threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      %buffer = builtin.unrealized_conversion_cast %a
-          : memref<?xf32> to !hc.buffer<f32, ["M"]>
+      %buffer = builtin.unrealized_conversion_cast %ptr, %m, %sm
+          : !hc.ptr<global, f32>, index, index
+          to !hc.buffer<f32, ["M"]>
       %k = builtin.unrealized_conversion_cast %ext_k
           : index to !hc.idx<"K">
       %off = hc.idx_apply (%k as "K")

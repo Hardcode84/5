@@ -66,14 +66,17 @@ func.func @private_alloc(%v: f32, %n: index) -> f32 {
 // alignment (we pass 0 — LLVM treats that as "natural alignment for the
 // type"). The passthrough is required by the op verifier and rides
 // straight through.
+// Function signatures shed `!hc.ptr<...>` at the same time as the
+// per-op `hc.ptr_*` lowering — `populateAnyFunctionOpInterfaceTypeConversionPattern`
+// runs the type converter over every input/result, so the kernel arg
+// arrives as `!llvm.ptr<3>` directly and no use-site UCC is needed.
 // CHECK-LABEL: func.func @masked_vector(
-// CHECK-SAME: %[[P:[^:]+]]: !hc.ptr<workgroup, f32>
+// CHECK-SAME: %[[P:[^:]+]]: !llvm.ptr<3>
 // CHECK-SAME: %[[M:[^:]+]]: vector<4xi1>
 // CHECK-SAME: %[[PT:[^:]+]]: vector<4xf32>
 // CHECK-SAME: %[[V:[^:)]+]]: vector<4xf32>
-// CHECK: %[[PCAST:.+]] = builtin.unrealized_conversion_cast %[[P]] : !hc.ptr<workgroup, f32> to !llvm.ptr<3>
-// CHECK: %[[L:.+]] = llvm.intr.masked.load %[[PCAST]], %[[M]], %[[PT]] {alignment = 0 : i32} : (!llvm.ptr<3>, vector<4xi1>, vector<4xf32>) -> vector<4xf32>
-// CHECK: llvm.intr.masked.store %[[V]], %[[PCAST]], %[[M]] {alignment = 0 : i32} : vector<4xf32>, vector<4xi1> into !llvm.ptr<3>
+// CHECK: %[[L:.+]] = llvm.intr.masked.load %[[P]], %[[M]], %[[PT]] {alignment = 0 : i32} : (!llvm.ptr<3>, vector<4xi1>, vector<4xf32>) -> vector<4xf32>
+// CHECK: llvm.intr.masked.store %[[V]], %[[P]], %[[M]] {alignment = 0 : i32} : vector<4xf32>, vector<4xi1> into !llvm.ptr<3>
 // CHECK: return %[[L]] : vector<4xf32>
 func.func @masked_vector(%p: !hc.ptr<workgroup, f32>, %m: vector<4xi1>,
                          %pt: vector<4xf32>, %v: vector<4xf32>)
@@ -94,19 +97,18 @@ func.func @masked_vector(%p: !hc.ptr<workgroup, f32>, %m: vector<4xi1>,
 // `llvm.store`. The masked-intrinsic ops are vector-only, so scalar
 // has to go through scf.
 // CHECK-LABEL: func.func @masked_scalar(
-// CHECK-SAME: %[[P:[^:]+]]: !hc.ptr<workgroup, f32>
+// CHECK-SAME: %[[P:[^:]+]]: !llvm.ptr<3>
 // CHECK-SAME: %[[PRED:[^:]+]]: i1
 // CHECK-SAME: %[[PT:[^:]+]]: f32
 // CHECK-SAME: %[[V:[^:)]+]]: f32
-// CHECK: %[[PCAST:.+]] = builtin.unrealized_conversion_cast %[[P]] : !hc.ptr<workgroup, f32> to !llvm.ptr<3>
 // CHECK: %[[R:.+]] = scf.if %[[PRED]] -> (f32) {
-// CHECK:   %[[L:.+]] = llvm.load %[[PCAST]] : !llvm.ptr<3> -> f32
+// CHECK:   %[[L:.+]] = llvm.load %[[P]] : !llvm.ptr<3> -> f32
 // CHECK:   scf.yield %[[L]] : f32
 // CHECK: } else {
 // CHECK:   scf.yield %[[PT]] : f32
 // CHECK: }
 // CHECK: scf.if %[[PRED]] {
-// CHECK:   llvm.store %[[V]], %[[PCAST]] : f32, !llvm.ptr<3>
+// CHECK:   llvm.store %[[V]], %[[P]] : f32, !llvm.ptr<3>
 // CHECK: }
 // CHECK: return %[[R]] : f32
 func.func @masked_scalar(%p: !hc.ptr<workgroup, f32>, %pred: i1,

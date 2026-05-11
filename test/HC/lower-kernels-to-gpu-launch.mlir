@@ -7,22 +7,28 @@
 // Helpers are declared once at module scope and shared across kernels. They
 // carry `llvm.emit_c_interface` so `convert-func-to-llvm` later routes call
 // sites through the `_mlir_ciface_*` symbols exported by libhc_rt_helpers.so.
+// `hc_get_ptr` is the descriptor-free entry the buffer ABI lives on; the
+// legacy `hc_get_buffer` declaration sticks around for any pre-`hc.ptr`
+// consumer still in flight, but no buffer-arg lowering reaches for it now.
 // CHECK-DAG: func.func private @hc_get_buffer(!llvm.ptr) -> memref<?xi8> attributes {llvm.emit_c_interface}
+// CHECK-DAG: func.func private @hc_get_ptr(!llvm.ptr) -> !llvm.ptr attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_dim(!llvm.ptr, i32) -> i64 attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_stride(!llvm.ptr, i32) -> i64 attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_int64(!llvm.ptr) -> i64 attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_float64(!llvm.ptr) -> f64 attributes {llvm.emit_c_interface}
 
 module {
-  // Static-shape buffer. No symbolic dims, so the wrapper feeds zero
-  // dynamic sizes into the intermediate `memref.view` (which only does the
-  // byte→f32 bitcast — its identity strides are immediately discarded by
-  // the `reinterpret_cast` below). Strides are still pulled at runtime via
+  // Static-shape buffer. `hc_get_ptr` returns the raw `data_ptr()` and gets
+  // UCC'd to `!hc.ptr<global, f32>`; dim values fall out of the static shape
+  // (no `hc_get_dim` call needed); strides are still pulled at runtime via
   // `hc_get_stride` because even a static-shape kernel may be called on a
-  // sliced/transposed input. The leading `!llvm.ptr` is the stream slot —
-  // the launch-func-to-runtime pass picks it up later and threads it
-  // through hc_rt_load_kernel / hc_rt_launch_kernel; this pass just lays
-  // the slot down.
+  // sliced/transposed input. The bridge from the (ptr, dim0, dim1, s0, s1)
+  // tuple to `!hc.buffer<f32, ["64", "16"]>` happens INSIDE the launch
+  // region so `gpu-kernel-outlining` later captures the raw values, each
+  // llvm-translatable, instead of the bridged buffer (which isn't).
+  // The leading `!llvm.ptr` is the stream slot — the launch-func-to-runtime
+  // pass picks it up later and threads it through hc_rt_load_kernel /
+  // hc_rt_launch_kernel.
   // CHECK-LABEL: func.func @static_launch(
   // CHECK-SAME: %{{[^:]+}}: !llvm.ptr,
   // CHECK-SAME: %[[A:.*]]: !llvm.ptr)
@@ -34,27 +40,18 @@ module {
         group_shape = #hc.shape<["32", "8"]>,
         bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1"]
       } {
-    // CHECK: %[[BUF:.*]] = call @hc_get_buffer(%[[A]]) : (!llvm.ptr) -> memref<?xi8>
-    // CHECK: %[[OFF:.*]] = arith.constant 0 : index
-    // CHECK: %[[VIEW:.*]] = memref.view %[[BUF]][%[[OFF]]][] : memref<?xi8> to memref<64x16xf32>
+    // CHECK: %[[D0:.*]] = arith.constant 64 : index
+    // CHECK: %[[D1:.*]] = arith.constant 16 : index
+    // CHECK: %[[RAW:.*]] = call @hc_get_ptr(%[[A]]) : (!llvm.ptr) -> !llvm.ptr
+    // CHECK: %[[PTR:.*]] = builtin.unrealized_conversion_cast %[[RAW]] : !llvm.ptr to !hc.ptr<global, f32>
     // CHECK: %[[S0_IDX:.*]] = arith.constant 0 : i32
     // CHECK: %[[S0_I64:.*]] = call @hc_get_stride(%[[A]], %[[S0_IDX]]) : (!llvm.ptr, i32) -> i64
     // CHECK: %[[S0:.*]] = arith.index_cast %[[S0_I64]] : i64 to index
     // CHECK: %[[S1_IDX:.*]] = arith.constant 1 : i32
     // CHECK: %[[S1_I64:.*]] = call @hc_get_stride(%[[A]], %[[S1_IDX]]) : (!llvm.ptr, i32) -> i64
     // CHECK: %[[S1:.*]] = arith.index_cast %[[S1_I64]] : i64 to index
-    // CHECK: %[[STRIDED:.*]] = memref.reinterpret_cast %[[VIEW]] to offset: [0], sizes: [64, 16], strides: [%[[S0]], %[[S1]]] : memref<64x16xf32> to memref<64x16xf32, strided<[?, ?]>>
-    // CHECK: %[[C32:.*]] = arith.constant 32 : index
-    // CHECK: %[[GX:.*]] = arith.ceildivui %{{.*}}, %[[C32]] : index
-    // CHECK: %[[C8:.*]] = arith.constant 8 : index
-    // CHECK: %[[GY:.*]] = arith.ceildivui %{{.*}}, %[[C8]] : index
     // CHECK: gpu.launch blocks
-    // CHECK-SAME: %[[GX]]
-    // CHECK-SAME: %[[GY]]
-    // CHECK-SAME: threads
-    // CHECK-SAME: %[[C32]]
-    // CHECK-SAME: %[[C8]]
-    // CHECK: unrealized_conversion_cast %[[STRIDED]] : memref<64x16xf32, strided<[?, ?]>> to !hc.buffer<f32, ["64", "16"]>
+    // CHECK: unrealized_conversion_cast %[[PTR]], %[[D0]], %[[D1]], %[[S0]], %[[S1]] : !hc.ptr<global, f32>, index, index, index, index to !hc.buffer<f32, ["64", "16"]>
     // CHECK: gpu.terminator
     // CHECK: return
     hc.return
@@ -62,10 +59,9 @@ module {
 
   // Dynamic-shape buffer. Wrapper calls `hc_get_dim` once per first-
   // occurrence shape symbol (`M` from axis 0, `N` from axis 1), index-casts
-  // the i64 to index, then `hc_get_stride` per axis. Sizes feed the
-  // intermediate `memref.view` (typed bitcast); sizes + strides feed the
-  // final `memref.reinterpret_cast` that produces the strided memref the
-  // kernel body actually consumes.
+  // the i64 to index, then `hc_get_ptr` for the data pointer and
+  // `hc_get_stride` per axis. The bridging UCC at the kernel boundary
+  // takes (ptr, M, N, stride_0, stride_1) → !hc.buffer<f32, ["M", "N"]>.
   // CHECK-LABEL: func.func @dynamic_launch(
   // CHECK-SAME: %{{[^:]+}}: !llvm.ptr,
   // CHECK-SAME: %[[A:.*]]: !llvm.ptr)
@@ -83,21 +79,19 @@ module {
     // CHECK: %[[D1_IDX:.*]] = arith.constant 1 : i32
     // CHECK: %[[D1_I64:.*]] = call @hc_get_dim(%[[A]], %[[D1_IDX]]) : (!llvm.ptr, i32) -> i64
     // CHECK: %[[N:.*]] = arith.index_cast %[[D1_I64]] : i64 to index
-    // CHECK: %[[BUF:.*]] = call @hc_get_buffer(%[[A]]) : (!llvm.ptr) -> memref<?xi8>
-    // CHECK: %[[OFF:.*]] = arith.constant 0 : index
-    // CHECK: %[[VIEW:.*]] = memref.view %[[BUF]][%[[OFF]]][%[[M]], %[[N]]] : memref<?xi8> to memref<?x?xf32>
+    // CHECK: %[[RAW:.*]] = call @hc_get_ptr(%[[A]]) : (!llvm.ptr) -> !llvm.ptr
+    // CHECK: %[[PTR:.*]] = builtin.unrealized_conversion_cast %[[RAW]] : !llvm.ptr to !hc.ptr<global, f32>
     // CHECK: %[[S0_IDX:.*]] = arith.constant 0 : i32
     // CHECK: %[[S0_I64:.*]] = call @hc_get_stride(%[[A]], %[[S0_IDX]]) : (!llvm.ptr, i32) -> i64
     // CHECK: %[[S0:.*]] = arith.index_cast %[[S0_I64]] : i64 to index
     // CHECK: %[[S1_IDX:.*]] = arith.constant 1 : i32
     // CHECK: %[[S1_I64:.*]] = call @hc_get_stride(%[[A]], %[[S1_IDX]]) : (!llvm.ptr, i32) -> i64
     // CHECK: %[[S1:.*]] = arith.index_cast %[[S1_I64]] : i64 to index
-    // CHECK: %[[STRIDED:.*]] = memref.reinterpret_cast %[[VIEW]] to offset: [0], sizes: [%[[M]], %[[N]]], strides: [%[[S0]], %[[S1]]] : memref<?x?xf32> to memref<?x?xf32, strided<[?, ?]>>
     // CHECK: arith.ceildivui %{{.*}},
     // CHECK: gpu.launch
     // CHECK-SAME: blocks(
     // CHECK-SAME: threads(
-    // CHECK: unrealized_conversion_cast %[[STRIDED]] : memref<?x?xf32, strided<[?, ?]>> to !hc.buffer<f32, ["M", "N"]>
+    // CHECK: unrealized_conversion_cast %[[PTR]], %[[M]], %[[N]], %[[S0]], %[[S1]] : !hc.ptr<global, f32>, index, index, index, index to !hc.buffer<f32, ["M", "N"]>
     // CHECK: gpu.terminator
     hc.return
   }

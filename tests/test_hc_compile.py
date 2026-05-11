@@ -705,7 +705,9 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         # (lowered to `!llvm.ptr`) per kernel argument, calls the
         # `_mlir_ciface_hc_get_*` helpers (which `convert-func-to-llvm`
         # routes via the public-name wrappers `@hc_get_*`) to unpack
-        # each tensor's data pointer + shape dims, then dispatches via
+        # each tensor's data pointer (raw `!llvm.ptr` from
+        # `hc_get_ptr`, addrspace-cast to `!llvm.ptr<1>` on the way to
+        # the kernel) plus shape dims and strides, then dispatches via
         # the HIP shim (`hc_rt_load_kernel` + `hc_rt_launch_kernel`).
         # The HSACO blob and per-callsite handle/name globals live at
         # module scope.
@@ -715,13 +717,17 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
             "%arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr)"
             in handle.hc_ir_text
         ), handle.hc_ir_text
-        assert "@hc_get_buffer" in handle.hc_ir_text, handle.hc_ir_text
+        assert "@hc_get_ptr" in handle.hc_ir_text, handle.hc_ir_text
         assert (
-            "@_mlir_ciface_hc_get_buffer" in handle.hc_ir_text
+            "@_mlir_ciface_hc_get_ptr" in handle.hc_ir_text
         ), handle.hc_ir_text
         assert "@hc_get_dim" in handle.hc_ir_text, handle.hc_ir_text
         assert (
             "@_mlir_ciface_hc_get_dim" in handle.hc_ir_text
+        ), handle.hc_ir_text
+        assert "@hc_get_stride" in handle.hc_ir_text, handle.hc_ir_text
+        assert (
+            "@_mlir_ciface_hc_get_stride" in handle.hc_ir_text
         ), handle.hc_ir_text
         assert "@hc_rt_load_kernel" in handle.hc_ir_text, handle.hc_ir_text
         assert "@hc_rt_launch_kernel" in handle.hc_ir_text, handle.hc_ir_text

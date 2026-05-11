@@ -42,7 +42,6 @@ add_mlir_library(MLIRHCTransforms
   MLIRHCTransformOps
   MLIRIR
   MLIRLLVMDialect
-  MLIRMemRefDialect
   MLIRPass
   MLIRROCDLDialect
   MLIRROCDLTarget

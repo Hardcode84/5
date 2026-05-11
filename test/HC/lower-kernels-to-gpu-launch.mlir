@@ -7,10 +7,8 @@
 // Helpers are declared once at module scope and shared across kernels. They
 // carry `llvm.emit_c_interface` so `convert-func-to-llvm` later routes call
 // sites through the `_mlir_ciface_*` symbols exported by libhc_rt_helpers.so.
-// `hc_get_ptr` is the descriptor-free entry the buffer ABI lives on; the
-// legacy `hc_get_buffer` declaration sticks around for any pre-`hc.ptr`
-// consumer still in flight, but no buffer-arg lowering reaches for it now.
-// CHECK-DAG: func.func private @hc_get_buffer(!llvm.ptr) -> memref<?xi8> attributes {llvm.emit_c_interface}
+// `hc_get_ptr` is the buffer ABI entry — raw `data_ptr()` lifted to
+// `!llvm.ptr` and UCC'd into the kernel-arg `(ptr, dim*, stride*)` tuple.
 // CHECK-DAG: func.func private @hc_get_ptr(!llvm.ptr) -> !llvm.ptr attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_dim(!llvm.ptr, i32) -> i64 attributes {llvm.emit_c_interface}
 // CHECK-DAG: func.func private @hc_get_stride(!llvm.ptr, i32) -> i64 attributes {llvm.emit_c_interface}

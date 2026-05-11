@@ -44,7 +44,6 @@ __all__ = ["InvokerCache", "make_invoker", "runtime_symbol_map"]
 # explicitly — wave does the same — and listing them here doubles as
 # documentation of the runtime ABI surface.
 _RUNTIME_HELPER_SYMBOLS: tuple[str, ...] = (
-    "_mlir_ciface_hc_get_buffer",
     "_mlir_ciface_hc_get_ptr",
     "_mlir_ciface_hc_get_int64",
     "_mlir_ciface_hc_get_float64",

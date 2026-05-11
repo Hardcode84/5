@@ -86,9 +86,9 @@ def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> 
     to FP32 round-off. Requires GPU memory for the inputs/outputs;
     `torch.cuda` is the path of least resistance because its
     `Tensor.data_ptr()` returns a HIP-allocated device pointer that
-    `_mlir_ciface_hc_get_buffer` can plug straight into the kernel
-    descriptor — the runtime helpers don't allocate or copy on their
-    own. Skip cleanly if torch isn't installed so the gate stays usable
+    `_mlir_ciface_hc_get_ptr` hands straight to `gpu.launch_func` —
+    the runtime helpers don't allocate or copy on their own. Skip
+    cleanly if torch isn't installed so the gate stays usable
     on minimal Python envs.
     """
 
@@ -184,9 +184,8 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     # to materialize each tensor's data pointer, shape dims, and
     # strides before dispatching. The pointer arrives via
     # `hc_get_ptr` (raw `!llvm.ptr`, addrspace-cast on the way to the
-    # kernel) — `hc_get_buffer`'s memref-descriptor envelope is gone
-    # from the kernel-arg ABI. Pin each load-bearing milestone so the
-    # dump test fails loudly if anything regresses.
+    # kernel). Pin each load-bearing milestone so the dump test fails
+    # loudly if anything regresses.
     assert "module attributes {gpu.container_module}" in captured.out
     assert (
         "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "

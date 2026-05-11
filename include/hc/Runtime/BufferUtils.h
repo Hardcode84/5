@@ -27,39 +27,12 @@
 extern "C" struct _object;
 typedef struct _object PyObject;
 
-// Layout-compatible with `mlir::StridedMemRefType<T, N>` from
-// `mlir/ExecutionEngine/CRunnerUtils.h`. We redeclare the struct locally to
-// avoid pulling in the heavier MLIR runtime header on the consumer side.
-template <typename T, int N> struct StridedMemRefType {
-  T *basePtr;
-  T *data;
-  int64_t offset;
-  int64_t sizes[N];
-  int64_t strides[N];
-};
-
-using HcMemRef1Di8 = StridedMemRefType<uint8_t, 1>;
-
 extern "C" {
-
-// Materialize a tensor-like PyObject (anything quacking like torch.Tensor:
-// `data_ptr()`, `size(i)`, `stride(i)`) into an opaque `memref<?xi8>`
-// descriptor. `sizes[0]` is set to `-1` as a sentinel — the host wrapper
-// immediately reinterprets via `memref.view` + `memref.reinterpret_cast`
-// to a typed memref of the kernel's expected shape, so the byte length is
-// never consumed and computing it would just be an extra C-API roundtrip
-// per call.
-//
-// Legacy: kept for any pre-`hc.ptr` consumers still in flight. New code
-// should reach for `hc_get_ptr` below — it returns just the raw pointer
-// without the memref descriptor wrapper.
-void _mlir_ciface_hc_get_buffer(HcMemRef1Di8 *ret, PyObject *obj);
 
 // Read `obj.data_ptr()` and return the raw pointer. Used by the
 // `!hc.ptr<global, T?>` kernel-arg ABI: the host wrapper passes the
 // pointer to `gpu.launch_func` directly, with dim and stride values
 // arriving as separate scalar operands (`hc_get_dim` / `hc_get_stride`).
-// No memref descriptor is involved on either side.
 void *_mlir_ciface_hc_get_ptr(PyObject *obj);
 
 // Coerce a Python int to int64. Raises `std::runtime_error` (which the
@@ -70,13 +43,14 @@ int64_t _mlir_ciface_hc_get_int64(PyObject *obj);
 // Coerce a Python float to f64. Raises on non-float input.
 double _mlir_ciface_hc_get_float64(PyObject *obj);
 
-// Read `obj.size(dim_idx)`. Used by the host wrapper to derive dynamic
-// memref shape arguments at launch time.
+// Read `obj.size(dim_idx)`. Host wrapper feeds the result into the
+// per-axis dim slot of the kernel-arg `(ptr, dim*, stride*)` UCC.
 int64_t _mlir_ciface_hc_get_dim(PyObject *obj, int32_t dim_idx);
 
 // Read `obj.stride(dim_idx)` (in elements, matching torch's convention,
-// not bytes). Used by the host wrapper for non-trivially-strided memref
-// args.
+// not bytes). Host wrapper feeds the result into the per-axis stride slot
+// of the kernel-arg `(ptr, dim*, stride*)` UCC; the launch-body lowering
+// uses it to linearize `hc.ptr_offset` indices.
 int64_t _mlir_ciface_hc_get_stride(PyObject *obj, int32_t dim_idx);
 }
 

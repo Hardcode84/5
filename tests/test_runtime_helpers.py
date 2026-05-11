@@ -21,23 +21,12 @@ from build_tools import hc_native_tools, llvm_toolchain
 from hc._native_paths import runtime_helpers_lib_path
 
 _HELPER_NAMES = (
-    "_mlir_ciface_hc_get_buffer",
     "_mlir_ciface_hc_get_ptr",
     "_mlir_ciface_hc_get_int64",
     "_mlir_ciface_hc_get_float64",
     "_mlir_ciface_hc_get_dim",
     "_mlir_ciface_hc_get_stride",
 )
-
-
-class _MemRef1Di8(ctypes.Structure):
-    _fields_ = (
-        ("base_ptr", ctypes.c_void_p),
-        ("data", ctypes.c_void_p),
-        ("offset", ctypes.c_int64),
-        ("sizes", ctypes.c_int64 * 1),
-        ("strides", ctypes.c_int64 * 1),
-    )
 
 
 class _NumpyTensor:
@@ -90,11 +79,6 @@ def helpers() -> ctypes.CDLL:
     if not path.exists():
         pytest.skip(f"libhc_rt_helpers.so not built: {path}")
     lib = ctypes.CDLL(str(path))
-    lib._mlir_ciface_hc_get_buffer.argtypes = [
-        ctypes.POINTER(_MemRef1Di8),
-        ctypes.py_object,
-    ]
-    lib._mlir_ciface_hc_get_buffer.restype = None
     lib._mlir_ciface_hc_get_ptr.argtypes = [ctypes.py_object]
     lib._mlir_ciface_hc_get_ptr.restype = ctypes.c_void_p
     lib._mlir_ciface_hc_get_int64.argtypes = [ctypes.py_object]
@@ -113,25 +97,10 @@ def test_helpers_export_expected_symbols(helpers: ctypes.CDLL) -> None:
         assert getattr(helpers, name) is not None, name
 
 
-def test_get_buffer_returns_data_pointer(helpers: ctypes.CDLL) -> None:
-    array = np.arange(32, dtype=np.float32)
-    tensor = _NumpyTensor(array)
-    descriptor = _MemRef1Di8()
-    helpers._mlir_ciface_hc_get_buffer(ctypes.byref(descriptor), tensor)
-
-    expected_ptr = int(array.ctypes.data)
-    assert descriptor.base_ptr == expected_ptr
-    assert descriptor.data == expected_ptr
-    assert descriptor.offset == 0
-    assert descriptor.strides[0] == 1
-    # The byte length is intentionally a sentinel; see BufferUtils.h.
-    assert descriptor.sizes[0] == -1
-
-
 def test_get_ptr_returns_data_pointer(helpers: ctypes.CDLL) -> None:
-    # `hc_get_ptr` is the descriptor-free entry the `!hc.ptr<global, T?>`
-    # kernel-arg ABI calls into — it should return the same address as
-    # `data_ptr()` without the memref envelope.
+    # `hc_get_ptr` is the buffer ABI entry the `!hc.ptr<global, T?>`
+    # kernel-arg path calls into — it should return the same address as
+    # `data_ptr()`.
     array = np.arange(64, dtype=np.float16)
     tensor = _NumpyTensor(array)
     expected_ptr = int(array.ctypes.data)

@@ -174,8 +174,9 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m14 : !transform.any_op
     // Sink constant index ops into `gpu.launch` so the outliner inlines them
     // into `gpu.func` instead of routing them through kernel arguments.
-    // memref.dim's axis operand is the canonical victim — runtime-typed axes
-    // hit `dynamic_stackalloc` in AMDGPU codegen, so we keep them literal.
+    // Any constant-axis dim/stride producer (`hc.buffer_dim`, the kernel-arg
+    // UCC indexing) is the canonical victim — runtime-typed axes hit
+    // `dynamic_stackalloc` in AMDGPU codegen, so we keep them literal.
     %m15 = transform.apply_registered_pass "gpu-launch-sink-index-computations" to %m14
         : (!transform.any_op) -> !transform.any_op
     // Outline each `gpu.launch` into `gpu.module @kernel_kernel` +

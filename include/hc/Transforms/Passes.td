@@ -544,10 +544,13 @@ def HCLowerKernelsToGPULaunch
     (`PyObject *`) per non-`!hc.group` kernel argument; the wrapper body calls
     the `_mlir_ciface_hc_get_*` runtime helpers (declared as `func.func
     private` with `llvm.emit_c_interface`) to unpack each PyObject into a
-    typed memref or scalar before computing launch geometry. Buffer arguments
-    come back as `memref<?xi8>` byte buffers and get re-typed via `memref.view`
-    using shape values pulled from the corresponding tensor PyObject (or from
-    sibling scalar `idx` arguments). The stream pointer threads through to the
+    raw pointer / dim / stride / scalar before computing launch geometry.
+    Each buffer argument materializes as an `(!hc.ptr<global, T>, dim*,
+    stride*)` tuple sourced from `hc_get_ptr` + per-axis `hc_get_dim` /
+    `hc_get_stride`; an N→1 `unrealized_conversion_cast` planted inside the
+    `gpu.launch` region bridges the tuple back to `!hc.buffer<...>` so
+    `gpu-kernel-outlining` captures the raw pointer / dim / stride values
+    the kernel ultimately consumes. The stream pointer threads through to the
     runtime launch calls in `hc-lower-launch-func-to-runtime`; passing null
     keeps HIP's default-stream semantics.
 
@@ -559,8 +562,7 @@ def HCLowerKernelsToGPULaunch
     "::mlir::arith::ArithDialect",
     "::mlir::func::FuncDialect",
     "::mlir::gpu::GPUDialect",
-    "::mlir::hc::HCDialect",
-    "::mlir::memref::MemRefDialect"
+    "::mlir::hc::HCDialect"
   ];
 }
 
@@ -723,18 +725,17 @@ def HCLowerLaunchBody
     materialize as `hc.alloc` + `hc.ptr_*` against `!hc.ptr<workgroup, T>`
     (the `hc-lower-to-llvm` slice owns the final memory lowering), and bare
     vectors lower to upstream `vector` values. Final masked stores lower to
-    `hc.ptr_store_pred` (vector form) or guarded scalar stores. Kernel
-    argument memrefs flow through unchanged — the host-side switch to
-    `!hc.ptr<global>` lives in the launch-helper / host-wrapper slice. WMMA
-    intrinsic boundaries stay on their existing `hc.call_intrinsic` path
-    until the matching recipe runs.
+    `hc.ptr_store_pred` (vector form) or guarded scalar stores. Kernel-arg
+    buffers arrive as `(!hc.ptr<global, T>, dim*, stride*)` and lower to
+    `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]` on the
+    same `!hc.ptr` family. WMMA intrinsic boundaries stay on their existing
+    `hc.call_intrinsic` path until the matching recipe runs.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
     "::mlir::func::FuncDialect",
     "::mlir::gpu::GPUDialect",
     "::mlir::hc::HCDialect",
-    "::mlir::memref::MemRefDialect",
     "::mlir::scf::SCFDialect",
     "::mlir::vector::VectorDialect"
   ];

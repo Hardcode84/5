@@ -174,7 +174,7 @@ func.func @progressive_undef(%n: index, %a: !hc.undef, %c: !hc.undef)
 }
 
 // Pure-store form: ptr-typed out, zero SSA results. Mirrors
-// `linalg.generic` over a memref destination — the body sources the
+// `linalg.generic` over an in-place destination — the body sources the
 // carry via the implicit ptr_load on the operand and the yield routes
 // through an implicit ptr_store at the operand's offset. Op-level
 // memory effects (Read on src, Read+Write on dst) come from
@@ -235,7 +235,8 @@ func.func @mixed_outs(%n: index,
 // Buffer-typed out is also a memory carrier (Read+Write effect on the
 // operand, no SSA result). Element type comes off the buffer's
 // `getElementType()` for the body-arg parity check, same as a shaped
-// value-typed out — just on the memref side of the polymorphism.
+// value-typed out — just on the in-place / pointer side of the
+// polymorphism (`linalg.generic`'s memref regime, in HC clothing).
 // CHECK-LABEL: func.func @buffer_out
 // CHECK: hc.generic
 // CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)

@@ -108,47 +108,18 @@ static int64_t callIntegerAccessor(PyObject *obj, const char *method,
 
 } // namespace
 
-// Shared `data_ptr()` extraction. Both the legacy `hc_get_buffer` and the
-// `hc.ptr`-native `hc_get_ptr` reach back to the same Python attribute;
-// keeping the call shape in one place avoids the two surfaces silently
-// drifting on attribute name / error-message wording.
-static void *fetchDataPtr(PyObject *obj, const char *who) {
-  PyRef accessor(PyObject_GetAttrString(obj, "data_ptr"));
-  if (!accessor)
-    raisePythonError(std::string("hc_rt: ")
-                         .append(who)
-                         .append(": tensor argument missing data_ptr()")
-                         .c_str());
-  PyRef raw(PyObject_CallNoArgs(accessor.get()));
-  if (!raw)
-    raisePythonError(std::string("hc_rt: ")
-                         .append(who)
-                         .append(": data_ptr() raised")
-                         .c_str());
-  void *ptr = PyLong_AsVoidPtr(raw.get());
-  if (ptr == nullptr && PyErr_Occurred())
-    raisePythonError(std::string("hc_rt: ")
-                         .append(who)
-                         .append(": data_ptr() returned non-int")
-                         .c_str());
-  return ptr;
-}
-
-extern "C" void _mlir_ciface_hc_get_buffer(HcMemRef1Di8 *ret, PyObject *obj) {
-  GilGuard gil;
-  void *ptr = fetchDataPtr(obj, "hc_get_buffer");
-  ret->basePtr = static_cast<uint8_t *>(ptr);
-  ret->data = static_cast<uint8_t *>(ptr);
-  ret->offset = 0;
-  // Sentinel: see header — the byte length is never consumed because the
-  // host wrapper immediately reinterprets to a typed memref.
-  ret->sizes[0] = -1;
-  ret->strides[0] = 1;
-}
-
 extern "C" void *_mlir_ciface_hc_get_ptr(PyObject *obj) {
   GilGuard gil;
-  return fetchDataPtr(obj, "hc_get_ptr");
+  PyRef accessor(PyObject_GetAttrString(obj, "data_ptr"));
+  if (!accessor)
+    raisePythonError("hc_rt: hc_get_ptr: tensor argument missing data_ptr()");
+  PyRef raw(PyObject_CallNoArgs(accessor.get()));
+  if (!raw)
+    raisePythonError("hc_rt: hc_get_ptr: data_ptr() raised");
+  void *ptr = PyLong_AsVoidPtr(raw.get());
+  if (ptr == nullptr && PyErr_Occurred())
+    raisePythonError("hc_rt: hc_get_ptr: data_ptr() returned non-int");
+  return ptr;
 }
 
 extern "C" int64_t _mlir_ciface_hc_get_int64(PyObject *obj) {

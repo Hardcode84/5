@@ -6,19 +6,18 @@
 // Mirrors the composition that `hc.compile` runs — the schedule in
 // `hc/schedules/front_to_hc.mlir` plus the `_GPU_LOWERING_PIPELINE` chain in
 // `hc/_pipeline.py` — as a hand-rolled `hc-opt` pass list, so this LIT can
-// run from any builder that has `hc-opt` in PATH and proves every milestone
-// the bead checklist requires:
+// run from any builder that has `hc-opt` in PATH. Pins the load-bearing
+// invariants of the executable lowering chain:
 //
 //   * `hc.kernel` becomes a host wrapper that ends up as `llvm.func` after
-//     `gpu-to-llvm` runs (the host-side memref descriptor flattening hits
-//     all `func.func` in the module, which is what the executable handle
-//     plumbing later wants).
+//     `gpu-to-llvm` finishes the host-side `func.func` → `llvm.func`
+//     lowering, which is what the executable handle plumbing later wants.
 //   * `gpu-kernel-outlining` relocates the launch body into a sibling
 //     `gpu.module @<kernel>_kernel`, `rocdl-attach-target` stamps it,
 //     and `hc-lower-gpu-to-binary` finally compiles the module to an
 //     HSACO blob attached to a `gpu.binary` op.
 //   * No `hc.*` ops survive at any point; all upstream conversions
-//     (workgroup memref AS3, vector transfer reduction, scf->cf, gpu->rocdl,
+//     (workgroup `!hc.ptr` → addrspace-3 LLVM globals, scf->cf, gpu->rocdl,
 //     amdgpu wmma intrinsic lowering) compose without leftover dialect.
 //
 // The HSACO blob bytes are opaque, so we strip the `bin = "..."` payload
@@ -54,11 +53,8 @@
 // then cwrapper-rewritten by `convert-func-to-llvm`: the public-name
 // wrapper passes scalars / pointers straight through to the matching
 // `_mlir_ciface_*` symbol libhc_rt_helpers.so exports. The
-// `hc.ptr<global, T?>` kernel-arg ABI calls into `hc_get_ptr` — no
-// memref descriptor on the wire — and pulls dims/strides via the matching
-// scalar helpers. The legacy `hc_get_buffer` decl can still appear if any
-// transitional consumer needs it, but the host wrapper's runtime calls
-// are exclusively the descriptor-free variants.
+// `hc.ptr<global, T?>` kernel-arg ABI calls into `hc_get_ptr` and pulls
+// dims/strides via the matching scalar helpers — no memref on the wire.
 // CHECK-DAG: llvm.func private @hc_get_ptr({{.*}}: !llvm.ptr) -> !llvm.ptr
 // CHECK-DAG: llvm.func @_mlir_ciface_hc_get_ptr(!llvm.ptr) -> !llvm.ptr
 // CHECK-DAG: llvm.func private @hc_get_dim({{.*}}: !llvm.ptr, {{.*}}: i32) -> i64

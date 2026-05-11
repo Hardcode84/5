@@ -5,13 +5,13 @@
 // Implements `-hc-lower-launch-body`, the launch-body lowering pass that runs
 // after HC kernels have been wrapped in `gpu.launch`.
 //
-// Workgroup-AS storage no longer materializes as `memref<..., workgroup>` —
-// the launch-body emits `hc.alloc`/`hc.ptr_*` against `!hc.ptr<workgroup, T>`
-// and the downstream `hc-lower-to-llvm` finishes the LLVM-dialect lowering.
-// Kernel-argument memrefs flow through unchanged; the host-wrapper switch to
-// `!hc.ptr<global>` is owned by a separate pass. The doc invariant scopes the
-// retirement to the workgroup-AS family — see `doc/layouts.md` "hc.ptr and
-// memory ops" for the contract.
+// Workgroup-AS storage and kernel-arg buffers are both off memref. Workgroup
+// tiles materialize as `hc.alloc` + `hc.ptr_*` against `!hc.ptr<workgroup, T>`;
+// kernel-arg buffers arrive as a `(!hc.ptr<global, T>, dim*, stride*)` UCC
+// fragment that this pass walks to recover dims/strides and to emit
+// `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`. The
+// downstream `hc-lower-to-llvm` finishes the LLVM-dialect lowering.
+// `doc/layouts.md` "hc.ptr and memory ops" holds the contract.
 
 #include "hc/Transforms/Passes.h"
 
@@ -23,7 +23,6 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AffineMap.h"
@@ -970,8 +969,9 @@ linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
   return std::pair<Value, Value>{linearTid, wgSize};
 }
 
-// Cooperative copy from a slice of a device-memory memref into a workgroup-AS
-// LDS pointer. Each thread of the enclosing wave is responsible for a strided
+// Cooperative copy from a slice of a kernel-arg `!hc.ptr<global, T>` into a
+// workgroup-AS LDS pointer. Each thread of the enclosing wave is responsible
+// for a strided
 // subset of the LDS tile's elements (`lane, lane + wgSize, lane + 2*wgSize,
 // ...`); a closing `gpu.barrier` makes the fully populated LDS visible to
 // every thread before it's read back as per-lane fragments.
@@ -1467,11 +1467,12 @@ static SmallVector<Value> storeIndicesForCoordinate(OpBuilder &builder,
   return indices;
 }
 
-// Per-element scalar memref.load of one lane of the result vector.
-// `axes` carries the slice's per-axis offsets and strides (`offset + coord
-// * stride` for slice axes; just `offset` for scalar axes). The result
-// vector's coords identify which slice axis we're walking; non-slice
-// axes get the same `axes[k].offset` for every lane.
+// Build the per-axis index list for one lane of the result vector. The
+// caller feeds these into `hc.ptr_offset` + `hc.ptr_load` against the
+// kernel-arg pointer. `axes` carries the slice's per-axis offsets and
+// strides (`offset + coord * stride` for slice axes; just `offset` for
+// scalar axes). The result vector's coords identify which slice axis we're
+// walking; non-slice axes get the same `axes[k].offset` for every lane.
 static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
                                                ArrayRef<SliceAxis> axes,
                                                ArrayRef<int64_t> resultCoord) {
@@ -2446,9 +2447,9 @@ static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
 static ConversionTarget
 makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   ConversionTarget target(*ctx);
-  target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
-                         gpu::GPUDialect, memref::MemRefDialect,
-                         scf::SCFDialect, vector::VectorDialect>();
+  target
+      .addLegalDialect<arith::ArithDialect, func::FuncDialect, gpu::GPUDialect,
+                       scf::SCFDialect, vector::VectorDialect>();
   // HC ptr-family ops are produced by this pass (workgroup tiles) and must
   // pass through to the downstream `hc-lower-to-llvm` slot.
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,

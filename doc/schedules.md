@@ -123,10 +123,13 @@ pass. The final normalization removes supported `hc.func` call boundaries and
 result-producing workitem regions from the executable HC body, leaving subgroup
 and other unsupported scope cases to diagnose. Cleanup runs over that normalized
 HC body before `hc-lower-kernels-to-gpu-launch` wraps each `hc.kernel` in a host
-`func.func` containing a `gpu.launch`. `hc-lower-launch-body` then lowers the
+`func.func` containing a `gpu.launch` and exposes buffer ABI as
+`(!hc.ptr<global, T>, dim*, stride*)`. `hc-lower-launch-body` then lowers the
 scalar/index subset inside that launch to upstream `arith`/`scf` operations and
-lowers static bare tensors to workgroup-memory `memref`s. Bare vectors lower to
-upstream `vector` values, and final masked stores become guarded memref writes.
+lowers static bare tensors to workgroup-memory `!hc.ptr<workgroup, T>` (via
+`hc.alloc` + `hc.ptr_offset` + `hc.ptr_*`). Bare vectors lower to upstream
+`vector` values, and final masked stores become `hc.ptr_store_pred` (vector
+form) or guarded scalar `hc.ptr_store` inside `scf.if`.
 Intrinsic boundaries remain HC ops with explicit casts at that point; the final
 `hc-interpret-intrinsic-recipes` step then walks the sibling
 `module @__hc_intrinsic_lowerings__` the frontend emitter planted, applies

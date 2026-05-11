@@ -5,8 +5,9 @@
 This document describes an MLIR-first lowering path for the high-level kernel
 API defined in `doc/langref.md`.
 
-For the concrete upstream MLIR executable path centered on the WMMA example,
-see `doc/upstream-lowering.md`.
+For the concrete pass schedule and live pipeline shape, see
+[`doc/schedules.md`](schedules.md) and the
+"hc.ptr and memory ops" section of [`doc/layouts.md`](layouts.md).
 
 The main design goal is to get a useful end-to-end compiler running quickly
 while keeping the Python frontend intentionally thin. Type inference, semantic
@@ -1098,11 +1099,9 @@ shim, with no external ROCm install on the host. The pieces are:
    takes one `PyObject *` per user argument and unpacks each one
    through the `_mlir_ciface_hc_get_ptr` / `_mlir_ciface_hc_get_int64`
    / `_mlir_ciface_hc_get_float64` / `_mlir_ciface_hc_get_dim` /
-   `_mlir_ciface_hc_get_stride` helpers. The buffer ABI uses the
-   pointer + per-axis dim/stride trio (no memref descriptor
-   envelope); `hc_get_buffer` is kept around for internal
-   transitional callers but is no longer on the kernel-arg path.
-   These helpers borrow the buffer protocol /
+   `_mlir_ciface_hc_get_stride` helpers. The buffer ABI is the raw
+   pointer + per-axis dim/stride trio — no memref descriptor on the
+   wire. These helpers borrow the buffer protocol /
    `__cuda_array_interface__` view of the object — they do not
    allocate, copy, or take ownership; the caller keeps the tensor
    alive across the launch.
@@ -1494,7 +1493,7 @@ sequences travel alongside the kernel into the `hc` dialect.
 #### Pipeline placement
 
 `-hc-interpret-intrinsic-recipes` is the consumer. It runs *after*
-`-hc-lower-launch-body`, when scalar, vector, memref, and mask types have
+`-hc-lower-launch-body`, when scalar, vector, ptr, and mask types have
 been materialized — the recipe authors see the same operand types the
 target op expects:
 

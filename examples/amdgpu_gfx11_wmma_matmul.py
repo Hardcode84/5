@@ -469,9 +469,9 @@ def run_on_hardware(
     Mirrors `tests/test_examples.py::test_gfx11_wmma_example_invokes_on_real_hardware`,
     which is the executable spec for the same chain. We use `torch.cuda`
     tensors for the device buffers because `Tensor.data_ptr()` returns a
-    HIP-allocated pointer that `_mlir_ciface_hc_get_buffer` plugs straight
-    into the kernel descriptor — the runtime helpers don't allocate or
-    copy on their own. Raises a clear `RuntimeError` (not `ImportError`)
+    HIP-allocated pointer that `_mlir_ciface_hc_get_ptr` hands straight
+    to `gpu.launch_func` — the runtime helpers don't allocate or copy on
+    their own. Raises a clear `RuntimeError` (not `ImportError`)
     when torch or torch.cuda is missing so callers see a single
     actionable message instead of a stack trace.
     """

@@ -390,7 +390,7 @@ def HC_PtrPredicateType : AnyTypeOf<[
 // Operand type for `hc.idx_apply` / `hc.pred_apply`: the SSA Value that
 // supplies the runtime integer for one explicitly-bound free symbol of
 // the carried expression / predicate. `index` is the natural form
-// (loop induction vars, `memref.dim` results, builtin arithmetic);
+// (loop induction vars, kernel-arg dim/stride values, builtin arithmetic);
 // `!hc.idx<...>` is accepted so producers that already have a typed
 // symbolic SSA in hand don't have to round-trip through an
 // `unrealized_conversion_cast` to pass it as an operand. Lowering

@@ -942,13 +942,12 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
 
 def test_compile_invoke_accepts_non_contiguous_tensor(tmp_path: Path) -> None:
     # The host wrapper pulls per-axis strides at runtime via
-    # `_mlir_ciface_hc_get_stride` and feeds them into
-    # `memref.reinterpret_cast`, so a numpy slice with stride > 1 must
-    # flow through without complaint. The pre-stride lowering used
-    # `memref.view` (which bakes identity strides) and would have
-    # silently miscomputed against this input. The kernel body is empty
-    # — we're not checking output values, just proving the strided
-    # descriptor reaches the typed memref intact.
+    # `_mlir_ciface_hc_get_stride` and feeds them into the kernel-arg
+    # `(!hc.ptr<global, T>, dim*, stride*)` tuple, where the launch-body
+    # lowering uses them to linearize `hc.ptr_offset` indices. A numpy
+    # slice with stride > 1 must therefore flow through without complaint.
+    # The kernel body is empty — we're not checking output values, just
+    # proving the strided pointer + per-axis strides reach the kernel intact.
     script = tmp_path / "compile_invoke_strided.py"
     script.write_text(textwrap.dedent("""
             import numpy as np

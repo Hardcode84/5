@@ -16,7 +16,6 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -282,8 +281,9 @@ static void bindScalarSymbol(Type originalType, Value hostArg,
 // `llvm.emit_c_interface` attribute is what makes `convert-func-to-llvm`
 // (a) emit an external `_mlir_ciface_<name>` decl that matches the C ABI
 // exported by `libhc_rt_helpers.so`, and (b) generate a private body for
-// `<name>` that handles memref descriptor sret packing and forwards to the
-// cwrapper. Call sites in this pass therefore use the unmangled `@<name>`.
+// `<name>` that forwards to the cwrapper. All HC runtime helpers return
+// scalars / pointers (no sret packing). Call sites in this pass therefore
+// use the unmangled `@<name>`.
 static func::FuncOp ensureRuntimeHelper(ModuleOp module, StringRef name,
                                         ArrayRef<Type> inputs,
                                         ArrayRef<Type> results) {
@@ -307,14 +307,10 @@ static void ensureRuntimeHelpers(ModuleOp module) {
   Type i32 = IntegerType::get(ctx, 32);
   Type i64 = IntegerType::get(ctx, 64);
   Type f64 = Float64Type::get(ctx);
-  // `hc_get_ptr` is the descriptor-free entry — the host wrapper hands its
-  // result straight to `gpu.launch_func` as the buffer arg, no memref
-  // packing in between. Returns `!llvm.ptr` (matching the `data_ptr()` raw
-  // address). Kept alongside `hc_get_buffer` for any in-flight consumer
-  // still on the legacy memref envelope.
-  Type byteRef =
-      MemRefType::get({ShapedType::kDynamic}, IntegerType::get(ctx, 8));
-  ensureRuntimeHelper(module, "hc_get_buffer", {ptr}, {byteRef});
+  // `hc_get_ptr` is the buffer-ABI entry — the host wrapper hands its
+  // result straight to `gpu.launch_func` as the buffer arg. Returns
+  // `!llvm.ptr` (matching the `data_ptr()` raw address); per-axis dim and
+  // stride values arrive via the matching scalar helpers below.
   ensureRuntimeHelper(module, "hc_get_ptr", {ptr}, {ptr});
   ensureRuntimeHelper(module, "hc_get_dim", {ptr, i32}, {i64});
   ensureRuntimeHelper(module, "hc_get_stride", {ptr, i32}, {i64});
@@ -323,8 +319,8 @@ static void ensureRuntimeHelpers(ModuleOp module) {
 }
 
 // Shared shape: each `_mlir_ciface_hc_get_*(pyobj, axis)` accessor returns
-// an i64 in element units that we want as `index` for memref descriptor
-// consumption. Lifted out so dim and stride don't drift apart.
+// an i64 in element units that we want as `index` for the kernel-arg
+// `(ptr, dim*, stride*)` UCC. Lifted out so dim and stride don't drift apart.
 static Value callIndexAccessor(OpBuilder &builder, Location loc,
                                ModuleOp module, StringRef name, Value pyArg,
                                unsigned axisIndex) {

@@ -1220,6 +1220,69 @@ def HCPtrStorePredOp : HC_Op<"ptr_store_pred", [
   let hasVerifier = 1;
 }
 
+def HCPredicateOp : HC_Op<"predicate",
+    [Pure, AllTypesMatch<["value", "passthrough", "result"]>]> {
+  let summary =
+      "Predicated SSA value (`mask ? value : passthrough`) with producer-"
+      "hoist lowering semantics.";
+  let description = [{
+    Per-lane select with a hoist contract: `result = mask ? value :
+    passthrough`, but the lowering rewrites the producer of `$value` in
+    place to a predicated form rather than emitting a speculative load
+    followed by a blend. OOB / inactive lanes never materialise the
+    underlying read — which is the whole point of having a distinct op
+    instead of plain `arith.select`.
+
+    The surface is intentionally generic — `Pure`, no parent restriction —
+    so producer-side rewriters and the `hc.generic` body lowering share
+    the same op. Mask shape parity is the same rule the predicated memory
+    ops carry: scalar value pairs with `i1`, `vector<NxT>` value pairs
+    with `vector<Nxi1>` of the same N. Pre-inference `!hc.undef` on
+    either side escapes the parity check.
+
+    `$passthrough` is required (no implicit poison / zero default), same
+    rule `hc.ptr_load_pred` carries: the producer always supplies the
+    inactive value.
+
+    Lowering — `hc-lower-generic` dispatches on the def of `$value`
+    (allow-list, not default-accept):
+    * `hc.generic` body ins block-arg: the implicit `hc.ptr_load` at the
+      ins-slot offset becomes `hc.ptr_load_pred` with `$mask` /
+      `$passthrough`. Speculative reads on OOB lanes never happen.
+    * `hc.ptr_load` / `hc.vload` / `hc.load`: clone the producer in place
+      in its predicated form. Each `hc.predicate` use clones one
+      predicated op at the producer's def site, so multiple decorators on
+      the same load each get their own predicated load.
+    * `vector.extract` of a vector value: emit `arith.select %mask,
+      %value, %passthrough` at the predicate site. The underlying vector
+      load stays unconditional; the predicate gates the lane only.
+    * Anything else: lowering diagnostic. Extending the allow-list is a
+      deliberate per-producer choice.
+
+    Dominance: `$mask` and `$passthrough` must dominate the producer's
+    def site when the lowering clones / rewrites there. The producer's
+    site is where the predicate physically lives in the lowered IR, so
+    the mask SSA has to be available there. Violations are lowering-time
+    diagnostics, not silent drops.
+
+    Always-true / always-false masks fold via `canonicalize`: `m_One()`
+    drops the predicate (`result := value`), `m_Zero()` drops the load
+    (`result := passthrough`). The fold path runs before the lowering's
+    producer dispatch, so unpredicated emit stays the default for
+    trivial masks. The folds land with the lowering wire-up, not on the
+    foundation surface.
+  }];
+  let arguments = (ins HC_PtrAccessValueType:$value,
+                       HC_PtrPredicateType:$mask,
+                       HC_PtrAccessValueType:$passthrough);
+  let results = (outs HC_PtrAccessValueType:$result);
+  let assemblyFormat = [{
+    $value `mask` $mask `passthrough` $passthrough attr-dict `:`
+    type($value) `,` type($mask)
+  }];
+  let hasVerifier = 1;
+}
+
 //===----------------------------------------------------------------------===//
 // Reductions, matmul, astype.
 //===----------------------------------------------------------------------===//

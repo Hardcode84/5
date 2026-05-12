@@ -1121,6 +1121,33 @@ module {
 
 // -----
 
+// `hc.predicate` shares the same scalar/vector shape-parity rule as the
+// predicated mem ops. Scalar value with vector mask is the typical
+// transcription mistake; the diagnostic names both types so the producer
+// can tell which side drifted.
+// CHECK: error: 'hc.predicate' op predicate shape must match value shape
+module {
+  func.func @bad(%v: f32, %m: vector<4xi1>, %fill: f32) -> f32 {
+    %r = hc.predicate %v mask %m passthrough %fill : f32, vector<4xi1>
+    return %r : f32
+  }
+}
+
+// -----
+
+// Vector value with mismatched-length mask: lane counts must match.
+// CHECK: error: 'hc.predicate' op predicate shape 'vector<4xi1>' must match value shape 'vector<8xf32>'
+module {
+  func.func @bad(%v: vector<8xf32>, %m: vector<4xi1>, %fill: vector<8xf32>)
+      -> vector<8xf32> {
+    %r = hc.predicate %v mask %m passthrough %fill
+        : vector<8xf32>, vector<4xi1>
+    return %r : vector<8xf32>
+  }
+}
+
+// -----
+
 // `hc.generic` requires at least one iter; an empty `iter ()` clause is
 // rejected at parse time before the verifier ever runs. The upstream
 // `parseKeyword` diagnostic fires first when the parser hits the

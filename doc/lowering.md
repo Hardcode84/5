@@ -549,6 +549,16 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
 * `hc.with_inactive %v, %inactive` — replace inactive elements. The inactive
   fill is a scalar SSA value; once inference pins both operands its numeric
   domain must match the shaped value's element type.
+* `hc.predicate %v mask %m passthrough %f` — predicated SSA value
+  (`m ? v : f`) with producer-hoist lowering. Same mask shape parity rule
+  as the predicated mem ops (`i1` for scalars, `vector<Nxi1>` for vectors).
+  `hc-lower-generic` peeks at the def of `%v`: an `hc.generic` body ins
+  block-arg becomes a predicated implicit load (`hc.ptr_load_pred`), a
+  body-emitted `hc.ptr_load` is cloned in place as its predicated form,
+  a `vector.extract` collapses to `arith.select` at the predicate site.
+  Other producers are a lowering diagnostic (strict allow-list). Mask
+  and passthrough must dominate the producer; folds `m_One()` →
+  passthrough drop, `m_Zero()` → load elision.
 * `hc.as_layout %v, layout = row_major | col_major` — change layout.
   The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
   spellings fail at parse. v0 admits `row_major` and `col_major`; later

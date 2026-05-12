@@ -176,6 +176,44 @@ func.func @ptr_load_store_pred_opaque_vector(%p: !hc.ptr<global>,
   return
 }
 
+// `hc.predicate` is the value-side counterpart of the predicated mem
+// pair: a `mask ? value : passthrough` triple whose lowering hoists the
+// predicate to the producer of `$value` (turning a plain `hc.ptr_load`
+// into `hc.ptr_load_pred`, an extract into `arith.select`, ...). The
+// surface op itself is `Pure` and parent-agnostic so producer rewriters
+// and the `hc.generic` body lowering share it. Mask shape parity mirrors
+// the predicated mem ops: scalar value with `i1`, vector value with
+// `vector<Nxi1>` of the same N.
+// CHECK-LABEL: func.func @predicate_scalar
+// CHECK: %{{.+}} = hc.predicate %{{.+}} mask %{{.+}} passthrough %{{.+}} : f32, i1
+func.func @predicate_scalar(%v: f32, %m: i1, %fill: f32) -> f32 {
+  %r = hc.predicate %v mask %m passthrough %fill : f32, i1
+  return %r : f32
+}
+
+// Vector-form `hc.predicate`: per-lane mask, per-lane passthrough. This
+// is the shape the post-merge vector lowering picks when it collapses
+// a contig group of width N into a single `vector<NxT>` register.
+// CHECK-LABEL: func.func @predicate_vector
+// CHECK: %{{.+}} = hc.predicate %{{.+}} mask %{{.+}} passthrough %{{.+}} : vector<4xf32>, vector<4xi1>
+func.func @predicate_vector(%v: vector<4xf32>, %m: vector<4xi1>,
+                            %fill: vector<4xf32>) -> vector<4xf32> {
+  %r = hc.predicate %v mask %m passthrough %fill
+      : vector<4xf32>, vector<4xi1>
+  return %r : vector<4xf32>
+}
+
+// Pre-inference `!hc.undef` on either side escapes the shape-parity
+// check, same policy the predicated mem ops use. Lets frontend / early
+// passes emit the op before inference has pinned the operand types.
+// CHECK-LABEL: func.func @predicate_undef
+// CHECK: %{{.+}} = hc.predicate %{{.+}} mask %{{.+}} passthrough %{{.+}} : !hc.undef, !hc.undef
+func.func @predicate_undef(%v: !hc.undef, %m: !hc.undef, %fill: !hc.undef)
+    -> !hc.undef {
+  %r = hc.predicate %v mask %m passthrough %fill : !hc.undef, !hc.undef
+  return %r : !hc.undef
+}
+
 // Pointer values flow through `scf.for` iter_args because `!hc.ptr` is
 // a legal `HC_ValueType`; this is how the post-flatten lowering will
 // hand a sliding workgroup pointer through a cooperative-copy loop.

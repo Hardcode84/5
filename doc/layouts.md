@@ -310,6 +310,47 @@ group) they lower directly to upstream `vector.maskedload` /
 see the lowering section's "Predicated bodies" notes for how the
 search interacts with `scf.if` residuals.
 
+The value-side counterpart for predicated reads is `hc.predicate`:
+
+```mlir
+// scalar `mask ? value : passthrough` — semantically equivalent to
+// arith.select, but with a producer-hoist lowering contract.
+%r = hc.predicate %v mask %m passthrough %fill : f32, i1
+
+// vector form — per-lane mask, per-lane passthrough.
+%rv = hc.predicate %vv mask %mv passthrough %fillv : vector<4xf32>, vector<4xi1>
+```
+
+`hc.predicate` is a `Pure` value op with no parent restriction —
+producer-side rewriters and the `hc.generic` body lowering share the
+same surface. Mask shape parity follows the same rule the predicated
+mem ops carry (scalar ↔ `i1`, `vector<NxT>` ↔ `vector<Nxi1>` of the
+same N); passthrough is mandatory, no implicit poison fallback.
+
+The lowering at `hc-lower-generic` hoists the predicate back to the
+producer of `$value` rather than emitting a speculative load followed
+by a blend — OOB lanes never materialise the underlying read. Dispatch
+is on the def site (strict allow-list, anything else is a lowering
+diagnostic):
+
+* `hc.generic` body ins block-arg → implicit `hc.ptr_load` at the
+  ins-slot offset becomes `hc.ptr_load_pred` with the mask /
+  passthrough;
+* `hc.ptr_load` / `hc.vload` / `hc.load` → clone the producer in
+  place, predicated. Each `hc.predicate` use clones one predicated op
+  at the producer's def site, so multiple decorators on the same load
+  each get their own predicated form;
+* `vector.extract` of a vector value → `arith.select` at the
+  predicate site. The underlying vector load stays unconditional; the
+  predicate only gates the lane.
+
+Dominance: the mask and passthrough must dominate the producer's def
+site when the lowering clones / rewrites there. The user has to
+schedule the mask before the load; otherwise the lowering errors
+out. Always-true masks fold the predicate away
+(`m_One()` → `result := value`); always-false elide the load
+(`m_Zero()` → `result := passthrough`).
+
 `hc.alloc` count is a single `index` SSA value. **In v1 the count is
 required to be statically known after specialization** — the verifier
 rejects allocations whose `count` is not a constant once the
@@ -532,33 +573,51 @@ This op is the single home for compute end-to-end:
   lands as a single mixed-outs `hc.generic` instead of two ops.
 
 No typed mask slot on `hc.generic` itself in v1 — masks ride as
-ordinary bare-pred tensor inputs on the input side; on the output
-side the body-terminator carries the mask channel via
-`hc.yield_predicated`. Producers materializing masked memory access
-route input loads through the predicated `hc.ptr_load_pred` op and
-output stores through the predicated terminator (lowering picks
-`hc.ptr_store_pred` for ptr-typed outs and an `arith.select` blend
-for value-typed outs). That keeps masked code vectorizable
-end-to-end without falling back to `scf.if` shapes in the body
-(see the `hc.ptr` section). A typed mask slot on the op surface
-remains a follow-up if a workload shows the input-side story needs
-first-class operand treatment.
+ordinary bare-pred tensor inputs when precomputed, or on body-side
+ops when computed in the iteration scope. Both edges of the body
+carry their own mask channel:
+
+* **Input side**: `hc.predicate %sv mask %m passthrough %f` decorates
+  the block-arg load. `hc-lower-generic` hoists the predicate to
+  the implicit `hc.ptr_load`, so masked-out lanes never speculate.
+* **Output side**: the body terminates with `hc.yield_predicated`
+  instead of `hc.yield`; per-value masks gate the publish. Lowering
+  picks `hc.ptr_store_pred` for ptr-typed outs and an `arith.select`
+  blend against the outs-as-init carry for value-typed outs.
+
+That keeps masked code vectorizable end-to-end without falling back
+to `scf.if` shapes in the body (see the `hc.ptr` section). A typed
+mask slot on the op surface remains a follow-up only if a workload
+shows the precomputed-tensor input story needs first-class operand
+treatment beyond what the body-side `hc.predicate` already covers.
 
 Tile sizes that don't divide the work bound generate trailing
-iterations with some lanes OOB. With `hc.yield_predicated` the
-body's per-element validity computes from iter syms + ambient
-bounds and rides the mask channel:
+iterations with some lanes OOB. Both edges express the validity
+condition at the source-rewrite level:
 
 ```mlir
-%valid = hc.pred_apply (%i as "i") : (!hc.idx<"i">) -> !hc.pred<"i < N">
-%vmask = hc.cast %valid : !hc.pred<"i < N"> -> i1
-hc.yield_predicated %sv mask %vmask : (f32), (i1)
+hc.generic
+    iter (parallel i = %n : index)
+    ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+    outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+    -> () {
+^bb0(%sv: f32, %dv: f32):
+  %valid = hc.pred_apply (%i as "i") : (!hc.idx<"i">) -> !hc.pred<"i < M">
+  %m = hc.cast %valid : !hc.pred<"i < M"> -> i1
+  %fill = arith.constant 0.0 : f32
+  // Predicated load: lowering hoists %m to the implicit hc.ptr_load,
+  // OOB lanes never read past the buffer.
+  %sv_pred = hc.predicate %sv mask %m passthrough %fill : f32, i1
+  // Predicated store: lowering routes through hc.ptr_store_pred at
+  // %dst's ins-slot offset.
+  hc.yield_predicated %sv_pred mask %m : (f32), (i1)
+}
 ```
 
 The launch-body / cooperative-copy lowering picks up the predicated
-store off the mask directly — no hand-rolled OOB guard
-inside the rewriter, the predicate lives at the source-rewrite
-level.
+load and store off the mask directly — no hand-rolled OOB guard
+inside the rewriter, the predicate lives at the source-rewrite level
+on both sides.
 
 Bound inference — `hc-infer-generic-bounds`:
 
@@ -635,12 +694,18 @@ Predicated bodies — the dominant case is masked memory access,
 expressed two ways depending on which side of the body owns the
 mask channel:
 
-* **Input loads** ride on the first-class `hc.ptr_load_pred`
-  (see the `hc.ptr` section above). The merge analyzer probes
-  predicated loads the same as the unconditional pair (the predicate
-  doesn't change offset arithmetic), and emission decomposes the
-  chosen partition: scalar groups lower to `scf.if` + `hc.ptr_load`,
-  vector groups lower directly to `vector.maskedload`.
+* **Input loads** ride on `hc.predicate %v mask %m passthrough %f`
+  in the body. The lowering hoists the predicate to the producer of
+  `%v`: an ins block-arg's implicit load becomes `hc.ptr_load_pred`,
+  a body-emitted `hc.ptr_load` is cloned in place as its predicated
+  form, a `vector.extract` collapses to `arith.select` at the
+  predicate site. Each `hc.predicate` use generates its own
+  producer-site clone — sharing is opt-in, not default. The merge
+  analyzer probes the resulting predicated loads the same way it
+  probes the unconditional pair (the predicate doesn't change offset
+  arithmetic). Emission decomposes the chosen partition: scalar
+  groups lower to `scf.if` + `hc.ptr_load`, vector groups lower
+  directly to `vector.maskedload`.
 * **Output stores and value-out blends** ride on
   `hc.yield_predicated` at the body terminator. The lowering peeks
   at the terminator kind: an `hc.yield` produces unpredicated stores

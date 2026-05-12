@@ -1840,6 +1840,15 @@ LogicalResult HCPtrStorePredOp::verify() {
                                          getPredicate().getType());
 }
 
+// Mask shape parity (`hc.predicate` covers the same scalar/vector cases
+// the predicated mem ops do). `AllTypesMatch` already ties `$value`,
+// `$passthrough`, and `$result` together; we only need the value-vs-mask
+// shape check here.
+LogicalResult HCPredicateOp::verify() {
+  return checkPredicateShapeMatchesValue(getOperation(), getValue().getType(),
+                                         getMask().getType());
+}
+
 // Per-pair value/mask shape parity: scalar value pairs with `i1`,
 // `vector<NxT>` value pairs with `vector<Nxi1>` of the same N. Count
 // parity is enforced by `SameVariadicOperandSize` on the op, so we only

@@ -68,8 +68,8 @@ hc.func @helper {
 // CHECK: hc.vec %{{.*}} : !hc.undef -> !hc.undef
 // CHECK: %[[INACTIVE:.*]] = hc.const<0.000000e+00 : f32> : f32
 // CHECK: hc.with_inactive %{{.*}}, %[[INACTIVE]] : (!hc.undef, f32) -> !hc.undef
-// CHECK: hc.as_layout %{{.*}}, layout = row_major : !hc.undef -> !hc.undef
-// CHECK: hc.as_layout %{{.*}}, layout = col_major : !hc.undef -> !hc.undef
+// CHECK: hc.as_layout %{{.*}}, layout = (#hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i1 + d1*i0">>) : !hc.undef -> !hc.undef
+// CHECK: hc.as_layout %{{.*}}, layout = (#hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + d0*i1">>) : !hc.undef -> !hc.undef
 func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
                          %v: !hc.undef) {
   %m = hc.const<"M"> : !hc.undef
@@ -87,16 +87,23 @@ func.func @data_movement(%buf: !hc.undef, %i: !hc.undef, %j: !hc.undef,
   %inactive = hc.const<0.0 : f32> : f32
   %masked = hc.with_inactive %v, %inactive
       : (!hc.undef, f32) -> !hc.undef
-  %reshaped = hc.as_layout %v, layout = row_major : !hc.undef -> !hc.undef
-  %transposed = hc.as_layout %v, layout = col_major : !hc.undef -> !hc.undef
+  // Two distinct 2D layouts: the first has `i0` step the inner axis,
+  // the second has `i1` step the inner axis. Same shape, different
+  // addressing — that's what `hc.as_layout` is for.
+  %reshaped = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1">
+  >) : !hc.undef -> !hc.undef
+  %transposed = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.undef -> !hc.undef
   return
 }
 
 // CHECK-LABEL: func.func @as_layout_structured
-// Both attribute kinds round-trip on the same op surface; the named-enum
-// keyword for back-compat, the structured `#hc.layout<...>` for the
-// `doc/layouts.md` direction. Structured spellings are wrapped in
-// `(...)` to disambiguate from the trailing `: type` on the op.
+// Structured spellings are wrapped in `(...)` to disambiguate from the
+// trailing `: type` on the op.
 // CHECK: hc.as_layout %{{.*}}, layout = (#hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">>) : !hc.undef -> !hc.undef
 func.func @as_layout_structured(%v: !hc.undef) -> !hc.undef {
   %r = hc.as_layout %v, layout = (#hc.layout<

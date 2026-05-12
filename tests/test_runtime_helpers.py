@@ -133,7 +133,7 @@ def test_get_dim_reads_size(helpers: ctypes.CDLL) -> None:
 def test_get_stride_reads_element_strides(helpers: ctypes.CDLL) -> None:
     array = np.zeros((4, 8), dtype=np.int64)
     tensor = _NumpyTensor(array)
-    # Row-major contiguous: stride(0) == 8 elements, stride(1) == 1 element.
+    # Contiguous: stride(0) == 8 elements, stride(1) == 1 element.
     assert helpers._mlir_ciface_hc_get_stride(tensor, 0) == 8
     assert helpers._mlir_ciface_hc_get_stride(tensor, 1) == 1
 

@@ -83,9 +83,9 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
       1. Strip explicit identity layouts from shaped Values. A layout
          is identity for an n-dim shape iff its shape_syms /
          index_syms have rank n, params is empty, storage_size is
-         the product over shape_syms, and offset is the row-major
-         dot product over index_syms with strides taken from the
-         tail product of shape_syms, all under ixsimpl-canonical
+         the product over shape_syms, and offset is the dot product
+         of index_syms with tail-product strides over shape_syms
+         (rightmost axis varies fastest), all under ixsimpl-canonical
          form. Matching values get `setType` to the layout-less type
          — the layout slot was made optional precisely so
          "absent equals identity" is the canonical form.

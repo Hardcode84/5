@@ -1416,7 +1416,7 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
       builder.setInsertionPointToStart(&rangeIf.getThenRegion().front());
 
       // Unlinearise `lin` into per-axis coords: rightmost axis varies
-      // fastest, matching the row-major flatten convention used by
+      // fastest, matching the flatten convention used by
       // `hc-flatten-with-layouts` so post-flatten offset expressions
       // line up with the coord assignment.
       SmallVector<Value> coords(axes.size());
@@ -1520,12 +1520,12 @@ static int64_t constIterBound(Value bound) {
   return -1;
 }
 
-// Per-axis row-major decompose of a flat lane index against a list of
-// integer bounds. Rightmost axis varies fastest, matching the
-// flatten convention used elsewhere. Returns `[i_0, i_1, ..., i_n-1]`
-// for `lane in [0, prod(bounds))`.
-static SmallVector<int, 4> decomposeRowMajor(int lane,
-                                             ArrayRef<int64_t> bounds) {
+// Per-axis decompose of a flat lane index against a list of integer
+// bounds. Rightmost axis varies fastest, matching the flatten
+// convention used elsewhere. Returns `[i_0, i_1, ..., i_n-1]` for
+// `lane in [0, prod(bounds))`.
+static SmallVector<int, 4> decomposeLaneIndex(int lane,
+                                              ArrayRef<int64_t> bounds) {
   SmallVector<int, 4> vals(bounds.size(), 0);
   for (int axis = static_cast<int>(bounds.size()) - 1; axis >= 0; --axis) {
     int64_t b = bounds[axis];
@@ -1566,7 +1566,7 @@ static Type asBuiltinElementType(Type t) {
 }
 
 // Resolve the per-lane integer slot for one operand's offset under
-// row-major iter-sym substitution. Used by both the value-outs
+// per-axis iter-sym substitution. Used by both the value-outs
 // (bijection on `[0, prodPar)`) and the value-ins (gather, allows
 // repeats, range check only) paths.
 static std::optional<int64_t> resolveOperandSlot(sym::Store &store,
@@ -1655,7 +1655,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
     llvm::SmallDenseSet<int64_t, 16> seen;
     for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
       SmallVector<int, 4> vals =
-          decomposeRowMajor(static_cast<int>(parLane), bounds);
+          decomposeLaneIndex(static_cast<int>(parLane), bounds);
       std::optional<int64_t> slot =
           resolveOperandSlot(store, origOff, iterNames, vals);
       if (!slot || *slot < 0 || *slot >= prodPar || !seen.insert(*slot).second)
@@ -1684,7 +1684,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
     slots.reserve(prodPar);
     for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
       SmallVector<int, 4> vals =
-          decomposeRowMajor(static_cast<int>(parLane), bounds);
+          decomposeLaneIndex(static_cast<int>(parLane), bounds);
       std::optional<int64_t> slot =
           resolveOperandSlot(store, origOff, iterNames, vals);
       if (!slot || *slot < 0 || *slot >= *count)
@@ -1699,7 +1699,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   // Reuse the partition emission machinery with `p[a] = bounds[a]`
   // on every axis (full unroll) and declaration order. The ins-load
   // path then runs `findContigGroups` over the unrolled lane offsets
-  // and merges contiguous runs into vector loads (a 16x16 row-major
+  // and merges contiguous runs into vector loads (a 16x16 contiguous
   // load with unit-stride inner axis collapses to one
   // `vector<256xT>` load before LLVM's vectorizer ever sees the IR).
   AxisOrder order;

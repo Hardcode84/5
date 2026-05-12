@@ -1150,7 +1150,8 @@ static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
 
 // Per-element store from a multi-dim `vector<...xT>` value into a flat
 // `!hc.ptr<workgroup, T>` buffer. Emits one `hc.ptr_offset` + `hc.ptr_store`
-// per lane in row-major order. We unconditionally use the per-element form
+// per lane in lex order (rightmost axis varies fastest). We
+// unconditionally use the per-element form
 // (rather than a single vector-typed `hc.ptr_store`) so the matching reads
 // can also be per-element scalars and the i1 byte-vs-bit discrepancy LLVM
 // has between scalar and vector i1 stores never bites.
@@ -1265,7 +1266,7 @@ emitCooperativeCopy(OpBuilder &builder, Location loc, Operation *anchor,
 
     // Unlinearize `lin` into per-axis coordinates of the LDS tile. Walk the
     // axes back-to-front so the innermost axis (fastest-varying) absorbs the
-    // remainder first; this matches the canonical row-major flatten order.
+    // remainder first; this matches the canonical lex flatten order.
     SmallVector<Value> coords(ldsShape.size());
     Value remaining = lin;
     for (int64_t axis = static_cast<int64_t>(ldsShape.size()) - 1; axis >= 0;
@@ -1489,10 +1490,10 @@ resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
 // reads from the source's flat offset `base + sum_k(view_idx[k] *
 // source_stride[slice_axis_k])` — base is the contribution of scalar source
 // axes, the slice contribution scales the lane coord by the source's
-// row-major stride at that source axis. For trivial (full-slice) patterns,
-// this collapses to the contiguous `0..N-1` linear walk a no-view source
-// wants. For strided patterns (column-of-2D-tile in WMMA), it threads each
-// lane through a separate `hc.ptr_offset` + `hc.ptr_load`.
+// identity-layout stride at that source axis. For trivial (full-slice)
+// patterns, this collapses to the contiguous `0..N-1` linear walk a no-view
+// source wants. For strided patterns (column-of-2D-tile in WMMA), it threads
+// each lane through a separate `hc.ptr_offset` + `hc.ptr_load`.
 //
 // The per-element shape preserves the byte-per-element layout the
 // cooperative store and other consumers use, sidestepping the i1

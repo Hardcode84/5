@@ -96,7 +96,7 @@ module attributes {transform.with_named_sequence} {
     // Layout cleanup. Identity layouts fold to absent so the post-decompose
     // shape carriers stay layout-less wherever the user didn't pin a
     // non-identity layout; `hc.as_layout` chains collapse to their outer
-    // arg. Non-identity layouts (col-major, padded, default-strided buffer
+    // arg. Non-identity layouts (transposed, padded, default-strided buffer
     // args) survive structurally — `hc-flatten-with-layouts` is the one
     // that erases the slot wholesale.
     %m10a = transform.apply_registered_pass "hc-canonicalize-layouts" to %m10

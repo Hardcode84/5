@@ -25,9 +25,10 @@ using namespace mlir::hc;
 // tablegen-generated op parse/print methods. The definitions live below
 // the generated include so the helpers can use the generated op classes.
 static mlir::ParseResult parseHCAsLayoutAttr(mlir::OpAsmParser &parser,
-                                             mlir::Attribute &layout);
+                                             mlir::hc::LayoutAttr &layout);
 static void printHCAsLayoutAttr(mlir::OpAsmPrinter &printer,
-                                mlir::Operation *op, mlir::Attribute layout);
+                                mlir::Operation *op,
+                                mlir::hc::LayoutAttr layout);
 static mlir::ParseResult parseApplyBindings(
     mlir::OpAsmParser &parser,
     llvm::SmallVectorImpl<mlir::OpAsmParser::UnresolvedOperand> &operands,
@@ -104,55 +105,24 @@ static Operation *tryGetTerminator(Block &block) {
 // `body.front()`.
 //===----------------------------------------------------------------------===//
 
-// Custom parse/print for `hc.as_layout`'s `$layout` operand. The slot
-// admits both the legacy `row_major` / `col_major` keyword (an
-// `HC_NamedLayoutAttr` enum) and the structured `#hc.layout<...>`
-// descriptor (an `HC_LayoutAttr`). The keyword form is what every
-// existing IR uses; the structured form is what `doc/layouts.md`
-// commits to. Picking which one to emit is a syntactic decision, not a
-// semantic one — both lower into the same `$layout` slot — so the
-// dispatch lives here, not in the verifier.
-static ParseResult parseHCAsLayoutAttr(OpAsmParser &parser, Attribute &layout) {
-  StringRef keyword;
-  // `row_major` / `col_major` are keywords — peek ahead for a bare
-  // identifier first. If the next token is `#` (the dialect-prefixed
-  // attribute lead-in) `parseOptionalKeyword` declines and we fall
-  // through to the structured-attribute parser.
-  if (succeeded(parser.parseOptionalKeyword(&keyword))) {
-    if (auto value = symbolizeNamedLayout(keyword)) {
-      layout = NamedLayoutAttr::get(parser.getContext(), *value);
-      return success();
-    }
-    return parser.emitError(parser.getCurrentLocation())
-           << "expected `row_major`, `col_major`, or `(#hc.layout<...>)`, "
-              "got '"
-           << keyword << "'";
-  }
-  // Structured form is wrapped in `(...)` because MLIR's
-  // `parseExtendedAttr` unconditionally consumes a trailing `: type`
-  // after a dialect-prefixed attribute (the type annotation for typed
-  // attrs); without the parens it would eat the assembly format's
-  // literal `:` separator that precedes `type($value)`. The parens
-  // ensure the lookahead sees `)` instead, leaving the literal `:` for
-  // the format to consume.
-  LayoutAttr structured;
-  if (parser.parseLParen() || parser.parseAttribute(structured) ||
+// Custom parse/print for `hc.as_layout`'s `$layout` operand. The
+// `(...)` wrapper around the structured `#hc.layout<...>` attribute is
+// required because MLIR's `parseExtendedAttr` unconditionally consumes
+// a trailing `: type` after a dialect-prefixed attribute (the type
+// annotation for typed attrs); without the parens it would eat the
+// assembly format's literal `:` separator that precedes
+// `type($value)`. The parens ensure the lookahead sees `)` instead,
+// leaving the literal `:` for the format to consume.
+static ParseResult parseHCAsLayoutAttr(OpAsmParser &parser,
+                                       LayoutAttr &layout) {
+  if (parser.parseLParen() || parser.parseAttribute(layout) ||
       parser.parseRParen())
     return failure();
-  layout = structured;
   return success();
 }
 
 static void printHCAsLayoutAttr(OpAsmPrinter &printer, Operation *op,
-                                Attribute layout) {
-  // Round-trip the keyword form when we can — it is what every existing
-  // surface IR uses and what `verify-hc.mlir` round-trips against. The
-  // structured form is wrapped in parens to mirror the parser; see
-  // `parseHCAsLayoutAttr` for the rationale.
-  if (auto named = llvm::dyn_cast<NamedLayoutAttr>(layout)) {
-    printer << stringifyNamedLayout(named.getValue());
-    return;
-  }
+                                LayoutAttr layout) {
   printer << "(";
   printer.printAttribute(layout);
   printer << ")";

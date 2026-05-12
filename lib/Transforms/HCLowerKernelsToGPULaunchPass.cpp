@@ -355,7 +355,8 @@ static Value callGetStride(OpBuilder &builder, Location loc, ModuleOp module,
 //   3. one `index` slot per axis, holding the per-axis element stride from
 //      `_mlir_ciface_hc_get_stride` — that's what makes a transposed /
 //      sliced input (`numpy[..., ::2]`, `torch.transpose`) compute the
-//      right offsets without us silently falling back to row-major.
+//      right offsets without us silently falling back to a contiguous
+//      identity layout.
 // The values are stitched into a single 1-to-N `unrealized_conversion_cast`
 // whose result type is the original `!hc.buffer<...>` so the kernel body's
 // existing buffer-typed code sees no immediate change. Launch-body walks

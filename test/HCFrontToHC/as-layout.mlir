@@ -49,7 +49,7 @@ module {
            offset = #hc.expr<"j + i*row_stride">
          }}
     %relabeled = hc_front.call %layout_fn(%v, %descriptor)
-    %tgt = hc_front.target_name "w_rowmajor"
+    %tgt = hc_front.target_name "w_relabeled"
     hc_front.assign %tgt = %relabeled
     hc_front.return
   }

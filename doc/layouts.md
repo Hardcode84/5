@@ -21,8 +21,9 @@ Four legs:
 1. **Layout attr** — `#hc.layout<...>` built on `#hc.expr`. Attaches to
    `!hc.buffer` / `!hc.tensor` / `!hc.vector` / `!hc.bare_tensor` /
    `!hc.bare_vector` as an optional type parameter. Absent on tensors
-   and vectors means identity (dense row-major); on buffers it is set
-   to the host-supplied strided layout at frontend time.
+   and vectors means the identity layout (dense, rightmost axis varies
+   fastest); on buffers it is set to the host-supplied strided layout
+   at frontend time.
 2. **Flatten** — a normalization pass folds every nD+layout shaped value
    into a 1D bare value with no layout, materializing the offset
    expression at each access site.
@@ -74,10 +75,10 @@ real layouts (block-cyclic, swizzle, padded, broadcast) and see what
 ixsimpl chokes on. Documenting the supported subset comes after, not
 before.
 
-The legacy `HC_LayoutAttr` enum (`row_major | col_major`) is folded into
-this representation. The Python-side `index_map` builder constructs the
-canonical row-major / col-major instances when no `params` / `offset` is
-supplied; the enum stops being a first-class IR concept.
+`hc.as_layout` and the type-attached `#hc.layout` slot take only the
+structured form above. The Python-side `index_map` builder constructs
+canonical row-first / column-first instances when no `params` /
+`offset` is supplied.
 
 ## Type slot
 
@@ -94,7 +95,7 @@ The five shaped types grow an optional layout parameter:
 
 `SymbolicallyShapedTypeInterface` extends with a `getLayout()` query.
 For `!hc.tensor` / `!hc.vector` / their bare counterparts, `absent`
-means identity row-major; the canonicalization pass folds an explicit
+means the identity layout; the canonicalization pass folds an explicit
 identity layout back to absent so type uniquing stays tight
 (`hc-canonicalize-layouts`). For `!hc.buffer` the absent-as-identity
 shortcut does **not** apply — see below.
@@ -138,18 +139,18 @@ Per-axis stride symbols (`$STRIDE_0_a`, `$STRIDE_1_a`, ...) join `M`,
 ABI. The wrapper extracts them from `np.ndarray.strides` (in elements,
 not bytes — divided by `itemsize` at the wrapper) or
 `torch.Tensor.stride()` and binds them at launch alongside the existing
-shape symbols. Contiguous inputs end up with the same expressions a
-default row-major layout would produce; non-contiguous slices (a
-column from a 2D tensor, a transposed view) work without a host-side
-copy.
+shape symbols. Contiguous inputs end up with the same expressions the
+identity layout would produce; non-contiguous slices (a column from a
+2D tensor, a transposed view) work without a host-side copy.
 
 The buffer-attached layout differs from tensor/vector layouts in three
 ways:
 
 * The absent-as-identity shortcut doesn't apply — the absence of an
   explicit layout on a buffer means "the host hasn't been queried yet",
-  not "dense row-major". The frontend always emits a strided layout for
-  every buffer argument; the canonicalization pass leaves them alone.
+  not "the dense identity layout". The frontend always emits a strided
+  layout for every buffer argument; the canonicalization pass leaves
+  them alone.
 * `storage_size` is informational at most. The host owns the
   allocation and the verifier doesn't require
   `storage_size ≥ max(offset) + 1` for buffer layouts.
@@ -175,8 +176,8 @@ layout slot. On `hc.generic` and per-access ops it also composes the
 per-operand offset addressing into the post-flatten 1D form: the
 per-axis `#hc.expr` array on each `hc.generic` operand becomes a
 single composed `#hc.expr` (substituted through the operand's
-`#hc.layout` offset, or identity row-major when no layout is
-attached); multi-index lists on `hc.load` / `hc.store` / `hc.vload`
+`#hc.layout` offset, or the identity-layout fallback when no layout
+is attached); multi-index lists on `hc.load` / `hc.store` / `hc.vload`
 / `hc.load_mask` collapse to a single `hc.idx_apply`-materialized
 1D base offset by the same path. `hc.buffer_view` stays as-is —
 its sub-view semantics differ from a single base offset and are
@@ -188,7 +189,7 @@ What runs:
    `<T, [storage_size_expr]>` (1D, no layout). `storage_size_expr` is
    the layout's `storage_size` after binding `shape_syms` to the
    original shape entries — or the dimension product when the type
-   sits on the implicit identity-row-major contract (no explicit
+   sits on the implicit identity-layout contract (no explicit
    layout).
 2. **Buffers** collapse to `<T, [?]>` — the `?` is the surface
    spelling for the `#hc.dyn` sentinel. Buffer storage extent is
@@ -476,7 +477,7 @@ in the pipeline:
   has a single composed entry. Flatten substitutes the per-axis exprs
   positionally into the operand's `#hc.layout` offset formula
   (binding `index_syms` to the per-axis exprs and `shape_syms` to
-  the operand dim entries) — or falls back to identity row-major when
+  the operand dim entries) — or falls back to the identity layout when
   no layout is attached — to produce that single composed offset. The
   iter space stays nD on `iter_syms`; only the per-operand addressing
   collapses to 1D.
@@ -819,8 +820,8 @@ on later slices.
 3. **frontend capture** — `hc_front` collects `layout=` and
    `as_layout(...)` for tensors/vectors and emits the default strided
    layout for every buffer argument (referring to per-arg `$STRIDE_*`
-   symbols). `hc.as_layout` grows the new attr kind alongside the
-   enum (transitional).
+   symbols). `hc.as_layout` carries the structured `#hc.layout<...>`
+   attribute.
 4. **`hc-canonicalize-layouts`** — identity → absent for shaped types,
    double `as_layout` fold, ixsimpl normalization on attached attrs;
    buffer layouts left alone.
@@ -839,7 +840,7 @@ on later slices.
    sentinel) because their storage extent is host-owned. Operand
    addressing also collapses post-flatten: `hc.generic`'s per-axis
    `#hc.expr` arrays compose through the operand's `#hc.layout`
-   offset (or identity row-major when no layout is attached) into
+   offset (or the identity layout when no layout is attached) into
    a single 1D `#hc.expr` per operand; per-access multi-index
    lists on `hc.load` / `hc.store` / `hc.vload` / `hc.load_mask`
    collapse to a single `hc.idx_apply`-materialized base offset.
@@ -854,8 +855,8 @@ on later slices.
    `ArrayAttr<#hc.expr>` per operand of length equal to the
    operand's rank. Pre-flatten the entries are the per-axis
    addressing on the operand's logical nD shape; flatten composes
-   them through the operand's `#hc.layout` offset (or identity
-   row-major) into a single entry on the post-flatten 1D operand.
+   them through the operand's `#hc.layout` offset (or the identity
+   layout) into a single entry on the post-flatten 1D operand.
    The verifier enforces rank parity in both regimes.
 10. **`hc-infer-generic-bounds`** — pre-flatten pass that walks operand
     shapes and per-axis offsets to fill any `!hc.undef`-typed

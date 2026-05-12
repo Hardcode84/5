@@ -24,8 +24,7 @@ void printInlineShapeAttr(AsmPrinter &printer, ShapeAttr attr);
 } // namespace mlir::hc
 
 // The enum header is included before the attrdef header so that the
-// generated `ReduceKindAttr` / `NamedLayoutAttr` classes can refer to the
-// underlying enums.
+// generated `ReduceKindAttr` class can refer to the underlying enum.
 #include "hc/IR/HCEnums.h.inc"
 
 #define GET_ATTRDEF_CLASSES

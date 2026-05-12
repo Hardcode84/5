@@ -37,7 +37,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// Build canonical row-major (offset, storage_size) ixsimpl handles in
+// Build canonical identity (offset, storage_size) ixsimpl handles in
 // terms of a layout's OWN shape_syms / index_syms — no parser, no string
 // concatenation, just leaf-and-compose calls so we go through the same
 // hash-consed nodes any other producer of these expressions would. The
@@ -46,13 +46,13 @@ namespace {
 // nodes (matters when the producer of `layout`'s offset built it the
 // same way — pointer equality after hash-consing is what makes the
 // identity check work).
-struct CanonicalRowMajor {
+struct CanonicalIdentity {
   sym::ExprHandle offset;
   sym::ExprHandle storage;
 };
 
-static FailureOr<CanonicalRowMajor>
-buildCanonicalRowMajor(sym::Store &store, ArrayRef<Attribute> shapeSyms,
+static FailureOr<CanonicalIdentity>
+buildCanonicalIdentity(sym::Store &store, ArrayRef<Attribute> shapeSyms,
                        ArrayRef<Attribute> indexSyms) {
   auto liftSym = [&](Attribute name) -> FailureOr<sym::ExprHandle> {
     return sym::composeExprSym(store, llvm::cast<StringAttr>(name).getValue());
@@ -64,7 +64,7 @@ buildCanonicalRowMajor(sym::Store &store, ArrayRef<Attribute> shapeSyms,
     auto one = sym::composeExprInt(store, 1);
     if (failed(zero) || failed(one))
       return failure();
-    return CanonicalRowMajor{*zero, *one};
+    return CanonicalIdentity{*zero, *one};
   }
 
   // Cache shape-syms once: liftSym creates a fresh ixs_node per call,
@@ -135,10 +135,10 @@ buildCanonicalRowMajor(sym::Store &store, ArrayRef<Attribute> shapeSyms,
   if (failed(storageHandle))
     return failure();
 
-  return CanonicalRowMajor{offsetAcc, *storageHandle};
+  return CanonicalIdentity{offsetAcc, *storageHandle};
 }
 
-// True iff `layout` is the identity row-major contract for `shape`.
+// True iff `layout` is the identity-layout contract for `shape`.
 // Absent layout (`!layout`) is the v0 identity by definition; this helper
 // only fires for the explicit case so the pass can decide whether to
 // strip the slot.
@@ -158,8 +158,8 @@ static bool isIdentityLayout(LayoutAttr layout, ShapeAttr shape) {
 
   auto &store =
       layout.getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
-  FailureOr<CanonicalRowMajor> canonical =
-      buildCanonicalRowMajor(store, shapeSyms, indexSyms);
+  FailureOr<CanonicalIdentity> canonical =
+      buildCanonicalIdentity(store, shapeSyms, indexSyms);
   if (failed(canonical))
     return false;
   // ixsimpl handles are hash-consed against the shared store; pointer

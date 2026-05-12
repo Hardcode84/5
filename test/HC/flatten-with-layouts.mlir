@@ -7,13 +7,13 @@
 //     (semantic and bare) get a concrete `storage_size_expr` from
 //     the layout's `storage_size` after binding `shape_syms` to the
 //     original shape entries — or from the dimension product when
-//     the type sits on the implicit identity-row-major contract.
+//     the type sits on the implicit identity-layout contract.
 //     Buffers collapse to `[?]` (`#hc.dyn` sentinel) because the
 //     host owns the allocation and the in-IR symbol set doesn't
 //     have enough to name the storage extent.
 //   * strips every `#hc.layout` slot off `SymbolicallyShapedTypeInterface`
 //     types, including the non-identity ones `hc-canonicalize-layouts`
-//     deliberately leaves alone (col-major, padded, params-bearing,
+//     deliberately leaves alone (transposed, padded, params-bearing,
 //     default strided buffer args).
 //   * **expands every shaped value 1-to-N**: alongside the flat
 //     carrier the converter emits one `!hc.idx<sym>` SSA value for
@@ -30,17 +30,18 @@
 //     func / scf / call signature populators.
 //
 // Op-surface contract: per-axis offset arrays on `hc.generic` compose
-// through the operand's `#hc.layout` offset expression (or identity
-// row-major when the operand has no layout) into a single 1D offset
-// matching the post-flatten 1D operand. Multi-index lists on
-// `hc.load` / `hc.store` / `hc.vload` collapse the same way through
-// the per-access `Compose*Offsets` patterns. `hc.buffer_view` composes
-// rank-N subscripts into a single rank-1 slice on the flat carrier:
-// pure-scalar identity views forward the source through, single-slice
-// strided views land one `hc.slice_expr` with `lower` / `upper` /
-// `step` scaled by the original axis's row-major stride. Multi-slice
-// and rank-mismatched views (frontend rank-up patterns) fall through
-// to the catch-all retyper; downstream lowering owns those cases.
+// through the operand's `#hc.layout` offset expression (or the
+// identity-layout fallback when the operand has no layout) into a
+// single 1D offset matching the post-flatten 1D operand. Multi-index
+// lists on `hc.load` / `hc.store` / `hc.vload` collapse the same way
+// through the per-access `Compose*Offsets` patterns. `hc.buffer_view`
+// composes rank-N subscripts into a single rank-1 slice on the flat
+// carrier: pure-scalar identity views forward the source through,
+// single-slice strided views land one `hc.slice_expr` with `lower` /
+// `upper` / `step` scaled by the original axis's identity-layout
+// stride. Multi-slice and rank-mismatched views (frontend rank-up
+// patterns) fall through to the catch-all retyper; downstream lowering
+// owns those cases.
 //
 // Post-flatten invariant from `doc/layouts.md`: *no `#hc.layout`
 // survives on any shaped type*. The implicit-check below pins that
@@ -116,7 +117,7 @@ hc.kernel @strided_buffer_kernel(
 // -----
 
 // All five shaped types lose their layout under flatten regardless of
-// whether the layout was identity or padded / col-major. Tensors and
+// whether the layout was identity, padded, or transposed. Tensors and
 // vectors (semantic and bare) collapse to a single-entry shape using
 // the layout's `storage_size` after binding to the original shape;
 // buffers collapse to `[?]` because their storage extent is
@@ -145,7 +146,7 @@ func.func @all_five_non_identity(
 
 // -----
 
-// Layout-less identity row-major collapse: a 2D `!hc.tensor` with no
+// Layout-less identity collapse: a 2D `!hc.tensor` with no
 // explicit layout flattens to its dimension product. Same answer the
 // canonicalize pass would have built had the layout been written out.
 // Trailing aux for each shaped arg surface the dim names that the
@@ -212,18 +213,22 @@ func.func @as_layout_structured_collapses(
 
 // -----
 
-// `hc.as_layout` with the legacy named-enum form also drops, even
-// though the result type isn't layout-bearing — the op is purely a
-// relabel post-flatten. The 2D `!hc.tensor` collapses to its
-// dimension product on both sides; the dim aux propagates through.
-// CHECK-LABEL: @as_layout_named_collapses
+// `hc.as_layout` drops post-flatten regardless of what its layout
+// payload was — the op is purely a relabel and both endpoints route
+// through the same `FlattenLayoutConverter`. The 2D `!hc.tensor`
+// collapses to its dimension product on both sides; the dim aux
+// propagates through. The structural payload here stands in for "any
+// layout the op carried before flatten".
+// CHECK-LABEL: @as_layout_collapses
 // CHECK-SAME: %arg0: !hc.tensor<f16, ["M*N"]>
 // CHECK-SAME: %arg1: !hc.idx<"M">, %arg2: !hc.idx<"N">
 // CHECK: return %arg0, %arg1, %arg2 : !hc.tensor<f16, ["M*N"]>, !hc.idx<"M">, !hc.idx<"N">
-func.func @as_layout_named_collapses(
+func.func @as_layout_collapses(
     %t: !hc.tensor<f16, ["M", "N"]>) -> !hc.tensor<f16, ["M", "N"]> {
-  %r = hc.as_layout %t, layout = col_major
-      : !hc.tensor<f16, ["M", "N"]> -> !hc.tensor<f16, ["M", "N"]>
+  %r = hc.as_layout %t, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.tensor<f16, ["M", "N"]> -> !hc.tensor<f16, ["M", "N"]>
   return %r : !hc.tensor<f16, ["M", "N"]>
 }
 
@@ -270,8 +275,8 @@ func.func @layout_in_tuple(
 
 // -----
 
-// Control flow: an `scf.for` carrying a non-identity (col-major)
-// layout-bearing iter_arg flattens on every type surface. Same
+// Control flow: an `scf.for` carrying a non-identity layout-bearing
+// iter_arg flattens on every type surface. Same
 // upstream populators the canonicalize pass uses, exercised against
 // the full 1D-collapse boundary. The dim aux rides through every
 // `iter_args` slot in lockstep — `scf::populateSCFStructuralTypeConversionsAndLegality`
@@ -328,15 +333,15 @@ func.func @padded_caller(
 // -----
 
 // Op-surface contract: `hc.generic` per-operand per-axis offset arrays
-// compose through the operand's layout (or identity row-major for
-// layout-less types) into a single 1D offset on the post-flatten 1D
-// operand. `[i, j]` over `bare_tensor<f32, ["M","N"]>` (no layout) goes
-// through identity row-major — `i*N + j`, ixsimpl-canonicalized to
-// `j + N*i`. Flatten captures every ambient symbol in the composed
-// offset onto `hc.generic`'s `ambient_idxs` slot — here that's `N`
-// (the operand's shape dim), surfaced via the 1-to-N operand
-// expansion's trailing `!hc.idx<"N">` aux value.
-// CHECK-LABEL: @generic_composes_offsets_default_row_major
+// compose through the operand's layout (or the identity-layout
+// fallback for layout-less types) into a single 1D offset on the
+// post-flatten 1D operand. `[i, j]` over `bare_tensor<f32, ["M","N"]>`
+// (no layout) goes through the identity fallback — `i*N + j`,
+// ixsimpl-canonicalized to `j + N*i`. Flatten captures every ambient
+// symbol in the composed offset onto `hc.generic`'s `ambient_idxs`
+// slot — here that's `N` (the operand's shape dim), surfaced via the
+// 1-to-N operand expansion's trailing `!hc.idx<"N">` aux value.
+// CHECK-LABEL: @generic_composes_offsets_default_identity
 // CHECK-SAME: %[[A:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
 // CHECK-SAME: !hc.idx<"M">, %[[N:[^:]+]]: !hc.idx<"N">,
 // CHECK-SAME: %[[C:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
@@ -344,7 +349,7 @@ func.func @padded_caller(
 // CHECK-SAME: ins (%[[A]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
 // CHECK-SAME: outs (%[[C]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
 // CHECK-SAME: ambient (%[[N]] as "N" : !hc.idx<"N">)
-func.func @generic_composes_offsets_default_row_major(
+func.func @generic_composes_offsets_default_identity(
     %m: index, %n: index,
     %a: !hc.bare_tensor<f32, ["M", "N"]>,
     %c: !hc.bare_tensor<f32, ["M", "N"]>)
@@ -367,10 +372,10 @@ func.func @generic_composes_offsets_default_row_major(
 // With an explicit layout the composer substitutes both `index_syms`
 // (positional with the per-axis exprs) and `shape_syms` (positional
 // with the operand dims) into `layout.offset` through ixsimpl. The
-// rank-2 row-major `i0 * d1 + i1` over `[M, N]` indexed `[i, j]`
-// canonicalizes to `j + N*i` — same destination as the layout-less
-// case, but reached via the substitution path rather than the
-// identity-row-major fallback. `ambient` captures the dim sym
+// rank-2 identity-equivalent `i0 * d1 + i1` over `[M, N]` indexed
+// `[i, j]` canonicalizes to `j + N*i` — same destination as the
+// layout-less case, but reached via the substitution path rather than
+// the identity-layout fallback. `ambient` captures the dim sym
 // surfaced by the operand's expansion the same way the layout-less
 // case does.
 // CHECK-LABEL: @generic_composes_offsets_layout
@@ -427,7 +432,7 @@ func.func @generic_ptr_out_passthrough(
 
 // -----
 
-// Layouted load: `hc.load` with a 2D index list and a row-major
+// Layouted load: `hc.load` with a 2D index list and an explicit
 // `#hc.layout` collapses to a single `hc.idx_apply` of
 // the substituted offset, then a one-index `hc.load`. ixsimpl
 // canonicalizes `i0 * d1 + i1` with `d0->M, d1->N, i0->i, i1->j` to
@@ -457,20 +462,20 @@ func.func @load_with_layout_composes(
 
 // -----
 
-// Layout-less identity row-major composition: a 2D `hc.vload` on a
-// layout-less `!hc.bare_tensor` falls back to the
-// `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` formula. ixsimpl
-// canonicalizes the resulting `0 + i*N + j` to `j + N*i`. Same
-// 1-to-N expansion shape as `@load_with_layout_composes`: the
+// Layout-less identity composition: a 2D `hc.vload` on a layout-less
+// `!hc.bare_tensor` falls back to the
+// `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` identity offset.
+// ixsimpl canonicalizes the resulting `0 + i*N + j` to `j + N*i`.
+// Same 1-to-N expansion shape as `@load_with_layout_composes`: the
 // source tensor's dim aux supplies the `N` binding for the offset.
-// CHECK-LABEL: @vload_identity_row_major
+// CHECK-LABEL: @vload_identity_layout
 // CHECK-SAME: %[[T:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
 // CHECK-SAME: %[[TM:[^:]+]]: !hc.idx<"M">, %[[TN:[^:]+]]: !hc.idx<"N">
 // CHECK-SAME: %[[I:[^:]+]]: !hc.idx<"i">, %[[J:[^:]+]]: !hc.idx<"j">
 // CHECK: %[[OFF:.*]] = hc.idx_apply (%[[TN]] as "N", %[[I]] as "i", %[[J]] as "j")
 // CHECK-SAME: : (!hc.idx<"N">, !hc.idx<"i">, !hc.idx<"j">) -> !hc.idx<"j + N*i">
 // CHECK: hc.vload %[[T]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.bare_tensor<f32, ["M*N"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_vector<f32, ["M*N"]>
-func.func @vload_identity_row_major(
+func.func @vload_identity_layout(
     %t: !hc.bare_tensor<f32, ["M", "N"]>,
     %i: !hc.idx<"i">, %j: !hc.idx<"j">,
     %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
@@ -627,7 +632,7 @@ func.func @buffer_view_identity_forwards_source(
 // full_col_slice)` over `bare_tensor<f16, ["M", "N"]>`. Post-flatten
 // the source carrier collapses to a single dim sized `M*N`; the row
 // scalar contributes `row * N` to the flat base offset (`N` is the
-// row-major stride at axis 0), and the column slice maps to a step-1
+// identity-layout stride at axis 0), and the column slice maps to a step-1
 // slice of length `N` starting there. The rebuilt view sits on the
 // flat carrier with one slice subscript whose lower / upper / step
 // were composed through ixsimpl.

@@ -26,9 +26,9 @@
 // outputs feed straight into the flatten step — every shaped
 // operand/result collapses to its 1D storage form, layout slots
 // vanish, and `hc.generic`'s per-operand per-axis offset arrays
-// compose through the operand's layout (or identity row-major when
-// the operand has no layout) into a single 1D offset, matching the
-// post-flatten 1D operand rank.
+// compose through the operand's layout (or the identity-layout
+// fallback when the operand has no layout) into a single 1D offset,
+// matching the post-flatten 1D operand rank.
 // RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds,hc-flatten-with-layouts)' --split-input-file | FileCheck %s --check-prefix=POSTFLATTEN --implicit-check-not='#hc.layout'
 
 // Matmul + elementwise add on the result. The matmul rewriter emits one
@@ -61,8 +61,8 @@
 
 // Each shaped tensor arg expands 1-to-N into a flat carrier + one
 // `!hc.idx<sym>` per free dim symbol from its pre-flatten shape;
-// `hc.generic`'s per-axis offsets compose through identity row-major
-// (the no-layout fallback) into a single 1D offset that matches the
+// `hc.generic`'s per-axis offsets compose through the identity
+// layout (the no-layout fallback) into a single 1D offset that matches the
 // 1D operand rank. `[i, k]` over `[M, K]` becomes `k + K*i`, etc.
 // `hc.matmul` and the bias `hc.add` are already gone after the
 // rewriters above; the implicit-check banner pins that no
@@ -102,8 +102,8 @@ func.func @matmul_then_add(%a: !hc.tensor<f32, ["M", "K"]>,
 
 // Reduce already produces a 1D result type, so the output side's
 // per-axis array is already a single entry; the rank-2 input
-// tensor's `[i_0, r]` over `[M, N]` composes through identity
-// row-major to `r + N*i_0`.
+// tensor's `[i_0, r]` over `[M, N]` composes through the identity
+// layout to `r + N*i_0`.
 // POSTFLATTEN-LABEL: func.func @reduce_sum_axis1
 // POSTFLATTEN-SAME: !hc.tensor<f32, ["M*N"]>
 // POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, reduction r = %{{.+}} : !hc.idx<"N">) ins (%{{.+}} at [#hc.expr<"r + N*i_0">] : !hc.tensor<f32, ["M*N"]>) outs (%{{.+}} at [#hc.expr<"i_0">] : !hc.tensor<f32, ["M"]>)
@@ -131,7 +131,7 @@ func.func @reduce_sum_axis1(%v: !hc.tensor<f32, ["M", "N"]>)
 
 // All three operands and the result expand 1-to-3 (flat + dim aux
 // for M and N). The rank-2 `[i_0, i_1]` per-axis arrays compose
-// through identity row-major to `i_1 + N*i_0` on every operand,
+// through the identity layout to `i_1 + N*i_0` on every operand,
 // matching the 1D `["M*N"]` storage form.
 // POSTFLATTEN-LABEL: func.func @elementwise_chain
 // POSTFLATTEN-SAME: -> (!hc.tensor<f32, ["M*N"]>, !hc.idx<"M">, !hc.idx<"N">)
@@ -167,7 +167,7 @@ func.func @elementwise_chain(%a: !hc.tensor<f32, ["M", "N"]>,
 // Buffer args collapse to `!hc.buffer<..., ["?"]>` (host owns the
 // allocation, the IR doesn't have enough symbols to name the
 // extent), with dim aux idxs trailing. The buffer's `[16*$WG0+i_0,
-// i_1]` access composes against identity row-major over `[M, N]`
+// i_1]` access composes against the identity layout over `[M, N]`
 // (this LIT skips the `hc-canonicalize-layouts` default-strided-
 // layout attach for `func.func` args, so there's no explicit layout
 // to substitute through) to `i_1 + N*(16*$WG0 + i_0)`. The result

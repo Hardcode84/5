@@ -199,11 +199,11 @@ func.func @vec_pure_par_unroll_1d(%a: !hc.ptr<global, f32>,
 
 // -----
 
-// 2D row-major (offset `i*32 + j`, j contig). The merge analyzer
-// finds a 32-wide contig run on the j-axis and picks partition
-// `(1, 32)` — i steps by 1 in the parallel loop, j steps by 32, and
-// every lane folds into one vector load / store of width 32.
-// CHECK-LABEL: func.func @vec_rowmaj_2d
+// 2D identity layout (offset `i*32 + j`, j contig). The merge
+// analyzer finds a 32-wide contig run on the j-axis and picks
+// partition `(1, 32)` — i steps by 1 in the parallel loop, j steps
+// by 32, and every lane folds into one vector load / store of width 32.
+// CHECK-LABEL: func.func @vec_contig_2d
 // CHECK: %[[STEPI:[^ ]+]] = arith.constant 1 : index
 // CHECK: %[[STEPJ:[^ ]+]] = arith.constant 32 : index
 // CHECK: scf.parallel (%[[I:[^,]+]], %[[J:[^)]+]]) = {{.*}} step (%[[STEPI]], %[[STEPJ]])
@@ -212,7 +212,7 @@ func.func @vec_pure_par_unroll_1d(%a: !hc.ptr<global, f32>,
 // CHECK:   hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f32> -> vector<32xf32>
 // CHECK:   hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f32> -> vector<32xf32>
 // CHECK:   hc.ptr_store %{{[^ ]+}}, %{{[^ ]+}} : vector<32xf32>, !hc.ptr<global, f32>
-func.func @vec_rowmaj_2d(%a: !hc.ptr<global, f32>, %c: !hc.ptr<global, f32>) {
+func.func @vec_contig_2d(%a: !hc.ptr<global, f32>, %c: !hc.ptr<global, f32>) {
   %m = hc.idx_apply () : () -> !hc.idx<"8">
   %n = hc.idx_apply () : () -> !hc.idx<"32">
   hc.generic
@@ -292,7 +292,7 @@ func.func @vec_reduce_unroll_1d(%dst: !hc.ptr<global, f32>,
 
 // -----
 
-// Mixed parallel + reduction with bounds 4 and 32, row-major offset.
+// Mixed parallel + reduction with bounds 4 and 32, identity offset.
 // Total budget caps prod(p_i) at 32, so the search picks partition
 // `(4, 8)` — i fully unrolled as a 4-wide outs vector, j chunked
 // into 4 inner-loop iterations of 8 unrolled lanes each. The
@@ -616,12 +616,12 @@ func.func @value_out_1d_ptr_in(%src: !hc.ptr<global, f32>,
 // -----
 
 // Value-typed out: 2D parallel iter (16x16, both constant-bound)
-// with row-major outs offset `16*i_0 + i_1` — the WMMA fragment-
-// load shape. Slot = parLane under row-major decomposition, so
+// with identity outs offset `16*i_0 + i_1` — the WMMA fragment-load
+// shape. Slot = parLane under identity-layout decomposition, so
 // `vector.from_elements` sees finals in identity order. Contig
 // analysis on the ins (unit-stride inner axis) collapses to one
 // `vector<256xf16>` load.
-// CHECK-LABEL: func.func @value_out_2d_rowmajor_fragment_load
+// CHECK-LABEL: func.func @value_out_2d_fragment_load
 // CHECK-NOT: scf.parallel
 // CHECK: hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f16> -> vector<256xf16>
 // CHECK: vector.from_elements
@@ -629,7 +629,7 @@ func.func @value_out_1d_ptr_in(%src: !hc.ptr<global, f32>,
 // CHECK: builtin.unrealized_conversion_cast
 // CHECK-SAME: vector<256xf16> to !hc.bare_tensor<f16, ["256"]>
 // CHECK-NOT: hc.generic
-func.func @value_out_2d_rowmajor_fragment_load(
+func.func @value_out_2d_fragment_load(
     %src: !hc.ptr<global, f16>,
     %init: !hc.bare_tensor<f16, ["256"]>)
     -> !hc.bare_tensor<f16, ["256"]> {

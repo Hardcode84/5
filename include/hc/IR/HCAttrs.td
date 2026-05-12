@@ -135,25 +135,6 @@ def HC_ReduceKindAttr
   let assemblyFormat = "$value";
 }
 
-def HC_LayoutRowMajor : I32EnumAttrCase<"RowMajor", 0, "row_major">;
-def HC_LayoutColMajor : I32EnumAttrCase<"ColMajor", 1, "col_major">;
-
-// Transitional named-layout enum. The `layout` mnemonic is reserved for the
-// structured `#hc.layout<...>` attribute (see HC_LayoutAttr below); this
-// enum keeps the v0 row_major / col_major surface alive for `hc.as_layout`
-// callers until the canonicalization pass folds it into the structured form.
-def HC_NamedLayout : I32EnumAttr<"NamedLayout",
-    "Named tensor/vector layout (row_major/col_major).",
-    [HC_LayoutRowMajor, HC_LayoutColMajor]> {
-  let genSpecializedAttr = 0;
-  let cppNamespace = "::mlir::hc";
-}
-
-def HC_NamedLayoutAttr : EnumAttr<HC_Dialect, HC_NamedLayout, "named_layout"> {
-  let summary = "Named tensor/vector layout descriptor (transitional).";
-  let assemblyFormat = "$value";
-}
-
 def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
   let summary = "Symbolic layout descriptor for shaped values.";
   let description = [{

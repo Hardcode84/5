@@ -420,10 +420,11 @@ module {
 
 // -----
 
-// Layout slot accepts the named-enum keyword and the structured
-// `#hc.layout<...>` attr; the custom parser rejects unknown keyword spellings
-// up front with a located diagnostic listing the valid forms.
-// CHECK: expected `row_major`, `col_major`, or `(#hc.layout<...>)`, got 'weird'
+// Layout slot only accepts the structured `#hc.layout<...>` attr
+// wrapped in `(...)`. A bare keyword fails at parse against the `(`
+// the format expects, surfacing the standard MLIR "expected '('"
+// diagnostic.
+// CHECK: error: expected '('
 module {
   func.func @bad(%v: !hc.undef) -> !hc.undef {
     %r = hc.as_layout %v, layout = weird : !hc.undef -> !hc.undef

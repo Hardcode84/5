@@ -577,10 +577,10 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
   `m_One()` drops the predicate (`result := value`), `m_Zero()` drops
   the load (`result := passthrough`, value's producer cleaned up if it
   becomes trivially dead).
-* `hc.as_layout %v, layout = row_major | col_major` — change layout.
-  The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
-  spellings fail at parse. v0 admits `row_major` and `col_major`; later
-  schemes can extend the enum without changing call sites.
+* `hc.as_layout %v, layout = (#hc.layout<...>)` — change layout. The
+  `layout` payload is the structured `#hc.layout<...>` attribute
+  defined in `doc/layouts.md`; the wrapping `(...)` disambiguates the
+  trailing `: type` annotation.
 * `hc.vzeros shape %shape, dtype = T`, `hc.vones shape %shape, dtype = T`,
   `hc.vfull %fill, shape %shape, dtype = T` — vector allocators (any scope).
   The dtype is optional when the result or fill operand already fixes the

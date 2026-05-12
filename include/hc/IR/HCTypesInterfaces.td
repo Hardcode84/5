@@ -36,7 +36,7 @@ def SymbolicallyShapedTypeInterface
     depend on this interface instead of enumerating buffer/tensor/vector shells.
 
     The layout accessors are nullable: a null `LayoutAttr` means the type has
-    no explicit layout slot (the v0 identity-row-major contract). The clone
+    no explicit layout slot (the v0 identity-layout contract). The clone
     hook is the canonical "rebuild this type with a different layout" entry
     point — passing a null `LayoutAttr` strips the slot and returns the
     layout-less form, which is how `hc-canonicalize-layouts` collapses

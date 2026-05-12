@@ -6,7 +6,7 @@
 // `#hc.layout` slot AND collapses its shape to a single entry. Tensors
 // and vectors get a concrete `storage_size_expr` (from the layout's
 // `storage_size` after binding `shape_syms` to the original shape, or
-// the dim product when the implicit identity-row-major contract
+// the dim product when the implicit identity-layout contract
 // applies); buffers collapse to `[?]` (`#hc.dyn`) because the host
 // owns the allocation.
 //
@@ -32,10 +32,10 @@
 //
 // `hc.generic` per-operand per-axis `#hc.expr` offset arrays compose
 // post-flatten: each operand's array of axis exprs goes through the
-// operand's pre-flatten layout offset (or identity row-major when
-// no layout is attached) into a single 1D `#hc.expr`, matching the
-// post-flatten 1D operand rank. The verifier on `hc.generic` enforces
-// rank parity in both regimes.
+// operand's pre-flatten layout offset (or the identity-layout
+// fallback when no layout is attached) into a single 1D `#hc.expr`,
+// matching the post-flatten 1D operand rank. The verifier on
+// `hc.generic` enforces rank parity in both regimes.
 //
 // Per-access ops (`hc.load`, `hc.vload`, `hc.store`, `hc.load_mask`)
 // also get rewritten in this pass: their multi-index lists collapse
@@ -197,7 +197,7 @@ static LogicalResult buildAuxIdxTypes(MLIRContext *ctx,
 // optional `layout`. With a layout, that is `layout.storage_size`
 // after substituting `layout.shape_syms` with the original shape's
 // per-axis expressions. Without a layout, the type sits on the
-// implicit identity-row-major contract and the storage size is the
+// implicit identity-layout contract and the storage size is the
 // product of the original dimensions. Rank-0 falls out as the empty
 // product `1`.
 //
@@ -304,14 +304,14 @@ extractAccessIndexExpr(MLIRContext *ctx, sym::Store &store, Type indexType) {
   return failure();
 }
 
-// Build the identity row-major offset for an access into a layout-less
+// Build the identity-layout offset for an access into a layout-less
 // shaped operand: `i_0 * (d_1 * ... * d_{n-1}) + i_1 * (d_2 * ... *
 // d_{n-1}) + ... + i_{n-1}`. Right-to-left fold gives a single ixsimpl
 // pass on the way out, which canonicalizes the result for free.
 // Rank-0 returns `0`. Caller checks rank parity.
 static FailureOr<sym::ExprHandle>
-identityRowMajorOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
-                       ArrayRef<Attribute> dims) {
+identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
+                     ArrayRef<Attribute> dims) {
   auto zero = sym::composeExprInt(store, 0);
   if (failed(zero))
     return failure();
@@ -343,11 +343,12 @@ identityRowMajorOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
 // operand. With a layout, substitute `shape_syms` positionally with the
 // operand's shape entries and `index_syms` positionally with the access
 // site's index expressions, then evaluate `layout.offset`. Without a
-// layout, fall back to identity row-major over the operand's shape (the
-// canonical contract for layout-less shaped types). Rank parity between
-// the operand shape and the index list is the caller's responsibility —
-// the verifier on the access op already enforces it pre-rewrite, but
-// the helper still bails on mismatch instead of producing nonsense.
+// layout, fall back to the identity layout over the operand's shape
+// (the canonical contract for layout-less shaped types). Rank parity
+// between the operand shape and the index list is the caller's
+// responsibility — the verifier on the access op already enforces it
+// pre-rewrite, but the helper still bails on mismatch instead of
+// producing nonsense.
 static FailureOr<ExprAttr>
 composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
                         ShapeAttr originalShape,
@@ -358,7 +359,7 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
     return failure();
 
   if (!layout) {
-    auto offset = identityRowMajorOffset(store, indexExprs, dims);
+    auto offset = identityLayoutOffset(store, indexExprs, dims);
     if (failed(offset))
       return failure();
     return ExprAttr::get(ctx, *offset);
@@ -477,7 +478,7 @@ composeAccessBaseOffset(ConversionPatternRewriter &rewriter, Operation *op,
   if (!originalShape)
     return failure();
   // Buffers ride on a `[?]` post-flatten shape and an absent layout
-  // here would mean we'd fall back to identity row-major over the
+  // here would mean we'd fall back to the identity layout over the
   // wrong dims. Today every buffer carries the default strided
   // layout, so a missing layout on a buffer is a frontend bug we
   // surface as a rewrite failure instead of silently emitting `0`.
@@ -1183,11 +1184,11 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
 //   Forward the flat source through.
 //
 // * Single-slice strided: exactly one subscript is a slice; the rest
-//   are scalar `!hc.idx<...>` indices. Compose the row-major offset
-//   into a single contiguous-stride slice on the flat carrier.
+//   are scalar `!hc.idx<...>` indices. Compose the identity-layout
+//   offset into a single contiguous-stride slice on the flat carrier.
 //   Layout-less sources are the canonical contract for this rewrite;
 //   sources carrying an explicit `#hc.layout<...>` payload bail (the
-//   v0 surface uses identity row-major for these views — a custom
+//   v0 surface uses the identity layout for these views — a custom
 //   layout would need to participate in the offset composition the
 //   same way `composeAccessOffsetExpr` does for access ops, which is
 //   out of scope here).
@@ -1485,7 +1486,7 @@ struct ComposeBufferViewOffsets
 // layout / shape, treats the per-axis array as the access-site index
 // list, and composes a single 1D offset through ixsimpl using the same
 // machinery the per-access patterns above use. Without an explicit
-// layout the fallback is identity row-major over the operand's shape.
+// layout the fallback is the identity layout over the operand's shape.
 //
 // Free symbols of the composed offset (iter syms, dim / stride params)
 // stay free — they're resolved by the surrounding kernel scope and the
@@ -1535,8 +1536,8 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
       LayoutAttr layout = shaped.getSymbolicLayout();
       // Layout-less operands (including buffers that haven't picked
       // up the default strided layout — `hc-canonicalize-layouts`
-      // only attaches one for kernel-arg buffers) fall back to
-      // identity row-major, the canonical contract for layout-free
+      // only attaches one for kernel-arg buffers) fall back to the
+      // identity layout, the canonical contract for layout-free
       // shaped types. Same path `composeAccessOffsetExpr` takes for
       // tensor / vector operands.
       // Rank-0 has nothing to compose; ditto for an op produced with
@@ -1556,8 +1557,8 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
       if (failed(offset))
         return failure();
       auto result = ArrayAttr::get(ctx, ArrayRef<Attribute>{*offset});
-      // A rank-1 layout-less operand round-trips through identity
-      // row-major to itself; don't flip `composed` for an unchanged
+      // A rank-1 layout-less operand round-trips through the identity
+      // layout to itself; don't flip `composed` for an unchanged
       // attribute or the pattern would claim a rewrite happened when
       // nothing on the surface moved.
       if (result != perAxis)

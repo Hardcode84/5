@@ -6,7 +6,7 @@
 //   * strips explicit identity layouts from shaped Values, refreshes the
 //     cached function-type attribute when entry-arg types changed,
 //   * recognizes ixsimpl-equivalent identity spellings,
-//   * keeps non-identity layouts (padded, col-major, params-bearing),
+//   * keeps non-identity layouts (padded, transposed, params-bearing),
 //   * collapses chained `hc.as_layout(hc.as_layout(...))` to the outer
 //     choice and erases the dead inner op.
 //
@@ -84,12 +84,12 @@ func.func @padded_preserved(
 
 // -----
 
-// Col-major layout (offset uses the first shape sym as the inner stride)
-// is preserved.
-// CHECK-LABEL: @col_major_preserved
+// A non-identity layout (offset uses the first shape sym as the inner
+// stride) is preserved.
+// CHECK-LABEL: @transposed_layout_preserved
 // CHECK-SAME: %arg0: !hc.tensor<f16, ["M", "N"], <
 // CHECK-SAME: offset = #hc.expr<"i + M*j">
-func.func @col_major_preserved(
+func.func @transposed_layout_preserved(
     %a: !hc.tensor<f16, ["M", "N"],
                    #hc.layout<shape_syms = ["M", "N"],
                               index_syms = ["i", "j"],
@@ -135,13 +135,21 @@ func.func @identity_rank_zero(
 
 // `hc.as_layout(hc.as_layout(%v, L1), L2)` collapses to
 // `hc.as_layout(%v, L2)`; the inner op becomes dead and is erased.
+// Two distinct structural layouts here stand in for "any two distinct
+// layouts" — the collapse logic doesn't read the payload.
 // CHECK-LABEL: @chained_as_layout
-// CHECK-NOT: hc.as_layout %{{.*}} layout = row_major
-// CHECK: %[[R:.*]] = hc.as_layout %arg0, layout = col_major
+// CHECK-NOT: hc.as_layout %{{.*}} offset = #hc.expr<"i1 + d1*i0">
+// CHECK: %[[R:.*]] = hc.as_layout %arg0, layout = (#hc.layout<{{.*}}offset = #hc.expr<"i0 + d0*i1">
 // CHECK: return %[[R]]
 func.func @chained_as_layout(%v: !hc.undef) -> !hc.undef {
-  %x = hc.as_layout %v, layout = row_major : !hc.undef -> !hc.undef
-  %y = hc.as_layout %x, layout = col_major : !hc.undef -> !hc.undef
+  %x = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1">
+  >) : !hc.undef -> !hc.undef
+  %y = hc.as_layout %x, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.undef -> !hc.undef
   return %y : !hc.undef
 }
 
@@ -152,9 +160,18 @@ func.func @chained_as_layout(%v: !hc.undef) -> !hc.undef {
 // CHECK-COUNT-1: hc.as_layout
 // CHECK-NOT: hc.as_layout
 func.func @triple_as_layout(%v: !hc.undef) -> !hc.undef {
-  %a = hc.as_layout %v, layout = col_major : !hc.undef -> !hc.undef
-  %b = hc.as_layout %a, layout = row_major : !hc.undef -> !hc.undef
-  %c = hc.as_layout %b, layout = col_major : !hc.undef -> !hc.undef
+  %a = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.undef -> !hc.undef
+  %b = hc.as_layout %a, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1">
+  >) : !hc.undef -> !hc.undef
+  %c = hc.as_layout %b, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.undef -> !hc.undef
   return %c : !hc.undef
 }
 
@@ -162,9 +179,12 @@ func.func @triple_as_layout(%v: !hc.undef) -> !hc.undef {
 
 // A single (uncollapsed) `hc.as_layout` is left alone.
 // CHECK-LABEL: @single_as_layout
-// CHECK: hc.as_layout %arg0, layout = col_major
+// CHECK: hc.as_layout %arg0, layout = (#hc.layout<{{.*}}offset = #hc.expr<"i0 + d0*i1">
 func.func @single_as_layout(%v: !hc.undef) -> !hc.undef {
-  %x = hc.as_layout %v, layout = col_major : !hc.undef -> !hc.undef
+  %x = hc.as_layout %v, layout = (#hc.layout<
+    shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {},
+    storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0 + i1*d0">
+  >) : !hc.undef -> !hc.undef
   return %x : !hc.undef
 }
 
@@ -209,9 +229,9 @@ func.func @scf_for_identity_iter_arg(
 
 // -----
 
-// Non-identity iter_arg layout (col-major) is preserved on every
-// surface — the strip never fires, the loop signature stays
-// layout-bearing end to end.
+// Non-identity iter_arg layout is preserved on every surface — the
+// strip never fires, the loop signature stays layout-bearing end to
+// end.
 // CHECK-LABEL: @scf_for_nonidentity_iter_arg_preserved
 // CHECK-SAME: %arg0: !hc.tensor<f16, ["M", "N"], <{{.*}}offset = #hc.expr<"i + M*j">{{.*}}>>
 // CHECK: scf.for {{.*}} iter_args({{.*}}) -> (!hc.tensor<f16, ["M", "N"], <{{.*}}offset = #hc.expr<"i + M*j">{{.*}}>>)

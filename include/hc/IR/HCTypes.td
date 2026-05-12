@@ -80,12 +80,12 @@ def HC_SliceType : HC_Type<"Slice", "slice",
 
 // All five shaped types carry an optional `#hc.layout<...>` payload after
 // the shape. Absent layout is the v0 identity contract (canonical
-// row-major, identity offset, product-of-shape storage); explicit layouts
-// are interpreted by the canonicalize / flatten passes documented in
-// `doc/layouts.md`. Layouts attach to both semantic (`!hc.tensor`,
-// `!hc.vector`) and bare (`!hc.bare_tensor`, `!hc.bare_vector`) shapes
-// because the flatten pass needs them on either side of the
-// decompose-shaped-values boundary.
+// identity offset, product-of-shape storage, rightmost axis varies
+// fastest); explicit layouts are interpreted by the canonicalize / flatten
+// passes documented in `doc/layouts.md`. Layouts attach to both semantic
+// (`!hc.tensor`, `!hc.vector`) and bare (`!hc.bare_tensor`,
+// `!hc.bare_vector`) shapes because the flatten pass needs them on either
+// side of the decompose-shaped-values boundary.
 
 // Each of the five shaped types below adds a `get(ctx, elem, shape)`
 // overload alongside the auto-generated 4-arg form so existing callers
@@ -127,7 +127,7 @@ def HC_TensorType : HC_Type<"Tensor", "tensor",
     Initial semantic tensor type carrying an element type and a symbolic shape
     attribute. The textual type syntax inlines the shape dimensions as
     `["M", "N + 1"]`. An optional `#hc.layout<...>` payload follows the
-    shape; absent means identity row-major.
+    shape; absent means the identity layout.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -152,7 +152,7 @@ def HC_VectorType : HC_Type<"Vector", "vector",
     shape; activity mask semantics, the optional collective-return suffix, and
     layout metadata sit on top of this shell as they settle. Printed as
     `!hc.vector<elem, ["A", "B"]>`. An optional `#hc.layout<...>` payload
-    follows the shape; absent means identity row-major.
+    follows the shape; absent means the identity layout.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -177,7 +177,7 @@ def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
     lowering. Unlike `!hc.tensor`, this type carries only data; validity travels
     as a parallel `!hc.bare_tensor<!hc.pred, ...>` value with the same shape.
     An optional `#hc.layout<...>` payload follows the shape; absent means
-    identity row-major.
+    the identity layout.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -202,7 +202,7 @@ def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
     lowering. Unlike `!hc.vector`, this type carries only data; validity travels
     as a parallel `!hc.bare_vector<!hc.pred, ...>` value with the same shape.
     An optional `#hc.layout<...>` payload follows the shape; absent means
-    identity row-major.
+    the identity layout.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,

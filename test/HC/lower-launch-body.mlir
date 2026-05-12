@@ -434,4 +434,133 @@ module {
     }
     return
   }
+
+  // Post-flatten kernel-arg ABI: `hc-flatten-with-layouts` collapses the
+  // per-axis dim/stride bundle down to a `(ptr, total, 1)` UCC and folds
+  // the access op's multi-index list into a single composed `!hc.idx<expr>`
+  // base offset. The lowering's synthesized "lane stride = 1" axis is
+  // what fires here instead of `collectAxes`: per-lane addresses come out
+  // as `composed + lane * 1`, the kernel-arg `* stride_0 = * 1` rides
+  // through `linearizeKernelArgOffset` unchanged, and the result vector
+  // is the flat tile materialized one element at a time. The composed
+  // offset has to ride a vanilla `index` operand (the `!hc.idx<...>`
+  // input the converter produced from the `hc.idx_apply`) — that's how
+  // `synthesizePostFlattenAxes` discriminates the post-flatten form from
+  // a pre-flatten scalar subscript on a rank-1 buffer. The lane-0
+  // `arith.addi (composed + 0)` and `arith.muli (_ * 1)` survive in the
+  // unfolded IR because `hc-lower-launch-body` doesn't run canonicalize
+  // on its own output; LLVM later folds them.
+  // CHECK-LABEL: func.func @post_flatten_vload(
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[TOTAL:[^:]+]]: index,
+  // CHECK-SAME: %[[OFF:[^:)]+]]: index
+  // CHECK: gpu.launch
+  // CHECK: %[[AT0:.*]] = arith.addi %[[OFF]], %{{.*}} : index
+  // CHECK: %[[SC0:.*]] = arith.muli %[[AT0]], %{{.*}} : index
+  // CHECK: hc.ptr_offset %[[PTR]], %[[SC0]] : (!hc.ptr<global, f32>, index) -> !hc.ptr<global, f32>
+  // CHECK: %[[E0:.*]] = hc.ptr_load %{{.*}} : !hc.ptr<global, f32> -> f32
+  // CHECK: vector.insert %[[E0]], %{{.*}} [0] : f32 into vector<8xf32>
+  // CHECK: %[[AT1:.*]] = arith.addi %[[OFF]], %{{.*}} : index
+  // CHECK: %[[SC1:.*]] = arith.muli %[[AT1]], %{{.*}} : index
+  // CHECK: hc.ptr_offset %[[PTR]], %[[SC1]] : (!hc.ptr<global, f32>, index) -> !hc.ptr<global, f32>
+  // CHECK: hc.ptr_load %{{.*}} : !hc.ptr<global, f32> -> f32
+  // CHECK: vector.insert {{.*}} [1] : f32 into vector<8xf32>
+  // CHECK-NOT: hc.vload
+  func.func @post_flatten_vload(%ptr: !hc.ptr<global, f32>,
+                                %total: index, %composed: index) {
+    %c1 = arith.constant 1 : index
+    %one = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %ptr, %total, %one
+        : !hc.ptr<global, f32>, index, index
+        to !hc.buffer<f32, ["?"]>
+    %off = builtin.unrealized_conversion_cast %composed
+        : index to !hc.idx<"composed">
+    %eight = hc.const<8 : i64> : !hc.idx<"8">
+    %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %vec = hc.vload %buffer[%off], shape %shape
+          : (!hc.buffer<f32, ["?"]>, !hc.idx<"composed">, tuple<!hc.idx<"8">>)
+            -> !hc.bare_vector<f32, ["8"]>
+      gpu.terminator
+    }
+    return
+  }
+
+  // `hc.load_mask` on the same post-flatten form: the composed offset
+  // anchors a flat lane walk, the kernel-arg's only dim is the post-
+  // flatten `total` element count, and the mask size collapses to
+  // `total - composed` (no per-axis ceildiv because the synthesized lane
+  // stride is the constant 1 that `maskAxisIsUnitStride` accepts).
+  // CHECK-LABEL: func.func @post_flatten_load_mask(
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[TOTAL:[^:]+]]: index,
+  // CHECK-SAME: %[[OFF:[^:)]+]]: index
+  // CHECK: %[[REM:.*]] = arith.subi %[[TOTAL]], %[[OFF]] : index
+  // CHECK: vector.create_mask %[[REM]] : vector<8xi1>
+  // CHECK-NOT: arith.divsi
+  // CHECK-NOT: hc.load_mask
+  func.func @post_flatten_load_mask(%ptr: !hc.ptr<global, f32>,
+                                    %total: index, %composed: index) {
+    %c1 = arith.constant 1 : index
+    %one = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %ptr, %total, %one
+        : !hc.ptr<global, f32>, index, index
+        to !hc.buffer<f32, ["?"]>
+    %off = builtin.unrealized_conversion_cast %composed
+        : index to !hc.idx<"composed">
+    %eight = hc.const<8 : i64> : !hc.idx<"8">
+    %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %mask = hc.load_mask %buffer[%off], shape %shape
+          : (!hc.buffer<f32, ["?"]>, !hc.idx<"composed">, tuple<!hc.idx<"8">>)
+            -> !hc.bare_vector<!hc.pred, ["8"]>
+      gpu.terminator
+    }
+    return
+  }
+
+  // Post-flatten masked store: same synthesized "lane stride = 1" axis
+  // applies. Each lane's `hc.ptr_store_pred` takes the per-lane mask bit
+  // and the per-lane data element side-by-side; no rank-N coordinate
+  // bookkeeping survives flatten.
+  // CHECK-LABEL: func.func @post_flatten_masked_store(
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[TOTAL:[^:]+]]: index,
+  // CHECK-SAME: %[[OFF:[^:)]+]]: index
+  // CHECK: vector.extract
+  // CHECK-SAME: f32 from vector<4xf32>
+  // CHECK: arith.addi %[[OFF]], %{{.*}} : index
+  // CHECK: hc.ptr_offset %[[PTR]]
+  // CHECK-SAME: !hc.ptr<global, f32>
+  // CHECK: vector.extract
+  // CHECK-SAME: i1 from vector<4xi1>
+  // CHECK: hc.ptr_store_pred
+  // CHECK-SAME: f32, !hc.ptr<global, f32>, i1
+  // CHECK-NOT: hc.store
+  func.func @post_flatten_masked_store(%ptr: !hc.ptr<global, f32>,
+                                       %total: index, %composed: index) {
+    %c1 = arith.constant 1 : index
+    %one = arith.constant 1 : index
+    %buffer = builtin.unrealized_conversion_cast %ptr, %total, %one
+        : !hc.ptr<global, f32>, index, index
+        to !hc.buffer<f32, ["?"]>
+    %off = builtin.unrealized_conversion_cast %composed
+        : index to !hc.idx<"composed">
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %data_vector = arith.constant dense<1.000000e+00> : vector<4xf32>
+      %mask_vector = arith.constant dense<true> : vector<4xi1>
+      %data = builtin.unrealized_conversion_cast %data_vector
+          : vector<4xf32> to !hc.bare_vector<f32, ["4"]>
+      %mask = builtin.unrealized_conversion_cast %mask_vector
+          : vector<4xi1> to !hc.bare_vector<!hc.pred, ["4"]>
+      hc.store %buffer[%off], %data, mask %mask
+          : (!hc.buffer<f32, ["?"]>, !hc.idx<"composed">,
+             !hc.bare_vector<f32, ["4"]>, !hc.bare_vector<!hc.pred, ["4"]>) -> ()
+      gpu.terminator
+    }
+    return
+  }
 }

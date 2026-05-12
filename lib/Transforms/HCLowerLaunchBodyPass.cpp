@@ -875,6 +875,46 @@ collectAxes(Operation *op, ValueRange indices, OpBuilder &builder,
   return axes;
 }
 
+// Post-flatten access-op shape: one scalar `index` subscript carrying the
+// already-linearised element offset, against a 1-rank kernel-arg ABI whose
+// only stride is constant 1, and a 1-rank iter shape from the result vector
+// (load/vload), source vector (store), or mask vector (load_mask). The
+// pre-flatten per-axis structure has been folded into the composed offset
+// by `hc-flatten-with-layouts`; the remaining lane walk over the flat tile
+// is a unit-stride bump over `[composed_offset, composed_offset + N)`.
+//
+// Synthesizing a single full-slice axis (`offset = composed`, `stride = 1`,
+// `isSlice = true`) lets the existing per-lane machinery in
+// `kernelArgLaneIndices` / `storeIndicesForCoordinate` /
+// `linearizeKernelArgOffset` fall through unchanged: the kernel-arg's
+// unit stride collapses through the lin formula and each lane's offset
+// reduces to `composed + lane`. Non-contiguous post-flatten tiles
+// (strided slice survivors) intentionally fail this detect and route
+// through the slice-aware path — they need the rank-N kernel-arg ABI
+// to recompute per-axis offsets and are tracked separately.
+static std::optional<SmallVector<SliceAxis>>
+synthesizePostFlattenAxes(OpBuilder &builder, Location loc,
+                          const KernelArgSource &kernelArg, ValueRange indices,
+                          ArrayRef<int64_t> iterShape) {
+  if (kernelArg.rank() != 1)
+    return std::nullopt;
+  if (indices.size() != 1)
+    return std::nullopt;
+  if (iterShape.size() != 1)
+    return std::nullopt;
+  if (!indices[0].getType().isIndex())
+    return std::nullopt;
+  APInt stride;
+  if (!matchPattern(kernelArg.strides[0], m_ConstantInt(&stride)) ||
+      stride.getSExtValue() != 1)
+    return std::nullopt;
+  SliceAxis axis;
+  axis.offset = indices[0];
+  axis.stride = oneIndex(builder, loc);
+  axis.isSlice = true;
+  return SmallVector<SliceAxis>{axis};
+}
+
 // Allocate a flat `!hc.ptr<workgroup, T>` sized for `count` elements. The
 // downstream `hc-lower-to-llvm` rewrites the alloc into a sibling
 // addrspace(3) global; rank-erasure happens at this boundary because the
@@ -1549,12 +1589,20 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
           "expected kernel-arg source rank to match index rank");
     auto sourcePtrType = cast<PtrType>(kernelArg->ptr.getType());
 
-    FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                    /*requireUnitStride=*/false);
-    if (failed(axes))
-      return failure();
-    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+    SmallVector<SliceAxis> axes;
+    if (auto synthesized =
+            synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
+                                      adaptor.getIndices(), resultShape)) {
+      axes = std::move(*synthesized);
+    } else {
+      FailureOr<SmallVector<SliceAxis>> collected =
+          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                      /*requireUnitStride=*/false);
+      if (failed(collected))
+        return failure();
+      axes = std::move(*collected);
+    }
+    if (llvm::count_if(axes, [](const SliceAxis &axis) {
           return axis.isSlice;
         }) != static_cast<int64_t>(resultShape.size()))
       return op.emitOpError("load result rank must match slice subscript rank");
@@ -1573,7 +1621,7 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
           allocateWorkgroupPtr(rewriter, op.getLoc(), resultPtrType, total);
       KernelArgSource argCopy = *kernelArg;
       if (failed(emitCooperativeCopy(rewriter, op.getLoc(), op.getOperation(),
-                                     argCopy, *axes, lds, resultShape,
+                                     argCopy, axes, lds, resultShape,
                                      elementType)))
         return failure();
       rewriter.replaceOp(op, lds);
@@ -1593,7 +1641,7 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
     Value laneVec = zero;
     for (ArrayRef<int64_t> resultCoord : staticVectorCoordinates(resultShape)) {
       SmallVector<Value> indices =
-          kernelArgLaneIndices(rewriter, op.getLoc(), *axes, resultCoord);
+          kernelArgLaneIndices(rewriter, op.getLoc(), axes, resultCoord);
       Value flat =
           linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
       Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), sourcePtrType,
@@ -1677,12 +1725,22 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
       return op.emitOpError("expected kernel-arg ptr rank to match index rank");
     }
 
-    FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                    /*requireUnitStride=*/false);
-    if (failed(axes))
-      return failure();
-    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+    SmallVector<SliceAxis> axes;
+    std::optional<SmallVector<SliceAxis>> synthesized;
+    if (kernelArg)
+      synthesized = synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
+                                              adaptor.getIndices(), maskShape);
+    if (synthesized) {
+      axes = std::move(*synthesized);
+    } else {
+      FailureOr<SmallVector<SliceAxis>> collected =
+          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                      /*requireUnitStride=*/false);
+      if (failed(collected))
+        return failure();
+      axes = std::move(*collected);
+    }
+    if (llvm::count_if(axes, [](const SliceAxis &axis) {
           return axis.isSlice;
         }) != static_cast<int64_t>(maskShape.size()))
       return op.emitOpError("mask result rank must match slice subscript rank");
@@ -1695,7 +1753,7 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
     // `extent - offset` (offset past the end) lands on a zero-clamped,
     // all-false mask without an explicit guard here.
     SmallVector<Value> maskSizes;
-    for (auto [axis, info] : llvm::enumerate(*axes)) {
+    for (auto [axis, info] : llvm::enumerate(axes)) {
       if (!info.isSlice)
         continue;
       Value extent;
@@ -1984,12 +2042,6 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
           "expected kernel-arg destination rank to match index rank");
     auto destPtrType = cast<PtrType>(kernelArg->ptr.getType());
 
-    FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                    /*requireUnitStride=*/false);
-    if (failed(axes))
-      return failure();
-
     Type convertedSource = typeConverter->convertType(op.getSource().getType());
     FailureOr<SmallVector<int64_t>> sourceShape =
         shapedResultShape(op.getSource().getType());
@@ -2004,7 +2056,20 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
     if (!sourceType)
       return op.emitOpError("expected store source to be a vector");
 
-    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
+    SmallVector<SliceAxis> axes;
+    if (auto synthesized =
+            synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
+                                      adaptor.getIndices(), *sourceShape)) {
+      axes = std::move(*synthesized);
+    } else {
+      FailureOr<SmallVector<SliceAxis>> collected =
+          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                      /*requireUnitStride=*/false);
+      if (failed(collected))
+        return failure();
+      axes = std::move(*collected);
+    }
+    if (llvm::count_if(axes, [](const SliceAxis &axis) {
           return axis.isSlice;
         }) != sourceType.getRank())
       return op.emitOpError(
@@ -2036,7 +2101,7 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
       Value element =
           extractVectorElement(rewriter, op.getLoc(), *source, coordinate);
       SmallVector<Value> indices =
-          storeIndicesForCoordinate(rewriter, op.getLoc(), *axes, coordinate);
+          storeIndicesForCoordinate(rewriter, op.getLoc(), axes, coordinate);
       Value flat =
           linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
       Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), destPtrType,

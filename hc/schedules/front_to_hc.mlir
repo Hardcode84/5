@@ -128,12 +128,13 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
     // Flatten runs after `hc-lower-launch-body`. The eventual target
-    // is to run it right after `hc-infer-generic-bounds`. One
-    // downstream pass still wants pre-flatten shapes and blocks the
-    // move: `hc-lower-launch-body` resolves per-arg sources off the
-    // rank-N kernel-arg list, so the 1D post-flatten form trips
-    // both its rank-parity assert on multi-axis access ops and its
-    // kernel-arg dim binder.
+    // is to run it right after `hc-infer-generic-bounds`. Two pieces
+    // are still missing before the move can happen: slice-indexed
+    // access ops (`hc.vload`, `hc.load_mask`, `hc.store`) need to
+    // route through `hc-load-store-to-generic` so flatten only sees
+    // generics, and the workitem-region inlining has to land. Until
+    // both ship the post-flatten launch-body still trips on the
+    // multi-axis slice-indexed survivors.
     %m13b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m13
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13b {

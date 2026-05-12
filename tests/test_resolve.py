@@ -397,3 +397,159 @@ def test_resolve_raises_on_unclassifiable_capture(tmp_path: Path) -> None:
     assert "Widget" in msg
     assert "bad" in msg
     assert "@kernel.func" in msg or "hc.symbols" in msg
+
+
+# --- layout descriptors -----------------------------------------------------
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_resolve_index_map_capture_serializes_layout_payload() -> None:
+    """Module-level ``IndexMap`` captures get a ``kind = "layout"`` ref
+    with parallel ``params_names`` / ``params_exprs`` arrays plus textual
+    ``storage_size`` / ``offset`` bodies — exactly what the C++ converter
+    needs to assemble a ``#hc.layout`` attribute. Pinning the strings
+    keeps slice-3 frontend output stable across resolver changes; if
+    ixsimpl normalization changes a spelling, the assertion catches it
+    and forces a documented bump rather than silent drift in IR text.
+    """
+    _ensure_hc_front_bindings_available()
+
+    from hc import Buffer, kernel, sym
+    from hc.core import index_map
+    from hc.symbols import ceil_div
+
+    M = sym.M
+    N = sym.N
+
+    A_LAYOUT = index_map(
+        params=lambda w, h: {"row_stride": h + 4},
+        storage_size=lambda w, h, p: w * p["row_stride"],
+        offset=lambda i, j, w, h, p: i * p["row_stride"] + j,
+    )
+
+    @kernel(work_shape=(ceil_div(M, 4),), group_shape=(4,))
+    def uses_layout(group, a: Buffer[M, N]) -> None:
+        _ = A_LAYOUT
+        return
+
+    resolved = resolve_front_ir(uses_layout)
+    name_refs = _name_refs(resolved.module)
+
+    (ref,) = name_refs["A_LAYOUT"]
+    assert ref["kind"] == "layout"
+    assert ref["shape_syms"] == '["w", "h"]'
+    assert ref["index_syms"] == '["i", "j"]'
+    assert ref["params_names"] == '["row_stride"]'
+    assert ref["params_exprs"] == '["4 + h"]'
+    assert ref["storage_size"] == "row_stride*w"
+    assert ref["offset"] == "j + i*row_stride"
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_resolve_index_map_without_params_emits_empty_table() -> None:
+    """``IndexMap`` without a ``params`` callable: ``storage_size`` and
+    ``offset`` see only shape / index syms, and the ref carries empty
+    ``params_*`` tuples. Default-strided buffer layouts already do this
+    on the C++ side; the Python surface needs to round-trip the same
+    minimal shape.
+    """
+    _ensure_hc_front_bindings_available()
+
+    from hc import Buffer, kernel, sym
+    from hc.core import index_map
+    from hc.symbols import ceil_div
+
+    M = sym.M
+    N = sym.N
+
+    DENSE = index_map(
+        storage_size=lambda m, n: m * n,
+        offset=lambda i, j, m, n: i * n + j,
+    )
+
+    @kernel(work_shape=(ceil_div(M, 4),), group_shape=(4,))
+    def uses_dense(group, a: Buffer[M, N]) -> None:
+        _ = DENSE
+        return
+
+    resolved = resolve_front_ir(uses_dense)
+    name_refs = _name_refs(resolved.module)
+
+    (ref,) = name_refs["DENSE"]
+    assert ref["kind"] == "layout"
+    assert ref["shape_syms"] == '["m", "n"]'
+    assert ref["index_syms"] == '["i", "j"]'
+    assert ref["params_names"] == "[]"
+    assert ref["params_exprs"] == "[]"
+    assert ref["storage_size"] == "m*n"
+    assert ref["offset"] == "j + i*n"
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
+    """The free ``as_layout`` function is a DSL primitive, not an
+    inlinable helper. The resolver must produce a ``layout_op`` ref so
+    ``hc-front-to-hc`` recognizes the call site as the source of an
+    ``hc.as_layout`` op — and must NOT walk it as a BFS dep (which
+    would re-parse its dispatcher body as kernel source).
+    """
+    _ensure_hc_front_bindings_available()
+
+    from hc import Buffer, as_layout, kernel, sym
+    from hc.symbols import ceil_div
+
+    M = sym.M
+    N = sym.N
+
+    @kernel(work_shape=(ceil_div(M, 4),), group_shape=(4,))
+    def uses_as_layout(group, a: Buffer[M, N]) -> None:
+        _ = as_layout
+        return
+
+    resolved = resolve_front_ir(uses_as_layout)
+    name_refs = _name_refs(resolved.module)
+
+    (ref,) = name_refs["as_layout"]
+    assert ref == {"kind": "layout_op", "op": "as_layout"}
+    assert "as_layout" not in resolved.inline_names
+
+
+def test_index_map_classifier_diagnoses_bad_signature() -> None:
+    """Lambdas with varargs / keyword-only / defaults are rejected with
+    a located error. The simulator and the symbolic evaluator both
+    bind by positional slot; anything else would make slot semantics
+    ambiguous and lower confusing diagnostics from the lambda body
+    instead of the layout descriptor.
+    """
+    from hc._resolve import _classify_index_map
+    from hc.core import index_map
+
+    L = index_map(
+        storage_size=lambda *shape: shape[0],
+        offset=lambda *args: args[0],
+    )
+    with pytest.raises(FrontendError) as exc_info:
+        _classify_index_map("L", L)
+    assert "L" in str(exc_info.value)
+    assert "positional parameters only" in str(exc_info.value)
+
+
+def test_index_map_classifier_diagnoses_mismatched_shape_names() -> None:
+    """offset's trailing shape slots must match params/storage_size's
+    shape slots by name. A typo in the offset signature would silently
+    rebind the layout to the wrong shape sym; the classifier rejects
+    it instead.
+    """
+    from hc._resolve import _classify_index_map
+    from hc.core import index_map
+
+    L = index_map(
+        params=lambda w, h: {"s": w + h},
+        storage_size=lambda w, h, p: w * p["s"],
+        offset=lambda i, j, w, hh, p: i * p["s"] + j,
+    )
+    with pytest.raises(FrontendError) as exc_info:
+        _classify_index_map("L", L)
+    msg = str(exc_info.value)
+    assert "shape parameters" in msg
+    assert "disagree" in msg

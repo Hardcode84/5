@@ -46,7 +46,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._frontend import FrontendError, lower_functions_to_front_ir
-from .core import FuncMetadata, IntrinsicMetadata, KernelMetadata
+from .core import FuncMetadata, IndexMap, IntrinsicMetadata, KernelMetadata
+from .core import as_layout as _dsl_as_layout
 
 __all__ = [
     "ResolvedFrontIR",
@@ -523,8 +524,225 @@ def _classify_inline(name: str, value: Any) -> Mapping[str, object] | None:
     return {"kind": "inline", "qualified_name": _qualified_name(value)}
 
 
+def _classify_as_layout(name: str, value: Any) -> Mapping[str, object] | None:
+    """`hc.core.as_layout` resolved by name — DSL primitive, not inlinable.
+
+    Recognized by identity so a kernel doing ``from hc import as_layout``
+    (or ``as_layout = hc.as_layout``) classifies the captured function
+    here instead of falling through to ``_classify_inline``, which would
+    try to re-parse the helper's body as kernel source. The lowering
+    pass keys on ``kind = "layout_op"`` to emit ``hc.as_layout`` with
+    the structured ``#hc.layout`` attribute carried by the second
+    positional argument.
+    """
+    del name
+    if value is not _dsl_as_layout:
+        return None
+    return {"kind": "layout_op", "op": "as_layout"}
+
+
+def _classify_index_map(name: str, value: Any) -> Mapping[str, object] | None:
+    """Module-level ``IndexMap`` captured as a layout descriptor.
+
+    The lambdas are evaluated symbolically (with ``hc.symbols.Symbol``
+    args bound to the lambda's own parameter names) so the resulting
+    ``shape_syms``, ``index_syms``, ``params``, ``storage_size``, and
+    ``offset`` arrive at the MLIR side as textual ``#hc.expr`` bodies
+    ready to feed ``LayoutAttr``. Failure during evaluation surfaces as
+    a ``FrontendError`` against ``name`` so users see which capture is
+    the problem, not just an opaque traceback.
+    """
+    if not isinstance(value, IndexMap):
+        return None
+    try:
+        return _index_map_ref(value)
+    except FrontendError as exc:
+        raise FrontendError(f"layout descriptor {name!r}: {exc}") from None
+
+
+def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
+    """Symbolically evaluate ``layout`` into a serializable ref payload.
+
+    Strategy: discover the user's chosen ``shape_syms`` from the
+    ``params`` or ``storage_size`` signature (positional arg names),
+    discover ``index_syms`` from the leading positional args of
+    ``offset``, and bind every name through a fresh
+    ``SymbolNamespace`` so the resulting ``Expr`` carriers print as
+    textual ``#hc.expr`` bodies. Params are passed back into
+    ``storage_size`` / ``offset`` as symbol-valued, not expr-valued, so
+    the resulting offset stays ``i * row_stride + j`` instead of
+    fully-substituted ``i * (h + 4) + j`` — the named-table form lines
+    up with the design doc example and keeps post-hoc diagnostics
+    readable.
+
+    Returns a mapping with parallel arrays for the params table; the
+    classifier-side encoder only handles flat scalar/tuple values
+    (see ``_OpClassifier._to_attr``) and a nested dict would need its
+    own encoder. The pairing is ``params_names[i] -> params_exprs[i]``.
+    """
+    from .symbols import Context, SymbolNamespace
+
+    shape_param_names = _layout_shape_param_names(layout)
+    index_param_names = _layout_index_param_names(layout, shape_param_names)
+
+    ctx = Context()
+    syms = SymbolNamespace(ctx)
+    shape_syms = tuple(syms[n] for n in shape_param_names)
+    index_syms = tuple(syms[n] for n in index_param_names)
+
+    params_exprs, params_named = _layout_eval_params(layout, syms, shape_syms)
+
+    storage_args = (
+        (*shape_syms, params_named) if layout.params is not None else shape_syms
+    )
+    storage_call = _layout_invoke(
+        layout.storage_size, storage_args, role="storage_size"
+    )
+
+    offset_args = (
+        (*index_syms, *shape_syms, params_named)
+        if layout.params is not None
+        else (*index_syms, *shape_syms)
+    )
+    offset_call = _layout_invoke(layout.offset, offset_args, role="offset")
+
+    return {
+        "kind": "layout",
+        "shape_syms": tuple(shape_param_names),
+        "index_syms": tuple(index_param_names),
+        "params_names": tuple(params_exprs.keys()),
+        "params_exprs": tuple(params_exprs.values()),
+        "storage_size": str(storage_call),
+        "offset": str(offset_call),
+    }
+
+
+def _layout_eval_params(
+    layout: IndexMap,
+    syms: Any,
+    shape_syms: tuple[Any, ...],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Run ``layout.params`` (if any) symbolically and split the result.
+
+    Returns ``(params_exprs, params_named)``:
+        ``params_exprs[name] -> textual #hc.expr body``
+        ``params_named[name] -> Symbol with that name``
+    The first is what the IR records as the named table; the second
+    gets fed back into ``storage_size`` and ``offset`` so the symbolic
+    eval prints ``i * row_stride + j`` instead of the fully-substituted
+    form.
+    """
+    params_exprs: dict[str, str] = {}
+    params_named: dict[str, Any] = {}
+    if layout.params is None:
+        return params_exprs, params_named
+    raw = _layout_invoke(layout.params, shape_syms, role="params")
+    if raw is None:
+        return params_exprs, params_named
+    if not isinstance(raw, Mapping):
+        raise FrontendError("params(...) must return a mapping or None")
+    for key, expr in raw.items():
+        if not isinstance(key, str):
+            raise FrontendError(f"params(...) key {key!r} is not a string")
+        params_exprs[key] = str(expr)
+        params_named[key] = syms[key]
+    return params_exprs, params_named
+
+
+def _layout_invoke(fn: Any, args: tuple[Any, ...], *, role: str) -> Any:
+    """Call ``fn(*args)`` and rewrap any exception as a ``FrontendError``.
+
+    User-supplied lambdas may raise anything (``TypeError`` on a missing
+    operator, ``KeyError`` on a typoed param, ...); flatten those into
+    a layout-descriptor diagnostic that names the offending callable's
+    role instead of leaking the raw exception class.
+    """
+    try:
+        return fn(*args)
+    except Exception as exc:
+        raise FrontendError(f"{role}(...) raised {type(exc).__name__}: {exc}") from None
+
+
+def _layout_positional_names(fn: Any, *, role: str) -> tuple[str, ...]:
+    """Names of ``fn``'s positional args (no varargs, no kw-only, no defaults).
+
+    Layout lambdas must be straight positional shape -> ... -> params so
+    the simulator and the symbolic evaluator agree on slot binding; any
+    other signature shape produces a located diagnostic via ``role``.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError) as exc:
+        raise FrontendError(f"cannot inspect {role}: {exc}") from None
+    names: list[str] = []
+    for param in sig.parameters.values():
+        if param.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            raise FrontendError(
+                f"{role} must use positional parameters only, "
+                f"got {param.name!r} ({param.kind.description})"
+            )
+        if param.default is not inspect.Parameter.empty:
+            raise FrontendError(
+                f"{role} parameter {param.name!r} must not have a default value"
+            )
+        names.append(param.name)
+    return tuple(names)
+
+
+def _layout_shape_param_names(layout: IndexMap) -> tuple[str, ...]:
+    """Resolve the layout's shape-sym names from its lambda signatures.
+
+    Priority: ``params`` (when present) — it takes only shape syms, so
+    its full signature is the shape-sym list. Without ``params``,
+    ``storage_size``'s signature is the shape-sym list (and offset's
+    trailing slots must match).
+    """
+    if layout.params is not None:
+        return _layout_positional_names(layout.params, role="layout params")
+    return _layout_positional_names(layout.storage_size, role="layout storage_size")
+
+
+def _layout_index_param_names(
+    layout: IndexMap, shape_param_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Resolve the layout's index-sym names from ``offset``'s prefix.
+
+    Convention from `doc/langref.md`:
+        offset(i, j, ..., *shape_syms[, params])
+    Index syms occupy the leading slots, shape syms the next ``len(shape_syms)``
+    slots, and ``params`` (when present) trails. Mismatches surface as
+    ``FrontendError`` rather than silently dropping or duplicating slots.
+    """
+    offset_names = _layout_positional_names(layout.offset, role="layout offset")
+    trailing = 1 if layout.params is not None else 0
+    n_shape = len(shape_param_names)
+    if len(offset_names) < n_shape + trailing + 1:
+        raise FrontendError(
+            f"offset(...) needs at least one index parameter plus "
+            f"{n_shape} shape parameter(s)"
+            + (" and a params dict" if trailing else "")
+            + f"; got {offset_names!r}"
+        )
+    n_index = len(offset_names) - n_shape - trailing
+    index_names = offset_names[:n_index]
+    shape_tail = offset_names[n_index : n_index + n_shape]
+    if shape_tail != shape_param_names:
+        raise FrontendError(
+            f"offset(...) shape parameters {shape_tail!r} disagree with "
+            f"the layout's shape parameters {shape_param_names!r}"
+        )
+    return index_names
+
+
 # Ordered most-specific-first: builtins win over constants (``True`` is a
 # builtin name rather than a random `1`), numpy wins over generic callables.
+# ``IndexMap`` and the ``as_layout`` primitive sit ahead of
+# ``_classify_inline`` so neither falls through to "re-parse as kernel
+# helper" — IndexMap holds three lambdas, ``as_layout`` is a thin
+# dispatcher, both produce nonsense inline IR.
 _CAPTURE_CLASSIFIERS: tuple[_CaptureClassifier, ...] = (
     _classify_builtin,
     _classify_numpy_module,
@@ -532,6 +750,8 @@ _CAPTURE_CLASSIFIERS: tuple[_CaptureClassifier, ...] = (
     _classify_constant,
     _classify_callee,
     _classify_intrinsic,
+    _classify_as_layout,
+    _classify_index_map,
     _classify_inline,
 )
 
@@ -599,13 +819,18 @@ def _is_inlinable_helper(value: Any) -> bool:
     needs a ``__code__`` object backed by real source, and only
     ``types.FunctionType`` gives us that reliably. Decorated callables
     are also excluded — those take the `@kernel.func` / `@kernel.intrinsic`
-    path with their own metadata.
+    path with their own metadata. DSL primitives like ``as_layout`` are
+    also excluded so the BFS doesn't drag their dispatcher body into
+    the module as a "helper"; their classifier produces a dedicated
+    ref kind instead (see ``_classify_as_layout``).
     """
     import types
 
     if not isinstance(value, types.FunctionType):
         return False
     if _is_kernel_func(value) or _is_intrinsic(value) or _is_kernel(value):
+        return False
+    if value is _dsl_as_layout:
         return False
     try:
         source_file = inspect.getsourcefile(value)

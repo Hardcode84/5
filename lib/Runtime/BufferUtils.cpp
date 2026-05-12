@@ -108,6 +108,15 @@ static int64_t callIntegerAccessor(PyObject *obj, const char *method,
 
 } // namespace
 
+// Returned pointer is passed verbatim to `hipModuleLaunchKernel` by the
+// JIT'd host wrapper — so `obj.data_ptr()` MUST be a device-allocated
+// address. `torch.Tensor.cuda().data_ptr()` works; bare `numpy.ndarray`
+// (whose `ctypes.data` is a host pointer) does not. Auto-wrapping numpy
+// here would silently produce launches that either segfault on the
+// first device dereference or, on a unified-memory system, return
+// nondeterministic garbage. The cure for "I want to invoke from numpy"
+// is an explicit host→device alloc/copy surface (hc.to_device or
+// equivalent), not relaxing this contract.
 extern "C" void *_mlir_ciface_hc_get_ptr(PyObject *obj) {
   GilGuard gil;
   PyRef accessor(PyObject_GetAttrString(obj, "data_ptr"));

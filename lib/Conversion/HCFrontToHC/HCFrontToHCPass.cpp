@@ -952,6 +952,37 @@ readLayoutFromValue(Value descriptor, Operation *consumer, StringRef role) {
   return layoutAttrFromRef(consumer, ref);
 }
 
+// Locate a specific keyword operand on a call op. Returns the
+// `hc_front.keyword` op that names `kwname`, or null if absent. Keyword
+// args are emitted as `hc_front.keyword "name" = %v` ops feeding the
+// call's operand list, so a name match resolves uniquely. Callers want
+// the keyword op (not just the underlying value) so they can chase
+// classification metadata that lives on the source name op without
+// going through `valueMap`, which intentionally maps non-SSA
+// classifications (layout descriptors) to null.
+static hc_front::KeywordOp findKeywordArg(hc_front::CallOp call,
+                                          StringRef kwname) {
+  for (Value arg : call.getArguments()) {
+    auto k = arg.getDefiningOp<hc_front::KeywordOp>();
+    if (k && k.getName() == kwname)
+      return k;
+  }
+  return {};
+}
+
+// Consume the optional `layout=` keyword on a tensor-creation call,
+// resolving the captured `IndexMap` descriptor to a `LayoutAttr`. Null
+// `LayoutAttr` on success means "no `layout=` kwarg present" — the
+// caller leaves the result untouched. `failure()` is a real error
+// (malformed layout ref, wrong-kind descriptor, etc.) that has already
+// emitted a diagnostic.
+static FailureOr<LayoutAttr> consumeLayoutKwarg(hc_front::CallOp call) {
+  hc_front::KeywordOp kw = findKeywordArg(call, "layout");
+  if (!kw)
+    return LayoutAttr();
+  return readLayoutFromValue(kw.getValue(), call.getOperation(), "layout=");
+}
+
 static FailureOr<Type>
 parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
                       LaunchMetadataAttrs defaultLaunchMetadata,
@@ -1314,6 +1345,15 @@ private:
   // `kind = "layout"` carrying typed `#hc.expr` / DictAttr pieces; this
   // path reassembles them into a `LayoutAttr` and emits `hc.as_layout`.
   FailureOr<Value> lowerLayoutOpCall(hc_front::CallOp op, const RefInfo &ref);
+
+  // Wrap a freshly-emitted tensor/vector result in `hc.as_layout` when
+  // the originating call carried a `layout=` kwarg. Returns the
+  // unwrapped value when no kwarg is present, so the caller can write
+  // a uniform `return maybeApplyLayoutKwarg(call, v)` at every
+  // allocator/load exit. The post-emit overlay keeps the rest of the
+  // op-builder code paths untouched and lets `-hc-canonicalize-layouts`
+  // collapse the wrap when the captured layout is the identity.
+  FailureOr<Value> maybeApplyLayoutKwarg(hc_front::CallOp call, Value result);
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
@@ -2916,6 +2956,17 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
               .getResult()};
 }
 
+FailureOr<Value> Lowerer::maybeApplyLayoutKwarg(hc_front::CallOp call,
+                                                Value result) {
+  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+  if (failed(layout))
+    return failure();
+  if (!*layout)
+    return result;
+  return {HCAsLayoutOp::create(builder, call.getLoc(), undef, result, *layout)
+              .getResult()};
+}
+
 FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
                                               const RefInfo &ref,
                                               const CallArgs &args) {
@@ -2976,7 +3027,8 @@ FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
   if (method == "vec") {
     if (failed(requireBase(method)))
       return failure();
-    return {HCVecOp::create(builder, call.getLoc(), undef, base).getResult()};
+    return maybeApplyLayoutKwarg(
+        call, HCVecOp::create(builder, call.getLoc(), undef, base).getResult());
   }
   if (method == "with_inactive") {
     if (failed(requireBase(method)))
@@ -3076,11 +3128,19 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
                         : HCVLoadOp::create(builder, call.getLoc(), undef, src,
                                             indices, shape)
                               .getOperation();
-    return {op->getResult(0)};
+    return maybeApplyLayoutKwarg(call, op->getResult(0));
   }
   if (method == "store") {
     if (args.positional.size() < 2) {
       call.emitOpError("`store` expects at least (dest, source)");
+      return failure();
+    }
+    // `store` is the one mem op without a shaped result — reinterpreting
+    // its (absent) output via `layout=` is meaningless, so diagnose at
+    // the call site instead of silently dropping the kwarg.
+    if (findKeywordArg(call, "layout")) {
+      call.emitOpError("`store` does not accept a `layout=` kwarg "
+                       "(stores have no shaped result to relabel)");
       return failure();
     }
     Value dest = args.positional.front();
@@ -3127,20 +3187,23 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     FailureOr<TypeAttr> dtype = optionalDtype(method);
     if (failed(dtype))
       return failure();
+    Value result;
     if (method == "vzeros")
-      return {HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                  .getResult()};
-    if (method == "vones")
-      return {HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                  .getResult()};
-    if (method == "zeros")
-      return {HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                  .getResult()};
-    if (method == "ones")
-      return {HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                  .getResult()};
-    return {HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                .getResult()};
+      result = HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                   .getResult();
+    else if (method == "vones")
+      result = HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                   .getResult();
+    else if (method == "zeros")
+      result = HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                   .getResult();
+    else if (method == "ones")
+      result = HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                   .getResult();
+    else
+      result = HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype)
+                   .getResult();
+    return maybeApplyLayoutKwarg(call, result);
   }
 
   if (method == "vfull" || method == "full") {
@@ -3160,13 +3223,14 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
       call.emitOpError("`") << method << "` missing `fill_value=` operand";
       return failure();
     }
-    if (method == "vfull")
-      return {
-          HCVFullOp::create(builder, call.getLoc(), undef, fill, *shape, *dtype)
-              .getResult()};
-    return {
-        HCFullOp::create(builder, call.getLoc(), undef, fill, *shape, *dtype)
-            .getResult()};
+    Value result = method == "vfull"
+                       ? HCVFullOp::create(builder, call.getLoc(), undef, fill,
+                                           *shape, *dtype)
+                             .getResult()
+                       : HCFullOp::create(builder, call.getLoc(), undef, fill,
+                                          *shape, *dtype)
+                             .getResult();
+    return maybeApplyLayoutKwarg(call, result);
   }
   llvm_unreachable("unknown memory DSL method");
 }

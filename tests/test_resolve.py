@@ -514,6 +514,64 @@ def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
     assert "as_layout" not in resolved.inline_names
 
 
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
+    """End-to-end Python -> hc_front -> hc handshake: a kernel calling
+    ``group.vzeros(shape=..., layout=A_LAYOUT)`` must reach
+    ``-convert-hc-front-to-hc`` with the right ref payload and surface
+    as ``hc.vzeros`` + ``hc.as_layout``. The LIT side pins the C++
+    consumer on hand-written hc_front IR; this test pins the boundary
+    (resolver ref shape exactly matches the C++ reader contract).
+    """
+    import subprocess
+
+    from hc import Buffer, kernel, sym
+    from hc._native_paths import hc_opt_path
+    from hc.core import index_map
+    from hc.symbols import ceil_div
+
+    _ensure_hc_front_bindings_available()
+
+    M = sym.M
+    N = sym.N
+
+    A_LAYOUT = index_map(
+        storage_size=lambda w, h: w * h,
+        offset=lambda i, j, w, h: i * h + j,
+    )
+
+    @kernel(work_shape=(ceil_div(M, 16),), group_shape=(16,))
+    def uses_layout_kwarg(group, a: Buffer[M, N]) -> None:
+        _ = group.vzeros(shape=(16,), layout=A_LAYOUT)
+        return
+
+    resolved = resolve_front_ir(uses_layout_kwarg)
+    front_text = str(resolved.module)
+
+    result = subprocess.run(
+        [str(hc_opt_path()), "--convert-hc-front-to-hc"],
+        input=front_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (
+        result.returncode == 0
+    ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    hc_text = result.stdout
+    assert "hc.vzeros" in hc_text, hc_text
+    assert "hc.as_layout" in hc_text, hc_text
+    # The captured layout overlay must carry both the row/col index
+    # symbols and the storage_size built from the IndexMap lambdas.
+    # ixsimpl is free to reorder commuting factors (``h*w`` vs ``w*h``)
+    # so the test asserts presence-and-shape rather than a verbatim
+    # spelling.
+    assert 'index_syms = ["i", "j"]' in hc_text, hc_text
+    assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
+    assert "storage_size = #hc.expr<" in hc_text, hc_text
+    assert "offset = #hc.expr<" in hc_text, hc_text
+
+
 def test_index_map_classifier_diagnoses_bad_signature() -> None:
     """Lambdas with varargs / keyword-only / defaults are rejected with
     a located error. The simulator and the symbolic evaluator both

@@ -769,6 +769,39 @@ module {
 
 // -----
 
+// `store` doesn't produce a shaped result, so `layout=` is a no-op
+// (or a user-side bug). Diagnose at the call site instead of silently
+// dropping the kwarg.
+module {
+  hc_front.kernel "store_with_layout" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [
+      {name = "group"},
+      {annotation = "Buffer[M]", kind = "buffer", name = "c", shape = ["M"]},
+      {name = "tile"}
+    ],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %c = hc_front.name "c" {ctx = "load", ref = {kind = "param"}}
+    %tile = hc_front.name "tile" {ctx = "load", ref = {kind = "param"}}
+    %store = hc_front.attr %grp, "store" {ref = {kind = "dsl_method", method = "store"}}
+    %zero = hc_front.constant<0 : i64>
+    %lay = hc_front.name "D" {ctx = "load", ref = {
+      kind = "layout", shape_syms = ["d0"], index_syms = ["i0"],
+      params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">}}
+    %lay_kw = hc_front.keyword "layout" = %lay
+    // expected-error@+1 {{`store` does not accept a `layout=` kwarg}}
+    %call = hc_front.call %store(%c, %zero, %tile, %lay_kw)
+    hc_front.return
+  }
+}
+
+// -----
+
 // Malformed layout ref payload — missing `params` is a driver bug
 // (resolver always stamps it, even when empty). Diagnose against the
 // descriptor name op so users follow the chain back to the resolver.

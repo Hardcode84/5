@@ -1341,9 +1341,16 @@ resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
         return failure();
       remappedIndices.push_back(remapped);
     }
+    // Non-unit strides are fine here. `loadVectorFromPtrView` /
+    // `writeVectorToWorkgroupPtr` walk the result-vector lanes through
+    // `axis.stride * iter + axis.offset` (one per-element scalar
+    // load/store), so any constant or symbolic stride lowers correctly
+    // — there's no SIMD-vs-gather decision pending on this site.
+    // The wider upgrade to `vector.gather` / strided `vector.transfer_*`
+    // for performance is the separate "SIMD/gather upgrade" task.
     FailureOr<SmallVector<SliceAxis>> axes =
         collectAxes(bv.getOperation(), remappedIndices, rewriter,
-                    /*requireUnitStride=*/true);
+                    /*requireUnitStride=*/false);
     if (failed(axes))
       return failure();
     if (axes->size() != sourceShape->size())

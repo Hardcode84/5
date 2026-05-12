@@ -405,12 +405,14 @@ def test_resolve_raises_on_unclassifiable_capture(tmp_path: Path) -> None:
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_index_map_capture_serializes_layout_payload() -> None:
     """Module-level ``IndexMap`` captures get a ``kind = "layout"`` ref
-    with parallel ``params_names`` / ``params_exprs`` arrays plus textual
-    ``storage_size`` / ``offset`` bodies — exactly what the C++ converter
-    needs to assemble a ``#hc.layout`` attribute. Pinning the strings
-    keeps slice-3 frontend output stable across resolver changes; if
-    ixsimpl normalization changes a spelling, the assertion catches it
-    and forces a documented bump rather than silent drift in IR text.
+    whose payload is built from typed MLIR attributes: ``#hc.expr`` for
+    ``storage_size`` / ``offset`` and for every ``params`` entry, plus
+    ``ArrayAttr`` of ``StringAttr`` for ``shape_syms`` / ``index_syms``.
+    No textual round-trip survives across the Python -> C++ boundary;
+    pinning the MLIR-text forms keeps slice-3 frontend output stable
+    across resolver changes (if ixsimpl normalization changes a
+    spelling, the assertion catches it and forces a documented bump
+    rather than silent drift in IR text).
     """
     _ensure_hc_front_bindings_available()
 
@@ -439,19 +441,18 @@ def test_resolve_index_map_capture_serializes_layout_payload() -> None:
     assert ref["kind"] == "layout"
     assert ref["shape_syms"] == '["w", "h"]'
     assert ref["index_syms"] == '["i", "j"]'
-    assert ref["params_names"] == '["row_stride"]'
-    assert ref["params_exprs"] == '["4 + h"]'
-    assert ref["storage_size"] == "row_stride*w"
-    assert ref["offset"] == "j + i*row_stride"
+    assert ref["params"] == '{row_stride = #hc.expr<"4 + h">}'
+    assert ref["storage_size"] == '#hc.expr<"row_stride*w">'
+    assert ref["offset"] == '#hc.expr<"j + i*row_stride">'
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_index_map_without_params_emits_empty_table() -> None:
     """``IndexMap`` without a ``params`` callable: ``storage_size`` and
-    ``offset`` see only shape / index syms, and the ref carries empty
-    ``params_*`` tuples. Default-strided buffer layouts already do this
-    on the C++ side; the Python surface needs to round-trip the same
-    minimal shape.
+    ``offset`` see only shape / index syms, and the ref carries an
+    empty ``params`` dictionary. Default-strided buffer layouts already
+    do this on the C++ side; the Python surface needs to round-trip
+    the same minimal shape.
     """
     _ensure_hc_front_bindings_available()
 
@@ -479,10 +480,9 @@ def test_resolve_index_map_without_params_emits_empty_table() -> None:
     assert ref["kind"] == "layout"
     assert ref["shape_syms"] == '["m", "n"]'
     assert ref["index_syms"] == '["i", "j"]'
-    assert ref["params_names"] == "[]"
-    assert ref["params_exprs"] == "[]"
-    assert ref["storage_size"] == "m*n"
-    assert ref["offset"] == "j + i*n"
+    assert ref["params"] == "{}"
+    assert ref["storage_size"] == '#hc.expr<"m*n">'
+    assert ref["offset"] == '#hc.expr<"j + i*n">'
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

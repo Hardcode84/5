@@ -426,6 +426,10 @@ class _OpClassifier:
         return ir.DictAttr.get(entries, context=self._ctx)
 
     def _to_attr(self, value: object) -> Any:
+        # Local import: ``hc.symbols`` is heavy and only needed when the
+        # classifier surfaces an ``Expr`` carrier (layout descriptors).
+        from .symbols import Expr
+
         ir = self._ir
         if isinstance(value, str):
             return ir.StringAttr.get(value, context=self._ctx)
@@ -439,6 +443,19 @@ class _OpClassifier:
                 [self._to_attr(item) for item in value],
                 context=self._ctx,
             )
+        if isinstance(value, Mapping):
+            return ir.DictAttr.get(
+                {str(k): self._to_attr(v) for k, v in value.items()},
+                context=self._ctx,
+            )
+        if isinstance(value, Expr):
+            # Construct an `#hc.expr` attribute via the MLIR parser bound to
+            # this context — the printed form of the ixsimpl-owned `Expr`
+            # round-trips through `sym::parseExpr` once at the frontend
+            # boundary, and downstream C++ readers see a typed `ExprAttr`
+            # instead of a `StringAttr` they would have to re-parse. See
+            # ``AGENTS.md`` → "Python -> MLIR attribute construction".
+            return ir.Attribute.parse(f'#hc.expr<"{value}">', context=self._ctx)
         raise FrontendError(f"cannot encode ref payload value {value!r}")
 
 
@@ -606,14 +623,20 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     )
     offset_call = _layout_invoke(layout.offset, offset_args, role="offset")
 
+    # The ref payload carries raw ``Expr`` carriers (and a name->Expr table
+    # for params); the encoder (``_OpClassifier._to_attr``) builds typed
+    # ``#hc.expr`` attributes via the MLIR Python bindings before stamping.
+    # C++ readers get already-typed ``ExprAttr`` / ``DictionaryAttr`` /
+    # ``ArrayAttr`` and never see textual expression bodies — see
+    # ``doc/layouts.md`` slice 3 and ``AGENTS.md`` under
+    # "Python -> MLIR attribute construction".
     return {
         "kind": "layout",
         "shape_syms": tuple(shape_param_names),
         "index_syms": tuple(index_param_names),
-        "params_names": tuple(params_exprs.keys()),
-        "params_exprs": tuple(params_exprs.values()),
-        "storage_size": str(storage_call),
-        "offset": str(offset_call),
+        "params": params_exprs,
+        "storage_size": storage_call,
+        "offset": offset_call,
     }
 
 
@@ -621,18 +644,17 @@ def _layout_eval_params(
     layout: IndexMap,
     syms: Any,
     shape_syms: tuple[Any, ...],
-) -> tuple[dict[str, str], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run ``layout.params`` (if any) symbolically and split the result.
 
     Returns ``(params_exprs, params_named)``:
-        ``params_exprs[name] -> textual #hc.expr body``
-        ``params_named[name] -> Symbol with that name``
-    The first is what the IR records as the named table; the second
-    gets fed back into ``storage_size`` and ``offset`` so the symbolic
-    eval prints ``i * row_stride + j`` instead of the fully-substituted
-    form.
+        ``params_exprs[name] -> hc.symbols.Expr`` (becomes a typed ``#hc.expr``
+            at stamp time)
+        ``params_named[name] -> Symbol with that name`` (fed back into
+            ``storage_size`` / ``offset`` so the symbolic eval prints
+            ``i * row_stride + j`` instead of the fully-substituted form)
     """
-    params_exprs: dict[str, str] = {}
+    params_exprs: dict[str, Any] = {}
     params_named: dict[str, Any] = {}
     if layout.params is None:
         return params_exprs, params_named
@@ -644,7 +666,7 @@ def _layout_eval_params(
     for key, expr in raw.items():
         if not isinstance(key, str):
             raise FrontendError(f"params(...) key {key!r} is not a string")
-        params_exprs[key] = str(expr)
+        params_exprs[key] = expr
         params_named[key] = syms[key]
     return params_exprs, params_named
 

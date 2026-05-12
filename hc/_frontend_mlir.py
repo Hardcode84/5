@@ -12,7 +12,7 @@ from ._frontend import FrontendEmitError
 from ._intrinsic_contracts import validate_intrinsic_type_contract_record
 from ._intrinsic_recipes import IntrinsicTransformRecipe
 from .mlir import ir
-from .mlir.dialects import hc_front
+from .mlir.dialects import hc, hc_front
 
 
 @dataclass
@@ -55,6 +55,14 @@ class HCFrontEmitter:
     def __init__(self, *, context: Any | None = None) -> None:
         self._context = ir.Context() if context is None else context
         hc_front.register_dialects(self._context)
+        # The semantic ``hc`` dialect rides on the same context so the
+        # resolver can stamp typed ``#hc.expr`` / ``#hc.layout`` payloads
+        # built straight from Python ``IndexMap`` captures (see
+        # ``hc/_resolve.py`` → "Python -> MLIR attribute construction").
+        # Without this the parser would refuse the structured forms with
+        # "unregistered dialect" and force a textual round-trip through
+        # ``-convert-hc-front-to-hc``.
+        hc.register_dialects(self._context)
         self._filename = "<unknown>"
         self._module: Any | None = None
         self._blocks: list[Any] = []

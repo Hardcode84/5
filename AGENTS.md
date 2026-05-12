@@ -135,6 +135,13 @@ Code comments, docstrings, and commit messages share the same voice: terse, dry,
 - `sym::parseExpr` / `sym::parsePred` are for the textual surface only — ODS parser hooks, attribute round-trip, frontend / Python ingestion. Production C++ paths inside passes build structurally.
 - Same rule applies to LIT helpers, generated code, and Python: don't `f"{a} + {b}"`-then-parse. Construct via the API and serialize at the boundary if needed.
 
+### Python -> MLIR attribute construction
+
+- Don't smuggle structured payloads across the Python / MLIR boundary as `StringAttr`s of MLIR text that C++ then re-parses. Build the typed attribute in Python and let C++ readers cast it.
+- Single source of truth for the construction is the MLIR Python bindings under `hc.mlir.ir`: prefer `ir.Attribute.parse('#hc.expr<"…">', context=ctx)` for `ExprAttr` / `PredAttr`, `ir.ArrayAttr.get([...])` for ordered name lists, and `ir.DictAttr.get({...})` for name->attr tables. Compose them into the final `DictAttr` ref the way `_OpClassifier._to_attr` does in `hc/_resolve.py`.
+- Register every dialect whose attributes you intend to construct on the active context before building. Frontend emitters that touch hc payloads must call both `hc_front.register_dialects(ctx)` and `hc.register_dialects(ctx)`; otherwise `ir.Attribute.parse` rejects `#hc.…` with "unregistered dialect" and the silent fix is "round-trip as a string", which is the exact failure mode this rule forbids.
+- The frontend boundary is allowed exactly one `parseExpr` per expression (mirroring the C++ side rule above). Don't widen that — never reconstruct an attribute by stringifying an existing typed attr and re-parsing it; pass the typed `Attribute` through.
+
 ## Testing
 
 - Use `pytest` for Python tests.

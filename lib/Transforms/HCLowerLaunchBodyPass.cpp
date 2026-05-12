@@ -230,9 +230,27 @@ struct KernelArgSource {
   unsigned rank() const { return dims.size(); }
 };
 
+// Pure query: walks defining ops to find the underlying kernel-arg
+// `(ptr, dims..., strides...)` UCC. Handles both the pre-flatten
+// direct kernel-arg shape (one UCC carrying the bundle) and the
+// post-flatten chain (a multi-output UCC retypes the bundle to a
+// rank-1 carrier plus idx-typed aux). For the post-flatten chain we
+// return the inner rank-N source — the consumer decides whether to
+// use it directly (e.g. `AdaptGenericOp` just needs `ptr`) or to
+// collapse to a rank-1 view (`flatKernelArgView`, IR-mutating).
 static std::optional<KernelArgSource> resolveKernelArg(Value source) {
   auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
-  if (!cast || cast.getOutputs().size() != 1)
+  if (!cast)
+    return std::nullopt;
+
+  if (cast.getInputs().size() == 1 && cast.getOutputs().size() > 1 &&
+      source == cast.getOutputs()[0]) {
+    if (auto bufOut = dyn_cast<BufferType>(source.getType());
+        bufOut && bufOut.getShape().getDims().size() == 1)
+      return resolveKernelArg(cast.getInputs()[0]);
+  }
+
+  if (cast.getOutputs().size() != 1)
     return std::nullopt;
   if (cast.getInputs().size() < 1)
     return std::nullopt;
@@ -261,6 +279,57 @@ static std::optional<KernelArgSource> resolveKernelArg(Value source) {
       return std::nullopt;
     info.strides.push_back(stride);
   }
+  return info;
+}
+
+// True when `source` is the rank-1 carrier output of the post-flatten
+// retype UCC (`buffer<T, [...]> -> buffer<T, ["?"]>, idx..., idx...`).
+// Together with `resolveKernelArg` (which transparently recurses
+// through the retype to the kernel-arg bundle), this lets a consumer
+// distinguish "kernel-arg accessed via its native rank-N indexing" from
+// "kernel-arg accessed via a single composed 1D offset over the post-
+// flatten carrier".
+static bool isPostFlattenKernelArgSource(Value source) {
+  auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
+  if (!cast || cast.getInputs().size() != 1 || cast.getOutputs().size() <= 1 ||
+      source != cast.getOutputs()[0])
+    return false;
+  auto bufOut = dyn_cast<BufferType>(source.getType());
+  return bufOut && bufOut.getShape().getDims().size() == 1;
+}
+
+// IR-mutating helper: synthesize a rank-1 kernel-arg view (same ptr,
+// placeholder dim, unit stride). Used by consumers that need a uniform
+// rank-1 surface when the access uses a single composed offset against
+// the post-flatten carrier. The constants land at the builder's
+// insertion point; downstream canonicalize/cse folds the placeholder
+// dim's `arith.constant 0` away because nothing uses it.
+static KernelArgSource flatKernelArgView(OpBuilder &builder, Location loc,
+                                         const KernelArgSource &inner) {
+  Value zero = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  Value one = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+  KernelArgSource flat;
+  flat.ptr = inner.ptr;
+  flat.dims = {zero};
+  flat.strides = {one};
+  return flat;
+}
+
+// Resolve `source` to a kernel-arg view shaped to match how the
+// access op is using the buffer: pre-flatten rank-N access against a
+// rank-N kernel-arg → rank-N view; post-flatten rank-1 access against
+// the same kernel-arg (reached through the flatten retype UCC) →
+// rank-1 view synthesized via `flatKernelArgView`. The pre-flatten
+// shorthand (single UCC carrying a rank-1 carrier) falls through the
+// rank-N branch with rank already == 1, so consumers don't have to
+// special-case it.
+static std::optional<KernelArgSource>
+resolveAccessKernelArg(OpBuilder &builder, Location loc, Value source) {
+  auto info = resolveKernelArg(source);
+  if (!info)
+    return std::nullopt;
+  if (isPostFlattenKernelArgSource(source) && info->rank() > 1)
+    return flatKernelArgView(builder, loc, *info);
   return info;
 }
 
@@ -332,22 +401,62 @@ static BoundValues collectBoundValues(Operation *anchor,
   bindLaunchDim3("$WGS", launch.getBlockSizeOperandValues(), boundValues);
 
   launch.walk([&](UnrealizedConversionCastOp cast) {
-    if (cast.getOutputs().size() != 1)
-      return;
-    Type outputType = cast.getOutputs().front().getType();
+    // Pre-flatten kernel-arg UCC: single multi-input bundle → single
+    // buffer output. The buffer carries shape syms (M, N, ...) and the
+    // inputs give us per-axis dim values.
+    if (cast.getOutputs().size() == 1) {
+      Type outputType = cast.getOutputs().front().getType();
+      if (auto buffer = dyn_cast<BufferType>(outputType)) {
+        if (auto info = resolveKernelArg(cast.getResult(0)))
+          bindShapeSymbols(buffer, *info, boundValues);
+        return;
+      }
 
-    if (auto buffer = dyn_cast<BufferType>(outputType)) {
-      if (auto info = resolveKernelArg(cast.getResult(0)))
-        bindShapeSymbols(buffer, *info, boundValues);
+      if (cast.getInputs().size() != 1)
+        return;
+      Value input = cast.getInputs().front();
+      if (std::optional<StringRef> symbol = exactSymbolName(outputType))
+        boundValues.bind(*symbol, indexCast(rewriter, anchor->getLoc(), input));
       return;
     }
 
-    if (cast.getInputs().size() != 1)
-      return;
-    Value input = cast.getInputs().front();
-    if (std::optional<StringRef> symbol = exactSymbolName(outputType))
-      boundValues.bind(*symbol, indexCast(rewriter, anchor->getLoc(), input));
+    // Post-flatten retype UCC: rank-N buffer input → (rank-1 buffer,
+    // idx<sym>, idx<sym>, ...) outputs. Each idx-typed output exposes
+    // an implicit-symbol value (kernel-arg shape dim, stride, layout
+    // param, ...) that the access ops reference symbolically in their
+    // composed offsets. Bind each one so the ambient lowering can
+    // resolve the apply.
+    if (cast.getInputs().size() == 1) {
+      for (Value output : cast.getOutputs().drop_front()) {
+        std::optional<StringRef> symbol = exactSymbolName(output.getType());
+        if (symbol)
+          boundValues.bind(*symbol,
+                           indexCast(rewriter, anchor->getLoc(), output));
+      }
+    }
   });
+
+  // Structured loop/region block arguments that carry a bare-sym `!hc.idx`
+  // type (e.g. an `hc.for_range` induction variable typed
+  // `!hc.idx<"$join0">`) are their own binding for that symbol name. The
+  // post-flatten access-offset apply leaves these as free symbols because
+  // the inner expression references the bare sym directly rather than
+  // taking the value as an explicit operand; we pick them up ambiently
+  // here. Only ancestor blocks of `anchor` qualify — a sibling for_range's
+  // induction var would shadow incorrectly and would also fail SSA
+  // dominance if a UCC against it ended up outside its defining block.
+  for (Block *block = anchor->getBlock(); block;) {
+    for (BlockArgument arg : block->getArguments()) {
+      std::optional<StringRef> symbol = exactSymbolName(arg.getType());
+      if (!symbol)
+        continue;
+      boundValues.bind(*symbol, indexCast(rewriter, anchor->getLoc(), arg));
+    }
+    Operation *parent = block->getParentOp();
+    if (!parent || parent == launch.getOperation())
+      break;
+    block = parent->getBlock();
+  }
 
   return boundValues;
 }
@@ -1554,7 +1663,8 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
       else
         return adaptor.getSource();
     }();
-    std::optional<KernelArgSource> kernelArg = resolveKernelArg(source);
+    std::optional<KernelArgSource> kernelArg =
+        resolveAccessKernelArg(rewriter, op.getLoc(), source);
     if (!kernelArg)
       return op.emitOpError(
           "expected load source to be a kernel-arg ptr ABI cast");
@@ -1676,7 +1786,7 @@ struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
     // ride as UCC inputs) or a workgroup-staged tile (its bare-tensor
     // shape is statically known).
     std::optional<KernelArgSource> kernelArg =
-        resolveKernelArg(adaptor.getSource());
+        resolveAccessKernelArg(rewriter, op.getLoc(), adaptor.getSource());
     Value workgroupPtr;
     SmallVector<int64_t> sourceStaticShape;
     if (!kernelArg) {
@@ -2007,7 +2117,7 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
   matchAndRewrite(HCStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     std::optional<KernelArgSource> kernelArg =
-        resolveKernelArg(adaptor.getDest());
+        resolveAccessKernelArg(rewriter, op.getLoc(), adaptor.getDest());
     if (!kernelArg)
       return op.emitOpError(
           "expected store destination to be a kernel-arg ptr ABI cast");
@@ -2346,6 +2456,66 @@ struct AdaptRegionlessOp : public OpConversionPattern<OpT> {
   }
 };
 
+// Resolve a `hc.generic` operand from its post-flatten `!hc.buffer<T,
+// ["?"]>` carrier (or a pre-flatten kernel-arg buffer carrier) back
+// to the underlying `!hc.ptr<global, T>` produced by the kernel-arg
+// UCC chain. Leaves non-buffer operands (`!hc.bare_vector`,
+// `!hc.bare_tensor`, workgroup ptrs, ...) untouched — those route
+// through other lowering paths.
+//
+// The pass keeps the iter bounds, the offset arrays, and the body
+// verbatim; only the operand SSA values change. The composed offset
+// expression already references kernel ABI symbols (e.g.
+// `$STRIDE_0_<buf>`); binding those symbols is the responsibility
+// of whoever later materializes the offset into SSA — `hc-lower-
+// generic` v0 fills that slot via `hc.idx_apply`'s ambient walk.
+struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCGenericOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Only the kernel-arg buffer operands transform here. Other HC
+    // operand slots (`!hc.bare_vector`, `!hc.bare_tensor`,
+    // `!hc.ptr<workgroup, T>`, `!hc.undef`) must stay in their HC form
+    // because `HCGenericOp`'s verifier rejects converted vector /
+    // memref types (`HC_GenericOperandType` is HC-only). We therefore
+    // start from the op's original operand values (which are guaranteed
+    // HC-typed) and only swap the buffer slots for their resolved ptr.
+    // Iter bounds, on the other hand, do accept the index conversion
+    // because `HC_ValueType` covers both `!hc.idx<>` and `index`; pull
+    // them from the adaptor to clean up the trailing idx-to-index cast
+    // chain in one shot.
+    SmallVector<Value> newIns(op.getIns());
+    SmallVector<Value> newOuts(op.getOuts());
+    bool changed = false;
+    auto resolve = [&](Value &v) {
+      if (!isa<BufferType>(v.getType()))
+        return;
+      auto info = resolveKernelArg(v);
+      if (!info)
+        return;
+      v = info->ptr;
+      changed = true;
+    };
+    for (Value &v : newIns)
+      resolve(v);
+    for (Value &v : newOuts)
+      resolve(v);
+    if (!changed)
+      return failure();
+
+    auto newOp = HCGenericOp::create(
+        rewriter, op.getLoc(), op.getResultTypes(), op.getIterSymsAttr(),
+        adaptor.getIterBounds(), op.getIterKindsAttr(), ValueRange(newIns),
+        ValueRange(newOuts), op.getInsOffsetsAttr(), op.getOutsOffsetsAttr());
+    rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
+                                newOp.getBody().end());
+    rewriter.replaceOp(op, newOp.getResults());
+    return success();
+  }
+};
+
 struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
   using Base::Base;
 
@@ -2474,7 +2644,7 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter, ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
-               AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
+               AdaptRegionlessOp<HCGetItemOp>, AdaptGenericOp>(converter, ctx);
 }
 
 static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
@@ -2491,16 +2661,38 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
                        scf::SCFDialect, vector::VectorDialect>();
   // HC ptr-family ops are produced by this pass (workgroup tiles) and must
   // pass through to the downstream `hc-lower-to-llvm` slot.
+  //
+  // `hc.generic` is dynamically legal: legal once `AdaptGenericOp` has
+  // resolved every kernel-arg buffer operand back to its underlying
+  // `!hc.ptr<global, T>` (the post-flatten access path expects a ptr
+  // operand + composed 1D offset for `hc-lower-generic` v0). Non-buffer
+  // operands (`!hc.bare_vector`, `!hc.bare_tensor`, workgroup ptrs)
+  // pass through unchanged. `hc.yield_predicated` is the masked-yield
+  // terminator for `hc.generic` bodies and rides the same legality
+  // slot. `hc.yield` is illegal at the launch-body root (where its
+  // historical user is `hc.for_range`, lowered to `scf.for` here) but
+  // dynamically legal inside `hc.generic` so the generic-body
+  // terminator survives the pass for `hc-lower-generic` to consume.
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,
                     HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp, HCPtrLoadPredOp,
-                    HCPtrStorePredOp>();
+                    HCPtrStorePredOp, HCYieldPredicatedOp>();
+  target.addDynamicallyLegalOp<HCGenericOp>([](HCGenericOp op) {
+    auto operandIsLegal = [](Value v) {
+      return !isa<BufferType>(v.getType()) || !resolveKernelArg(v);
+    };
+    return llvm::all_of(op.getIns(), operandIsLegal) &&
+           llvm::all_of(op.getOuts(), operandIsLegal);
+  });
+  target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
+    return isa_and_nonnull<HCGenericOp>(op->getParentOp());
+  });
   target.addIllegalOp<HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp,
                       HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
                       HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
                       HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
                       HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
                       HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp, HCYieldOp>();
+                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

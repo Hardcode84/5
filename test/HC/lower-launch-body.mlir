@@ -563,4 +563,61 @@ module {
     }
     return
   }
+
+  // Post-flatten `hc.generic` with a kernel-arg buffer ins: the outer
+  // UCC carries `(ptr, dim_M, dim_N, stride_M, stride_N) ->
+  // !hc.buffer<f32, ["M","N"], <layout>>` and a chained
+  // multi-output UCC retypes that rank-2 buffer to a rank-1 storage
+  // carrier plus idx-typed aux ($STRIDE_*, M, N). `hc-lower-launch-
+  // body` resolves the post-flatten 1D buffer back to its underlying
+  // global ptr through the chain; the offset attribute, the body, and
+  // the bare_vector outs are preserved verbatim for `hc-lower-generic`
+  // to consume next.
+  // CHECK-LABEL: func.func @post_flatten_generic_buffer_ins(
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[M:[^:]+]]: index,
+  // CHECK-SAME: %[[N:[^:]+]]: index,
+  // CHECK-SAME: %[[SM:[^:]+]]: index,
+  // CHECK-SAME: %[[SN:[^:]+]]: index
+  // CHECK: %[[OUT:.*]] = hc.generic
+  // CHECK-SAME: ins (%[[PTR]] at [{{.*}}] : !hc.ptr<global, f32>)
+  // CHECK-SAME: outs (%{{.*}} at [{{.*}}] : !hc.bare_vector<f32, ["8"]>)
+  // CHECK-NOT: !hc.buffer<f32, ["?"]>
+  func.func @post_flatten_generic_buffer_ins(%ptr: !hc.ptr<global, f32>,
+                                             %m: index, %n: index,
+                                             %sm: index, %sn: index) {
+    %c1 = arith.constant 1 : index
+    %buf2d = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"]>
+    %sym_sm = hc.const<0 : i64> : !hc.idx<"$STRIDE_0_x">
+    %sym_sn = hc.const<0 : i64> : !hc.idx<"$STRIDE_1_x">
+    %sym_m = hc.const<0 : i64> : !hc.idx<"M">
+    %sym_n = hc.const<0 : i64> : !hc.idx<"N">
+    %buf1d, %as_sm, %as_sn, %as_m, %as_n
+        = builtin.unrealized_conversion_cast %buf2d
+        : !hc.buffer<f32, ["M", "N"]>
+        to !hc.buffer<f32, ["?"]>, !hc.idx<"$STRIDE_0_x">,
+           !hc.idx<"$STRIDE_1_x">, !hc.idx<"M">, !hc.idx<"N">
+    %eight = hc.const<8 : i64> : !hc.idx<"8">
+    %one_idx = hc.const<1 : i64> : !hc.idx<"1">
+    %vshape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      %zeros = hc.vzeros shape %vshape
+          : (tuple<!hc.idx<"8">>) -> !hc.bare_vector<f32, ["8"]>
+      %res = hc.generic iter (parallel i_0 = %eight : !hc.idx<"8">,
+                              parallel i_1 = %one_idx : !hc.idx<"1">)
+          ins (%buf1d at [#hc.expr<"$STRIDE_0_x*i_0 + $STRIDE_1_x*i_1">]
+                : !hc.buffer<f32, ["?"]>)
+          outs (%zeros at [#hc.expr<"i_0 + i_1">]
+                : !hc.bare_vector<f32, ["8"]>)
+          -> (!hc.bare_vector<f32, ["8"]>) {
+        ^bb0(%arg0: f32, %arg1: f32):
+          hc.yield %arg0 : f32
+      }
+      gpu.terminator
+    }
+    return
+  }
 }

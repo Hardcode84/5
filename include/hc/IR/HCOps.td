@@ -1402,6 +1402,23 @@ def HCGenericOp : HC_Op<"generic",
     rewrites need not introduce `scf.if` shapes in the body. The body
     therefore terminates with either `hc.yield` (unconditional publish)
     or `hc.yield_predicated` (per-value mask gate).
+
+    Ambient-symbol bindings ride on `ambient_idxs` / `ambient_idx_syms`:
+    a parallel SSA-operand / name-attr pair that pins every non-iter
+    free symbol the offset expressions reference (`$STRIDE_*`, kernel-
+    arg dim syms, `$WG*` / `$WI*` / `$WGS*`, structured-loop join
+    symbols, ...) to the SSA value that holds its runtime integer at
+    the point of emission. `hc-flatten-with-layouts` is the canonical
+    populator — it walks the kernel-arg-bundle / launch-context chain
+    while every ambient sym is reachable as an HC-typed SSA value and
+    captures the binding so downstream lowerings can pass it through
+    as a real dataflow edge instead of re-discovering the resolution
+    by name. Pre-flatten emitters leave the lists empty; the lowering
+    treats absence as "fall back to ambient-context resolution",
+    matching `hc.idx_apply`'s severing form. Operand types are
+    `!hc.idx<...>` (or `index` after the launch-body type converter
+    has stripped the sym-typed payload — the symbolic name is kept on
+    `ambient_idx_syms`).
   }];
   let arguments = (ins
     StrArrayAttr:$iter_syms,
@@ -1410,6 +1427,8 @@ def HCGenericOp : HC_Op<"generic",
                        "array of `#hc<iter_kind ...>` attributes">:$iter_kinds,
     Variadic<HC_GenericOperandType>:$ins,
     Variadic<HC_GenericOperandType>:$outs,
+    Variadic<HC_SymBindingValueType>:$ambient_idxs,
+    StrArrayAttr:$ambient_idx_syms,
     TypedArrayAttrBase<
         TypedArrayAttrBase<HC_ExprAttr, "per-axis `#hc.expr<...>` array">,
         "array of per-operand per-axis `#hc.expr<...>` offset arrays"

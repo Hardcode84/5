@@ -2619,7 +2619,9 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
     auto newOp = HCGenericOp::create(
         rewriter, op.getLoc(), op.getResultTypes(), op.getIterSymsAttr(),
         adaptor.getIterBounds(), op.getIterKindsAttr(), ValueRange(newIns),
-        ValueRange(newOuts), op.getInsOffsetsAttr(), op.getOutsOffsetsAttr());
+        ValueRange(newOuts), /*ambient_idxs=*/adaptor.getAmbientIdxs(),
+        op.getAmbientIdxSymsAttr(), op.getInsOffsetsAttr(),
+        op.getOutsOffsetsAttr());
     rewriter.inlineRegionBefore(op.getBody(), newOp.getBody(),
                                 newOp.getBody().end());
     rewriter.replaceOp(op, newOp.getResults());

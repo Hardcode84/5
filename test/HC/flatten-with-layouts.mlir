@@ -332,14 +332,18 @@ func.func @padded_caller(
 // layout-less types) into a single 1D offset on the post-flatten 1D
 // operand. `[i, j]` over `bare_tensor<f32, ["M","N"]>` (no layout) goes
 // through identity row-major — `i*N + j`, ixsimpl-canonicalized to
-// `j + N*i`.
+// `j + N*i`. Flatten captures every ambient symbol in the composed
+// offset onto `hc.generic`'s `ambient_idxs` slot — here that's `N`
+// (the operand's shape dim), surfaced via the 1-to-N operand
+// expansion's trailing `!hc.idx<"N">` aux value.
 // CHECK-LABEL: @generic_composes_offsets_default_row_major
 // CHECK-SAME: %[[A:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
-// CHECK-SAME: !hc.idx<"M">, %{{[^:]+}}: !hc.idx<"N">,
+// CHECK-SAME: !hc.idx<"M">, %[[N:[^:]+]]: !hc.idx<"N">,
 // CHECK-SAME: %[[C:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
 // CHECK: hc.generic
 // CHECK-SAME: ins (%[[A]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
 // CHECK-SAME: outs (%[[C]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+// CHECK-SAME: ambient (%[[N]] as "N" : !hc.idx<"N">)
 func.func @generic_composes_offsets_default_row_major(
     %m: index, %n: index,
     %a: !hc.bare_tensor<f32, ["M", "N"]>,
@@ -366,11 +370,15 @@ func.func @generic_composes_offsets_default_row_major(
 // rank-2 row-major `i0 * d1 + i1` over `[M, N]` indexed `[i, j]`
 // canonicalizes to `j + N*i` — same destination as the layout-less
 // case, but reached via the substitution path rather than the
-// identity-row-major fallback.
+// identity-row-major fallback. `ambient` captures the dim sym
+// surfaced by the operand's expansion the same way the layout-less
+// case does.
 // CHECK-LABEL: @generic_composes_offsets_layout
 // CHECK-SAME: %[[B:[^:]+]]: !hc.bare_tensor<f32, ["M*N"]>
+// CHECK-SAME: !hc.idx<"M">, %[[N:[^:]+]]: !hc.idx<"N">
 // CHECK: hc.generic
 // CHECK-SAME: ins (%[[B]] at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+// CHECK-SAME: ambient (%[[N]] as "N" : !hc.idx<"N">)
 func.func @generic_composes_offsets_layout(
     %m: index, %n: index,
     %a: !hc.bare_tensor<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
@@ -393,11 +401,14 @@ func.func @generic_composes_offsets_layout(
 
 // Ptr-typed operands ride on a single 1D address by op contract — the
 // per-axis array is already length 1 pre-flatten. The composer leaves
-// it untouched while the operand passes through the converter.
+// it untouched while the operand passes through the converter. The
+// ptr operand contributes no shape aux, but the bare_tensor input
+// still surfaces `N` for the ambient slot.
 // CHECK-LABEL: @generic_ptr_out_passthrough
 // CHECK: hc.generic
 // CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
 // CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+// CHECK-SAME: ambient (%{{[^ ]+}} as "N" : !hc.idx<"N">)
 func.func @generic_ptr_out_passthrough(
     %m: index, %n: index,
     %a: !hc.bare_tensor<f32, ["M", "N"]>,

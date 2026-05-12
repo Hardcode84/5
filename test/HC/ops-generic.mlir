@@ -345,3 +345,34 @@ func.func @yield_predicated_opaque_ptr(%v: i32, %n: index,
   }
   return
 }
+
+// `ambient` clause carries the SSA edge for every non-iter symbol the
+// offset expressions reference. Producer passes (canonically
+// `hc-flatten-with-layouts`) populate it while ambient symbols are
+// still reachable as HC-typed SSA — the operand list is a real
+// dataflow edge, not a name lookup, so the binding survives the
+// downstream type converter strip without needing a name marker on
+// the consumer. Round-trips both with `!hc.idx<sym>` (pre-strip) and
+// `index` (post-strip) operand types. The `as` keyword mirrors
+// `hc.idx_apply`'s textual surface.
+// CHECK-LABEL: func.func @ambient_clause_round_trip
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i = %{{[^ ]+}} : index)
+// CHECK-SAME: ambient (%[[STRIDE:[^ ]+]] as "$STRIDE_0" : !hc.idx<"$STRIDE_0">, %[[WG:[^ ]+]] as "$WG0" : index)
+func.func @ambient_clause_round_trip(%n: index,
+                                     %stride: !hc.idx<"$STRIDE_0">,
+                                     %wg: index,
+                                     %dst: !hc.ptr<global, f32>) {
+  hc.generic
+      iter (parallel i = %n : index)
+      ins ()
+      outs (%dst at [#hc.expr<"$STRIDE_0*i + $WG0">] : !hc.ptr<global, f32>)
+      ambient (%stride as "$STRIDE_0" : !hc.idx<"$STRIDE_0">,
+               %wg as "$WG0" : index)
+      -> () {
+  ^bb0(%dv: f32):
+    %c = arith.constant 0.0 : f32
+    hc.yield %c : f32
+  }
+  return
+}

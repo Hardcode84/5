@@ -245,7 +245,8 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{outTy}, iterSyms,
       ValueRange(iterBoundsArr), iterKinds, ValueRange(insArr),
-      ValueRange(outsArr), insOffsets, outsOffsets);
+      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   // Body: %p = lhs * rhs (with astype-promotion to the accumulator
   // element type), %s = acc + %p, yield %s.
@@ -363,7 +364,8 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{outTy}, iterSyms,
       ValueRange(iterBoundsAll), iterKinds, ValueRange(insArr),
-      ValueRange(outsArr), insOffsets, outsOffsets);
+      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   Block *body = new Block();
   BlockArgument vIn = body->addArgument(elem, loc);

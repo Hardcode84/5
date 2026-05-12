@@ -1556,3 +1556,50 @@ module {
     return
   }
 }
+
+// -----
+
+// `ambient_idxs` is a parallel list with `ambient_idx_syms`; the
+// verifier catches a count mismatch. The textual surface only emits
+// the clause when populated, so building this case requires the raw
+// attribute form.
+// CHECK: error: 'hc.generic' op ambient_idxs count 1 != ambient_idx_syms count 0
+module {
+  func.func @bad(%n: index, %stride: !hc.idx<"$STRIDE_0">,
+                 %dst: !hc.ptr<global, f32>) {
+    "hc.generic"(%n, %dst, %stride) <{
+      iter_syms = ["i"],
+      iter_kinds = [#hc<iter_kind parallel>],
+      ambient_idx_syms = [],
+      ins_offsets = [],
+      outs_offsets = [[#hc.expr<"i">]],
+      operandSegmentSizes = array<i32: 1, 0, 1, 1>
+    }> ({
+    ^bb0(%dv: f32):
+      hc.yield %dv : f32
+    }) : (index, !hc.ptr<global, f32>, !hc.idx<"$STRIDE_0">) -> ()
+    return
+  }
+}
+
+// -----
+
+// Operand type pins a different sym than `ambient_idx_syms` says —
+// the verifier compares the bare-sym expression on `!hc.idx<...>`
+// against the entry in the attr.
+// CHECK: error: 'hc.generic' op ambient sym '$WG0' operand type does not pin the same bare symbol
+module {
+  func.func @bad(%n: index, %stride: !hc.idx<"$STRIDE_0">,
+                 %dst: !hc.ptr<global, f32>) {
+    hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%dst at [#hc.expr<"i + $WG0">] : !hc.ptr<global, f32>)
+        ambient (%stride as "$WG0" : !hc.idx<"$STRIDE_0">)
+        -> () {
+    ^bb0(%dv: f32):
+      hc.yield %dv : f32
+    }
+    return
+  }
+}

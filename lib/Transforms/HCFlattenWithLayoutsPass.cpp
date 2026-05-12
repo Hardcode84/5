@@ -790,6 +790,78 @@ static void noteOperandBindings(Type preFlattenType, ValueRange operandRange,
     bindings.try_emplace(name, value);
 }
 
+// Identify a type that pins a single bare symbol — used to recognize
+// `!hc.idx<"$WG0">`-style block args / SSAs whose own type IS the
+// binding for one name. Composite expressions (`i + 1`, `i * stride`)
+// are not their own binding; the value-as-binding shortcut only
+// applies when the type's symbol set is exactly `{name}` and the
+// expression is that symbol leaf. Returns empty `StringRef` if the
+// type doesn't qualify.
+static StringRef typePinsBareSymbol(sym::Store &store, Type type) {
+  auto idxType = dyn_cast<IdxType>(type);
+  if (!idxType)
+    return {};
+  ExprAttr expr = idxType.getExpr();
+  if (!expr)
+    return {};
+  StringRef onlyName;
+  bool unique = true;
+  sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+    if (onlyName.empty())
+      onlyName = name;
+    else if (onlyName != name)
+      unique = false;
+  });
+  if (!unique || onlyName.empty())
+    return {};
+  auto pinned = sym::composeExprSym(store, onlyName);
+  if (failed(pinned))
+    return {};
+  if (pinned->raw() != expr.getValue().raw())
+    return {};
+  return onlyName;
+}
+
+// Walk enclosing region/loop block arguments and operand-result SSAs
+// produced by ancestor ops, binding every `!hc.idx<"$name">` value we
+// find to its bare symbol name. Canonical sources: `hc.for_range`'s
+// induction var (typed `!hc.idx<"$joinN">`), `gpu.launch`'s block
+// args ($WG*, $WI*, $WGS*), buffer-from-ptr UCC retype aux outputs
+// ($STRIDE_*, dim syms), and other `hc.idx_apply` results that
+// happen to land in scope.
+//
+// `bindings.try_emplace` preserves the first binding wins rule —
+// callers that pre-seed the map (with op-local 1-to-N operand
+// expansions) keep precedence over ancestor scans.
+static void collectAncestorIdxBindings(sym::Store &store, Operation *op,
+                                       llvm::StringMap<Value> &bindings) {
+  for (Block *block = op->getBlock(); block;) {
+    for (BlockArgument arg : block->getArguments()) {
+      StringRef name = typePinsBareSymbol(store, arg.getType());
+      if (!name.empty())
+        bindings.try_emplace(name, arg);
+    }
+    // Also pick up `!hc.idx<sym>` results from ops preceding `op` in
+    // its own block — the kernel-arg-bundle retype UCC plants these,
+    // and they're the SSA value for `$STRIDE_*` / dim syms in scope
+    // for any op that comes after it. Pre-`op` SSAs in ancestor
+    // blocks were already covered by traversing parent->block->ops.
+    for (Operation &prev : *block) {
+      if (&prev == op)
+        break;
+      for (Value res : prev.getResults()) {
+        StringRef name = typePinsBareSymbol(store, res.getType());
+        if (!name.empty())
+          bindings.try_emplace(name, res);
+      }
+    }
+    Operation *parent = block->getParentOp();
+    if (!parent)
+      break;
+    block = parent->getBlock();
+  }
+}
+
 // Resolve the trailing aux value for each implicit sym a result type
 // carries. The first matching operand expansion wins; missing
 // names fall through to an empty-binding `hc.idx_apply` sourced
@@ -1551,6 +1623,75 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
     for (auto [orig, range] : llvm::zip_equal(op.getOuts(), adaptor.getOuts()))
       noteOperandBindings(orig.getType(), range, bindings);
 
+    // Capture ambient sym → SSA bindings now, while the kernel-arg
+    // bundle UCC chain, gpu.launch block args, and structured-loop
+    // induction vars are all still HC-typed and reachable. Walking
+    // ancestor blocks here also picks up `$joinN` from `hc.for_range`'s
+    // IV — `hc-lower-launch-body` will later rewrite for_range to
+    // scf.for and strip the `!hc.idx<sym>` payload off the IV, but
+    // by then `ambient_idxs` already holds the SSA edge and the
+    // launch-body type converter only changes the operand's type
+    // (the sym name lives on `ambient_idx_syms`).
+    auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+    collectAncestorIdxBindings(store, op, bindings);
+
+    // Collect every free symbol that the composed offset expressions
+    // reference, minus the iter syms (those are the per-iteration
+    // axes, scoped to the hc.generic body — they remain free and are
+    // substituted per-lane by `hc-lower-generic`).
+    llvm::StringSet<> iterSymSet;
+    for (Attribute s : op.getIterSymsAttr())
+      iterSymSet.insert(cast<StringAttr>(s).getValue());
+    llvm::StringSet<> ambientNeeded;
+    auto walkOffsets = [&](ArrayRef<Attribute> perOperandAttrs) {
+      for (Attribute a : perOperandAttrs) {
+        auto perOperand = dyn_cast<ArrayAttr>(a);
+        if (!perOperand)
+          continue;
+        for (Attribute axisAttr : perOperand) {
+          auto expr = dyn_cast<ExprAttr>(axisAttr);
+          if (!expr)
+            continue;
+          sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
+            if (!iterSymSet.contains(name))
+              ambientNeeded.insert(name);
+          });
+        }
+      }
+    };
+    walkOffsets(newInsOffsets);
+    walkOffsets(newOutsOffsets);
+    // Carry over any ambient bindings the source op already had — the
+    // pre-flatten emitters may have left them empty, but if a prior
+    // pass populated them we don't want to drop the SSA edge silently.
+    for (auto [val, symAttr] :
+         llvm::zip_equal(adaptor.getAmbientIdxs(),
+                         op.getAmbientIdxSymsAttr().getAsRange<StringAttr>())) {
+      // adaptor handed us a per-operand value range — pick the first
+      // entry (the operand itself; trailing aux belongs to its own
+      // expansion).
+      if (val.empty())
+        continue;
+      bindings.try_emplace(symAttr.getValue(), val.front());
+      ambientNeeded.insert(symAttr.getValue());
+    }
+    // Lex-sort for deterministic operand order. Pin bindings whose
+    // SSA we resolved; leave the rest to ambient-context resolution
+    // downstream (the symbol stays free in the offset expression and
+    // `hc.idx_apply`'s severing form handles it).
+    SmallVector<StringRef> ambientNames(ambientNeeded.keys().begin(),
+                                        ambientNeeded.keys().end());
+    llvm::sort(ambientNames);
+    SmallVector<Value> ambientIdxsVec;
+    SmallVector<Attribute> ambientSymsVec;
+    for (StringRef name : ambientNames) {
+      auto it = bindings.find(name);
+      if (it == bindings.end())
+        continue;
+      ambientIdxsVec.push_back(it->second);
+      ambientSymsVec.push_back(rewriter.getStringAttr(name));
+    }
+
     // Convert result types via the 1-to-N converter. The new op only
     // carries the leading flat type per result; trailing aux values
     // are SSA-generated alongside.
@@ -1591,7 +1732,9 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
     auto newOp = HCGenericOp::create(
         rewriter, op.getLoc(), flatResultTypes, op.getIterSymsAttr(),
         ValueRange(iterBounds), op.getIterKindsAttr(), ValueRange(flatIns),
-        ValueRange(flatOuts), ArrayAttr::get(ctx, newInsOffsets),
+        ValueRange(flatOuts), /*ambient_idxs=*/ValueRange(ambientIdxsVec),
+        rewriter.getArrayAttr(ambientSymsVec),
+        ArrayAttr::get(ctx, newInsOffsets),
         ArrayAttr::get(ctx, newOutsOffsets));
     // Carry over any extra discardable attributes (e.g. location-name
     // hints) the original op picked up before we got here. The named
@@ -1600,6 +1743,7 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
     StringSet<> handled = {
         op.getIterSymsAttrName().getValue(),
         op.getIterKindsAttrName().getValue(),
+        op.getAmbientIdxSymsAttrName().getValue(),
         op.getInsOffsetsAttrName().getValue(),
         op.getOutsOffsetsAttrName().getValue(),
         op.getOperandSegmentSizesAttrName().getValue(),

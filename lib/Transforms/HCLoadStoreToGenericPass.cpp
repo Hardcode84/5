@@ -347,10 +347,15 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 
   SmallVector<Value> insArr{source};
   SmallVector<Value> outsArr{initOut};
+  // No ambient sym SSA captured at this surface; the offset attrs still
+  // carry the free names and ambient-context resolution handles them.
+  // `hc-flatten-with-layouts` is where we bind them as a real dataflow
+  // edge — see HCGenericOp's `ambient_idxs` doc.
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{resultTy}, common.iterSymsAttr,
       ValueRange(common.iterBounds), common.iterKindsAttr, ValueRange(insArr),
-      ValueRange(outsArr), insOffsets, outsOffsets);
+      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   Block *body = new Block();
   BlockArgument bv = body->addArgument(srcElem, loc);
@@ -441,7 +446,8 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{}, common.iterSymsAttr,
       ValueRange(common.iterBounds), common.iterKindsAttr, ValueRange(insArr),
-      ValueRange(outsArr), insOffsets, outsOffsets);
+      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   Block *body = new Block();
   BlockArgument sv = body->addArgument(srcElem, loc);

@@ -2176,6 +2176,62 @@ static void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
 
 } // namespace
 
+// Optional clause `ambient (%a as "name" : type, %b as "name" : type, ...)`
+// where the operand type is `!hc.idx<...>` (carrying the sym leaf as
+// its expression) or `index` (post-launch-body type strip). Empty /
+// missing clause means the op uses ambient-context resolution (the
+// severing form of `hc.idx_apply`'s contract). The clause prints
+// only when populated. The `as` keyword separates the SSA value
+// from its sym-name attribute the same way `hc.idx_apply`'s textual
+// surface does — readers don't have to learn a second convention
+// for the same data shape.
+static ParseResult parseGenericAmbientClause(
+    OpAsmParser &parser, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
+    SmallVectorImpl<Type> &types, SmallVectorImpl<Attribute> &syms) {
+  if (failed(parser.parseOptionalKeyword("ambient")))
+    return success();
+  if (parser.parseLParen())
+    return failure();
+  if (succeeded(parser.parseOptionalRParen()))
+    return success();
+  auto parseOne = [&]() -> ParseResult {
+    OpAsmParser::UnresolvedOperand op;
+    std::string symName;
+    Type ty;
+    // `parseString` reads the bare quoted string without trying to
+    // attach a type suffix the way `parseAttribute(StringAttr&)` does
+    // (which would consume the trailing `: !hc.idx<...>` as the
+    // attribute's value type).
+    if (parser.parseOperand(op) || parser.parseKeyword("as") ||
+        parser.parseString(&symName) || parser.parseColonType(ty))
+      return failure();
+    ops.push_back(op);
+    types.push_back(ty);
+    syms.push_back(parser.getBuilder().getStringAttr(symName));
+    return success();
+  };
+  if (parseOne())
+    return failure();
+  while (succeeded(parser.parseOptionalComma()))
+    if (parseOne())
+      return failure();
+  if (parser.parseRParen())
+    return failure();
+  // Defensive duplicate check — the verifier catches this too, but a
+  // parser-time error gives a tighter location.
+  llvm::StringSet<> seen;
+  for (Attribute a : syms) {
+    auto s = cast<StringAttr>(a).getValue();
+    if (s.empty())
+      return parser.emitError(parser.getCurrentLocation())
+             << "ambient sym name must be non-empty";
+    if (!seen.insert(s).second)
+      return parser.emitError(parser.getCurrentLocation())
+             << "duplicate ambient sym '" << s << "'";
+  }
+  return success();
+}
+
 ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
   SmallVector<Attribute> iterSyms;
   SmallVector<Attribute> iterKinds;
@@ -2199,6 +2255,12 @@ ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
                                 outsTypes, outsOffsets))
     return failure();
 
+  SmallVector<OpAsmParser::UnresolvedOperand> ambientOps;
+  SmallVector<Type> ambientTypes;
+  SmallVector<Attribute> ambientSyms;
+  if (parseGenericAmbientClause(parser, ambientOps, ambientTypes, ambientSyms))
+    return failure();
+
   SmallVector<Type> resultTypes;
   if (parser.parseArrow() || parser.parseLParen())
     return failure();
@@ -2216,12 +2278,14 @@ ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
 
   // `resolveOperands` appends to `result.operands` in the call order; the
-  // ODS-declared operand groups (iter_bounds, ins, outs) must arrive in the
-  // same order so `operandSegmentSizes` reads them back consistently.
+  // ODS-declared operand groups (iter_bounds, ins, outs, ambient_idxs)
+  // must arrive in the same order so `operandSegmentSizes` reads them
+  // back consistently.
   auto loc = parser.getCurrentLocation();
   if (parser.resolveOperands(boundsOps, boundsTypes, loc, result.operands) ||
       parser.resolveOperands(insOps, insTypes, loc, result.operands) ||
-      parser.resolveOperands(outsOps, outsTypes, loc, result.operands))
+      parser.resolveOperands(outsOps, outsTypes, loc, result.operands) ||
+      parser.resolveOperands(ambientOps, ambientTypes, loc, result.operands))
     return failure();
 
   MLIRContext *ctx = parser.getContext();
@@ -2230,6 +2294,8 @@ ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
                       ArrayAttr::get(ctx, iterSyms));
   result.addAttribute(getIterKindsAttrName(result.name),
                       ArrayAttr::get(ctx, iterKinds));
+  result.addAttribute(getAmbientIdxSymsAttrName(result.name),
+                      ArrayAttr::get(ctx, ambientSyms));
   result.addAttribute(getInsOffsetsAttrName(result.name),
                       ArrayAttr::get(ctx, insOffsets));
   result.addAttribute(getOutsOffsetsAttrName(result.name),
@@ -2238,7 +2304,8 @@ ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
       getOperandSegmentSizesAttrName(result.name),
       builder.getDenseI32ArrayAttr({static_cast<int32_t>(boundsOps.size()),
                                     static_cast<int32_t>(insOps.size()),
-                                    static_cast<int32_t>(outsOps.size())}));
+                                    static_cast<int32_t>(outsOps.size()),
+                                    static_cast<int32_t>(ambientOps.size())}));
   result.addTypes(resultTypes);
   return success();
 }
@@ -2259,6 +2326,21 @@ void HCGenericOp::print(OpAsmPrinter &p) {
   printGenericOperandClause(p, "ins", getIns(), getInsOffsetsAttr());
   printGenericOperandClause(p, "outs", getOuts(), getOutsOffsetsAttr());
 
+  // Ambient SSA-bound symbol clause prints only when populated. Empty
+  // means "fall back to ambient-context resolution" downstream.
+  OperandRange ambient = getAmbientIdxs();
+  if (!ambient.empty()) {
+    p << " ambient (";
+    llvm::interleaveComma(
+        llvm::zip_equal(ambient,
+                        getAmbientIdxSymsAttr().getAsRange<StringAttr>()),
+        p, [&](auto pair) {
+          auto [val, sym] = pair;
+          p << val << " as " << sym << " : " << val.getType();
+        });
+    p << ")";
+  }
+
   p << " -> (";
   llvm::interleaveComma(getResultTypes(), p, [&](Type t) { p.printType(t); });
   p << ")";
@@ -2267,6 +2349,7 @@ void HCGenericOp::print(OpAsmPrinter &p) {
       (*this)->getAttrs(),
       /*elidedAttrs=*/{getIterSymsAttrName(), getIterKindsAttrName(),
                        getInsOffsetsAttrName(), getOutsOffsetsAttrName(),
+                       getAmbientIdxSymsAttrName(),
                        getOperandSegmentSizesAttrName()});
   p << ' ';
   p.printRegion(getBody(), /*printEntryBlockArgs=*/true);
@@ -2307,6 +2390,44 @@ LogicalResult HCGenericOp::verify() {
   if (outsOffsets.size() != getOuts().size())
     return emitOpError("outs_offsets count ")
            << outsOffsets.size() << " != outs count " << getOuts().size();
+
+  OperandRange ambientIdxs = getAmbientIdxs();
+  ArrayAttr ambientSyms = getAmbientIdxSymsAttr();
+  if (ambientIdxs.size() != ambientSyms.size())
+    return emitOpError("ambient_idxs count ")
+           << ambientIdxs.size() << " != ambient_idx_syms count "
+           << ambientSyms.size();
+  // Ambient names must be non-empty and unique; if the operand still
+  // carries its `!hc.idx<sym>` payload, its expression must be the bare
+  // sym leaf matching the attr entry. After the launch-body type
+  // converter has stripped to `index`, the attr is the only sym record.
+  {
+    llvm::StringSet<> seen;
+    for (auto [val, symAttr] :
+         llvm::zip_equal(ambientIdxs, ambientSyms.getAsRange<StringAttr>())) {
+      StringRef name = symAttr.getValue();
+      if (name.empty())
+        return emitOpError("ambient sym name must be non-empty");
+      if (!seen.insert(name).second)
+        return emitOpError("duplicate ambient sym '") << name << "'";
+      if (auto idxTy = dyn_cast<IdxType>(val.getType())) {
+        if (ExprAttr expr = idxTy.getExpr()) {
+          StringRef onlyName;
+          bool unique = true;
+          sym::walkSymbolNames(expr.getValue(), [&](StringRef n) {
+            if (onlyName.empty())
+              onlyName = n;
+            else if (onlyName != n)
+              unique = false;
+          });
+          if (!unique || onlyName.empty() || onlyName != name)
+            return emitOpError("ambient sym '")
+                   << name
+                   << "' operand type does not pin the same bare symbol";
+        }
+      }
+    }
+  }
 
   if (getOuts().empty())
     return emitOpError("must declare at least one output");

@@ -634,14 +634,41 @@ static ExprAttr getOperandOffset(ArrayAttr arrayAttr, size_t idx) {
   return cast<ExprAttr>(cast<ArrayAttr>(arrayAttr[idx])[0]);
 }
 
+// Seed a sym-name → SSA binding map from the op's captured ambient
+// bindings. `hc-flatten-with-layouts` walks the kernel-arg bundle /
+// launch context while every ambient sym is reachable as an HC-typed
+// SSA and stamps the (sym, value) pairs onto `ambient_idxs` /
+// `ambient_idx_syms`. Lower-generic consumes them through this seed
+// so the per-lane offset emission inherits the dataflow edge instead
+// of re-discovering each ambient name via an ancestor walk at planting
+// time. The map's later writes (iter syms, partition coords) override
+// any name they collide with — iter / partition bindings are scoped
+// to the per-lane scf body and take precedence over ambient SSAs
+// that happen to share a name with a body sym.
+static void seedAmbientScope(HCGenericOp op, llvm::StringMap<Value> &scope) {
+  ArrayAttr syms = op.getAmbientIdxSymsAttr();
+  OperandRange vals = op.getAmbientIdxs();
+  for (auto [val, symAttr] :
+       llvm::zip_equal(vals, syms.getAsRange<StringAttr>()))
+    scope.try_emplace(symAttr.getValue(), val);
+}
+
 // Materialize one offset expression as `index`-typed SSA. Filters
 // the loop-scope binding map down to the symbols that actually
 // occur in the offset expression — `hc.idx_apply`'s verifier
 // requires every listed symbol to be free in the expression — then
 // emits the apply and casts the resulting `!hc.idx<expr>` to
-// `index` for the consumer's `hc.ptr_offset`. Symbols not in the
-// loop-scope map (kernel ABI shape dims, stride params, etc.) stay
-// ambient and are bound by the launch-body lowering's launch-walk.
+// `index` for the consumer's `hc.ptr_offset`.
+//
+// `loopScope` is seeded with the op's `ambient_idxs` (kernel-arg
+// dim / stride syms, launch geometry, structured-loop join syms —
+// captured at flatten time) plus the per-iteration loop induction
+// vars and partition coordinates. Any symbol the caller didn't pre-
+// bind stays free in the planted apply and falls through to ambient-
+// context resolution downstream; today the only such names are the
+// ones flatten couldn't locate in scope, which the kernel-arg-bundle
+// resolver still handles. Once every emission path is ambient-bound
+// the fallback becomes unreachable.
 static Value emitOffset(OpBuilder &builder, Location loc, ExprAttr offsetExpr,
                         const llvm::StringMap<Value> &loopScope) {
   llvm::StringSet<> freeSyms;
@@ -1057,6 +1084,7 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
 
   if (parIdx.empty()) {
     llvm::StringMap<Value> scope;
+    seedAmbientScope(op, scope);
     return buildPerParallel(builder, scope);
   }
 
@@ -1076,6 +1104,7 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
   scf::ParallelOp::create(builder, loc, lowers, uppers, steps,
                           [&](OpBuilder &b, Location, ValueRange ivs) {
                             llvm::StringMap<Value> scope;
+                            seedAmbientScope(op, scope);
                             for (auto [k, pi] : llvm::enumerate(parIdx))
                               scope[axes[pi].name] = ivs[k];
                             bodyStatus = buildPerParallel(b, scope);
@@ -1188,6 +1217,7 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
       }
 
       llvm::StringMap<Value> scope;
+      seedAmbientScope(op, scope);
       for (auto [ax, coord] : llvm::zip(axes, coords))
         scope[ax.name] = coord;
 
@@ -1394,6 +1424,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   }
 
   llvm::StringMap<Value> scope = buildZeroIterScope(builder, loc, axes);
+  seedAmbientScope(op, scope);
   SmallVector<SmallVector<Value>> insLanes =
       emitInsLoadsLaned(builder, op, axes, order, p, scope, store);
 

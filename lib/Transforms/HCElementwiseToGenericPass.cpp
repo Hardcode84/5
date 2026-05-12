@@ -209,7 +209,8 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{spec.resultTy}, iter.symsAttr,
       ValueRange(iterBounds), iter.kindsAttr, ValueRange(insVals),
-      ValueRange(outsVals), insOffsets, outsOffsets);
+      ValueRange(outsVals), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   Block *body = new Block();
   SmallVector<Value> insArgs;

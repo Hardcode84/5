@@ -156,4 +156,97 @@ module {
        : (index, !hc.idx<"K">) -> !hc.pred<"i < K">
     hc.return
   }
+
+  // `hc.workitem_region` with results: the verifier accepts the
+  // collective-lift relationship between the yield and the region
+  // result. Both the pre-flatten "append suffix dims" form and the
+  // post-flatten "storage equals yield_storage * product(suffix)"
+  // form must round-trip cleanly so the verifier survives both
+  // sides of `hc-flatten-with-layouts`.
+
+  // CHECK: hc.func @collective_lift_preflatten_vector
+  // CHECK: hc.workitem_region
+  // CHECK-SAME: -> (!hc.bare_vector<f32, ["8", "1", "32", "1"]>)
+  // CHECK: hc.yield {{.*}} : !hc.bare_vector<f32, ["8", "1"]>
+  hc.func @collective_lift_preflatten_vector(
+      %lane: !hc.bare_vector<f32, ["8", "1"]>) {
+    %r = hc.workitem_region
+        -> (!hc.bare_vector<f32, ["8", "1", "32", "1"]>) {
+    ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                           subgroup_size = #hc.expr<"32">>):
+      hc.yield %lane : !hc.bare_vector<f32, ["8", "1"]>
+    }
+    hc.return
+  }
+
+  // CHECK: hc.func @collective_lift_postflatten_vector
+  // CHECK: hc.workitem_region
+  // CHECK-SAME: -> (!hc.bare_vector<f32, ["256"]>)
+  // CHECK: hc.yield {{.*}} : !hc.bare_vector<f32, ["8"]>
+  hc.func @collective_lift_postflatten_vector(
+      %lane: !hc.bare_vector<f32, ["8"]>) {
+    %r = hc.workitem_region -> (!hc.bare_vector<f32, ["256"]>) {
+    ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                           subgroup_size = #hc.expr<"32">>):
+      hc.yield %lane : !hc.bare_vector<f32, ["8"]>
+    }
+    hc.return
+  }
+
+  // Symbolic post-flatten storage: `S * 32 * 1` canonicalizes to `32*S`
+  // through the ixsimpl store, and the verifier compares the lift's
+  // hash-consed handle against the result's storage handle.
+  // CHECK: hc.func @collective_lift_postflatten_symbolic
+  // CHECK: hc.workitem_region
+  // CHECK-SAME: -> (!hc.bare_vector<f32, ["32*S"]>)
+  // CHECK: hc.yield {{.*}} : !hc.bare_vector<f32, ["S"]>
+  hc.func @collective_lift_postflatten_symbolic(
+      %lane: !hc.bare_vector<f32, ["S"]>) {
+    %r = hc.workitem_region -> (!hc.bare_vector<f32, ["32*S"]>) {
+    ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                           subgroup_size = #hc.expr<"32">>):
+      hc.yield %lane : !hc.bare_vector<f32, ["S"]>
+    }
+    hc.return
+  }
+
+  // Tuple yields lift element-wise both pre- and post-flatten; the
+  // verifier walks the tuple recursively in both regimes.
+  // CHECK: hc.func @collective_lift_postflatten_tuple
+  // CHECK: hc.workitem_region
+  // CHECK-SAME: -> (tuple<!hc.bare_vector<f32, ["256"]>, !hc.bare_vector<!hc.pred, ["256"]>>)
+  hc.func @collective_lift_postflatten_tuple(
+      %data: !hc.bare_vector<f32, ["8"]>,
+      %mask: !hc.bare_vector<!hc.pred, ["8"]>) {
+    %tup = hc.tuple(%data, %mask)
+        : (!hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>)
+        -> tuple<!hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>>
+    %r = hc.workitem_region
+        -> (tuple<!hc.bare_vector<f32, ["256"]>,
+                  !hc.bare_vector<!hc.pred, ["256"]>>) {
+    ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                           subgroup_size = #hc.expr<"32">>):
+      hc.yield %tup
+          : tuple<!hc.bare_vector<f32, ["8"]>,
+                  !hc.bare_vector<!hc.pred, ["8"]>>
+    }
+    hc.return
+  }
+
+  // `hc.subgroup_region` runs the same lift logic; the suffix is the
+  // workgroup-tile-size divided by the subgroup_size, so for a
+  // group_shape of [32, 1] with subgroup_size 32 the suffix is `[1]`
+  // and post-flatten storage equals the yield storage.
+  // CHECK: hc.func @collective_lift_subgroup_postflatten
+  // CHECK: hc.subgroup_region
+  // CHECK-SAME: -> (!hc.bare_vector<f32, ["8"]>)
+  hc.func @collective_lift_subgroup_postflatten(
+      %lane: !hc.bare_vector<f32, ["8"]>) {
+    %r = hc.subgroup_region -> (!hc.bare_vector<f32, ["8"]>) {
+    ^bb0(%sg: !hc.subgroup<group_shape = #hc.shape<["32", "1"]>,
+                           subgroup_size = #hc.expr<"32">>):
+      hc.yield %lane : !hc.bare_vector<f32, ["8"]>
+    }
+    hc.return
+  }
 }

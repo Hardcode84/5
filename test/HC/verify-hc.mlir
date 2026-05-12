@@ -870,6 +870,23 @@ hc.kernel @bad {
 
 // -----
 
+// Post-flatten lift compares yield storage * product(suffix) against
+// the result storage; a wrong product fails verification. Here the
+// suffix is `[32, 1]` so the only legal post-flatten result storage
+// for a yield of `["8"]` is `["256"]`; `["255"]` differs and gets
+// caught.
+// CHECK: error: 'hc.workitem_region' op body yield[0] type '!hc.bare_vector<f32, ["8"]>' does not match result[0] type '!hc.bare_vector<f32, ["255"]>'
+hc.func @bad(%lane: !hc.bare_vector<f32, ["8"]>) {
+  %r = hc.workitem_region -> (!hc.bare_vector<f32, ["255"]>) {
+  ^bb0(%wi: !hc.workitem<group_shape = #hc.shape<["32", "1"]>,
+                         subgroup_size = #hc.expr<"32">>):
+    hc.yield %lane : !hc.bare_vector<f32, ["8"]>
+  }
+  hc.return
+}
+
+// -----
+
 // Same verifier runs on `hc.subgroup_region`. Arity-zero yield is a
 // separate case from type-mismatch so a future divergence between
 // the two region kinds fails here, not silently passes.

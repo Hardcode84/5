@@ -1076,6 +1076,133 @@ static Type collectiveLiftedType(Type yieldedType, ArrayRef<Attribute> suffix) {
   return {};
 }
 
+// Multiply the per-axis suffix dims into a single `#hc.expr` product
+// via the dialect-owned ixsimpl store. Empty suffix is identity (`1`).
+// Caller's responsibility: each entry must be an `ExprAttr` (the
+// `collectiveSuffix` family already enforces this when it returns a
+// non-empty list, so any non-`ExprAttr` here means a misuse).
+static FailureOr<ExprAttr> composeSuffixProduct(MLIRContext *ctx,
+                                                ArrayRef<Attribute> suffix) {
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  if (suffix.empty()) {
+    auto one = sym::composeExprInt(store, 1);
+    if (failed(one))
+      return failure();
+    return ExprAttr::get(ctx, *one);
+  }
+  auto first = dyn_cast<ExprAttr>(suffix.front());
+  if (!first)
+    return failure();
+  sym::ExprHandle product = first.getValue();
+  for (Attribute dim : suffix.drop_front()) {
+    auto next = dyn_cast<ExprAttr>(dim);
+    if (!next)
+      return failure();
+    auto handle = sym::composeExprBinary(store, product, sym::ExprBinaryOp::Mul,
+                                         next.getValue());
+    if (failed(handle))
+      return failure();
+    product = *handle;
+  }
+  return ExprAttr::get(ctx, product);
+}
+
+// Pull the single-entry storage `#hc.expr` off a 1D shaped type the
+// flatten converter would have produced (no layout, single-entry
+// `ExprAttr` shape). Failure means the type isn't in the post-flatten
+// form and the caller should not try the storage-product compare.
+static FailureOr<ExprAttr> postFlattenStorageExpr(Type type) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  if (!shaped)
+    return failure();
+  if (shaped.getSymbolicLayout())
+    return failure();
+  ShapeAttr shape = shaped.getSymbolicShape();
+  if (!shape)
+    return failure();
+  ArrayRef<Attribute> dims = shape.getDims();
+  if (dims.size() != 1)
+    return failure();
+  auto expr = dyn_cast<ExprAttr>(dims.front());
+  if (!expr)
+    return failure();
+  return expr;
+}
+
+// Match the post-flatten lift relationship `result_storage = yield_storage *
+// product(suffix)` structurally via ixsimpl hash-cons. Both sides must
+// have collapsed to the 1D form `hc-flatten-with-layouts` produces:
+// single-entry `ExprAttr` shape, no layout, same outer type kind, same
+// element type. Recurses through `TupleType` so `tuple<vec, vec>` yields
+// match `tuple<vec, vec>` results pointwise. Collective scalar yield
+// (`f32`, `i32`, `!hc.idx`, `!hc.pred`) lifts post-flatten to a 1D
+// collective vector with `dim[0] == product(suffix)`; carry the scalar
+// across as a synthesised `yield_storage = 1` so the same storage-product
+// check fires.
+static bool postFlattenLiftMatches(Type yieldedType, Type resultType,
+                                   ArrayRef<Attribute> suffix) {
+  if (auto yt = dyn_cast<TupleType>(yieldedType)) {
+    auto rt = dyn_cast<TupleType>(resultType);
+    if (!rt || yt.size() != rt.size())
+      return false;
+    for (auto [yElem, rElem] : llvm::zip_equal(yt.getTypes(), rt.getTypes())) {
+      if (isa<TupleType>(yElem))
+        return false;
+      if (!postFlattenLiftMatches(yElem, rElem, suffix))
+        return false;
+    }
+    return true;
+  }
+
+  FailureOr<ExprAttr> resultStorage = postFlattenStorageExpr(resultType);
+  if (failed(resultStorage))
+    return false;
+  auto resultShaped = cast<SymbolicallyShapedTypeInterface>(resultType);
+
+  MLIRContext *ctx = yieldedType.getContext();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+
+  ExprAttr yieldStorage;
+  if (auto yieldShaped =
+          dyn_cast<SymbolicallyShapedTypeInterface>(yieldedType)) {
+    if (yieldedType.getTypeID() != resultType.getTypeID())
+      return false;
+    if (resultShaped.getSymbolicElementType() !=
+        yieldShaped.getSymbolicElementType())
+      return false;
+    FailureOr<ExprAttr> ys = postFlattenStorageExpr(yieldedType);
+    if (failed(ys))
+      return false;
+    yieldStorage = *ys;
+  } else if (isCollectiveScalarType(yieldedType)) {
+    // Collective-scalar lift wraps the scalar in `mlir::hc::VectorType`
+    // pre-flatten, which collapses to its 1D form post-flatten. The
+    // bare-vector form is not a legal target for the scalar lift
+    // (the pre-flatten `collectiveLiftedType` only produces
+    // `mlir::hc::VectorType` here), so demand the same kind here.
+    if (!isa<mlir::hc::VectorType>(resultType))
+      return false;
+    if (resultShaped.getSymbolicElementType() != yieldedType)
+      return false;
+    auto one = sym::composeExprInt(store, 1);
+    if (failed(one))
+      return false;
+    yieldStorage = ExprAttr::get(ctx, *one);
+  } else {
+    return false;
+  }
+
+  FailureOr<ExprAttr> suffixProduct = composeSuffixProduct(ctx, suffix);
+  if (failed(suffixProduct))
+    return false;
+  auto lifted =
+      sym::composeExprBinary(store, yieldStorage.getValue(),
+                             sym::ExprBinaryOp::Mul, suffixProduct->getValue());
+  if (failed(lifted))
+    return false;
+  return ExprAttr::get(ctx, *lifted) == *resultStorage;
+}
+
 static bool collectiveYieldMatchesRegionResult(Operation *op, Type yieldedType,
                                                Type resultType) {
   if (!isa<HCWorkitemRegionOp, HCSubgroupRegionOp>(op) ||
@@ -1089,7 +1216,17 @@ static bool collectiveYieldMatchesRegionResult(Operation *op, Type yieldedType,
   FailureOr<SmallVector<Attribute>> suffix = collectiveSuffix(op, *metadata);
   if (failed(suffix))
     return false;
-  return collectiveLiftedType(yieldedType, *suffix) == resultType;
+  // Pre-flatten path: structural append of suffix dims to the yield
+  // shape, compared by literal type equality. Covers every scope
+  // region the verifier sees before `hc-flatten-with-layouts` runs.
+  if (collectiveLiftedType(yieldedType, *suffix) == resultType)
+    return true;
+  // Post-flatten path: yield and result both collapsed to their 1D
+  // bare carriers, the lift relationship survives as the ixsimpl
+  // identity `result.storage == yield.storage * product(suffix)`.
+  // Without this branch the verifier rejects internally-consistent
+  // IR after flatten.
+  return postFlattenLiftMatches(yieldedType, resultType, *suffix);
 }
 
 LogicalResult HCForRangeOp::verify() {

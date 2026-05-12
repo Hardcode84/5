@@ -12,25 +12,32 @@
 // inline helpers, fold identity layouts, funnel shaped compute / per-element
 // arith / load+store into `hc.generic`, infer placeholder iter bounds,
 // normalize supported scope regions, run the standard cleanup pair, wrap
-// kernels in upstream GPU launches, lower launch-body scalar/control flow,
-// clean up, interpret target lowering recipes (which rewrites every
-// `hc.call_intrinsic` and DCEs the matching `hc.intrinsic` decls), then a
-// canonicalize/cse pair to fold the recipe's bridging UCCs into identity.
+// kernels in upstream GPU launches, flatten every shaped carrier to its
+// 1D storage form and compose every offset to a single 1D `#hc.expr`,
+// lower launch-body scalar/control flow on the now-flat IR, clean up,
+// lower `hc.generic` whose operands resolved to `!hc.ptr` to the
+// `scf.parallel` / `scf.for` loop nest, fold `hc.predicate` through to
+// its producer, then interpret target lowering recipes (which rewrites
+// every `hc.call_intrinsic` and DCEs the matching `hc.intrinsic`
+// decls), then a canonicalize/cse pair to fold the recipe's bridging
+// UCCs into identity.
 //
 // The generic-pipeline rewriters (`hc-shaped-compute-to-generic`,
 // `hc-elementwise-to-generic`, `hc-load-store-to-generic`,
 // `hc-infer-generic-bounds`) are conservative — they only fire on inputs
 // they can prove safe (rank-2 matmul / reduce, per-element on shaped
 // types, pinned `!hc.idx<expr>` indices on load and store). Inputs that
-// don't match (slice-indexed loads, intrinsic-mediated WMMA paths, ...)
-// flow through untouched and lower via the existing per-op handlers in
-// `hc-lower-launch-body`. `hc-flatten-with-layouts` follows the
-// generic rewriters and bounds inference: every shaped value
-// collapses to its 1D bare carrier and every `hc.generic` operand /
+// don't match (intrinsic-mediated WMMA recipes, ...) flow through
+// untouched and lower via the existing per-op handlers in
+// `hc-lower-launch-body`. `hc-flatten-with-layouts` runs after
+// `hc-lower-kernels-to-gpu-launch` and before `hc-lower-launch-body`:
+// the launch wrapper plants the buffer-from-ptr+dims UCC chain that
+// flatten's post-flatten layout retyper consumes, every shaped value
+// collapses to its 1D bare carrier, every `hc.generic` operand /
 // access op offset composes through the operand layout into a single
-// 1D `#hc.expr`. `hc-lower-generic` runs after `hc-lower-launch-body`
-// so any `hc.generic` whose operands are `!hc.ptr` collapses to the
-// `scf.parallel` / `scf.for` loop nest.
+// 1D `#hc.expr`, and `hc-lower-launch-body` then sees the 1D form
+// uniformly. `hc-lower-generic` follows launch-body so any `hc.generic`
+// whose operands are `!hc.ptr` collapses to the loop nest.
 //
 // The closing chunk produces the device-side artefacts the GPU lowering
 // pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
@@ -121,37 +128,38 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m11 : !transform.any_op
     %m12 = transform.apply_registered_pass "hc-lower-kernels-to-gpu-launch" to %m11
         : (!transform.any_op) -> !transform.any_op
-    %m13 = transform.apply_registered_pass "hc-lower-launch-body" to %m12
+    // Flatten before launch-body so launch-body sees rank-1 buffer
+    // carriers and a single composed 1D `#hc.expr` per access. The
+    // post-flatten layout retyper inside flatten handles the buffer-
+    // from-ptr UCC chain that `hc-lower-kernels-to-gpu-launch`
+    // plants on each kernel-arg boundary, and the post-flatten
+    // collective-lift verifier (extended for the storage-product
+    // regime) keeps `hc.workitem_region` / `hc.subgroup_region`
+    // accepting the post-flatten yield/result shape. The
+    // `applyPartialConversion` step that flatten drives plants
+    // boundary UCCs on every type it converted; fold them through
+    // the standard cleanup pair before launch-body walks the IR.
+    %m12b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m12
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m13 {
+    transform.apply_patterns to %m12b {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m13 : !transform.any_op
-    // Flatten runs after `hc-lower-launch-body`. The eventual target
-    // is to run it right after `hc-infer-generic-bounds`. Two pieces
-    // are still missing before the move can happen: slice-indexed
-    // access ops (`hc.vload`, `hc.load_mask`, `hc.store`) need to
-    // route through `hc-load-store-to-generic` so flatten only sees
-    // generics, and the workitem-region inlining has to land. Until
-    // both ship the post-flatten launch-body still trips on the
-    // multi-axis slice-indexed survivors.
-    %m13b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m13
+    transform.apply_cse to %m12b : !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12b
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13b {
-      // `applyPartialConversion` plants `unrealized_conversion_cast`s
-      // on every boundary nothing else converted; fold them away here
-      // so downstream passes don't have to special-case the cast walk.
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13b : !transform.any_op
-    // Lower every `hc.generic` whose operands have already been
-    // converted to `!hc.ptr` (by the launch-body pass above) and
-    // composed to a single 1D offset (by the flatten pass above) to
-    // an outer `scf.parallel` over the parallel iters and an inner
-    // `scf.for` nest over reduction iters. The pass bails on any
-    // generic that doesn't fit its v0 surface — for the WMMA path
-    // that means a no-op since the recipe is dispatched via
-    // `hc-interpret-intrinsic-recipes` instead of generic.
+    // Lower every `hc.generic` whose operands are `!hc.ptr<...>`
+    // (resolved by the launch-body pass above off the kernel-arg
+    // UCCs) with rank-1 composed offsets (built by the flatten
+    // pass above) to an outer `scf.parallel` over the parallel
+    // iters and an inner `scf.for` nest over reduction iters. The
+    // pass bails on any generic that doesn't fit its v0 surface —
+    // for the WMMA path that means a no-op since the recipe is
+    // dispatched via `hc-interpret-intrinsic-recipes` instead of
+    // generic.
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
         : (!transform.any_op) -> !transform.any_op
     // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as

@@ -166,18 +166,21 @@ func.func @elementwise_two_outs(%n: index,
 
 // -----
 
-// Out-of-v0-scope ops survive untouched. v0 only handles all-ptr
-// operands; a bare-tensor on either side keeps the op around for a
-// later slice (bufferization → all-ptr, then this pass picks it
-// up). LIT pins the bail behaviour so a future scope expansion is
-// an explicit, reviewable change.
-// CHECK-LABEL: func.func @bail_bare_tensor_out
+// Out-of-v0-scope ops survive untouched. Value-typed outs need a
+// compile-time-fixed lane count (`isV0Candidate` rejects symbolic
+// shapes like `["N"]`) and constant iter bounds. A plain `index`
+// bound + symbolic shape on the out trip both gates; the op
+// survives intact for a later slice to revisit. LIT pins the bail
+// shape so a future scope expansion is an explicit, reviewable
+// change.
+// CHECK-LABEL: func.func @bail_symbolic_bare_tensor_out
 // CHECK: hc.generic
 // CHECK-NOT: scf.parallel
 // CHECK-NOT: scf.for
-func.func @bail_bare_tensor_out(%n: index,
-                                %src: !hc.ptr<global, f32>,
-                                %dst: !hc.bare_tensor<f32, ["N"]>)
+// CHECK-NOT: vector.from_elements
+func.func @bail_symbolic_bare_tensor_out(%n: index,
+                                         %src: !hc.ptr<global, f32>,
+                                         %dst: !hc.bare_tensor<f32, ["N"]>)
     -> !hc.bare_tensor<f32, ["N"]> {
   %r = hc.generic
       iter (parallel i = %n : index)
@@ -539,4 +542,127 @@ func.func @workgroup_outs_with_reduction_falls_through(
     gpu.terminator
   }
   return
+}
+
+// -----
+
+// Value-typed out: ptr ins + bare_vector out, single parallel iter
+// with a constant bound. The value-outs lowering unrolls the
+// parallel sweep at compile time (no `scf.parallel`), composes
+// per-lane finals through a single `vector.from_elements`, and
+// UCC's the result back to `!hc.bare_vector<...>` for the original
+// consumer. Contig-group analysis on the ins side collapses the
+// 8 unit-stride loads into one `vector<8xf32>` `hc.ptr_load`.
+// CHECK-LABEL: func.func @value_out_1d_ptr_in
+// CHECK-NOT: scf.parallel
+// CHECK: hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f32> -> vector<8xf32>
+// CHECK-NOT: hc.ptr_store
+// CHECK: %[[VEC:[^ ]+]] = vector.from_elements
+// CHECK-SAME: vector<8xf32>
+// CHECK: %[[CAST:[^ ]+]] = builtin.unrealized_conversion_cast %[[VEC]]
+// CHECK-SAME: vector<8xf32> to !hc.bare_vector<f32, ["8"]>
+// CHECK: return %[[CAST]]
+// CHECK-NOT: hc.generic
+func.func @value_out_1d_ptr_in(%src: !hc.ptr<global, f32>,
+                               %init: !hc.bare_vector<f32, ["8"]>)
+    -> !hc.bare_vector<f32, ["8"]> {
+  %n = hc.idx_apply () : () -> !hc.idx<"8">
+  %r = hc.generic
+      iter (parallel i = %n : !hc.idx<"8">)
+      ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["8"]>)
+      -> (!hc.bare_vector<f32, ["8"]>) {
+  ^bb0(%sv: f32, %iv: f32):
+    %s = hc.add %iv, %sv : (f32, f32) -> f32
+    hc.yield %s : f32
+  }
+  return %r : !hc.bare_vector<f32, ["8"]>
+}
+
+// -----
+
+// Value-typed out: 2D parallel iter (16x16, both constant-bound)
+// with row-major outs offset `16*i_0 + i_1` — the WMMA fragment-
+// load shape. Slot = parLane under row-major decomposition, so
+// `vector.from_elements` sees finals in identity order. Contig
+// analysis on the ins (unit-stride inner axis) collapses to one
+// `vector<256xf16>` load.
+// CHECK-LABEL: func.func @value_out_2d_rowmajor_fragment_load
+// CHECK-NOT: scf.parallel
+// CHECK: hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f16> -> vector<256xf16>
+// CHECK: vector.from_elements
+// CHECK-SAME: vector<256xf16>
+// CHECK: builtin.unrealized_conversion_cast
+// CHECK-SAME: vector<256xf16> to !hc.bare_tensor<f16, ["256"]>
+// CHECK-NOT: hc.generic
+func.func @value_out_2d_rowmajor_fragment_load(
+    %src: !hc.ptr<global, f16>,
+    %init: !hc.bare_tensor<f16, ["256"]>)
+    -> !hc.bare_tensor<f16, ["256"]> {
+  %m = hc.idx_apply () : () -> !hc.idx<"16">
+  %n = hc.idx_apply () : () -> !hc.idx<"16">
+  %r = hc.generic
+      iter (parallel i_0 = %m : !hc.idx<"16">,
+            parallel i_1 = %n : !hc.idx<"16">)
+      ins (%src at [#hc.expr<"16*i_0 + i_1">] : !hc.ptr<global, f16>)
+      outs (%init at [#hc.expr<"16*i_0 + i_1">]
+            : !hc.bare_tensor<f16, ["256"]>)
+      -> (!hc.bare_tensor<f16, ["256"]>) {
+  ^bb0(%sv: f16, %iv: f16):
+    hc.yield %sv : f16
+  }
+  return %r : !hc.bare_tensor<f16, ["256"]>
+}
+
+// -----
+
+// Bail: value-typed out with a non-constant iter bound. The
+// `index`-typed bound has no `IdxType` payload to fish a literal
+// out of, so the value-outs gate rejects and the op survives. Pins
+// the diagnostic surface so a future tighter "constant iter bound"
+// check at the bail point can land without silently changing the
+// shape of generics that already use this fallback.
+// CHECK-LABEL: func.func @bail_value_out_dynamic_bound
+// CHECK: hc.generic
+// CHECK-NOT: vector.from_elements
+func.func @bail_value_out_dynamic_bound(%n: index,
+                                        %src: !hc.ptr<global, f32>,
+                                        %init: !hc.bare_vector<f32, ["8"]>)
+    -> !hc.bare_vector<f32, ["8"]> {
+  %r = hc.generic
+      iter (parallel i = %n : index)
+      ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["8"]>)
+      -> (!hc.bare_vector<f32, ["8"]>) {
+  ^bb0(%sv: f32, %iv: f32):
+    hc.yield %sv : f32
+  }
+  return %r : !hc.bare_vector<f32, ["8"]>
+}
+
+// -----
+
+// Bail: value-typed out with a reduction iter. The value-outs
+// compose threads every parLane through one result vector — a
+// reduction axis would need cross-lane carry the boundary form
+// doesn't model in v0, so the gate rejects and the op survives.
+// CHECK-LABEL: func.func @bail_value_out_with_reduction
+// CHECK: hc.generic
+// CHECK-NOT: vector.from_elements
+func.func @bail_value_out_with_reduction(%src: !hc.ptr<global, f32>,
+                                         %init: !hc.bare_vector<f32, ["4"]>)
+    -> !hc.bare_vector<f32, ["4"]> {
+  %m = hc.idx_apply () : () -> !hc.idx<"4">
+  %k = hc.idx_apply () : () -> !hc.idx<"8">
+  %r = hc.generic
+      iter (parallel i = %m : !hc.idx<"4">,
+            reduction j = %k : !hc.idx<"8">)
+      ins (%src at [#hc.expr<"8*i + j">] : !hc.ptr<global, f32>)
+      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["4"]>)
+      -> (!hc.bare_vector<f32, ["4"]>) {
+  ^bb0(%sv: f32, %iv: f32):
+    %s = hc.add %iv, %sv : (f32, f32) -> f32
+    hc.yield %s : f32
+  }
+  return %r : !hc.bare_vector<f32, ["4"]>
 }

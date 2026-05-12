@@ -18,11 +18,12 @@ lowering chain (`_GPU_LOWERING_PIPELINE`) that takes the
 `#rocdl.target`-stamped `gpu.module` ops to `gpu.binary` (HSACO) blobs
 via `hc-lower-gpu-to-binary`. The chain is appended as a raw
 `pass-pipeline` string rather than as more `transform.apply_registered_pass`
-nodes because some of the included passes (notably `gpu-to-llvm` via
-its `dlti` dependency) refuse to be loaded through the transform
-interpreter's per-pass `PassManager`. Custom schedules still get the
-chain appended — overriding it would mean composing your own
-binary-emission stage and is out of scope for `schedule=`.
+ops because the transform-dialect pass-application op doesn't express
+the nested pass manager `gpu.module(...)` requires, and
+`convert-gpu-to-rocdl` is anchored on `gpu::GPUModuleOp` upstream.
+Custom schedules still get the chain appended — overriding it would
+mean composing your own binary-emission stage and is out of scope for
+`schedule=`.
 
 The `ld.lld` path used by `hc-lower-gpu-to-binary` is resolved
 Python-side from `_native_paths.lld_path` (bundled binary in
@@ -133,35 +134,24 @@ _FEATURES_PLACEHOLDER = "__HC_FEATURES__"
 _FEATURES_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
 # Device-side lowering chain appended after the user's schedule fires.
-# Two things matter about the order:
 #
-#   * `lower-affine` runs three times — once at top-level before the
-#     scf->cf step (the recipe interpreter and the launch-body lowering
-#     both leave affine.apply ops behind), once nested in `gpu.module`
-#     (because the top-level pass doesn't recurse into outlined
-#     modules), and a third time after `convert-amdgpu-to-rocdl` (which
-#     synthesises a fresh affine.apply per WMMA tile). Skipping any of
-#     the three leaves an `affine.apply` for `translateModuleToLLVMIR`
-#     to choke on.
+# `convert-gpu-to-rocdl` is `Pass<"convert-gpu-to-rocdl", "gpu::GPUModuleOp">`
+# upstream — anchored on `gpu::GPUModuleOp`, so the pass-manager nesting
+# `gpu.module(...)` is mandatory and the gpu-internal vector / arith /
+# index conversions sit alongside it inside the same nested manager so
+# they see the LLVM types `convert-gpu-to-rocdl` materialised. The
+# outer `gpu-to-llvm` then handles the host-side launch boundary and
+# pulls vector/index patterns via `ConvertToLLVMPatternInterface`.
 #
-#   * `convert-gpu-to-rocdl` MUST be nested inside `gpu.module` so its
-#     TypeConverter installs the workgroup-AS mapping that the rest of
-#     the inner conversions (vector/arith/index → llvm) need. Running
-#     it at top-level just emits "memory space conversion failed" and
-#     leaves the body in mixed dialect.
+# The chain is kept as a raw pipeline string (rather than threaded
+# through more `transform.apply_registered_pass` ops in the schedule)
+# primarily because `transform.apply_registered_pass` doesn't express
+# nested pass managers, which `gpu.module(...)` requires.
 #
 # The placeholders match the schedule's: `_substitute_chip` /
 # `_substitute_lld` swap them in before the pipeline string is
 # parsed.
 _GPU_LOWERING_PIPELINE = (
-    # Fold subview-into-load/store before the rocdl chain. Without this
-    # the descriptor materialisation for dynamic-offset subviews emits
-    # `llvm.alloca <count> x <type>` (a runtime alloca from AMDGPU's
-    # POV) that the backend then rejects as `dynamic_stackalloc`.
-    "gpu.module(fold-memref-alias-ops),"
-    "lower-affine,"
-    "gpu.module(lower-affine),"
-    "canonicalize,cse,"
     # Lower the `!hc.ptr` family launch-body emits before the rocdl chain
     # walks the gpu.module body — the convert-*-to-llvm passes nested in
     # `gpu.module(...)` below have no idea about `hc.alloc`/`hc.ptr_*`,
@@ -169,9 +159,7 @@ _GPU_LOWERING_PIPELINE = (
     "hc-lower-to-llvm,"
     "convert-scf-to-cf,"
     f"convert-amdgpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
-    "lower-affine,"
     "gpu.module("
-    "lower-affine,"
     f"convert-gpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
     "convert-arith-to-llvm,"
     "convert-vector-to-llvm,"
@@ -191,7 +179,11 @@ _GPU_LOWERING_PIPELINE = (
     # `hc_rt_launch_kernel` calls and embed each binary's HSACO blob
     # as an LLVM global. Runs after `hc-lower-gpu-to-binary` so the
     # `gpu.binary` ops it consumes already exist; the pass erases each
-    # binary after the last launch_func references it.
+    # binary after the last launch_func references it. `symbol-dce`
+    # cleans the runtime helper decls `ensureRuntimeHelpers` plants
+    # for every payload regardless of whether the kernel ended up
+    # using them (`hc_get_int64`, `hc_get_float64` are the usual
+    # culprits).
     "hc-lower-launch-func-to-runtime,"
     "symbol-dce"
 )
@@ -345,14 +337,15 @@ def _ensure_passes_registered() -> None:
 def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
     # Two-stage pipeline:
     #   1) `transform-preload-library` + `transform-interpreter` runs the
-    #      user-or-default schedule (front-to-hc, recipe interpretation,
-    #      kernel outlining, alloca-to-global, vector transfer lowering,
-    #      rocdl-attach-target).
+    #      user-or-default schedule (front-to-hc lowering, layout
+    #      cleanup, generic-pipeline funnels, kernel outlining, recipe
+    #      interpretation, `rocdl-attach-target`).
     #   2) The fixed `_GPU_LOWERING_PIPELINE` chain takes the
     #      `#rocdl.target`-stamped `gpu.module` to a `gpu.binary` blob.
-    #      Appended as raw passes (not more transform.apply_registered_pass
-    #      ops) because `gpu-to-llvm` lazy-loads the `dlti` dialect, which
-    #      the transform interpreter's per-pass `PassManager` can't satisfy.
+    #      Appended as raw passes because `convert-gpu-to-rocdl` is
+    #      anchored on `gpu::GPUModuleOp` upstream and the transform
+    #      dialect's pass-application op doesn't express nested pass
+    #      managers.
     # The entry-point option is spelled redundantly because
     # `__transform_main` is also the upstream default, but being explicit
     # makes the pipeline self-documenting if we ever introduce secondary

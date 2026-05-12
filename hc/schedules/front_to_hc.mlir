@@ -4,23 +4,26 @@
 //
 // Default hc_front -> hc schedule.
 //
-// Mirrors the pass order `hc-opt` and `doc/lowering.md` document for
-// the frontend stage: fold/erase region scaffolding, inline undecorated
+// Frontend stage: fold/erase region scaffolding, inline undecorated
 // helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
-// SSA, infer concrete HC value types, materialize bound symbolic values, verify
-// static shape carriers, split semantic shaped values into bare data/masks,
-// inline helpers, fold identity layouts, funnel shaped compute / per-element
-// arith / load+store into `hc.generic`, infer placeholder iter bounds,
-// normalize supported scope regions, run the standard cleanup pair, wrap
-// kernels in upstream GPU launches, flatten every shaped carrier to its
-// 1D storage form and compose every offset to a single 1D `#hc.expr`,
-// lower launch-body scalar/control flow on the now-flat IR, clean up,
-// lower `hc.generic` whose operands resolved to `!hc.ptr` to the
-// `scf.parallel` / `scf.for` loop nest, fold `hc.predicate` through to
-// its producer, then interpret target lowering recipes (which rewrites
-// every `hc.call_intrinsic` and DCEs the matching `hc.intrinsic`
-// decls), then a canonicalize/cse pair to fold the recipe's bridging
-// UCCs into identity.
+// SSA, infer concrete HC value types, materialize bound symbolic values,
+// verify static shape carriers, split semantic shaped values into bare
+// data/masks, inline helpers, materialize bound symbolic values a
+// second time (helper inlining re-roots fresh launch-geometry chains
+// in kernel scope), fold identity layouts, funnel shaped compute /
+// per-element arith / load+store into `hc.generic`, infer placeholder
+// iter bounds, normalize supported scope regions, run the standard
+// cleanup pair, wrap kernels in upstream GPU launches, flatten every
+// shaped carrier to its 1D storage form and compose every offset to a
+// single 1D `#hc.expr`, lower launch-body scalar/control flow on the
+// now-flat IR, clean up, lower `hc.generic` whose operands resolved
+// to `!hc.ptr` to the `scf.parallel` / `scf.for` loop nest, fold
+// `hc.predicate` through to its producer, run `hc-lower-launch-body`
+// a second time to convert the fresh per-lane `hc.idx_apply` ops the
+// generic lowering planted, then interpret target lowering recipes
+// (which rewrites every `hc.call_intrinsic` and erases the sibling
+// `__hc_intrinsic_lowerings__` module), then a canonicalize/cse pair
+// to fold the recipe's bridging UCCs into identity.
 //
 // The generic-pipeline rewriters (`hc-shaped-compute-to-generic`,
 // `hc-elementwise-to-generic`, `hc-load-store-to-generic`,
@@ -90,6 +93,11 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
         : (!transform.any_op) -> !transform.any_op
+    // Second materialize: helper inlining re-roots launch-geometry
+    // producer chains (`hc.group_id` / `hc.local_id` / `hc.work_offset`
+    // and friends) in the kernel scope. The first materialize handled
+    // the kernel-body chains; this one catches the freshly-inlined
+    // helper-body ones.
     %m10 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m9
         : (!transform.any_op) -> !transform.any_op
     transform.apply_dce to %m10 : !transform.any_op
@@ -181,14 +189,13 @@ module attributes {transform.with_named_sequence} {
     // emitted by `hc-lower-generic` surface as fresh `hc.idx_apply`
     // ops that still need to be rewritten to plain `arith.*` /
     // `index_cast` arithmetic before LLVM translation. Re-running
-    // launch-body picks them up via `ConvertIdxApplyOp`; the ambient
-    // sym walker that used to be load-bearing here is now redundant
-    // (every apply already has its sym operands explicit, planted by
-    // `emitOffset` against `seedAmbientScope`'s map), but the
-    // conversion patterns are the only `hc.idx_apply -> arith` path
-    // in the pipeline. The first invocation's body conversion target
-    // is idempotent on the IR shape it produced; only the surviving
-    // applies match.
+    // launch-body picks them up via `ConvertIdxApplyOp` — the only
+    // `hc.idx_apply -> arith` path in the pipeline. Any sym the
+    // per-lane emitter couldn't pre-bind (free in the planted apply)
+    // still falls through to the ambient-context resolver inside
+    // launch-body. The first invocation's body conversion target is
+    // idempotent on the IR shape it produced; only the surviving
+    // applies match here.
     %m13ar = transform.apply_registered_pass "hc-lower-launch-body" to %m13af
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13ar {
@@ -258,10 +265,6 @@ module attributes {transform.with_named_sequence} {
     %m17 = transform.apply_registered_pass "rocdl-attach-target"
         with options = { "chip" = "__HC_CHIP__", "features" = "__HC_FEATURES__" } to %m16
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m17 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m17 : !transform.any_op
     transform.yield
   }
 }

@@ -51,6 +51,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <array>
@@ -544,22 +545,47 @@ static bool hasValueIns(HCGenericOp op) {
   return false;
 }
 
-// Pre-flight check: returns `true` when this op matches the v0
-// codegen scope. The ptr-only path accepts any rank-1 offset with
-// resolved iter bounds. The value-outs path additionally requires
-// constant iter bounds (full unroll happens at compile time), all
-// iters parallel (reduction-with-value-out is a v1 follow-up — the
-// accumulator threading across an `scf.for` doesn't compose with
-// the single-SSA-result boundary), a plain `hc.yield` terminator
-// (predicated-yield against a value-out is a v1 follow-up too), and
-// every outs offset's free syms confined to iter syms — anything
-// else makes the slot index ambient-dependent and the compile-time
-// slot evaluation can't pin it. Mismatch leaves the op in place —
-// we'd rather skip than partially lower. Opaque pointers (no
-// element type on the carrier) also bail: the v0 load emission
-// needs the element type to spell the result, and the pointer's
-// `$elementType` is the only available source.
-static bool isV0Candidate(HCGenericOp op) {
+// Pre-flight gate: returns `nullopt` when this op fits one of the
+// three lowering paths in `lowerOne` (collective dispatch, value-
+// outs unroll, scalar partition), otherwise a short reason naming
+// the specific check that failed. Callers use the boolean coercion
+// of the return (`has_value()` ↔ rejected) for the dispatch
+// decision and the underlying string for the diagnostic at the end
+// of the pass.
+//
+// The ptr-only path accepts any rank-1 offset with resolved iter
+// bounds. The value-typed path additionally requires constant iter
+// bounds (full unroll happens at compile time), all iters parallel
+// (a reduction iter would need cross-lane accumulator carry the
+// single-SSA-result boundary doesn't model), a plain `hc.yield` /
+// `hc.yield_predicated` terminator, and every value-side offset's
+// free syms confined to iter syms — anything else makes the slot
+// index ambient-dependent and the compile-time slot evaluation
+// can't pin it. Opaque pointers (no element type on the carrier)
+// also bail: load emission needs the element type to spell the
+// result and the pointer's `$elementType` is the only available
+// source.
+//
+// We deliberately diagnose every rejection at the end of the pass
+// instead of silently skipping: an un-lowered `hc.generic` flowing
+// through GPU outlining + ROCDL attach trips downstream passes with
+// cryptic errors far from the source, and the supported scope here
+// is narrow enough that "this op didn't lower" is always a real bug
+// at the frontend or in an earlier rewrite, never an intentional
+// fallback.
+static std::optional<std::string> diagnoseUnsupported(HCGenericOp op) {
+  auto fmt = [](auto &&...args) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    (os << ... << args);
+    return buf;
+  };
+  auto typeStr = [](Type t) {
+    std::string buf;
+    llvm::raw_string_ostream os(buf);
+    t.print(os);
+    return buf;
+  };
   auto goodPtr = [](Value v) {
     auto p = dyn_cast<PtrType>(v.getType());
     return p && p.getElementType();
@@ -570,38 +596,48 @@ static bool isV0Candidate(HCGenericOp op) {
   // happens in `lowerValueOuts`; the candidate gate just admits the
   // op into the fully-unrolled path.
   bool hasValIn = false;
-  for (Value v : op.getIns()) {
+  for (auto [i, v] : llvm::enumerate(op.getIns())) {
     if (goodPtr(v))
       continue;
     if (!getValueOutLaneCount(v.getType()))
-      return false;
+      return fmt("ins #", i, " has type '", typeStr(v.getType()),
+                 "'; expected !hc.ptr<...> with element type or a rank-1 "
+                 "fixed-lane carrier with integer-literal shape");
     hasValIn = true;
   }
   bool hasValOut = false;
-  for (Value v : op.getOuts()) {
+  for (auto [i, v] : llvm::enumerate(op.getOuts())) {
     if (goodPtr(v))
       continue;
     if (!getValueOutLaneCount(v.getType()))
-      return false;
+      return fmt("outs #", i, " has type '", typeStr(v.getType()),
+                 "'; expected !hc.ptr<...> with element type or a rank-1 "
+                 "fixed-lane carrier with integer-literal shape");
     hasValOut = true;
   }
+  // No rank-N offset check here — the op verifier already pins
+  // per-operand offset arity to the operand's rank (ptr → 1, rank-N
+  // shaped → N), and the operand-type gate above rejects every
+  // rank-N shaped type that would let a rank-N offset slip through.
+  // The combination "rank-1 operand, rank-N offsets" is not
+  // representable in textual IR. A future verifier relaxation should
+  // restore the check (and pair it with a LIT fixture that actually
+  // exercises it).
   ArrayAttr insOff = op.getInsOffsetsAttr();
   ArrayAttr outsOff = op.getOutsOffsetsAttr();
-  for (Attribute perOp : insOff)
-    if (cast<ArrayAttr>(perOp).size() != 1)
-      return false;
-  for (Attribute perOp : outsOff)
-    if (cast<ArrayAttr>(perOp).size() != 1)
-      return false;
-  for (Value bound : op.getIterBounds())
+  for (auto [i, bound] : llvm::enumerate(op.getIterBounds()))
     if (auto def = bound.getDefiningOp())
       if (isa<HCUndefValueOp>(def))
-        return false;
+        return fmt("iter #", i,
+                   " bound is hc.undef_value; bounds must resolve to a "
+                   "concrete index value");
   for (Operation &nested : op.getBody().front())
     if (isa<scf::IfOp>(nested))
-      return false;
+      return std::string(
+          "body contains nested scf.if; control flow inside the body is not "
+          "modeled (lower predicates to hc.yield_predicated first)");
   if (!hasValOut && !hasValIn)
-    return true;
+    return std::nullopt;
 
   // Fully-unrolled-path conditions (any value-typed operand). Iter
   // bounds: each one must resolve to a compile-time integer (either
@@ -611,7 +647,7 @@ static bool isV0Candidate(HCGenericOp op) {
   llvm::StringSet<> iterNames;
   for (Attribute s : op.getIterSymsAttr())
     iterNames.insert(cast<StringAttr>(s).getValue());
-  for (Value bound : op.getIterBounds()) {
+  for (auto [i, bound] : llvm::enumerate(op.getIterBounds())) {
     std::optional<int64_t> v;
     if (auto def = bound.getDefiningOp<arith::ConstantOp>())
       if (auto attr = dyn_cast<IntegerAttr>(def.getValue()))
@@ -622,7 +658,9 @@ static bool isV0Candidate(HCGenericOp op) {
           v = sym::getIntegerLiteralValue(e.getValue());
     }
     if (!v || *v < 0)
-      return false;
+      return fmt("iter #", i,
+                 " bound is not a compile-time non-negative integer literal "
+                 "(value-typed operand needs constant bound)");
   }
   // All iters must be parallel — the unrolled emitter threads every
   // parLane through the result vector / store sequence, and a
@@ -631,23 +669,28 @@ static bool isV0Candidate(HCGenericOp op) {
   // the gather slot is a function of iter syms alone, and a reduction
   // iter would mean the same value-in lane gets read at different
   // reduction steps with no scf-loop carry to express it.
-  for (Attribute k : op.getIterKindsAttr())
+  for (auto [i, k] : llvm::enumerate(op.getIterKindsAttr()))
     if (cast<IterKindAttr>(k).getValue() != IterKind::Parallel)
-      return false;
+      return fmt("iter #", i,
+                 " kind is reduction (value-typed operand needs all-parallel "
+                 "iters)");
   // Body terminator: `hc.yield` (unconditional publish) or
   // `hc.yield_predicated` (per-value mask gate → `arith.select` at
   // the boundary in `cloneBody`). Anything else escaped the emitters
   // we know about.
   Operation &term = op.getBody().front().back();
   if (!isa<HCYieldOp, HCYieldPredicatedOp>(&term))
-    return false;
+    return fmt("body terminator '", term.getName().getStringRef(),
+               "' is not hc.yield or hc.yield_predicated");
   // Outs offset's free syms must be a subset of iter syms; ambient
   // syms (shape / stride params) would make slot evaluation
   // ambient-dependent. Value-typed ins offsets are the per-lane slot
   // expressions and follow the same constraint — `lowerValueOuts`
   // constant-evaluates them at every parallel-lane combo.
-  auto offsetFreeSymsOk = [&](ArrayAttr arr, OperandRange operands) {
-    for (auto [a, v] : llvm::zip_equal(arr, operands)) {
+  auto findAmbientSym = [&](ArrayAttr arr, OperandRange operands,
+                            StringRef kind) -> std::optional<std::string> {
+    for (size_t i = 0, e = arr.size(); i < e; ++i) {
+      Value v = operands[i];
       // Ptr operands carry their offset against the source pointer
       // and may reference ambient syms (the `emitOffset` path
       // resolves them via `loopScope` + ambient bindings); only the
@@ -655,26 +698,28 @@ static bool isV0Candidate(HCGenericOp op) {
       // iter-only.
       if (isa<PtrType>(v.getType()))
         continue;
-      auto off = cast<ExprAttr>(cast<ArrayAttr>(a)[0]);
-      bool ok = true;
+      auto off = cast<ExprAttr>(cast<ArrayAttr>(arr[i])[0]);
+      std::optional<std::string> ambient;
       sym::walkSymbolNames(off.getValue(), [&](StringRef name) {
-        if (!iterNames.contains(name))
-          ok = false;
+        if (!iterNames.contains(name) && !ambient)
+          ambient = name.str();
       });
-      if (!ok)
-        return false;
+      if (ambient)
+        return fmt(kind, " #", i, " offset references non-iter symbol '",
+                   *ambient, "' (value-typed operand needs iter-only offsets)");
     }
-    return true;
+    return std::nullopt;
   };
-  if (!offsetFreeSymsOk(insOff, op.getIns()) ||
-      !offsetFreeSymsOk(outsOff, op.getOuts()))
-    return false;
-  return true;
+  if (auto r = findAmbientSym(insOff, op.getIns(), "ins"))
+    return r;
+  if (auto r = findAmbientSym(outsOff, op.getOuts(), "outs"))
+    return r;
+  return std::nullopt;
 }
 
 // Pull the single composed offset expression for an operand at
 // position `idx` from an `ins_offsets` / `outs_offsets` array.
-// Caller has already checked rank-1 via `isV0Candidate`.
+// Caller has already checked rank-1 via `diagnoseUnsupported`.
 static ExprAttr getOperandOffset(ArrayAttr arrayAttr, size_t idx) {
   return cast<ExprAttr>(cast<ArrayAttr>(arrayAttr[idx])[0]);
 }
@@ -928,7 +973,7 @@ static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
 // ins are left empty in `result` — only the fully-unrolled emitter
 // reaches them, and it fills the entries via `vector.extract` against
 // the precomputed gather-slot table; the partition path never sees
-// value-typed ins (`isV0Candidate` gates them through the unrolled
+// value-typed ins (`diagnoseUnsupported` gates them through the unrolled
 // path) so leaving the entry empty there is unreachable.
 static SmallVector<SmallVector<Value>>
 emitInsLoadsLaned(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
@@ -1462,7 +1507,7 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
 }
 
 // Pull the constant integer value off an iter bound. Caller checked
-// `isV0Candidate` already, which guarantees one of the two forms
+// `diagnoseUnsupported` already, which guarantees one of the two forms
 // resolves (`arith.constant index` or `!hc.idx<"<int>">`).
 static int64_t constIterBound(Value bound) {
   if (auto def = bound.getDefiningOp<arith::ConstantOp>())
@@ -1550,7 +1595,7 @@ static std::optional<int64_t> resolveOperandSlot(sym::Store &store,
 //     `[0, count)` per parLane, where `count` is the operand's
 //     compile-time lane count. Gather pattern, repeats are fine —
 //     multiple lanes may read the same slot.
-// `isV0Candidate` already pinned every value-side offset's free syms
+// `diagnoseUnsupported` already pinned every value-side offset's free syms
 // to iter syms only, so `substituteIterValues` produces a pure
 // integer per lane.
 //
@@ -1882,13 +1927,36 @@ struct HCLowerGenericPass
     SmallVector<HCGenericOp> work;
     getOperation()->walk([&](HCGenericOp op) { work.push_back(op); });
     for (HCGenericOp op : work) {
-      if (!isV0Candidate(op))
+      if (diagnoseUnsupported(op))
         continue;
       if (failed(lowerOne(op))) {
         signalPassFailure();
         return;
       }
     }
+
+    // Post-walk: anything still here is a hard failure. A surviving
+    // `hc.generic` flows through GPU outlining + ROCDL attach and
+    // trips later passes with diagnostics far from the source —
+    // diagnose at the production site instead. We re-run the gate
+    // here (and not against the originally-rejected set) so that a
+    // future `lowerOne` path that mistakenly returns success without
+    // erasing also surfaces as a failure rather than silent data
+    // loss.
+    bool sawSurvivor = false;
+    getOperation()->walk([&](HCGenericOp op) {
+      auto reason = diagnoseUnsupported(op);
+      InFlightDiagnostic diag =
+          op.emitError("hc-lower-generic: cannot lower hc.generic");
+      if (reason)
+        diag << "; " << *reason;
+      else
+        diag << "; op passed every candidate gate but no lowering path "
+                "erased it (internal)";
+      sawSurvivor = true;
+    });
+    if (sawSurvivor)
+      signalPassFailure();
   }
 };
 

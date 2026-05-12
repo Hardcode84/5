@@ -166,35 +166,6 @@ func.func @elementwise_two_outs(%n: index,
 
 // -----
 
-// Out-of-v0-scope ops survive untouched. Value-typed outs need a
-// compile-time-fixed lane count (`isV0Candidate` rejects symbolic
-// shapes like `["N"]`) and constant iter bounds. A plain `index`
-// bound + symbolic shape on the out trip both gates; the op
-// survives intact for a later slice to revisit. LIT pins the bail
-// shape so a future scope expansion is an explicit, reviewable
-// change.
-// CHECK-LABEL: func.func @bail_symbolic_bare_tensor_out
-// CHECK: hc.generic
-// CHECK-NOT: scf.parallel
-// CHECK-NOT: scf.for
-// CHECK-NOT: vector.from_elements
-func.func @bail_symbolic_bare_tensor_out(%n: index,
-                                         %src: !hc.ptr<global, f32>,
-                                         %dst: !hc.bare_tensor<f32, ["N"]>)
-    -> !hc.bare_tensor<f32, ["N"]> {
-  %r = hc.generic
-      iter (parallel i = %n : index)
-      ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
-      outs (%dst at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
-      -> (!hc.bare_tensor<f32, ["N"]>) {
-  ^bb0(%sv: f32, %dv: f32):
-    hc.yield %sv : f32
-  }
-  return %r : !hc.bare_tensor<f32, ["N"]>
-}
-
-// -----
-
 // Pure-parallel 1D with a divisible bound (`!hc.idx<"32">`). The
 // partition search proves `32 % 32 == 0`, picks `(32,)`, and merges
 // every lane into one vector group of width 32. The outer
@@ -743,82 +714,4 @@ func.func @value_in_wmma_writeback(%vec: !hc.bare_vector<f32, ["8"]>,
     hc.yield_predicated %v mask %m_arg : (f32), (!hc.pred)
   }
   return
-}
-
-// -----
-
-// Bail: value-typed in with an offset that references an ambient
-// (non-iter) sym. Slot evaluation would be ambient-dependent, so
-// the candidate gate rejects and the op survives.
-// CHECK-LABEL: func.func @bail_value_in_ambient_offset
-// CHECK: hc.generic
-// CHECK-NOT: vector.extract
-func.func @bail_value_in_ambient_offset(
-    %vec: !hc.bare_vector<f32, ["8"]>,
-    %dst: !hc.ptr<global, f32>,
-    %k: !hc.idx<"$K">) {
-  %n = hc.idx_apply () : () -> !hc.idx<"8">
-  hc.generic
-      iter (parallel i = %n : !hc.idx<"8">)
-      ins (%vec at [#hc.expr<"i + $K">] : !hc.bare_vector<f32, ["8"]>)
-      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
-      ambient (%k as "$K" : !hc.idx<"$K">)
-      -> () {
-  ^bb0(%v: f32, %init: f32):
-    hc.yield %v : f32
-  }
-  return
-}
-
-// -----
-
-// Bail: value-typed out with a non-constant iter bound. The
-// `index`-typed bound has no `IdxType` payload to fish a literal
-// out of, so the value-outs gate rejects and the op survives. Pins
-// the diagnostic surface so a future tighter "constant iter bound"
-// check at the bail point can land without silently changing the
-// shape of generics that already use this fallback.
-// CHECK-LABEL: func.func @bail_value_out_dynamic_bound
-// CHECK: hc.generic
-// CHECK-NOT: vector.from_elements
-func.func @bail_value_out_dynamic_bound(%n: index,
-                                        %src: !hc.ptr<global, f32>,
-                                        %init: !hc.bare_vector<f32, ["8"]>)
-    -> !hc.bare_vector<f32, ["8"]> {
-  %r = hc.generic
-      iter (parallel i = %n : index)
-      ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
-      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["8"]>)
-      -> (!hc.bare_vector<f32, ["8"]>) {
-  ^bb0(%sv: f32, %iv: f32):
-    hc.yield %sv : f32
-  }
-  return %r : !hc.bare_vector<f32, ["8"]>
-}
-
-// -----
-
-// Bail: value-typed out with a reduction iter. The value-outs
-// compose threads every parLane through one result vector — a
-// reduction axis would need cross-lane carry the boundary form
-// doesn't model in v0, so the gate rejects and the op survives.
-// CHECK-LABEL: func.func @bail_value_out_with_reduction
-// CHECK: hc.generic
-// CHECK-NOT: vector.from_elements
-func.func @bail_value_out_with_reduction(%src: !hc.ptr<global, f32>,
-                                         %init: !hc.bare_vector<f32, ["4"]>)
-    -> !hc.bare_vector<f32, ["4"]> {
-  %m = hc.idx_apply () : () -> !hc.idx<"4">
-  %k = hc.idx_apply () : () -> !hc.idx<"8">
-  %r = hc.generic
-      iter (parallel i = %m : !hc.idx<"4">,
-            reduction j = %k : !hc.idx<"8">)
-      ins (%src at [#hc.expr<"8*i + j">] : !hc.ptr<global, f32>)
-      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["4"]>)
-      -> (!hc.bare_vector<f32, ["4"]>) {
-  ^bb0(%sv: f32, %iv: f32):
-    %s = hc.add %iv, %sv : (f32, f32) -> f32
-    hc.yield %s : f32
-  }
-  return %r : !hc.bare_vector<f32, ["4"]>
 }

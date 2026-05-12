@@ -549,9 +549,9 @@ def HCYieldPredicatedOp : HC_Op<"yield_predicated",
     verifier rule — every mask is an `i1` SSA.
 
     The motivating consumers — masked store rewrite, `hc.load_mask`
-    rewrite, OOB-tile guard at the cooperative-copy source — all share
-    the same handoff: compute the mask in the body from iter syms and
-    ambient bounds, ride it on `$masks`, let the lowering pick the
+    rewrite, OOB-tile guard at the workgroup-staged copy source — all
+    share the same handoff: compute the mask in the body from iter syms
+    and ambient bounds, ride it on `$masks`, let the lowering pick the
     predicated memory op or `arith.select` blend.
   }];
   let arguments = (ins Variadic<HC_ValueType>:$values,

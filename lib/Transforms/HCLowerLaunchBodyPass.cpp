@@ -972,14 +972,6 @@ static FailureOr<TypedAttr> splatAttr(OpBuilder &builder, Type type,
   return cast<TypedAttr>(scalar);
 }
 
-static Value constantSplat(OpBuilder &builder, Location loc, Type type,
-                           int64_t value) {
-  FailureOr<TypedAttr> attr = splatAttr(builder, type, value);
-  if (failed(attr))
-    return {};
-  return arith::ConstantOp::create(builder, loc, type, *attr).getResult();
-}
-
 struct ConvertConstOp : public OpConversionPattern<HCConstOp> {
   using Base::Base;
 
@@ -1188,173 +1180,6 @@ static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
   return success();
 }
 
-// Cooperative copy from a slice of a kernel-arg `!hc.ptr<global, T>` into a
-// workgroup-AS LDS pointer. Each thread of the enclosing wave is responsible
-// for a strided
-// subset of the LDS tile's elements (`lane, lane + wgSize, lane + 2*wgSize,
-// ...`); a closing `gpu.barrier` makes the fully populated LDS visible to
-// every thread before it's read back as per-lane fragments.
-//
-// Why one element per thread per chunk (rather than vectorized 2/4/8-wide
-// loads): the prior lowering materialized the entire tile as a per-lane
-// `vector<MxNxT>` value, blew register pressure into the hundreds of SGPR
-// spills, and -- on real gfx11 hardware -- corrupted the WMMA inputs for
-// most lanes. Scalar per-element loads keep the per-lane register footprint
-// constant regardless of tile size; the compiler still coalesces the
-// uniform-stride global loads into wide accesses.
-//
-// OOB elements pad with zero (matching the prior `transfer_read` semantics).
-// The bounds check is per-element rather than at the tile level so partial
-// tiles at the edge of `M`/`N`/`K` get correct zero padding without
-// over-reading the source.
-//
-// LDS writes route through `hc.ptr_offset` + `hc.ptr_store` against the
-// flat workgroup buffer. The linear index already in hand from the
-// per-thread chunk loop *is* the flat offset; the per-axis coords only
-// participate in computing the source offset back into the kernel-arg
-// global pointer.
-static LogicalResult
-emitCooperativeCopy(OpBuilder &builder, Location loc, Operation *anchor,
-                    const KernelArgSource &source, ArrayRef<SliceAxis> axes,
-                    Value lds, ArrayRef<int64_t> ldsShape, Type elementType) {
-  FailureOr<std::pair<Value, Value>> tidAndSize =
-      linearizedThreadAndSize(builder, loc, anchor);
-  if (failed(tidAndSize))
-    return failure();
-  Value linearTid = tidAndSize->first;
-  Value wgSize = tidAndSize->second;
-
-  int64_t totalElements = 1;
-  for (int64_t d : ldsShape)
-    totalElements *= d;
-
-  Value totalVal =
-      arith::ConstantIndexOp::create(builder, loc, totalElements).getResult();
-  Value c0 = zeroIndex(builder, loc);
-  Value c1 = oneIndex(builder, loc);
-
-  // Per-lane chunk count. `ceildiv` so the trailing partial chunk still runs
-  // (its in-range `scf.if` then gates the actual work for the lanes that
-  // would otherwise step past `totalVal`).
-  Value chunks =
-      arith::CeilDivUIOp::create(builder, loc, totalVal, wgSize).getResult();
-  Value padding = constantSplat(builder, loc, elementType, 0);
-  if (!padding)
-    return failure();
-
-  auto ptrType = cast<PtrType>(lds.getType());
-
-  scf::ForOp loop =
-      scf::ForOp::create(builder, loc, c0, chunks, c1, ValueRange{});
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(loop.getBody());
-
-    Value chunkIdx = loop.getInductionVar();
-    Value chunkOffset =
-        arith::MulIOp::create(builder, loc, chunkIdx, wgSize).getResult();
-    Value lin =
-        arith::AddIOp::create(builder, loc, chunkOffset, linearTid).getResult();
-    Value inRange = arith::CmpIOp::create(
-                        builder, loc, arith::CmpIPredicate::ult, lin, totalVal)
-                        .getResult();
-
-    auto rangeIf = scf::IfOp::create(builder, loc, TypeRange{}, inRange,
-                                     /*withElseRegion=*/false);
-    OpBuilder::InsertionGuard rangeGuard(builder);
-    builder.setInsertionPointToStart(&rangeIf.getThenRegion().front());
-
-    // Unlinearize `lin` into per-axis coordinates of the LDS tile. Walk the
-    // axes back-to-front so the innermost axis (fastest-varying) absorbs the
-    // remainder first; this matches the canonical lex flatten order.
-    SmallVector<Value> coords(ldsShape.size());
-    Value remaining = lin;
-    for (int64_t axis = static_cast<int64_t>(ldsShape.size()) - 1; axis >= 0;
-         --axis) {
-      Value dim = arith::ConstantIndexOp::create(builder, loc, ldsShape[axis])
-                      .getResult();
-      coords[axis] =
-          arith::RemUIOp::create(builder, loc, remaining, dim).getResult();
-      if (axis > 0)
-        remaining =
-            arith::DivUIOp::create(builder, loc, remaining, dim).getResult();
-    }
-
-    // Translate LDS coords to source indices. Non-slice axes contribute their
-    // fixed offset; slice axes scale the LDS coord by the slice's stride and
-    // add the slice's base offset, matching the `axes`-driven addressing in
-    // the per-lane vector path below.
-    SmallVector<Value> srcIndices;
-    srcIndices.reserve(axes.size());
-    int64_t sliceCoordIdx = 0;
-    for (const SliceAxis &info : axes) {
-      if (!info.isSlice) {
-        srcIndices.push_back(info.offset);
-        continue;
-      }
-      Value coord = coords[sliceCoordIdx++];
-      Value scaled =
-          arith::MulIOp::create(builder, loc, coord, info.stride).getResult();
-      srcIndices.push_back(
-          arith::AddIOp::create(builder, loc, info.offset, scaled).getResult());
-    }
-
-    // Per-element bounds check on the source: every slice-axis index must be
-    // less than the source dim. Non-slice axes carry a fixed in-bounds offset
-    // by construction (the slice dialect rejects scalar subscripts past the
-    // end statically) so they don't need a runtime check.
-    Value inBounds =
-        arith::ConstantOp::create(builder, loc, builder.getBoolAttr(true))
-            .getResult();
-    for (auto [axisIdx, info] : llvm::enumerate(axes)) {
-      if (!info.isSlice)
-        continue;
-      Value extent = source.dims[axisIdx];
-      Value check =
-          arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
-                                srcIndices[axisIdx], extent)
-              .getResult();
-      inBounds =
-          arith::AndIOp::create(builder, loc, inBounds, check).getResult();
-    }
-
-    // Predicated load against the kernel-arg ptr: in-bounds gives the
-    // tile element, OOB lanes pad with zero (matching the prior
-    // `transfer_read` semantics). The branchless `hc.ptr_load_pred` keeps
-    // the inner if-then-else flat for downstream LLVM SLP recombination.
-    auto sourcePtrType = cast<PtrType>(source.ptr.getType());
-    Value flatSrc = linearizeKernelArgOffset(builder, loc, source, srcIndices);
-    Value srcAddr =
-        HCPtrOffsetOp::create(builder, loc, sourcePtrType, source.ptr, flatSrc)
-            .getResult();
-    auto loadIf = scf::IfOp::create(builder, loc, TypeRange{elementType},
-                                    inBounds, /*withElseRegion=*/true);
-    {
-      OpBuilder::InsertionGuard thenGuard(builder);
-      builder.setInsertionPointToStart(&loadIf.getThenRegion().front());
-      Value loaded =
-          HCPtrLoadOp::create(builder, loc, elementType, srcAddr).getResult();
-      scf::YieldOp::create(builder, loc, loaded);
-    }
-    {
-      OpBuilder::InsertionGuard elseGuard(builder);
-      builder.setInsertionPointToStart(&loadIf.getElseRegion().front());
-      scf::YieldOp::create(builder, loc, padding);
-    }
-
-    Value addr =
-        HCPtrOffsetOp::create(builder, loc, ptrType, lds, lin).getResult();
-    HCPtrStoreOp::create(builder, loc, loadIf.getResult(0), addr);
-  }
-
-  // Make the cooperative writes visible to every thread before any per-lane
-  // reader sees the LDS tile. Without this, multi-wave workgroups race; for
-  // single-wave workgroups it's redundant but cheap and the canonicalizer
-  // doesn't (and shouldn't) drop the safety net.
-  gpu::BarrierOp::create(builder, loc);
-  return success();
-}
-
 // Walk back through an `unrealized_conversion_cast` to recover a workgroup-AS
 // `!hc.ptr` value. Counterpart to `resolveKernelArg` for the launch-body's
 // LDS path; kernel-arg buffers come in as ptr+dims+strides UCC bundles
@@ -1396,10 +1221,10 @@ struct PtrViewSource {
 // pass). Two-deep view chains (`view(view(...))`) are vanishingly rare in
 // the surface; if they ever show up we'd unroll the chain here.
 //
-// For non-view sources (`hc.alloc`, cooperative-copy result, fresh LDS from
-// a `select`), we synthesize a trivial axis pattern (every axis a full
-// slice over the source's static dim). That keeps the loader uniform — the
-// strided per-element loop with trivial axes degenerates to the same flat
+// For non-view sources (`hc.alloc`, fresh LDS from a `select`), we
+// synthesize a trivial axis pattern (every axis a full slice over the
+// source's static dim). That keeps the loader uniform — the strided
+// per-element loop with trivial axes degenerates to the same flat
 // `0..N` iteration the no-view path would emit.
 static FailureOr<PtrViewSource>
 resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
@@ -1718,6 +1543,18 @@ static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
   return indices;
 }
 
+// Per-lane vector load from a kernel-arg `!hc.ptr<global, T>`. Every lane
+// materializes its own fragment via per-element scalar `hc.ptr_offset` +
+// `hc.ptr_load` + `vector.insert`s; LLVM's SLP recombines adjacent
+// scalar loads when the slice is unit-stride. Switching to per-element
+// keeps a single shape for unit and non-unit stride and sidesteps the
+// i1 packed-vs-byte discrepancy that `vector.transfer_read` of
+// `vector<Nxi1>` triggered.
+//
+// `hc.load` / `hc.vload` reaching launch-body always have bare-vector
+// results: bare-tensor loads (workgroup-shared tiles) are funneled
+// through `hc-load-store-to-generic` + `hc-flatten-with-layouts` +
+// `hc-lower-generic` long before this pass walks them.
 template <typename OpT>
 struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
@@ -1726,39 +1563,19 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
-    auto resultPtrType = dyn_cast_if_present<PtrType>(converted);
     auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+    if (!resultVectorType)
+      return failure();
 
-    auto resultBareTensor = dyn_cast<BareTensorType>(op.getResult().getType());
     auto resultBareVector = dyn_cast<BareVectorType>(op.getResult().getType());
-
-    // The shape we'll iterate over per-element comes from the original HC
-    // result type — the converted ptr is rank-erased, the vector type
-    // already carries it.
-    SmallVector<int64_t> resultShape;
-    if (resultBareTensor) {
-      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
-          cast<SymbolicallyShapedTypeInterface>(resultBareTensor));
-      if (failed(dims))
-        return failure();
-      resultShape = std::move(*dims);
-    } else if (resultBareVector) {
-      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
-          cast<SymbolicallyShapedTypeInterface>(resultBareVector));
-      if (failed(dims))
-        return failure();
-      resultShape = std::move(*dims);
-    } else {
+    if (!resultBareVector)
       return failure();
-    }
-
-    Type elementType;
-    if (resultPtrType)
-      elementType = resultPtrType.getElementType();
-    else if (resultVectorType)
-      elementType = resultVectorType.getElementType();
-    if (!elementType)
+    FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
+        cast<SymbolicallyShapedTypeInterface>(resultBareVector));
+    if (failed(dims))
       return failure();
+    SmallVector<int64_t> resultShape = std::move(*dims);
+    Type elementType = resultVectorType.getElementType();
 
     Value source = [&]() -> Value {
       if constexpr (std::is_same_v<OpT, HCLoadOp>)
@@ -1794,33 +1611,6 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
         }) != static_cast<int64_t>(resultShape.size()))
       return op.emitOpError("load result rank must match slice subscript rank");
 
-    // LDS-staged result: use a cooperative per-lane copy so each thread of
-    // the wave only handles its share of the tile elements. The previous
-    // path materialized the whole tile as a per-lane vector, then had every
-    // lane redundantly write it to the same LDS bytes -- correct on paper
-    // but it drove SGPR spills into the hundreds and corrupted WMMA inputs
-    // on real gfx11 hardware.
-    if (resultPtrType) {
-      int64_t total = 1;
-      for (int64_t d : resultShape)
-        total *= d;
-      Value lds =
-          allocateWorkgroupPtr(rewriter, op.getLoc(), resultPtrType, total);
-      KernelArgSource argCopy = *kernelArg;
-      if (failed(emitCooperativeCopy(rewriter, op.getLoc(), op.getOperation(),
-                                     argCopy, axes, lds, resultShape,
-                                     elementType)))
-        return failure();
-      rewriter.replaceOp(op, lds);
-      return success();
-    }
-
-    // Per-lane vector result: each thread materializes its own fragment via
-    // per-element scalar `hc.ptr_offset` + `hc.ptr_load`s + `vector.insert`s.
-    // Switching to per-element keeps a single shape for unit and non-unit
-    // stride, sidesteps the i1 packed-vs-byte discrepancy that
-    // `vector.transfer_read` of `vector<Nxi1>` triggered, and lets LLVM's
-    // SLP recombine adjacent scalar loads when the slice is unit-stride.
     Value zero =
         arith::ConstantOp::create(rewriter, op.getLoc(), resultVectorType,
                                   rewriter.getZeroAttr(resultVectorType))

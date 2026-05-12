@@ -1293,7 +1293,7 @@ static PtrType workgroupPtrFor(BareTensorType bt) {
 }
 
 // Collective dispatch detector: at least one outs operand is
-// `!hc.ptr<workgroup, T>` (LDS-staged tile) or a `bare_tensor` view
+// `!hc.ptr<workgroup, T>` (workgroup-staged tile) or a `bare_tensor` view
 // (every bare-tensor SSA inside `gpu.launch` is workgroup-backed by
 // the launch-body type-converter convention — `hc.zeros : bare_tensor`
 // collapsed to `hc.alloc workgroup` + a UCC bridge to the still-
@@ -1347,11 +1347,11 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
 // Body emission reuses the trivial-partition single-clone path: each
 // in-range iteration loads one element per input operand, runs the
 // body once with the loaded ins + a per-element outs init load, and
-// stores the yielded scalars back at the same composed offset. The
-// outs init load is the same race-free pattern the cooperative copy
-// uses: each thread owns its element of the workgroup tile for the
-// duration of the body, so the load+store pair never sees a write
-// from another thread between them.
+// stores the yielded scalars back at the same composed offset. Each
+// thread owns its element of the workgroup tile for the duration of
+// the body, so the load+store pair never sees a write from another
+// thread between them; the closing `gpu.barrier` makes the chunk's
+// writes visible before the per-lane readers run.
 static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   Location loc = op.getLoc();
   OpBuilder builder(op);

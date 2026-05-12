@@ -1130,8 +1130,9 @@ shim, with no external ROCm install on the host. The pieces are:
    (`hc/schedules/front_to_hc.mlir`) lowers `hc_front` to `hc`,
    replaces every `hc.kernel` with a `gpu.launch` (`hc-lower-kernels-to-gpu-launch`)
    wrapping a `func.func` host wrapper, lowers `hc` ops in the launch
-   body to upstream dialects (`hc-lower-launch-body`, including the
-   cooperative LDS-staged copy for `group.load`), and stamps each
+   body to upstream dialects (`hc-lower-launch-body` for the per-op
+   scalar/control-flow surface, with workgroup-staged copies funneled
+   through `hc-flatten-with-layouts` + `hc-lower-generic`), and stamps each
    outlined `gpu.module` with a `#rocdl.target` carrying the resolved
    chip and `target-features` (the wave32 feature is mandatory on
    gfx10+ — without it WMMA silently miscompiles to a wave64 fragment

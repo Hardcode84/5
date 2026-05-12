@@ -378,10 +378,11 @@ Address space lowering:
 The 1D bare tensor → memory carrier transition has retired the
 workgroup-AS `memref<...xT, #gpu.address_space<workgroup>>` family
 *and* the kernel-arg `memref<?x?xT>` envelope from
-`HCLowerLaunchBodyPass.cpp`. Workgroup-staged tiles, the cooperative
-copy helper (`emitCooperativeCopy`), and the per-op load/store/select
-patterns now emit `hc.alloc` + `hc.ptr_offset` + `hc.ptr_load[_pred]` /
-`hc.ptr_store[_pred]` directly. The end-of-pipeline `hc-lower-to-llvm`
+`HCLowerLaunchBodyPass.cpp`. Workgroup-staged tiles flow through the
+`hc.generic` pipeline (`hc-load-store-to-generic` →
+`hc-flatten-with-layouts` → `hc-lower-generic`); the per-op
+load/store/select patterns in launch-body emit `hc.alloc` +
+`hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]` directly. The end-of-pipeline `hc-lower-to-llvm`
 pass rewrites that family into `!llvm.ptr` (workgroup → addrspace-3
 `llvm.mlir.global private` + `llvm.mlir.addressof`, private →
 `llvm.alloca` addrspace-5, predicated forms → `scf.if` / masked
@@ -575,8 +576,8 @@ This op is the single home for compute end-to-end:
 * `hc.store` rewrites into `hc.generic` with a value-typed input and
   a ptr/buffer out (all-parallel iters, no SSA result, body
   forwards the input element through `hc.yield`);
-* the cooperative copy helper becomes `hc.generic` with one
-  ptr/buffer input and one ptr/buffer output, all parallel iters;
+* workgroup-staged copy becomes `hc.generic` with one ptr/buffer
+  input and one ptr/buffer output, all parallel iters;
 * `as_layout` reorderings — when they survive flatten — also become
   `hc.generic` between two offset expressions;
 * fused compute-and-spill (e.g. matmul + LDS trace, GEMM + bias write)
@@ -626,10 +627,10 @@ hc.generic
 }
 ```
 
-The launch-body / cooperative-copy lowering picks up the predicated
-load and store off the mask directly — no hand-rolled OOB guard
-inside the rewriter, the predicate lives at the source-rewrite level
-on both sides.
+The launch-body / `hc.generic` lowering picks up the predicated load
+and store off the mask directly — no hand-rolled OOB guard inside the
+rewriter, the predicate lives at the source-rewrite level on both
+sides.
 
 Bound inference — `hc-infer-generic-bounds`:
 

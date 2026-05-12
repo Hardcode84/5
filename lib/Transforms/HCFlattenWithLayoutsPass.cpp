@@ -1195,9 +1195,8 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
 //
 // Anything else (multi-slice on a non-trivial layout, missing
 // `hc.slice_expr` producer for the slice operand, ...) bails to the
-// catch-all retyper. Today the only consumer that emits such patterns
-// is `hc-vec`-style WMMA tile loads through cooperative LDS; the
-// retire-cooperative-copy cleanup will narrow this further.
+// catch-all retyper. The remaining producer is `hc-vec`-style WMMA
+// tile loads through workgroup-staged LDS.
 struct ComposeBufferViewOffsets
     : public ComposeAccessOffsetBase<HCBufferViewOp> {
   using ComposeAccessOffsetBase::ComposeAccessOffsetBase;

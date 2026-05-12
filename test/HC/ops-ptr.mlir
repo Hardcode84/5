@@ -215,8 +215,8 @@ func.func @predicate_undef(%v: !hc.undef, %m: !hc.undef, %fill: !hc.undef)
 }
 
 // Pointer values flow through `scf.for` iter_args because `!hc.ptr` is
-// a legal `HC_ValueType`; this is how the post-flatten lowering will
-// hand a sliding workgroup pointer through a cooperative-copy loop.
+// a legal `HC_ValueType`; this is how the post-flatten lowering hands a
+// sliding workgroup pointer through a workgroup-staged copy loop.
 // CHECK-LABEL: func.func @ptr_through_scf
 // CHECK: scf.for %{{[^ ]+}} = %{{[^ ]+}} to %{{[^ ]+}} step %{{[^ ]+}} iter_args(%[[ARG:[^ ]+]] = %{{[^)]+}}) -> (!hc.ptr<workgroup, f16>)
 // CHECK: %[[NEXT:.*]] = hc.ptr_offset %[[ARG]], %{{.*}}

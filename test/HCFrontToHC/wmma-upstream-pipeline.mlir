@@ -3,10 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // End-to-end snapshot of the canonical `amdgpu-gfx11` WMMA lowering pipeline.
-// Mirrors the composition that `hc.compile` runs — the schedule in
+// Hand-rolls the composition `hc.compile` runs — the schedule in
 // `hc/schedules/front_to_hc.mlir` plus the `_GPU_LOWERING_PIPELINE` chain in
-// `hc/_pipeline.py` — as a hand-rolled `hc-opt` pass list, so this LIT can
-// run from any builder that has `hc-opt` in PATH. Pins the load-bearing
+// `hc/_pipeline.py` — as an `hc-opt` pass list. Driving the actual schedule
+// via `transform-interpreter` from inside `hc-opt` would be more
+// drift-resistant, but the interpreter's nested pass manager races on
+// loading the `dlti` dialect (an LLVM ERROR), so we stick with the
+// hand-rolled list; the WMMA pytest exercises the real `hc.compile`
+// composition and catches drift between the two. Pins the load-bearing
 // invariants of the executable lowering chain:
 //
 //   * `hc.kernel` becomes a host wrapper that ends up as `llvm.func` after
@@ -26,7 +30,7 @@
 // `sed` keeps only the prefix up through `bin = "` on the gpu.binary line.
 //
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
-// RUN:   | hc-opt --pass-pipeline='builtin.module(hc-front-fold-region-defs,hc-front-inline,convert-hc-front-to-hc,hc-promote-names,hc-infer-types,hc-materialize-bound-exprs,hc-verify-static-shapes,hc-decompose-shaped-values{strict=false},hc-inline-helpers,hc-materialize-bound-exprs,canonicalize,hc-normalize-scope-regions,canonicalize,cse,hc-lower-kernels-to-gpu-launch,hc-lower-launch-body,canonicalize,cse,hc-interpret-intrinsic-recipes{target=amdgpu-gfx11},canonicalize,cse,gpu-launch-sink-index-computations,gpu-kernel-outlining,canonicalize,cse,gpu.module(fold-memref-alias-ops),lower-affine,gpu.module(lower-affine),canonicalize,cse,hc-lower-to-llvm,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},lower-affine,gpu.module(lower-affine,convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),rocdl-attach-target{chip=gfx1100},gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,canonicalize,cse,hc-lower-gpu-to-binary{lld-path=%hc_lld},hc-lower-launch-func-to-runtime,symbol-dce)' \
+// RUN:   | hc-opt --pass-pipeline='builtin.module(hc-front-fold-region-defs,hc-front-inline,convert-hc-front-to-hc,hc-promote-names,hc-infer-types,hc-materialize-bound-exprs,hc-verify-static-shapes,hc-decompose-shaped-values{strict=false},hc-inline-helpers,hc-materialize-bound-exprs,canonicalize,hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds,hc-normalize-scope-regions,canonicalize,cse,hc-lower-kernels-to-gpu-launch,hc-flatten-with-layouts,canonicalize,cse,hc-lower-launch-body,canonicalize,cse,hc-lower-generic,hc-fold-predicates,hc-lower-launch-body,canonicalize,cse,hc-interpret-intrinsic-recipes{target=amdgpu-gfx11},canonicalize,cse,gpu-launch-sink-index-computations,gpu-kernel-outlining,canonicalize,cse,rocdl-attach-target{chip=gfx1100 features=+wavefrontsize32},hc-lower-to-llvm,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},gpu.module(convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,hc-lower-gpu-to-binary{lld-path=%hc_lld},hc-lower-launch-func-to-runtime,symbol-dce)' \
 // RUN:   | sed 's/\(@[A-Za-z0-9_]*_data[A-Za-z0-9_]* *(\)"[^"]*"/\1"<HSACO>"/' \
 // RUN:   | FileCheck %s --implicit-check-not='hc.' --implicit-check-not='!hc.' --implicit-check-not='gpu.' --implicit-check-not='amdgpu.' --implicit-check-not='vector.transfer'
 

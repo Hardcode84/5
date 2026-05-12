@@ -358,7 +358,7 @@ func.func @scalar_fallback_index_bound(%n: index,
 
 // -----
 
-// Collective dispatch: outs is a `!hc.ptr<workgroup, T>` (LDS-staged
+// Collective dispatch: outs is a `!hc.ptr<workgroup, T>` (workgroup-staged
 // tile), every iter is parallel, and the op sits inside `gpu.launch`.
 // The pass picks the chunk-and-publish shape instead of `scf.parallel`
 // — every thread of the wave processes a strided subset of the

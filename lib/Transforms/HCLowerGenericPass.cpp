@@ -1215,13 +1215,43 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
   return bodyStatus;
 }
 
+// Walk a chain of `builtin.unrealized_conversion_cast` ops up from
+// `v` looking for an underlying `!hc.ptr<workgroup, T>` source. Used
+// to admit `bare_tensor` outs whose backing storage is an LDS
+// allocation surfaced through a UCC view: the op's outs is shaped as
+// `bare_tensor`, but the SSA chain back to its producer
+// (`hc.alloc workgroup`, kernel-arg materialization, ...) goes
+// through one or more single-operand UCCs. Returns the resolved ptr
+// when found, null otherwise.
+//
+// Conservative on chains that branch (multi-result UCCs) or where the
+// chain dead-ends at a block argument or non-UCC op without a
+// workgroup-ptr type: returns null, letting the caller fall through
+// to the value-outs / partition paths. Walking only through `UCC`
+// keeps the resolver scoped to the materialization pattern; widening
+// to other view ops would need a per-op semantic check
+// (`hc.buffer_view` reshapes, etc.).
+static Value resolveWorkgroupPtr(Value v) {
+  while (v) {
+    if (auto ptr = dyn_cast<PtrType>(v.getType()))
+      if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+        return v;
+    auto ucc = v.getDefiningOp<UnrealizedConversionCastOp>();
+    if (!ucc || ucc.getNumOperands() != 1 || ucc.getNumResults() != 1)
+      return Value();
+    v = ucc.getOperand(0);
+  }
+  return Value();
+}
+
 // Collective dispatch detector: at least one outs operand is
-// `!hc.ptr<workgroup, T>` (LDS-staged tile), every iter is parallel
-// (no cross-thread accumulation), and the op sits inside a
-// `gpu.launch` (we need the dim3 thread/block layout to chunk the
-// iter space across the wave). Per-lane outs falls through to the
-// existing partition-aware path — running scf.parallel without
-// partitioning is the correct shape for lane-local results.
+// `!hc.ptr<workgroup, T>` (LDS-staged tile) or a `bare_tensor` view
+// backed by one via a UCC chain, every iter is parallel (no cross-
+// thread accumulation), and the op sits inside a `gpu.launch` (we
+// need the dim3 thread/block layout to chunk the iter space across
+// the wave). Per-lane outs falls through to the existing partition-
+// aware path — running scf.parallel without partitioning is the
+// correct shape for lane-local results.
 //
 // The workgroup-ptr signal is the dispositive one: a workgroup tile
 // is shared state, so emitting "every lane runs every iteration"
@@ -1230,14 +1260,27 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
 // reduction needs cross-thread synchronization the collective shape
 // doesn't model, and the chunk loop's `lin_tid` source disappears
 // outside a launch.
+//
+// `bare_tensor` outs are admitted iff their UCC chain resolves to a
+// workgroup ptr; otherwise they're stand-alone shaped values and
+// belong on the value-outs path (`vector.from_elements` + UCC back).
+// Mixed outs (some `bare_tensor`, some `ptr<workgroup>`) work since
+// the emit resolves each to its underlying ptr at the access site.
 static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
   bool hasWorkgroupOut = false;
   for (Value v : op.getOuts()) {
-    auto ptr = dyn_cast<PtrType>(v.getType());
-    if (!ptr)
-      return false;
-    if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+    if (auto ptr = dyn_cast<PtrType>(v.getType())) {
+      if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+        hasWorkgroupOut = true;
+      continue;
+    }
+    if (isa<BareTensorType>(v.getType())) {
+      if (!resolveWorkgroupPtr(v))
+        return false;
       hasWorkgroupOut = true;
+      continue;
+    }
+    return false;
   }
   if (!hasWorkgroupOut)
     return false;
@@ -1338,12 +1381,23 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
             HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
       }
 
+      // Resolve each outs to the concrete `!hc.ptr<workgroup, T>` we
+      // emit accesses against. Direct ptr outs are themselves; bare-
+      // tensor outs surface their backing storage through a UCC
+      // chain captured at the op level (the candidate gate already
+      // verified the resolution succeeds).
       ArrayAttr outsOff = op.getOutsOffsetsAttr();
+      SmallVector<Value> outsPtrs(op.getOuts().size());
+      for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
+        Value out = op.getOuts()[oi];
+        outsPtrs[oi] =
+            isa<PtrType>(out.getType()) ? out : resolveWorkgroupPtr(out);
+      }
       SmallVector<Value> outsVals(op.getOuts().size());
       for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
         ExprAttr origOff = getOperandOffset(outsOff, oi);
         Value off = emitOffset(builder, loc, origOff, scope);
-        Value ptr = op.getOuts()[oi];
+        Value ptr = outsPtrs[oi];
         Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
         Value addr =
             HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
@@ -1361,7 +1415,7 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
         for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
           ExprAttr origOff = getOperandOffset(outsOff, oi);
           Value off = emitOffset(builder, loc, origOff, scope);
-          Value ptr = op.getOuts()[oi];
+          Value ptr = outsPtrs[oi];
           Value addr =
               HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
                   .getResult();
@@ -1379,6 +1433,15 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   // need it; the cost is trivial and the canonicalizer leaves it
   // alone deliberately.
   gpu::BarrierOp::create(builder, loc);
+
+  // The generic's result (`bare_tensor` value, when present) is the
+  // post-write logical view of the same storage the cooperative
+  // emit just populated. Replace it with the original outs SSA so
+  // downstream consumers (typically a follow-up UCC back to
+  // `!hc.ptr<workgroup>`) see the input chain and fold cleanly,
+  // instead of dangling against the erased generic.
+  for (auto [res, out] : llvm::zip(op.getResults(), op.getOuts()))
+    res.replaceAllUsesWith(out);
   return success();
 }
 
@@ -1742,22 +1805,36 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
 // path verb-for-verb to the scalar baseline (single scalar load /
 // store per operand, body cloned once per innermost iteration).
 //
-// Collective candidates (workgroup-shared outs inside a launch)
-// route through `lowerCollective` instead — the chunk-and-publish
-// shape is the right loop nest for cooperative tile population, and
-// running `lowerWithPartition` against shared outs would have every
-// thread of the wave fight every other thread for every element.
-//
-// Any value-typed operand (ins or outs) routes through
-// `lowerValueOuts` regardless of the launch / workgroup signal — the
-// result has to live in a single SSA register and value-typed ins
-// only have a per-lane `vector.extract` materialization, so the
-// parallel sweep must be compile-time-unrolled rather than scattered
-// across `scf.parallel` iterations.
+// Dispatch order is significant:
+//   * Collective first — workgroup-shared outs (direct
+//     `!hc.ptr<workgroup>` or `bare_tensor` UCC-backed by one) inside
+//     a `gpu.launch` route to `lowerCollective`. Per-lane unroll
+//     against shared state would have every thread fight every other
+//     thread for every element, so a `bare_tensor` carrier whose
+//     backing storage is LDS has to be partitioned across the wave
+//     even though the carrier type would otherwise admit the value-
+//     outs path. `lowerCollective` RAUWs its result(s) to the
+//     original outs SSA (the bare_tensor view of the same storage).
+//   * Value-typed operands next — `lowerValueOuts` compile-time-
+//     unrolls the parallel sweep so a single SSA register can hold
+//     the result; value-typed ins have only a per-lane
+//     `vector.extract` materialization. Stand-alone `bare_tensor`
+//     outs (no `gpu.launch` ancestor, so no backing LDS) reach this
+//     path and ride the same compose-and-UCC-back shape as
+//     `bare_vector` outs.
+//   * Otherwise — the partition-aware emitter handles all-ptr
+//     generics with no workgroup-shared outs.
 static LogicalResult lowerOne(HCGenericOp op) {
   MLIRContext *ctx = op.getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   SmallVector<IterAxis> axes = collectIterAxes(op);
+
+  if (isCollectiveCandidate(op, axes)) {
+    if (failed(lowerCollective(op, axes)))
+      return failure();
+    op.erase();
+    return success();
+  }
 
   if (hasValueOuts(op) || hasValueIns(op)) {
     if (failed(lowerValueOuts(op, axes)))
@@ -1766,20 +1843,14 @@ static LogicalResult lowerOne(HCGenericOp op) {
     return success();
   }
 
-  if (isCollectiveCandidate(op, axes)) {
-    if (failed(lowerCollective(op, axes)))
-      return failure();
-  } else {
-    auto [order, p] = selectBest(op, axes, store);
-    if (failed(lowerWithPartition(op, axes, order, p)))
-      return failure();
-  }
+  auto [order, p] = selectBest(op, axes, store);
+  if (failed(lowerWithPartition(op, axes, order, p)))
+    return failure();
 
-  // Ptr-only outs produce zero SSA results, so erasing is sufficient.
-  // The candidate check + `hasValueOuts` early-return upstream
-  // guarantees this branch only sees zero-result generics; the
-  // belt-and-suspenders error keeps a future relaxation of either
-  // gate from silently losing results.
+  // The partition path is the all-ptr-out branch — those produce no
+  // SSA results, so erasing is sufficient. The belt-and-suspenders
+  // error keeps a future relaxation of the candidate gates from
+  // silently losing results on this path.
   if (op.getNumResults() != 0)
     return op.emitOpError("ptr-out lowering only handles all-ptr outs "
                           "(zero SSA results)");

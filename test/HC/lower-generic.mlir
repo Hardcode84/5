@@ -546,6 +546,103 @@ func.func @workgroup_outs_with_reduction_falls_through(
 
 // -----
 
+// `bare_tensor` outs backed by `hc.alloc workgroup` via a UCC chain
+// inside `gpu.launch`: the outs carrier type is `bare_tensor` (the
+// shape view), the underlying storage is an LDS allocation. The
+// dispatch resolves the UCC chain, routes to the collective shape,
+// and stores through the resolved `!hc.ptr<workgroup>`. The
+// generic's `bare_tensor` SSA result RAUWs to the original outs SSA
+// so the downstream UCC back to `!hc.ptr<workgroup>` folds cleanly
+// against the alloc instead of dangling.
+// CHECK-LABEL: func.func @collective_bare_tensor_ucc_lds
+// CHECK: gpu.launch
+// CHECK: %[[ALLOC:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
+// CHECK: %[[TILE:.+]] = builtin.unrealized_conversion_cast %[[ALLOC]]
+// CHECK-SAME: !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["256"]>
+// CHECK: scf.for
+// CHECK: scf.if
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<global, f32> -> f32
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
+// CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
+// CHECK: gpu.barrier
+// CHECK: %[[BACK:.+]] = builtin.unrealized_conversion_cast %[[TILE]]
+// CHECK-SAME: !hc.bare_tensor<f32, ["256"]> to !hc.ptr<workgroup, f32>
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
+// CHECK-NOT: hc.generic
+// CHECK-NOT: vector.from_elements
+func.func @collective_bare_tensor_ucc_lds(%src: !hc.ptr<global, f32>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  %c256 = arith.constant 256 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %lds = hc.alloc count = %c256 : index -> !hc.ptr<workgroup, f32>
+    %tile = builtin.unrealized_conversion_cast %lds
+        : !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["256"]>
+    %m = hc.idx_apply () : () -> !hc.idx<"16">
+    %n = hc.idx_apply () : () -> !hc.idx<"16">
+    %r = hc.generic
+        iter (parallel i_0 = %m : !hc.idx<"16">,
+              parallel i_1 = %n : !hc.idx<"16">)
+        ins (%src at [#hc.expr<"16*i_0 + i_1">] : !hc.ptr<global, f32>)
+        outs (%tile at [#hc.expr<"16*i_0 + i_1">]
+              : !hc.bare_tensor<f32, ["256"]>)
+        -> (!hc.bare_tensor<f32, ["256"]>) {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield %sv : f32
+    }
+    %back = builtin.unrealized_conversion_cast %r
+        : !hc.bare_tensor<f32, ["256"]> to !hc.ptr<workgroup, f32>
+    %addr = hc.ptr_offset %back, %c1
+        : (!hc.ptr<workgroup, f32>, index) -> !hc.ptr<workgroup, f32>
+    %v = hc.ptr_load %addr : !hc.ptr<workgroup, f32> -> f32
+    gpu.terminator
+  }
+  return
+}
+
+// -----
+
+// `bare_tensor` outs whose UCC chain doesn't resolve to a workgroup
+// ptr (here: the outs SSA is a function argument with no defining
+// op) inside `gpu.launch`: the collective gate rejects (no backing
+// LDS to chunk against), the op falls through to the value-outs
+// path and rides the compose-and-UCC-back shape `bare_vector` outs
+// use. This is the regression guard against the dispatcher routing
+// every `bare_tensor`-out-in-launch through collective.
+// CHECK-LABEL: func.func @bare_tensor_in_launch_no_ucc_falls_through
+// CHECK: gpu.launch
+// CHECK-NOT: gpu.barrier
+// CHECK: vector.from_elements
+// CHECK-SAME: vector<256xf32>
+// CHECK: builtin.unrealized_conversion_cast
+// CHECK-SAME: vector<256xf32> to !hc.bare_tensor<f32, ["256"]>
+// CHECK-NOT: hc.generic
+func.func @bare_tensor_in_launch_no_ucc_falls_through(
+    %src: !hc.ptr<global, f32>, %init: !hc.bare_tensor<f32, ["256"]>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %m = hc.idx_apply () : () -> !hc.idx<"16">
+    %n = hc.idx_apply () : () -> !hc.idx<"16">
+    %r = hc.generic
+        iter (parallel i_0 = %m : !hc.idx<"16">,
+              parallel i_1 = %n : !hc.idx<"16">)
+        ins (%src at [#hc.expr<"16*i_0 + i_1">] : !hc.ptr<global, f32>)
+        outs (%init at [#hc.expr<"16*i_0 + i_1">]
+              : !hc.bare_tensor<f32, ["256"]>)
+        -> (!hc.bare_tensor<f32, ["256"]>) {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield %sv : f32
+    }
+    gpu.terminator
+  }
+  return
+}
+
+// -----
+
 // Value-typed out: ptr ins + bare_vector out, single parallel iter
 // with a constant bound. The value-outs lowering unrolls the
 // parallel sweep at compile time (no `scf.parallel`), composes

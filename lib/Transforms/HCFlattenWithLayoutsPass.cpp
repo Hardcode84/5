@@ -518,19 +518,19 @@ composeAccessBaseOffset(ConversionPatternRewriter &rewriter, Operation *op,
   for (auto [name, value] : llvm::zip_equal(implicitSyms, shapedAux))
     bindings[name] = value;
 
-  for (Value idx : indices) {
-    auto idxType = dyn_cast<IdxType>(idx.getType());
+  // Only bind when the type pins a *bare* free symbol. Composite
+  // expressions (`i + 1`, `i * stride`) are not their own binding for
+  // any single name; the value-as-binding shortcut only applies when
+  // the type's symbol set is exactly `{name}` and the expression *is*
+  // that symbol leaf. The cheapest check: walk and single-out a
+  // unique name, then confirm by reconstruction.
+  auto pinsBareSymbol = [&store](Type type) -> StringRef {
+    auto idxType = dyn_cast<IdxType>(type);
     if (!idxType)
-      continue;
+      return {};
     ExprAttr expr = idxType.getExpr();
     if (!expr)
-      continue;
-    // Only bind when the type pins a *bare* free symbol. Composite
-    // expressions (`i + 1`, `i * stride`) are not their own binding
-    // for any single name; the value-as-binding shortcut only
-    // applies when the type's symbol set is exactly `{name}` and the
-    // expression *is* that symbol leaf. The cheapest check: walk and
-    // single-out a unique name, then confirm by reconstruction.
+      return {};
     StringRef onlyName;
     bool unique = true;
     sym::walkSymbolNames(expr.getValue(), [&](StringRef name) {
@@ -540,14 +540,45 @@ composeAccessBaseOffset(ConversionPatternRewriter &rewriter, Operation *op,
         unique = false;
     });
     if (!unique || onlyName.empty())
-      continue;
+      return {};
     auto pinned = sym::composeExprSym(store, onlyName);
     if (failed(pinned))
-      continue;
+      return {};
     if (pinned->raw() != expr.getValue().raw())
+      return {};
+    return onlyName;
+  };
+
+  for (Value idx : indices) {
+    StringRef name = pinsBareSymbol(idx.getType());
+    if (name.empty())
       continue;
     // Don't overwrite a binding from the operand's expansion.
-    bindings.try_emplace(onlyName, idx);
+    bindings.try_emplace(name, idx);
+  }
+
+  // Walk enclosing region/loop block arguments (the canonical example
+  // is an `hc.for_range` induction variable typed
+  // `!hc.idx<"$join0">`) and bind any bare-sym `!hc.idx` we find.
+  // Without this the composed offset would leave such names as free
+  // symbols, and the launch-body lowering would have to resolve them
+  // ambiently — fragile, because the structured-loop converter
+  // rewrites the for_range to `scf.for` before the inner apply gets
+  // lowered, and at that point the original `!hc.idx<sym>` type is
+  // gone from the IR. Explicit operand binding here keeps the apply's
+  // free-sym set bounded to the launch geometry and kernel-arg shape
+  // syms.
+  for (Block *block = op->getBlock(); block;) {
+    for (BlockArgument arg : block->getArguments()) {
+      StringRef name = pinsBareSymbol(arg.getType());
+      if (name.empty())
+        continue;
+      bindings.try_emplace(name, arg);
+    }
+    Operation *parent = block->getParentOp();
+    if (!parent)
+      break;
+    block = parent->getBlock();
   }
 
   return materializeOffsetSSA(rewriter, op->getLoc(), *offsetExpr, bindings);

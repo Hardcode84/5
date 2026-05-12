@@ -166,9 +166,6 @@ module attributes {transform.with_named_sequence} {
     // ride on `hc.generic`'s `ambient_idxs` slot, captured by
     // `hc-flatten-with-layouts` while the kernel-arg bundle UCC
     // chain and structured-loop induction vars were still HC-typed).
-    // So lower-generic's output has no surviving sym-free applies for
-    // a downstream resolver to chase — no second launch-body call,
-    // no UCC-chain preservation hack needed.
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
         : (!transform.any_op) -> !transform.any_op
     // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as
@@ -180,6 +177,24 @@ module attributes {transform.with_named_sequence} {
     // not just on `hc-lower-generic`'s output.
     %m13af = transform.apply_registered_pass "hc-fold-predicates" to %m13a
         : (!transform.any_op) -> !transform.any_op
+    // Second `hc-lower-launch-body` invocation: the per-lane offsets
+    // emitted by `hc-lower-generic` surface as fresh `hc.idx_apply`
+    // ops that still need to be rewritten to plain `arith.*` /
+    // `index_cast` arithmetic before LLVM translation. Re-running
+    // launch-body picks them up via `ConvertIdxApplyOp`; the ambient
+    // sym walker that used to be load-bearing here is now redundant
+    // (every apply already has its sym operands explicit, planted by
+    // `emitOffset` against `seedAmbientScope`'s map), but the
+    // conversion patterns are the only `hc.idx_apply -> arith` path
+    // in the pipeline. The first invocation's body conversion target
+    // is idempotent on the IR shape it produced; only the surviving
+    // applies match.
+    %m13ar = transform.apply_registered_pass "hc-lower-launch-body" to %m13af
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13ar {
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %m13ar : !transform.any_op
     // The `__HC_TARGET__` placeholder is substituted by the Python
     // driver before the schedule is handed to the transform
     // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the
@@ -192,7 +207,7 @@ module attributes {transform.with_named_sequence} {
     // The pass is also a no-op for kernels that never use intrinsics:
     // no lowerings module, no calls, nothing to diagnose.
     %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
-        with options = { "target" = "__HC_TARGET__" } to %m13af
+        with options = { "target" = "__HC_TARGET__" } to %m13ar
         : (!transform.any_op) -> !transform.any_op
     // Cleanup pair folds away every `unrealized_conversion_cast` the
     // recipe-side `transform.hc.cast_value` planted around the freshly

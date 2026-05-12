@@ -530,6 +530,20 @@ static bool hasValueOuts(HCGenericOp op) {
   return false;
 }
 
+// True when this op has at least one value-typed (non-ptr) ins
+// operand. The fully-unrolled emitter materializes those via per-lane
+// `vector.extract` against a compile-time slot index (gather pattern);
+// the partition-aware emitter has no shape for that — it loads each
+// lane through `hc.ptr_load`, which requires a `!hc.ptr` carrier. So
+// value-typed ins force the same fully-unrolled dispatch as value-
+// typed outs.
+static bool hasValueIns(HCGenericOp op) {
+  for (Value v : op.getIns())
+    if (!isa<PtrType>(v.getType()))
+      return true;
+  return false;
+}
+
 // Pre-flight check: returns `true` when this op matches the v0
 // codegen scope. The ptr-only path accepts any rank-1 offset with
 // resolved iter bounds. The value-outs path additionally requires
@@ -550,9 +564,19 @@ static bool isV0Candidate(HCGenericOp op) {
     auto p = dyn_cast<PtrType>(v.getType());
     return p && p.getElementType();
   };
-  for (Value v : op.getIns())
-    if (!goodPtr(v))
+  // Value-typed ins are accepted when the carrier resolves to a
+  // compile-time lane count (rank-1, integer-literal shape — same
+  // gate the outs side uses). The actual per-lane slot evaluation
+  // happens in `lowerValueOuts`; the candidate gate just admits the
+  // op into the fully-unrolled path.
+  bool hasValIn = false;
+  for (Value v : op.getIns()) {
+    if (goodPtr(v))
+      continue;
+    if (!getValueOutLaneCount(v.getType()))
       return false;
+    hasValIn = true;
+  }
   bool hasValOut = false;
   for (Value v : op.getOuts()) {
     if (goodPtr(v))
@@ -576,14 +600,14 @@ static bool isV0Candidate(HCGenericOp op) {
   for (Operation &nested : op.getBody().front())
     if (isa<scf::IfOp>(nested))
       return false;
-  if (!hasValOut)
+  if (!hasValOut && !hasValIn)
     return true;
 
-  // Value-outs-specific extra conditions. Iter bounds: each one must
-  // resolve to a compile-time integer (either an `arith.constant`
-  // index value or an `!hc.idx<"<int>">`-typed SSA bound — the
-  // frontend planting `hc.const` against an integer-only shape is
-  // the canonical case).
+  // Fully-unrolled-path conditions (any value-typed operand). Iter
+  // bounds: each one must resolve to a compile-time integer (either
+  // an `arith.constant` index value or an `!hc.idx<"<int>">`-typed
+  // SSA bound — the frontend planting `hc.const` against an integer-
+  // only shape is the canonical case).
   llvm::StringSet<> iterNames;
   for (Attribute s : op.getIterSymsAttr())
     iterNames.insert(cast<StringAttr>(s).getValue());
@@ -600,30 +624,51 @@ static bool isV0Candidate(HCGenericOp op) {
     if (!v || *v < 0)
       return false;
   }
-  // All iters must be parallel — the value-outs compose threads
-  // every parLane through the result vector, and a reduction iter
-  // would need cross-lane carry that the boundary form doesn't
-  // model in v0.
+  // All iters must be parallel — the unrolled emitter threads every
+  // parLane through the result vector / store sequence, and a
+  // reduction iter would need cross-lane carry that the boundary
+  // form doesn't model. Value-typed ins reuse the same constraint:
+  // the gather slot is a function of iter syms alone, and a reduction
+  // iter would mean the same value-in lane gets read at different
+  // reduction steps with no scf-loop carry to express it.
   for (Attribute k : op.getIterKindsAttr())
     if (cast<IterKindAttr>(k).getValue() != IterKind::Parallel)
       return false;
-  // Body terminator must be `hc.yield` — predicated-yield against
-  // a value-out needs select-at-the-boundary, deferred to v1.
-  if (!isa<HCYieldOp>(op.getBody().front().back()))
+  // Body terminator: `hc.yield` (unconditional publish) or
+  // `hc.yield_predicated` (per-value mask gate → `arith.select` at
+  // the boundary in `cloneBody`). Anything else escaped the emitters
+  // we know about.
+  Operation &term = op.getBody().front().back();
+  if (!isa<HCYieldOp, HCYieldPredicatedOp>(&term))
     return false;
   // Outs offset's free syms must be a subset of iter syms; ambient
   // syms (shape / stride params) would make slot evaluation
-  // ambient-dependent.
-  for (Attribute perOp : outsOff) {
-    auto off = cast<ExprAttr>(cast<ArrayAttr>(perOp)[0]);
-    bool ok = true;
-    sym::walkSymbolNames(off.getValue(), [&](StringRef name) {
-      if (!iterNames.contains(name))
-        ok = false;
-    });
-    if (!ok)
-      return false;
-  }
+  // ambient-dependent. Value-typed ins offsets are the per-lane slot
+  // expressions and follow the same constraint — `lowerValueOuts`
+  // constant-evaluates them at every parallel-lane combo.
+  auto offsetFreeSymsOk = [&](ArrayAttr arr, OperandRange operands) {
+    for (auto [a, v] : llvm::zip_equal(arr, operands)) {
+      // Ptr operands carry their offset against the source pointer
+      // and may reference ambient syms (the `emitOffset` path
+      // resolves them via `loopScope` + ambient bindings); only the
+      // value-typed operands need slot-eval, and slot-eval needs
+      // iter-only.
+      if (isa<PtrType>(v.getType()))
+        continue;
+      auto off = cast<ExprAttr>(cast<ArrayAttr>(a)[0]);
+      bool ok = true;
+      sym::walkSymbolNames(off.getValue(), [&](StringRef name) {
+        if (!iterNames.contains(name))
+          ok = false;
+      });
+      if (!ok)
+        return false;
+    }
+    return true;
+  };
+  if (!offsetFreeSymsOk(insOff, op.getIns()) ||
+      !offsetFreeSymsOk(outsOff, op.getOuts()))
+    return false;
   return true;
 }
 
@@ -699,11 +744,40 @@ static Value emitOffset(OpBuilder &builder, Location loc, ExprAttr offsetExpr,
   return castIdxToIndex(builder, loc, applied);
 }
 
+// UCC a per-lane mask to the type `arith.select` requires (`i1` for
+// scalar selects, `vector<Nxi1>` for vector selects). Inputs at this
+// boundary are whatever the body's mask block arg resolved to —
+// commonly `!hc.pred` (which the broader pipeline lowers to `i1`
+// downstream) or already `i1`. The UCC pair canonicalises away when
+// the producer side is the matching i1.
+static Value coerceMaskToI1(OpBuilder &builder, Location loc, Value mask,
+                            Type valueType) {
+  Type want;
+  if (auto vt = dyn_cast<mlir::VectorType>(valueType))
+    want = mlir::VectorType::get(vt.getShape(), builder.getI1Type());
+  else
+    want = builder.getI1Type();
+  if (mask.getType() == want)
+    return mask;
+  return UnrealizedConversionCastOp::create(builder, loc, want, mask)
+      .getResult(0);
+}
+
 // Body cloner. Replaces block-arg references with their loaded /
-// carry values via the IR mapping, drops the `hc.yield` (its values
-// are surfaced through `yieldedOut` for the caller to feed into the
-// SCF loop's terminator), and emits the cloned ops at the builder's
-// current insertion point.
+// carry values via the IR mapping, lowers the body's terminator, and
+// emits the cloned ops at the builder's current insertion point.
+//
+// Terminator handling:
+//   * `hc.yield` — surface the yielded SSAs verbatim through
+//     `yieldedOut` for the caller to feed into the enclosing
+//     `scf.for` carry or the per-lane store path.
+//   * `hc.yield_predicated` — position `i` becomes
+//     `arith.select(mask, val, outsVals[i])`, so masked-out lanes
+//     preserve the init (the outs-as-init carry the per-lane
+//     init-load just published). Mask is coerced to `i1` /
+//     `vector<Nxi1>` via UCC because the body-side carrier is often
+//     `!hc.pred` and the broader pipeline owns the actual
+//     pred-to-i1 resolution.
 static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
                                ValueRange insVals, ValueRange outsVals,
                                SmallVectorImpl<Value> &yieldedOut) {
@@ -714,19 +788,41 @@ static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
     mapping.map(src.getArgument(pos++), v);
   for (Value v : outsVals)
     mapping.map(src.getArgument(pos++), v);
-  auto yield = dyn_cast<HCYieldOp>(src.back());
-  if (!yield)
-    return op.emitOpError("body must end with `hc.yield`");
+  Operation &term = src.back();
   for (Operation &nested : src) {
-    if (&nested == yield.getOperation())
+    if (&nested == &term)
       break;
     builder.clone(nested, mapping);
   }
   yieldedOut.clear();
-  yieldedOut.reserve(yield.getValues().size());
-  for (Value v : yield.getValues())
-    yieldedOut.push_back(mapping.lookupOrDefault(v));
-  return success();
+  if (auto yield = dyn_cast<HCYieldOp>(&term)) {
+    yieldedOut.reserve(yield.getValues().size());
+    for (Value v : yield.getValues())
+      yieldedOut.push_back(mapping.lookupOrDefault(v));
+    return success();
+  }
+  if (auto pyield = dyn_cast<HCYieldPredicatedOp>(&term)) {
+    auto vals = pyield.getValues();
+    auto masks = pyield.getMasks();
+    if (vals.size() != outsVals.size())
+      return op.emitOpError(
+          "yield_predicated arity does not match outs operand count");
+    if (vals.size() != masks.size())
+      return op.emitOpError("yield_predicated values/masks size mismatch");
+    yieldedOut.reserve(vals.size());
+    Location loc = op.getLoc();
+    for (auto [v, m, init] : llvm::zip_equal(vals, masks, outsVals)) {
+      Value mapped = mapping.lookupOrDefault(v);
+      Value mappedMask = mapping.lookupOrDefault(m);
+      Value i1Mask = coerceMaskToI1(builder, loc, mappedMask, mapped.getType());
+      Value sel = arith::SelectOp::create(builder, loc, i1Mask, mapped, init)
+                      .getResult();
+      yieldedOut.push_back(sel);
+    }
+    return success();
+  }
+  return op.emitOpError(
+      "body must end with `hc.yield` or `hc.yield_predicated`");
 }
 
 // Materialize one lane's offset as `index`-typed SSA via
@@ -824,11 +920,16 @@ static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
   HCPtrStoreOp::create(builder, loc, vec, baseAddr);
 }
 
-// Emit per-lane loads for every input of `op`, returning a flat
-// `[in_idx][lane]` 2D buffer of SSA values. Per-input contig groups
-// drive load shape: scalar groups emit single `hc.ptr_load`, groups
-// of size > 1 emit vector loads + extracts. Lanes are decomposed
-// against every iter axis (mask = all-true).
+// Emit per-lane loads for every ptr-typed input of `op`, returning a
+// flat `[in_idx][lane]` 2D buffer of SSA values. Per-input contig
+// groups drive load shape: scalar groups emit single `hc.ptr_load`,
+// groups of size > 1 emit vector loads + extracts. Lanes are
+// decomposed against every iter axis (mask = all-true). Value-typed
+// ins are left empty in `result` — only the fully-unrolled emitter
+// reaches them, and it fills the entries via `vector.extract` against
+// the precomputed gather-slot table; the partition path never sees
+// value-typed ins (`isV0Candidate` gates them through the unrolled
+// path) so leaving the entry empty there is unreachable.
 static SmallVector<SmallVector<Value>>
 emitInsLoadsLaned(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
                   ArrayRef<size_t> order, ArrayRef<int> p,
@@ -840,11 +941,13 @@ emitInsLoadsLaned(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
   ArrayAttr insOff = op.getInsOffsetsAttr();
   SmallVector<bool, 4> allMask(axes.size(), true);
   for (size_t ii = 0; ii < numIns; ++ii) {
+    Value ptr = op.getIns()[ii];
+    if (!isa<PtrType>(ptr.getType()))
+      continue;
     ExprAttr origOff = getOperandOffset(insOff, ii);
     SmallVector<sym::ExprHandle> offs =
         laneOffsets(store, origOff, axes, order, p, allMask, prodAll);
     auto groups = findContigGroups(store, offs);
-    Value ptr = op.getIns()[ii];
     Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
     result[ii].resize(prodAll);
     for (const ContigGroup &g : groups) {
@@ -1324,25 +1427,57 @@ buildZeroIterScope(OpBuilder &builder, Location loc, ArrayRef<IterAxis> axes) {
   return scope;
 }
 
-// Value-typed outs lowering: fully unroll the parallel iter space
-// at compile time (no `scf.parallel` — the result has to live in
-// one SSA register so the sweep IS the unroll), reuse the per-lane
-// ins-load + body-clone infrastructure from the partition path, and
-// compose the per-parLane scalar finals into a single
-// `vector.from_elements` per value-typed out. Ptr-typed outs ride
-// the same per-parLane emission with contig-group merging on the
-// stores; mixed outs (some ptr, some value) work since the loop
-// shape is per-lane either way.
+// Compile-time slot for a value-typed operand: returns the element
+// type if it can be wrapped in a builtin `VectorType` (floats, ints,
+// index, or `!hc.pred` → `i1`). Returns null for everything else.
+// The UCC chain through `vector<NxBuiltin>` is the only mechanism
+// the per-lane extract path can use, so non-wrappable element types
+// have no path through this emitter.
+static Type asBuiltinElementType(Type t) {
+  if (isa<PredType>(t))
+    return IntegerType::get(t.getContext(), 1);
+  if (t.isIntOrIndexOrFloat())
+    return t;
+  return Type();
+}
+
+// Resolve the per-lane integer slot for one operand's offset under
+// row-major iter-sym substitution. Used by both the value-outs
+// (bijection on `[0, prodPar)`) and the value-ins (gather, allows
+// repeats, range check only) paths.
+static std::optional<int64_t> resolveOperandSlot(sym::Store &store,
+                                                 ExprAttr origOff,
+                                                 ArrayRef<StringRef> iterNames,
+                                                 ArrayRef<int> vals) {
+  sym::ExprHandle subbed =
+      substituteIterValues(store, origOff.getValue(), iterNames, vals);
+  return sym::getIntegerLiteralValue(subbed);
+}
+
+// Fully-unrolled lowering: handles every op with at least one
+// value-typed operand (ins or outs). The parallel iter space is
+// compile-time-unrolled (no `scf.parallel` — the result lives in a
+// single SSA register / lane-indexed extract sequence), per-lane
+// extracts feed the body, per-lane composes build the value-typed
+// outs. Ptr operands ride the same per-parLane emission with contig-
+// group merging on the loads/stores; mixed operand kinds work since
+// the loop shape is per-lane either way.
 //
-// Slot mapping: the outs offset expression must evaluate to a
-// bijection on `[0, prodPar)` when iter syms substitute to their
-// row-major delta values — the verifier in `isV0Candidate` already
-// pinned the offset's free syms to iter syms only, so the
-// `substituteIterValues` step produces a pure integer for each lane.
+// Slot mapping:
+//   * Value-typed outs: offset must be a bijection on `[0, prodPar)`
+//     (one parLane writes each slot exactly once; the result
+//     `vector.from_elements` needs every slot populated).
+//   * Value-typed ins: offset must evaluate to an integer slot in
+//     `[0, count)` per parLane, where `count` is the operand's
+//     compile-time lane count. Gather pattern, repeats are fine —
+//     multiple lanes may read the same slot.
+// `isV0Candidate` already pinned every value-side offset's free syms
+// to iter syms only, so `substituteIterValues` produces a pure
+// integer per lane.
 //
-// `lowerOne` dispatches here when any out is value-typed; the
-// partition path handles all-ptr-out generics where the
-// `scf.parallel`-shaped emission is the right form.
+// `lowerOne` dispatches here when any operand is value-typed; the
+// partition path handles all-ptr generics where the `scf.parallel`-
+// shaped emission is the right form.
 static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -1378,6 +1513,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   // the outs offset. Bijection check rejects gaps / collisions; the
   // diagnostic-guard bead can tighten this further with a more
   // helpful message once the surface stabilizes.
+  ArrayAttr insOff = op.getInsOffsetsAttr();
   ArrayAttr outsOff = op.getOutsOffsetsAttr();
   size_t numOuts = op.getOuts().size();
   size_t numIns = op.getIns().size();
@@ -1396,9 +1532,8 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
     for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
       SmallVector<int, 4> vals =
           decomposeRowMajor(static_cast<int>(parLane), bounds);
-      sym::ExprHandle subbed =
-          substituteIterValues(store, origOff.getValue(), iterNames, vals);
-      std::optional<int64_t> slot = sym::getIntegerLiteralValue(subbed);
+      std::optional<int64_t> slot =
+          resolveOperandSlot(store, origOff, iterNames, vals);
       if (!slot || *slot < 0 || *slot >= prodPar || !seen.insert(*slot).second)
         return op.emitOpError("value-outs lowering: outs #")
                << oi << " offset is not a bijection on [0, " << prodPar
@@ -1406,6 +1541,35 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
       slots.push_back(*slot);
     }
     slotPerOut[oi] = std::move(slots);
+  }
+
+  // Per-parLane gather slot for each value-typed ins. No bijection
+  // (multiple lanes may read the same slot); only the integer-eval +
+  // in-range check is required. Skipped for ptr-typed ins (handled
+  // by `emitInsLoadsLaned`'s contig-group loop downstream).
+  SmallVector<SmallVector<int64_t>> slotPerIn(numIns);
+  for (auto [ii, v] : llvm::enumerate(op.getIns())) {
+    if (isa<PtrType>(v.getType()))
+      continue;
+    auto count = getValueOutLaneCount(v.getType());
+    if (!count)
+      return op.emitOpError("value-ins lowering: ins #")
+             << ii << " has no compile-time lane count";
+    ExprAttr origOff = getOperandOffset(insOff, ii);
+    SmallVector<int64_t> slots;
+    slots.reserve(prodPar);
+    for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
+      SmallVector<int, 4> vals =
+          decomposeRowMajor(static_cast<int>(parLane), bounds);
+      std::optional<int64_t> slot =
+          resolveOperandSlot(store, origOff, iterNames, vals);
+      if (!slot || *slot < 0 || *slot >= *count)
+        return op.emitOpError("value-ins lowering: ins #")
+               << ii << " offset at parLane " << parLane
+               << " does not evaluate to a slot in [0, " << *count << ")";
+      slots.push_back(*slot);
+    }
+    slotPerIn[ii] = std::move(slots);
   }
 
   // Reuse the partition emission machinery with `p[a] = bounds[a]`
@@ -1427,6 +1591,40 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   seedAmbientScope(op, scope);
   SmallVector<SmallVector<Value>> insLanes =
       emitInsLoadsLaned(builder, op, axes, order, p, scope, store);
+
+  // Value-typed ins: gather pattern. UCC the carrier to builtin
+  // `vector<NxBuiltinElem>` (with `!hc.pred` mapped to `i1` — see
+  // `asBuiltinElementType`) and emit one `vector.extract` per parLane
+  // at the slot the offset evaluates to. Restore the body's expected
+  // element type via a trailing UCC so the per-lane mapping in
+  // `cloneBody` doesn't shadow it with a non-matching SSA type.
+  for (auto [ii, v] : llvm::enumerate(op.getIns())) {
+    if (isa<PtrType>(v.getType()))
+      continue;
+    auto count = getValueOutLaneCount(v.getType());
+    auto shaped = cast<SymbolicallyShapedTypeInterface>(v.getType());
+    Type elemTy = shaped.getSymbolicElementType();
+    Type builtinElem = asBuiltinElementType(elemTy);
+    if (!builtinElem)
+      return op.emitOpError("value-ins lowering: ins #")
+             << ii << " has unsupported element type for vector carrier";
+    mlir::VectorType vecTy = mlir::VectorType::get({*count}, builtinElem);
+    Value asVec = v;
+    if (v.getType() != Type(vecTy))
+      asVec = UnrealizedConversionCastOp::create(builder, loc, vecTy, v)
+                  .getResult(0);
+    insLanes[ii].assign(prodPar, Value());
+    for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
+      int64_t slot = slotPerIn[ii][parLane];
+      Value lane = vector::ExtractOp::create(builder, loc, asVec,
+                                             ArrayRef<int64_t>{slot})
+                       .getResult();
+      if (lane.getType() != elemTy)
+        lane = UnrealizedConversionCastOp::create(builder, loc, elemTy, lane)
+                   .getResult(0);
+      insLanes[ii][parLane] = lane;
+    }
+  }
 
   // Per-parLane outs init: value-typed ones extract from the SSA out
   // (via UCC if the carrier isn't builtin `vector`); ptr-typed ones
@@ -1550,16 +1748,18 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
 // running `lowerWithPartition` against shared outs would have every
 // thread of the wave fight every other thread for every element.
 //
-// Value-typed outs route through `lowerValueOuts` regardless of
-// the launch / workgroup-out signal — the result has to live in a
-// single SSA register, so the parallel sweep must be compile-time-
-// unrolled rather than scattered across `scf.parallel` iterations.
+// Any value-typed operand (ins or outs) routes through
+// `lowerValueOuts` regardless of the launch / workgroup signal — the
+// result has to live in a single SSA register and value-typed ins
+// only have a per-lane `vector.extract` materialization, so the
+// parallel sweep must be compile-time-unrolled rather than scattered
+// across `scf.parallel` iterations.
 static LogicalResult lowerOne(HCGenericOp op) {
   MLIRContext *ctx = op.getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   SmallVector<IterAxis> axes = collectIterAxes(op);
 
-  if (hasValueOuts(op)) {
+  if (hasValueOuts(op) || hasValueIns(op)) {
     if (failed(lowerValueOuts(op, axes)))
       return failure();
     op.erase();

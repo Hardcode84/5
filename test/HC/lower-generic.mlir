@@ -616,6 +616,99 @@ func.func @value_out_2d_rowmajor_fragment_load(
 
 // -----
 
+// Value-typed ins, ptr-typed out, unpredicated yield. The fully-
+// unrolled emitter UCC's the bare_vector carrier to `vector<8xf32>`,
+// extracts per parLane at the slot the offset evaluates to (here
+// `i` itself, so slot == parLane), and stores each lane through the
+// ptr out. The contig analyzer collapses the 8 unit-stride stores
+// into one `vector<8xf32>` store via `vector.from_elements`. No
+// `scf.parallel` because the parallel sweep is compile-time-
+// unrolled.
+// CHECK-LABEL: func.func @value_in_1d_ptr_out
+// CHECK-NOT: scf.parallel
+// CHECK: builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.bare_vector<f32, ["8"]> to vector<8xf32>
+// CHECK: vector.extract %{{[^ ]+}}[0]
+// CHECK: vector.extract %{{[^ ]+}}[7]
+// CHECK: vector.from_elements
+// CHECK-SAME: vector<8xf32>
+// CHECK: hc.ptr_store %{{[^ ]+}}, %{{[^ ]+}} : vector<8xf32>, !hc.ptr<global, f32>
+// CHECK-NOT: hc.generic
+func.func @value_in_1d_ptr_out(%vec: !hc.bare_vector<f32, ["8"]>,
+                               %dst: !hc.ptr<global, f32>) {
+  %n = hc.idx_apply () : () -> !hc.idx<"8">
+  hc.generic
+      iter (parallel i = %n : !hc.idx<"8">)
+      ins (%vec at [#hc.expr<"i">] : !hc.bare_vector<f32, ["8"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%v: f32, %init: f32):
+    hc.yield %v : f32
+  }
+  return
+}
+
+// -----
+
+// WMMA-writeback shape: value-typed value ins + value-typed mask ins
+// + ptr out + `hc.yield_predicated`. Per-lane materialization:
+// UCC value carrier to `vector<8xf32>`, UCC mask carrier to
+// `vector<8xi1>` (the `!hc.pred` element is mapped to `i1` for the
+// arith.select boundary), `arith.select(mask, val, init)` per lane,
+// then per-lane store. The init feeds the masked-out lanes so they
+// preserve the dst contents the per-lane init-load just published.
+// CHECK-LABEL: func.func @value_in_wmma_writeback
+// CHECK-NOT: scf.parallel
+// CHECK: builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.bare_vector<f32, ["8"]> to vector<8xf32>
+// CHECK: builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.bare_vector<!hc.pred, ["8"]> to vector<8xi1>
+// CHECK: hc.ptr_load
+// CHECK: arith.select
+// CHECK: hc.ptr_store
+// CHECK-NOT: hc.generic
+func.func @value_in_wmma_writeback(%vec: !hc.bare_vector<f32, ["8"]>,
+                                   %pred: !hc.bare_vector<!hc.pred, ["8"]>,
+                                   %dst: !hc.ptr<global, f32>) {
+  %m = hc.idx_apply () : () -> !hc.idx<"8">
+  %n = hc.idx_apply () : () -> !hc.idx<"1">
+  hc.generic
+      iter (parallel i_0 = %m : !hc.idx<"8">,
+            parallel i_1 = %n : !hc.idx<"1">)
+      ins (%vec at [#hc.expr<"i_0 + i_1">] : !hc.bare_vector<f32, ["8"]>,
+           %pred at [#hc.expr<"i_0 + i_1">] : !hc.bare_vector<!hc.pred, ["8"]>)
+      outs (%dst at [#hc.expr<"i_0 + i_1">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%v: f32, %m_arg: !hc.pred, %init: f32):
+    hc.yield_predicated %v mask %m_arg : (f32), (!hc.pred)
+  }
+  return
+}
+
+// -----
+
+// Bail: value-typed in with an offset that references an ambient
+// (non-iter) sym. Slot evaluation would be ambient-dependent, so
+// the candidate gate rejects and the op survives.
+// CHECK-LABEL: func.func @bail_value_in_ambient_offset
+// CHECK: hc.generic
+// CHECK-NOT: vector.extract
+func.func @bail_value_in_ambient_offset(
+    %vec: !hc.bare_vector<f32, ["8"]>,
+    %dst: !hc.ptr<global, f32>,
+    %k: !hc.idx<"$K">) {
+  %n = hc.idx_apply () : () -> !hc.idx<"8">
+  hc.generic
+      iter (parallel i = %n : !hc.idx<"8">)
+      ins (%vec at [#hc.expr<"i + $K">] : !hc.bare_vector<f32, ["8"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      ambient (%k as "$K" : !hc.idx<"$K">)
+      -> () {
+  ^bb0(%v: f32, %init: f32):
+    hc.yield %v : f32
+  }
+  return
+}
+
+// -----
+
 // Bail: value-typed out with a non-constant iter bound. The
 // `index`-typed bound has no `IdxType` payload to fish a literal
 // out of, so the value-outs gate rejects and the op survives. Pins

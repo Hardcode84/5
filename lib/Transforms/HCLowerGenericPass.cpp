@@ -1215,39 +1215,45 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
   return bodyStatus;
 }
 
-// Walk a chain of `builtin.unrealized_conversion_cast` ops up from
-// `v` looking for an underlying `!hc.ptr<workgroup, T>` source. Used
-// to admit `bare_tensor` outs whose backing storage is an LDS
-// allocation surfaced through a UCC view: the op's outs is shaped as
-// `bare_tensor`, but the SSA chain back to its producer
-// (`hc.alloc workgroup`, kernel-arg materialization, ...) goes
-// through one or more single-operand UCCs. Returns the resolved ptr
-// when found, null otherwise.
-//
-// Conservative on chains that branch (multi-result UCCs) or where the
-// chain dead-ends at a block argument or non-UCC op without a
-// workgroup-ptr type: returns null, letting the caller fall through
-// to the value-outs / partition paths. Walking only through `UCC`
-// keeps the resolver scoped to the materialization pattern; widening
-// to other view ops would need a per-op semantic check
-// (`hc.buffer_view` reshapes, etc.).
-static Value resolveWorkgroupPtr(Value v) {
-  while (v) {
-    if (auto ptr = dyn_cast<PtrType>(v.getType()))
-      if (ptr.getAddrSpace() == AddrSpace::Workgroup)
-        return v;
-    auto ucc = v.getDefiningOp<UnrealizedConversionCastOp>();
-    if (!ucc || ucc.getNumOperands() != 1 || ucc.getNumResults() != 1)
-      return Value();
-    v = ucc.getOperand(0);
-  }
-  return Value();
+// Element type for the `!hc.ptr<workgroup, T>` a `bare_tensor` outs
+// resolves through. Matches `convertElementType` in
+// `HCLowerLaunchBodyPass.cpp` so the UCC we plant against the outs
+// type-matches the one `ConvertNullaryShapedConstantOp` already
+// planted on the producing side (`hc.zeros : bare_tensor` →
+// `hc.alloc workgroup` + UCC back). Identical converted-element
+// types are what lets canonicalize fold the
+// `ptr<workgroup> → bare_tensor → ptr<workgroup>` pair to the
+// underlying alloc.
+static Type convertBareTensorElement(Type t) {
+  if (isa<PredType>(t))
+    return IntegerType::get(t.getContext(), 1);
+  if (t.isIntOrIndexOrFloat())
+    return t;
+  return {};
+}
+
+// `!hc.ptr<workgroup, T>` the converter pins for a `bare_tensor` outs.
+// `BareTensorType` itself doesn't carry a ptr, but every bare-tensor
+// SSA inside `gpu.launch` traces to an `hc.alloc workgroup` through
+// the source-materialization UCC the partial-conversion driver
+// planted in `hc-lower-launch-body`. We rebuild the same ptr type
+// here so a fresh `bare_tensor → ptr<workgroup>` UCC pairs with the
+// upstream one and folds out at canonicalize.
+static PtrType workgroupPtrFor(BareTensorType bt) {
+  auto shaped = cast<SymbolicallyShapedTypeInterface>(bt);
+  Type elem = convertBareTensorElement(shaped.getSymbolicElementType());
+  if (!elem)
+    return PtrType();
+  return PtrType::get(bt.getContext(), AddrSpace::Workgroup, elem);
 }
 
 // Collective dispatch detector: at least one outs operand is
 // `!hc.ptr<workgroup, T>` (LDS-staged tile) or a `bare_tensor` view
-// backed by one via a UCC chain, every iter is parallel (no cross-
-// thread accumulation), and the op sits inside a `gpu.launch` (we
+// (every bare-tensor SSA inside `gpu.launch` is workgroup-backed by
+// the launch-body type-converter convention — `hc.zeros : bare_tensor`
+// collapsed to `hc.alloc workgroup` + a UCC bridge to the still-
+// bare_tensor consumer slot). Every iter is parallel (no cross-
+// thread accumulation) and the op sits inside a `gpu.launch` (we
 // need the dim3 thread/block layout to chunk the iter space across
 // the wave). Per-lane outs falls through to the existing partition-
 // aware path — running scf.parallel without partitioning is the
@@ -1260,12 +1266,6 @@ static Value resolveWorkgroupPtr(Value v) {
 // reduction needs cross-thread synchronization the collective shape
 // doesn't model, and the chunk loop's `lin_tid` source disappears
 // outside a launch.
-//
-// `bare_tensor` outs are admitted iff their UCC chain resolves to a
-// workgroup ptr; otherwise they're stand-alone shaped values and
-// belong on the value-outs path (`vector.from_elements` + UCC back).
-// Mixed outs (some `bare_tensor`, some `ptr<workgroup>`) work since
-// the emit resolves each to its underlying ptr at the access site.
 static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
   bool hasWorkgroupOut = false;
   for (Value v : op.getOuts()) {
@@ -1274,8 +1274,8 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
         hasWorkgroupOut = true;
       continue;
     }
-    if (isa<BareTensorType>(v.getType())) {
-      if (!resolveWorkgroupPtr(v))
+    if (auto bt = dyn_cast<BareTensorType>(v.getType())) {
+      if (!workgroupPtrFor(bt))
         return false;
       hasWorkgroupOut = true;
       continue;
@@ -1326,6 +1326,29 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   }
   Value chunks =
       arith::CeilDivUIOp::create(builder, loc, total, wgSize).getResult();
+
+  // Pin every outs to a workgroup ptr we can ptr_offset/load/store
+  // against. Direct ptr outs are themselves; bare-tensor outs UCC
+  // through to their backing ptr<workgroup> type once, hoisted above
+  // the chunk loop so the cast doesn't re-emit per chunk. The
+  // upstream UCC `ptr<workgroup> → bare_tensor` (planted by
+  // `hc-lower-launch-body`'s shaped-constant lowering on the
+  // producing side) and this fresh `bare_tensor → ptr<workgroup>`
+  // form a foldable pair: canonicalize collapses the chain back to
+  // the original `hc.alloc workgroup` so per-thread stores hit the
+  // real LDS storage without a UCC dead-end at LLVM translation.
+  SmallVector<Value> outsPtrs(op.getOuts().size());
+  for (auto [i, out] : llvm::enumerate(op.getOuts())) {
+    if (isa<PtrType>(out.getType())) {
+      outsPtrs[i] = out;
+      continue;
+    }
+    auto bt = cast<BareTensorType>(out.getType());
+    PtrType ptrTy = workgroupPtrFor(bt);
+    assert(ptrTy && "isCollectiveCandidate accepted unconvertible bare_tensor");
+    outsPtrs[i] = UnrealizedConversionCastOp::create(builder, loc, ptrTy, out)
+                      .getResult(0);
+  }
 
   scf::ForOp loop =
       scf::ForOp::create(builder, loc, c0, chunks, c1, ValueRange{});
@@ -1381,18 +1404,11 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
             HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
       }
 
-      // Resolve each outs to the concrete `!hc.ptr<workgroup, T>` we
-      // emit accesses against. Direct ptr outs are themselves; bare-
-      // tensor outs surface their backing storage through a UCC
-      // chain captured at the op level (the candidate gate already
-      // verified the resolution succeeds).
+      // `outsPtrs` was set up above the chunk loop (direct ptr outs
+      // verbatim; bare-tensor outs UCC'd through once to the
+      // converter-pinned `ptr<workgroup>`). Access emission below
+      // walks it for every operand uniformly.
       ArrayAttr outsOff = op.getOutsOffsetsAttr();
-      SmallVector<Value> outsPtrs(op.getOuts().size());
-      for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
-        Value out = op.getOuts()[oi];
-        outsPtrs[oi] =
-            isa<PtrType>(out.getType()) ? out : resolveWorkgroupPtr(out);
-      }
       SmallVector<Value> outsVals(op.getOuts().size());
       for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
         ExprAttr origOff = getOperandOffset(outsOff, oi);

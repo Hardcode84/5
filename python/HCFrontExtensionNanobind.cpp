@@ -89,6 +89,12 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
         MlirDialectRegistry registry = mlirDialectRegistryCreate();
         mlirDialectHandleInsertDialect(hcDialect, registry);
         mlirRegisterHCTransformDialectExtension(registry);
+        // Carry the same HC→dlti preload extension that hc-opt installs.
+        // The Python `Context` already calls `load_all_available_dialects()`
+        // during `_site_initialize`, so dlti is in fact already loaded here;
+        // wiring the extension regardless keeps the registration story
+        // symmetric and self-documenting for the next reader.
+        mlirRegisterHCDependentDialectExtensions(registry);
         mlirContextAppendDialectRegistry(context_, registry);
         mlirDialectRegistryDestroy(registry);
         if (load)

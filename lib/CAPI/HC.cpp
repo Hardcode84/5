@@ -33,3 +33,7 @@ void mlirRegisterHCAllPasses(void) {
 void mlirRegisterHCTransformDialectExtension(MlirDialectRegistry registry) {
   mlir::hc::transform::registerTransformDialectExtension(*unwrap(registry));
 }
+
+void mlirRegisterHCDependentDialectExtensions(MlirDialectRegistry registry) {
+  mlir::hc::registerHCDependentDialectExtensions(*unwrap(registry));
+}

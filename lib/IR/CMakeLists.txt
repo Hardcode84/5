@@ -24,6 +24,7 @@ add_mlir_dialect_library(MLIRHCDialect
   HCIXSimpl
   MLIRCallInterfaces
   MLIRControlFlowInterfaces
+  MLIRDLTIDialect
   MLIRIR
 )
 

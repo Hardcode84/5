@@ -35,6 +35,14 @@ MLIR_CAPI_EXPORTED void mlirRegisterHCAllPasses(void);
 MLIR_CAPI_EXPORTED void
 mlirRegisterHCTransformDialectExtension(MlirDialectRegistry registry);
 
+// Append HC's "load these upstream dialects when HC is loaded" extensions to
+// a registry. Currently this force-loads `dlti` so that passes dispatched
+// from within `transform-interpreter` (notably `gpu-to-llvm`) don't trip the
+// multi-threaded dialect-load guard the first time they query
+// `dlti.dl_spec` for a pointer width.
+MLIR_CAPI_EXPORTED void
+mlirRegisterHCDependentDialectExtensions(MlirDialectRegistry registry);
+
 #ifdef __cplusplus
 }
 #endif

@@ -32,6 +32,14 @@ int main(int argc, char **argv) {
   mlir::hc::transform::registerTransformDialectExtension(registry);
   registry.insert<mlir::hc::HCDialect>();
   registry.insert<mlir::hc::front::HCFrontDialect>();
+  // Pre-load `dlti` (etc.) the moment HC is loaded, so passes that get
+  // dispatched from inside `transform-interpreter`'s threaded inner PM
+  // don't race against MLIR's "Loading a dialect (dlti) while in a
+  // multi-threaded execution context" guard. The PassManager loads
+  // dependent dialects synchronously before threading kicks in; HC is a
+  // dependent dialect of every meaningful pipeline, so its extension is
+  // the right hook.
+  mlir::hc::registerHCDependentDialectExtensions(registry);
 
   auto result = mlir::MlirOptMain(
       argc, argv, "hc optimizer driver with hc and hc_front dialect support\n",

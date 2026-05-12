@@ -8,6 +8,10 @@
 #include "hc/IR/HCOps.h"
 #include "hc/IR/HCTypes.h"
 
+#include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+
 #include <cassert>
 
 using namespace mlir::hc;
@@ -33,4 +37,11 @@ sym::Store &HCDialect::getSymbolStore() {
 const sym::Store &HCDialect::getSymbolStore() const {
   assert(symbolStore && "hc symbolic store must be initialized");
   return *symbolStore;
+}
+
+void mlir::hc::registerHCDependentDialectExtensions(
+    mlir::DialectRegistry &registry) {
+  registry.addExtension(+[](mlir::MLIRContext *ctx, HCDialect *) {
+    ctx->getOrLoadDialect<mlir::DLTIDialect>();
+  });
 }

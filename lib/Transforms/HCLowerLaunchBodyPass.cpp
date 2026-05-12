@@ -156,10 +156,21 @@ static Type convertBareVectorType(BareVectorType type) {
   return mlir::VectorType::get(*dims, element);
 }
 
+static Value resolveToBundleIndex(Value value);
+
 static Value materializeCast(OpBuilder &builder, Type type, ValueRange inputs,
                              Location loc) {
   if (inputs.size() != 1)
     return {};
+  // Conversion-driver materialization (`idx<sym>` → `index`, etc.):
+  // when the source is a post-flatten retype output that chains back
+  // to a kernel-arg bundle, prefer the bundle's `index`-typed input
+  // value over a fresh UCC. See `resolveToBundleIndex` for why we
+  // can't leave this for `reconcileUnrealizedCasts` to clean up.
+  if (type.isIndex()) {
+    if (Value direct = resolveToBundleIndex(inputs.front()))
+      return direct;
+  }
   return UnrealizedConversionCastOp::create(builder, loc, type, inputs)
       .getResult(0);
 }
@@ -355,6 +366,14 @@ static Value linearizeKernelArgOffset(OpBuilder &builder, Location loc,
   return offset;
 }
 
+static Value indexCast(OpBuilder &builder, Location loc, Value value) {
+  if (value.getType().isIndex())
+    return value;
+  return UnrealizedConversionCastOp::create(builder, loc,
+                                            builder.getIndexType(), value)
+      .getResult(0);
+}
+
 // Bind each free shape symbol from `type` to its matching dim value pulled
 // out of the kernel-arg UCC fragment. Replaces the prior `memref.dim`
 // chain — the dims now ride as explicit UCC inputs (one per axis).
@@ -371,6 +390,76 @@ static void bindShapeSymbols(BufferType type, const KernelArgSource &source,
   }
 }
 
+// Map a sym name produced by the frontend's default strided layout
+// (`$STRIDE_<axis>_<argname>`, per `buildDefaultStridedBufferLayout`)
+// to the corresponding kernel-arg `index`-typed stride value. Returns
+// null when `symName` doesn't match the convention or the axis is
+// out of range. Pairs with the shape-dim walk below to cover every
+// implicit sym a kernel-arg bundle carries.
+static Value resolveBundleStrideSym(const KernelArgSource &source,
+                                    StringRef symName) {
+  if (!symName.consume_front("$STRIDE_"))
+    return Value{};
+  unsigned axis = 0;
+  if (symName.consumeInteger(10, axis))
+    return Value{};
+  if (!symName.starts_with("_"))
+    return Value{};
+  if (axis >= source.strides.size())
+    return Value{};
+  return source.strides[axis];
+}
+
+// If `value` is an `!hc.idx<sym>` whose defining op is a post-flatten
+// retype UCC chaining back to a kernel-arg bundle, return the
+// bundle's corresponding `index`-typed input value (shape dim or
+// stride per the frontend's default strided layout convention).
+// Returns null when the chain doesn't reach a kernel-arg bundle, or
+// when the sym doesn't map to any kernel-ABI slot (layout-param
+// syms, opaque non-bundle indices, etc.).
+//
+// Binding to the bundle root short-circuits the post-flatten retype
+// UCC + `idx<sym>→index` cast that `reconcileUnrealizedCasts` can't
+// reduce across (the HC-typed intermediate hides the round trip from
+// MLIR's standard UCC-folding view, and the leftover UCC fails LLVM
+// translation downstream). The kernel-arg bundle's `index` inputs
+// fold through the `index → i64` block-arg materialization that
+// `convert-gpu-to-rocdl` plants, taking the offset arith all the way
+// back to the i64 kernel args.
+static Value resolveToBundleIndex(Value value) {
+  auto idxType = dyn_cast<IdxType>(value.getType());
+  if (!idxType)
+    return Value{};
+  std::optional<StringRef> symbol = exactSymbolName(idxType.getExpr());
+  if (!symbol)
+    return Value{};
+  auto cast = value.getDefiningOp<UnrealizedConversionCastOp>();
+  if (!cast || cast.getInputs().size() != 1 || cast.getOutputs().size() <= 1)
+    return Value{};
+  auto bundleType = dyn_cast<BufferType>(cast.getInputs()[0].getType());
+  if (!bundleType)
+    return Value{};
+  std::optional<KernelArgSource> info = resolveKernelArg(cast.getInputs()[0]);
+  if (!info)
+    return Value{};
+  for (auto [axis, attr] : llvm::enumerate(bundleType.getShape().getDims())) {
+    auto expr = dyn_cast<ExprAttr>(attr);
+    std::optional<StringRef> dimSym = exactSymbolName(expr);
+    if (dimSym && *dimSym == *symbol && axis < info->dims.size())
+      return info->dims[axis];
+  }
+  return resolveBundleStrideSym(*info, *symbol);
+}
+
+// `indexCast` with a short-circuit through the kernel-arg bundle: if
+// `value` chains back to one, use the bundle's `index`-typed input
+// directly; otherwise fall back to emitting an `idx<sym>→index` UCC.
+static Value indexCastViaBundle(OpBuilder &builder, Location loc, Value value) {
+  if (Value direct = resolveToBundleIndex(value))
+    return direct;
+  return indexCast(builder, loc, value);
+}
+
 static void bindLaunchDim3(StringRef prefix, gpu::KernelDim3 values,
                            BoundValues &boundValues) {
   Value dims[] = {values.x, values.y, values.z};
@@ -379,14 +468,6 @@ static void bindLaunchDim3(StringRef prefix, gpu::KernelDim3 values,
     name += Twine(axis).str();
     boundValues.bind(name, value);
   }
-}
-
-static Value indexCast(OpBuilder &builder, Location loc, Value value) {
-  if (value.getType().isIndex())
-    return value;
-  return UnrealizedConversionCastOp::create(builder, loc,
-                                            builder.getIndexType(), value)
-      .getResult(0);
 }
 
 static BoundValues collectBoundValues(Operation *anchor,
@@ -426,12 +507,17 @@ static BoundValues collectBoundValues(Operation *anchor,
     // param, ...) that the access ops reference symbolically in their
     // composed offsets. Bind each one so the ambient lowering can
     // resolve the apply.
+    //
+    // `indexCastViaBundle` short-circuits to the underlying kernel-arg
+    // bundle's `index`-typed input when one is reachable; otherwise it
+    // emits an `idx<sym>→index` UCC on the retype output as before.
+    // See `resolveToBundleIndex` for the rationale.
     if (cast.getInputs().size() == 1) {
       for (Value output : cast.getOutputs().drop_front()) {
         std::optional<StringRef> symbol = exactSymbolName(output.getType());
         if (symbol)
-          boundValues.bind(*symbol,
-                           indexCast(rewriter, anchor->getLoc(), output));
+          boundValues.bind(
+              *symbol, indexCastViaBundle(rewriter, anchor->getLoc(), output));
       }
     }
   });
@@ -807,7 +893,8 @@ static BoundValues collectApplyBindings(Operation *op,
     StringRef name = cast<StringAttr>(attr).getValue();
     if (name.empty())
       continue;
-    boundValues.symbols[name] = indexCast(rewriter, op->getLoc(), operand);
+    boundValues.symbols[name] =
+        indexCastViaBundle(rewriter, op->getLoc(), operand);
   }
   return boundValues;
 }

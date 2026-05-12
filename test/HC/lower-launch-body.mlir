@@ -620,4 +620,63 @@ module {
     }
     return
   }
+
+  // `idx_apply` and other apply-driven offset lowering paths route
+  // `!hc.idx<sym>` references through the post-flatten retype UCC.
+  // The launch-body pass binds each implicit sym to the kernel-arg
+  // bundle's original `index`-typed input (shape dim or stride per the
+  // frontend's default strided layout convention), so the resulting
+  // arith chain reads straight off the bundle inputs instead of
+  // bouncing through an `idx<sym> -> index` UCC. That UCC chain has
+  // an HC-typed intermediate the `gpu-to-rocdl` block-arg conversion
+  // can't see across, so any survivor would block LLVM translation
+  // downstream — pin the short-circuit so a regression that
+  // re-materializes the cast fails here, not at the GPU surface.
+  // CHECK-LABEL: func.func @bundle_sym_short_circuits_idx_to_index(
+  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
+  // CHECK-SAME: %[[M:[^:]+]]: index,
+  // CHECK-SAME: %[[N:[^:]+]]: index,
+  // CHECK-SAME: %[[SM:[^:]+]]: index,
+  // CHECK-SAME: %[[SN:[^:]+]]: index
+  // The apply chain composes `$STRIDE_0_x*$WI0 + $STRIDE_1_x*1`. With
+  // the bundle short-circuit the `$STRIDE_*_x` operands of the
+  // resulting arith chain are the bundle inputs themselves (`%[[SM]]`
+  // / `%[[SN]]`) rather than UCCs re-materialized from the retype
+  // output.
+  // CHECK: gpu.launch
+  // CHECK-DAG: arith.muli %{{.*}}, %[[SM]] : index
+  // CHECK-DAG: arith.addi %{{.*}}, %[[SN]] : index
+  // No `idx<...> to index` cast — bundle short-circuit handles it.
+  // CHECK-NOT: builtin.unrealized_conversion_cast {{.*}} : !hc.idx<{{.*}}> to index
+  func.func @bundle_sym_short_circuits_idx_to_index(
+      %ptr: !hc.ptr<global, f32>,
+      %m: index, %n: index, %sm: index, %sn: index) {
+    %c1 = arith.constant 1 : index
+    %buf2d = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
+        : !hc.ptr<global, f32>, index, index, index, index
+        to !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_x*i0 + $STRIDE_1_x*i1">>>
+    %buf1d, %as_sm, %as_sn, %as_m, %as_n
+        = builtin.unrealized_conversion_cast %buf2d
+        : !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_x*i0 + $STRIDE_1_x*i1">>>
+        to !hc.buffer<f32, ["?"]>, !hc.idx<"$STRIDE_0_x">,
+           !hc.idx<"$STRIDE_1_x">, !hc.idx<"M">, !hc.idx<"N">
+    %eight = hc.const<8 : i64> : !hc.idx<"8">
+    %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
+      // `$STRIDE_*_x` symbol references inside the offset expression
+      // must resolve to the bundle's `%sm` / `%sn` index inputs
+      // through the apply lowering; the retype UCC's idx-typed
+      // outputs would be the long way around.
+      %composed = hc.idx_apply (%as_sm as "$STRIDE_0_x", %as_sn as "$STRIDE_1_x")
+          : (!hc.idx<"$STRIDE_0_x">, !hc.idx<"$STRIDE_1_x">) -> !hc.idx<"$STRIDE_0_x*$WI0 + $STRIDE_1_x*1">
+      %vec = hc.vload %buf1d[%composed], shape %shape
+          : (!hc.buffer<f32, ["?"]>,
+             !hc.idx<"$STRIDE_0_x*$WI0 + $STRIDE_1_x*1">,
+             tuple<!hc.idx<"8">>)
+            -> !hc.bare_vector<f32, ["8"]>
+      gpu.terminator
+    }
+    return
+  }
 }

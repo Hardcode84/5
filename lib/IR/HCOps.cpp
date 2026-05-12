@@ -1776,8 +1776,8 @@ static LogicalResult checkPredicateShapeMatchesValue(Operation *op,
   if (static_cast<bool>(valueVec) != static_cast<bool>(predVec))
     return op->emitOpError(
                "predicate shape must match value shape: scalar value "
-               "requires i1 predicate, vector value requires vector<...xi1> "
-               "predicate; got value type ")
+               "requires scalar (i1 / !hc.pred) predicate, vector value "
+               "requires vector<...xi1> predicate; got value type ")
            << valueType << " and predicate type " << predicateType;
   if (valueVec && predVec && valueVec.getShape() != predVec.getShape())
     return op->emitOpError("predicate shape ")

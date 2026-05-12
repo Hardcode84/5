@@ -367,11 +367,6 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 // ----- hc.store ---------------------------------------------------------
 
 static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
-  // Masked stores need scf.if-shaped bodies the v0 rewrite doesn't
-  // emit; leave them for the masked-store follow-up.
-  if (op.getMask())
-    return failure();
-
   // Tensor / bare_tensor dst is workgroup-shared LDS storage; the IR
   // models it as a value-typed operand even though the runtime
   // semantic is in-place mutation. A clean rewrite would need to
@@ -403,6 +398,28 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   if (!srcElem || !dstElem || srcElem != dstElem)
     return failure();
 
+  // Masked path: the mask operand rides as an extra ins slot with
+  // identity offsets (same shape as `src`, both tile-local). The body
+  // loads the mask element alongside the src element and terminates
+  // with `hc.yield_predicated` instead of `hc.yield`; the lowering
+  // routes that through `hc.ptr_store_pred` at the dst's ins-slot
+  // offset, so masked-out lanes leave the existing dst contents in
+  // place. Mask must be the same shape as src (the `hc.store`
+  // verifier already enforces this); we don't carry separate axes
+  // because the mask's offsets are identity by construction.
+  Value mask = op.getMask();
+  Type maskElem;
+  if (mask) {
+    auto maskShape = getOperandShape(mask.getType());
+    if (failed(maskShape))
+      return failure();
+    if (maskShape->size() != tileShape->size())
+      return failure();
+    maskElem = bodyArgElementType(mask.getType());
+    if (!maskElem)
+      return failure();
+  }
+
   Location loc = op.getLoc();
   OpBuilder builder(op);
   CommonRewriteData common = buildCommon(builder, loc, *tileShape);
@@ -411,10 +428,15 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   auto outOffArr = composeMemoryOffsetArray(ctx, store, *axes, common.iterSyms);
   if (failed(outOffArr))
     return failure();
-  ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
+  SmallVector<Attribute> insOffArr{inOff};
+  SmallVector<Value> insArr{src};
+  if (mask) {
+    insOffArr.push_back(inOff);
+    insArr.push_back(mask);
+  }
+  ArrayAttr insOffsets = ArrayAttr::get(ctx, insOffArr);
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {*outOffArr});
 
-  SmallVector<Value> insArr{src};
   SmallVector<Value> outsArr{dst};
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{}, common.iterSymsAttr,
@@ -423,10 +445,17 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
 
   Block *body = new Block();
   BlockArgument sv = body->addArgument(srcElem, loc);
+  BlockArgument mv;
+  if (mask)
+    mv = body->addArgument(maskElem, loc);
   body->addArgument(dstElem, loc);
   generic.getBody().push_back(body);
   OpBuilder bodyBuilder(body, body->begin());
-  HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
+  if (mask)
+    HCYieldPredicatedOp::create(bodyBuilder, loc, ValueRange{sv},
+                                ValueRange{mv});
+  else
+    HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
 
   op->erase();
   return success();

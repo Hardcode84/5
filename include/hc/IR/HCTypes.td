@@ -375,14 +375,21 @@ def HC_PtrAccessValueType : AnyTypeOf<[
   FixedVectorOfAnyRank<[AnyInteger, AnyFloat, Index]>,
 ]>;
 
-// Predicate-side type for `hc.ptr_load_pred` / `hc.ptr_store_pred`:
-// `i1` for scalar accesses, `vector<Nxi1>` for vector-form accesses
-// where N matches the value's vector length. The shape parity check
-// (scalar value <-> i1 predicate, vector<NxT> value <-> vector<Nxi1>
-// predicate of the same N) is enforced by the per-op verifier; this
-// constraint only restricts the type to one of the two flavours.
+// Predicate-side type for the mask operand of predicated ops
+// (`hc.ptr_load_pred` / `hc.ptr_store_pred` at ptr level,
+// `hc.yield_predicated` / `hc.predicate` at body level). Concrete
+// `i1` / `vector<Nxi1>` is the post-lowering surface; `!hc.pred` is
+// the pre-lowering body-level surface (the element type of a
+// `!hc.bare_tensor<!hc.pred, ...>` mask operand when an `hc.generic`
+// loads one element at a time, before `hc-lower-bare-predicates`
+// converts the carrier to `vector<Nxi1>`). Shape parity against the
+// matching value operand (scalar value <-> scalar mask, vector<NxT>
+// value <-> vector<Nxi1> of the same N) is enforced by the per-op
+// verifier; this constraint only restricts the type to one of the
+// flavours.
 def HC_PtrPredicateType : AnyTypeOf<[
   HC_UndefType,
+  HC_PredType,
   I1,
   FixedVectorOfAnyRank<[I1]>,
 ]>;

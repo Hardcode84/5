@@ -894,8 +894,12 @@ on later slices.
     ptr/buffer out. Picks up the multi-index offset arrays the
     per-access materialization slice (`hc-flatten-with-layouts`
     follow-up) feeds it. Cooperative copy helpers fold into a single
-    ptr-in / ptr-out generic. Masked stores, tensor-dst stores, and
-    `hc.load_mask` are deferred to follow-ups.
+    ptr-in / ptr-out generic. Masked `hc.store` rides on the same
+    rewrite — the mask operand becomes a second ins slot with
+    identity offsets and the body terminates with
+    `hc.yield_predicated` instead of `hc.yield`, so the lowering
+    routes through `hc.ptr_store_pred` at the dst's ins-slot offset.
+    Tensor-dst stores and `hc.load_mask` are deferred to follow-ups.
 15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
     forms: value-out, ptr-out, mixed) to an outer `scf.parallel`
     over the parallel iters with an inner `scf.for` nest over the

@@ -145,18 +145,71 @@ func.func @load_untyped_index_falls_through(%buf: !hc.buffer<f32, ["M"]>, %i: in
 
 // -----
 
-// Masked store: scf.if-shaped body the v0 rewrite doesn't emit; the
-// op stays for the masked-store follow-up.
-// CHECK-LABEL: func.func @store_masked_falls_through
-// CHECK: hc.store {{.*}} mask
-// CHECK-NOT: hc.generic
-func.func @store_masked_falls_through(%dst: !hc.buffer<f32, ["M"]>,
-                                      %src: !hc.bare_tensor<f32, ["A"]>,
-                                      %mask: !hc.bare_tensor<!hc.pred, ["A"]>,
-                                      %i: !hc.idx<"i">) {
+// Masked store: the mask rides as a second `ins` slot with identity
+// offsets (same shape as `%src`, both tile-local). The body now has
+// three block args (`src`, `mask`, `dst`) and terminates with
+// `hc.yield_predicated`, which `hc-lower-generic` routes to
+// `hc.ptr_store_pred` at the dst's ins-slot offset — masked-out
+// lanes leave the existing dst contents in place.
+// CHECK-LABEL: func.func @store_masked
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply () : () -> !hc.idx<"A">
+// CHECK: hc.generic iter (parallel i_0 = %[[A]] : !hc.idx<"A">{{[^)]*}})
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<f32, ["A"]>, %{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<!hc.pred, ["A"]>)
+// CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i + i_0">] : !hc.buffer<f32, ["M"]>)
+// CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+// CHECK-NOT: hc.store
+func.func @store_masked(%dst: !hc.buffer<f32, ["M"]>,
+                        %src: !hc.bare_tensor<f32, ["A"]>,
+                        %mask: !hc.bare_tensor<!hc.pred, ["A"]>,
+                        %i: !hc.idx<"i">) {
   hc.store %dst[%i], %src, mask %mask
       : (!hc.buffer<f32, ["M"]>, !hc.idx<"i">, !hc.bare_tensor<f32, ["A"]>,
          !hc.bare_tensor<!hc.pred, ["A"]>) -> ()
+  return
+}
+
+// -----
+
+// Rank-2 masked store: the mask carries the same shape as the source
+// tile and rides as a second ins slot with identity offsets. The dst
+// keeps the per-axis composed `base + i_k` offsets, same as the
+// unmasked rank-2 store.
+// CHECK-LABEL: func.func @store_masked_rank2
+// CHECK: hc.generic iter (parallel i_0 = {{[^,]+}}, parallel i_1 = {{[^)]+}})
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["A", "B"]>, %{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<!hc.pred, ["A", "B"]>)
+// CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i + i_0">, #hc.expr<"i_1 + j">] : !hc.buffer<f32, ["M", "N"]>)
+// CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+func.func @store_masked_rank2(%dst: !hc.buffer<f32, ["M", "N"]>,
+                              %src: !hc.bare_tensor<f32, ["A", "B"]>,
+                              %mask: !hc.bare_tensor<!hc.pred, ["A", "B"]>,
+                              %i: !hc.idx<"i">, %j: !hc.idx<"j">) {
+  hc.store %dst[%i, %j], %src, mask %mask
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.idx<"i">, !hc.idx<"j">,
+         !hc.bare_tensor<f32, ["A", "B"]>,
+         !hc.bare_tensor<!hc.pred, ["A", "B"]>) -> ()
+  return
+}
+
+// -----
+
+// Bare-vector source + bare-vector mask: same rewrite shape — the
+// mask rides as a second ins slot with identity offsets. Confirms
+// the rewrite isn't pinned to bare_tensor on the src/mask pair.
+// CHECK-LABEL: func.func @store_masked_bare_vector
+// CHECK: hc.generic iter (parallel i_0 = {{[^)]+}})
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_vector<f32, ["A"]>, %{{.+}} at [#hc.expr<"i_0">] : !hc.bare_vector<!hc.pred, ["A"]>)
+// CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+func.func @store_masked_bare_vector(%dst: !hc.buffer<f32, ["M"]>,
+                                    %src: !hc.bare_vector<f32, ["A"]>,
+                                    %mask: !hc.bare_vector<!hc.pred, ["A"]>,
+                                    %i: !hc.idx<"i">) {
+  hc.store %dst[%i], %src, mask %mask
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"i">,
+         !hc.bare_vector<f32, ["A"]>,
+         !hc.bare_vector<!hc.pred, ["A"]>) -> ()
   return
 }
 

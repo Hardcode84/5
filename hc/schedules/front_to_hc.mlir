@@ -154,10 +154,19 @@ module attributes {transform.with_named_sequence} {
     // `hc-interpret-intrinsic-recipes` instead of generic.
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m13a {
+    // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as
+    // ordinary body ops — the pass doesn't touch them, the predicate
+    // physically lands in the lowered `scf` body next to its (now
+    // explicit) `hc.ptr_load` producer. Folding them is a separate pass
+    // so the emission side stays unaware of mask shapes / producer kinds
+    // and so the fold runs on every emitter that can plant a predicate,
+    // not just on `hc-lower-generic`'s output.
+    %m13af = transform.apply_registered_pass "hc-fold-predicates" to %m13a
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13af {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m13a : !transform.any_op
+    transform.apply_cse to %m13af : !transform.any_op
     // The `__HC_TARGET__` placeholder is substituted by the Python
     // driver before the schedule is handed to the transform
     // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the
@@ -170,7 +179,7 @@ module attributes {transform.with_named_sequence} {
     // The pass is also a no-op for kernels that never use intrinsics:
     // no lowerings module, no calls, nothing to diagnose.
     %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
-        with options = { "target" = "__HC_TARGET__" } to %m13a
+        with options = { "target" = "__HC_TARGET__" } to %m13af
         : (!transform.any_op) -> !transform.any_op
     // Cleanup pair folds away every `unrealized_conversion_cast` the
     // recipe-side `transform.hc.cast_value` planted around the freshly

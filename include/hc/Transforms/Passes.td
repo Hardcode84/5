@@ -395,6 +395,49 @@ def HCLowerGeneric : Pass<"hc-lower-generic"> {
   ];
 }
 
+def HCFoldPredicates : Pass<"hc-fold-predicates"> {
+  let summary = "Fold `hc.predicate` by hoisting the mask to its producer "
+                "or collapsing to `arith.select`.";
+  let description = [{
+    Walks every `hc.predicate %v mask %m passthrough %f` op and resolves
+    it by inspecting the def of `$value`:
+
+      * Trivial masks fold first — `m_One()` replaces the op with `$value`
+        (drop the predicate), `m_Zero()` replaces with `$passthrough`
+        (load elided).
+
+      * `hc.ptr_load` / `hc.vload` / `hc.load`: clone the producer at
+        its def site in predicated form (`hc.ptr_load_pred` etc.) with
+        `$mask` / `$passthrough`. The predicate op's uses get
+        redirected to the new predicated load. Each `hc.predicate` use
+        of the same load creates its own clone — sharing is opt-in,
+        not default. The original load is dropped once it has no
+        remaining uses.
+
+      * `vector.extract` of a vector value: emit `arith.select %mask,
+        %value, %passthrough` at the predicate site. The underlying
+        vector load stays unconditional; the predicate gates the lane
+        only.
+
+      * Anything else is a hard error — the allow-list is deliberate,
+        extending it is a per-producer choice.
+
+    Dominance: `$mask` and `$passthrough` must dominate the producer's
+    def site when the lowering clones / rewrites there. Violations are
+    emitted as diagnostics, the pass signals failure.
+
+    Conceptually the pass is the lowering counterpart of
+    `hc.yield_predicated`'s store-side path: both edges of an
+    `hc.generic` body decompose into predicated mem ops or
+    `arith.select` blends, depending on the producer / sink.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::vector::VectorDialect"
+  ];
+}
+
 def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
   let summary = "Type-only flatten: every shaped value becomes 1D, "
                 "no #hc.layout slot survives.";

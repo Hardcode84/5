@@ -550,15 +550,33 @@ carry the conservative `MemRead + MemWrite` pair until `hc.func` /
   fill is a scalar SSA value; once inference pins both operands its numeric
   domain must match the shaped value's element type.
 * `hc.predicate %v mask %m passthrough %f` — predicated SSA value
-  (`m ? v : f`) with producer-hoist lowering. Same mask shape parity rule
-  as the predicated mem ops (`i1` for scalars, `vector<Nxi1>` for vectors).
-  `hc-lower-generic` peeks at the def of `%v`: an `hc.generic` body ins
-  block-arg becomes a predicated implicit load (`hc.ptr_load_pred`), a
-  body-emitted `hc.ptr_load` is cloned in place as its predicated form,
-  a `vector.extract` collapses to `arith.select` at the predicate site.
-  Other producers are a lowering diagnostic (strict allow-list). Mask
-  and passthrough must dominate the producer; folds `m_One()` →
-  passthrough drop, `m_Zero()` → load elision.
+  (`m ? v : f`) with producer-hoist lowering, handled by
+  `hc-fold-predicates` (the pass runs after `hc-lower-generic`, so the
+  body's implicit loads have already materialised as explicit
+  `hc.ptr_load` ops by the time the fold dispatches). Same mask shape
+  parity rule as the predicated mem ops (`i1` for scalars,
+  `vector<Nxi1>` for vectors). `hc-lower-generic` itself doesn't touch
+  predicates — it clones them through the body verbatim. The fold pass
+  then peeks at the def of `%v`:
+
+    * `hc.ptr_load` producer: clone in place as `hc.ptr_load_pred` with
+      `%m` / `%f`. Each `hc.predicate` use of the same load creates its
+      own predicated clone — sharing is opt-in, not default. The
+      unpredicated load is erased only when nothing else uses it.
+    * `vector.extract` producer: emit `arith.select %m, %v, %f` at the
+      predicate site. The underlying vector load stays unconditional;
+      the predicate gates the lane only.
+    * Anything else (including `hc.ptr_load_pred` — double-predicating
+      is not supported): hard diagnostic. The allow-list is deliberate;
+      extending it is a per-producer choice.
+
+  Mask / passthrough must dominate the producer's def site when the
+  pass clones / rewrites there, since the predicated op physically
+  lives at the producer's site in the lowered IR. Violations surface as
+  diagnostics, not silent drops. Trivial mask folds run first:
+  `m_One()` drops the predicate (`result := value`), `m_Zero()` drops
+  the load (`result := passthrough`, value's producer cleaned up if it
+  becomes trivially dead).
 * `hc.as_layout %v, layout = row_major | col_major` — change layout.
   The `layout` payload is a typed `#hc<layout ...>` enum, so garbage
   spellings fail at parse. v0 admits `row_major` and `col_major`; later

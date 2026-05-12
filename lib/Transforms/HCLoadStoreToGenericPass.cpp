@@ -79,34 +79,91 @@ static FailureOr<SmallVector<ExprAttr>> getOperandShape(Type t) {
   return dims;
 }
 
-// Pull the symbolic expression off a single index operand. Mirrors
-// the helper in `hc-flatten-with-layouts`. v0 only supports
-// pinned `!hc.idx<expr>` operands; raw `index`, untyped `!hc.idx`,
-// and slices fall through. The flatten-side helper accepts slices
-// too because the access op already passes verification there;
-// here we'd be synthesising a tile walk over a sliced base, which
-// the v0 lowering doesn't model — bail rather than emit something
-// the lowering would silently produce wrong code for.
-static FailureOr<ExprAttr> extractIndexExpr(Type indexType) {
+// Per-axis decomposition of an access op's index operand. `base` is the
+// lower bound of the tile walk on that axis (a scalar `!hc.idx<expr>`
+// contributes `base = expr`; a slice contributes `base = lower` or `0`
+// when the slice's lower is absent). `step` is the per-iter stride; a
+// scalar idx is always step 1, a slice contributes `step = step_expr`
+// or `1` when absent. Both are stored as `ExprAttr` so callers can
+// build the per-axis offset structurally without re-parsing.
+struct AxisIndex {
+  ExprAttr base;
+  ExprAttr step;
+};
+
+// Extract `(base, step)` for one access op index operand. Mirrors
+// `extractAccessIndexExpr` in `hc-flatten-with-layouts` on the slice
+// branch — accepts default-step slices (`step = 1`) and pinned
+// `!hc.idx<expr>` lower / step. Non-pinned slice parts (`!hc.undef` or
+// other), raw `index`, and untyped `!hc.idx` fail the rewrite: there's
+// no symbolic name to bind into a `lower + step*iter` offset, and
+// silently lowering would emit an offset the launch-body would walk
+// without the stride contribution.
+static FailureOr<AxisIndex>
+extractAxisIndex(MLIRContext *ctx, sym::Store &store, Type indexType) {
+  auto litOne = sym::composeExprInt(store, 1);
+  if (failed(litOne))
+    return failure();
+  ExprAttr stepOne = ExprAttr::get(ctx, *litOne);
   if (auto idx = llvm::dyn_cast<IdxType>(indexType)) {
     if (ExprAttr expr = idx.getExpr())
-      return expr;
+      return AxisIndex{expr, stepOne};
+    return failure();
+  }
+  if (auto slice = llvm::dyn_cast<SliceType>(indexType)) {
+    ExprAttr base;
+    if (Type lowerTy = slice.getLowerType()) {
+      auto lowerIdx = llvm::dyn_cast<IdxType>(lowerTy);
+      if (!lowerIdx || !lowerIdx.getExpr())
+        return failure();
+      base = lowerIdx.getExpr();
+    } else {
+      auto zero = sym::composeExprInt(store, 0);
+      if (failed(zero))
+        return failure();
+      base = ExprAttr::get(ctx, *zero);
+    }
+    ExprAttr step;
+    if (Type stepTy = slice.getStepType()) {
+      auto stepIdx = llvm::dyn_cast<IdxType>(stepTy);
+      if (!stepIdx || !stepIdx.getExpr())
+        return failure();
+      step = stepIdx.getExpr();
+    } else {
+      step = stepOne;
+    }
+    return AxisIndex{base, step};
   }
   return failure();
 }
 
-// Compose `base + iterSym` for the per-axis offset on the
-// memory-side operand. ixsimpl hash-conses, so building via the
-// store keeps the printed offset canonical and shares storage
-// with other identical sums elsewhere in the IR.
-static FailureOr<ExprAttr> composeBasePlusIter(MLIRContext *ctx,
-                                               sym::Store &store, ExprAttr base,
-                                               StringAttr iterSym) {
-  auto sym = sym::composeExprSym(store, iterSym.getValue());
-  if (failed(sym))
+// Compose `base + step * iterSym` for the per-axis offset on the
+// memory-side operand. Folds the trivial `step == 1` to `base +
+// iterSym` so the printed offset stays the form scalar-idx callers
+// already produce — without the fold, otherwise-identical loads land
+// on two distinct hash-consed sums and obscure the diff. ixsimpl
+// hash-conses, so building via the store keeps the printed offset
+// canonical and shares storage with other identical sums elsewhere in
+// the IR.
+static FailureOr<ExprAttr> composeBasePlusStepIter(MLIRContext *ctx,
+                                                   sym::Store &store,
+                                                   AxisIndex axis,
+                                                   StringAttr iterSym) {
+  auto symHandle = sym::composeExprSym(store, iterSym.getValue());
+  if (failed(symHandle))
     return failure();
-  auto sum = sym::composeExprBinary(store, base.getValue(),
-                                    sym::ExprBinaryOp::Add, *sym);
+  sym::ExprHandle term = *symHandle;
+  std::optional<int64_t> stepLit =
+      sym::getIntegerLiteralValue(axis.step.getValue());
+  if (!stepLit || *stepLit != 1) {
+    auto mul = sym::composeExprBinary(store, axis.step.getValue(),
+                                      sym::ExprBinaryOp::Mul, term);
+    if (failed(mul))
+      return failure();
+    term = *mul;
+  }
+  auto sum = sym::composeExprBinary(store, axis.base.getValue(),
+                                    sym::ExprBinaryOp::Add, term);
   if (failed(sum))
     return failure();
   return ExprAttr::get(ctx, *sum);
@@ -128,17 +185,17 @@ static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
 }
 
 // Build the per-axis offset attribute on the memory-side operand:
-// `[base_0 + i_0, base_1 + i_1, ...]`. Empty `baseExprs` (whole-tensor
-// access, e.g. `hc.store %dst[]`) collapses to identity over the iter
-// syms — same shape, no addressing addend. Sizes must match
-// post-pre-checks; this helper just assembles the array.
+// `[base_0 + step_0*i_0, base_1 + step_1*i_1, ...]`. Empty `axes`
+// (whole-tensor access, e.g. `hc.store %dst[]`) collapses to identity
+// over the iter syms — same shape, no addressing addend. Sizes must
+// match post-pre-checks; this helper just assembles the array.
 static FailureOr<ArrayAttr>
 composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
-                         ArrayRef<ExprAttr> baseExprs,
+                         ArrayRef<AxisIndex> axes,
                          ArrayRef<StringAttr> iterSyms) {
   SmallVector<Attribute> exprs;
   exprs.reserve(iterSyms.size());
-  if (baseExprs.empty()) {
+  if (axes.empty()) {
     for (StringAttr name : iterSyms) {
       auto handle = sym::composeExprSym(store, name.getValue());
       if (failed(handle))
@@ -146,8 +203,8 @@ composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
       exprs.push_back(ExprAttr::get(ctx, *handle));
     }
   } else {
-    for (auto [base, name] : llvm::zip_equal(baseExprs, iterSyms)) {
-      auto sum = composeBasePlusIter(ctx, store, base, name);
+    for (auto [axis, name] : llvm::zip_equal(axes, iterSyms)) {
+      auto sum = composeBasePlusStepIter(ctx, store, axis, name);
       if (failed(sum))
         return failure();
       exprs.push_back(*sum);
@@ -208,19 +265,22 @@ static CommonRewriteData buildCommon(OpBuilder &builder, Location loc,
   return out;
 }
 
-// Pull the per-axis base expressions off an op's index operands. v0
-// only handles pinned `!hc.idx<expr>` index operands; anything else
-// fails the whole rewrite.
-static FailureOr<SmallVector<ExprAttr>> collectIndexBases(ValueRange indices) {
-  SmallVector<ExprAttr> bases;
-  bases.reserve(indices.size());
+// Pull the per-axis `(base, step)` off an op's index operands. v0
+// handles pinned `!hc.idx<expr>` scalar indices and slices whose
+// lower/step (when present) are pinned `!hc.idx<expr>`. Anything else
+// fails the whole rewrite — the launch-body lowering still owns those
+// shapes.
+static FailureOr<SmallVector<AxisIndex>>
+collectAxisIndices(MLIRContext *ctx, sym::Store &store, ValueRange indices) {
+  SmallVector<AxisIndex> axes;
+  axes.reserve(indices.size());
   for (Value idx : indices) {
-    auto base = extractIndexExpr(idx.getType());
-    if (failed(base))
+    auto axis = extractAxisIndex(ctx, store, idx.getType());
+    if (failed(axis))
       return failure();
-    bases.push_back(*base);
+    axes.push_back(*axis);
   }
-  return bases;
+  return axes;
 }
 
 // Element / pointee type the body block-arg carries for a given
@@ -262,8 +322,9 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   ValueRange indices = op.getIndices();
   if (!indices.empty() && indices.size() != tileShape->size())
     return failure();
-  auto indexBases = collectIndexBases(indices);
-  if (failed(indexBases))
+  MLIRContext *ctx = op.getContext();
+  auto axes = collectAxisIndices(ctx, store, indices);
+  if (failed(axes))
     return failure();
 
   Type srcElem = bodyArgElementType(source.getType());
@@ -271,15 +332,13 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   if (!srcElem || !resElem || srcElem != resElem)
     return failure();
 
-  MLIRContext *ctx = op.getContext();
   Location loc = op.getLoc();
   OpBuilder builder(op);
   CommonRewriteData common = buildCommon(builder, loc, *tileShape);
   Value shapeTuple = buildShapeTuple(builder, loc, common.iterBounds);
   Value initOut = emitValueInit(builder, loc, resultTy, shapeTuple);
 
-  auto inOff =
-      composeMemoryOffsetArray(ctx, store, *indexBases, common.iterSyms);
+  auto inOff = composeMemoryOffsetArray(ctx, store, *axes, common.iterSyms);
   if (failed(inOff))
     return failure();
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
@@ -334,8 +393,9 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   ValueRange indices = op.getIndices();
   if (!indices.empty() && indices.size() != tileShape->size())
     return failure();
-  auto indexBases = collectIndexBases(indices);
-  if (failed(indexBases))
+  MLIRContext *ctx = op.getContext();
+  auto axes = collectAxisIndices(ctx, store, indices);
+  if (failed(axes))
     return failure();
 
   Type srcElem = bodyArgElementType(srcTy);
@@ -343,14 +403,12 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   if (!srcElem || !dstElem || srcElem != dstElem)
     return failure();
 
-  MLIRContext *ctx = op.getContext();
   Location loc = op.getLoc();
   OpBuilder builder(op);
   CommonRewriteData common = buildCommon(builder, loc, *tileShape);
 
   ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
-  auto outOffArr =
-      composeMemoryOffsetArray(ctx, store, *indexBases, common.iterSyms);
+  auto outOffArr = composeMemoryOffsetArray(ctx, store, *axes, common.iterSyms);
   if (failed(outOffArr))
     return failure();
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});

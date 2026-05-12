@@ -208,3 +208,161 @@ func.func @load_mask_untouched(%buf: !hc.buffer<f32, ["M"]>, %i: !hc.idx<"i">)
         -> !hc.bare_tensor<!hc.pred, ["A"]>
   return %m : !hc.bare_tensor<!hc.pred, ["A"]>
 }
+
+// -----
+
+// Slice-indexed load (unit step): the slice carries pinned
+// `!hc.idx<"lo">` lower and `!hc.idx<"1">` step. Per-axis offset is
+// `lo + i_0` — step = const 1 folds out, matching the scalar-idx
+// printed form. This is the case the WMMA cooperative-load path emits
+// when both fragment dims are walked as `range(0, k)`-style slices.
+// CHECK-LABEL: func.func @load_slice_unit_step
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{.+}} : !hc.idx<"A">)
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0 + lo">] : !hc.buffer<f32, ["M"]>)
+// CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i_0">] : !hc.tensor<f32, ["A"]>)
+// CHECK-NOT: hc.load
+func.func @load_slice_unit_step(%buf: !hc.buffer<f32, ["M"]>,
+                                %lo: !hc.idx<"lo">, %hi: !hc.idx<"hi">,
+                                %step: !hc.idx<"1">)
+    -> !hc.tensor<f32, ["A"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %shape = hc.tuple(%a) : (!hc.idx<"A">) -> tuple<!hc.idx<"A">>
+  %s = hc.slice_expr(lower = %lo upper = %hi step = %step)
+      : (!hc.idx<"lo">, !hc.idx<"hi">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>
+  %r = hc.load %buf[%s], shape %shape
+      : (!hc.buffer<f32, ["M"]>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>,
+         tuple<!hc.idx<"A">>) -> !hc.tensor<f32, ["A"]>
+  return %r : !hc.tensor<f32, ["A"]>
+}
+
+// -----
+
+// Non-unit step slice: per-axis offset composes to
+// `lo + i_0 * step`. The Mul rides on the iter sym because step is a
+// generic `!hc.idx<"step">` — the unit-step fold only triggers on
+// integer literal 1. Canonical ixsimpl ordering puts the bare term
+// (`lo`) first and the product (`i_0*step`) second.
+// CHECK-LABEL: func.func @load_slice_non_unit_step
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"lo + i_0*step">] : !hc.buffer<f32, ["M"]>)
+// CHECK-NOT: hc.load
+func.func @load_slice_non_unit_step(%buf: !hc.buffer<f32, ["M"]>,
+                                    %lo: !hc.idx<"lo">, %hi: !hc.idx<"hi">,
+                                    %step: !hc.idx<"step">)
+    -> !hc.tensor<f32, ["A"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %shape = hc.tuple(%a) : (!hc.idx<"A">) -> tuple<!hc.idx<"A">>
+  %s = hc.slice_expr(lower = %lo upper = %hi step = %step)
+      : (!hc.idx<"lo">, !hc.idx<"hi">, !hc.idx<"step">)
+        -> !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"step">>
+  %r = hc.load %buf[%s], shape %shape
+      : (!hc.buffer<f32, ["M"]>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"step">>,
+         tuple<!hc.idx<"A">>) -> !hc.tensor<f32, ["A"]>
+  return %r : !hc.tensor<f32, ["A"]>
+}
+
+// -----
+
+// Slice with no lower / no step (`x[:]`-shaped): per-axis offset
+// reduces to identity over the iter sym. Confirms the default-step /
+// default-lower path picks the `0 + iter_sym` form, which after the
+// ixsimpl additive-identity fold prints as just `iter_sym`.
+// CHECK-LABEL: func.func @load_slice_default_parts
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.buffer<f32, ["M"]>)
+// CHECK-NOT: hc.load
+func.func @load_slice_default_parts(%buf: !hc.buffer<f32, ["M"]>)
+    -> !hc.tensor<f32, ["A"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %shape = hc.tuple(%a) : (!hc.idx<"A">) -> tuple<!hc.idx<"A">>
+  %s = hc.slice_expr() : () -> !hc.slice
+  %r = hc.load %buf[%s], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.slice, tuple<!hc.idx<"A">>)
+        -> !hc.tensor<f32, ["A"]>
+  return %r : !hc.tensor<f32, ["A"]>
+}
+
+// -----
+
+// Slice mixed with scalar idx: rank-2 access where axis 0 is a slice
+// and axis 1 is a pinned scalar. The mixed case is what the WMMA
+// fragment loads emit (block tile origin pinned, lane walk striped
+// across the other axis).
+// CHECK-LABEL: func.func @load_mixed_slice_and_scalar
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0 + lo">, #hc.expr<"i_1 + j">] : !hc.buffer<f32, ["M", "N"]>)
+// CHECK-NOT: hc.load
+func.func @load_mixed_slice_and_scalar(%buf: !hc.buffer<f32, ["M", "N"]>,
+                                       %lo: !hc.idx<"lo">,
+                                       %hi: !hc.idx<"hi">,
+                                       %step: !hc.idx<"1">,
+                                       %j: !hc.idx<"j">)
+    -> !hc.tensor<f32, ["A", "B"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %b = hc.const<1 : i64> : !hc.idx<"B">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %s = hc.slice_expr(lower = %lo upper = %hi step = %step)
+      : (!hc.idx<"lo">, !hc.idx<"hi">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>
+  %r = hc.load %buf[%s, %j], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>,
+         !hc.idx<"j">,
+         tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.tensor<f32, ["A", "B"]>
+  return %r : !hc.tensor<f32, ["A", "B"]>
+}
+
+// -----
+
+// Slice with a non-pinned step (raw `index`, not `!hc.idx<expr>`):
+// the rewrite needs a symbolic name to compose `step * iter` and
+// bails. The op survives for a later slice-pinning pass / downstream
+// lowering.
+// CHECK-LABEL: func.func @load_slice_unpinned_step_falls_through
+// CHECK: hc.load
+// CHECK-NOT: hc.generic
+func.func @load_slice_unpinned_step_falls_through(%buf: !hc.buffer<f32, ["M"]>,
+                                                  %lo: !hc.idx<"lo">,
+                                                  %hi: !hc.idx<"hi">,
+                                                  %step: index)
+    -> !hc.tensor<f32, ["A"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %shape = hc.tuple(%a) : (!hc.idx<"A">) -> tuple<!hc.idx<"A">>
+  %s = hc.slice_expr(lower = %lo upper = %hi step = %step)
+      : (!hc.idx<"lo">, !hc.idx<"hi">, index)
+        -> !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = index>
+  %r = hc.load %buf[%s], shape %shape
+      : (!hc.buffer<f32, ["M"]>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = index>,
+         tuple<!hc.idx<"A">>) -> !hc.tensor<f32, ["A"]>
+  return %r : !hc.tensor<f32, ["A"]>
+}
+
+// -----
+
+// Slice-indexed store: same `lo + step*iter` composition fires on
+// the outs side of `hc.store`. Confirms the helper is shared between
+// load and store paths.
+// CHECK-LABEL: func.func @store_slice_buffer
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.tensor<f32, ["A"]>)
+// CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i_0 + lo">] : !hc.buffer<f32, ["M"]>)
+// CHECK-NOT: hc.store
+func.func @store_slice_buffer(%dst: !hc.buffer<f32, ["M"]>,
+                              %src: !hc.tensor<f32, ["A"]>,
+                              %lo: !hc.idx<"lo">, %hi: !hc.idx<"hi">,
+                              %step: !hc.idx<"1">) {
+  %s = hc.slice_expr(lower = %lo upper = %hi step = %step)
+      : (!hc.idx<"lo">, !hc.idx<"hi">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>
+  hc.store %dst[%s], %src
+      : (!hc.buffer<f32, ["M"]>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">, step = !hc.idx<"1">>,
+         !hc.tensor<f32, ["A"]>) -> ()
+  return
+}

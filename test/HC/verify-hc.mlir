@@ -34,9 +34,38 @@ module {
 
 // -----
 
-// CHECK: error: subgroup_size must be non-negative
+// CHECK: error: subgroup_size must be positive
 module {
   func.func @bad(%arg0: !hc.group<subgroup_size = #hc.expr<"-1">>) {
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: subgroup_size must be positive
+module {
+  func.func @bad(%arg0: !hc.group<subgroup_size = #hc.expr<"0">>) {
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: subgroup_size must be positive
+module {
+  func.func @bad(%arg0: !hc.workitem<group_shape = #hc.shape<["32"]>,
+                                     subgroup_size = #hc.expr<"0">>) {
+    return
+  }
+}
+
+// -----
+
+// CHECK: error: subgroup_size must be positive
+module {
+  func.func @bad(%arg0: !hc.subgroup<group_shape = #hc.shape<["32"]>,
+                                     subgroup_size = #hc.expr<"0">>) {
     return
   }
 }

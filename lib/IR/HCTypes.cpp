@@ -473,45 +473,44 @@ Type mlir::hc::BareVectorType::cloneWithSymbolicShape(ShapeAttr shape) const {
                              getLayout());
 }
 
+// `subgroup_size` is the wavefront width: always strictly positive when
+// present (32 on wave32 chips, 64 on wave64). "Unknown" is expressed by
+// the attribute being absent; storing zero would silently propagate
+// through `subgroupCollectiveSuffix` (firstDim / 0) and pin
+// `IdxType<#hc.expr<"0">>` on `hc.wave_size`. Negative is also rejected.
+static mlir::LogicalResult
+verifySubgroupSize(function_ref<InFlightDiagnostic()> emitError,
+                   ExprAttr subgroupSize) {
+  if (!subgroupSize)
+    return success();
+  std::optional<int64_t> value =
+      sym::getIntegerLiteralValue(subgroupSize.getValue());
+  if (value && *value <= 0)
+    return emitError() << "subgroup_size must be positive";
+  return success();
+}
+
 mlir::LogicalResult
 mlir::hc::GroupType::verify(function_ref<InFlightDiagnostic()> emitError,
                             ShapeAttr workShape, ShapeAttr groupShape,
                             ExprAttr subgroupSize) {
   (void)workShape;
   (void)groupShape;
-  if (subgroupSize) {
-    std::optional<int64_t> value =
-        sym::getIntegerLiteralValue(subgroupSize.getValue());
-    if (value && *value < 0)
-      return emitError() << "subgroup_size must be non-negative";
-  }
-  return success();
+  return verifySubgroupSize(emitError, subgroupSize);
 }
 
 mlir::LogicalResult
 mlir::hc::WorkitemType::verify(function_ref<InFlightDiagnostic()> emitError,
                                ShapeAttr groupShape, ExprAttr subgroupSize) {
   (void)groupShape;
-  if (subgroupSize) {
-    std::optional<int64_t> value =
-        sym::getIntegerLiteralValue(subgroupSize.getValue());
-    if (value && *value < 0)
-      return emitError() << "subgroup_size must be non-negative";
-  }
-  return success();
+  return verifySubgroupSize(emitError, subgroupSize);
 }
 
 mlir::LogicalResult
 mlir::hc::SubgroupType::verify(function_ref<InFlightDiagnostic()> emitError,
                                ShapeAttr groupShape, ExprAttr subgroupSize) {
   (void)groupShape;
-  if (subgroupSize) {
-    std::optional<int64_t> value =
-        sym::getIntegerLiteralValue(subgroupSize.getValue());
-    if (value && *value < 0)
-      return emitError() << "subgroup_size must be non-negative";
-  }
-  return success();
+  return verifySubgroupSize(emitError, subgroupSize);
 }
 
 static FailureOr<ExprAttr> parseSubgroupSizeAttr(AsmParser &parser,

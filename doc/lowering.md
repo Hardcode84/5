@@ -915,60 +915,79 @@ The first real compiler stage should:
   capture lists,
 * build semantic `hc` operations while preserving symbolic launch parameters.
 
-The canonical pipeline for a module the resolver may have stamped
-folding / inline markers on is:
+The canonical pipeline that `hc.compile` runs against a module the
+resolver may have stamped folding / inline markers on, in the order
+`hc/schedules/front_to_hc.mlir` invokes the passes (read top-to-bottom):
 
-    hc-front-fold-region-defs → hc-front-inline
-                              → convert-hc-front-to-hc
-                              → hc-promote-names
-                              → hc-infer-types
-                              → hc-materialize-bound-exprs
-                              → hc-verify-static-shapes
-                              → hc-decompose-shaped-values(strict=false)
-                              → hc-inline-helpers
-                              → hc-materialize-bound-exprs
-                              → hc-canonicalize-layouts
-                              → hc-shaped-compute-to-generic
-                              → hc-elementwise-to-generic
-                              → hc-load-store-to-generic
-                              → hc-infer-generic-bounds
-                              → hc-normalize-scope-regions
-                              → hc-lower-kernels-to-gpu-launch
-                              → hc-lower-launch-body
+    hc-front-fold-region-defs
+    hc-front-inline
+    convert-hc-front-to-hc
+    hc-promote-names
+    hc-infer-types
+    hc-materialize-bound-exprs                      (#1)
+    hc-verify-static-shapes
+    hc-decompose-shaped-values(strict=false)
+    hc-inline-helpers
+    hc-materialize-bound-exprs                      (#2)
+    apply_dce
+    hc-canonicalize-layouts
+    hc-shaped-compute-to-generic
+    hc-elementwise-to-generic
+    hc-load-store-to-generic
+    hc-infer-generic-bounds
+    hc-normalize-scope-regions
+    canonicalize / cse
+    hc-lower-kernels-to-gpu-launch
+    hc-flatten-with-layouts
+    canonicalize / cse
+    hc-lower-launch-body                            (#1)
+    canonicalize / cse
+    hc-lower-generic
+    hc-fold-predicates
+    hc-lower-launch-body                            (#2)
+    canonicalize / cse
+    hc-interpret-intrinsic-recipes(target=<chip>)
+    canonicalize / cse
+    gpu-launch-sink-index-computations
+    gpu-kernel-outlining
+    canonicalize / cse
+    rocdl-attach-target(chip, features)
 
 Both `-hc-front-fold-region-defs` and `-hc-front-inline` are no-ops
 when nothing is marked, so both are safe to keep in the pipeline
 unconditionally.
 
-`hc.compile` drives this pipeline through a transform-dialect schedule
-shipped as `hc/schedules/front_to_hc.mlir`; `hc-opt` is the CLI handle
-on the same pass list, so
+After the schedule fires the Python driver appends the device-side
+GPU lowering chain (`_GPU_LOWERING_PIPELINE` in `hc/_pipeline.py`):
 
-    hc-opt --hc-front-fold-region-defs --hc-front-inline \
-           --convert-hc-front-to-hc --hc-promote-names \
-           --hc-infer-types --hc-materialize-bound-exprs \
-           --hc-verify-static-shapes \
-           --hc-decompose-shaped-values=strict=false \
-           --hc-inline-helpers --hc-materialize-bound-exprs \
-           --canonicalize \
-           --hc-canonicalize-layouts \
-           --hc-shaped-compute-to-generic \
-           --hc-elementwise-to-generic \
-           --hc-load-store-to-generic \
-           --hc-infer-generic-bounds \
-           --hc-normalize-scope-regions --canonicalize --cse \
-           --hc-lower-kernels-to-gpu-launch \
-           --hc-lower-launch-body --canonicalize --cse
+    hc-lower-to-llvm
+    convert-scf-to-cf
+    convert-amdgpu-to-rocdl(chipset=<chip>)
+    gpu.module(
+        convert-gpu-to-rocdl(chipset=<chip>),
+        convert-arith-to-llvm,
+        convert-vector-to-llvm,
+        convert-index-to-llvm,
+        reconcile-unrealized-casts)
+    gpu-to-llvm
+    convert-vector-to-llvm
+    convert-index-to-llvm
+    reconcile-unrealized-casts
+    canonicalize / cse
+    hc-lower-gpu-to-binary(lld-path=…, dump-intermediates=…)
+    hc-lower-launch-func-to-runtime
+    symbol-dce
 
-and `hc.compile(...)` with the default schedule produce identical
-output. See [`doc/schedules.md`](schedules.md) for the schedule format
-and override API.
+`hc.compile` drives the schedule via `-transform-preload-library` +
+`-transform-interpreter`; `hc-opt` is the same pass list spelled out
+as CLI flags. See [`doc/schedules.md`](schedules.md) for the schedule
+format and override API.
 
 Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
 refined, bound symbolic expressions declared by kernel `bound_symbols` have
 been materialized as SSA, static tensor/vector shape operands have been verified,
-and supported semantic shaped values may have been split into bare data/masks.
+and supported semantic shaped values have been split into bare data/masks.
 The scheduled decomposition is non-strict: helper-call signatures, call sites,
 stores, and structured/collective region boundaries are decomposed, while
 intrinsic boundaries that are not decomposed yet are preserved with
@@ -977,45 +996,47 @@ remain. Supported helper calls and workitem scope regions are then normalized
 away so the executable HC body is closer to per-workitem SPMD form before
 upstream lowering. Bound-expression materialization runs a second time after
 helper inlining because inlined helper bodies can expose fresh launch-geometry
-producer chains; DCE/canonicalization removes the dead scope-token producers
-before region normalization checks for remaining live scope-token uses. The
-generic-pipeline rewriters (`hc-canonicalize-layouts`,
-`hc-shaped-compute-to-generic`, `hc-elementwise-to-generic`,
-`hc-load-store-to-generic`, `hc-infer-generic-bounds`) run after the
-DCE pair: each one is conservative and only fires on inputs that match
-its v0 surface (rank-2 matmul / reduce, all-shaped per-element arith,
-pinned `!hc.idx<expr>` indices on load and store) — anything outside
-that surface flows through untouched and reaches the per-op handlers
-in `hc-lower-launch-body`. `hc-flatten-with-layouts` slots in
-immediately after `hc-lower-launch-body` and the canonicalize/CSE pair:
-by then the collective scope regions (`hc.workitem_region` /
-`hc.subgroup_region`) and the per-op shaped-access paths the
-launch-body pass owns (the WMMA recipe surface, cooperative-copy LDS
-staging, `hc.buffer_view` slice walks) are already gone, so the
-type-only 1-to-N converter sees a settled surface. Flatten then
-collapses every shaped value to its 1D bare carrier and composes
-per-access offsets and `hc.generic` per-axis offset arrays into a
-single 1D `#hc.expr` per operand. `hc-lower-generic` picks up
-generic candidates with the single composed offset per operand and
-lowers them to an outer `scf.parallel` over the parallel iters and
-an inner `scf.for` nest over reduction iters; the WMMA path takes
-the recipe surface instead of generic, so the pass is a no-op for
-that workload.
-`hc-lower-launch-body` is now memref-free end to end: workgroup-AS
-storage lands on `!hc.ptr<workgroup, T>` and kernel-arg loads/stores
-go through `hc.ptr_offset` + `hc.ptr_load[_pred]` /
-`hc.ptr_store[_pred]` against the `(ptr, dim*, stride*)` tuple
-`hc-lower-kernels-to-gpu-launch` plants at the host boundary
-([`doc/layouts.md`](layouts.md) covers both contracts). Kernel
-lowering then converts each semantic `hc.kernel` into a host
-`func.func` with a `gpu.launch`, exposing buffer ABI arguments as
-`!hc.ptr<global, T>` rather than memrefs and leaving remaining HC
-body operations behind explicit conversion boundaries for the
-subsequent upstream-lowering slices. `hc-lower-to-llvm` finishes the
-job: `!hc.ptr<global, T>` → `!llvm.ptr<1>` on `gpu.func` and
-`func.func` signatures, with an `llvm.addrspacecast` planted at the
-host boundary to bridge the generic pointer (returned by
-`hc_get_ptr`) to the global pointer the kernel consumes.
+producer chains rooted in kernel scope; the following `apply_dce` removes
+the dead scope-token producers before region normalization checks for
+remaining live scope-token uses. The generic-pipeline rewriters
+(`hc-shaped-compute-to-generic`, `hc-elementwise-to-generic`,
+`hc-load-store-to-generic`, `hc-infer-generic-bounds`) are conservative
+and only fire on inputs that match their v0 surface (rank-2 matmul / reduce,
+all-shaped per-element arith, pinned `!hc.idx<expr>` indices on load and
+store) — anything outside that surface flows through untouched and reaches
+the per-op handlers in `hc-lower-launch-body`. `hc-flatten-with-layouts`
+slots in immediately *after* `hc-lower-kernels-to-gpu-launch` and *before*
+the first `hc-lower-launch-body`: the launch wrapper plants the
+`(ptr, dim*, stride*)` UCC chain that flatten's post-flatten layout retyper
+consumes, and the post-flatten collective-lift verifier keeps
+`hc.workitem_region` / `hc.subgroup_region` accepting the post-flatten
+yield/result shape. Flatten collapses every shaped value to its 1D bare
+carrier and composes per-access offsets and `hc.generic` per-axis offset
+arrays into a single 1D `#hc.expr` per operand, so `hc-lower-launch-body`
+then sees the 1D form uniformly. `hc-lower-generic` (after the first
+launch-body invocation) picks up generic candidates with the single
+composed offset per operand and lowers them to an outer `scf.parallel` over
+the parallel iters and an inner `scf.for` nest over reduction iters; the
+WMMA path goes through `hc-interpret-intrinsic-recipes` instead, so
+generic lowering is a no-op for that workload. `hc-fold-predicates`
+collapses `hc.predicate` chains adjacent to their loads/stores, and the
+second `hc-lower-launch-body` invocation rewrites the fresh `hc.idx_apply`
+ops the generic lowering planted into plain `arith.*` / `index_cast`.
+`hc-lower-launch-body` is memref-free end to end: workgroup-AS storage
+lands on `!hc.ptr<workgroup, T>` and kernel-arg loads/stores go through
+`hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]` against the
+`(ptr, dim*, stride*)` tuple `hc-lower-kernels-to-gpu-launch` plants at
+the host boundary ([`doc/layouts.md`](layouts.md) covers both contracts).
+`hc-interpret-intrinsic-recipes` then rewrites every `hc.call_intrinsic`
+into its target-specific payload (WMMA recipes, ...) and erases the
+sibling `__hc_intrinsic_lowerings__` module. After the schedule's
+`gpu-launch-sink-index-computations` / `gpu-kernel-outlining` /
+`rocdl-attach-target` finalize the GPU surface, `hc-lower-to-llvm` and
+the appended GPU lowering chain finish the job: `!hc.ptr<global, T>` →
+`!llvm.ptr<1>` on `gpu.func` and `func.func` signatures, with an
+`llvm.addrspacecast` planted at the host boundary to bridge the generic
+pointer (returned by `hc_get_ptr`) to the global pointer the kernel
+consumes.
 
 ### SSA construction
 

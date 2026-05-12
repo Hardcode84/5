@@ -503,6 +503,21 @@ def HCDecomposeShapedValues
     matching bare `!hc.pred` masks. This is an HC-to-HC normalization boundary
     for upstream lowering; semantic shaped values that cross unsupported ops are
     diagnosed instead of being silently dropped.
+
+    Ordering: scheduled after `hc-infer-types`, `hc-materialize-bound-exprs`,
+    and `hc-verify-static-shapes`. The decomposition reads concrete shaped
+    types (so the mask-type derivation can build matching `!hc.pred` carriers)
+    and assumes bound symbolic expressions have already been severed from
+    their producer chains, so it only sees the post-inference shape surface.
+
+    Legality in `strict=false` mode is asymmetric: unknown ops are legal
+    (passed through unchanged), but the explicit HC op list in
+    `makePartialShapedDecompositionTarget` is still converter-legal-checked
+    because every op in that list is a registered rewrite target — if one of
+    them carries a semantic shaped operand or result, the partial conversion
+    decomposes it even though the rest of the IR may keep its semantic shape
+    via `builtin.unrealized_conversion_cast` boundaries. Strict mode collapses
+    the asymmetry: every op must converter-legalize before the pass succeeds.
   }];
   let options = [
     Option<"strictMode", "strict", "bool", "true",

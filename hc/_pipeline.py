@@ -88,17 +88,12 @@ _CHIP_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 # is built around so the default produces sensible IR for every
 # kernel the project currently exercises end-to-end.
 _DEFAULT_CHIP = "gfx1100"
-
-# `target=` strings to AMDGPU chip names. The mapping is intentionally
-# narrow — every entry is a target the project has actively exercised
-# end-to-end. Unknown targets (including the bare gfx-style names like
-# `gfx1100`) fall through to a sanity check that accepts any
-# `gfx`-prefixed string verbatim, so callers running on a chip we
-# haven't catalogued yet can still get a working schedule by passing
-# `target="gfx<chip>"` directly.
-_TARGET_CHIP_MAP: dict[str, str] = {
-    "amdgpu-gfx11": "gfx1100",
-}
+# `amdgpu-gfx11` is the only logical-target alias we expose today; bare
+# gfx-prefixed targets pass through `_resolve_chip` verbatim, so callers
+# on a chip we haven't catalogued yet can still get a working schedule
+# by passing `target="gfx<chip>"` directly. If a second alias shows up,
+# bring back a small dict here — until then a single conditional in
+# `_resolve_chip` is the whole "registry".
 
 # Sister sentinel for `ld.lld` that `hc-lower-gpu-to-binary` invokes to
 # link the AMDGPU object into an HSACO blob. Substituted Python-side
@@ -243,12 +238,11 @@ def run_front_to_hc(
     The `__HC_CHIP__` placeholder is filled in two places: the schedule
     (for `rocdl-attach-target`) and the appended GPU lowering chain
     (for `convert-amdgpu-to-rocdl` / `convert-gpu-to-rocdl`). `target=`
-    is mapped through `_TARGET_CHIP_MAP` (e.g. `"amdgpu-gfx11"` →
-    `"gfx1100"`). Passing a bare `gfx<chip>` string works too — anything
-    starting with `gfx` is accepted verbatim. With `target=None` the chip
-    falls back to `_DEFAULT_CHIP`, which is fine because chip-keyed
-    passes are no-ops on a payload that never grew a `gpu.module`
-    (trivial/fully-folded kernels).
+    is resolved by `_resolve_chip`: the logical alias `"amdgpu-gfx11"`
+    maps to `"gfx1100"`, and bare `gfx<chip>` strings pass through
+    verbatim. With `target=None` the chip falls back to `_DEFAULT_CHIP`,
+    which is fine because chip-keyed passes are no-ops on a payload
+    that never grew a `gpu.module` (trivial/fully-folded kernels).
 
     `__HC_LLD__` is filled with the path returned by
     `hc._native_paths.lld_path` — bundled `hc/_native/bin/ld.lld` by
@@ -555,9 +549,10 @@ def _resolve_lld() -> str:
 def _resolve_chip(target: str | None) -> str:
     """Map the user-facing `target=` to an AMDGPU chip name.
 
-    `None` -> `_DEFAULT_CHIP`; named target -> table lookup; bare
-    `gfx<chip>` -> verbatim. Anything else is rejected — better to fail
-    here than to feed `rocdl-attach-target` a chip it can't parse.
+    `None` -> `_DEFAULT_CHIP`; the single logical alias `amdgpu-gfx11`
+    -> `gfx1100`; bare `gfx<chip>` -> verbatim. Anything else falls
+    through to the default so `rocdl-attach-target` still gets a chip
+    it can parse.
     """
 
     if target is None:
@@ -567,8 +562,8 @@ def _resolve_chip(target: str | None) -> str:
     bad = sorted({c for c in target if c in _CHIP_FORBIDDEN_CHARS})
     if bad:
         raise ValueError(f"target contains forbidden characters {bad}: {target!r}")
-    if target in _TARGET_CHIP_MAP:
-        return _TARGET_CHIP_MAP[target]
+    if target == "amdgpu-gfx11":
+        return "gfx1100"
     if target.startswith("gfx"):
         return target
     # Unknown logical target — recipe interpretation will simply not

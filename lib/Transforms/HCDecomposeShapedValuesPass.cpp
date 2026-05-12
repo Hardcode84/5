@@ -944,6 +944,16 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
   return target;
 }
 
+// Partial conversion target. Asymmetric on purpose: unknown ops are
+// legal (preserved with `unrealized_conversion_cast` boundaries when
+// their operands/results get decomposed), but every op in the enumerated
+// list below is a registered rewrite-pattern target — if one of them
+// carries a semantic shaped operand or result we still want it
+// decomposed, even when the surrounding IR isn't. Extending the rewrite
+// pattern set means extending this list in lockstep; the strict target
+// avoids this drift by treating every op uniformly. See the
+// `hc-decompose-shaped-values` description in `Passes.td` for the
+// invariant the two targets are encoding.
 static ConversionTarget
 makePartialShapedDecompositionTarget(MLIRContext *ctx,
                                      const TypeConverter &converter) {

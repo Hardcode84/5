@@ -34,9 +34,13 @@
 // row-major when the operand has no layout) into a single 1D offset
 // matching the post-flatten 1D operand. Multi-index lists on
 // `hc.load` / `hc.store` / `hc.vload` collapse the same way through
-// the per-access `Compose*Offsets` patterns. `hc.buffer_view` is
-// deferred — it produces a sub-view whose offset semantics differ
-// from a single-base-offset access.
+// the per-access `Compose*Offsets` patterns. `hc.buffer_view` composes
+// rank-N subscripts into a single rank-1 slice on the flat carrier:
+// pure-scalar identity views forward the source through, single-slice
+// strided views land one `hc.slice_expr` with `lower` / `upper` /
+// `step` scaled by the original axis's row-major stride. Multi-slice
+// and rank-mismatched views (frontend rank-up patterns) fall through
+// to the catch-all retyper; downstream lowering owns those cases.
 //
 // Post-flatten invariant from `doc/layouts.md`: *no `#hc.layout`
 // survives on any shaped type*. The implicit-check below pins that
@@ -582,4 +586,110 @@ func.func @load_unbound_index_falls_through(
          tuple<!hc.idx<"M">, !hc.idx<"N">>)
         -> !hc.bare_tensor<f32, ["M", "N"]>
   return
+}
+
+// -----
+
+// `hc.buffer_view` identity: rank-2 source where one axis is a unit
+// dim, indexed by `slice + idx<"0">`. Post-flatten the source carrier
+// collapses to ["8"] and the view covers the same 8 elements, so the
+// rewrite forwards the flat source through unchanged. The original
+// op drops out of the IR.
+// CHECK-LABEL: @buffer_view_identity_forwards_source
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_vector<f32, ["8"]>
+// CHECK-NOT: hc.buffer_view
+// CHECK: return %[[SRC]]
+func.func @buffer_view_identity_forwards_source(
+    %src: !hc.bare_vector<f32, ["8", "1"]>)
+    -> !hc.bare_vector<f32, ["8"]> {
+  %z = hc.const<0 : i64> : !hc.idx<"0">
+  %s = hc.slice_expr() : () -> !hc.slice
+  %v = hc.buffer_view %src[%s, %z]
+      : (!hc.bare_vector<f32, ["8", "1"]>, !hc.slice, !hc.idx<"0">)
+        -> !hc.bare_vector<f32, ["8"]>
+  return %v : !hc.bare_vector<f32, ["8"]>
+}
+
+// -----
+
+// `hc.buffer_view` strided slice: rank-2 source with `(scalar_row,
+// full_col_slice)` over `bare_tensor<f16, ["M", "N"]>`. Post-flatten
+// the source carrier collapses to a single dim sized `M*N`; the row
+// scalar contributes `row * N` to the flat base offset (`N` is the
+// row-major stride at axis 0), and the column slice maps to a step-1
+// slice of length `N` starting there. The rebuilt view sits on the
+// flat carrier with one slice subscript whose lower / upper / step
+// were composed through ixsimpl.
+// CHECK-LABEL: @buffer_view_row_then_full_col_composes
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_tensor<f16, ["M*N"]>
+// CHECK-SAME: %[[BM:[^:]+]]: !hc.idx<"M">, %[[BN:[^:]+]]: !hc.idx<"N">
+// CHECK-SAME: %[[ROW:[^:]+]]: !hc.idx<"r">
+// CHECK: %[[LO:.*]] = hc.idx_apply (%[[BN]] as "N", %[[ROW]] as "r")
+// CHECK-SAME: -> !hc.idx<"N*r">
+// CHECK: %[[HI:.*]] = hc.idx_apply (%[[BN]] as "N", %[[ROW]] as "r")
+// CHECK-SAME: -> !hc.idx<"N + N*r">
+// CHECK: %[[STEP:.*]] = hc.idx_apply () : () -> !hc.idx<"1">
+// CHECK: %[[SL:.*]] = hc.slice_expr(lower = %[[LO]] upper = %[[HI]] step = %[[STEP]])
+// CHECK: hc.buffer_view %[[SRC]][%[[SL]]]
+// CHECK-SAME: : (!hc.bare_tensor<f16, ["M*N"]>,
+// CHECK-SAME: -> !hc.bare_tensor<f16, ["N"]>
+func.func @buffer_view_row_then_full_col_composes(
+    %src: !hc.bare_tensor<f16, ["M", "N"]>,
+    %row: !hc.idx<"r">) -> !hc.bare_tensor<f16, ["N"]> {
+  %s = hc.slice_expr() : () -> !hc.slice
+  %v = hc.buffer_view %src[%row, %s]
+      : (!hc.bare_tensor<f16, ["M", "N"]>, !hc.idx<"r">, !hc.slice)
+        -> !hc.bare_tensor<f16, ["N"]>
+  return %v : !hc.bare_tensor<f16, ["N"]>
+}
+
+// -----
+
+// `hc.buffer_view` strided slice column-of-2D: full row slice + scalar
+// column. The column scalar contributes `col * 1` (innermost axis row-
+// major stride is 1) to the flat base offset; the row slice becomes a
+// step-`N` slice over the flat carrier — each successive row sits `N`
+// elements apart. The rebuilt rank-1 view is the column-as-strided-1D
+// pattern the WMMA recipe relies on.
+// CHECK-LABEL: @buffer_view_full_row_then_col_composes
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_tensor<f16, ["M*N"]>
+// CHECK-SAME: %[[BM:[^:]+]]: !hc.idx<"M">, %[[BN:[^:]+]]: !hc.idx<"N">
+// CHECK-SAME: %[[COL:[^:]+]]: !hc.idx<"c">
+// CHECK: %[[LO:.*]] = hc.idx_apply (%[[COL]] as "c") : (!hc.idx<"c">) -> !hc.idx<"c">
+// CHECK: %[[HI:.*]] = hc.idx_apply (%[[BM]] as "M", %[[BN]] as "N", %[[COL]] as "c")
+// CHECK-SAME: -> !hc.idx<"c + M*N">
+// CHECK: %[[STEP:.*]] = hc.idx_apply (%[[BN]] as "N") : (!hc.idx<"N">) -> !hc.idx<"N">
+// CHECK: %[[SL:.*]] = hc.slice_expr(lower = %[[LO]] upper = %[[HI]] step = %[[STEP]])
+// CHECK: hc.buffer_view %[[SRC]][%[[SL]]]
+// CHECK-SAME: : (!hc.bare_tensor<f16, ["M*N"]>,
+// CHECK-SAME: -> !hc.bare_tensor<f16, ["M"]>
+func.func @buffer_view_full_row_then_col_composes(
+    %src: !hc.bare_tensor<f16, ["M", "N"]>,
+    %col: !hc.idx<"c">) -> !hc.bare_tensor<f16, ["M"]> {
+  %s = hc.slice_expr() : () -> !hc.slice
+  %v = hc.buffer_view %src[%s, %col]
+      : (!hc.bare_tensor<f16, ["M", "N"]>, !hc.slice, !hc.idx<"c">)
+        -> !hc.bare_tensor<f16, ["M"]>
+  return %v : !hc.bare_tensor<f16, ["M"]>
+}
+
+// -----
+
+// Rank-mismatched buffer_view (frontend rank-up: rank-1 source carrier
+// indexed by three subscripts) falls through to the catch-all retyper.
+// The view stays in the IR with its original subscripts on the now-
+// flat carrier; downstream lowering owns the rewrite.
+// CHECK-LABEL: @buffer_view_rank_up_falls_through
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_vector<f32, ["8"]>
+// CHECK: hc.buffer_view %[[SRC]][%{{[^,]+}}, %{{[^,]+}}, %{{[^]]+}}]
+// CHECK-SAME: : (!hc.bare_vector<f32, ["8"]>, !hc.slice, !hc.idx<"lane">, !hc.idx<"0">) -> !hc.bare_vector<f32, ["8"]>
+func.func @buffer_view_rank_up_falls_through(
+    %src: !hc.bare_vector<f32, ["8"]>,
+    %lane: !hc.idx<"lane">) -> !hc.bare_vector<f32, ["8"]> {
+  %z = hc.const<0 : i64> : !hc.idx<"0">
+  %s = hc.slice_expr() : () -> !hc.slice
+  %v = hc.buffer_view %src[%s, %lane, %z]
+      : (!hc.bare_vector<f32, ["8"]>, !hc.slice, !hc.idx<"lane">, !hc.idx<"0">)
+        -> !hc.bare_vector<f32, ["8"]>
+  return %v : !hc.bare_vector<f32, ["8"]>
 }

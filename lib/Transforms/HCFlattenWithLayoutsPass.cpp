@@ -1095,6 +1095,318 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
   }
 };
 
+// Rewrite an `hc.buffer_view` whose source has been flattened to its 1D
+// carrier. The pre-flatten subscript list is rank-N (one entry per
+// source axis); post-flatten the source carries a single composite
+// axis so the verifier on the consumer side rejects the original
+// subscript count.
+//
+// Two cases:
+//
+// * Identity: the converted (1D) source shape matches the converted
+//   (1D) result shape. The buffer_view is a no-op against the
+//   collapsed storage — every scalar subscript landed on an axis that
+//   the flatten layout already factors out (unit-size axis, or a
+//   work-distributed axis whose lane index is implicit per thread).
+//   Forward the flat source through.
+//
+// * Single-slice strided: exactly one subscript is a slice; the rest
+//   are scalar `!hc.idx<...>` indices. Compose the row-major offset
+//   into a single contiguous-stride slice on the flat carrier.
+//   Layout-less sources are the canonical contract for this rewrite;
+//   sources carrying an explicit `#hc.layout<...>` payload bail (the
+//   v0 surface uses identity row-major for these views — a custom
+//   layout would need to participate in the offset composition the
+//   same way `composeAccessOffsetExpr` does for access ops, which is
+//   out of scope here).
+//
+// Anything else (multi-slice on a non-trivial layout, missing
+// `hc.slice_expr` producer for the slice operand, ...) bails to the
+// catch-all retyper. Today the only consumer that emits such patterns
+// is `hc-vec`-style WMMA tile loads through cooperative LDS; the
+// retire-cooperative-copy cleanup will narrow this further.
+struct ComposeBufferViewOffsets
+    : public ComposeAccessOffsetBase<HCBufferViewOp> {
+  using ComposeAccessOffsetBase::ComposeAccessOffsetBase;
+  using Base = OpConversionPattern<HCBufferViewOp>;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(HCBufferViewOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (adaptor.getBuffer().empty())
+      return failure();
+    Value flatSource = adaptor.getBuffer().front();
+    ValueRange sourceAux = adaptor.getBuffer().drop_front();
+
+    auto preFlattenSrc =
+        dyn_cast<SymbolicallyShapedTypeInterface>(op.getBuffer().getType());
+    if (!preFlattenSrc)
+      return failure();
+    ShapeAttr preShape = preFlattenSrc.getSymbolicShape();
+    if (!preShape)
+      return failure();
+    if (preShape.getDims().size() == op.getIndices().size() &&
+        preShape.getDims().size() <= 1)
+      return failure();
+    if (preShape.getDims().size() != op.getIndices().size())
+      return failure();
+
+    Type origResultType = op.getResult().getType();
+    SmallVector<Type> convertedResults;
+    if (failed(
+            getTypeConverter()->convertType(origResultType, convertedResults)))
+      return failure();
+    if (convertedResults.empty())
+      return failure();
+    Type flatResultType = convertedResults.front();
+
+    auto flatResultShaped =
+        dyn_cast<SymbolicallyShapedTypeInterface>(flatResultType);
+    auto flatSourceShaped =
+        dyn_cast<SymbolicallyShapedTypeInterface>(flatSource.getType());
+    if (!flatResultShaped || !flatSourceShaped)
+      return failure();
+
+    auto pushReplacement = [&](Value flatValue) {
+      llvm::StringMap<Value> bindings;
+      noteOperandBindings(op.getBuffer().getType(), adaptor.getBuffer(),
+                          bindings);
+      auto auxValues = resolveResultAuxValues(rewriter, op.getLoc(),
+                                              origResultType, bindings);
+      if (failed(auxValues))
+        return failure();
+      SmallVector<Value> replacement = {flatValue};
+      llvm::append_range(replacement, *auxValues);
+      SmallVector<ValueRange> replacements = {replacement};
+      rewriter.replaceOpWithMultiple(op, replacements);
+      return success();
+    };
+
+    // Identity: every scalar subscript hits an axis the flatten layout
+    // already factors out. The flat carrier shape matches the result's
+    // flat shape, so forwarding the source through is the right
+    // semantics. (Sanity: the source must also share the element type
+    // with the result. Cross-element-type view requests don't exist in
+    // the v0 surface, but a flat-shape coincidence with a different
+    // elt type would silently miscompile, so reject it here.)
+    if (flatSourceShaped.getSymbolicShape() ==
+            flatResultShaped.getSymbolicShape() &&
+        flatSource.getType() == flatResultType) {
+      (void)sourceAux;
+      return pushReplacement(flatSource);
+    }
+
+    // Strided slice: exactly one slice subscript, rest scalar.
+    if (preFlattenSrc.getSymbolicLayout())
+      return failure();
+    int64_t sliceAxis = -1;
+    for (auto [axis, idx] : llvm::enumerate(op.getIndices())) {
+      if (isa<SliceType>(idx.getType())) {
+        if (sliceAxis >= 0)
+          return failure();
+        sliceAxis = static_cast<int64_t>(axis);
+      } else if (!isa<IdxType>(idx.getType())) {
+        return failure();
+      }
+    }
+    if (sliceAxis < 0)
+      return failure();
+
+    MLIRContext *ctx = op.getContext();
+    auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+    ArrayRef<Attribute> preDims = preShape.getDims();
+
+    auto getDimExpr = [&](size_t axis) -> FailureOr<sym::ExprHandle> {
+      auto e = dyn_cast<ExprAttr>(preDims[axis]);
+      if (!e)
+        return failure();
+      return e.getValue();
+    };
+
+    auto rowStrideAt = [&](size_t k) -> FailureOr<sym::ExprHandle> {
+      auto oneE = sym::composeExprInt(store, 1);
+      if (failed(oneE))
+        return failure();
+      sym::ExprHandle stride = *oneE;
+      for (size_t j = k + 1; j < preDims.size(); ++j) {
+        auto dim = getDimExpr(j);
+        if (failed(dim))
+          return failure();
+        auto next =
+            sym::composeExprBinary(store, stride, sym::ExprBinaryOp::Mul, *dim);
+        if (failed(next))
+          return failure();
+        stride = *next;
+      }
+      return stride;
+    };
+
+    auto zeroExpr = sym::composeExprInt(store, 0);
+    auto oneExpr = sym::composeExprInt(store, 1);
+    if (failed(zeroExpr) || failed(oneExpr))
+      return failure();
+
+    // Accumulate the scalar-axis contribution to the flat base offset.
+    sym::ExprHandle baseOffset = *zeroExpr;
+    for (auto [axis, idx] : llvm::enumerate(op.getIndices())) {
+      if (axis == static_cast<size_t>(sliceAxis))
+        continue;
+      auto idxType = dyn_cast<IdxType>(idx.getType());
+      if (!idxType || !idxType.getExpr())
+        return failure();
+      auto rowStride = rowStrideAt(axis);
+      if (failed(rowStride))
+        return failure();
+      auto term = sym::composeExprBinary(store, idxType.getExpr().getValue(),
+                                         sym::ExprBinaryOp::Mul, *rowStride);
+      if (failed(term))
+        return failure();
+      auto added = sym::composeExprBinary(store, baseOffset,
+                                          sym::ExprBinaryOp::Add, *term);
+      if (failed(added))
+        return failure();
+      baseOffset = *added;
+    }
+
+    // Pull lower / upper / step off the slice subscript's producing
+    // `hc.slice_expr`. Optional operands default to Python slice
+    // semantics: lower → 0, upper → axis size, step → 1.
+    auto sliceProducer =
+        op.getIndices()[sliceAxis].getDefiningOp<HCSliceExprOp>();
+    if (!sliceProducer)
+      return failure();
+    auto exprFromOperand =
+        [&](Value v, sym::ExprHandle dflt) -> FailureOr<sym::ExprHandle> {
+      if (!v)
+        return dflt;
+      auto t = dyn_cast<IdxType>(v.getType());
+      if (!t || !t.getExpr())
+        return failure();
+      return t.getExpr().getValue();
+    };
+    auto sliceLower = exprFromOperand(sliceProducer.getLower(), *zeroExpr);
+    if (failed(sliceLower))
+      return failure();
+    auto sliceAxisDim = getDimExpr(sliceAxis);
+    if (failed(sliceAxisDim))
+      return failure();
+    auto sliceUpper = exprFromOperand(sliceProducer.getUpper(), *sliceAxisDim);
+    if (failed(sliceUpper))
+      return failure();
+    auto sliceStep = exprFromOperand(sliceProducer.getStep(), *oneExpr);
+    if (failed(sliceStep))
+      return failure();
+
+    auto sliceRowStride = rowStrideAt(sliceAxis);
+    if (failed(sliceRowStride))
+      return failure();
+
+    // Flat slice lower = scalar_base + slice.lower * row_stride.
+    auto sliceLowerContrib = sym::composeExprBinary(
+        store, *sliceLower, sym::ExprBinaryOp::Mul, *sliceRowStride);
+    if (failed(sliceLowerContrib))
+      return failure();
+    auto flatLowerExpr = sym::composeExprBinary(
+        store, baseOffset, sym::ExprBinaryOp::Add, *sliceLowerContrib);
+    if (failed(flatLowerExpr))
+      return failure();
+
+    // Flat slice upper = scalar_base + slice.upper * row_stride.
+    auto sliceUpperContrib = sym::composeExprBinary(
+        store, *sliceUpper, sym::ExprBinaryOp::Mul, *sliceRowStride);
+    if (failed(sliceUpperContrib))
+      return failure();
+    auto flatUpperExpr = sym::composeExprBinary(
+        store, baseOffset, sym::ExprBinaryOp::Add, *sliceUpperContrib);
+    if (failed(flatUpperExpr))
+      return failure();
+
+    // Flat slice step = slice.step * row_stride.
+    auto flatStepExpr = sym::composeExprBinary(
+        store, *sliceStep, sym::ExprBinaryOp::Mul, *sliceRowStride);
+    if (failed(flatStepExpr))
+      return failure();
+
+    // Build the symbol-binding map the same way `composeAccessBaseOffset`
+    // does for the per-access patterns: the source operand's 1-to-N
+    // expansion supplies dim / stride aux; idx-typed subscripts bind
+    // their own bare symbol; ancestor block args (loop induction vars)
+    // bind any bare-sym `!hc.idx` they carry. `materializeOffsetSSA`
+    // emits `hc.idx_apply` ops with the right operand list so the
+    // launch-body lowering downstream picks them up by SSA, not by
+    // ambient resolution.
+    llvm::StringMap<Value> bindings;
+    SmallVector<std::string> implicitSyms = collectImplicitSyms(preFlattenSrc);
+    if (sourceAux.size() == implicitSyms.size())
+      for (auto [name, value] : llvm::zip_equal(implicitSyms, sourceAux))
+        bindings[name] = value;
+    auto pinsBareSymbol = [&store](Type type) -> StringRef {
+      auto idxType = dyn_cast<IdxType>(type);
+      if (!idxType)
+        return {};
+      ExprAttr exprAttr = idxType.getExpr();
+      if (!exprAttr)
+        return {};
+      StringRef onlyName;
+      bool unique = true;
+      sym::walkSymbolNames(exprAttr.getValue(), [&](StringRef name) {
+        if (onlyName.empty())
+          onlyName = name;
+        else if (onlyName != name)
+          unique = false;
+      });
+      if (!unique || onlyName.empty())
+        return {};
+      auto pinned = sym::composeExprSym(store, onlyName);
+      if (failed(pinned))
+        return {};
+      if (pinned->raw() != exprAttr.getValue().raw())
+        return {};
+      return onlyName;
+    };
+    for (Value idx : op.getIndices()) {
+      StringRef name = pinsBareSymbol(idx.getType());
+      if (name.empty())
+        continue;
+      bindings.try_emplace(name, idx);
+    }
+    for (Block *block = op->getBlock(); block;) {
+      for (BlockArgument arg : block->getArguments()) {
+        StringRef name = pinsBareSymbol(arg.getType());
+        if (name.empty())
+          continue;
+        bindings.try_emplace(name, arg);
+      }
+      Operation *parent = block->getParentOp();
+      if (!parent)
+        break;
+      block = parent->getBlock();
+    }
+
+    auto buildIdx = [&](sym::ExprHandle e) -> Value {
+      return materializeOffsetSSA(rewriter, op.getLoc(), ExprAttr::get(ctx, e),
+                                  bindings);
+    };
+    Value newLower = buildIdx(*flatLowerExpr);
+    Value newUpper = buildIdx(*flatUpperExpr);
+    Value newStep = buildIdx(*flatStepExpr);
+
+    auto sliceType = SliceType::get(ctx, newLower.getType(), newUpper.getType(),
+                                    newStep.getType());
+    Value newSlice = HCSliceExprOp::create(rewriter, op.getLoc(), sliceType,
+                                           newLower, newUpper, newStep)
+                         .getResult();
+
+    Value newView =
+        HCBufferViewOp::create(rewriter, op.getLoc(), flatResultType,
+                               flatSource, ValueRange{newSlice})
+            .getResult();
+
+    return pushReplacement(newView);
+  }
+};
+
 // Compose the per-operand per-axis offset arrays on `hc.generic` into
 // single-entry arrays — the post-flatten contract per `doc/layouts.md`.
 // For each shaped operand the rewrite reads the operand's pre-flatten
@@ -1654,12 +1966,12 @@ struct HCFlattenWithLayoutsPass final
     // Per-access-op patterns are listed first by intent — the
     // conversion driver still picks via benefit (2 vs the generic
     // retype's 1), but having them grouped reads as the design.
-    patterns
-        .add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeLoadMaskOffsets,
-             ComposeStoreOffsets, ComposeGenericOffsets, DropAsLayout,
-             RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
-             ConvertHCSymbolSignatureOp<HCFuncOp>,
-             ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
+    patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets,
+                 ComposeLoadMaskOffsets, ComposeStoreOffsets,
+                 ComposeGenericOffsets, ComposeBufferViewOffsets, DropAsLayout,
+                 RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
+                 ConvertHCSymbolSignatureOp<HCFuncOp>,
+                 ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
 
     target.markUnknownOpDynamicallyLegal([&](Operation *op) {
       if (auto fn = dyn_cast<FunctionOpInterface>(op))

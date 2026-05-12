@@ -128,14 +128,51 @@ LogicalResult HCLowerGPUToBinaryPass::dumpLLVMModule(gpu::GPUModuleOp module,
 }
 
 std::string HCLowerGPUToBinaryPass::resolveLldPath(gpu::GPUModuleOp module) {
-  if (!lldPath.empty())
-    return lldPath;
+  // Three candidate sources in priority order:
+  //   1. `--lld-path=` option (populated Python-side by `_substitute_lld`
+  //      from `_native_paths.lld_path()`, which points at the bundled
+  //      `hc/_native/bin/ld.lld` by default).
+  //   2. `HC_LLD` env (source-tree dev override, undocumented but kept
+  //      working for users who run pre-staged toolchain builds).
+  //   3. `findProgramByName("ld.lld")` — last-ditch PATH search; not what
+  //      the production pipeline should rely on but harmless as a fallback
+  //      when the wheel is misconfigured.
+  //
+  // Each candidate is existence-checked before we hand it to
+  // `linkObjectCode` — the MLIR `ExecuteAndWait` wrapper surfaces an
+  // `execve` failure as the same unhelpful "lld invocation failed"
+  // diagnostic as a real linker error, and a missing-binary is by far
+  // the more common failure mode for source-tree devs and broken wheel
+  // installs. Validating up front lets the diagnostic name the missing
+  // path so the user knows exactly which file to stage.
+  //
+  // Explicit candidates (option, env) are authoritative — when the
+  // user sets one we fail loudly on a miss rather than cascading to
+  // PATH. Silently substituting a different `ld.lld` than was asked
+  // for would defeat the point of the override and surface as the
+  // next mysterious "why is my linker doing X" bug. Only the implicit
+  // PATH fallback fires when nothing was set.
+  auto failMissing = [&](StringRef where, StringRef path) {
+    module.emitError("hc-lower-gpu-to-binary: ld.lld not executable at ")
+        << path << " (via " << where << ")";
+  };
 
-  if (const char *fromEnv = std::getenv("HC_LLD"); fromEnv && *fromEnv)
-    return std::string(fromEnv);
+  if (!lldPath.empty()) {
+    if (llvm::sys::fs::can_execute(lldPath))
+      return lldPath;
+    failMissing("--lld-path=", lldPath);
+    return {};
+  }
+
+  if (const char *fromEnv = std::getenv("HC_LLD"); fromEnv && *fromEnv) {
+    if (llvm::sys::fs::can_execute(fromEnv))
+      return std::string(fromEnv);
+    failMissing("HC_LLD env", fromEnv);
+    return {};
+  }
 
   llvm::ErrorOr<std::string> found = llvm::sys::findProgramByName("ld.lld");
-  if (found)
+  if (found && llvm::sys::fs::can_execute(*found))
     return *found;
 
   module.emitError("hc-lower-gpu-to-binary: ld.lld not found").attachNote()
@@ -237,6 +274,15 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
       targetMachine->getTargetTriple().str(), targetMachine->getTargetCPU(),
       targetMachine->getTargetFeatureString(), emitOpError);
   if (failed(object))
+    return failure();
+  // Stage `2b` because we want this between `2-isa.s` and `3-binary.hsaco`
+  // in `ls | sort` — the assembled ELF is the input lld actually sees, so
+  // when the linker step fails the .o is what you reach for first. The
+  // MLIR `linkObjectCode` wrapper swallows lld's stderr and surfaces only
+  // a generic "lld invocation failed", so without this dump every linker
+  // bug starts with a re-run-with-extra-instrumentation step.
+  if (failed(dumpStage(module, "2b-object.o",
+                       StringRef(object->data(), object->size()))))
     return failure();
 
   // Step 6: ELF → HSACO via ld.lld.

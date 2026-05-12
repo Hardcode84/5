@@ -7,11 +7,12 @@
 // silently producing wrong-target HSACO or punting confusing
 // TargetRegistry diagnostics to the user.
 //
-// We deliberately do not exercise the missing-lld path here: most CI
-// environments have *some* `ld.lld` on PATH, so a "fail when no lld"
-// test would be falsey. The path resolution order is option > HC_LLD
-// > $PATH and the diagnostic itself is short enough to grep when it
-// does fire.
+// We deliberately do not exercise the "no lld anywhere" path here:
+// most CI environments have *some* `ld.lld` on PATH, so a "fail when
+// no lld" test would be falsey. The bogus-lld-path path (option set
+// to a path that doesn't exist) is independent of $PATH state and
+// lives in `lower-gpu-to-binary-missing-lld.mlir` so the
+// `expected-error` markers can be paired with their own RUN line.
 
 // RUN: hc-opt --hc-lower-gpu-to-binary='lld-path=%hc_lld' --split-input-file --verify-diagnostics %s
 

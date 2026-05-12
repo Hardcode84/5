@@ -20,23 +20,31 @@
 // RUN:        --split-input-file %s -o /dev/null \
 // RUN:   && ls %t.dump | sort | FileCheck --check-prefix=DUMP %s
 //
-// Per gpu.module the pass writes four artifacts: pre-opt LLVM IR,
-// post-opt LLVM IR, ISA assembly, and the linked HSACO blob. The
-// names embed an order prefix so `ls | sort` matches the pipeline
-// order. With --split-input-file three modules go through the pass
-// (@kernel from the first split, @first / @second from the second),
-// so we expect 12 files — DUMP-NEXT pins them in lexical order.
+// Per gpu.module the pass writes five artifacts: pre-opt LLVM IR,
+// post-opt LLVM IR, ISA assembly, the assembled ELF object (the input
+// to ld.lld), and the linked HSACO blob. The object dump lives at
+// stage `2b` so it sits between `2-isa.s` and `3-binary.hsaco` in
+// lexical sort — when lld fails the .o is the input we care about,
+// having it on disk skips the "rerun with extra instrumentation"
+// step. The names embed an order prefix so `ls | sort` matches the
+// pipeline order. With --split-input-file three modules go through
+// the pass (@kernel from the first split, @first / @second from the
+// second), so we expect 15 files — DUMP-NEXT pins them in lexical
+// order.
 // DUMP: first.0-pre-opt.ll
 // DUMP-NEXT: first.1-post-opt.ll
 // DUMP-NEXT: first.2-isa.s
+// DUMP-NEXT: first.2b-object.o
 // DUMP-NEXT: first.3-binary.hsaco
 // DUMP-NEXT: kernel.0-pre-opt.ll
 // DUMP-NEXT: kernel.1-post-opt.ll
 // DUMP-NEXT: kernel.2-isa.s
+// DUMP-NEXT: kernel.2b-object.o
 // DUMP-NEXT: kernel.3-binary.hsaco
 // DUMP-NEXT: second.0-pre-opt.ll
 // DUMP-NEXT: second.1-post-opt.ll
 // DUMP-NEXT: second.2-isa.s
+// DUMP-NEXT: second.2b-object.o
 // DUMP-NEXT: second.3-binary.hsaco
 
 // Trivial empty kernel: validates the entire pipeline runs and emits

@@ -3,15 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // End-to-end snapshot of the canonical `amdgpu-gfx11` WMMA lowering pipeline.
-// Hand-rolls the composition `hc.compile` runs — the schedule in
-// `hc/schedules/front_to_hc.mlir` plus the `_GPU_LOWERING_PIPELINE` chain in
-// `hc/_pipeline.py` — as an `hc-opt` pass list. Driving the actual schedule
-// via `transform-interpreter` from inside `hc-opt` would be more
-// drift-resistant, but the interpreter's nested pass manager races on
-// loading the `dlti` dialect (an LLVM ERROR), so we stick with the
-// hand-rolled list; the WMMA pytest exercises the real `hc.compile`
-// composition and catches drift between the two. Pins the load-bearing
-// invariants of the executable lowering chain:
+// Drives the in-tree schedule (`hc/schedules/front_to_hc.mlir`, substituted
+// for `amdgpu-gfx11` / `gfx1100` / `+wavefrontsize32`) through
+// `transform-preload-library` + `transform-interpreter`, then appends the
+// `_GPU_LOWERING_PIPELINE` chain from `hc/_pipeline.py` as a raw
+// pass-pipeline string (the transform-dialect's pass-application op can't
+// express the nested `gpu.module(...)` pass manager that `convert-gpu-to-rocdl`
+// needs). Running the actual schedule keeps this snapshot drift-resistant: a
+// reorder or rename in `front_to_hc.mlir` shows up here first.
+//
+// The `transform-interpreter`'s inner PM is multi-threaded; passes that
+// reach for `dlti.dl_spec` (notably `rocdl-attach-target` /
+// `TargetToDataLayout`, dispatched as part of the rocdl chain) would
+// otherwise lazy-load the `dlti` dialect under threading and trip MLIR's
+// dialect-load guard. `hc-opt` works around that by attaching a
+// `DialectExtension` to `HCDialect` that force-loads `dlti` synchronously
+// during the PassManager's dependent-dialect scan — see
+// `registerHCDependentDialectExtensions` in `lib/IR/HCDialect.cpp`.
+//
+// Pins the load-bearing invariants of the executable lowering chain:
 //
 //   * `hc.kernel` becomes a host wrapper that ends up as `llvm.func` after
 //     `gpu-to-llvm` finishes the host-side `func.func` → `llvm.func`
@@ -29,8 +39,9 @@
 // substrings inside the binary (the ELF carries `.amdgpu.metadata`, etc.).
 // `sed` keeps only the prefix up through `bin = "` on the gpu.binary line.
 //
+// RUN: sed -e 's/__HC_TARGET__/amdgpu-gfx11/g' -e 's/__HC_CHIP__/gfx1100/g' -e 's/__HC_FEATURES__/+wavefrontsize32/g' %hc_schedule_default > %t-schedule.mlir
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
-// RUN:   | hc-opt --pass-pipeline='builtin.module(hc-front-fold-region-defs,hc-front-inline,convert-hc-front-to-hc,hc-promote-names,hc-infer-types,hc-materialize-bound-exprs,hc-verify-static-shapes,hc-decompose-shaped-values{strict=false},hc-inline-helpers,hc-materialize-bound-exprs,canonicalize,hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds,hc-normalize-scope-regions,canonicalize,cse,hc-lower-kernels-to-gpu-launch,hc-flatten-with-layouts,canonicalize,cse,hc-lower-launch-body,canonicalize,cse,hc-lower-generic,hc-fold-predicates,hc-lower-launch-body,canonicalize,cse,hc-interpret-intrinsic-recipes{target=amdgpu-gfx11},canonicalize,cse,gpu-launch-sink-index-computations,gpu-kernel-outlining,canonicalize,cse,rocdl-attach-target{chip=gfx1100 features=+wavefrontsize32},hc-lower-to-llvm,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},gpu.module(convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,hc-lower-gpu-to-binary{lld-path=%hc_lld},hc-lower-launch-func-to-runtime,symbol-dce)' \
+// RUN:   | hc-opt --pass-pipeline="builtin.module(transform-preload-library{transform-library-paths=%t-schedule.mlir},transform-interpreter,hc-lower-to-llvm,convert-scf-to-cf,convert-amdgpu-to-rocdl{chipset=gfx1100},gpu.module(convert-gpu-to-rocdl{chipset=gfx1100},convert-arith-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts),gpu-to-llvm,convert-vector-to-llvm,convert-index-to-llvm,reconcile-unrealized-casts,canonicalize,cse,hc-lower-gpu-to-binary{lld-path=%hc_lld},hc-lower-launch-func-to-runtime,symbol-dce)" \
 // RUN:   | sed 's/\(@[A-Za-z0-9_]*_data[A-Za-z0-9_]* *(\)"[^"]*"/\1"<HSACO>"/' \
 // RUN:   | FileCheck %s --implicit-check-not='hc.' --implicit-check-not='!hc.' --implicit-check-not='gpu.' --implicit-check-not='amdgpu.' --implicit-check-not='vector.transfer'
 

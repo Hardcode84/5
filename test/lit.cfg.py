@@ -30,6 +30,18 @@ config.substitutions.append(("%python", sys.executable))
 # to depend on the test runner's $PATH layering being right. Point at
 # the ld.lld that lives in the same LLVM install we built against.
 config.substitutions.append(("%hc_lld", str(Path(config.llvm_tools_dir) / "ld.lld")))
+# End-to-end pipeline LIT tests that want to drive `hc.compile`'s canonical
+# schedule through `transform-preload-library` + `transform-interpreter`
+# point `%hc_schedule_default` at the in-tree copy. The schedule has
+# `__HC_TARGET__` / `__HC_CHIP__` / `__HC_FEATURES__` placeholders the
+# Python driver substitutes; tests do the same with `sed` before feeding
+# the result to `--transform-library-paths`.
+config.substitutions.append(
+    (
+        "%hc_schedule_default",
+        str(Path(config.hc_src_root) / "hc" / "schedules" / "front_to_hc.mlir"),
+    )
+)
 
 llvm_config.with_environment("PYTHONPATH", config.hc_src_root, append_path=True)
 llvm_config.with_environment(

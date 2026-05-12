@@ -1358,6 +1358,58 @@ module {
 
 // -----
 
+// Predicated yield arity follows the same `outs.size()` rule as the
+// unconditional yield — the diagnostic just names which terminator
+// kind the parent saw. Two outs with a single masked value is the
+// "forgot the second slot" mistake.
+// CHECK: error: 'hc.generic' op hc.yield_predicated arity 1 != outs count 2
+module {
+  func.func @bad(%n: index,
+                 %c0: !hc.bare_tensor<f32, ["N"]>,
+                 %c1: !hc.bare_tensor<f32, ["N"]>)
+      -> (!hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>) {
+    %t = arith.constant true
+    %r:2 = hc.generic
+        iter (parallel i = %n : index)
+        ins ()
+        outs (%c0 at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>,
+              %c1 at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+        -> (!hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>) {
+    ^bb0(%c0v: f32, %c1v: f32):
+      hc.yield_predicated %c0v mask %t : (f32), (i1)
+    }
+    return %r#0, %r#1
+        : !hc.bare_tensor<f32, ["N"]>, !hc.bare_tensor<f32, ["N"]>
+  }
+}
+
+// -----
+
+// Mask shape must track the value's shape — scalar value pairs with
+// `i1`, `vector<NxT>` value pairs with `vector<Nxi1>` of the same N. A
+// scalar yield value paired with a vector mask is the most likely
+// transcription mistake; the diagnostic names the values' type and the
+// mask's type so the producer can tell which side drifted.
+// CHECK: error: 'hc.yield_predicated' op predicate shape must match value shape
+module {
+  func.func @bad(%n: index,
+                 %src: !hc.bare_tensor<f32, ["N"]>,
+                 %dst: !hc.ptr<global, f32>,
+                 %vmask: vector<4xi1>) {
+    hc.generic
+        iter (parallel i = %n : index)
+        ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+        outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+        -> () {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield_predicated %sv mask %vmask : (f32), (vector<4xi1>)
+    }
+    return
+  }
+}
+
+// -----
+
 // Each `(operand as "name")` slot on `hc.idx_apply` must reference a
 // free symbol of the carried expression — the binding has nothing to
 // do otherwise. The custom assembly directive forces the operand and

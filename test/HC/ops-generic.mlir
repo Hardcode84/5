@@ -275,3 +275,73 @@ func.func @opaque_ptr_out(%n: index, %dst: !hc.ptr<global>) {
   }
   return
 }
+
+// Predicated terminator (scalar): one masked yield value drives the publish.
+// The mask is an ordinary `i1` SSA; downstream lowering routes through a
+// predicated store / select using `mask` as the gate. Always-true sites
+// (no semantic guard) materialise `arith.constant true` and rely on the
+// emit-time fold to collapse back to an unpredicated store.
+// CHECK-LABEL: func.func @yield_predicated_scalar
+// CHECK: hc.generic
+// CHECK: ^bb0(%[[SV:.+]]: f32, %[[DV:.+]]: f32):
+// CHECK:   hc.yield_predicated %[[SV]] mask %{{.+}} : (f32), (i1)
+func.func @yield_predicated_scalar(%n: index,
+                                   %src: !hc.bare_tensor<f32, ["N"]>,
+                                   %dst: !hc.ptr<global, f32>) {
+  %t = arith.constant true
+  hc.generic
+      iter (parallel i = %n : index)
+      ins (%src at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%sv: f32, %dv: f32):
+    hc.yield_predicated %sv mask %t : (f32), (i1)
+  }
+  return
+}
+
+// Predicated terminator (multi-value): mask count == value count, one
+// `i1` mask per yielded slot. Mixed outs (value + ptr) both ride on the
+// same per-slot mask channel.
+// CHECK-LABEL: func.func @yield_predicated_multi
+// CHECK: hc.generic
+// CHECK: hc.yield_predicated %{{.+}}, %{{.+}} mask %{{.+}}, %{{.+}} : (f32, f32), (i1, i1)
+func.func @yield_predicated_multi(%n: index,
+                                  %a: !hc.bare_tensor<f32, ["N"]>,
+                                  %c: !hc.bare_tensor<f32, ["N"]>,
+                                  %trace: !hc.ptr<workgroup, f32>) ->
+    !hc.bare_tensor<f32, ["N"]> {
+  %tt = arith.constant true
+  %r = hc.generic
+      iter (parallel i = %n : index)
+      ins (%a at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>)
+      outs (%c at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["N"]>,
+            %trace at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+      -> (!hc.bare_tensor<f32, ["N"]>) {
+  ^bb0(%av: f32, %cv: f32, %tv: f32):
+    %sq = hc.mul %av, %av : (f32, f32) -> f32
+    hc.yield_predicated %sq, %sq mask %tt, %tt : (f32, f32), (i1, i1)
+  }
+  return %r : !hc.bare_tensor<f32, ["N"]>
+}
+
+// Opaque ptr (no `$elementType`) escapes the body's per-slot parity in
+// the same way the unconditional yield does, so a masked publish can ride
+// any scalar yield type the producer wants. The verifier still gates the
+// scalar/vector-mask shape parity at the yield site — see verify-hc.mlir
+// for the negative case.
+// CHECK-LABEL: func.func @yield_predicated_opaque_ptr
+// CHECK: hc.yield_predicated %{{.+}} mask %{{.+}} : (i32), (i1)
+func.func @yield_predicated_opaque_ptr(%v: i32, %n: index,
+                                       %dst: !hc.ptr<global>) {
+  %t = arith.constant true
+  hc.generic
+      iter (parallel i = %n : index)
+      ins ()
+      outs (%dst at [#hc.expr<"i">] : !hc.ptr<global>)
+      -> () {
+  ^bb0(%dv: i32):
+    hc.yield_predicated %v mask %t : (i32), (i1)
+  }
+  return
+}

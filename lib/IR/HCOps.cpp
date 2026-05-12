@@ -1840,6 +1840,21 @@ LogicalResult HCPtrStorePredOp::verify() {
                                          getPredicate().getType());
 }
 
+// Per-pair value/mask shape parity: scalar value pairs with `i1`,
+// `vector<NxT>` value pairs with `vector<Nxi1>` of the same N. Count
+// parity is enforced by `SameVariadicOperandSize` on the op, so we only
+// walk the pairs here. The outs / yield element-type parity is validated
+// on the parent `hc.generic` — same diagnostic shape as the unconditional
+// `hc.yield`.
+LogicalResult HCYieldPredicatedOp::verify() {
+  for (auto [value, mask] : llvm::zip_equal(getValues(), getMasks())) {
+    if (failed(checkPredicateShapeMatchesValue(getOperation(), value.getType(),
+                                               mask.getType())))
+      return failure();
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // SymbolUserOpInterface verification for call ops.
 //
@@ -2412,20 +2427,34 @@ LogicalResult HCGenericOp::verify() {
       return failure();
 
   Operation *terminator = tryGetTerminator(entry);
-  auto yield = llvm::dyn_cast_or_null<HCYieldOp>(terminator);
-  if (!yield)
-    return emitOpError("body must terminate with `hc.yield`");
-  if (yield.getValues().size() != getOuts().size())
-    return emitOpError("hc.yield arity ")
-           << yield.getValues().size() << " != outs count " << getOuts().size();
-  for (auto [i, yv, outVal] : llvm::enumerate(yield.getValues(), getOuts())) {
+  // Body terminates with either `hc.yield` (unconditional) or
+  // `hc.yield_predicated` (per-value mask gate). Type-parity rules are the
+  // same in both cases — only the predicated form additionally carries
+  // masks, and the per-pair shape match is enforced on that op.
+  ValueRange yieldValues;
+  StringRef terminatorName;
+  if (auto yield = llvm::dyn_cast_or_null<HCYieldOp>(terminator)) {
+    yieldValues = yield.getValues();
+    terminatorName = "hc.yield";
+  } else if (auto yieldPred =
+                 llvm::dyn_cast_or_null<HCYieldPredicatedOp>(terminator)) {
+    yieldValues = yieldPred.getValues();
+    terminatorName = "hc.yield_predicated";
+  } else {
+    return emitOpError(
+        "body must terminate with `hc.yield` or `hc.yield_predicated`");
+  }
+  if (yieldValues.size() != getOuts().size())
+    return emitOpError(terminatorName) << " arity " << yieldValues.size()
+                                       << " != outs count " << getOuts().size();
+  for (auto [i, yv, outVal] : llvm::enumerate(yieldValues, getOuts())) {
     Type yieldType = yv.getType();
     Type outElem = genericOperandElement(outVal.getType());
     if (!outElem || isHCUndefType(yieldType) || yieldType == outElem)
       continue;
-    return emitOpError("hc.yield #")
-           << i << " type " << yieldType << " does not match outs #" << i
-           << " element type " << outElem;
+    return emitOpError(terminatorName)
+           << " #" << i << " type " << yieldType << " does not match outs #"
+           << i << " element type " << outElem;
   }
 
   return success();

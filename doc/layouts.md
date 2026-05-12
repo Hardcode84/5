@@ -477,6 +477,14 @@ in the pipeline:
     to each output's element type. The lowering routes value-typed
     yields into the SSA result and ptr-typed yields into an implicit
     `hc.ptr_store` at the operand's offset.
+  - **`hc.yield_predicated`** is the per-value masked counterpart of
+    `hc.yield`: same arity and same per-slot element-type parity as
+    `hc.yield`, plus one `i1` (or `vector<Nxi1>` for vector slots)
+    mask per yielded value. Slot `i` publishes only on lanes where
+    `$masks[i]` is true; masked-out lanes leave the outs-as-init
+    carry in place. The lowering routes value-typed predicated yields
+    into an `arith.select` blend against the carry and ptr-typed
+    yields into `hc.ptr_store_pred` at the operand's offset.
 
 Verifier rules:
 
@@ -489,8 +497,11 @@ Verifier rules:
   order. Element type per arg = element type of the operand
   (value-typed: the operand's element type; ptr-typed: the pointee
   type).
-* `hc.yield` produces exactly `outs.size()` values, type-matched to
-  each output's element type.
+* the body terminates with either `hc.yield` or `hc.yield_predicated`;
+  both produce exactly `outs.size()` values, type-matched to each
+  output's element type. `hc.yield_predicated` additionally carries
+  one mask per value (strict parity) — scalar value with `i1`,
+  `vector<NxT>` value with `vector<Nxi1>` of the same N.
 * result types match the value-typed outs in declaration order; the
   ptr/buffer outs contribute no SSA result. A generic with no
   value-typed outs produces zero results.
@@ -521,13 +532,33 @@ This op is the single home for compute end-to-end:
   lands as a single mixed-outs `hc.generic` instead of two ops.
 
 No typed mask slot on `hc.generic` itself in v1 — masks ride as
-ordinary bare-pred tensor inputs. Producers materializing masked
-memory access route through the predicated `hc.ptr_load_pred` /
-`hc.ptr_store_pred` ops at the body boundary so the lowering pass
-can vectorize masked code without falling back to `scf.if` shapes
-in the body (see the `hc.ptr` section). A typed mask slot on the
-op surface is a follow-up if a workload shows it's needed as a
-first-class operand.
+ordinary bare-pred tensor inputs on the input side; on the output
+side the body-terminator carries the mask channel via
+`hc.yield_predicated`. Producers materializing masked memory access
+route input loads through the predicated `hc.ptr_load_pred` op and
+output stores through the predicated terminator (lowering picks
+`hc.ptr_store_pred` for ptr-typed outs and an `arith.select` blend
+for value-typed outs). That keeps masked code vectorizable
+end-to-end without falling back to `scf.if` shapes in the body
+(see the `hc.ptr` section). A typed mask slot on the op surface
+remains a follow-up if a workload shows the input-side story needs
+first-class operand treatment.
+
+Tile sizes that don't divide the work bound generate trailing
+iterations with some lanes OOB. With `hc.yield_predicated` the
+body's per-element validity computes from iter syms + ambient
+bounds and rides the mask channel:
+
+```mlir
+%valid = hc.pred_apply (%i as "i") : (!hc.idx<"i">) -> !hc.pred<"i < N">
+%vmask = hc.cast %valid : !hc.pred<"i < N"> -> i1
+hc.yield_predicated %sv mask %vmask : (f32), (i1)
+```
+
+The launch-body / cooperative-copy lowering picks up the predicated
+store off the mask directly — no hand-rolled OOB guard
+inside the rewriter, the predicate lives at the source-rewrite
+level.
 
 Bound inference — `hc-infer-generic-bounds`:
 
@@ -601,15 +632,29 @@ bound, the unrolled main loop covers the entire iteration space
 exactly — no tail loop is ever emitted.
 
 Predicated bodies — the dominant case is masked memory access,
-expressed via the first-class `hc.ptr_load_pred` / `hc.ptr_store_pred`
-ops (see the `hc.ptr` section above). The merge analyzer probes
-those ops the same as the unconditional pair (the predicate doesn't
-change offset arithmetic), and emission decomposes the chosen
-partition: scalar groups lower to `scf.if` + `hc.ptr_load` /
-`hc.ptr_store`, vector groups lower directly to upstream
-`vector.maskedload` / `vector.maskedstore`. Masked code stays
-vectorizable end-to-end without intermediate `scf.if` shapes
-defeating the search.
+expressed two ways depending on which side of the body owns the
+mask channel:
+
+* **Input loads** ride on the first-class `hc.ptr_load_pred`
+  (see the `hc.ptr` section above). The merge analyzer probes
+  predicated loads the same as the unconditional pair (the predicate
+  doesn't change offset arithmetic), and emission decomposes the
+  chosen partition: scalar groups lower to `scf.if` + `hc.ptr_load`,
+  vector groups lower directly to `vector.maskedload`.
+* **Output stores and value-out blends** ride on
+  `hc.yield_predicated` at the body terminator. The lowering peeks
+  at the terminator kind: an `hc.yield` produces unpredicated stores
+  / SSA result writes as before; an `hc.yield_predicated` per-value
+  mask drives `hc.ptr_store_pred` for ptr-typed outs and
+  `arith.select` against the outs-as-init carry for value-typed
+  outs. Always-true masks fold back to the unpredicated path
+  (canonical `m_One()` match), constant-false masks elide the store
+  / select entirely; the producer materialises `arith.constant true`
+  to keep one verifier rule — every mask is an `i1` SSA — without
+  inventing a sentinel "no mask" op.
+
+Masked code stays vectorizable end-to-end without intermediate
+`scf.if` shapes defeating the search.
 
 `scf.if` *in the body* — i.e. control flow not lifted into a
 predicated memory op — remains as the residual case. A single

@@ -509,6 +509,12 @@ def HCYieldOp : HC_Op<"yield",
     post-`-hc-promote-names` form — pre-promotion the body terminates
     with `hc.region_return`, which the pass resolves and rewrites into
     this op.
+
+    Inside `hc.generic` this is the unconditional terminator — every
+    iteration of the body publishes its values into the outs slots.
+    The masked counterpart `hc.yield_predicated` covers the
+    per-value-gated case (masked store, OOB tile guard, predicated
+    select) without an `scf.if` shape in the body.
   }];
   let arguments = (ins Variadic<HC_ValueType>:$values);
   let assemblyFormat = "($values^ `:` type($values))? attr-dict";
@@ -516,6 +522,45 @@ def HCYieldOp : HC_Op<"yield",
     // Needed by `SingleBlockImplicitTerminator` on the parent ops.
     OpBuilder<(ins), [{ /* empty yield */ }]>,
   ];
+}
+
+def HCYieldPredicatedOp : HC_Op<"yield_predicated",
+    [Pure, Terminator, SameVariadicOperandSize,
+     ParentOneOf<["HCGenericOp"]>]> {
+  let summary =
+      "Predicated terminator for `hc.generic` bodies: per-value masked publish.";
+  let description = [{
+    Per-value masked counterpart of `hc.yield` for `hc.generic` bodies.
+    Position `i` publishes `$values[i]` into outs slot `i` on lanes where
+    `$masks[i]` is true; masked-out lanes leave the outs-as-init carry
+    in place. Strict parity: `values.size() == masks.size()` — one mask
+    per yielded value, no exceptions.
+
+    Mask type tracks the value's shape (`hc-lower-generic` enforces it
+    when it materialises the predicated store / select at the body
+    boundary): scalar value pairs with `i1`, `vector<NxT>` pairs with
+    `vector<Nxi1>` of the same N. Pre-inference `!hc.undef` operands on
+    either side escape the parity check.
+
+    Always-true positions materialise `arith.constant true : i1` (folding
+    in the lowering turns those back into unpredicated stores). A
+    sentinel "no mask" op is an opt-in follow-up if body bloat from
+    constant-i1 ever measures; the foundational primitive stays one
+    verifier rule — every mask is an `i1` SSA.
+
+    The motivating consumers — masked store rewrite, `hc.load_mask`
+    rewrite, OOB-tile guard at the cooperative-copy source — all share
+    the same handoff: compute the mask in the body from iter syms and
+    ambient bounds, ride it on `$masks`, let the lowering pick the
+    predicated memory op or `arith.select` blend.
+  }];
+  let arguments = (ins Variadic<HC_ValueType>:$values,
+                       Variadic<HC_PtrPredicateType>:$masks);
+  let assemblyFormat = [{
+    $values `mask` $masks attr-dict `:`
+    `(` type($values) `)` `,` `(` type($masks) `)`
+  }];
+  let hasVerifier = 1;
 }
 
 def HCRegionReturnOp : HC_Op<"region_return",
@@ -1222,7 +1267,7 @@ def HCReduceOp : HC_Op<"reduce", [Pure]> {
 //===----------------------------------------------------------------------===//
 
 def HCGenericOp : HC_Op<"generic",
-    [SingleBlockImplicitTerminator<"HCYieldOp">,
+    [SingleBlock,
      AttrSizedOperandSegments,
      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Generic compute with value or in-place outs.";
@@ -1285,10 +1330,15 @@ def HCGenericOp : HC_Op<"generic",
         slot twice without specifying combinator semantics, which the op
         does not model. Applies to both value- and ptr-typed outs.
 
-    Mask handling is deferred — pre-decomposition the input mask story
-    rides on `hc.load_mask` / `hc.store(mask=...)`; if `hc.generic`
-    grows mask operands it will be a separate slot, not piggybacked on
-    the offset array.
+    Mask handling on the input side is deferred — pre-decomposition
+    the input mask story rides on `hc.load_mask` / `hc.store(mask=...)`;
+    if `hc.generic` grows mask operands it will be a separate slot, not
+    piggybacked on the offset array. The body-output side is covered by
+    the `hc.yield_predicated` terminator, which carries one `i1` mask
+    per yielded value so masked-store / OOB-tile / predicated-select
+    rewrites need not introduce `scf.if` shapes in the body. The body
+    therefore terminates with either `hc.yield` (unconditional publish)
+    or `hc.yield_predicated` (per-value mask gate).
   }];
   let arguments = (ins
     StrArrayAttr:$iter_syms,

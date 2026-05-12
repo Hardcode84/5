@@ -380,6 +380,11 @@ refine; folders dispatch on the concrete-type combinations they recognize.
 * `hc.return` — kernel/func/intrinsic terminator
 * `hc.yield` — block terminator for `hc.for_range` / `hc.if` and other
   structured-value ops
+* `hc.yield_predicated` — `hc.generic`-only masked terminator: one `i1`
+  (or `vector<Nxi1>`) mask per yielded value, strict arity parity. The
+  lowering routes masked yields into `hc.ptr_store_pred` (ptr outs) or
+  `arith.select` against the outs-as-init carry (value outs); always-true
+  masks fold back to the unpredicated path.
 
 #### Structured control flow
 

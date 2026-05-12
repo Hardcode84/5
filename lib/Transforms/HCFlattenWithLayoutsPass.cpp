@@ -144,6 +144,38 @@ collectImplicitSyms(SymbolicallyShapedTypeInterface shaped) {
   return result;
 }
 
+// Pull the bare symbol name out of a shape dim entry, or return an
+// empty `StringRef` when the dim isn't a single-symbol expression
+// (constant, composite expression, dyn-size sentinel). Used to map
+// `axis -> sym name` for the host-wrapper aux-arg metadata so the
+// dim-slot path can recover axis order post-flatten.
+static StringRef bareDimSymbolName(Attribute dimAttr) {
+  auto expr = dyn_cast<ExprAttr>(dimAttr);
+  if (!expr)
+    return {};
+  ixs_node *node = const_cast<ixs_node *>(expr.getNode());
+  if (ixs_node_tag(node) != IXS_SYM)
+    return {};
+  return StringRef(ixs_node_sym_name(node));
+}
+
+// `$STRIDE_<axis>_<bufname>` is the frontend's stride symbol shape (see
+// `buildDefaultStridedBufferLayout`). Parsing the axis back out of the
+// symbol name keeps `5-1qy4`'s host-wrapper lowering name-driven on the
+// stride side, mirroring the dim side's axis lookup against the buffer
+// shape. Returns `std::nullopt` for symbols that aren't strides.
+static std::optional<unsigned> parseStrideAxis(StringRef name) {
+  static constexpr StringLiteral kStridePrefix = "$STRIDE_";
+  if (!name.starts_with(kStridePrefix))
+    return std::nullopt;
+  StringRef rest = name.drop_front(kStridePrefix.size());
+  auto [axisStr, bufName] = rest.split('_');
+  unsigned axis = 0;
+  if (axisStr.consumeInteger(10, axis) || !axisStr.empty() || bufName.empty())
+    return std::nullopt;
+  return axis;
+}
+
 // Build the !hc.idx<sym> type carrying a bare-symbol expression
 // for each implicit name. Returns failure if any name fails to
 // compose into the dialect store (extreme edge case; the names
@@ -1418,6 +1450,92 @@ struct RetypeAnyHCOp : public ConversionPattern {
   }
 };
 
+// Build a sparse `DictionaryAttr` keyed by stringified post-flatten arg
+// index. Each entry records, for one of flatten's aux `!hc.idx<sym>`
+// slots, the parent (flat carrier) buffer arg's post-flatten index, the
+// axis the aux corresponds to in the parent's pre-flatten shape, and
+// whether it's a `"dim"` or `"stride"` aux. Pre-flatten the host
+// wrapper recovers dim values from the buffer arg's symbolic shape;
+// post-flatten the shape collapses to `[?]` and the per-axis info
+// lives on the trailing aux slots — the meta lets the lowering pair
+// each aux slot back to a `(parent buf pyArg, axis, kind)` triple
+// without re-deriving it from the surrounding signature.
+//
+// Returns a null attribute when no buffer arg expanded (e.g. a func
+// that only takes scalars, or one whose buffers were already flat).
+static DictionaryAttr buildFlattenAuxArgsMeta(MLIRContext *ctx,
+                                              FunctionType origType,
+                                              const TypeConverter &converter) {
+  SmallVector<NamedAttribute> entries;
+  auto i64Type = IntegerType::get(ctx, 64);
+  unsigned newIdx = 0;
+  for (Type origInput : origType.getInputs()) {
+    SmallVector<Type> converted;
+    if (failed(converter.convertType(origInput, converted))) {
+      ++newIdx;
+      continue;
+    }
+
+    auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(origInput);
+    auto buffer = dyn_cast<BufferType>(origInput);
+    if (!buffer || !shaped || isAlreadyFlat(shaped)) {
+      newIdx += converted.size();
+      continue;
+    }
+
+    SmallVector<StringRef> axisSyms;
+    if (ShapeAttr shape = shaped.getSymbolicShape())
+      for (Attribute dim : shape.getDims())
+        axisSyms.push_back(bareDimSymbolName(dim));
+
+    SmallVector<std::string> implicitSyms = collectImplicitSyms(shaped);
+    unsigned flatCarrierIdx = newIdx;
+
+    for (auto [i, sym] : llvm::enumerate(implicitSyms)) {
+      unsigned auxPostIdx = flatCarrierIdx + 1 + i;
+      StringRef name(sym);
+      StringRef kind;
+      int64_t axis = -1;
+      if (std::optional<unsigned> strideAxis = parseStrideAxis(name)) {
+        kind = "stride";
+        axis = static_cast<int64_t>(*strideAxis);
+      } else {
+        kind = "dim";
+        for (auto [a, axisSym] : llvm::enumerate(axisSyms))
+          if (axisSym == name) {
+            axis = static_cast<int64_t>(a);
+            break;
+          }
+      }
+      // A dim aux with no matching shape axis would mean the implicit
+      // sym leaked in via a non-shape source (`storage_size`, layout
+      // params); the host wrapper can't bind it from `hc_get_dim`
+      // alone, so drop the entry rather than emit an ambiguous one.
+      if (kind == "dim" && axis < 0)
+        continue;
+
+      SmallVector<NamedAttribute> auxEntries;
+      auxEntries.emplace_back(StringAttr::get(ctx, "aux_of"),
+                              IntegerAttr::get(i64Type, flatCarrierIdx));
+      auxEntries.emplace_back(StringAttr::get(ctx, "axis"),
+                              IntegerAttr::get(i64Type, axis));
+      auxEntries.emplace_back(StringAttr::get(ctx, "kind"),
+                              StringAttr::get(ctx, kind));
+
+      SmallString<8> key;
+      Twine(auxPostIdx).toVector(key);
+      entries.emplace_back(StringAttr::get(ctx, key),
+                           DictionaryAttr::get(ctx, auxEntries));
+    }
+
+    newIdx += converted.size();
+  }
+
+  if (entries.empty())
+    return {};
+  return DictionaryAttr::get(ctx, entries);
+}
+
 // Update the `function_type` attribute and body block arguments of a
 // HC dialect symbol op (`hc.intrinsic`, `hc.func`, `hc.kernel`) so the
 // signature stays in sync with the converted call sites and bodies.
@@ -1432,6 +1550,13 @@ struct RetypeAnyHCOp : public ConversionPattern {
 // carrier + N aux `!hc.idx<sym>` for free dim/stride symbols) lands
 // as parallel block arguments — the same surface call sites get on
 // their operand expansion.
+//
+// `hc.flatten_aux_args` is attached on rewrite so the host-wrapper
+// lowering (`hc-lower-kernels-to-gpu-launch`) can identify which
+// post-flatten args are flatten-emitted aux slots (vs user-passed
+// scalars) and resolve their values from the parent buffer's PyObject
+// instead of allocating a fresh PyObject slot per aux. See
+// `buildFlattenAuxArgsMeta` for the attribute shape.
 template <typename SymbolOp>
 struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
   using OpConversionPattern<SymbolOp>::OpConversionPattern;
@@ -1456,9 +1581,14 @@ struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
     if (newType == *fnType)
       return failure();
 
+    DictionaryAttr auxMeta = buildFlattenAuxArgsMeta(
+        rewriter.getContext(), *fnType, *this->getTypeConverter());
+
     Region &body = op.getBody();
     rewriter.modifyOpInPlace(op, [&] {
       op.setFunctionType(newType);
+      if (auxMeta)
+        op->setAttr("hc.flatten_aux_args", auxMeta);
       if (body.empty())
         return;
       TypeConverter::SignatureConversion conversion(fnType->getNumInputs());

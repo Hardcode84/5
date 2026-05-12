@@ -128,13 +128,12 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
     // Flatten runs after `hc-lower-launch-body`. The eventual target
-    // is to run it right after `hc-infer-generic-bounds`. Two
-    // downstream passes still want pre-flatten shapes and block the
-    // move: `hc-lower-kernels-to-gpu-launch` reads the rank-N buffer
-    // ABI off the kernel-arg type instead of the dialect descriptor,
-    // and `hc-lower-launch-body` resolves per-arg sources from the
-    // same rank-N kernel-arg list. Both need to learn about the 1D
-    // post-flatten kernel-arg form before flatten can move earlier.
+    // is to run it right after `hc-infer-generic-bounds`. One
+    // downstream pass still wants pre-flatten shapes and blocks the
+    // move: `hc-lower-launch-body` resolves per-arg sources off the
+    // rank-N kernel-arg list, so the 1D post-flatten form trips
+    // both its rank-parity assert on multi-axis access ops and its
+    // kernel-arg dim binder.
     %m13b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m13
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13b {

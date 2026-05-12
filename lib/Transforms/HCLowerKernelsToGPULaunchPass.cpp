@@ -546,6 +546,36 @@ cloneKernelBodyIntoLaunch(OpBuilder &builder, HCKernelOp kernel,
   return success();
 }
 
+// Resolved aux-arg meta entry from `hc.flatten_aux_args`. See
+// `buildFlattenAuxArgsMeta` in `HCFlattenWithLayoutsPass.cpp` for the
+// attribute shape — `aux_of` is the parent buffer arg's post-flatten
+// index, `axis` is the axis in the parent's pre-flatten shape, and
+// `kind` distinguishes the `_get_dim` and `_get_stride` accessor.
+struct FlattenAuxInfo {
+  unsigned auxOf;
+  unsigned axis;
+  StringRef kind;
+};
+
+static std::optional<FlattenAuxInfo> lookupFlattenAux(DictionaryAttr meta,
+                                                      unsigned argIndex) {
+  if (!meta)
+    return std::nullopt;
+  SmallString<8> key;
+  Twine(argIndex).toVector(key);
+  auto dict = dyn_cast_or_null<DictionaryAttr>(meta.get(key));
+  if (!dict)
+    return std::nullopt;
+  auto auxOfAttr = dyn_cast_or_null<IntegerAttr>(dict.get("aux_of"));
+  auto axisAttr = dyn_cast_or_null<IntegerAttr>(dict.get("axis"));
+  auto kindAttr = dyn_cast_or_null<StringAttr>(dict.get("kind"));
+  if (!auxOfAttr || !axisAttr || !kindAttr)
+    return std::nullopt;
+  return FlattenAuxInfo{static_cast<unsigned>(auxOfAttr.getInt()),
+                        static_cast<unsigned>(axisAttr.getInt()),
+                        kindAttr.getValue()};
+}
+
 static LogicalResult lowerKernel(HCKernelOp kernel) {
   MLIRContext *ctx = kernel.getContext();
   Location loc = kernel.getLoc();
@@ -554,17 +584,30 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   if (!module)
     return kernel.emitOpError("must be nested in a module");
 
+  // Post-flatten kernels (1D `?` buffers with per-axis dim/stride exposed
+  // as trailing `!hc.idx<sym>` aux slots) carry an `hc.flatten_aux_args`
+  // attribute pinning each aux slot back to its parent buffer arg, axis,
+  // and accessor kind. Pre-flatten the attribute is absent and the
+  // rank-N shape walk below carries all the information itself.
+  DictionaryAttr auxMeta =
+      kernel->getAttrOfType<DictionaryAttr>("hc.flatten_aux_args");
+
   // Per-arg conversion bookkeeping. `kernelABITypes[i]` is the post-
   // `convertABIType` type the kernel body expects; `hostArgFor[i]` is the
   // index of the matching `PyObject *` slot in the host wrapper signature
-  // (or sentinel for `!hc.group` args, which aren't user-visible). The +1
-  // offset accounts for the leading stream pointer at slot 0.
+  // (or sentinel for `!hc.group` args and flatten-aux slots, neither of
+  // which is user-visible — group args are synthesized from undef inside
+  // the launch region, aux slots get their value from the parent buffer's
+  // PyObject via `hc_get_dim` / `hc_get_stride`). The +1 offset on host
+  // arg indices accounts for the leading stream pointer at slot 0.
   SmallVector<Type> kernelABITypes(kernelBlock.getNumArguments());
   SmallVector<unsigned> hostArgFor(kernelBlock.getNumArguments(),
                                    std::numeric_limits<unsigned>::max());
   unsigned userArgCount = 0;
   for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
     if (isa<GroupType>(arg.getType()))
+      continue;
+    if (lookupFlattenAux(auxMeta, index))
       continue;
     Type converted = convertABIType(arg.getType());
     if (!converted)
@@ -591,11 +634,24 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   Block *entry = hostFunc.addEntryBlock();
   builder.setInsertionPointToStart(entry);
 
-  // Two-pass arg materialization: scalar `idx` args first so a kernel that
-  // declares `M: idx` alongside `Buffer[M, K, ...]` binds `M` from the
-  // explicit scalar (authoritative) rather than from the buffer's dim. This
-  // matches the previous "first wins" behaviour now that we're free of
-  // lexical kernel-arg order.
+  // Three-pass arg materialization:
+  //   1. scalar `idx` args first so a kernel that declares `M: idx`
+  //      alongside `Buffer[M, K, ...]` binds `M` from the explicit
+  //      scalar (authoritative) rather than from the buffer's dim. This
+  //      matches the previous "first wins" behaviour now that we're
+  //      free of lexical kernel-arg order.
+  //   2. flatten-aux `!hc.idx<sym>` slots next, pulling each value
+  //      from the parent buffer's PyObject via `hc_get_dim` /
+  //      `hc_get_stride`. The aux symbol is then bound just like any
+  //      other scalar idx so post-flatten launch geometry and
+  //      pre-flatten kernels agree on `boundValues`.
+  //   3. buffer args last, materializing the kernel-arg `(ptr, dim*,
+  //      stride*)` UCC. Pre-flatten the dim values come from
+  //      `buffer.getShape().getDims()` (potentially via `ExprLowerer`
+  //      for non-trivial expressions); post-flatten the shape is a
+  //      single `?` so the pack collapses to `(ptr, total_elements,
+  //      1)` where `total_elements` is the product of the aux dim
+  //      values bound in pass 2.
   SmallVector<Value> kernelABIArgs(kernelBlock.getNumArguments());
   SmallVector<std::optional<BufferABIPack>> bufferPacks(
       kernelBlock.getNumArguments());
@@ -604,6 +660,8 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
     if (isa<GroupType>(arg.getType()))
       continue;
     if (isa<BufferType>(arg.getType()))
+      continue;
+    if (lookupFlattenAux(auxMeta, index))
       continue;
     Value pyArg = entry->getArgument(hostArgFor[index]);
     FailureOr<Value> scalar =
@@ -615,6 +673,22 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
     bindScalarSymbol(arg.getType(), *scalar, boundValues);
   }
 
+  for (auto [index, arg] : llvm::enumerate(kernelBlock.getArguments())) {
+    std::optional<FlattenAuxInfo> info = lookupFlattenAux(auxMeta, index);
+    if (!info)
+      continue;
+    if (info->auxOf >= kernelBlock.getNumArguments())
+      return kernel.emitOpError("flatten aux arg #")
+             << index << " references out-of-range parent arg #" << info->auxOf;
+    Value parentPyArg = entry->getArgument(hostArgFor[info->auxOf]);
+    Value value =
+        info->kind == "stride"
+            ? callGetStride(builder, loc, module, parentPyArg, info->axis)
+            : callGetDim(builder, loc, module, parentPyArg, info->axis);
+    kernelABIArgs[index] = value;
+    bindScalarSymbol(arg.getType(), value, boundValues);
+  }
+
   // Buffer args. For each, harvest any free shape symbols from this buffer's
   // shape (calling `_get_dim` once per first-occurrence symbol) and lower the
   // full shape attr — including non-trivial exprs — through `ExprLowerer` so
@@ -624,6 +698,66 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
     if (!buffer)
       continue;
     Value pyArg = entry->getArgument(hostArgFor[index]);
+
+    SmallVector<Value> shapeValues;
+    SmallVector<Value> strideValues;
+    bool postFlatten = false;
+    for (unsigned j = 0; j != kernelBlock.getNumArguments(); ++j) {
+      std::optional<FlattenAuxInfo> auxInfo = lookupFlattenAux(auxMeta, j);
+      if (!auxInfo || auxInfo->auxOf != index)
+        continue;
+      postFlatten = true;
+      Value auxValue = kernelABIArgs[j];
+      if (!auxValue)
+        return kernel.emitOpError("flatten aux arg #")
+               << j << " unresolved before buffer #" << index;
+      auto &slots = auxInfo->kind == "stride" ? strideValues : shapeValues;
+      if (auxInfo->axis >= slots.size())
+        slots.resize(auxInfo->axis + 1);
+      slots[auxInfo->axis] = auxValue;
+    }
+
+    auto ptrType = cast<PtrType>(kernelABITypes[index]);
+    if (postFlatten) {
+      // Constant-dim axes have no implicit sym and therefore no dim aux
+      // pointing at them; fall back to a runtime probe (mirrors what
+      // the existing rank-N path does for `4 : i64` dims). Symbolic
+      // axes already filled via the aux loop above.
+      unsigned rank = std::max(shapeValues.size(), strideValues.size());
+      shapeValues.resize(rank);
+      for (auto [axis, slot] : llvm::enumerate(shapeValues))
+        if (!slot)
+          slot = callGetDim(builder, loc, module, pyArg, axis);
+
+      Value total;
+      for (Value d : shapeValues)
+        total = total
+                    ? arith::MulIOp::create(builder, loc, total, d).getResult()
+                    : d;
+      Value one = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+      if (!total)
+        total = one;
+
+      // The flat carrier is a contiguous element view: every access
+      // composed by flatten reads/writes against an offset already in
+      // element units, so the bridging UCC carries `(ptr, total, 1)`.
+      // Per-axis stride values still ride into the kernel via the
+      // aux idx slots above; the bridging cast just doesn't need
+      // them because the composed offset already folded them in.
+      auto getPtr = module.lookupSymbol<func::FuncOp>("hc_get_ptr");
+      auto rawCall =
+          func::CallOp::create(builder, loc, getPtr, ValueRange{pyArg});
+      Value bridgedPtr = UnrealizedConversionCastOp::create(
+                             builder, loc, ptrType, rawCall.getResult(0))
+                             .getResult(0);
+      BufferABIPack pack;
+      pack.ptr = bridgedPtr;
+      pack.dims.push_back(total);
+      pack.strides.push_back(one);
+      bufferPacks[index] = std::move(pack);
+      continue;
+    }
+
     for (auto [dimIndex, dimAttr] :
          llvm::enumerate(buffer.getShape().getDims())) {
       std::optional<StringRef> symbol = exactSymbolName(dimAttr);
@@ -635,7 +769,6 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
       boundValues.bind(*symbol, dimValue);
     }
 
-    SmallVector<Value> shapeValues;
     ExprLowerer lowerer(builder, loc, boundValues);
     for (Attribute dimAttr : buffer.getShape().getDims()) {
       FailureOr<Value> dimValue = lowerer.lower(dimAttr);
@@ -644,7 +777,6 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
                << index;
       shapeValues.push_back(*dimValue);
     }
-    auto ptrType = cast<PtrType>(kernelABITypes[index]);
     bufferPacks[index] =
         buildBufferPack(builder, loc, module, pyArg, ptrType, shapeValues);
   }

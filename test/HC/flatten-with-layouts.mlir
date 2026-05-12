@@ -69,6 +69,48 @@ func.func @strided_buffer_arg(
 
 // -----
 
+// Same signature on an `hc.kernel` instead of a `func.func` so the
+// kernel-specific signature populator (`ConvertHCSymbolSignatureOp`)
+// fires alongside the buffer's 1-to-N expansion. Aux idx slots get
+// pinned back to their parent buffer's post-flatten arg index via
+// the `hc.flatten_aux_args` attribute the populator attaches; the
+// host-wrapper lowering (`hc-lower-kernels-to-gpu-launch`) reads
+// it to skip allocating Python ABI slots for the auxes and to
+// resolve each aux through `_get_dim` / `_get_stride` on the parent
+// buffer's PyObject. `kind` distinguishes the accessor; `axis`
+// picks the axis in the parent's pre-flatten shape (stride symbols
+// encode the axis in their name, dim symbols by position in the
+// pre-flatten shape).
+// CHECK-LABEL: hc.kernel @strided_buffer_kernel
+// CHECK-SAME: %arg0: !hc.group
+// CHECK-SAME: %arg1: !hc.buffer<f16, ["?"]>
+// CHECK-SAME: %arg2: !hc.idx<"$STRIDE_0_a">
+// CHECK-SAME: %arg3: !hc.idx<"$STRIDE_1_a">
+// CHECK-SAME: %arg4: !hc.idx<"K">
+// CHECK-SAME: %arg5: !hc.idx<"M">
+// CHECK-SAME: hc.flatten_aux_args
+// CHECK-SAME: "2" = {aux_of = 1 : i64, axis = 0 : i64, kind = "stride"}
+// CHECK-SAME: "3" = {aux_of = 1 : i64, axis = 1 : i64, kind = "stride"}
+// CHECK-SAME: "4" = {aux_of = 1 : i64, axis = 1 : i64, kind = "dim"}
+// CHECK-SAME: "5" = {aux_of = 1 : i64, axis = 0 : i64, kind = "dim"}
+hc.kernel @strided_buffer_kernel(
+    %group: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*K)"]>, group_shape = #hc.shape<["32", "1"]>>,
+    %a: !hc.buffer<f16, ["M", "K"],
+                   #hc.layout<shape_syms = ["d0", "d1"],
+                              index_syms = ["i0", "i1"],
+                              params = {},
+                              storage_size = #hc.expr<"0">,
+                              offset = #hc.expr<"$STRIDE_0_a*i0 + $STRIDE_1_a*i1">>>)
+    attributes {
+      work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*K)"]>,
+      group_shape = #hc.shape<["32", "1"]>,
+      bound_symbols = ["$WG0", "$WG1", "$WI0", "$WI1", "M", "K", "$STRIDE_0_a", "$STRIDE_1_a"]
+    } {
+  hc.return
+}
+
+// -----
+
 // All five shaped types lose their layout under flatten regardless of
 // whether the layout was identity or padded / col-major. Tensors and
 // vectors (semantic and bare) collapse to a single-entry shape using

@@ -531,6 +531,15 @@ static BoundValues collectBoundValues(Operation *anchor,
   // here. Only ancestor blocks of `anchor` qualify — a sibling for_range's
   // induction var would shadow incorrectly and would also fail SSA
   // dominance if a UCC against it ended up outside its defining block.
+  //
+  // The scf.for fallback covers the post-conversion case: a second
+  // `hc-lower-launch-body` invocation runs on IR where the original
+  // `hc.for_range` has already collapsed to `scf.for` (an `index`-typed
+  // induction var, no `!hc.idx<sym>` payload on the block arg). The
+  // first invocation's `ConvertForRangeOp` stamps the original join
+  // sym name as a discardable `hc.sym` StringAttr on the new scf.for;
+  // honoring it here keeps the binding visible across the conversion
+  // boundary without requiring the schedule to re-derive the mapping.
   for (Block *block = anchor->getBlock(); block;) {
     for (BlockArgument arg : block->getArguments()) {
       std::optional<StringRef> symbol = exactSymbolName(arg.getType());
@@ -541,6 +550,14 @@ static BoundValues collectBoundValues(Operation *anchor,
     Operation *parent = block->getParentOp();
     if (!parent || parent == launch.getOperation())
       break;
+    if (auto forOp = dyn_cast<scf::ForOp>(parent)) {
+      if (auto sym = forOp->getAttrOfType<StringAttr>("hc.sym")) {
+        StringRef name = sym.getValue();
+        if (!name.empty())
+          boundValues.bind(name, indexCast(rewriter, anchor->getLoc(),
+                                           forOp.getInductionVar()));
+      }
+    }
     block = parent->getBlock();
   }
 
@@ -2632,6 +2649,25 @@ struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
       rewriter.setInsertionPoint(dstTerminator);
     else
       rewriter.setInsertionPointToEnd(&dst);
+
+    // Preserve the induction var's symbolic-name binding through the
+    // scf.for conversion. The frontend / generic-pipeline emitters
+    // bind `$joinN` (the join sym of the `hc.for_range`) to the
+    // induction var via the `!hc.idx<"$joinN">`-typed block-arg type;
+    // scf.for has `index`-typed args and would lose that name. A
+    // post-pass that later materialises an offset against `$joinN`
+    // — concretely `hc-lower-generic`'s `emitOffset` and the second
+    // `hc-lower-launch-body` invocation that follows it — would then
+    // have no way to resolve the symbol back to SSA. Stamping the
+    // name as a discardable `hc.sym` attribute on the new scf.for op
+    // re-exposes it: `collectBoundValues` walks parent ops up to
+    // `gpu.launch` and, when it sees an scf.for carrying the
+    // attribute, binds the symbol to that scf.for's induction var.
+    Value inductionArg = src.getArguments().front();
+    if (std::optional<StringRef> inductionSym =
+            exactSymbolName(inductionArg.getType()))
+      if (!inductionSym->empty())
+        loop->setAttr("hc.sym", rewriter.getStringAttr(*inductionSym));
 
     IRMapping mapping;
     for (auto [oldArg, newArg] :

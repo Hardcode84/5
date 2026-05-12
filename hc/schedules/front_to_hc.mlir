@@ -147,10 +147,6 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m12b : !transform.any_op
     %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12b
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m13b {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m13b : !transform.any_op
     // Lower every `hc.generic` whose operands are `!hc.ptr<...>`
     // (resolved by the launch-body pass above off the kernel-arg
     // UCCs) with rank-1 composed offsets (built by the flatten
@@ -160,6 +156,20 @@ module attributes {transform.with_named_sequence} {
     // for the WMMA path that means a no-op since the recipe is
     // dispatched via `hc-interpret-intrinsic-recipes` instead of
     // generic.
+    //
+    // No canonicalize/cse between the first launch-body and here:
+    // the kernel-arg + post-flatten retype UCC chain has no
+    // remaining HC-typed consumers once launch-body's
+    // `AdaptGenericOp` has resolved each `!hc.buffer` operand to
+    // its underlying `!hc.ptr` and the access-op converters
+    // (`ConvertLoadLikeOp`, ...) have rewritten the load/store
+    // surface. Canonicalize would DCE the chain because nothing
+    // uses its outputs anymore, but the chain is the source-of-
+    // truth for `$STRIDE_*` / shape-sym bindings that the second
+    // launch-body call below resolves into SSA via its launch
+    // walk. Folding it here would silently strip those bindings;
+    // the cleanup runs after the second launch-body has consumed
+    // them.
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
         : (!transform.any_op) -> !transform.any_op
     // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as
@@ -171,10 +181,26 @@ module attributes {transform.with_named_sequence} {
     // not just on `hc-lower-generic`'s output.
     %m13af = transform.apply_registered_pass "hc-fold-predicates" to %m13a
         : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m13af {
+    // Second `hc-lower-launch-body` pass: `hc-lower-generic`'s
+    // per-lane offset emission plants fresh `hc.idx_apply` ops
+    // carrying the same ambient `$STRIDE_*` / `$WG*` / `$WI*` symbols
+    // the pre-generic kernel-arg accesses do, plus the substituted
+    // iter syms bound as explicit operands. The first launch-body
+    // call ran before the generic was lowered, so those new applies
+    // would otherwise reach LLVM translation as an unconverted
+    // `!hc.idx<expr> → index → i64` UCC chain and fail at
+    // `i64 → index` reconciliation. Re-running launch-body is
+    // idempotent on the pointer/scf/arith body the first call
+    // produced (every op already legal under its conversion
+    // target) and only matches the surviving applies; the
+    // ambient-sym bindings still live on the unfolded kernel-arg
+    // retype UCC chain (see the note above).
+    %m13ar = transform.apply_registered_pass "hc-lower-launch-body" to %m13af
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %m13ar {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m13af : !transform.any_op
+    transform.apply_cse to %m13ar : !transform.any_op
     // The `__HC_TARGET__` placeholder is substituted by the Python
     // driver before the schedule is handed to the transform
     // interpreter: `hc.compile(target="amdgpu-gfx11")` substitutes the
@@ -187,7 +213,7 @@ module attributes {transform.with_named_sequence} {
     // The pass is also a no-op for kernels that never use intrinsics:
     // no lowerings module, no calls, nothing to diagnose.
     %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
-        with options = { "target" = "__HC_TARGET__" } to %m13af
+        with options = { "target" = "__HC_TARGET__" } to %m13ar
         : (!transform.any_op) -> !transform.any_op
     // Cleanup pair folds away every `unrealized_conversion_cast` the
     // recipe-side `transform.hc.cast_value` planted around the freshly

@@ -130,17 +130,25 @@ into the installed `hc` package under:
 hc/_native/
 ```
 
-The package-relative native tree carries `bin/hc-opt`, the generated
+The package-relative native tree carries `bin/hc-opt`, the bundled
+`bin/ld.lld` that `hc-lower-gpu-to-binary` invokes, the generated
 `python_packages/hc_front/hc_mlir/` bindings, and the native libraries needed
 by those bindings. Runtime discovery uses that package-relative tree by
 default, so `hc.mlir` works after `pip install -e .[dev]` without exporting
-`HC_MLIR_PYTHON_PACKAGE_DIR`.
+`HC_MLIR_PYTHON_PACKAGE_DIR` or `HC_LLD`.
 
 To bootstrap the native tool explicitly from a source checkout, run:
 
 ```bash
 python -m build_tools.hc_native_tools
 ```
+
+That command runs the cmake configure + install for `hc-opt` and the MLIR
+Python bindings, then refreshes `hc/_native/` to match — including staging
+`ld.lld` from the pinned LLVM toolchain into `hc/_native/bin/ld.lld`. Running
+it is functionally equivalent to the native-bits half of `pip install -e .`,
+which is what you want when you're iterating on the C++ sources without
+re-installing the wheel each time.
 
 The managed cache also carries the same relocatable MLIR Python package under:
 

@@ -4,9 +4,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
 import threading
 from pathlib import Path
 
@@ -21,6 +19,7 @@ from build_tools.llvm_toolchain import (
     ensure_llvm_toolchain,
     export_toolchain_environment,
 )
+from build_tools.package_artifacts import install_package_native_artifacts
 
 _BOOTSTRAP_LOCK = threading.Lock()
 _IXSIMPL_BOOTSTRAPPED = False
@@ -30,7 +29,6 @@ _LLVM_INSTALL_ROOT: Path | None = None
 _HC_NATIVE_INSTALL_ROOT: Path | None = None
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _PACKAGE_NATIVE_ROOT = _PROJECT_ROOT / "hc" / "_native"
-_PACKAGE_NATIVE_SUBTREES = ("bin", "lib", "python_packages")
 
 
 def _ensure_build_dependencies_bootstrapped() -> Path | None:
@@ -71,59 +69,15 @@ def _ensure_build_dependencies_bootstrapped() -> Path | None:
 def _install_package_native_artifacts(
     native_install_root: Path, llvm_install_root: Path | None = None
 ) -> None:
-    _validate_native_install(native_install_root)
-    if _PACKAGE_NATIVE_ROOT.exists():
-        shutil.rmtree(_PACKAGE_NATIVE_ROOT)
-    _PACKAGE_NATIVE_ROOT.mkdir(parents=True)
-    for name in _PACKAGE_NATIVE_SUBTREES:
-        source = native_install_root / name
-        if source.exists():
-            shutil.copytree(
-                source,
-                _PACKAGE_NATIVE_ROOT / name,
-                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-            )
-    if llvm_install_root is not None:
-        _stage_lld_into_native_bin(llvm_install_root)
-    _write_native_manifest(native_install_root)
-
-
-def _stage_lld_into_native_bin(llvm_install_root: Path) -> None:
-    # Copy the pinned `ld.lld` from the LLVM toolchain install into
-    # `hc/_native/bin/ld.lld` so the runtime can resolve it via the
-    # bundled-resource path returned by `_native_paths.lld_path`,
-    # without needing the `HC_LLD` env var. The toolchain ships
-    # `ld.lld` as a symlink to `lld`; dereference the symlink so wheel
-    # installs work without preserving the link.
-    src = llvm_install_root / "bin" / "ld.lld"
-    if not src.exists():
-        raise RuntimeError(f"hc llvm toolchain is missing ld.lld; expected at {src}")
-    dest_bin = _PACKAGE_NATIVE_ROOT / "bin"
-    dest_bin.mkdir(parents=True, exist_ok=True)
-    dest = dest_bin / "ld.lld"
-    if dest.exists() or dest.is_symlink():
-        dest.unlink()
-    shutil.copy2(src.resolve(), dest)
-
-
-def _validate_native_install(native_install_root: Path) -> None:
-    hc_opt = native_install_root / "bin" / "hc-opt"
-    hc_mlir = native_install_root / "python_packages" / "hc_front" / "hc_mlir"
-    missing = [str(path) for path in (hc_opt, hc_mlir / "ir.py") if not path.exists()]
-    if missing:
-        raise RuntimeError(
-            "hc native install is incomplete; missing:\n" + "\n".join(missing)
-        )
-
-
-def _write_native_manifest(native_install_root: Path) -> None:
-    manifest = {
-        "source": str(native_install_root),
-        "subtrees": list(_PACKAGE_NATIVE_SUBTREES),
-    }
-    (_PACKAGE_NATIVE_ROOT / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    # Thin wrapper over the shared staging helper so the build-hook
+    # call site stays readable and the existing tests' monkeypatch
+    # surface — `build_backend._install_package_native_artifacts` and
+    # `build_backend._PACKAGE_NATIVE_ROOT` — keep working without
+    # leaking the project-root computation into the shared module.
+    install_package_native_artifacts(
+        native_install_root,
+        llvm_install_root,
+        package_native_root=_PACKAGE_NATIVE_ROOT,
     )
 
 

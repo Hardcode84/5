@@ -12,8 +12,10 @@
 #include "hc/IR/HCTypes.h"
 
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
 namespace mlir::hc {
@@ -129,6 +131,178 @@ static void dropWorkitemSuffixFromCallable(Operation *callable,
           arg.setType(rewriteType(arg.getType()));
     return WalkResult::advance();
   });
+}
+
+// Post-flatten the rank-N suffix structure has collapsed to its 1D bare
+// carrier so `dropWorkitemSuffix` is a no-op on every type. Recover the
+// lane-local form by anchoring on `hc.workitem_region` results that carry a
+// `result_storage == yield_storage * product(suffix)` lift relationship and
+// propagating the yielded (lane-local) target type through type-preserving
+// consumer chains: `hc.for_range` iter-init / iter-result / block-arg /
+// yield slots, `hc.if` branch yields back through to the parent op result,
+// `hc.return` slots that bubble up to the enclosing `hc.func`'s declared
+// return-type list. Workgroup-shared tiles never enter the propagation
+// because they don't appear as a workitem-region result, so the same 1D
+// `bare_tensor` storage that matches a lifted vector by divisibility is
+// left untouched here.
+namespace {
+class PostFlattenLiftRetyper {
+public:
+  PostFlattenLiftRetyper(Operation *callable, ArrayRef<Attribute> suffix)
+      : callable(callable), suffix(suffix) {}
+
+  bool empty() const { return targets.empty(); }
+  void seed();
+  void propagate();
+  void apply();
+
+private:
+  Operation *callable;
+  ArrayRef<Attribute> suffix;
+  llvm::DenseMap<Value, Type> targets;
+  llvm::DenseMap<HCFuncOp, llvm::DenseMap<unsigned, Type>> funcReturnSlots;
+  llvm::SmallVector<Value> worklist;
+
+  void retype(Value v, Type target);
+  void retypeOpResult(Operation *op, unsigned idx, Type target);
+  void handleUse(OpOperand &use, Type target);
+};
+} // namespace
+
+void PostFlattenLiftRetyper::retype(Value v, Type target) {
+  if (!v || !target)
+    return;
+  if (v.getType() == target)
+    return;
+  // Conflicts (same value, different targets) shouldn't arise for
+  // well-formed IR; if they do, the verifier downstream surfaces the
+  // mismatch with a more useful diagnostic than this pass could emit.
+  // Skip silently and let it through.
+  if (!targets.try_emplace(v, target).second)
+    return;
+  worklist.push_back(v);
+}
+
+void PostFlattenLiftRetyper::retypeOpResult(Operation *op, unsigned idx,
+                                            Type target) {
+  if (!op || idx >= op->getNumResults())
+    return;
+  retype(op->getResult(idx), target);
+  // The matching yield operand in each region of `op` co-types with the
+  // result; keep them in sync so the parent's `hc.if` / `hc.workitem_region`
+  // / `hc.for_range` verifier sees consistent types after `apply` lands.
+  for (Region &region : op->getRegions()) {
+    if (region.empty())
+      continue;
+    Block &block = region.front();
+    Operation *terminator = block.getTerminator();
+    if (auto yield = dyn_cast_or_null<HCYieldOp>(terminator))
+      if (idx < yield->getNumOperands())
+        retype(yield->getOperand(idx), target);
+  }
+}
+
+void PostFlattenLiftRetyper::seed() {
+  callable->walk([&](HCWorkitemRegionOp wi) {
+    if (wi->getNumResults() == 0)
+      return;
+    Region &region = wi.getBody();
+    if (region.empty())
+      return;
+    Block &body = region.front();
+    if (body.getNumArguments() == 0)
+      return;
+    std::optional<LaunchContextMetadata> metadata =
+        getLaunchContextMetadata(body.getArgument(0).getType());
+    if (!metadata)
+      return;
+    ValueRange yielded = wi.getYieldedResultValues();
+    if (yielded.size() != wi->getNumResults())
+      return;
+    for (auto [yieldVal, regionResult] :
+         llvm::zip_equal(yielded, wi->getResults())) {
+      Type yieldedTy = yieldVal.getType();
+      Type resultTy = regionResult.getType();
+      if (resultTy == yieldedTy)
+        continue;
+      if (!postFlattenLiftMatches(yieldedTy, resultTy, suffix))
+        continue;
+      retype(regionResult, yieldedTy);
+    }
+  });
+}
+
+void PostFlattenLiftRetyper::handleUse(OpOperand &use, Type target) {
+  Operation *user = use.getOwner();
+  unsigned operandIdx = use.getOperandNumber();
+
+  if (auto loop = dyn_cast<HCForRangeOp>(user)) {
+    // (lower, upper, step) sit on operands 0..2; iter_inits start at 3 and
+    // mirror iter_results 1:1.
+    constexpr unsigned kIterInitStart = 3;
+    if (operandIdx < kIterInitStart)
+      return;
+    unsigned iterIdx = operandIdx - kIterInitStart;
+    Block &body = loop.getBody().front();
+    if (1 + iterIdx < body.getNumArguments())
+      retype(body.getArgument(1 + iterIdx), target);
+    retypeOpResult(loop, iterIdx, target);
+    return;
+  }
+
+  if (auto yield = dyn_cast<HCYieldOp>(user)) {
+    if (Operation *parent = yield->getParentOp())
+      retypeOpResult(parent, operandIdx, target);
+    return;
+  }
+
+  if (auto ret = dyn_cast<HCReturnOp>(user)) {
+    if (auto func = dyn_cast_or_null<HCFuncOp>(ret->getParentOp()))
+      funcReturnSlots[func][operandIdx] = target;
+    return;
+  }
+}
+
+void PostFlattenLiftRetyper::propagate() {
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    auto it = targets.find(v);
+    if (it == targets.end())
+      continue;
+    Type target = it->second;
+    for (OpOperand &use : v.getUses())
+      handleUse(use, target);
+  }
+}
+
+void PostFlattenLiftRetyper::apply() {
+  for (auto &kv : targets)
+    kv.first.setType(kv.second);
+  for (auto &kv : funcReturnSlots) {
+    HCFuncOp func = kv.first;
+    TypeAttr fnTypeAttr = func.getFunctionTypeAttr();
+    if (!fnTypeAttr)
+      continue;
+    auto fnType = cast<FunctionType>(fnTypeAttr.getValue());
+    SmallVector<Type> newResults(fnType.getResults());
+    for (auto &slot : kv.second) {
+      unsigned idx = slot.first;
+      if (idx < newResults.size())
+        newResults[idx] = slot.second;
+    }
+    func.setFunctionTypeAttr(TypeAttr::get(
+        FunctionType::get(func.getContext(), fnType.getInputs(), newResults)));
+  }
+}
+
+static void retypePostFlattenLifts(Operation *callable,
+                                   ArrayRef<Attribute> suffix) {
+  PostFlattenLiftRetyper retyper(callable, suffix);
+  retyper.seed();
+  if (retyper.empty())
+    return;
+  retyper.propagate();
+  retyper.apply();
 }
 
 static SmallVector<unsigned> eraseUnusedScopeTokenArgs(HCFuncOp func) {
@@ -266,9 +440,18 @@ struct HCNormalizeScopeRegionsPass
     for (Operation *callable : callables) {
       std::optional<LaunchContextMetadata> metadata =
           launchMetadataFromCallable(callable);
-      if (metadata && metadata->groupShape)
-        dropWorkitemSuffixFromCallable(callable,
-                                       metadata->groupShape.getDims());
+      if (metadata && metadata->groupShape) {
+        // Pre-flatten path: the rank-N suffix is in the type structure, so
+        // a uniform per-type strip handles every shaped value at once.
+        // Post-flatten path: every shaped value has collapsed to a 1D bare
+        // carrier and the suffix-strip walk is a no-op; the anchored lift
+        // retyper then recovers the lane-local form via workitem-region
+        // results. Running both per callable lets one schedule cover both
+        // regimes without the caller having to flag which one fired.
+        ArrayRef<Attribute> suffix = metadata->groupShape.getDims();
+        dropWorkitemSuffixFromCallable(callable, suffix);
+        retypePostFlattenLifts(callable, suffix);
+      }
     }
     dropUnusedScopeTokenArgs(getOperation());
 

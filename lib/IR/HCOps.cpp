@@ -1139,8 +1139,8 @@ static FailureOr<ExprAttr> postFlattenStorageExpr(Type type) {
 // collective vector with `dim[0] == product(suffix)`; carry the scalar
 // across as a synthesised `yield_storage = 1` so the same storage-product
 // check fires.
-static bool postFlattenLiftMatches(Type yieldedType, Type resultType,
-                                   ArrayRef<Attribute> suffix) {
+bool mlir::hc::postFlattenLiftMatches(Type yieldedType, Type resultType,
+                                      ArrayRef<Attribute> suffix) {
   if (auto yt = dyn_cast<TupleType>(yieldedType)) {
     auto rt = dyn_cast<TupleType>(resultType);
     if (!rt || yt.size() != rt.size())

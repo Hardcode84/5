@@ -128,17 +128,13 @@ module attributes {transform.with_named_sequence} {
     } : !transform.any_op
     transform.apply_cse to %m13 : !transform.any_op
     // Flatten runs after `hc-lower-launch-body`. The eventual target
-    // is to run it right after `hc-infer-generic-bounds`, but the
-    // `hc.for_range` collective-lift conversion gap blocks that:
-    // pre-flatten the loop's iter_inits are lane-local
-    // (`bare_vector<f32, ["8", "1"]>`) while iter_results are the
-    // collective-lifted form (`bare_vector<f32, ["8", "1", "32",
-    // "1"]>`); flatten collapses both axes-wise and the resulting
-    // mismatch trips `HCForRangeOp::areTypesCompatible`. The
-    // verifier-side collective-lift relationship on
-    // `hc.workitem_region` / `hc.subgroup_region` is already taught
-    // about the post-flatten storage product; the matching path on
-    // `hc.for_range` still needs the same treatment.
+    // is to run it right after `hc-infer-generic-bounds`. Two
+    // downstream passes still want pre-flatten shapes and block the
+    // move: `hc-lower-kernels-to-gpu-launch` reads the rank-N buffer
+    // ABI off the kernel-arg type instead of the dialect descriptor,
+    // and `hc-lower-launch-body` resolves per-arg sources from the
+    // same rank-N kernel-arg list. Both need to learn about the 1D
+    // post-flatten kernel-arg form before flatten can move earlier.
     %m13b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m13
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m13b {

@@ -32,6 +32,7 @@
 
 #include "hc/Transforms/Passes.h"
 
+#include "LaunchUtils.h"
 #include "hc/IR/HCAttrs.h"
 #include "hc/IR/HCDialect.h"
 #include "hc/IR/HCOps.h"
@@ -39,6 +40,7 @@
 #include "hc/IR/HCTypes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
@@ -945,19 +947,196 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
   return bodyStatus;
 }
 
+// Collective dispatch detector: at least one outs operand is
+// `!hc.ptr<workgroup, T>` (LDS-staged tile), every iter is parallel
+// (no cross-thread accumulation), and the op sits inside a
+// `gpu.launch` (we need the dim3 thread/block layout to chunk the
+// iter space across the wave). Per-lane outs falls through to the
+// existing partition-aware path — running scf.parallel without
+// partitioning is the correct shape for lane-local results.
+//
+// The workgroup-ptr signal is the dispositive one: a workgroup tile
+// is shared state, so emitting "every lane runs every iteration"
+// against it would have the wave fight itself for every element.
+// All-parallel + launch-enclosed are necessary follow-ups: cross-iter
+// reduction needs cross-thread synchronization the collective shape
+// doesn't model, and the chunk loop's `lin_tid` source disappears
+// outside a launch.
+static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
+  bool hasWorkgroupOut = false;
+  for (Value v : op.getOuts()) {
+    auto ptr = dyn_cast<PtrType>(v.getType());
+    if (!ptr)
+      return false;
+    if (ptr.getAddrSpace() == AddrSpace::Workgroup)
+      hasWorkgroupOut = true;
+  }
+  if (!hasWorkgroupOut)
+    return false;
+  for (const IterAxis &ax : axes)
+    if (ax.kind != IterKind::Parallel)
+      return false;
+  return op->getParentOfType<gpu::LaunchOp>() != nullptr;
+}
+
+// Collective dispatch emit. Each thread of the enclosing wave
+// processes a strided subset of the iter space: chunk `c` lands lane
+// `lane * c + lin_tid`, an `scf.if lin < total` guards the trailing
+// partial chunk, and the body runs once per in-range iteration with
+// the unlinearized per-axis coords bound to the iter syms in scope.
+// A closing `gpu.barrier` makes the cooperative writes visible to
+// every thread before the per-lane readers downstream pick the
+// finished tile back up.
+//
+// Body emission reuses the trivial-partition single-clone path: each
+// in-range iteration loads one element per input operand, runs the
+// body once with the loaded ins + a per-element outs init load, and
+// stores the yielded scalars back at the same composed offset. The
+// outs init load is the same race-free pattern the cooperative copy
+// uses: each thread owns its element of the workgroup tile for the
+// duration of the body, so the load+store pair never sees a write
+// from another thread between them.
+static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
+  Location loc = op.getLoc();
+  OpBuilder builder(op);
+
+  auto tidAndSize = linearizedThreadAndSize(builder, loc, op);
+  if (failed(tidAndSize))
+    return op.emitOpError("collective dispatch requires a gpu.launch parent");
+  auto [linTid, wgSize] = *tidAndSize;
+
+  ValueRange bounds = op.getIterBounds();
+  Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  Value c1 = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+  Value total = c1;
+  for (auto bound : bounds) {
+    Value dim = castIdxToIndex(builder, loc, bound);
+    total = arith::MulIOp::create(builder, loc, total, dim).getResult();
+  }
+  Value chunks =
+      arith::CeilDivUIOp::create(builder, loc, total, wgSize).getResult();
+
+  scf::ForOp loop =
+      scf::ForOp::create(builder, loc, c0, chunks, c1, ValueRange{});
+  LogicalResult bodyStatus = success();
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(loop.getBody());
+    Value chunkIdx = loop.getInductionVar();
+    Value chunkOffset =
+        arith::MulIOp::create(builder, loc, chunkIdx, wgSize).getResult();
+    Value lin =
+        arith::AddIOp::create(builder, loc, chunkOffset, linTid).getResult();
+    Value inRange = arith::CmpIOp::create(builder, loc,
+                                          arith::CmpIPredicate::ult, lin, total)
+                        .getResult();
+    auto rangeIf = scf::IfOp::create(builder, loc, TypeRange{}, inRange,
+                                     /*withElseRegion=*/false);
+    {
+      OpBuilder::InsertionGuard rangeGuard(builder);
+      builder.setInsertionPointToStart(&rangeIf.getThenRegion().front());
+
+      // Unlinearise `lin` into per-axis coords: rightmost axis varies
+      // fastest, matching the row-major flatten convention used by
+      // `hc-flatten-with-layouts` so post-flatten offset expressions
+      // line up with the coord assignment.
+      SmallVector<Value> coords(axes.size());
+      Value remaining = lin;
+      for (int axis = static_cast<int>(axes.size()) - 1; axis >= 0; --axis) {
+        Value dim = castIdxToIndex(builder, loc, bounds[axis]);
+        coords[axis] =
+            arith::RemUIOp::create(builder, loc, remaining, dim).getResult();
+        if (axis > 0)
+          remaining =
+              arith::DivUIOp::create(builder, loc, remaining, dim).getResult();
+      }
+
+      llvm::StringMap<Value> scope;
+      for (auto [ax, coord] : llvm::zip(axes, coords))
+        scope[ax.name] = coord;
+
+      ArrayAttr insOff = op.getInsOffsetsAttr();
+      SmallVector<Value> insVals(op.getIns().size());
+      for (size_t ii = 0; ii < op.getIns().size(); ++ii) {
+        ExprAttr origOff = getOperandOffset(insOff, ii);
+        Value off = emitOffset(builder, loc, origOff, scope);
+        Value ptr = op.getIns()[ii];
+        Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+        Value addr =
+            HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                .getResult();
+        insVals[ii] =
+            HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
+      }
+
+      ArrayAttr outsOff = op.getOutsOffsetsAttr();
+      SmallVector<Value> outsVals(op.getOuts().size());
+      for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
+        ExprAttr origOff = getOperandOffset(outsOff, oi);
+        Value off = emitOffset(builder, loc, origOff, scope);
+        Value ptr = op.getOuts()[oi];
+        Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+        Value addr =
+            HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                .getResult();
+        outsVals[oi] =
+            HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
+      }
+
+      SmallVector<Value> yielded;
+      if (failed(cloneBody(builder, op, insVals, outsVals, yielded))) {
+        bodyStatus = failure();
+      } else if (yielded.size() != op.getOuts().size()) {
+        bodyStatus = op.emitOpError("body yielded wrong arity");
+      } else {
+        for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
+          ExprAttr origOff = getOperandOffset(outsOff, oi);
+          Value off = emitOffset(builder, loc, origOff, scope);
+          Value ptr = op.getOuts()[oi];
+          Value addr =
+              HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
+                  .getResult();
+          HCPtrStoreOp::create(builder, loc, yielded[oi], addr);
+        }
+      }
+    }
+  }
+  if (failed(bodyStatus))
+    return failure();
+
+  // Make the cooperative writes visible to every thread of the
+  // workgroup before any downstream per-lane read picks the
+  // populated tile back up. Single-wave workgroups don't strictly
+  // need it; the cost is trivial and the canonicalizer leaves it
+  // alone deliberately.
+  gpu::BarrierOp::create(builder, loc);
+  return success();
+}
+
 // Top-level: pick `(order, partition)` via the divisibility-pruned
 // merge-score search, then dispatch to the partition-aware emitter.
 // The trivial `(1, ..., 1)` partition collapses through the same
 // path verb-for-verb to the scalar baseline (single scalar load /
 // store per operand, body cloned once per innermost iteration).
+//
+// Collective candidates (workgroup-shared outs inside a launch)
+// route through `lowerCollective` instead — the chunk-and-publish
+// shape is the right loop nest for cooperative tile population, and
+// running `lowerWithPartition` against shared outs would have every
+// thread of the wave fight every other thread for every element.
 static LogicalResult lowerOne(HCGenericOp op) {
   MLIRContext *ctx = op.getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   SmallVector<IterAxis> axes = collectIterAxes(op);
-  auto [order, p] = selectBest(op, axes, store);
 
-  if (failed(lowerWithPartition(op, axes, order, p)))
-    return failure();
+  if (isCollectiveCandidate(op, axes)) {
+    if (failed(lowerCollective(op, axes)))
+      return failure();
+  } else {
+    auto [order, p] = selectBest(op, axes, store);
+    if (failed(lowerWithPartition(op, axes, order, p)))
+      return failure();
+  }
 
   // v0 candidates are all-ptr-outs (zero SSA results), so erasing
   // is sufficient — no `replaceAllUsesWith` needed. The candidate

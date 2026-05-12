@@ -381,3 +381,162 @@ func.func @scalar_fallback_index_bound(%n: index,
   }
   return
 }
+
+// -----
+
+// Collective dispatch: outs is a `!hc.ptr<workgroup, T>` (LDS-staged
+// tile), every iter is parallel, and the op sits inside `gpu.launch`.
+// The pass picks the chunk-and-publish shape instead of `scf.parallel`
+// — every thread of the wave processes a strided subset of the
+// linearised iter space, with an in-range gate at the trailing
+// partial chunk and a closing `gpu.barrier` so the populated tile is
+// visible to downstream readers. The body still runs once per
+// in-range iteration (no partition unroll on this path: collective
+// dispatch is inherently per-element, the merge analyzer can't claim
+// anything useful when every lane owns a different element).
+// CHECK-LABEL: func.func @collective_lds_population
+// CHECK: gpu.launch blocks
+// CHECK-SAME: threads({{[^,]+}}, %[[TY:[^,]+]], %[[TZ:[^)]+]])
+// CHECK: %[[TZBY:.+]] = arith.muli %[[TZ]], %{{.+}} : index
+// CHECK: %[[TZBYTY:.+]] = arith.addi %[[TZBY]], %[[TY]] : index
+// CHECK: %[[ROWSPAN:.+]] = arith.muli %[[TZBYTY]], %{{.+}} : index
+// CHECK: %[[LIN_TID:.+]] = arith.addi %[[ROWSPAN]], %{{.+}} : index
+// CHECK: %[[BXBY:.+]] = arith.muli %{{.+}}, %{{.+}} : index
+// CHECK: %[[WG_SIZE:.+]] = arith.muli %[[BXBY]], %{{.+}} : index
+// CHECK: arith.muli {{.+}} : index
+// CHECK: %[[TOTAL:.+]] = arith.muli {{.+}} : index
+// CHECK: %[[CHUNKS:.+]] = arith.ceildivui %[[TOTAL]], %[[WG_SIZE]] : index
+// CHECK: scf.for %[[C:[^=]+]] = %{{.+}} to %[[CHUNKS]] step
+// CHECK: %[[OFF:.+]] = arith.muli %[[C]], %[[WG_SIZE]] : index
+// CHECK: %[[LIN:.+]] = arith.addi %[[OFF]], %[[LIN_TID]] : index
+// CHECK: %[[INR:.+]] = arith.cmpi ult, %[[LIN]], %[[TOTAL]] : index
+// CHECK: scf.if %[[INR]] {
+// CHECK: arith.remui
+// CHECK: arith.divui
+// CHECK: arith.remui
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<global, f32> -> f32
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
+// CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
+// CHECK: }
+// CHECK: gpu.barrier
+// CHECK-NOT: hc.generic
+// CHECK-NOT: scf.parallel
+func.func @collective_lds_population(%src: !hc.ptr<global, f32>,
+                                     %lds: !hc.ptr<workgroup, f32>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %m = hc.idx_apply () : () -> !hc.idx<"8">
+    %n = hc.idx_apply () : () -> !hc.idx<"16">
+    hc.generic
+        iter (parallel i = %m : !hc.idx<"8">,
+              parallel j = %n : !hc.idx<"16">)
+        ins (%src at [#hc.expr<"i*16 + j">] : !hc.ptr<global, f32>)
+        outs (%lds at [#hc.expr<"i*16 + j">] : !hc.ptr<workgroup, f32>)
+        -> () {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield %sv : f32
+    }
+    gpu.terminator
+  }
+  return
+}
+
+// -----
+
+// Workgroup-shared outs but no enclosing `gpu.launch`: the pass has
+// no thread-id source to chunk against, so the collective path
+// rejects the op and the partition-aware emitter handles it as the
+// per-lane scf.parallel shape would. The cooperative-staging shape
+// the pipeline ultimately wants comes from running this after the
+// kernel was wrapped in `gpu.launch`; running stand-alone is the
+// hc-opt smoke-test slot.
+// CHECK-LABEL: func.func @workgroup_outs_no_launch_falls_through
+// CHECK-NOT: scf.for
+// CHECK: scf.parallel
+// CHECK-NOT: hc.generic
+// CHECK-NOT: gpu.barrier
+func.func @workgroup_outs_no_launch_falls_through(
+    %src: !hc.ptr<global, f32>, %lds: !hc.ptr<workgroup, f32>) {
+  %m = hc.idx_apply () : () -> !hc.idx<"8">
+  hc.generic
+      iter (parallel i = %m : !hc.idx<"8">)
+      ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      outs (%lds at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+      -> () {
+  ^bb0(%sv: f32, %dv: f32):
+    hc.yield %sv : f32
+  }
+  return
+}
+
+// -----
+
+// Global-only outs (no workgroup ptr in the outs list) inside a
+// `gpu.launch`: collective dispatch isn't appropriate — running
+// every lane on every element of a global-shared output races, the
+// same way it does without a launch. The partition-aware emitter
+// still produces the per-lane `scf.parallel` shape.
+// CHECK-LABEL: func.func @global_outs_in_launch_falls_through
+// CHECK: gpu.launch
+// CHECK: scf.parallel
+// CHECK-NOT: gpu.barrier
+// CHECK-NOT: hc.generic
+func.func @global_outs_in_launch_falls_through(%src: !hc.ptr<global, f32>,
+                                               %dst: !hc.ptr<global, f32>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %m = hc.idx_apply () : () -> !hc.idx<"8">
+    hc.generic
+        iter (parallel i = %m : !hc.idx<"8">)
+        ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+        outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+        -> () {
+    ^bb0(%sv: f32, %dv: f32):
+      hc.yield %sv : f32
+    }
+    gpu.terminator
+  }
+  return
+}
+
+// -----
+
+// Workgroup-shared outs with a reduction iter: collective dispatch
+// requires every iter to be parallel — cross-iter accumulation
+// across threads is a cross-thread reduction the chunk-and-publish
+// shape doesn't model. Reduction generics fall through to the
+// partition-aware emitter even when the outs is in workgroup AS;
+// the per-thread accumulator path runs locally and the user's
+// upstream code is responsible for the cross-thread synchronization.
+// CHECK-LABEL: func.func @workgroup_outs_with_reduction_falls_through
+// CHECK: gpu.launch
+// CHECK: scf.for
+// CHECK: scf.reduce
+// CHECK-NOT: gpu.barrier
+// CHECK-NOT: hc.generic
+func.func @workgroup_outs_with_reduction_falls_through(
+    %src: !hc.ptr<global, f32>, %lds: !hc.ptr<workgroup, f32>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %m = hc.idx_apply () : () -> !hc.idx<"8">
+    %n = hc.idx_apply () : () -> !hc.idx<"16">
+    hc.generic
+        iter (parallel i = %m : !hc.idx<"8">,
+              reduction j = %n : !hc.idx<"16">)
+        ins (%src at [#hc.expr<"i*16 + j">] : !hc.ptr<global, f32>)
+        outs (%lds at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+        -> () {
+    ^bb0(%sv: f32, %dv: f32):
+      %s = hc.add %dv, %sv : (f32, f32) -> f32
+      hc.yield %s : f32
+    }
+    gpu.terminator
+  }
+  return
+}

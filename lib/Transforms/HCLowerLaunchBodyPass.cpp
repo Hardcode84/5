@@ -15,6 +15,7 @@
 
 #include "hc/Transforms/Passes.h"
 
+#include "LaunchUtils.h"
 #include "hc/IR/HCDialect.h"
 #include "hc/IR/HCOps.h"
 #include "hc/IR/HCSymbols.h"
@@ -980,33 +981,6 @@ static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
     HCPtrStoreOp::create(builder, loc, element, addr);
   }
   return success();
-}
-
-// Linearize the enclosing launch's 3-D thread id and block size into a single
-// `(tid, wgSize)` pair so the cooperative-copy loop only has to reason about
-// one dimension. The dim3 layout is the standard
-// `lin = (tz * by + ty) * bx + tx`. For the common `block_y = block_z = 1`
-// shape the y/z multiplications fold to identity and the resulting IR
-// collapses to plain `tx` / `bx`.
-static FailureOr<std::pair<Value, Value>>
-linearizedThreadAndSize(OpBuilder &builder, Location loc, Operation *anchor) {
-  auto launch = anchor->getParentOfType<gpu::LaunchOp>();
-  if (!launch)
-    return failure();
-  gpu::KernelDim3 tids = launch.getThreadIds();
-  // `getBlockSizeOperandValues` reaches the values defined above the launch
-  // (the operands that pin the block shape). Inside the body they're still
-  // dominating SSA values, and using the outer form keeps the cooperative
-  // loop's IR close to the values the materializeBoundExpr lowering already
-  // surfaces under the `$WGS*` symbols.
-  gpu::KernelDim3 sizes = launch.getBlockSizeOperandValues();
-  Value tzBy = arith::MulIOp::create(builder, loc, tids.z, sizes.y);
-  Value tzByPlusTy = arith::AddIOp::create(builder, loc, tzBy, tids.y);
-  Value rowSpan = arith::MulIOp::create(builder, loc, tzByPlusTy, sizes.x);
-  Value linearTid = arith::AddIOp::create(builder, loc, rowSpan, tids.x);
-  Value bxBy = arith::MulIOp::create(builder, loc, sizes.x, sizes.y);
-  Value wgSize = arith::MulIOp::create(builder, loc, bxBy, sizes.z);
-  return std::pair<Value, Value>{linearTid, wgSize};
 }
 
 // Cooperative copy from a slice of a kernel-arg `!hc.ptr<global, T>` into a

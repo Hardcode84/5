@@ -24,6 +24,7 @@ add_mlir_library(MLIRHCTransforms
   HCPromoteNamesPass.cpp
   HCShapedComputeToGenericPass.cpp
   HCVerifyStaticShapesPass.cpp
+  LaunchUtils.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/hc/Transforms

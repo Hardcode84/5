@@ -859,6 +859,99 @@ buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
       ExprAttr::get(ctx, *storageSizeHandle), ExprAttr::get(ctx, offsetHandle));
 }
 
+// Read a Python-stamped ``layout`` ref dict and rebuild the structured
+// ``#hc.layout<...>`` attribute. The resolver carries every piece as a
+// typed MLIR attribute (`ArrayAttr<StringAttr>` for name lists,
+// `DictionaryAttr` keyed on the param name with `ExprAttr` values,
+// `ExprAttr` for `storage_size` / `offset`); see the resolver-side
+// contract documented at `hc/_resolve.py::_index_map_ref`. No text is
+// parsed here — assemble straight from the typed payload.
+static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
+                                               const RefInfo &ref) {
+  auto require = [&](StringRef key, auto attr) -> LogicalResult {
+    if (attr)
+      return success();
+    return sourceOp->emitOpError("layout ref missing `") << key << "`";
+  };
+
+  ArrayAttr shapeSymsAttr = ref.getAs<ArrayAttr>("shape_syms");
+  ArrayAttr indexSymsAttr = ref.getAs<ArrayAttr>("index_syms");
+  ExprAttr storageSize = ref.getAs<ExprAttr>("storage_size");
+  ExprAttr offset = ref.getAs<ExprAttr>("offset");
+  if (failed(require("shape_syms", shapeSymsAttr)) ||
+      failed(require("index_syms", indexSymsAttr)) ||
+      failed(require("storage_size", storageSize)) ||
+      failed(require("offset", offset)))
+    return failure();
+
+  auto validateNames = [&](ArrayAttr names, StringRef which) -> LogicalResult {
+    for (auto en : llvm::enumerate(names)) {
+      if (!isa<StringAttr>(en.value())) {
+        sourceOp->emitOpError("layout ref ")
+            << which << " entry #" << en.index() << " is not a StringAttr (got "
+            << en.value() << ")";
+        return failure();
+      }
+    }
+    return success();
+  };
+  if (failed(validateNames(shapeSymsAttr, "shape_syms")) ||
+      failed(validateNames(indexSymsAttr, "index_syms")))
+    return failure();
+
+  // Params is optional only in the "I have no derived params" sense
+  // (default-strided builds a `DictionaryAttr::get(ctx, {})` of its own).
+  // The Python resolver always emits the key — even empty — so a missing
+  // entry here is a driver bug, not a parameterless layout.
+  DictionaryAttr paramsAttr = ref.getAs<DictionaryAttr>("params");
+  if (!paramsAttr)
+    return sourceOp->emitOpError("layout ref missing `params`");
+  for (NamedAttribute kv : paramsAttr) {
+    if (!isa<ExprAttr>(kv.getValue())) {
+      sourceOp->emitOpError("layout ref param '")
+          << kv.getName().getValue() << "' is not an ExprAttr (got "
+          << kv.getValue() << ")";
+      return failure();
+    }
+  }
+
+  return LayoutAttr::get(sourceOp->getContext(),
+                         llvm::to_vector(shapeSymsAttr.getValue()),
+                         llvm::to_vector(indexSymsAttr.getValue()), paramsAttr,
+                         storageSize, offset);
+}
+
+// Resolve the layout descriptor SSA argument fed to a `layout_op` call
+// (currently `as_layout(value, descriptor)`). The descriptor must be
+// produced by an `hc_front.name` whose `ref` was classified as
+// `kind = "layout"`; anything else is a frontend bug — diagnose at the
+// call site so users get the offending op rather than a downstream
+// "missing attribute" complaint.
+static FailureOr<LayoutAttr>
+readLayoutFromValue(Value descriptor, Operation *consumer, StringRef role) {
+  auto nameOp = descriptor.getDefiningOp<hc_front::NameOp>();
+  if (!nameOp) {
+    InFlightDiagnostic diag = consumer->emitOpError(role)
+                              << " must be a captured IndexMap "
+                                 "(hc_front.name reference)";
+    if (Operation *def = descriptor.getDefiningOp())
+      diag << "; got an SSA value defined by " << def->getName();
+    else
+      diag << "; got a block argument";
+    return failure();
+  }
+  RefInfo ref = RefInfo::get(nameOp);
+  if (failed(ref.diagnoseIfMalformed(nameOp)))
+    return failure();
+  if (ref.getKind() != "layout") {
+    consumer->emitOpError(role)
+        << " must be a captured IndexMap; got ref.kind '" << ref.getKind()
+        << "'";
+    return failure();
+  }
+  return layoutAttrFromRef(consumer, ref);
+}
+
 static FailureOr<Type>
 parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
                       LaunchMetadataAttrs defaultLaunchMetadata,
@@ -1213,6 +1306,14 @@ private:
                                         Value base, const CallArgs &args);
   FailureOr<Value> lowerMemOp(hc_front::CallOp call, StringRef method,
                               const CallArgs &args);
+
+  // Consume a `hc_front.call` whose callee was classified as a layout
+  // primitive (`ref.kind = "layout_op"`). Today the only such primitive
+  // is `as_layout(value, descriptor)`. The descriptor argument arrives
+  // as an SSA value defined by an `hc_front.name` whose own `ref` is
+  // `kind = "layout"` carrying typed `#hc.expr` / DictAttr pieces; this
+  // path reassembles them into a `LayoutAttr` and emits `hc.as_layout`.
+  FailureOr<Value> lowerLayoutOpCall(hc_front::CallOp op, const RefInfo &ref);
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
@@ -2480,6 +2581,14 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     return failure();
   StringRef kind = ref.getKind();
 
+  // Layout primitives (today: `as_layout(value, descriptor)`) want their
+  // descriptor argument inspected as a captured `hc_front.name` rather
+  // than lowered to an SSA value — the descriptor maps to a null entry
+  // in `valueMap`, and `collectCallArgs` would reject it as "did not
+  // lower". Dispatch early.
+  if (kind == "layout_op")
+    return lowerLayoutOpCall(op, ref);
+
   FailureOr<CallArgs> argsOr = collectCallArgs(op);
   if (failed(argsOr))
     return failure();
@@ -2756,6 +2865,55 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
 
   call.emitOpError("unsupported dsl_method '") << method << "'";
   return failure();
+}
+
+FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
+                                            const RefInfo &ref) {
+  // Today the only ``layout_op`` primitive is ``as_layout(value,
+  // descriptor)``. The dispatch is keyed on the ref's `op` string so we
+  // can grow more primitives (`as_dense`, mask-rebinders, ...) without
+  // touching this switch's neighbors.
+  StringRef opName = ref.getString("op");
+  if (opName != "as_layout") {
+    op.emitOpError("unsupported layout_op '") << opName << "'";
+    return failure();
+  }
+
+  // ``as_layout`` accepts exactly two positional arguments and no
+  // kwargs. Anything else is a frontend bug, not a "stretch the
+  // semantics" surface — diagnose loudly so the user fixes the call
+  // shape before the layout machinery quietly drops information.
+  ValueRange args = op.getArguments();
+  if (args.size() != 2) {
+    op.emitOpError("as_layout expects 2 positional arguments "
+                   "(value, layout descriptor); got ")
+        << args.size();
+    return failure();
+  }
+  for (Value v : args) {
+    if (keywordInfo.contains(v)) {
+      op.emitOpError("as_layout does not accept keyword arguments");
+      return failure();
+    }
+  }
+
+  FailureOr<Value> valueOr =
+      lowerValueOperand(args[0], op.getOperation(), "as_layout value");
+  if (failed(valueOr))
+    return failure();
+  Value value = *valueOr;
+  if (!value) {
+    op.emitOpError("as_layout value did not lower to an hc value");
+    return failure();
+  }
+
+  FailureOr<LayoutAttr> layout =
+      readLayoutFromValue(args[1], op.getOperation(), "as_layout layout");
+  if (failed(layout))
+    return failure();
+
+  return {HCAsLayoutOp::create(builder, op.getLoc(), undef, value, *layout)
+              .getResult()};
 }
 
 FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,

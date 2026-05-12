@@ -688,3 +688,109 @@ module {
   } {
   }
 }
+
+// -----
+
+// `layout_op` dispatch is keyed on `ref.op`. An unknown primitive name
+// is a frontend bug (resolver shouldn't have classified it without a
+// matching emission path), so diagnose loudly.
+module {
+  hc_front.kernel "bad_layout_op" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "unknown"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_unknown"}}
+    %d = hc_front.name "D" {ctx = "load", ref = {
+      kind = "layout", shape_syms = ["d0"], index_syms = ["i0"],
+      params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">}}
+    // expected-error@+1 {{unsupported layout_op 'as_unknown'}}
+    %r = hc_front.call %fn(%v, %d)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}
+
+// -----
+
+// `as_layout` is binary; a frontend that emits anything else is broken.
+module {
+  hc_front.kernel "bad_as_layout_arity" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    // expected-error@+1 {{as_layout expects 2 positional arguments (value, layout descriptor); got 1}}
+    %r = hc_front.call %fn(%v)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}
+
+// -----
+
+// The descriptor argument must arrive as a captured IndexMap name. A
+// plain `hc_front.name` with the wrong ref.kind would silently drop
+// layout info, so reject at the call site.
+module {
+  hc_front.kernel "bad_as_layout_descriptor" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %notlayout = hc_front.name "not_a_layout"
+        {ctx = "load", ref = {kind = "local"}}
+    // expected-error@+1 {{as_layout layout must be a captured IndexMap; got ref.kind 'local'}}
+    %r = hc_front.call %fn(%v, %notlayout)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}
+
+// -----
+
+// Malformed layout ref payload — missing `params` is a driver bug
+// (resolver always stamps it, even when empty). Diagnose against the
+// descriptor name op so users follow the chain back to the resolver.
+module {
+  hc_front.kernel "bad_layout_ref_missing_params" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %d = hc_front.name "D" {ctx = "load", ref = {
+      kind = "layout", shape_syms = ["d0"], index_syms = ["i0"],
+      storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">}}
+    // expected-error@+1 {{layout ref missing `params`}}
+    %r = hc_front.call %fn(%v, %d)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}

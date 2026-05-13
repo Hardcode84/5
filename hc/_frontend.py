@@ -1286,13 +1286,7 @@ def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
     from .symbols import Symbol
 
     if isinstance(value, BufferSpec):
-        record: dict[str, object] = {
-            "kind": "buffer",
-            "shape": tuple(str(dim) for dim in value.dimensions),
-        }
-        if value.dtype is not None:
-            record["dtype"] = value.dtype
-        return record
+        return _serialize_buffer_spec(value)
     if value is CurrentGroup:
         return {"kind": "launch_context", "launch_context": "group"}
     if value is WorkItem:
@@ -1306,6 +1300,23 @@ def _serialize_parameter_annotation(value: Any) -> dict[str, object] | None:
         if dtype is not None:
             return {"kind": "scalar", "dtype": dtype}
     return None
+
+
+def _serialize_buffer_spec(value: Any) -> dict[str, object]:
+    record: dict[str, object] = {
+        "kind": "buffer",
+        "shape": tuple(str(dim) for dim in value.dimensions),
+    }
+    if value.dtype is not None:
+        record["dtype"] = value.dtype
+    if value.layout is not None:
+        # Stash the raw `IndexMap` here; the emitter
+        # (`HCFrontEmitter._apply_structural_annotation`) is the one
+        # with an MLIR context handy and does the symbolic
+        # `IndexMap -> #hc.layout` conversion via the same helper that
+        # body-level `layout=` kwargs go through.
+        record["layout"] = value.layout
+    return record
 
 
 def _region_payload(

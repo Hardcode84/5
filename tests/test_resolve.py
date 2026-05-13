@@ -18,8 +18,11 @@ from build_tools.hc_native_tools import (
 )
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
 from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
+from hc import Buffer, as_layout, kernel, sym
 from hc._frontend import FrontendError
 from hc._resolve import ResolvedFrontIR, resolve_front_ir
+from hc.core import index_map
+from hc.symbols import ceil_div
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
@@ -34,6 +37,39 @@ def _ensure_hc_front_bindings_available() -> None:
     os.environ.update(
         export_hc_native_environment(native_install_root, dict(os.environ))
     )
+
+
+# Module-scope fixtures for the layout-parameter / as_layout body-call
+# tests. PEP 563 stringified annotations (the file's `from __future__
+# import annotations`) need the referenced names to be resolvable from
+# the function's globals, so the kernel and its captured ``IndexMap``
+# must live at module scope — defining either inside the test body
+# hides ``Buffer`` / ``M`` / ``N`` / ``_FIXTURE_LAYOUT`` from
+# ``inspect.get_annotations(eval_str=True)``. Decorator names also have
+# to match `kernel` (or `kernel.func` / `kernel.intrinsic`) literally
+# in the parsed AST, so the imports above stay unaliased; local
+# re-imports inside other tests simply rebind these names in their own
+# scopes.
+_FIXTURE_M = sym.M
+_FIXTURE_N = sym.N
+_FIXTURE_LAYOUT = index_map(
+    storage_size=lambda w, h: w * h,
+    offset=lambda i, j, w, h: i * h + j,
+)
+
+
+@kernel(work_shape=(ceil_div(_FIXTURE_M, 16),), group_shape=(16,))
+def _param_layout_kernel(
+    group, a: Buffer[_FIXTURE_M, _FIXTURE_N, np.float32, _FIXTURE_LAYOUT]
+) -> None:
+    return
+
+
+@kernel(work_shape=(ceil_div(_FIXTURE_M, 16),), group_shape=(16,))
+def _as_layout_body_kernel(group, a: Buffer[_FIXTURE_M, _FIXTURE_N]) -> None:
+    v = group.vzeros(shape=(16,))
+    _ = as_layout(v, _FIXTURE_LAYOUT)
+    return
 
 
 def _iter_ops(module: Any) -> Any:
@@ -264,7 +300,7 @@ def test_resolve_wmma_symbols_get_symbol_ref() -> None:
     # Tiled WMMA doesn't load `M`/`N`/`K` directly inside its body (it reads
     # `a.shape[1]` instead), so build a minimal kernel that does reference a
     # `Symbol` in an expression context and check the payload shape.
-    from hc import Buffer, kernel, sym
+    from hc import kernel, sym
     from hc.symbols import ceil_div
 
     M = sym.M
@@ -291,7 +327,7 @@ def test_resolve_recognizes_live_numpy_scalar_dtypes() -> None:
     # per-platform edits to the resolver.
     _ensure_hc_front_bindings_available()
 
-    from hc import Buffer, kernel, sym
+    from hc import kernel, sym
     from hc.symbols import ceil_div
 
     M = sym.M
@@ -416,7 +452,7 @@ def test_resolve_index_map_capture_serializes_layout_payload() -> None:
     """
     _ensure_hc_front_bindings_available()
 
-    from hc import Buffer, kernel, sym
+    from hc import kernel, sym
     from hc.core import index_map
     from hc.symbols import ceil_div
 
@@ -456,7 +492,7 @@ def test_resolve_index_map_without_params_emits_empty_table() -> None:
     """
     _ensure_hc_front_bindings_available()
 
-    from hc import Buffer, kernel, sym
+    from hc import kernel, sym
     from hc.core import index_map
     from hc.symbols import ceil_div
 
@@ -495,7 +531,7 @@ def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
     """
     _ensure_hc_front_bindings_available()
 
-    from hc import Buffer, as_layout, kernel, sym
+    from hc import as_layout, kernel, sym
     from hc.symbols import ceil_div
 
     M = sym.M
@@ -525,7 +561,7 @@ def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
     """
     import subprocess
 
-    from hc import Buffer, kernel, sym
+    from hc import kernel, sym
     from hc._native_paths import hc_opt_path
     from hc.core import index_map
     from hc.symbols import ceil_div
@@ -568,6 +604,125 @@ def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
     # spelling.
     assert 'index_syms = ["i", "j"]' in hc_text, hc_text
     assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
+    assert "storage_size = #hc.expr<" in hc_text, hc_text
+    assert "offset = #hc.expr<" in hc_text, hc_text
+
+
+def test_buffer_class_getitem_captures_trailing_index_map_as_layout() -> None:
+    """``Buffer[d1, d2, dtype, IndexMap]`` stores the ``IndexMap`` on the
+    ``BufferSpec.layout`` field; ``Buffer[d1, d2, dtype]`` leaves it
+    ``None``. Detected by ``isinstance`` against ``IndexMap`` rather
+    than by position — ``[]`` syntax can't pass real kwargs, so a
+    positional-by-type rule is the only spelling that works at the
+    annotation surface. Default-strided callers keep their old shape
+    via the ``None`` fallback.
+    """
+    from hc import Buffer, sym
+    from hc.core import BufferSpec, index_map
+
+    L = index_map(
+        storage_size=lambda w, h: w * h,
+        offset=lambda i, j, w, h: i * h + j,
+    )
+
+    plain = Buffer[sym.M, sym.N, np.float32]
+    assert isinstance(plain, BufferSpec)
+    assert plain.layout is None
+
+    with_layout = Buffer[sym.M, sym.N, np.float32, L]
+    assert isinstance(with_layout, BufferSpec)
+    assert with_layout.layout is L
+    assert with_layout.dtype == "float32"
+    assert tuple(str(d) for d in with_layout.dimensions) == ("M", "N")
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_buffer_layout_lands_on_kernel_parameter_dict() -> None:
+    """End-to-end Python -> hc_front -> hc: a kernel parameter annotated
+    as ``Buffer[..., IndexMap]`` must round-trip through
+    ``-convert-hc-front-to-hc`` with the captured layout becoming the
+    ``BufferType``'s ``LayoutAttr``, replacing the default
+    ``$STRIDE_<i>_<argname>`` builder. Pins the boundary contract: the
+    resolver-side ``layout`` payload on the parameter dict matches the
+    same key set ``layoutAttrFromRef`` reads for body-level layouts.
+
+    The kernel under test lives at module scope (``_param_layout_kernel``)
+    rather than inside the test body so PEP 563 stringified annotations
+    can resolve their free names (``Buffer``, ``M``, ``N``,
+    ``A_LAYOUT``) via the module's globals — function-local frames
+    aren't visible to ``inspect.get_annotations(eval_str=True)``.
+    """
+    import subprocess
+
+    from hc._native_paths import hc_opt_path
+
+    _ensure_hc_front_bindings_available()
+
+    resolved = resolve_front_ir(_param_layout_kernel)
+    front_text = str(resolved.module)
+    # Resolver-side: the parameter dict carries the structured layout
+    # sub-dict matching the body-level ref shape (kind + 5 keys).
+    assert 'kind = "layout"' in front_text, front_text
+    assert 'shape_syms = ["w", "h"]' in front_text, front_text
+    assert 'index_syms = ["i", "j"]' in front_text, front_text
+
+    result = subprocess.run(
+        [str(hc_opt_path()), "--convert-hc-front-to-hc"],
+        input=front_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (
+        result.returncode == 0
+    ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    hc_text = result.stdout
+    # C++ side: the BufferType's LayoutAttr is the captured one, not
+    # the default-strided builder. Default-strided would emit
+    # `$STRIDE_<i>_<argname>` symbols inside the layout payload;
+    # asserting their absence pins that we took the override path.
+    assert "$STRIDE_" not in hc_text, hc_text
+    assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
+    assert 'index_syms = ["i", "j"]' in hc_text, hc_text
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_as_layout_body_call_emits_hc_as_layout() -> None:
+    """End-to-end body-level ``as_layout(value, A_LAYOUT)``: the AST
+    walker emits the generic ``hc_front.call``, the resolver stamps the
+    callee as ``kind = "layout_op"`` and the descriptor as
+    ``kind = "layout"``, and ``-convert-hc-front-to-hc`` recognizes the
+    pattern and produces ``hc.as_layout`` carrying the structured
+    layout attribute. Companion to the kwarg-overlay test above — they
+    cover the two surfaces a user has for attaching a captured
+    ``IndexMap`` to a body-level value.
+
+    Lives at module scope alongside its kernel for the same PEP 563 +
+    eval_str reason as the parameter-layout test.
+    """
+    import subprocess
+
+    from hc._native_paths import hc_opt_path
+
+    _ensure_hc_front_bindings_available()
+
+    resolved = resolve_front_ir(_as_layout_body_kernel)
+    front_text = str(resolved.module)
+
+    result = subprocess.run(
+        [str(hc_opt_path()), "--convert-hc-front-to-hc"],
+        input=front_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (
+        result.returncode == 0
+    ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    hc_text = result.stdout
+    assert "hc.as_layout" in hc_text, hc_text
+    assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
+    assert 'index_syms = ["i", "j"]' in hc_text, hc_text
     assert "storage_size = #hc.expr<" in hc_text, hc_text
     assert "offset = #hc.expr<" in hc_text, hc_text
 

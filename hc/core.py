@@ -23,11 +23,23 @@ from ._intrinsic_recipes import (
 class BufferSpec:
     dimensions: tuple[Any, ...]
     dtype: str | None = None
+    # Optional captured `IndexMap` overriding the boundary's default
+    # fully-strided np/torch layout. The frontend lowering pass reads
+    # this off the resolved parameter annotation and stamps a structured
+    # `#hc.layout<...>` attribute on the matching parameter dict in
+    # `hc_front.kernel.parameters`, which `-convert-hc-front-to-hc`
+    # then uses verbatim instead of the default builder. `None` means
+    # "no override" — the C++ side falls back to its
+    # `$STRIDE_<i>_<argname>` layout, which is what every existing call
+    # site continues to get.
+    layout: IndexMap | None = None
 
     def __repr__(self) -> str:
         parts = [str(dim) for dim in self.dimensions]
         if self.dtype is not None:
             parts.append(self.dtype)
+        if self.layout is not None:
+            parts.append(repr(self.layout))
         body = ", ".join(parts)
         return f"Buffer[{body}]"
 
@@ -74,11 +86,20 @@ class Buffer:
     def __class_getitem__(cls, item: Any) -> BufferSpec:
         if not isinstance(item, tuple):
             item = (item,)
+        # Trailing `IndexMap` (`Buffer[d1, d2, dtype, A_LAYOUT]`) is read
+        # as a layout override. `[]` syntax can't carry real kwargs, so
+        # the positional-by-type rule is the only way to attach a layout
+        # at the type-annotation surface — `IndexMap` is unambiguous
+        # against dims (`Symbol`/`int`/`Expr`) and dtypes (numpy types).
+        layout: IndexMap | None = None
+        if item and isinstance(item[-1], IndexMap):
+            layout = item[-1]
+            item = item[:-1]
         dtype = _buffer_dtype_annotation_name(item[-1]) if len(item) >= 2 else None
         if dtype is not None:
             dims = item[:-1]
             item = tuple(dims)
-        return BufferSpec(item, dtype=dtype)
+        return BufferSpec(item, dtype=dtype, layout=layout)
 
 
 def _buffer_dtype_annotation_name(value: Any) -> str | None:

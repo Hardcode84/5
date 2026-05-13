@@ -692,6 +692,26 @@ class HCFrontEmitter:
         launch_context = record.get("launch_context")
         if isinstance(launch_context, str):
             self._set_parameter_launch_context(parameter, launch_context)
+        layout = record.get("layout")
+        if layout is not None:
+            # Captured `IndexMap` overriding the boundary's default
+            # fully-strided layout. Build the same `kind = "layout"`
+            # `DictionaryAttr` shape body-level layout refs use, so
+            # `parameterTypeFromDict` on the C++ side can route both
+            # through `layoutAttrFromRef`. Local import keeps `_resolve`
+            # off the cold-path import chain for callers that never
+            # build a layout-bearing kernel.
+            from ._resolve import build_index_map_layout_dict_attr
+            from .core import IndexMap
+
+            if not isinstance(layout, IndexMap):
+                raise RuntimeError(
+                    f"parameter layout must be an IndexMap, got "
+                    f"{type(layout).__name__}"
+                )
+            parameter["layout"] = build_index_map_layout_dict_attr(
+                layout, self._context, ir
+            )
 
     def _payload_launch_context(self, payload: Mapping[str, object]) -> str | None:
         metadata = payload.get("metadata")

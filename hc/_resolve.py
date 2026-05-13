@@ -51,6 +51,7 @@ from .core import as_layout as _dsl_as_layout
 
 __all__ = [
     "ResolvedFrontIR",
+    "build_index_map_layout_dict_attr",
     "resolve_front_ir",
 ]
 
@@ -426,37 +427,77 @@ class _OpClassifier:
         return ir.DictAttr.get(entries, context=self._ctx)
 
     def _to_attr(self, value: object) -> Any:
-        # Local import: ``hc.symbols`` is heavy and only needed when the
-        # classifier surfaces an ``Expr`` carrier (layout descriptors).
-        from .symbols import Expr
+        return _encode_ref_payload(value, self._ctx, self._ir)
 
-        ir = self._ir
-        if isinstance(value, str):
-            return ir.StringAttr.get(value, context=self._ctx)
-        if isinstance(value, bool | int):
-            return ir.IntegerAttr.get(
-                ir.IntegerType.get_signless(64, context=self._ctx),
-                int(value),
-            )
-        if isinstance(value, tuple):
-            return ir.ArrayAttr.get(
-                [self._to_attr(item) for item in value],
-                context=self._ctx,
-            )
-        if isinstance(value, Mapping):
-            return ir.DictAttr.get(
-                {str(k): self._to_attr(v) for k, v in value.items()},
-                context=self._ctx,
-            )
-        if isinstance(value, Expr):
-            # Construct an `#hc.expr` attribute via the MLIR parser bound to
-            # this context — the printed form of the ixsimpl-owned `Expr`
-            # round-trips through `sym::parseExpr` once at the frontend
-            # boundary, and downstream C++ readers see a typed `ExprAttr`
-            # instead of a `StringAttr` they would have to re-parse. See
-            # ``AGENTS.md`` → "Python -> MLIR attribute construction".
-            return ir.Attribute.parse(f'#hc.expr<"{value}">', context=self._ctx)
-        raise FrontendError(f"cannot encode ref payload value {value!r}")
+
+def _encode_ref_payload(value: object, ctx: Any, ir: Any) -> Any:
+    """Translate a Python ref-payload value into a typed MLIR attribute.
+
+    The translation table is fixed:
+        str          -> StringAttr
+        bool / int   -> i64 IntegerAttr
+        tuple        -> ArrayAttr (recursive)
+        Mapping      -> DictionaryAttr (recursive, str keys)
+        hc Expr      -> #hc.expr<...>
+
+    Shared by ``_OpClassifier._to_attr`` (stamping refs on
+    ``hc_front.name`` ops post-emission) and the parameter-side
+    layout-stamper (``build_index_map_layout_dict_attr``, used to put a
+    captured ``IndexMap`` onto an ``hc_front.kernel`` parameter dict
+    before the classifier ever runs). Keeping one translator means the
+    C++ reader contract for layout payloads is identical regardless of
+    whether the layout was attached to a body-level name capture or to
+    a parameter annotation.
+    """
+    # Local import: ``hc.symbols`` is heavy and only needed when the
+    # classifier surfaces an ``Expr`` carrier (layout descriptors).
+    from .symbols import Expr
+
+    if isinstance(value, str):
+        return ir.StringAttr.get(value, context=ctx)
+    if isinstance(value, bool | int):
+        return ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64, context=ctx),
+            int(value),
+        )
+    if isinstance(value, tuple):
+        return ir.ArrayAttr.get(
+            [_encode_ref_payload(item, ctx, ir) for item in value],
+            context=ctx,
+        )
+    if isinstance(value, Mapping):
+        return ir.DictAttr.get(
+            {str(k): _encode_ref_payload(v, ctx, ir) for k, v in value.items()},
+            context=ctx,
+        )
+    if isinstance(value, Expr):
+        # Construct an `#hc.expr` attribute via the MLIR parser bound to
+        # this context — the printed form of the ixsimpl-owned `Expr`
+        # round-trips through `sym::parseExpr` once at the frontend
+        # boundary, and downstream C++ readers see a typed `ExprAttr`
+        # instead of a `StringAttr` they would have to re-parse. See
+        # ``AGENTS.md`` → "Python -> MLIR attribute construction".
+        return ir.Attribute.parse(f'#hc.expr<"{value}">', context=ctx)
+    raise FrontendError(f"cannot encode ref payload value {value!r}")
+
+
+def build_index_map_layout_dict_attr(
+    layout: IndexMap,
+    ctx: Any,
+    ir: Any,
+) -> Any:
+    """Symbolic-eval ``layout`` and return a ``DictionaryAttr`` matching
+    the body-level ``kind = "layout"`` ref shape.
+
+    Use this when the layout needs to land on something other than an
+    ``hc_front.name`` op — e.g. a parameter dict on
+    ``hc_front.kernel``, where the structured payload is consumed by
+    ``layoutAttrFromRef`` on the C++ side using the same key set
+    (``shape_syms`` / ``index_syms`` / ``params`` / ``storage_size`` /
+    ``offset``).
+    """
+    payload = _index_map_ref(layout)
+    return _encode_ref_payload(payload, ctx, ir)
 
 
 _CaptureClassifier = Callable[[str, Any], "Mapping[str, object] | None"]

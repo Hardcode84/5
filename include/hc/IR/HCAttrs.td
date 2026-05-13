@@ -157,6 +157,21 @@ def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
     either. Symbolic-engine-side substitution at the use site relies on
     that disjointness.
 
+    `index_syms` length is not pinned to the attached type's rank. The
+    first `rank` entries are the per-dim tile coordinates; any tail
+    entries are **selectors** — additional symbols the access op also
+    binds at its call site, used to express per-thread / per-lane
+    distribution patterns (e.g. a WMMA fragment with `index_syms =
+    ["i", "j", "lane"]` whose `offset` references `lane`). Selectors
+    are not a new field, not an enum, and not ambient: they are plain
+    `#hc.expr` symbols bound through the same mechanism as `i` / `j`,
+    via an extra operand on the access op. The verifier on `hc.load` /
+    `hc.vload` / `hc.store` / `hc.load_mask` requires the operand
+    `indices` length to match `len(index_syms)`. `storage_size` for a
+    selector-bearing layout is per-selector-tuple (e.g. per-lane for a
+    `["i","j","lane"]` layout); the consumer interprets that as
+    "one slice's worth of physical storage."
+
     All `#hc.expr` payloads go through the dialect symbolic store at
     construction so type uniquing across ixsimpl-canonical equality
     gives free layout equality.

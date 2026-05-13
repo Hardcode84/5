@@ -462,6 +462,40 @@ func.func @load_with_layout_composes(
 
 // -----
 
+// Selector-bearing layout (`index_syms = ["i0", "i1", "lane"]`, one
+// trailing selector beyond the rank-2 tile shape; see HC_LayoutAttr
+// description). The access op passes one extra index operand (`%lane`
+// bound to `!hc.idx<"lane">`) and the flatten substitution treats
+// `lane` like any other free symbol — substitutes it positionally
+// alongside `i0` / `i1`, then ixsimpl folds `i1` to `j` after the
+// `i1->j` rename, dropping `lane` (the offset doesn't reference it in
+// this minimal selector layout). The post-flatten storage size is the
+// layout's `K` (per-selector-tuple slot), not the wave-total `WAVE*K`,
+// so the source shape collapses to `["K"]`.
+// CHECK-LABEL: @vload_selector_layout
+// CHECK-SAME: %[[T:[^:]+]]: !hc.tensor<f16, ["K"]>
+// CHECK-SAME: %[[I:[^:]+]]: !hc.idx<"i">
+// CHECK-SAME: %[[J:[^:]+]]: !hc.idx<"j">
+// CHECK-SAME: %[[L:[^:]+]]: !hc.idx<"lane">
+// CHECK: %[[OFF:.*]] = hc.idx_apply (%[[J]] as "j")
+// CHECK-SAME: : (!hc.idx<"j">) -> !hc.idx<"j">
+// CHECK: hc.vload %[[T]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.tensor<f16, ["K"]>, !hc.idx<"j">, tuple<!hc.idx<"M">, !hc.idx<"K">>) -> !hc.bare_vector<f16, ["K"]>
+func.func @vload_selector_layout(
+    %t: !hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d1">, offset = #hc.expr<"i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">, %lane: !hc.idx<"lane">,
+    %m: !hc.idx<"M">, %k: !hc.idx<"K">) {
+  %shape = hc.tuple(%m, %k)
+      : (!hc.idx<"M">, !hc.idx<"K">) -> tuple<!hc.idx<"M">, !hc.idx<"K">>
+  %v = hc.vload %t[%i, %j, %lane], shape %shape
+      : (!hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d1">, offset = #hc.expr<"i1">>>,
+         !hc.idx<"i">, !hc.idx<"j">, !hc.idx<"lane">,
+         tuple<!hc.idx<"M">, !hc.idx<"K">>)
+        -> !hc.bare_vector<f16, ["K"]>
+  return
+}
+
+// -----
+
 // Layout-less identity composition: a 2D `hc.vload` on a layout-less
 // `!hc.bare_tensor` falls back to the
 // `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` identity offset.

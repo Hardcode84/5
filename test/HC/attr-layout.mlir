@@ -107,3 +107,24 @@ func.func @nonlinear_payload() attributes {
 } {
   return
 }
+
+// `index_syms` longer than `shape_syms` is admitted: the trailing
+// entries are *selectors* (per-thread / per-lane axes the access op
+// binds with extra operands; see HC_LayoutAttr description). The
+// `offset` here references the trailing `lane` symbol, modeling a
+// WMMA-style fragment whose per-lane storage_size is the K column
+// height regardless of the logical (M, K) tile area.
+// CHECK-LABEL: @selector_layout
+// CHECK-SAME: shape_syms = ["M", "K"]
+// CHECK-SAME: index_syms = ["i", "j", "lane"]
+// CHECK-SAME: storage_size = #hc.expr<"K">
+// CHECK-SAME: offset = #hc.expr<"j">
+func.func @selector_layout() attributes {
+  test.layout = #hc.layout<shape_syms = ["M", "K"],
+                           index_syms = ["i", "j", "lane"],
+                           params = {},
+                           storage_size = #hc.expr<"K">,
+                           offset = #hc.expr<"j">>
+} {
+  return
+}

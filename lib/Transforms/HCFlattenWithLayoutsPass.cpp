@@ -358,10 +358,15 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
                         ArrayRef<ExprAttr> indexExprs) {
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   ArrayRef<Attribute> dims = originalShape.getDims();
-  if (dims.size() != indexExprs.size())
-    return failure();
 
   if (!layout) {
+    // Identity layout fallback: rank parity is the contract — the
+    // implicit identity offset is built over `dims.size()` indices.
+    // Partial-bind accesses (`indexExprs.size() < dims.size()`) fall
+    // back to the catch-all retype path; the compose helper only
+    // handles full bindings.
+    if (dims.size() != indexExprs.size())
+      return failure();
     auto offset = identityLayoutOffset(store, indexExprs, dims);
     if (failed(offset))
       return failure();
@@ -370,6 +375,12 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
 
   ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
   ArrayRef<Attribute> indexSyms = layout.getIndexSyms();
+  // For selector-bearing layouts `indexSyms.size() > shapeSyms.size()`;
+  // the substitution loop below still works because it zips index_syms
+  // against the access op's variadic indices (which include the
+  // selectors as trailing operands). The check enforces both
+  // shape-rank parity AND access-arity parity, the latter against
+  // `indexSyms.size()` not `dims.size()`.
   if (shapeSyms.size() != dims.size() || indexSyms.size() != indexExprs.size())
     return failure();
 

@@ -17,6 +17,7 @@
 #define HC_RUNTIME_HIPRUNTIME_H
 
 #include <cstddef>
+#include <cstdint>
 
 extern "C" {
 
@@ -68,6 +69,36 @@ void hc_rt_launch_kernel(void *stream, void *function, int shared_memory_bytes,
                          int grid_x, int grid_y, int grid_z, int block_x,
                          int block_y, int block_z, int cluster_x, int cluster_y,
                          int cluster_z, void **args, int num_args);
+
+// Bench variant: launch `function` `n_inner` times back-to-back on `stream`,
+// `hipStreamSynchronize` at the end, and return the wall-clock nanoseconds
+// elapsed for the (N launches + sync) window. Timing is sampled in C via
+// `hc_clock_now_ns` (CLOCK_MONOTONIC on Linux today) so the measurement
+// never crosses the language boundary inside the sample window — the
+// caller's outer benchmark loop only needs to collect the returned value
+// per outer iteration, not bracket the call with `perf_counter_ns`.
+//
+// Same arg-conventions as `hc_rt_launch_kernel`: cluster dim > 1 routes
+// through `hipDrvLaunchKernelEx`, otherwise `hipModuleLaunchKernel`. The
+// args array is reused verbatim for every iteration — caller is
+// responsible for any per-launch state rotation (e.g. cache-cold input
+// reshuffling), this entry intentionally measures the hot path with
+// the args held constant.
+//
+// HIP errors propagate via the same `throw std::runtime_error` path the
+// single-shot launch uses; the partial sample is lost. `n_inner == 0` is
+// well-defined: no launches, still calls `hipStreamSynchronize` (drains
+// any prior work on `stream`), returns the clock-pair overhead.
+//
+// Return type is `uint64_t` (5+ centuries of headroom) so wrappers can
+// pass the value straight through to a Python caller via ctypes without
+// signed-overflow concerns at extreme sample sizes.
+uint64_t hc_rt_launch_kernel_repeat(void *stream, void *function,
+                                    int shared_memory_bytes, int grid_x,
+                                    int grid_y, int grid_z, int block_x,
+                                    int block_y, int block_z, int cluster_x,
+                                    int cluster_y, int cluster_z, void **args,
+                                    int num_args, size_t n_inner);
 }
 
 #endif // HC_RUNTIME_HIPRUNTIME_H

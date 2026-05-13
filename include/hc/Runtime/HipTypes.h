@@ -86,5 +86,6 @@ using hipModuleUnload_t = hipError_t (*)(hipModule_t);
 using hipModuleLoadData_t = hipError_t (*)(hipModule_t *, const void *);
 using hipModuleGetFunction_t = hipError_t (*)(hipFunction_t *, hipModule_t,
                                               const char *);
+using hipStreamSynchronize_t = hipError_t (*)(hipStream_t);
 
 #endif // HC_RUNTIME_HIPTYPES_H

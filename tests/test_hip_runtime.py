@@ -26,6 +26,7 @@ _SYMBOLS = (
     "hc_rt_init",
     "hc_rt_load_kernel",
     "hc_rt_launch_kernel",
+    "hc_rt_launch_kernel_repeat",
 )
 
 
@@ -95,6 +96,28 @@ def hip_runtime(hip_runtime_path: Path) -> ctypes.CDLL:
         ctypes.c_int,  # num_args
     ]
     lib.hc_rt_launch_kernel.restype = None
+    # Bench variant: same kernel-launch signature as `hc_rt_launch_kernel`,
+    # plus a `size_t n_inner` and a `uint64_t` elapsed-ns return. Mirrored
+    # here so ctypes consumers (and the test below) can resolve the symbol
+    # without rediscovering the C ABI shape.
+    lib.hc_rt_launch_kernel_repeat.argtypes = [
+        ctypes.c_void_p,  # stream
+        ctypes.c_void_p,  # function
+        ctypes.c_int,  # shared_memory_bytes
+        ctypes.c_int,  # grid_x
+        ctypes.c_int,  # grid_y
+        ctypes.c_int,  # grid_z
+        ctypes.c_int,  # block_x
+        ctypes.c_int,  # block_y
+        ctypes.c_int,  # block_z
+        ctypes.c_int,  # cluster_x
+        ctypes.c_int,  # cluster_y
+        ctypes.c_int,  # cluster_z
+        ctypes.POINTER(ctypes.c_void_p),  # args
+        ctypes.c_int,  # num_args
+        ctypes.c_size_t,  # n_inner
+    ]
+    lib.hc_rt_launch_kernel_repeat.restype = ctypes.c_uint64
     return lib
 
 
@@ -127,10 +150,12 @@ def test_hip_runtime_loads_in_subprocess_without_rocm(
     no libamdhip64.so on the system. We run in a subprocess with
     LD_LIBRARY_PATH cleared so any locally installed ROCm can't hide a
     misconfiguration."""
+    # Symbol list mirrors `_SYMBOLS` — keep them in sync via the module
+    # constant so a new entry only has to be added in one place.
     script = (
-        "import ctypes, sys\n"
+        "import ctypes\n"
         f"lib = ctypes.CDLL({str(hip_runtime_path)!r})\n"
-        "for name in ('hc_rt_init', 'hc_rt_load_kernel', 'hc_rt_launch_kernel'):\n"
+        f"for name in {_SYMBOLS!r}:\n"
         "    getattr(lib, name)\n"
         "print('ok')\n"
     )

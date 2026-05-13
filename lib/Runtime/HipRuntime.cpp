@@ -8,8 +8,10 @@
 
 #include "hc/Runtime/HipRuntime.h"
 
+#include "hc/Runtime/ClockNs.h"
 #include "hc/Runtime/HipTypes.h"
 
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -34,6 +36,7 @@ hipGetErrorString_t g_hipGetErrorString = nullptr;
 hipModuleUnload_t g_hipModuleUnload = nullptr;
 hipModuleLoadData_t g_hipModuleLoadData = nullptr;
 hipModuleGetFunction_t g_hipModuleGetFunction = nullptr;
+hipStreamSynchronize_t g_hipStreamSynchronize = nullptr;
 
 static void *symbolOrNull(ModuleHandle module, const char *name) {
 #if defined(__linux__)
@@ -86,12 +89,14 @@ extern "C" void hc_rt_init() {
   // threw mid-bind) re-runs cleanly.
   static std::mutex init_mutex;
   if (g_hipModuleLaunchKernel && g_hipGetErrorName && g_hipGetErrorString &&
-      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction)
+      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction &&
+      g_hipStreamSynchronize)
     return;
 
   std::lock_guard<std::mutex> guard(init_mutex);
   if (g_hipModuleLaunchKernel && g_hipGetErrorName && g_hipGetErrorString &&
-      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction)
+      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction &&
+      g_hipStreamSynchronize)
     return;
 
 #if defined(__linux__)
@@ -115,6 +120,13 @@ extern "C" void hc_rt_init() {
       requireSymbol<hipModuleLoadData_t>(module, "hipModuleLoadData");
   g_hipModuleGetFunction =
       requireSymbol<hipModuleGetFunction_t>(module, "hipModuleGetFunction");
+  // Mandatory: the bench-path `hc_rt_launch_kernel_repeat` needs it for
+  // the trailing sync, and any HIP install we'd care about exports it.
+  // Listing as mandatory here (rather than lazy on first bench call) keeps
+  // the failure mode consistent — either `hc_rt_init` succeeds and the
+  // whole ABI is callable, or it throws.
+  g_hipStreamSynchronize =
+      requireSymbol<hipStreamSynchronize_t>(module, "hipStreamSynchronize");
 
   // Optional — older HIPs predate `hipDrvLaunchKernelEx`. We only need
   // it on the cluster-launch path; missing here is reported lazily.
@@ -153,17 +165,26 @@ extern "C" void *hc_rt_load_kernel(void * /*stream*/,
   return function;
 }
 
-extern "C" void hc_rt_launch_kernel(void *stream, void *function,
-                                    int shared_memory_bytes, int grid_x,
-                                    int grid_y, int grid_z, int block_x,
-                                    int block_y, int block_z, int cluster_x,
-                                    int cluster_y, int cluster_z, void **args,
-                                    int /*num_args*/) {
+namespace {
+
+// One iteration's worth of launch dispatch, shared by the single-shot
+// `hc_rt_launch_kernel` and the bench-loop `hc_rt_launch_kernel_repeat`.
+// Kept as a TU-local helper rather than a header-inlined function so the
+// cluster fork only exists in one place and can't drift between the two
+// public entries. `errorPrefix` flows into HIP error messages so the
+// `runtime_error` text correctly names whichever entry the caller
+// reached us through.
+static void launchKernelOnce(void *stream, void *function,
+                             int shared_memory_bytes, int grid_x, int grid_y,
+                             int grid_z, int block_x, int block_y, int block_z,
+                             int cluster_x, int cluster_y, int cluster_z,
+                             void **args, const char *errorPrefix) {
   if (cluster_x * cluster_y * cluster_z > 1) {
     if (!g_hipDrvLaunchKernelEx)
       throw std::runtime_error(
-          "hc_rt_launch_kernel: cluster launch requested but the loaded "
-          "libamdhip64.so does not export hipDrvLaunchKernelEx");
+          std::string(errorPrefix) +
+          ": cluster launch requested but the loaded libamdhip64.so does not "
+          "export hipDrvLaunchKernelEx");
 
     hipLaunchAttribute attrs[1] = {};
     attrs[0].id = hipLaunchAttributeClusterDimension;
@@ -193,4 +214,42 @@ extern "C" void hc_rt_launch_kernel(void *stream, void *function,
       static_cast<unsigned>(grid_z), static_cast<unsigned>(block_x),
       static_cast<unsigned>(block_y), static_cast<unsigned>(block_z),
       static_cast<unsigned>(shared_memory_bytes), stream, args, nullptr));
+}
+
+} // namespace
+
+extern "C" void hc_rt_launch_kernel(void *stream, void *function,
+                                    int shared_memory_bytes, int grid_x,
+                                    int grid_y, int grid_z, int block_x,
+                                    int block_y, int block_z, int cluster_x,
+                                    int cluster_y, int cluster_z, void **args,
+                                    int /*num_args*/) {
+  launchKernelOnce(stream, function, shared_memory_bytes, grid_x, grid_y,
+                   grid_z, block_x, block_y, block_z, cluster_x, cluster_y,
+                   cluster_z, args, "hc_rt_launch_kernel");
+}
+
+extern "C" uint64_t
+hc_rt_launch_kernel_repeat(void *stream, void *function,
+                           int shared_memory_bytes, int grid_x, int grid_y,
+                           int grid_z, int block_x, int block_y, int block_z,
+                           int cluster_x, int cluster_y, int cluster_z,
+                           void **args, int /*num_args*/, size_t n_inner) {
+  // Bracket covers the inner launch loop AND the final stream sync.
+  // Picking the bracket here (rather than letting the caller wrap us)
+  // keeps the timer inside the same TU as the HIP calls and avoids a
+  // language-boundary crossing inside the sample window — the caller
+  // outer benchmark loop only does `samples[i] = repeat(...)`.
+  uint64_t start_ns = hc_clock_now_ns();
+  for (size_t i = 0; i < n_inner; ++i) {
+    launchKernelOnce(stream, function, shared_memory_bytes, grid_x, grid_y,
+                     grid_z, block_x, block_y, block_z, cluster_x, cluster_y,
+                     cluster_z, args, "hc_rt_launch_kernel_repeat");
+  }
+  // `hipStreamSynchronize(NULL)` syncs the default stream; same semantics
+  // the caller would get from passing `stream=None` through the rest of
+  // our launch surface, so no special-case for the n_inner==0 path.
+  HC_HIP_CHECK(g_hipStreamSynchronize(static_cast<hipStream_t>(stream)));
+  uint64_t end_ns = hc_clock_now_ns();
+  return hc_clock_diff_ns(start_ns, end_ns);
 }

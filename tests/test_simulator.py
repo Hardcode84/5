@@ -33,6 +33,29 @@ _INVALID_VECTOR_LAYOUT = index_map(
     offset=lambda i, n: 0,
 )
 
+# Selector-bearing layout: each lane owns `n` contiguous slots; the
+# accessor at `i` for a given `lane` lives at `lane * n + i`. The
+# resolve-time probe uses the all-zero selector tuple, so the recorded
+# storage_size is per-selector-tuple (one lane's slice).
+_PER_LANE_VECTOR_LAYOUT = index_map(
+    storage_size=lambda n: n,
+    offset=lambda i, lane, n: lane * n + i,
+)
+
+# Selector layout whose offset overshoots storage at the zero-selector
+# probe — offset 2 lands outside `[0, storage_size=2)` for shape (4,).
+_SELECTOR_OOB_LAYOUT = index_map(
+    storage_size=lambda n: n // 2,
+    offset=lambda i, lane, n: lane + i,
+)
+
+# Selector layout that collapses every logical index onto offset 0 at the
+# zero-selector probe; per-selector-tuple injectivity fires.
+_SELECTOR_NON_INJECTIVE_LAYOUT = index_map(
+    storage_size=lambda n: n,
+    offset=lambda i, lane, n: lane,
+)
+
 _EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
     [
         [1, 3],
@@ -445,6 +468,59 @@ def test_invalid_layout_is_rejected() -> None:
 
     with pytest.raises(sim.SimulatorError, match="injective"):
         as_layout(vec, layout=_INVALID_VECTOR_LAYOUT)
+
+
+def test_resolve_layout_records_selector_arity() -> None:
+    resolved = resolve_layout(_PER_LANE_VECTOR_LAYOUT, (3,))
+    assert resolved is not None
+    assert resolved.selector_arity == 1
+    # storage_size stays per-selector-tuple (one lane's slice), unlike the
+    # global logical_size = 3 the non-selector validator would demand.
+    assert resolved.storage_size == 3
+    assert resolved.shape == (3,)
+
+
+def test_as_layout_accepts_selector_bearing_layout() -> None:
+    vec = sim.SimVector(
+        np.array([1, 2, 3], dtype=np.int64),
+        np.array([True, True, True]),
+    )
+
+    relaid = as_layout(vec, layout=_PER_LANE_VECTOR_LAYOUT)
+
+    assert relaid.layout is not None
+    assert relaid.layout.selector_arity == 1
+    # Payload stays logical; selectors don't reshape simulator storage.
+    assert relaid[0] == 1
+    assert relaid[2] == 3
+
+
+def test_selector_layout_offset_out_of_bounds_rejected() -> None:
+    vec = sim.SimVector(
+        np.array([1, 2, 3, 4], dtype=np.int64),
+        np.array([True, True, True, True]),
+    )
+
+    with pytest.raises(sim.SimulatorError, match="out of bounds"):
+        as_layout(vec, layout=_SELECTOR_OOB_LAYOUT)
+
+
+def test_selector_layout_non_injective_at_zero_probe_rejected() -> None:
+    vec = sim.SimVector(
+        np.array([1, 2, 3], dtype=np.int64),
+        np.array([True, True, True]),
+    )
+
+    with pytest.raises(sim.SimulatorError, match="per selector tuple"):
+        as_layout(vec, layout=_SELECTOR_NON_INJECTIVE_LAYOUT)
+
+
+def test_resolve_layout_rejects_shape_rank_mismatch() -> None:
+    # `storage_size` takes one shape sym, so any non-rank-1 value is a
+    # contract violation that resolve_layout should diagnose by name
+    # rather than by an opaque TypeError from inside the lambda.
+    with pytest.raises(sim.SimulatorError, match="rank"):
+        resolve_layout(_PER_LANE_VECTOR_LAYOUT, (2, 3))
 
 
 def test_masked_load_respects_mask_value_and_mask_activity() -> None:

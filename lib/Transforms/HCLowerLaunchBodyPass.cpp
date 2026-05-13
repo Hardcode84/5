@@ -1779,6 +1779,55 @@ static FailureOr<SmallVector<int64_t>> shapedResultShape(Type type) {
   return failure();
 }
 
+struct ConvertMaskFromSizesOp : public OpConversionPattern<HCMaskFromSizesOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCMaskFromSizesOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = typeConverter->convertType(op.getMask().getType());
+    if (!converted)
+      return failure();
+
+    // The `shape` attribute holds the original multi-dim mask shape — that's
+    // what `vector.create_mask` wants. The result type may have been
+    // retyped to 1D by `hc-flatten-with-layouts`; we'll bridge to it after
+    // building the multi-dim vector.
+    SmallVector<int64_t> shape(op.getShape());
+    if (shape.size() != adaptor.getSizes().size())
+      return op.emitOpError(
+          "sizes / shape arity mismatch survived to conversion");
+    mlir::VectorType maskVectorType =
+        mlir::VectorType::get(shape, rewriter.getI1Type());
+    Value mask = vector::CreateMaskOp::create(
+        rewriter, op.getLoc(), maskVectorType, adaptor.getSizes());
+
+    // Lane path: post-flatten the converted type is a 1D `vector<Nxi1>`;
+    // pre-flatten it still matches the multi-dim `maskVectorType`. Bridge
+    // with `vector.shape_cast` whenever the shapes differ — the element
+    // count is preserved by construction (`prod(shape) == N`).
+    if (auto convVector = dyn_cast<mlir::VectorType>(converted)) {
+      if (mask.getType() != convVector)
+        mask =
+            vector::ShapeCastOp::create(rewriter, op.getLoc(), convVector, mask)
+                .getResult();
+      rewriter.replaceOp(op, mask);
+      return success();
+    }
+
+    // LDS path: spill the multi-dim mask vector into a flat workgroup ptr.
+    // `writeVectorToWorkgroupPtr` walks lex order and stores one element per
+    // lane offset, so the multi-dim vector layout matches the flat ptr's
+    // element ordering without an intermediate `shape_cast`.
+    FailureOr<Value> result =
+        materializeShapedResult(rewriter, op.getLoc(), converted, mask, shape);
+    if (failed(result))
+      return failure();
+    rewriter.replaceOp(op, *result);
+    return success();
+  }
+};
+
 struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
   using Base::Base;
 
@@ -2537,7 +2586,7 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertCmpOp<HCCmpGeOp>, ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>,
       ConvertCastOp, ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
       ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
-      ConvertLoadMaskOp, ConvertFullMaskOp,
+      ConvertLoadMaskOp, ConvertMaskFromSizesOp, ConvertFullMaskOp,
       ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
       ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
       ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
@@ -2590,13 +2639,13 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
-  target.addIllegalOp<HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp,
-                      HCMulOp, HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp,
-                      HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp,
-                      HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
-                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
-                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
+  target.addIllegalOp<
+      HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp, HCMulOp,
+      HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
+      HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp,
+      HCLoadMaskOp, HCMaskFromSizesOp, HCBufferViewOp, HCVecOp, HCVZerosOp,
+      HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp,
+      HCEmptyOp, HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

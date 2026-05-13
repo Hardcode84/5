@@ -193,6 +193,21 @@ public:
     return info;
   }
 
+  // Build from a bare `DictionaryAttr` that already carries the
+  // ref-shaped payload — used for parameter-side sub-dicts (e.g. the
+  // captured `layout=` payload on an `hc_front.kernel` parameter
+  // entry) that share the body-level ref schema but don't live on a
+  // dedicated op of their own.
+  static RefInfo fromDict(DictionaryAttr dict) {
+    RefInfo info;
+    info.dict_ = dict;
+    if (dict) {
+      if (auto k = dict.getAs<StringAttr>("kind"))
+        info.kind_ = k.getValue();
+    }
+    return info;
+  }
+
   // True iff a `ref` dict was present on the op.
   explicit operator bool() const { return static_cast<bool>(dict_); }
 
@@ -1067,13 +1082,22 @@ parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
   if (failed(shape))
     return failure();
   // Buffer args carry the default fully-strided np/torch layout from
-  // the boundary on. Per-axis stride symbols are namespaced by the
-  // arg name so two buffers with the same shape don't share strides;
-  // the host wrapper binds them at launch. We also extend
-  // `kernel.bound_symbols` below to include the layout's free
-  // symbols so downstream passes know to leave them unmaterialized.
-  FailureOr<LayoutAttr> layout =
-      buildDefaultStridedBufferLayout(sourceOp, name.getValue(), *shape);
+  // the boundary on unless the Python frontend captured an explicit
+  // `IndexMap` on the annotation (e.g. `Buffer[M, N, dtype, A_LAYOUT]`),
+  // in which case the parameter dict carries a `layout` sub-dict in the
+  // same shape as a body-level `kind = "layout"` ref. Per-axis stride
+  // symbols on the default-strided path are namespaced by the arg name
+  // so two buffers with the same shape don't share strides; the host
+  // wrapper binds them at launch. `appendLayoutBoundSymbols` (called
+  // further down) picks up either layout's free symbols and extends
+  // `kernel.bound_symbols` so downstream passes know to leave them
+  // unmaterialized.
+  FailureOr<LayoutAttr> layout;
+  if (auto layoutDict = param.getAs<DictionaryAttr>("layout")) {
+    layout = layoutAttrFromRef(sourceOp, RefInfo::fromDict(layoutDict));
+  } else {
+    layout = buildDefaultStridedBufferLayout(sourceOp, name.getValue(), *shape);
+  }
   if (failed(layout))
     return failure();
   return Type(BufferType::get(ctx, elementType, *shape, *layout));

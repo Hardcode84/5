@@ -6,6 +6,7 @@ add_mlir_library(MLIRHCTransforms
   HCCanonicalizeLayoutsPass.cpp
   HCDecomposeShapedValuesPass.cpp
   HCElementwiseToGenericPass.cpp
+  HCEmitBenchWrapperPass.cpp
   HCFlattenWithLayoutsPass.cpp
   HCFoldPredicatesPass.cpp
   HCInferGenericBoundsPass.cpp

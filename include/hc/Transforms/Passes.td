@@ -772,6 +772,47 @@ def HCLowerLaunchFuncToRuntime
   ];
 }
 
+def HCEmitBenchWrapper
+    : Pass<"hc-emit-bench-wrapper", "::mlir::ModuleOp"> {
+  let summary = "Mint an i64-returning `wrapper_bench` sibling per host wrapper "
+                "that calls hc_rt_launch_kernel_repeat for benchmarking.";
+  let description = [{
+    Runs after `-hc-lower-launch-func-to-runtime`, on the lowered LLVM
+    IR. For each `llvm.func` that calls `hc_rt_launch_kernel` exactly
+    once (the host wrapper shape `hc-lower-kernels-to-gpu-launch` /
+    `hc-lower-launch-func-to-runtime` lays down), clones the function
+    into a sibling `<name>_bench` with:
+
+      * a trailing `i64 %n_inner` block argument appended to the
+        original parameter list,
+      * `i64` return type instead of `void`,
+      * the `hc_rt_launch_kernel` callsite rewritten to
+        `hc_rt_launch_kernel_repeat` with `%n_inner` threaded as the
+        new trailing argument,
+      * the function's `llvm.return` replaced with `llvm.return
+        %elapsed : i64` where `%elapsed` is the repeat call's result.
+
+    Per-callsite `<kernel>_data` / `<kernel>_handle` / `<kernel>` name
+    globals are reused via symbol reference — the cloned `llvm.addressof`
+    ops point at the same symbols as the original wrapper's, so the
+    first `hc_rt_load_kernel` from either wrapper warms the shared
+    `hipFunction_t` cache slot for both paths.
+
+    Idempotent: functions whose symbol name already ends in `_bench`
+    are skipped, so a second invocation of the pass is a no-op. Host
+    wrappers that do not contain an `hc_rt_launch_kernel` call (the
+    runtime decl itself, the helper unpackers, externs) are likewise
+    skipped — only the launch-bearing wrappers get a bench sibling.
+
+    Default off; `hc.compile(bench=True)` flips the `__HC_BENCH__`
+    placeholder in `_GPU_LOWERING_PIPELINE` to splice this pass into
+    the chain right before `symbol-dce`. With `bench=False` the
+    placeholder is empty and the post-pipeline LLVM IR is
+    byte-identical to today.
+  }];
+  let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
+}
+
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";

@@ -128,6 +128,16 @@ _DUMP_DIR_ENV = "HC_DUMP_DIR"
 _FEATURES_PLACEHOLDER = "__HC_FEATURES__"
 _FEATURES_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
+# Optional `hc-emit-bench-wrapper` slot in `_GPU_LOWERING_PIPELINE`.
+# Substituted Python-side from the `bench=` kwarg threaded through
+# `run_front_to_hc` (and, eventually, `hc.compile`). Default-empty so
+# the post-pipeline LLVM IR for `bench=False` is byte-identical to the
+# pre-bench shape; `bench=True` expands the placeholder to the pass
+# spelling plus a trailing comma so the splice lands cleanly between
+# `hc-lower-launch-func-to-runtime` and `symbol-dce`.
+_BENCH_PLACEHOLDER = "__HC_BENCH__"
+_BENCH_PASS_FRAGMENT = "hc-emit-bench-wrapper,"
+
 # Device-side lowering chain appended after the user's schedule fires.
 #
 # `convert-gpu-to-rocdl` is `Pass<"convert-gpu-to-rocdl", "gpu::GPUModuleOp">`
@@ -179,7 +189,15 @@ _GPU_LOWERING_PIPELINE = (
     # for every payload regardless of whether the kernel ended up
     # using them (`hc_get_int64`, `hc_get_float64` are the usual
     # culprits).
+    # `hc-emit-bench-wrapper` mints an i64-returning `<wrapper>_bench`
+    # sibling per host wrapper, calling `hc_rt_launch_kernel_repeat` for
+    # tight-loop benchmarking. Opt-in via the `__HC_BENCH__` placeholder
+    # (driven by `bench=True`); empty by default so today's bench=False
+    # payload is byte-identical. Wired before `symbol-dce` so the new
+    # symbol is visible when the JIT consumer (`compiled.bench()`)
+    # looks it up.
     "hc-lower-launch-func-to-runtime,"
+    f"{_BENCH_PLACEHOLDER}"
     "symbol-dce"
 )
 
@@ -215,6 +233,7 @@ def run_front_to_hc(
     *,
     schedule: ScheduleSource = None,
     target: str | None = None,
+    bench: bool = False,
 ) -> PipelineResult:
     """Run the hc_front -> hc transform schedule on a parsed front module.
 
@@ -251,6 +270,11 @@ def run_front_to_hc(
     propagates the resolved path through the pass's `--lld-path=`
     option, so `hc.compile` is self-contained and doesn't lean on the
     environment to find the linker.
+
+    `bench=True` splices `-hc-emit-bench-wrapper` into the GPU lowering
+    chain so each host wrapper gets an i64-returning `<wrapper>_bench`
+    sibling driven by `hc_rt_launch_kernel_repeat`. Default `False`
+    leaves the IR byte-identical to the pre-bench shape.
     """
 
     from .mlir import ir
@@ -271,7 +295,7 @@ def run_front_to_hc(
         _schedule_file(schedule, target=target, context=context) as schedule_path,
         context.attach_diagnostic_handler(capture),
     ):
-        pipeline = _pipeline_string(schedule_path, target=target)
+        pipeline = _pipeline_string(schedule_path, target=target, bench=bench)
         try:
             pm = _build_pass_manager(pipeline, context)
             pm.run(front_module.operation)
@@ -328,7 +352,9 @@ def _ensure_passes_registered() -> None:
     _passes_registered = True
 
 
-def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
+def _pipeline_string(
+    schedule_path: Path, *, target: str | None, bench: bool = False
+) -> str:
     # Two-stage pipeline:
     #   1) `transform-preload-library` + `transform-interpreter` runs the
     #      user-or-default schedule (front-to-hc lowering, layout
@@ -347,6 +373,7 @@ def _pipeline_string(schedule_path: Path, *, target: str | None) -> str:
     gpu_lowering = _substitute_chip(_GPU_LOWERING_PIPELINE, target)
     gpu_lowering = _substitute_lld(gpu_lowering)
     gpu_lowering = _substitute_dump_dir(gpu_lowering)
+    gpu_lowering = _substitute_bench(gpu_lowering, bench=bench)
     return (
         "builtin.module("
         f"transform-preload-library{{transform-library-paths={schedule_path}}},"
@@ -503,6 +530,15 @@ def _substitute_lld(text: str) -> str:
     # naming the missing path, which is more actionable than a Python
     # IO error from this layer.
     return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
+
+
+def _substitute_bench(text: str, *, bench: bool) -> str:
+    # `bench=False` collapses the placeholder to empty so the surrounding
+    # `prev_pass,_BENCH_PLACEHOLDER_next_pass` template flattens to
+    # `prev_pass,next_pass` (no double comma, no empty pass slot). The
+    # `True` form supplies its own trailing comma — keeps the splice as a
+    # single replace rather than two coordinated substitutions.
+    return text.replace(_BENCH_PLACEHOLDER, _BENCH_PASS_FRAGMENT if bench else "")
 
 
 def _substitute_dump_dir(text: str) -> str:

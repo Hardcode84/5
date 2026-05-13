@@ -333,6 +333,30 @@ mlir::hc::sym::composePredCmp(Store &store, ExprHandle lhsHandle, PredCmpOp op,
                     diagnostic, "failed to compose hc.pred");
 }
 
+mlir::FailureOr<PredHandle>
+mlir::hc::sym::composePredAnd(Store &store, PredHandle lhsHandle,
+                              PredHandle rhsHandle, std::string *diagnostic) {
+  Session session(store);
+  ixs_node *lhs = importNode(session, lhsHandle.raw(), diagnostic, "hc.pred");
+  ixs_node *rhs = importNode(session, rhsHandle.raw(), diagnostic, "hc.pred");
+  if (!lhs || !rhs)
+    return failure();
+  return finishPred(session.raw(), ixs_and(session.raw(), lhs, rhs), diagnostic,
+                    "failed to compose hc.pred AND");
+}
+
+mlir::FailureOr<PredHandle>
+mlir::hc::sym::composePredOr(Store &store, PredHandle lhsHandle,
+                             PredHandle rhsHandle, std::string *diagnostic) {
+  Session session(store);
+  ixs_node *lhs = importNode(session, lhsHandle.raw(), diagnostic, "hc.pred");
+  ixs_node *rhs = importNode(session, rhsHandle.raw(), diagnostic, "hc.pred");
+  if (!lhs || !rhs)
+    return failure();
+  return finishPred(session.raw(), ixs_or(session.raw(), lhs, rhs), diagnostic,
+                    "failed to compose hc.pred OR");
+}
+
 std::optional<int64_t> mlir::hc::sym::getIntegerLiteralValue(ExprHandle value) {
   const ixs_node *node = value.raw();
   if (!node)

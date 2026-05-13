@@ -134,6 +134,17 @@ mlir::FailureOr<ExprHandle> composeExprInt(Store &store, int64_t value,
 mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
                                            PredCmpOp op, ExprHandle rhs,
                                            std::string *diagnostic = nullptr);
+/// Conjunction / disjunction of two predicates. Constructs the
+/// canonical hash-consed AND / OR node so combinators built by the
+/// rewriters (per-axis bounds conjunctions on the `hc.load_mask`
+/// emitter, future OOB-tile guard chains) share storage with any
+/// other identical conjunction elsewhere in the IR.
+mlir::FailureOr<PredHandle> composePredAnd(Store &store, PredHandle lhs,
+                                           PredHandle rhs,
+                                           std::string *diagnostic = nullptr);
+mlir::FailureOr<PredHandle> composePredOr(Store &store, PredHandle lhs,
+                                          PredHandle rhs,
+                                          std::string *diagnostic = nullptr);
 
 /// Returns the integer payload when an expression is structurally integral:
 /// an ixs integer node, or a rational node with unit denominator. Does not

@@ -592,6 +592,41 @@ def HCNormalizeScopeRegions
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerLoadMask : Pass<"hc-lower-load-mask"> {
+  let summary = "Lower hc.load_mask to hc.mask_from_sizes using per-axis "
+                "bounds from the multi-dim source.";
+  let description = [{
+    Pre-flatten lowering of `hc.load_mask`. For each op whose source
+    resolves to the multi-dim kernel-arg `(ptr, dims..., strides...)`
+    UCC bundle planted by `hc-lower-kernels-to-gpu-launch` (or to a
+    workgroup-staged bare tensor whose static shape supplies the
+    extents), we walk the per-axis slice subscripts, compute the
+    in-bounds size for each slice axis as `ceildiv(extent - lower, step)`
+    (or `extent - lower` for unit stride), and plant an
+    `hc.mask_from_sizes` op carrying those sizes as Index-typed
+    operands.
+
+    The whole point is to snapshot per-axis bounds while the
+    multi-dim source / per-axis indices are still visible.
+    `hc-flatten-with-layouts` would otherwise compose every per-axis
+    offset into a single 1D `#hc.expr` and re-derive the size from a
+    rank-1 kernel-arg view whose dim is a placeholder zero — that fold
+    used to drive `vector.create_mask` with `extent=0`, clamping every
+    mask to all-false and silently zeroing the kernel's stores. By
+    fixing the size eagerly here, the post-flatten lowering is free to
+    just plumb the operand through `vector.create_mask` without
+    revisiting the source shape.
+
+    Pass is a no-op on `hc.load_mask` ops whose source doesn't resolve
+    to a kernel-arg bundle or a static bare-tensor shape — those still
+    flow through `hc-lower-launch-body`'s direct `hc.load_mask` handler.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCLowerKernelsToGPULaunch
     : Pass<"hc-lower-kernels-to-gpu-launch"> {
   let summary = "Wrap HC kernels in upstream GPU launch operations.";

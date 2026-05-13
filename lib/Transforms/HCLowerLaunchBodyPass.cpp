@@ -2639,13 +2639,25 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
-  target.addIllegalOp<
-      HCIdxApplyOp, HCPredApplyOp, HCConstOp, HCAddOp, HCSubOp, HCMulOp,
-      HCDivOp, HCModOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
-      HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp,
-      HCLoadMaskOp, HCMaskFromSizesOp, HCBufferViewOp, HCVecOp, HCVZerosOp,
-      HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp,
-      HCEmptyOp, HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
+  target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
+                      HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
+                      HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp, HCLoadOp,
+                      HCVLoadOp, HCLoadMaskOp, HCMaskFromSizesOp,
+                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
+                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
+                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
+  // `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are
+  // left alone for the second invocation of this pass to consume —
+  // their iter-sym free names get explicit per-lane bindings only after
+  // `hc-lower-generic` unrolls the generic. The two-pass dance matches
+  // `hc.yield` above: bodily resident, materialised later. Outside the
+  // body (kernel-scope offset emission, ambient-binding helpers from
+  // earlier passes) the ops are illegal and lower here.
+  auto applyLegalInsideGeneric = [](Operation *op) {
+    return op->getParentOfType<HCGenericOp>() != nullptr;
+  };
+  target.addDynamicallyLegalOp<HCIdxApplyOp>(applyLegalInsideGeneric);
+  target.addDynamicallyLegalOp<HCPredApplyOp>(applyLegalInsideGeneric);
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
     std::optional<FunctionType> fnType = op.getFunctionType();
     if (!fnType)

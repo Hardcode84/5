@@ -1661,6 +1661,58 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
     };
     walkOffsets(newInsOffsets);
     walkOffsets(newOutsOffsets);
+    // Body `hc.idx_apply` / `hc.pred_apply` ops can reference ambient
+    // syms directly (post-flatten, the body authoring convention is
+    // that any sym not on the apply's `symbols` list is either an iter
+    // sym scoped to the body or an ambient sym the surrounding
+    // `hc.generic` is responsible for plumbing). Pick those up too so
+    // `hc-lower-generic` can seed the per-lane scope from
+    // `ambient_idxs` and the second `hc-lower-launch-body` invocation
+    // finds bindings for them via `seedAmbientScope` inside the
+    // unrolled body. The `hc.load_mask` rewrite in
+    // `hc-load-store-to-generic` is today the only emitter that puts
+    // ambient-referencing applies inside the body (its predicate is
+    // `(lo + step*i_k) < D_k` with `lo` / `D_k` being kernel-arg or
+    // launch-geometry syms) — extending the walk now keeps the
+    // contract general.
+    auto collectFreeNames =
+        [&](ArrayAttr existing,
+            llvm::function_ref<void(llvm::function_ref<void(StringRef)>)>
+                walker) {
+          llvm::StringSet<> already;
+          for (Attribute n : existing)
+            already.insert(cast<StringAttr>(n).getValue());
+          walker([&](StringRef name) {
+            if (already.contains(name))
+              return;
+            if (iterSymSet.contains(name))
+              return;
+            ambientNeeded.insert(name);
+          });
+        };
+    auto walkBodyApplies = [&](Block &body) {
+      for (Operation &nested : body) {
+        if (auto idx = dyn_cast<HCIdxApplyOp>(&nested)) {
+          auto idxTy = dyn_cast<IdxType>(idx.getResult().getType());
+          if (idxTy && idxTy.getExpr())
+            collectFreeNames(idx.getSymbolsAttr(),
+                             [&](llvm::function_ref<void(StringRef)> cb) {
+                               sym::walkSymbolNames(idxTy.getExpr().getValue(),
+                                                    cb);
+                             });
+        } else if (auto predOp = dyn_cast<HCPredApplyOp>(&nested)) {
+          auto predTy = dyn_cast<PredType>(predOp.getResult().getType());
+          if (predTy && predTy.getPred())
+            collectFreeNames(predOp.getSymbolsAttr(),
+                             [&](llvm::function_ref<void(StringRef)> cb) {
+                               sym::walkSymbolNames(predTy.getPred().getValue(),
+                                                    cb);
+                             });
+        }
+      }
+    };
+    if (!op.getBody().empty())
+      walkBodyApplies(op.getBody().front());
     // Carry over any ambient bindings the source op already had — the
     // pre-flatten emitters may have left them empty, but if a prior
     // pass populated them we don't want to drop the SSA edge silently.

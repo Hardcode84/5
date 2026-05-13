@@ -1558,8 +1558,19 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
         Value addr =
             HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
                 .getResult();
-        insVals[ii] =
+        Value loaded =
             HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
+        // `bare_tensor` ins with a non-builtin element type (e.g.
+        // `!hc.pred`) ride through workgroup LDS as their builtin
+        // surrogate (`i1`). The body's block arg keeps the symbolic
+        // type, so bridge back through a UCC before substitution —
+        // mirrors the value-ins lane in `lowerValueOuts`.
+        Type bodyArgTy = op.getBody().front().getArgument(ii).getType();
+        if (loaded.getType() != bodyArgTy)
+          loaded = UnrealizedConversionCastOp::create(builder, loc, bodyArgTy,
+                                                      loaded)
+                       .getResult(0);
+        insVals[ii] = loaded;
       }
 
       // `outsPtrs` was set up above the chunk loop (direct ptr outs
@@ -1576,16 +1587,33 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
         Value addr =
             HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
                 .getResult();
-        outsVals[oi] =
+        Value loaded =
             HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult();
+        // Same coercion as the ins side: outs block args are the
+        // operand's symbolic element type, the LDS store is the
+        // builtin surrogate. UCC bridges the gap.
+        Type bodyArgTy =
+            op.getBody().front().getArgument(op.getIns().size() + oi).getType();
+        if (loaded.getType() != bodyArgTy)
+          loaded = UnrealizedConversionCastOp::create(builder, loc, bodyArgTy,
+                                                      loaded)
+                       .getResult(0);
+        outsVals[oi] = loaded;
       }
 
       SmallVector<Value> yielded;
-      // Reduction-collective path doesn't expose iter-sym SSA bindings
-      // to the body — same rationale as the partition path above.
-      llvm::StringMap<Value> emptyIterScope;
-      if (failed(cloneBody(builder, op, insVals, outsVals, emptyIterScope,
-                           yielded))) {
+      // Hand the chunk's iter-sym SSA bindings to `cloneBody` so any
+      // body `hc.pred_apply` / `hc.idx_apply` that references the loop's
+      // iter syms (e.g. the `hc.load_mask` rewrite plants a single
+      // pred_apply with the conjunction predicate referring to `i_0` /
+      // `i_1` as free symbols) gets explicit-operand bindings before
+      // the second `hc-lower-launch-body` invocation lowers it. The
+      // `scope` map already mixes ambient and iter sym SSA per the
+      // offset-emission setup above; `bindIterSymsInClone` only acts on
+      // names the apply's pred/expr actually references and that aren't
+      // already in the apply's `symbols` list, so any unused entries
+      // are harmless.
+      if (failed(cloneBody(builder, op, insVals, outsVals, scope, yielded))) {
         bodyStatus = failure();
       } else if (yielded.size() != op.getOuts().size()) {
         bodyStatus = op.emitOpError("body yielded wrong arity");
@@ -1594,10 +1622,20 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
           ExprAttr origOff = getOperandOffset(outsOff, oi);
           Value off = emitOffset(builder, loc, origOff, scope);
           Value ptr = outsPtrs[oi];
+          Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
           Value addr =
               HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
                   .getResult();
-          HCPtrStoreOp::create(builder, loc, yielded[oi], addr);
+          // Yielded value is in the body's element type (e.g.
+          // `!hc.pred`); the LDS pointer is the builtin surrogate
+          // (e.g. `i1`). UCC at the boundary keeps `hc.ptr_store`'s
+          // verifier happy.
+          Value toStore = yielded[oi];
+          if (toStore.getType() != elemTy)
+            toStore = UnrealizedConversionCastOp::create(builder, loc, elemTy,
+                                                         toStore)
+                          .getResult(0);
+          HCPtrStoreOp::create(builder, loc, toStore, addr);
         }
       }
     }
@@ -1941,7 +1979,16 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
       insVals[ii] = insLanes[ii][lane];
     SmallVector<int, 4> coords =
         decomposeLaneIndex(static_cast<int>(lane), bounds);
-    llvm::StringMap<Value> laneIterScope;
+    // Start from the ambient scope (`$WG*`, `$WI*`, `$WGS*`, kernel-arg
+    // shape syms, ancestor structured-loop induction vars) so body
+    // applies that reference any of those as free symbols get explicit
+    // operand bindings here, and stamp the per-lane iter sym constants
+    // on top to override the zero placeholders `seedAmbientScope` left
+    // behind. The post-flatten second `hc-lower-launch-body` pass
+    // would otherwise have nothing to look these up against once
+    // generic unrolling lifts the body out from under its launch
+    // ancestor walker.
+    llvm::StringMap<Value> laneIterScope = scope;
     for (auto [ax, c] : llvm::zip_equal(axes, coords))
       laneIterScope[ax.name] =
           arith::ConstantIndexOp::create(builder, loc, c).getResult();

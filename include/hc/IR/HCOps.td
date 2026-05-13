@@ -869,6 +869,40 @@ def HCFullMaskOp : HC_Op<"full_mask", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($mask)";
 }
 
+def HCMaskFromSizesOp : HC_Op<"mask_from_sizes", [Pure]> {
+  let summary = "Build a bounds mask from explicit per-axis sizes.";
+  let description = [{
+    A bare-mask carrier shaped like `vector.create_mask`: each operand
+    is the number of leading-true lanes on one axis of the `shape`
+    attribute, in declaration order. `shape` snapshots the multi-dim
+    mask shape at the point the op is planted; the result carrier (which
+    `hc-flatten-with-layouts` will retype from the original multi-dim
+    bare vector / tensor to its 1D storage form) only fixes the total
+    element count, not the per-axis bounds.
+
+    Sits between the pre-flatten and post-flatten worlds.
+    `hc-lower-load-mask` walks `hc.load_mask`'s multi-dim source /
+    per-axis slice subscripts and synthesises one Index value per slice
+    axis, then plants this op in place of the original `hc.load_mask`.
+    `hc-flatten-with-layouts` folds the result shape to 1D without
+    disturbing the Index operands or the multi-dim `shape` attribute;
+    `hc-lower-launch-body` then converts the op to `vector.create_mask` +
+    a bare-vector / bare-tensor materialisation. The lane path inserts a
+    `vector.shape_cast` to bridge the multi-dim mask vector to the
+    converted 1D vector when needed; the LDS path consumes the multi-dim
+    vector directly via the per-element spill loop.
+  }];
+  let arguments = (ins
+    Variadic<Index>:$sizes,
+    DenseI64ArrayAttr:$shape
+  );
+  let results = (outs HC_BareShapedValueType:$mask);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    `(` $sizes `)` `shape` $shape attr-dict `:` type($mask)
+  }];
+}
+
 def HCStoreOp : HC_Op<"store", [MemoryEffects<[MemWrite]>,
                                  AttrSizedOperandSegments]> {
   let summary = "Store a tensor or vector into a buffer or tensor.";

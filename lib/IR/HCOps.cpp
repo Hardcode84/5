@@ -1614,6 +1614,19 @@ LogicalResult HCFullMaskOp::verify() {
   return verifyBarePredicateMask(getOperation(), getMask().getType());
 }
 
+LogicalResult HCMaskFromSizesOp::verify() {
+  if (failed(verifyBarePredicateMask(getOperation(), getMask().getType())))
+    return failure();
+  if (getShape().size() != getSizes().size())
+    return emitOpError("sizes operand count (")
+           << getSizes().size() << ") must match `shape` attribute rank ("
+           << getShape().size() << ")";
+  for (int64_t dim : getShape())
+    if (dim < 0)
+      return emitOpError("`shape` attribute must be non-negative, got ") << dim;
+  return success();
+}
+
 LogicalResult HCStoreOp::verify() {
   Value mask = getMask();
   Type source = getSource().getType();

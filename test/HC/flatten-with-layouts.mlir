@@ -552,32 +552,6 @@ func.func @store_with_mask_composes(
 
 // -----
 
-// `hc.load_mask` rides the same composition path as the data load —
-// same multi-index addressing surface, same per-access offset
-// rewrite. Verified separately because it gets emitted next to
-// `hc.load` post-decompose and would diverge silently if missed.
-// CHECK-LABEL: @load_mask_composes
-// CHECK-SAME: %[[BM:[^:]+]]: !hc.idx<"M">, %[[BN:[^:]+]]: !hc.idx<"N">
-// CHECK-SAME: %[[I:[^:]+]]: !hc.idx<"i">, %[[J:[^:]+]]: !hc.idx<"j">
-// CHECK: %[[OFF:.*]] = hc.idx_apply (%[[BN]] as "N", %[[I]] as "i", %[[J]] as "j")
-// CHECK-SAME: : (!hc.idx<"N">, !hc.idx<"i">, !hc.idx<"j">) -> !hc.idx<"j + N*i">
-// CHECK: hc.load_mask %{{[^[]+}}[%[[OFF]]], shape %{{[^ ]+}} : (!hc.buffer<f32, ["?"]>, !hc.idx<"j + N*i">, tuple<!hc.idx<"M">, !hc.idx<"N">>) -> !hc.bare_tensor<!hc.pred, ["M*N"]>
-func.func @load_mask_composes(
-    %buf: !hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
-    %i: !hc.idx<"i">, %j: !hc.idx<"j">,
-    %m: !hc.idx<"M">, %n: !hc.idx<"N">) {
-  %shape = hc.tuple(%m, %n)
-      : (!hc.idx<"M">, !hc.idx<"N">) -> tuple<!hc.idx<"M">, !hc.idx<"N">>
-  %mask = hc.load_mask %buf[%i, %j], shape %shape
-      : (!hc.buffer<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0 * d1">, offset = #hc.expr<"i0 * d1 + i1">>>,
-         !hc.idx<"i">, !hc.idx<"j">,
-         tuple<!hc.idx<"M">, !hc.idx<"N">>)
-        -> !hc.bare_tensor<!hc.pred, ["M", "N"]>
-  return
-}
-
-// -----
-
 // Indices that aren't pinned (raw `index` value here) leave the access
 // op alone — the rewrite needs a symbolic name to bind to the layout's
 // `index_sym`. The op stays on the multi-index surface and the

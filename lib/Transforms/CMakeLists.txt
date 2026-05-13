@@ -20,7 +20,6 @@ add_mlir_library(MLIRHCTransforms
   HCLowerKernelsToGPULaunchPass.cpp
   HCLowerLaunchBodyPass.cpp
   HCLowerLaunchFuncToRuntimePass.cpp
-  HCLowerLoadMaskPass.cpp
   HCLowerToLLVMPass.cpp
   HCMaterializeBoundExprsPass.cpp
   HCNormalizeScopeRegionsPass.cpp

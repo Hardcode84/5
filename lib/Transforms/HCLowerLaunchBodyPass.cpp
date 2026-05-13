@@ -1635,138 +1635,6 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Helper: probe whether `stride` is the constant 1. Used to decide between
-// `extent - offset` and `ceildiv(extent - offset, stride)` when sizing the
-// mask. (We dropped the `isUnitStride`/`hasNonUnitStrideSlice` helpers
-// elsewhere when the load path stopped routing through `memref.subview`,
-// but the mask sizing still needs the per-axis distinction.)
-static bool maskAxisIsUnitStride(const SliceAxis &axis) {
-  APInt step;
-  return matchPattern(axis.stride, m_ConstantInt(&step)) &&
-         step.getSExtValue() == 1;
-}
-
-struct ConvertLoadMaskOp : public OpConversionPattern<HCLoadMaskOp> {
-  using Base::Base;
-
-  LogicalResult
-  matchAndRewrite(HCLoadMaskOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Type converted = typeConverter->convertType(op.getMask().getType());
-
-    SmallVector<int64_t> maskShape;
-    if (auto resultBareTensor =
-            dyn_cast<BareTensorType>(op.getMask().getType())) {
-      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
-          cast<SymbolicallyShapedTypeInterface>(resultBareTensor));
-      if (failed(dims))
-        return failure();
-      maskShape = std::move(*dims);
-    } else if (auto resultBareVector =
-                   dyn_cast<BareVectorType>(op.getMask().getType())) {
-      FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
-          cast<SymbolicallyShapedTypeInterface>(resultBareVector));
-      if (failed(dims))
-        return failure();
-      maskShape = std::move(*dims);
-    } else {
-      return failure();
-    }
-    mlir::VectorType maskVectorType =
-        mlir::VectorType::get(maskShape, rewriter.getI1Type());
-
-    // Compute slice extents from either a kernel-arg ptr (per-axis dims
-    // ride as UCC inputs) or a workgroup-staged tile (its bare-tensor
-    // shape is statically known).
-    std::optional<KernelArgSource> kernelArg =
-        resolveAccessKernelArg(rewriter, op.getLoc(), adaptor.getSource());
-    Value workgroupPtr;
-    SmallVector<int64_t> sourceStaticShape;
-    if (!kernelArg) {
-      workgroupPtr = sourcePtr(adaptor.getSource());
-      if (!workgroupPtr)
-        return op.emitOpError(
-            "expected mask source to be a kernel-arg ptr or workgroup ptr");
-      auto bare = dyn_cast<BareTensorType>(op.getSource().getType());
-      if (!bare)
-        return op.emitOpError(
-            "workgroup-source mask requires the original source to be a "
-            "bare tensor (the static shape supplies the extents)");
-      FailureOr<SmallVector<int64_t>> dims =
-          staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bare));
-      if (failed(dims))
-        return failure();
-      sourceStaticShape = std::move(*dims);
-    } else if (kernelArg->rank() !=
-               static_cast<unsigned>(adaptor.getIndices().size())) {
-      return op.emitOpError("expected kernel-arg ptr rank to match index rank");
-    }
-
-    SmallVector<SliceAxis> axes;
-    std::optional<SmallVector<SliceAxis>> synthesized;
-    if (kernelArg)
-      synthesized = synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
-                                              adaptor.getIndices(), maskShape);
-    if (synthesized) {
-      axes = std::move(*synthesized);
-    } else {
-      FailureOr<SmallVector<SliceAxis>> collected =
-          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                      /*requireUnitStride=*/false);
-      if (failed(collected))
-        return failure();
-      axes = std::move(*collected);
-    }
-    if (llvm::count_if(axes, [](const SliceAxis &axis) {
-          return axis.isSlice;
-        }) != static_cast<int64_t>(maskShape.size()))
-      return op.emitOpError("mask result rank must match slice subscript rank");
-
-    // The mask size is the count of strided positions that stay in-bounds.
-    // Unit-stride collapses to `extent - offset`; for wider strides the count
-    // becomes `ceildiv(extent - offset, stride)` so e.g. a stride-2 slice into
-    // an 8-row tail of a 24-row buffer reports 4 valid lanes, not 8.
-    // `vector.create_mask` signed-clamps the result to `[0, N]`, so a negative
-    // `extent - offset` (offset past the end) lands on a zero-clamped,
-    // all-false mask without an explicit guard here.
-    SmallVector<Value> maskSizes;
-    for (auto [axis, info] : llvm::enumerate(axes)) {
-      if (!info.isSlice)
-        continue;
-      Value extent;
-      if (kernelArg) {
-        extent = kernelArg->dims[axis];
-      } else {
-        extent = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
-                                                sourceStaticShape[axis])
-                     .getResult();
-      }
-      Value remaining =
-          arith::SubIOp::create(rewriter, op.getLoc(), extent, info.offset);
-      Value size = remaining;
-      if (!maskAxisIsUnitStride(info)) {
-        Value strideMinusOne =
-            arith::SubIOp::create(rewriter, op.getLoc(), info.stride,
-                                  oneIndex(rewriter, op.getLoc()));
-        Value adjusted = arith::AddIOp::create(rewriter, op.getLoc(), remaining,
-                                               strideMinusOne);
-        size = arith::DivSIOp::create(rewriter, op.getLoc(), adjusted,
-                                      info.stride);
-      }
-      maskSizes.push_back(size);
-    }
-
-    Value mask = vector::CreateMaskOp::create(rewriter, op.getLoc(),
-                                              maskVectorType, maskSizes);
-    FailureOr<Value> result = materializeShapedResult(
-        rewriter, op.getLoc(), converted, mask, maskShape);
-    if (failed(result))
-      return failure();
-    rewriter.replaceOp(op, *result);
-    return success();
-  }
-};
-
 // Static shape from the original BareTensor or BareVector result type — used
 // to drive per-element materialization for the LDS path. Returns failure
 // for any type the converter wouldn't have produced a vector or workgroup
@@ -1778,55 +1646,6 @@ static FailureOr<SmallVector<int64_t>> shapedResultShape(Type type) {
     return staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bv));
   return failure();
 }
-
-struct ConvertMaskFromSizesOp : public OpConversionPattern<HCMaskFromSizesOp> {
-  using Base::Base;
-
-  LogicalResult
-  matchAndRewrite(HCMaskFromSizesOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Type converted = typeConverter->convertType(op.getMask().getType());
-    if (!converted)
-      return failure();
-
-    // The `shape` attribute holds the original multi-dim mask shape — that's
-    // what `vector.create_mask` wants. The result type may have been
-    // retyped to 1D by `hc-flatten-with-layouts`; we'll bridge to it after
-    // building the multi-dim vector.
-    SmallVector<int64_t> shape(op.getShape());
-    if (shape.size() != adaptor.getSizes().size())
-      return op.emitOpError(
-          "sizes / shape arity mismatch survived to conversion");
-    mlir::VectorType maskVectorType =
-        mlir::VectorType::get(shape, rewriter.getI1Type());
-    Value mask = vector::CreateMaskOp::create(
-        rewriter, op.getLoc(), maskVectorType, adaptor.getSizes());
-
-    // Lane path: post-flatten the converted type is a 1D `vector<Nxi1>`;
-    // pre-flatten it still matches the multi-dim `maskVectorType`. Bridge
-    // with `vector.shape_cast` whenever the shapes differ — the element
-    // count is preserved by construction (`prod(shape) == N`).
-    if (auto convVector = dyn_cast<mlir::VectorType>(converted)) {
-      if (mask.getType() != convVector)
-        mask =
-            vector::ShapeCastOp::create(rewriter, op.getLoc(), convVector, mask)
-                .getResult();
-      rewriter.replaceOp(op, mask);
-      return success();
-    }
-
-    // LDS path: spill the multi-dim mask vector into a flat workgroup ptr.
-    // `writeVectorToWorkgroupPtr` walks lex order and stores one element per
-    // lane offset, so the multi-dim vector layout matches the flat ptr's
-    // element ordering without an intermediate `shape_cast`.
-    FailureOr<Value> result =
-        materializeShapedResult(rewriter, op.getLoc(), converted, mask, shape);
-    if (failed(result))
-      return failure();
-    rewriter.replaceOp(op, *result);
-    return success();
-  }
-};
 
 struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
   using Base::Base;
@@ -2586,8 +2405,7 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertCmpOp<HCCmpGeOp>, ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>,
       ConvertCastOp, ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
       ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
-      ConvertLoadMaskOp, ConvertMaskFromSizesOp, ConvertFullMaskOp,
-      ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
+      ConvertFullMaskOp, ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
       ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
       ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
       ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
@@ -2639,13 +2457,20 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
+  // `hc.load_mask` is illegal here too — `hc-load-store-to-generic`
+  // already rewrote every load_mask the front IR can produce into an
+  // `hc.generic` body whose predicate is materialised structurally.
+  // Anything that survives is a producer bug and the conversion
+  // driver fails loudly instead of falling back to the old per-axis
+  // post-flatten lowering (which used to clamp every mask to
+  // all-false against the placeholder 1D kernel-arg dim).
   target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
                       HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
                       HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp, HCLoadOp,
-                      HCVLoadOp, HCLoadMaskOp, HCMaskFromSizesOp,
-                      HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
-                      HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                      HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
+                      HCVLoadOp, HCLoadMaskOp, HCBufferViewOp, HCVecOp,
+                      HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp,
+                      HCOnesOp, HCFullOp, HCEmptyOp, HCSelectOp, HCStoreOp,
+                      HCForRangeOp, HCIfOp>();
   // `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are
   // left alone for the second invocation of this pass to consume —
   // their iter-sym free names get explicit per-lane bindings only after

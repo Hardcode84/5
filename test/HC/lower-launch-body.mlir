@@ -5,9 +5,9 @@
 // Workgroup-AS storage (`!hc.bare_tensor`) lowers to flat
 // `!hc.ptr<workgroup, T>` instead of `memref<..., workgroup>`. Kernel-arg
 // buffers come in as `(ptr, dim, stride)` bundles UCC'd to
-// `!hc.buffer<...>`; the per-axis dim values feed `hc.buffer_dim` /
-// `hc.load_mask` extents and the stride values feed offset linearization
-// for `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+// `!hc.buffer<...>`; the per-axis dim values feed `hc.buffer_dim` and
+// the stride values feed offset linearization for `hc.ptr_offset` +
+// `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
 // See `doc/layouts.md` "hc.ptr and memory ops".
 //
 // RUN: hc-opt %s --hc-lower-launch-body | FileCheck %s
@@ -114,54 +114,6 @@ module {
              !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>,
              tuple<!hc.idx<"8">, !hc.idx<"1">>)
             -> !hc.bare_vector<f32, ["8", "1"]>
-      gpu.terminator
-    }
-    return
-  }
-
-  // CHECK-LABEL: func.func @strided_load_mask(
-  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
-  // CHECK-SAME: %[[M:[^:]+]]: index,
-  // CHECK-SAME: %[[N:[^:]+]]: index,
-  // For a stride-2 slice into row axis of extent `M`, the in-bounds count
-  // is `ceildiv(M - offset, 2)` rather than `M - offset`. Unit-stride
-  // axes still emit the simpler `extent - offset` form. The dim values
-  // come straight from the kernel-arg UCC (no `memref.dim` chain).
-  // CHECK: %[[REM_M:.*]] = arith.subi %[[M]], %{{.*}} : index
-  // CHECK: %[[STEPM1:.*]] = arith.subi %{{.*}}, %{{.*}} : index
-  // CHECK: %[[ADJ:.*]] = arith.addi %[[REM_M]], %[[STEPM1]] : index
-  // CHECK: %[[ROWSZ:.*]] = arith.divsi %[[ADJ]], %{{.*}} : index
-  // CHECK: %[[COLSZ:.*]] = arith.subi %[[N]], %{{.*}} : index
-  // CHECK: vector.create_mask %[[ROWSZ]], %[[COLSZ]] : vector<8x1xi1>
-  // CHECK-NOT: hc.load_mask
-  func.func @strided_load_mask(%ptr: !hc.ptr<global, f32>,
-                               %m: index, %n: index,
-                               %sm: index, %sn: index) {
-    %c1 = arith.constant 1 : index
-    %buffer = builtin.unrealized_conversion_cast %ptr, %m, %n, %sm, %sn
-        : !hc.ptr<global, f32>, index, index, index, index
-        to !hc.buffer<f32, ["M", "N"]>
-    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
-               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      %zero = hc.const<0 : i64> : !hc.idx<"0">
-      %one = hc.const<1 : i64> : !hc.idx<"1">
-      %two = hc.const<2 : i64> : !hc.idx<"2">
-      %sixteen = hc.const<16 : i64> : !hc.idx<"16">
-      %eight = hc.const<8 : i64> : !hc.idx<"8">
-      %rows = hc.slice_expr(lower = %zero upper = %sixteen step = %two)
-          : (!hc.idx<"0">, !hc.idx<"16">, !hc.idx<"2">)
-            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>
-      %col = hc.slice_expr(lower = %zero upper = %one)
-          : (!hc.idx<"0">, !hc.idx<"1">)
-            -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>
-      %shape = hc.tuple(%eight, %one)
-          : (!hc.idx<"8">, !hc.idx<"1">) -> tuple<!hc.idx<"8">, !hc.idx<"1">>
-      %mask = hc.load_mask %buffer[%rows, %col], shape %shape
-          : (!hc.buffer<f32, ["M", "N"]>,
-             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>,
-             !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>,
-             tuple<!hc.idx<"8">, !hc.idx<"1">>)
-            -> !hc.bare_vector<!hc.pred, ["8", "1"]>
       gpu.terminator
     }
     return
@@ -293,88 +245,6 @@ module {
       %vec = hc.vload %buffer[%off], shape %shape
           : (!hc.buffer<f32, ["?"]>, !hc.idx<"composed">, tuple<!hc.idx<"8">>)
             -> !hc.bare_vector<f32, ["8"]>
-      gpu.terminator
-    }
-    return
-  }
-
-  // `hc.mask_from_sizes` lowers to `vector.create_mask` of the static
-  // multi-dim mask shape using the op's per-axis sizes directly. The
-  // lane path emits a `vector.shape_cast` when the converted result
-  // type is the post-flatten 1D `vector<Nxi1>`; without the cast the
-  // bare-vector → vector converter would fail to materialise the
-  // multi-dim vector against the 1D carrier.
-  // CHECK-LABEL: func.func @mask_from_sizes_vector(
-  // CHECK-SAME: %[[ROW_SZ:[^:]+]]: index,
-  // CHECK-SAME: %[[COL_SZ:[^:)]+]]: index
-  // CHECK: vector.create_mask %[[ROW_SZ]], %[[COL_SZ]] : vector<8x1xi1>
-  // CHECK-NOT: hc.mask_from_sizes
-  func.func @mask_from_sizes_vector(%row_sz: index, %col_sz: index) {
-    %c1 = arith.constant 1 : index
-    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
-               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      %mask = hc.mask_from_sizes(%row_sz, %col_sz) shape [8, 1]
-          : !hc.bare_vector<!hc.pred, ["8", "1"]>
-      gpu.terminator
-    }
-    return
-  }
-
-  // The bare-tensor result drives the LDS spill path:
-  // `materializeShapedResult` allocates a workgroup `!hc.ptr<workgroup, i1>`
-  // and writes the multi-dim mask vector into it one lane at a time. The
-  // alloc / per-element stores survive in the lowered body so the AMDGPU
-  // backend's SLP recombines the unit-stride sequence into a single
-  // vectorised LDS write.
-  // CHECK-LABEL: func.func @mask_from_sizes_tile(
-  // CHECK-SAME: %[[ROW_SZ:[^:]+]]: index,
-  // CHECK-SAME: %[[COL_SZ:[^:)]+]]: index
-  // CHECK: %[[MASK:.*]] = vector.create_mask %[[ROW_SZ]], %[[COL_SZ]] : vector<4x4xi1>
-  // CHECK: hc.alloc
-  // CHECK-SAME: -> !hc.ptr<workgroup, i1>
-  // CHECK: vector.extract %[[MASK]][0, 0] : i1 from vector<4x4xi1>
-  // CHECK: hc.ptr_store
-  // CHECK-NOT: hc.mask_from_sizes
-  func.func @mask_from_sizes_tile(%row_sz: index, %col_sz: index) {
-    %c1 = arith.constant 1 : index
-    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
-               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      %mask = hc.mask_from_sizes(%row_sz, %col_sz) shape [4, 4]
-          : !hc.bare_tensor<!hc.pred, ["4", "4"]>
-      gpu.terminator
-    }
-    return
-  }
-
-  // `hc.load_mask` on the same post-flatten form: the composed offset
-  // anchors a flat lane walk, the kernel-arg's only dim is the post-
-  // flatten `total` element count, and the mask size collapses to
-  // `total - composed` (no per-axis ceildiv because the synthesized lane
-  // stride is the constant 1 that `maskAxisIsUnitStride` accepts).
-  // CHECK-LABEL: func.func @post_flatten_load_mask(
-  // CHECK-SAME: %[[PTR:[^:]+]]: !hc.ptr<global, f32>,
-  // CHECK-SAME: %[[TOTAL:[^:]+]]: index,
-  // CHECK-SAME: %[[OFF:[^:)]+]]: index
-  // CHECK: %[[REM:.*]] = arith.subi %[[TOTAL]], %[[OFF]] : index
-  // CHECK: vector.create_mask %[[REM]] : vector<8xi1>
-  // CHECK-NOT: arith.divsi
-  // CHECK-NOT: hc.load_mask
-  func.func @post_flatten_load_mask(%ptr: !hc.ptr<global, f32>,
-                                    %total: index, %composed: index) {
-    %c1 = arith.constant 1 : index
-    %one = arith.constant 1 : index
-    %buffer = builtin.unrealized_conversion_cast %ptr, %total, %one
-        : !hc.ptr<global, f32>, index, index
-        to !hc.buffer<f32, ["?"]>
-    %off = builtin.unrealized_conversion_cast %composed
-        : index to !hc.idx<"composed">
-    %eight = hc.const<8 : i64> : !hc.idx<"8">
-    %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
-    gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
-               threads(%tx, %ty, %tz) in (%sx = %c1, %sy = %c1, %sz = %c1) {
-      %mask = hc.load_mask %buffer[%off], shape %shape
-          : (!hc.buffer<f32, ["?"]>, !hc.idx<"composed">, tuple<!hc.idx<"8">>)
-            -> !hc.bare_vector<!hc.pred, ["8"]>
       gpu.terminator
     }
     return

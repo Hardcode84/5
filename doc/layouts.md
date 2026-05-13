@@ -178,10 +178,12 @@ per-axis `#hc.expr` array on each `hc.generic` operand becomes a
 single composed `#hc.expr` (substituted through the operand's
 `#hc.layout` offset, or the identity-layout fallback when no layout
 is attached); multi-index lists on `hc.load` / `hc.store` / `hc.vload`
-/ `hc.load_mask` collapse to a single `hc.idx_apply`-materialized
-1D base offset by the same path. `hc.buffer_view` stays as-is —
-its sub-view semantics differ from a single base offset and are
-deferred.
+collapse to a single `hc.idx_apply`-materialized 1D base offset by
+the same path. `hc.load_mask` is rewritten to an `hc.generic` upstream
+by `hc-load-store-to-generic`, so it reaches flatten via the
+generic-offset compose path with the rest. `hc.buffer_view` stays
+as-is — its sub-view semantics differ from a single base offset and
+are deferred.
 
 What runs:
 
@@ -843,8 +845,10 @@ on later slices.
    `#hc.expr` arrays compose through the operand's `#hc.layout`
    offset (or the identity layout when no layout is attached) into
    a single 1D `#hc.expr` per operand; per-access multi-index
-   lists on `hc.load` / `hc.store` / `hc.vload` / `hc.load_mask`
-   collapse to a single `hc.idx_apply`-materialized base offset.
+   lists on `hc.load` / `hc.store` / `hc.vload` collapse to a single
+   `hc.idx_apply`-materialized base offset. `hc.load_mask` is rewritten
+   to an `hc.generic` upstream and arrives here via the generic-offset
+   compose path.
    `hc.buffer_view`, `hc.as_layout` structural-difference handling,
    and `i1` byte-per-element retirement are separate slices
    documented under the pass section above.
@@ -891,17 +895,19 @@ on later slices.
     init-scaffolding rework or a broadcast story this slice doesn't
     pin down.
 14. **`hc-load-store-to-generic`** — rewrite `hc.load` / `hc.vload`
-    into `hc.generic` with a ptr/buffer in and a value-typed out, and
+    into `hc.generic` with a ptr/buffer in and a value-typed out,
     `hc.store` into `hc.generic` with a value-typed in and a
-    ptr/buffer out. Picks up the multi-index offset arrays the
-    per-access materialization slice (`hc-flatten-with-layouts`
-    follow-up) feeds it. Cooperative copy helpers fold into a single
-    ptr-in / ptr-out generic. Masked `hc.store` rides on the same
-    rewrite — the mask operand becomes a second ins slot with
-    identity offsets and the body terminates with
-    `hc.yield_predicated` instead of `hc.yield`, so the lowering
-    routes through `hc.ptr_store_pred` at the dst's ins-slot offset.
-    Tensor-dst stores and `hc.load_mask` are deferred to follow-ups.
+    ptr/buffer out, and `hc.load_mask` into a value-typed-outs
+    `hc.generic` whose body emits a single `hc.pred_apply` carrying
+    the per-axis bounds conjunction. Picks up the multi-index offset
+    arrays the per-access materialization slice
+    (`hc-flatten-with-layouts` follow-up) feeds it. Cooperative copy
+    helpers fold into a single ptr-in / ptr-out generic. Masked
+    `hc.store` rides on the same rewrite — the mask operand becomes
+    a second ins slot with identity offsets and the body terminates
+    with `hc.yield_predicated` instead of `hc.yield`, so the
+    lowering routes through `hc.ptr_store_pred` at the dst's ins-slot
+    offset. Tensor-dst stores remain a deferred follow-up.
 15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
     forms: value-out, ptr-out, mixed) to an outer `scf.parallel`
     over the parallel iters with an inner `scf.for` nest over the

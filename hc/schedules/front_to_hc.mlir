@@ -136,18 +136,6 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m11 : !transform.any_op
     %m12 = transform.apply_registered_pass "hc-lower-kernels-to-gpu-launch" to %m11
         : (!transform.any_op) -> !transform.any_op
-    // Lower `hc.load_mask` before flatten composes the per-axis
-    // slice subscripts into a single 1D offset. The pass snapshots
-    // each per-axis in-bounds size against the multi-dim kernel-arg
-    // dims and emits `hc.mask_from_sizes` carrying those Index-typed
-    // sizes; the launch-body lowering then converts that op to
-    // `vector.create_mask` + a bare-vector/-tensor materialisation
-    // without revisiting the source shape. Without this pre-flatten
-    // step the post-flatten 1D kernel-arg view's placeholder dim feeds
-    // a `0 - composed_offset` extent into the mask size, clamping every
-    // bound to all-false and silently masking off real stores.
-    %m12a = transform.apply_registered_pass "hc-lower-load-mask" to %m12
-        : (!transform.any_op) -> !transform.any_op
     // Flatten before launch-body so launch-body sees rank-1 buffer
     // carriers and a single composed 1D `#hc.expr` per access. The
     // post-flatten layout retyper inside flatten handles the buffer-
@@ -159,7 +147,16 @@ module attributes {transform.with_named_sequence} {
     // `applyPartialConversion` step that flatten drives plants
     // boundary UCCs on every type it converted; fold them through
     // the standard cleanup pair before launch-body walks the IR.
-    %m12b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m12a
+    //
+    // `hc.load_mask` doesn't need a pre-flatten snapshot here:
+    // `hc-load-store-to-generic` above rewrites every load_mask to an
+    // `hc.generic` whose body computes the per-axis bounds predicate
+    // structurally from the slice's `lo`, `step`, and the source's
+    // multi-dim shape syms. Flatten then folds the result-tile
+    // offsets to 1D the same way it folds load/store offsets, and
+    // launch-body lowers the body's `hc.pred_apply` via the same
+    // ExprLowerer that runs on every other apply.
+    %m12b = transform.apply_registered_pass "hc-flatten-with-layouts" to %m12
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %m12b {
       transform.apply_patterns.canonicalization

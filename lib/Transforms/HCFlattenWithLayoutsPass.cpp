@@ -37,10 +37,13 @@
 // matching the post-flatten 1D operand rank. The verifier on
 // `hc.generic` enforces rank parity in both regimes.
 //
-// Per-access ops (`hc.load`, `hc.vload`, `hc.store`, `hc.load_mask`)
-// also get rewritten in this pass: their multi-index lists collapse
-// to a single 1D base-offset SSA value composed from the operand's
-// layout against the access site's index expressions. Composition
+// Per-access ops (`hc.load`, `hc.vload`, `hc.store`) also get
+// rewritten in this pass: their multi-index lists collapse to a
+// single 1D base-offset SSA value composed from the operand's
+// layout against the access site's index expressions. `hc.load_mask`
+// is rewritten to an `hc.generic` upstream by
+// `hc-load-store-to-generic`, so its addressing rides the same
+// generic-offset compose path the data generics do. Composition
 // runs during conversion so the layout is still on the (pre-
 // conversion) operand type when we read it. Free symbols of the
 // composed offset that have a matching SSA in the operand's
@@ -1067,60 +1070,6 @@ struct ComposeVLoadOffsets : public ComposeAccessOffsetBase<HCVLoadOp> {
       return failure();
 
     SmallVector<Value> replacement = {newVLoad.getResult()};
-    llvm::append_range(replacement, *auxValues);
-    SmallVector<ValueRange> replacements = {replacement};
-    rewriter.replaceOpWithMultiple(op, replacements);
-    return success();
-  }
-};
-
-struct ComposeLoadMaskOffsets : public ComposeAccessOffsetBase<HCLoadMaskOp> {
-  using ComposeAccessOffsetBase::ComposeAccessOffsetBase;
-  using Base = OpConversionPattern<HCLoadMaskOp>;
-  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
-
-  LogicalResult
-  matchAndRewrite(HCLoadMaskOp op, OneToNOpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (op.getIndices().size() == 1)
-      return failure();
-    if (adaptor.getSource().empty())
-      return failure();
-    Value flatSource = adaptor.getSource().front();
-    ValueRange sourceAux = adaptor.getSource().drop_front();
-
-    auto indices = collectScalarOperands(adaptor.getIndices());
-    if (failed(indices))
-      return failure();
-    if (adaptor.getShape().size() != 1)
-      return failure();
-
-    auto base = composeAccessBaseOffset(rewriter, op, op.getSource(), sourceAux,
-                                        op.getIndices());
-    if (failed(base))
-      return failure();
-
-    Type origResultType = op.getMask().getType();
-    SmallVector<Type> convertedResults;
-    if (failed(
-            getTypeConverter()->convertType(origResultType, convertedResults)))
-      return failure();
-    if (convertedResults.empty())
-      return failure();
-
-    auto newLoadMask = HCLoadMaskOp::create(
-        rewriter, op.getLoc(), convertedResults.front(), flatSource,
-        ValueRange{*base}, adaptor.getShape()[0]);
-
-    llvm::StringMap<Value> bindings;
-    noteOperandBindings(op.getSource().getType(), adaptor.getSource(),
-                        bindings);
-    auto auxValues =
-        resolveResultAuxValues(rewriter, op.getLoc(), origResultType, bindings);
-    if (failed(auxValues))
-      return failure();
-
-    SmallVector<Value> replacement = {newLoadMask.getMask()};
     llvm::append_range(replacement, *auxValues);
     SmallVector<ValueRange> replacements = {replacement};
     rewriter.replaceOpWithMultiple(op, replacements);
@@ -2162,8 +2111,7 @@ struct HCFlattenWithLayoutsPass final
     // Per-access-op patterns are listed first by intent — the
     // conversion driver still picks via benefit (2 vs the generic
     // retype's 1), but having them grouped reads as the design.
-    patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets,
-                 ComposeLoadMaskOffsets, ComposeStoreOffsets,
+    patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeStoreOffsets,
                  ComposeGenericOffsets, ComposeBufferViewOffsets, DropAsLayout,
                  RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
                  ConvertHCSymbolSignatureOp<HCFuncOp>,

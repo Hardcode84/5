@@ -369,6 +369,168 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   return success();
 }
 
+// ----- hc.load_mask -----------------------------------------------------
+
+// Mask companion for `hc.load` / `hc.vload`: produces a bare predicate
+// carrier whose lane `i_k` says whether the source's per-axis slice
+// subscript `(lo_k + step_k * i_k)` stays in-bounds against the source's
+// k-th dim `D_k`. Pre-flatten the source still carries its multi-dim
+// shape, so `D_k` is the source operand's k-th symbolic dim — a sym
+// leaf for kernel-arg buffers (`"A"`, `"B"`, ...) or an integer literal
+// for static bare tensors.
+//
+// Rewrite shape:
+//
+//   %m = hc.generic
+//       iter (parallel i_0 = %S_0, parallel i_1 = %S_1, ...)
+//       outs (%init at [#hc.expr<"i_0">, #hc.expr<"i_1">, ...]
+//             : !hc.bare_(tensor|vector)<!hc.pred, ...>)
+//       -> (!hc.bare_(tensor|vector)<!hc.pred, ...>) {
+//   ^bb0(%iv: !hc.pred):
+//     %p_pinned = hc.pred_apply ()
+//                 : () -> !hc.pred<"(lo_0 + step_0*i_0 < D_0)
+//                                && (lo_1 + step_1*i_1 < D_1) && ...">
+//     %p = builtin.unrealized_conversion_cast %p_pinned : ... to !hc.pred
+//     hc.yield %p : !hc.pred
+//   }
+//
+// The pinned-pred → unpinned-pred UCC is the same bridge
+// `hc.yield_predicated`'s consumers use for body-computed masks; the
+// downstream `bindIterSymsInClone` (in `hc-lower-generic`'s value-outs
+// path) binds each iter sym to its per-lane compile-time integer on
+// the planted apply, so the launch-body resolver sees a direct
+// dataflow edge instead of falling through ambient context. The
+// hash-consed structural conjunction shares storage with any other
+// identical bound predicate elsewhere in the IR.
+//
+// Bails (op stays for legacy lowering / diagnostics):
+//   * Non-shaped source / non-shaped result types (`!hc.undef`, raw
+//     pointers, ...) — no shape to source bounds from.
+//   * Source axis carrying `#hc.dyn` instead of `#hc.expr` — host-owned
+//     size, no in-IR sym to bound against.
+//   * Index operand mismatch (rank, non-canonical slice with `!hc.undef`
+//     lower / step parts, scalar idx with no expression) — same shapes
+//     the data-side `rewriteLoadLike` punts on.
+//   * Rank-0 mask (no slice axes) — pathological shape that should
+//     have been folded earlier; if it ever lands, `hc-full-mask` is
+//     the right primitive.
+static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
+  Type resultTy = op.getMask().getType();
+  auto tileShape = getOperandShape(resultTy);
+  if (failed(tileShape))
+    return failure();
+
+  Value source = op.getSource();
+  auto srcShape = getOperandShape(source.getType());
+  if (failed(srcShape))
+    return failure();
+
+  ValueRange indices = op.getIndices();
+  if (indices.size() != srcShape->size())
+    return failure();
+  MLIRContext *ctx = op.getContext();
+
+  // Per-axis (lo, step, src-dim) carriers, slice axes only — scalar
+  // idx axes drop out of the result rank by construction so they
+  // contribute no iter dimension and no bounds term.
+  struct SliceAxisInfo {
+    ExprAttr lo;
+    ExprAttr step;
+    ExprAttr srcDim;
+  };
+  SmallVector<SliceAxisInfo> sliceAxes;
+  for (auto [idx, srcDim] : llvm::zip_equal(indices, *srcShape)) {
+    Type indexTy = idx.getType();
+    if (!isa<SliceType>(indexTy))
+      continue;
+    auto axis = extractAxisIndex(ctx, store, indexTy);
+    if (failed(axis))
+      return failure();
+    sliceAxes.push_back({axis->base, axis->step, srcDim});
+  }
+  if (sliceAxes.size() != tileShape->size())
+    return failure();
+  if (sliceAxes.empty())
+    return failure();
+
+  Location loc = op.getLoc();
+  OpBuilder builder(op);
+  CommonRewriteData common = buildCommon(builder, loc, *tileShape);
+  Value shapeTuple = buildShapeTuple(builder, loc, common.iterBounds);
+  Value initOut = emitValueInit(builder, loc, resultTy, shapeTuple);
+
+  ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
+  ArrayAttr insOffsets = ArrayAttr::get(ctx, {});
+  ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
+
+  auto generic = HCGenericOp::create(
+      builder, loc, /*resultTypes=*/TypeRange{resultTy}, common.iterSymsAttr,
+      ValueRange(common.iterBounds), common.iterKindsAttr,
+      /*ins=*/ValueRange{}, /*outs=*/ValueRange{initOut},
+      /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
+
+  Type predElem = getUnpinnedPredType(ctx);
+  Block *body = new Block();
+  body->addArgument(predElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+
+  // Per-axis predicate `lo + step * i_k < D_k`, conjuncted across all
+  // slice axes via the structural compose API. Hash-consing shares
+  // identical bounds expressions with any other producer, so two
+  // load_masks reading the same buffer with the same slice geometry
+  // emit one pred_apply each pointing at the same canonical node.
+  std::optional<sym::PredHandle> conjunction;
+  for (auto [k, info] : llvm::enumerate(sliceAxes)) {
+    StringAttr iterSym = common.iterSyms[k];
+    auto iterHandle = sym::composeExprSym(store, iterSym.getValue());
+    if (failed(iterHandle))
+      return failure();
+    sym::ExprHandle term = *iterHandle;
+    std::optional<int64_t> stepLit =
+        sym::getIntegerLiteralValue(info.step.getValue());
+    if (!stepLit || *stepLit != 1) {
+      auto mul = sym::composeExprBinary(store, info.step.getValue(),
+                                        sym::ExprBinaryOp::Mul, term);
+      if (failed(mul))
+        return failure();
+      term = *mul;
+    }
+    auto sum = sym::composeExprBinary(store, info.lo.getValue(),
+                                      sym::ExprBinaryOp::Add, term);
+    if (failed(sum))
+      return failure();
+    auto cmp = sym::composePredCmp(store, *sum, sym::PredCmpOp::Lt,
+                                   info.srcDim.getValue());
+    if (failed(cmp))
+      return failure();
+    if (!conjunction) {
+      conjunction = *cmp;
+    } else {
+      auto andP = sym::composePredAnd(store, *conjunction, *cmp);
+      if (failed(andP))
+        return failure();
+      conjunction = *andP;
+    }
+  }
+
+  PredAttr predAttr = PredAttr::get(ctx, *conjunction);
+  Type pinnedTy = PredType::get(ctx, predAttr);
+  Value predPinned = HCPredApplyOp::create(bodyBuilder, loc, pinnedTy,
+                                           /*operands=*/ValueRange{},
+                                           bodyBuilder.getStrArrayAttr({}))
+                         .getResult();
+  Value predUnpinned =
+      UnrealizedConversionCastOp::create(bodyBuilder, loc, predElem, predPinned)
+          .getResult(0);
+  HCYieldOp::create(bodyBuilder, loc, ValueRange{predUnpinned});
+
+  op->replaceAllUsesWith(generic.getResults());
+  op->erase();
+  return success();
+}
+
 // ----- hc.store ---------------------------------------------------------
 
 static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
@@ -480,6 +642,7 @@ struct HCLoadStoreToGenericPass
     SmallVector<HCLoadOp> loads;
     SmallVector<HCVLoadOp> vloads;
     SmallVector<HCStoreOp> stores;
+    SmallVector<HCLoadMaskOp> loadMasks;
     root->walk([&](Operation *op) {
       if (auto l = dyn_cast<HCLoadOp>(op))
         loads.push_back(l);
@@ -487,6 +650,8 @@ struct HCLoadStoreToGenericPass
         vloads.push_back(v);
       else if (auto s = dyn_cast<HCStoreOp>(op))
         stores.push_back(s);
+      else if (auto m = dyn_cast<HCLoadMaskOp>(op))
+        loadMasks.push_back(m);
     });
     for (HCLoadOp l : loads)
       (void)rewriteLoadLike(l, store);
@@ -494,6 +659,8 @@ struct HCLoadStoreToGenericPass
       (void)rewriteLoadLike(v, store);
     for (HCStoreOp s : stores)
       (void)rewriteStore(s, store);
+    for (HCLoadMaskOp m : loadMasks)
+      (void)rewriteLoadMask(m, store);
   }
 };
 

@@ -419,3 +419,48 @@ func.func @store_slice_buffer(%dst: !hc.buffer<f32, ["M"]>,
          !hc.tensor<f32, ["A"]>) -> ()
   return
 }
+
+// -----
+
+// `hc.load_mask` rewrites to an `hc.generic` whose body computes
+// the per-axis in-bounds predicate from the slice's `lo` + `step *
+// iter_k` against the source dim. Iter sym `i_k` matches the result
+// tile axis order. The body emits a single `hc.pred_apply` carrying
+// the conjuncted predicate (one comparison per slice axis, joined by
+// `&`) and feeds its result through an `UnrealizedConversionCast`
+// from the pinned form `!hc.pred<expr>` to the unpinned `!hc.pred`
+// the bare-tile carrier element type wants — the per-thread / LDS
+// materialisation downstream sees a single op that pulls every
+// runtime-dependent dim from the kernel-arg bundle through the
+// usual ambient-sym route.
+// CHECK-LABEL: func.func @load_mask_basic
+// CHECK: %[[OUT:.+]] = hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"8">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"1">)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">]
+// CHECK-SAME: -> (!hc.bare_vector<!hc.pred, ["8", "1"]>)
+// CHECK: ^bb0(%{{[^:]+}}: !hc.pred):
+// CHECK:   %[[P:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + 2*i_0 < 0 & -N + i_1 < 0">
+// CHECK:   %[[U:.+]] = builtin.unrealized_conversion_cast %[[P]] : !hc.pred<"-M + 2*i_0 < 0 & -N + i_1 < 0"> to !hc.pred
+// CHECK:   hc.yield %[[U]] : !hc.pred
+// CHECK-NOT: hc.load_mask
+func.func @load_mask_basic(%buf: !hc.buffer<f32, ["M", "N"]>) -> !hc.bare_vector<!hc.pred, ["8", "1"]> {
+  %zero = hc.const<0 : i64> : !hc.idx<"0">
+  %one = hc.const<1 : i64> : !hc.idx<"1">
+  %two = hc.const<2 : i64> : !hc.idx<"2">
+  %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+  %eight = hc.const<8 : i64> : !hc.idx<"8">
+  %rows = hc.slice_expr(lower = %zero upper = %sixteen step = %two)
+      : (!hc.idx<"0">, !hc.idx<"16">, !hc.idx<"2">)
+        -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>
+  %col = hc.slice_expr(lower = %zero upper = %one)
+      : (!hc.idx<"0">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>
+  %shape = hc.tuple(%eight, %one)
+      : (!hc.idx<"8">, !hc.idx<"1">) -> tuple<!hc.idx<"8">, !hc.idx<"1">>
+  %m = hc.load_mask %buf[%rows, %col], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"16">, step = !hc.idx<"2">>,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"1">>,
+         tuple<!hc.idx<"8">, !hc.idx<"1">>) -> !hc.bare_vector<!hc.pred, ["8", "1"]>
+  return %m : !hc.bare_vector<!hc.pred, ["8", "1"]>
+}

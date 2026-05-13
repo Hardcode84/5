@@ -8,6 +8,7 @@ import importlib
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
+from ._bench import BenchResult
 from ._compile import CompiledKernel, compile
 from .core import (
     Buffer,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from .symbols import Symbol
 
 __all__ = [
+    "BenchResult",
     "Buffer",
     "BufferSpec",
     "CompiledKernel",

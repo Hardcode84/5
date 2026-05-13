@@ -26,10 +26,11 @@ captured diagnostics.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._bench import BenchResult, make_bench_invoker
 from ._invoke import InvokerCache, make_invoker
 from ._pipeline import ScheduleSource
 from .core import KernelMetadata
@@ -39,7 +40,7 @@ from .core import KernelMetadata
 # stay lazy inside function bodies, so simulator-only callers that never
 # invoke `hc.compile` don't load the native bindings.
 
-__all__ = ["CompiledKernel", "ScheduleSource", "compile"]
+__all__ = ["BenchResult", "CompiledKernel", "ScheduleSource", "compile"]
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,13 @@ class CompiledKernel:
     # "any target"). Useful for downstream stages and debugging — the
     # actual recipe selection happened inside the pipeline.
     target: str | None = field(default=None)
+    # Symbol name of the bench wrapper if `hc.compile(bench=True)` was
+    # used, else `None`. `-hc-emit-bench-wrapper` mints `<kernel>_bench`
+    # next to the regular `<kernel>` wrapper; recording the name here
+    # gives `.bench()` a direct ctypes-lookup target without re-parsing
+    # the IR. `None` is the trigger to refuse `bench()` cleanly with a
+    # message pointing the user back at `bench=True`.
+    bench_wrapper_name: str | None = field(default=None)
     # Lazy JIT cache. Lives in a mutable side-channel so the dataclass
     # can stay frozen while the engine and cfunc materialize on first
     # invoke. Excluded from compare/repr so two handles compiled from
@@ -110,14 +118,109 @@ class CompiledKernel:
                 "cannot invoke. Diagnostics:\n  " + diagnostics
             )
         if self._invoker_cache.invoker is None:
-            kernel_name = getattr(self.kernel, "__name__", None)
-            if not kernel_name:
-                raise RuntimeError(
-                    "hc.invoke: kernel has no __name__; cannot resolve "
-                    "the host wrapper symbol"
-                )
-            self._invoker_cache.invoker = make_invoker(self.hc_ir, kernel_name)
+            kernel_name = self._resolve_kernel_name(surface="hc.invoke")
+            self._invoker_cache.invoker = make_invoker(
+                self._invoker_cache, self.hc_ir, kernel_name
+            )
         self._invoker_cache.invoker(*args, stream=stream)
+
+    def bench(
+        self,
+        args: tuple[Any, ...] | list[Any],
+        *,
+        n_inner: int,
+        m_outer: int,
+        warmup: int = 2,
+        stream: int | None = None,
+    ) -> BenchResult:
+        """Run the bench wrapper m_outer x n_inner times, return stats.
+
+        Driver shape: do `warmup` untimed outer iterations to prime the
+        kernel cache / JIT path, then collect `m_outer` timed outer
+        samples. Each outer sample drops into JIT'd code once, dispatches
+        `hc_rt_launch_kernel_repeat` for an inner loop of `n_inner`
+        launches plus one `hipStreamSynchronize`, and returns the
+        wall-clock nanoseconds the C-side measured under
+        `CLOCK_MONOTONIC`. No `perf_counter_ns` bracketing in Python —
+        the per-sample window never crosses the language boundary.
+
+        Caveats baked into the contract:
+        * Inputs are reused across every `m_outer * n_inner` launch.
+          Small / L2-fitting kernels report cache-hot latency. Rotate
+          inputs in the warmup phase or wait for the cache-cold mode
+          slice if it matters for your kernel.
+        * One time number per outer sample. The submit-vs-sync split is
+          derivable by sweeping `n_inner` (large `n_inner` → submit
+          path; `n_inner=1` → submit + sync per launch).
+
+        Raises `RuntimeError` if this handle was not compiled with
+        `bench=True` (the bench wrapper would not exist in the JIT'd
+        module).
+        """
+        self._require_bench_ready()
+        _validate_bench_counts(n_inner=n_inner, m_outer=m_outer, warmup=warmup)
+        kernel_name = self._resolve_kernel_name(surface="hc.bench")
+        bench_call = self._ensure_bench_invoker(kernel_name)
+
+        # Lazy numpy import so the bench surface respects the same
+        # "simulator-only callers don't load native deps" boundary
+        # `_compile` itself maintains for the resolver / pipeline.
+        import numpy as np
+
+        # Burn-in: the JIT'd module's first call also lazily fills the
+        # per-callsite `_handle` cache slot via `hc_rt_load_kernel`.
+        # That single-flight memoization is a one-time cost we want to
+        # exclude from the timing sample even if the caller passes
+        # warmup=0.
+        for _ in range(warmup):
+            bench_call(*args, stream=stream, n_inner=n_inner)
+        samples = np.empty(m_outer, dtype=np.int64)
+        for i in range(m_outer):
+            samples[i] = bench_call(*args, stream=stream, n_inner=n_inner)
+        return BenchResult(
+            samples_ns=samples,
+            n_inner=n_inner,
+            kernel_name=kernel_name,
+        )
+
+    def _require_bench_ready(self) -> None:
+        if self.hc_ir is None:
+            diagnostics = (
+                "\n  ".join(self.pipeline_diagnostics)
+                if self.pipeline_diagnostics
+                else "(no diagnostics captured)"
+            )
+            raise RuntimeError(
+                "hc.compile: pipeline failed to lower this kernel; "
+                "cannot bench. Diagnostics:\n  " + diagnostics
+            )
+        if self.bench_wrapper_name is None:
+            raise RuntimeError(
+                "hc.bench: this CompiledKernel was built without "
+                "bench=True; the bench wrapper symbol does not exist in "
+                "the JIT'd module. Re-call hc.compile(..., bench=True) "
+                "and retry."
+            )
+
+    def _ensure_bench_invoker(self, kernel_name: str) -> Callable[..., Any]:
+        if self._invoker_cache.bench_invoker is None:
+            assert self.bench_wrapper_name is not None  # asserted in caller
+            self._invoker_cache.bench_invoker = make_bench_invoker(
+                self._invoker_cache,
+                self.hc_ir,
+                kernel_name,
+                self.bench_wrapper_name,
+            )
+        return self._invoker_cache.bench_invoker
+
+    def _resolve_kernel_name(self, *, surface: str) -> str:
+        kernel_name = getattr(self.kernel, "__name__", None)
+        if not isinstance(kernel_name, str) or not kernel_name:
+            raise RuntimeError(
+                f"{surface}: kernel has no __name__; cannot resolve "
+                "the host wrapper symbol"
+            )
+        return kernel_name
 
     def __call__(self, *args: Any, stream: int | None = None, **kwargs: Any) -> Any:
         if kwargs:
@@ -136,12 +239,64 @@ class CompiledKernel:
         return f"CompiledKernel({name}, {{{joined}}}, stage={stage}{target})"
 
 
+def _snapshot_and_clone_front_ir(front_module: Any, context: Any) -> tuple[str, Any]:
+    """Pin the pre-pipeline IR text and produce a sibling module to mutate.
+
+    The MLIR Python bindings don't expose a cheap in-memory module clone,
+    so we round-trip through text: `str(front_module)` is the snapshot
+    the public handle keeps, and a fresh `Module.parse` gives the
+    pipeline its own mutable copy. Parse + print does not round-trip
+    every piece of metadata (some debug info, some exotic attributes);
+    callers needing bit-exact lineage should compare `front_ir_text`
+    rather than the module objects.
+    """
+    from .mlir import ir as _ir
+
+    front_ir_text = str(front_module)
+    pipeline_module = _ir.Module.parse(front_ir_text, context=context)
+    return front_ir_text, pipeline_module
+
+
+def _bench_wrapper_symbol(kernel_fn: Any, hc_module: Any, *, bench: bool) -> str | None:
+    """Derive the bench wrapper symbol name without re-parsing the IR.
+
+    `-hc-emit-bench-wrapper` appends `_bench` to the host wrapper's
+    name, and the host wrapper inherits the kernel function's
+    `__name__`. Computing the derived symbol here lets `.bench()` jump
+    straight to a JIT lookup without an IR walk.
+    """
+    if not bench or hc_module is None:
+        return None
+    kernel_name = getattr(kernel_fn, "__name__", None)
+    if not kernel_name:
+        return None
+    return f"{kernel_name}_bench"
+
+
+def _validate_bench_counts(*, n_inner: int, m_outer: int, warmup: int) -> None:
+    """Surface the bench API's int contract before any JIT lookup happens.
+
+    Splitting the validation out of `CompiledKernel.bench` keeps the
+    method body close to the lizard CCN threshold; the checks themselves
+    are mechanical so collapsing them here costs nothing readability-
+    wise. Each error names the failing arg so a misuse points at a
+    single line in the caller.
+    """
+    if not isinstance(n_inner, int) or n_inner <= 0:
+        raise ValueError(f"n_inner must be a positive int, got {n_inner!r}")
+    if not isinstance(m_outer, int) or m_outer <= 0:
+        raise ValueError(f"m_outer must be a positive int, got {m_outer!r}")
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError(f"warmup must be a non-negative int, got {warmup!r}")
+
+
 def compile(
     kernel_fn: Any,
     symbols: Mapping[Any, int] | None = None,
     *,
     schedule: ScheduleSource = None,
     target: str | None = None,
+    bench: bool = False,
 ) -> CompiledKernel:
     """Run the current compilation pipeline (frontend + hc_front -> hc) on a kernel.
 
@@ -170,6 +325,13 @@ def compile(
     silently ignores `target`; the override owns its own pass
     invocations.
 
+    `bench=True` splices `-hc-emit-bench-wrapper` into the GPU lowering
+    chain so each host wrapper grows a sibling `<name>_bench` that calls
+    `hc_rt_launch_kernel_repeat`. The returned handle's `.bench(...)`
+    method becomes callable; default `False` leaves the JIT'd module
+    byte-identical to today and `.bench(...)` raises with a pointer
+    back here.
+
     Bindings are stored on the returned handle but the current pipeline
     does not substitute them into the emitted IR; `front_ir`/`hc_ir`
     stay symbolic until specialization lands.
@@ -196,24 +358,11 @@ def compile(
     context = prepared_context()
     resolved = resolve_front_ir(kernel_fn, context=context)
     front_module = resolved.module
-    # Snapshot the frontend IR text before the pipeline rewrites ops in
-    # place. The `front_ir` handle is kept as-is by re-parsing into a
-    # sibling clone below; without this, `front_ir_text` and `hc_ir_text`
-    # would end up identical after a successful pipeline run.
-    front_ir_text = str(front_module)
-
-    # Round-trip through text is our "clone" primitive: the MLIR Python
-    # bindings don't expose a cheap in-memory module clone, and we need
-    # two handles to the same IR — one pinned as the pre-pipeline
-    # snapshot, one handed to the driver to be mutated. Parse + print
-    # does not round-trip every piece of metadata (some debug info, some
-    # exotic attributes); any caller that needs bit-exact lineage should
-    # keep their own copy of `front_ir_text` rather than comparing
-    # `front_ir` and `hc_ir` module objects.
-    from .mlir import ir as _ir
-
-    pipeline_module = _ir.Module.parse(front_ir_text, context=context)
-    result = run_front_to_hc(pipeline_module, schedule=schedule, target=target)
+    front_ir_text, pipeline_module = _snapshot_and_clone_front_ir(front_module, context)
+    result = run_front_to_hc(
+        pipeline_module, schedule=schedule, target=target, bench=bench
+    )
+    bench_wrapper_name = _bench_wrapper_symbol(kernel_fn, result.module, bench=bench)
     # Only decorated top-levels are surfaced on the public handle;
     # undecorated inline helpers are an implementation detail of the
     # `hc_front` pipeline (they're consumed by `-hc-front-inline`
@@ -229,6 +378,7 @@ def compile(
         hc_ir_text=result.module_text,
         pipeline_diagnostics=result.diagnostics,
         target=target,
+        bench_wrapper_name=bench_wrapper_name,
     )
 
 

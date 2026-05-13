@@ -10,6 +10,7 @@ import pytest
 import hc
 import hc.simulator as sim
 from examples.amdgpu_gfx11_wmma_matmul import (
+    bench_on_hardware,
     dump_hc_ir,
     make_demo_inputs,
     reference_blocked_matmul,
@@ -69,6 +70,50 @@ def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
     # skipped by the per-element store guards.
     assert np.all(padded[24:, :] == sentinel)
     assert np.all(padded[:24, 24:] == sentinel)
+
+
+@_RUN_HIP_INVOKE_TESTS
+def test_gfx11_wmma_example_benches_on_real_hardware() -> None:
+    """End-to-end acceptance for `CompiledKernel.bench(...)`.
+
+    Goes through the same JIT + HIP path as the invoke test but via
+    the bench wrapper: `hc_rt_launch_kernel_repeat` drives an inner
+    loop of `n_inner` launches, `hipStreamSynchronize` closes the
+    window, the runtime hands back monotonic ns. Verifies the shape
+    of the returned `BenchResult` and that the headline numbers
+    relate consistently — anything tighter (e.g. an absolute upper
+    bound on per-launch latency) would be flaky against driver /
+    queue jitter.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("torch.cuda unavailable")
+
+    a, b = make_demo_inputs(m=32, n=32, k=32, seed=17)
+    # Modest m_outer/n_inner so the test runs in a few hundred ms even
+    # on a slow gfx11 host; the correctness inside `bench_on_hardware`
+    # already asserts the kernel computes the right thing before the
+    # timing loop, so the assertions here only need to pin the result
+    # shape.
+    result, _ = bench_on_hardware(a, b, n_inner=4, m_outer=5, warmup=1)
+    assert result.kernel_name == "tiled_gfx11_wmma_matmul"
+    assert result.m_outer == 5
+    assert result.n_inner == 4
+    assert result.samples_ns.shape == (5,)
+    assert result.samples_ns.dtype == np.int64
+    # Every sample must be positive — the C-side timer brackets at
+    # least one host->device dispatch + one stream sync; a zero or
+    # negative ns reading would mean the monotonic clock ran
+    # backwards, which would be a bug worth catching here.
+    assert int(result.samples_ns.min()) > 0
+    # Per-launch median is the outer-sample median divided by n_inner;
+    # mirror that contract from the C-side timing window down to the
+    # Python aggregation.
+    assert result.per_launch_median_ns == pytest.approx(
+        result.median_ns / result.n_inner
+    )
+    summary = result.summary()
+    assert "tiled_gfx11_wmma_matmul" in summary
 
 
 @_RUN_HIP_INVOKE_TESTS

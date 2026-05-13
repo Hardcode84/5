@@ -38,7 +38,13 @@ from typing import Any
 
 from ._native_paths import hip_runtime_lib_path, runtime_helpers_lib_path
 
-__all__ = ["InvokerCache", "make_invoker", "runtime_symbol_map"]
+__all__ = [
+    "InvokerCache",
+    "ensure_engine",
+    "kernel_arg_count",
+    "make_invoker",
+    "runtime_symbol_map",
+]
 
 # Symbols the host wrapper calls. The lists are short enough to enumerate
 # explicitly — wave does the same — and listing them here doubles as
@@ -51,10 +57,15 @@ _RUNTIME_HELPER_SYMBOLS: tuple[str, ...] = (
     "_mlir_ciface_hc_get_stride",
 )
 
+# Bench-mode wrappers (`hc-emit-bench-wrapper`) call `hc_rt_launch_kernel_repeat`
+# in place of the single-shot launch entry. Listing it unconditionally is fine:
+# the JIT only needs the address in its symbol table, and `bench=False`
+# payloads simply never produce a callsite that resolves it.
 _HIP_RUNTIME_SYMBOLS: tuple[str, ...] = (
     "hc_rt_init",
     "hc_rt_load_kernel",
     "hc_rt_launch_kernel",
+    "hc_rt_launch_kernel_repeat",
 )
 
 
@@ -107,7 +118,7 @@ def _missing_libs() -> list[str]:
     return [path for path in paths if not Path(path).exists()]
 
 
-def _kernel_arg_count(module: Any, kernel_name: str) -> int:
+def kernel_arg_count(module: Any, kernel_name: str) -> int:
     """Read the host wrapper's user-visible PyObject* arity from the IR.
 
     The `llvm.func @<name>(...)` op in the post-pipeline module has a
@@ -117,6 +128,12 @@ def _kernel_arg_count(module: Any, kernel_name: str) -> int:
     arg-validation level. Reading the IR (rather than re-deriving from
     `kernel_fn.__hc_kernel__` + Python signature) keeps Python and C++
     decoupled — the lowering pass owns the ABI, this just observes it.
+
+    The bench surface (`hc.compile(bench=True).bench(...)`) shares the
+    same user-arg arity contract — `-hc-emit-bench-wrapper` clones the
+    regular wrapper and only appends an `i64 n_inner` after the user
+    args, so reading off the regular wrapper is the right count for
+    either path.
     """
     body = module.body if hasattr(module, "body") else module
     target = "@" + kernel_name + "("
@@ -151,41 +168,59 @@ def _kernel_arg_count(module: Any, kernel_name: str) -> int:
 class InvokerCache:
     """Side-channel mutable state for the otherwise-frozen `CompiledKernel`.
 
-    Lazy-initialized on the first `invoke()` call so a `CompiledKernel`
-    that's only inspected (e.g. tests asserting on `hc_ir_text`) never
-    loads the JIT or the runtime libraries. Holding the engine here
-    keeps the JIT'd code alive as long as the cache (and therefore the
-    `CompiledKernel`) is alive; releasing the kernel handle drops the
-    engine and reclaims the JIT memory.
+    Lazy-initialized on the first `invoke()` (or `bench()`) call so a
+    `CompiledKernel` that's only inspected (e.g. tests asserting on
+    `hc_ir_text`) never loads the JIT or the runtime libraries.
+    Holding the engine here keeps the JIT'd code alive as long as the
+    cache (and therefore the `CompiledKernel`) is alive; releasing the
+    handle drops the engine and reclaims the JIT memory.
+
+    `engine` + `handle` are populated once on the first invoke-shaped
+    access (whichever of `invoke()` / `bench()` lands first). Both
+    `invoker` and `bench_invoker` are then materialized lazily off the
+    shared engine, so a session that only ever calls `bench()` doesn't
+    pay for a parallel invoke cfunc and vice versa.
     """
 
+    engine: Any | None = field(default=None)
+    handle: Any | None = field(default=None)
     invoker: Callable[..., Any] | None = field(default=None)
+    bench_invoker: Callable[..., Any] | None = field(default=None)
 
 
-def make_invoker(
-    module: Any,
-    kernel_name: str,
-) -> Callable[..., Any]:
-    """Build a callable that ctypes-dispatches into the host wrapper.
+def _require_runtime_libs() -> None:
+    """Raise if either runtime shared library is missing from the install.
 
-    Raises `RuntimeError` (not `ImportError`) when either runtime
-    shared library is missing — the package install is broken in a way
-    that's not the caller's fault, and downgrading to a plain import
-    error would invite "wrap with try/ImportError" patterns that mask
-    the real cause.
+    The bench surface and the regular invoke surface need the same set
+    of `.so`s (`libhc_rt_helpers.so` + `libhc_hip_runtime.so`); factor
+    the check so both call sites surface the same error text.
     """
     missing = _missing_libs()
-    if missing:
-        raise RuntimeError(
-            "hc.invoke: runtime shared libraries are missing from the "
-            "package install:\n  "
-            + "\n  ".join(missing)
-            + "\nReinstall hc (the build copies the .so files under "
-            "hc/_native/lib/) or run `python -m build_tools.hc_native_tools` "
-            "from a checkout."
-        )
+    if not missing:
+        return
+    raise RuntimeError(
+        "hc.invoke: runtime shared libraries are missing from the "
+        "package install:\n  "
+        + "\n  ".join(missing)
+        + "\nReinstall hc (the build copies the .so files under "
+        "hc/_native/lib/) or run `python -m build_tools.hc_native_tools` "
+        "from a checkout."
+    )
 
-    num_args = _kernel_arg_count(module, kernel_name)
+
+def ensure_engine(cache: InvokerCache, module: Any) -> tuple[Any, Any]:
+    """Lazy-build an `ExecutionEngine` + load the module text once per cache.
+
+    `bench()` and `invoke()` share the same JIT'd module — JIT-compiling
+    twice would double the per-CompiledKernel warmup cost on every
+    sample-driven benchmark, so we hand both call sites the same
+    `(engine, handle)` pair through the cache. Idempotent: a second
+    call returns the cached pair.
+    """
+    if cache.engine is not None:
+        return cache.engine, cache.handle
+
+    _require_runtime_libs()
 
     from .execution_engine import ExecutionEngine, ExecutionEngineOptions
 
@@ -199,6 +234,28 @@ def make_invoker(
     # invoke surface a single function call and matches what the rest
     # of the pipeline emits.
     handle = engine.load_mlir(str(module))
+    cache.engine = engine
+    cache.handle = handle
+    return engine, handle
+
+
+def make_invoker(
+    cache: InvokerCache,
+    module: Any,
+    kernel_name: str,
+) -> Callable[..., Any]:
+    """Build a callable that ctypes-dispatches into the host wrapper.
+
+    Shares the cache's `ExecutionEngine` (via `ensure_engine`) with any
+    bench invoker that the same CompiledKernel materializes later.
+    Raises `RuntimeError` (not `ImportError`) when either runtime
+    shared library is missing — the package install is broken in a way
+    that's not the caller's fault, and downgrading to a plain import
+    error would invite "wrap with try/ImportError" patterns that mask
+    the real cause.
+    """
+    engine, handle = ensure_engine(cache, module)
+    num_args = kernel_arg_count(module, kernel_name)
     func_ptr = engine.lookup(handle, kernel_name)
     if not func_ptr:
         raise RuntimeError(

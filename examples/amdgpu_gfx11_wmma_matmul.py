@@ -21,6 +21,13 @@ physical gfx11 GPU, comparing the result to ``reference_blocked_matmul``.
 Requires a working ROCm install with a gfx11 device visible to HIP and the
 ``torch`` package on the path.
 
+Pass ``--bench`` to compile with ``bench=True``, dispatch through
+``compiled.bench(...)`` against ``torch.cuda`` tensors, and print a small
+stats table (median / mean / std + per-launch derivations). The
+correctness check still runs first; benchmarking a wrong kernel is a
+waste of wall time. Requires the same ROCm + torch setup as
+``--run-on-hw``.
+
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
 accumulator distributed across workitems at the WorkGroup-level K loop
@@ -457,6 +464,30 @@ def make_demo_inputs(
     return a, b
 
 
+def _require_torch_cuda(surface: str):
+    """Import torch and confirm a HIP/ROCm device is visible.
+
+    Both `--run-on-hw` and `--bench` need the same precondition;
+    factoring the import + check keeps the error texts consistent
+    (`surface=` names which flag the caller passed so the message is
+    actionable instead of generic).
+    """
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{surface} needs the `torch` package to allocate device "
+            "buffers; `pip install torch` (with a ROCm-enabled wheel) and "
+            "retry."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{surface} needs a HIP/ROCm device visible to torch.cuda; "
+            "torch.cuda.is_available() returned False."
+        )
+    return torch
+
+
 def run_on_hardware(
     a: np.ndarray,
     b: np.ndarray,
@@ -476,19 +507,7 @@ def run_on_hardware(
     actionable message instead of a stack trace.
     """
 
-    try:
-        import torch
-    except ImportError as exc:
-        raise RuntimeError(
-            "--run-on-hw needs the `torch` package to allocate device "
-            "buffers; `pip install torch` (with a ROCm-enabled wheel) and "
-            "retry."
-        ) from exc
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "--run-on-hw needs a HIP/ROCm device visible to torch.cuda; "
-            "torch.cuda.is_available() returned False."
-        )
+    torch = _require_torch_cuda("--run-on-hw")
 
     import hc
 
@@ -505,6 +524,55 @@ def run_on_hardware(
     reference = reference_blocked_matmul(a, b)
     np.testing.assert_allclose(out, reference, rtol=rtol, atol=atol)
     return out
+
+
+def bench_on_hardware(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    n_inner: int = 50,
+    m_outer: int = 20,
+    warmup: int = 3,
+    rtol: float = 0.0,
+    atol: float = 2e-3,
+):
+    """Compile with bench=True, sanity-check the output, then bench.
+
+    Same device-allocation shape as `run_on_hardware`. The correctness
+    check fires before timing so a wrong kernel doesn't masquerade as a
+    fast one — the m_outer*n_inner extra launches against a wrong
+    accumulator are wall time the user has already paid for if the
+    sanity gate is on the far side of `compiled.bench(...)`.
+    """
+    torch = _require_torch_cuda("--bench")
+
+    import hc
+
+    m, _ = a.shape
+    _, n = b.shape
+    a_dev = torch.from_numpy(a).cuda()
+    b_dev = torch.from_numpy(b).cuda()
+    c_dev = torch.zeros(m, n, dtype=torch.float32, device="cuda")
+
+    compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11", bench=True)
+    # One untimed invoke to fill `c_dev` with the real result; the
+    # bench loop after this overwrites it `m_outer*n_inner` times with
+    # the same value (inputs are constant across samples) so the final
+    # readback still matches the reference. Doing the correctness check
+    # here — before the bench loop — keeps a misbehaving kernel from
+    # eating tens of seconds of wall time in the dispatch loop.
+    compiled.invoke(a_dev, b_dev, c_dev)
+    out = c_dev.cpu().numpy()
+    reference = reference_blocked_matmul(a, b)
+    np.testing.assert_allclose(out, reference, rtol=rtol, atol=atol)
+
+    result = compiled.bench(
+        (a_dev, b_dev, c_dev),
+        n_inner=n_inner,
+        m_outer=m_outer,
+        warmup=warmup,
+    )
+    return result, out
 
 
 def dump_front_ir() -> None:
@@ -578,6 +646,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "needs torch + a HIP/ROCm device"
         ),
     )
+    dump_group.add_argument(
+        "--bench",
+        action="store_true",
+        help=(
+            "compile for amdgpu-gfx11 with bench=True, sanity-check the "
+            "output, then run compiled.bench(...) and print the stats "
+            "table; needs torch + a HIP/ROCm device"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -602,6 +679,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         # order of f16 mantissa (~1e-3) for the demo's uniform [-1, 1]
         # inputs once we cross the f16 -> f32 accumulation boundary.
         print(f"max abs diff vs blocked fallback reference: {max_diff}")
+        return
+    if args.bench:
+        result, out = bench_on_hardware(a, b)
+        reference = reference_blocked_matmul(a, b)
+        max_diff = float(np.max(np.abs(out - reference)))
+        print("gfx11 WMMA tiled matmul example passed on real hardware.")
+        print(f"shape: A={a.shape}, B={b.shape}, C={out.shape}")
+        print(f"max abs diff vs blocked fallback reference: {max_diff}")
+        print(result.summary())
         return
 
     out = simulate_gfx11_wmma_matmul(a, b)

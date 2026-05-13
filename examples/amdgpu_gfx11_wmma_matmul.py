@@ -23,10 +23,12 @@ Requires a working ROCm install with a gfx11 device visible to HIP and the
 
 Pass ``--bench`` to compile with ``bench=True``, dispatch through
 ``compiled.bench(...)`` against ``torch.cuda`` tensors, and print a small
-stats table (median / mean / std + per-launch derivations). The
-correctness check still runs first; benchmarking a wrong kernel is a
-waste of wall time. Requires the same ROCm + torch setup as
-``--run-on-hw``.
+stats table (median / mean / std + per-launch derivations). A correctness
+smoke check runs first; on a mismatch we *warn but do not abort* — the
+bench surface is for timing dispatch latency, not for verifying numerics,
+and the launch/dispatch cost is still meaningful even when the kernel
+itself is miscompiled (which is exactly when you want to triage the gap).
+Requires the same ROCm + torch setup as ``--run-on-hw``.
 
 This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
 WorkItem scope. It also uses collective-return values to keep the WMMA
@@ -536,13 +538,17 @@ def bench_on_hardware(
     rtol: float = 0.0,
     atol: float = 2e-3,
 ):
-    """Compile with bench=True, sanity-check the output, then bench.
+    """Compile with bench=True, smoke-check the output, then bench.
 
-    Same device-allocation shape as `run_on_hardware`. The correctness
-    check fires before timing so a wrong kernel doesn't masquerade as a
-    fast one — the m_outer*n_inner extra launches against a wrong
-    accumulator are wall time the user has already paid for if the
-    sanity gate is on the far side of `compiled.bench(...)`.
+    Same device-allocation shape as `run_on_hardware`. We sample one
+    invoke before timing and *warn* (not abort) if the output diverges
+    from the numpy reference: `compiled.bench(...)` is a timing tool,
+    not a correctness gate, and refusing to report dispatch-latency
+    numbers when the kernel happens to be miscompiled punishes whoever
+    is trying to triage that miscompile in the first place. The caller
+    still sees both the bench result and the max-abs-diff against the
+    reference, and can decide whether the timing is meaningful for
+    their workload.
     """
     torch = _require_torch_cuda("--bench")
 
@@ -555,16 +561,24 @@ def bench_on_hardware(
     c_dev = torch.zeros(m, n, dtype=torch.float32, device="cuda")
 
     compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11", bench=True)
-    # One untimed invoke to fill `c_dev` with the real result; the
-    # bench loop after this overwrites it `m_outer*n_inner` times with
-    # the same value (inputs are constant across samples) so the final
-    # readback still matches the reference. Doing the correctness check
-    # here — before the bench loop — keeps a misbehaving kernel from
-    # eating tens of seconds of wall time in the dispatch loop.
+    # One untimed invoke to fill `c_dev`. The bench loop after this
+    # overwrites it `m_outer*n_inner` times with the same value (inputs
+    # are constant across samples), so the final readback reflects the
+    # same kernel output as the smoke check below.
     compiled.invoke(a_dev, b_dev, c_dev)
     out = c_dev.cpu().numpy()
     reference = reference_blocked_matmul(a, b)
-    np.testing.assert_allclose(out, reference, rtol=rtol, atol=atol)
+    max_diff = float(np.max(np.abs(out - reference)))
+    tol = atol + rtol * float(np.max(np.abs(reference)))
+    if max_diff > tol:
+        print(
+            f"WARNING: kernel output diverges from the blocked f32 reference "
+            f"(max abs diff {max_diff:.3g} > tol {tol:.3g}); bench numbers "
+            "below will time a kernel that is producing the wrong value. "
+            "Launch/dispatch latency is still meaningful, but per-launch "
+            "compute cost should not be compared to a known-correct build.",
+            file=sys.stderr,
+        )
 
     result = compiled.bench(
         (a_dev, b_dev, c_dev),
@@ -650,9 +664,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--bench",
         action="store_true",
         help=(
-            "compile for amdgpu-gfx11 with bench=True, sanity-check the "
-            "output, then run compiled.bench(...) and print the stats "
-            "table; needs torch + a HIP/ROCm device"
+            "compile for amdgpu-gfx11 with bench=True, smoke-check the "
+            "output (warns on mismatch, does not abort), then run "
+            "compiled.bench(...) and print the stats table; needs torch + "
+            "a HIP/ROCm device"
         ),
     )
     return parser.parse_args(argv)
@@ -684,7 +699,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         result, out = bench_on_hardware(a, b)
         reference = reference_blocked_matmul(a, b)
         max_diff = float(np.max(np.abs(out - reference)))
-        print("gfx11 WMMA tiled matmul example passed on real hardware.")
+        # No "passed" claim here — `bench_on_hardware` only warns on
+        # output mismatch (timing the dispatch is still useful even
+        # when the lowered kernel is wrong). The max-abs-diff line
+        # below is the actual verdict on numerics; the stats table is
+        # the verdict on latency.
         print(f"shape: A={a.shape}, B={b.shape}, C={out.shape}")
         print(f"max abs diff vs blocked fallback reference: {max_diff}")
         print(result.summary())

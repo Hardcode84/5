@@ -715,3 +715,53 @@ func.func @value_in_wmma_writeback(%vec: !hc.bare_vector<f32, ["8"]>,
   }
   return
 }
+
+// -----
+
+// Body-side iter-sym binding: the value-outs unroll surfaces each
+// iter sym's compile-time lane value as an explicit `(%const as
+// "i_0")` binding on every body `hc.idx_apply` / `hc.pred_apply`
+// whose expression references the iter sym without listing it. The
+// motivating consumer is the mask emitter — body computes
+// `(lo + step * i_0) < D0` without a prior pass needing to know the
+// concrete value of `i_0`. Here a 4-lane parallel sweep over a body
+// that pred-applies `i_0 < 2` on the iter sym alone, then yields a
+// per-lane predicated mask. After lowering, each lane's
+// `hc.pred_apply` should bind `i_0` to the per-lane constant
+// index — `0`, `1`, `2`, `3` in declaration order. The unpinned-
+// pred UCC just rounds the pinned `hc.pred_apply` result into the
+// `!hc.pred` shape `hc.yield_predicated`'s mask slot wants.
+// CHECK-LABEL: func.func @value_out_body_iter_sym
+// CHECK-NOT: scf.parallel
+// Each lane's body pred_apply gets augmented with the lane const as
+// the "i_0" binding. The const for parLane=0 isn't checked against a
+// specific SSA name because `buildZeroIterScope` plants an unrelated
+// `arith.constant 0` ahead of the lane consts and FileCheck would
+// otherwise bind to that one. Subsequent lanes are pinned via
+// CHECK-NEXT — the lane const is the line directly above its
+// `hc.pred_apply`.
+// CHECK: hc.pred_apply (%{{[^ ]+}} as "i_0") : (index) -> !hc.pred
+// CHECK: %[[C1:[^ ]+]] = arith.constant 1 : index
+// CHECK-NEXT: hc.pred_apply (%[[C1]] as "i_0") : (index) -> !hc.pred
+// CHECK: %[[C2:[^ ]+]] = arith.constant 2 : index
+// CHECK-NEXT: hc.pred_apply (%[[C2]] as "i_0") : (index) -> !hc.pred
+// CHECK: %[[C3:[^ ]+]] = arith.constant 3 : index
+// CHECK-NEXT: hc.pred_apply (%[[C3]] as "i_0") : (index) -> !hc.pred
+// CHECK: vector.from_elements
+// CHECK-NOT: hc.generic
+func.func @value_out_body_iter_sym(%init: !hc.bare_vector<!hc.pred, ["4"]>)
+    -> !hc.bare_vector<!hc.pred, ["4"]> {
+  %n = hc.idx_apply () : () -> !hc.idx<"4">
+  %r = hc.generic
+      iter (parallel i_0 = %n : !hc.idx<"4">)
+      ins ()
+      outs (%init at [#hc.expr<"i_0">] : !hc.bare_vector<!hc.pred, ["4"]>)
+      -> (!hc.bare_vector<!hc.pred, ["4"]>) {
+  ^bb0(%iv: !hc.pred):
+    %p_pinned = hc.pred_apply () : () -> !hc.pred<"i_0 < 2">
+    %p = builtin.unrealized_conversion_cast %p_pinned
+        : !hc.pred<"i_0 < 2"> to !hc.pred
+    hc.yield_predicated %iv mask %p : (!hc.pred), (!hc.pred)
+  }
+  return %r : !hc.bare_vector<!hc.pred, ["4"]>
+}

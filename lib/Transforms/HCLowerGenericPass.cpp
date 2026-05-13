@@ -789,6 +789,107 @@ static Value emitOffset(OpBuilder &builder, Location loc, ExprAttr offsetExpr,
   return castIdxToIndex(builder, loc, applied);
 }
 
+// Body-authoring convention for `hc.generic`: an op inside the body
+// may reference iter syms by name in its `!hc.idx<...>` / `!hc.pred<...>`
+// expression with no explicit binding to a runtime value — the
+// expectation is the lowering supplies the binding when it realises a
+// specific lane. The mask emitters (`hc-load-store-to-generic`'s
+// `hc.load_mask` case, future OOB-tile guards) lean on this so the
+// body can compute `(lo + step * i_0) < D0` without first knowing
+// what concrete value `i_0` has on this iteration.
+//
+// `cloned` was just produced by `builder.clone(&nested, mapping)`. If
+// it's an `hc.idx_apply` / `hc.pred_apply` whose expression references
+// iter syms in `iterScope` but doesn't already list them as bindings,
+// replace it with an augmented op that pins each missing iter sym to
+// `iterScope[sym]`. The expression is preserved verbatim — bindings
+// only provide runtime integers for free symbols, they don't rewrite
+// the symbolic form. Updates `mapping` so subsequent body clones that
+// reference `nested`'s results see the augmented op's; replaces the
+// stale clone's uses and erases it.
+//
+// No-op for body ops that aren't `hc.idx_apply` / `hc.pred_apply`,
+// for empty `iterScope` (the partition / reduction call sites today),
+// and for ops whose expression doesn't reference any iter sym in
+// scope. The path is cheap on the common case — one lookup per body
+// op, one walk over its expression's free names.
+static void bindIterSymsInClone(OpBuilder &builder, Operation &nested,
+                                Operation *cloned,
+                                const llvm::StringMap<Value> &iterScope,
+                                IRMapping &mapping) {
+  if (iterScope.empty())
+    return;
+  ArrayAttr existingSyms;
+  bool isIdx = false;
+  if (auto idx = dyn_cast<HCIdxApplyOp>(cloned)) {
+    auto idxTy = dyn_cast<IdxType>(idx.getResult().getType());
+    if (!idxTy || !idxTy.getExpr())
+      return;
+    existingSyms = idx.getSymbolsAttr();
+    isIdx = true;
+  } else if (auto pred = dyn_cast<HCPredApplyOp>(cloned)) {
+    auto predTy = dyn_cast<PredType>(pred.getResult().getType());
+    if (!predTy || !predTy.getPred())
+      return;
+    existingSyms = pred.getSymbolsAttr();
+  } else {
+    return;
+  }
+
+  llvm::StringSet<> already;
+  for (Attribute n : existingSyms)
+    already.insert(cast<StringAttr>(n).getValue());
+
+  SmallVector<StringRef, 4> additions;
+  auto walker = [&](StringRef name) {
+    if (already.contains(name))
+      return;
+    if (!iterScope.count(name))
+      return;
+    if (llvm::is_contained(additions, name))
+      return;
+    additions.push_back(name);
+  };
+  if (isIdx) {
+    auto idxTy = cast<IdxType>(cloned->getResult(0).getType());
+    sym::walkSymbolNames(idxTy.getExpr().getValue(), walker);
+  } else {
+    auto predTy = cast<PredType>(cloned->getResult(0).getType());
+    sym::walkSymbolNames(predTy.getPred().getValue(), walker);
+  }
+  if (additions.empty())
+    return;
+
+  // Sort for deterministic textual form across rebuilds — see the
+  // matching note on `emitOffset`.
+  llvm::sort(additions);
+
+  SmallVector<Value> newOperands(cloned->getOperands());
+  SmallVector<Attribute> newSyms(existingSyms.begin(), existingSyms.end());
+  for (StringRef name : additions) {
+    newOperands.push_back(iterScope.lookup(name));
+    newSyms.push_back(builder.getStringAttr(name));
+  }
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(cloned);
+  Operation *replacement;
+  if (isIdx) {
+    replacement = HCIdxApplyOp::create(
+        builder, cloned->getLoc(), cloned->getResult(0).getType(), newOperands,
+        builder.getArrayAttr(newSyms));
+  } else {
+    replacement = HCPredApplyOp::create(
+        builder, cloned->getLoc(), cloned->getResult(0).getType(), newOperands,
+        builder.getArrayAttr(newSyms));
+  }
+  for (auto [origRes, newRes] :
+       llvm::zip_equal(nested.getResults(), replacement->getResults()))
+    mapping.map(origRes, newRes);
+  cloned->replaceAllUsesWith(replacement);
+  cloned->erase();
+}
+
 // UCC a per-lane mask to the type `arith.select` requires (`i1` for
 // scalar selects, `vector<Nxi1>` for vector selects). Inputs at this
 // boundary are whatever the body's mask block arg resolved to —
@@ -825,6 +926,7 @@ static Value coerceMaskToI1(OpBuilder &builder, Location loc, Value mask,
 //     pred-to-i1 resolution.
 static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
                                ValueRange insVals, ValueRange outsVals,
+                               const llvm::StringMap<Value> &iterScope,
                                SmallVectorImpl<Value> &yieldedOut) {
   Block &src = op.getBody().front();
   IRMapping mapping;
@@ -837,7 +939,8 @@ static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
   for (Operation &nested : src) {
     if (&nested == &term)
       break;
-    builder.clone(nested, mapping);
+    Operation *cloned = builder.clone(nested, mapping);
+    bindIterSymsInClone(builder, nested, cloned, iterScope, mapping);
   }
   yieldedOut.clear();
   if (auto yield = dyn_cast<HCYieldOp>(&term)) {
@@ -1124,7 +1227,17 @@ emitInnerBodyClones(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
       insVals[ii] = insLanes[ii][lane];
     SmallVector<Value> outsVals = acc[parLane];
     SmallVector<Value> yielded;
-    if (failed(cloneBody(builder, op, insVals, outsVals, yielded)))
+    // Partition / reduction path doesn't expose iter-sym SSA bindings
+    // to the body yet — emitInsLoadsLaned bakes deltas into the
+    // operand-offset side, and the body's only iter-sym story today is
+    // the value-outs unroll in `lowerValueOuts`. Pass an empty scope so
+    // `bindIterSymsInClone` no-ops here. Wiring this up properly is a
+    // follow-up if a body op ever references an iter sym from the
+    // partition path; the lane induction var is in `scope`, so the
+    // augmentation would emit one `+ delta_a` constant per axis.
+    llvm::StringMap<Value> emptyIterScope;
+    if (failed(
+            cloneBody(builder, op, insVals, outsVals, emptyIterScope, yielded)))
       return failure();
     if (yielded.size() != numOuts)
       return op.emitOpError("body yielded wrong arity");
@@ -1468,7 +1581,11 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
       }
 
       SmallVector<Value> yielded;
-      if (failed(cloneBody(builder, op, insVals, outsVals, yielded))) {
+      // Reduction-collective path doesn't expose iter-sym SSA bindings
+      // to the body — same rationale as the partition path above.
+      llvm::StringMap<Value> emptyIterScope;
+      if (failed(cloneBody(builder, op, insVals, outsVals, emptyIterScope,
+                           yielded))) {
         bodyStatus = failure();
       } else if (yielded.size() != op.getOuts().size()) {
         bodyStatus = op.emitOpError("body yielded wrong arity");
@@ -1778,33 +1895,59 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
     }
     // Value-typed out: per-parLane init = `vector.extract` at slot.
     // The slot is the integer the offset evaluates to for that lane;
-    // it's not necessarily `parLane` (the offset might permute).
+    // it's not necessarily `parLane` (the offset might permute). Non-
+    // builtin element types (`!hc.pred` from a bare-mask out — the
+    // shape the `hc.load_mask` rewrite produces) ride the same UCC
+    // chain the value-ins path uses: bridge the carrier to its
+    // `vector<NxBuiltin>` shape, extract per lane, then UCC each
+    // lane back to the body's expected element type so the per-lane
+    // mapping in `cloneBody` sees the matching SSA type.
     auto count = getValueOutLaneCount(v.getType());
     auto shaped = cast<SymbolicallyShapedTypeInterface>(v.getType());
     Type elemTy = shaped.getSymbolicElementType();
-    mlir::VectorType vecTy = mlir::VectorType::get({*count}, elemTy);
+    Type builtinElem = asBuiltinElementType(elemTy);
+    if (!builtinElem)
+      return op.emitOpError("value-outs lowering: outs #")
+             << oi << " has unsupported element type for vector carrier";
+    mlir::VectorType vecTy = mlir::VectorType::get({*count}, builtinElem);
     Value asVec = v;
     if (v.getType() != Type(vecTy))
       asVec = UnrealizedConversionCastOp::create(builder, loc, vecTy, v)
                   .getResult(0);
     for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
       int64_t slot = slotPerOut[oi][parLane];
-      outsInit[parLane][oi] = vector::ExtractOp::create(builder, loc, asVec,
-                                                        ArrayRef<int64_t>{slot})
-                                  .getResult();
+      Value lane = vector::ExtractOp::create(builder, loc, asVec,
+                                             ArrayRef<int64_t>{slot})
+                       .getResult();
+      if (lane.getType() != elemTy)
+        lane = UnrealizedConversionCastOp::create(builder, loc, elemTy, lane)
+                   .getResult(0);
+      outsInit[parLane][oi] = lane;
     }
   }
 
-  // Per-parLane body clones. Iter syms have no SSA representation in
-  // the body (they're symbolic in offset exprs only), so the clone
-  // mapping just covers ins + outs block args.
+  // Per-parLane body clones. The full unroll gives every iter sym a
+  // compile-time integer value on each lane, so we materialise a
+  // constant-index SSA per (iter_sym, parLane) and feed it as the
+  // body's iter-sym scope. `bindIterSymsInClone` walks each cloned
+  // `hc.idx_apply` / `hc.pred_apply` in the body and appends an iter
+  // sym binding wherever the body's expression references one without
+  // an explicit operand — the body-authoring convention the mask
+  // emitters rely on (see `bindIterSymsInClone`'s comment).
   SmallVector<SmallVector<Value>> finals(prodPar, SmallVector<Value>(numOuts));
   for (int64_t lane = 0; lane < prodPar; ++lane) {
     SmallVector<Value> insVals(numIns);
     for (size_t ii = 0; ii < numIns; ++ii)
       insVals[ii] = insLanes[ii][lane];
+    SmallVector<int, 4> coords =
+        decomposeLaneIndex(static_cast<int>(lane), bounds);
+    llvm::StringMap<Value> laneIterScope;
+    for (auto [ax, c] : llvm::zip_equal(axes, coords))
+      laneIterScope[ax.name] =
+          arith::ConstantIndexOp::create(builder, loc, c).getResult();
     SmallVector<Value> yielded;
-    if (failed(cloneBody(builder, op, insVals, outsInit[lane], yielded)))
+    if (failed(cloneBody(builder, op, insVals, outsInit[lane], laneIterScope,
+                         yielded)))
       return failure();
     if (yielded.size() != numOuts)
       return op.emitOpError("body yielded wrong arity");
@@ -1837,13 +1980,29 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
       }
       continue;
     }
+    // Mirrors the outs-init path's UCC chain: bridge the body's
+    // element type (`!hc.pred` for the mask carrier; arbitrary
+    // `!hc.idx<...>` would also fall here) to its builtin element so
+    // `vector.from_elements` can compose, then UCC the assembled
+    // `vector<NxBuiltin>` back to the operand's bare-vector carrier
+    // for the original consumer.
     auto count = getValueOutLaneCount(v.getType());
     auto shaped = cast<SymbolicallyShapedTypeInterface>(v.getType());
     Type elemTy = shaped.getSymbolicElementType();
-    mlir::VectorType vecTy = mlir::VectorType::get({*count}, elemTy);
+    Type builtinElem = asBuiltinElementType(elemTy);
+    if (!builtinElem)
+      return op.emitOpError("value-outs lowering: outs #")
+             << oi << " has unsupported element type for vector carrier";
+    mlir::VectorType vecTy = mlir::VectorType::get({*count}, builtinElem);
     SmallVector<Value> elems(*count);
-    for (int64_t parLane = 0; parLane < prodPar; ++parLane)
-      elems[slotPerOut[oi][parLane]] = finals[parLane][oi];
+    for (int64_t parLane = 0; parLane < prodPar; ++parLane) {
+      Value lane = finals[parLane][oi];
+      if (lane.getType() != builtinElem)
+        lane =
+            UnrealizedConversionCastOp::create(builder, loc, builtinElem, lane)
+                .getResult(0);
+      elems[slotPerOut[oi][parLane]] = lane;
+    }
     Value vec =
         vector::FromElementsOp::create(builder, loc, vecTy, elems).getResult();
     Value asOrig = vec;

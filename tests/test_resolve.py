@@ -52,9 +52,17 @@ def _ensure_hc_front_bindings_available() -> None:
 # scopes.
 _FIXTURE_M = sym.M
 _FIXTURE_N = sym.N
+_FIXTURE_K = sym.K
 _FIXTURE_LAYOUT = index_map(
     storage_size=lambda w, h: w * h,
     offset=lambda i, j, w, h: i * h + j,
+)
+# Selector-bearing layout fixture: rank-2 tile shape, one trailing
+# per-lane selector. See HC_LayoutAttr description for the convention
+# (index_syms strictly longer than shape_syms = selector tail).
+_FIXTURE_SELECTOR_LAYOUT = index_map(
+    storage_size=lambda d0, d1: d1,
+    offset=lambda i, j, lane, d0, d1: j,
 )
 
 
@@ -69,6 +77,18 @@ def _param_layout_kernel(
 def _as_layout_body_kernel(group, a: Buffer[_FIXTURE_M, _FIXTURE_N]) -> None:
     v = group.vzeros(shape=(16,))
     _ = as_layout(v, _FIXTURE_LAYOUT)
+    return
+
+
+@kernel(work_shape=(ceil_div(_FIXTURE_M, 16),), group_shape=(16,))
+def _selector_layout_vload_kernel(
+    group,
+    a: Buffer[_FIXTURE_M, _FIXTURE_K, np.float16, _FIXTURE_SELECTOR_LAYOUT],
+    i: sym.idx,
+    j: sym.idx,
+    lane: sym.idx,
+) -> None:
+    _ = group.vload(a, i, j, lane, shape=(16,))
     return
 
 
@@ -522,6 +542,49 @@ def test_resolve_index_map_without_params_emits_empty_table() -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_resolve_index_map_selector_layout_serializes() -> None:
+    """``IndexMap`` whose ``offset`` lambda lists more leading positional
+    parameters than the shape has dimensions: the trailing names beyond
+    rank are *selectors* (see HC_LayoutAttr description). The resolver
+    splits the offset signature into ``(index_syms, shape_syms,
+    [params])`` regardless of whether the index_sym tail is rank-wide,
+    so the ref payload carries ``index_syms`` strictly longer than
+    ``shape_syms`` without any selector-specific code path.
+    """
+    _ensure_hc_front_bindings_available()
+
+    from hc import kernel, sym
+    from hc.core import index_map
+    from hc.symbols import ceil_div
+
+    M = sym.M
+    K = sym.K
+
+    # A minimal WMMA-A-fragment-ish layout: rank-2 (M, K) tile, one
+    # per-lane selector; per-lane storage is just the K column.
+    A_FRAG = index_map(
+        storage_size=lambda d0, d1: d1,
+        offset=lambda i, j, lane, d0, d1: j,
+    )
+
+    @kernel(work_shape=(ceil_div(M, 16),), group_shape=(16,))
+    def uses_a_frag(group, a: Buffer[M, K]) -> None:
+        _ = A_FRAG
+        return
+
+    resolved = resolve_front_ir(uses_a_frag)
+    name_refs = _name_refs(resolved.module)
+
+    (ref,) = name_refs["A_FRAG"]
+    assert ref["kind"] == "layout"
+    assert ref["shape_syms"] == '["d0", "d1"]'
+    assert ref["index_syms"] == '["i", "j", "lane"]'
+    assert ref["params"] == "{}"
+    assert ref["storage_size"] == '#hc.expr<"d1">'
+    assert ref["offset"] == '#hc.expr<"j">'
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
     """The free ``as_layout`` function is a DSL primitive, not an
     inlinable helper. The resolver must produce a ``layout_op`` ref so
@@ -606,6 +669,60 @@ def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
     assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
     assert "storage_size = #hc.expr<" in hc_text, hc_text
     assert "offset = #hc.expr<" in hc_text, hc_text
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
+def test_selector_index_layout_lands_on_vload_with_extra_operand() -> None:
+    """End-to-end pin: a selector-bearing layout drives an access op
+    with one more index operand than the source rank. The kernel calls
+    ``group.vload(tile, i, j, lane, shape=...)`` against a buffer
+    annotated with an ``index_syms = ["i", "j", "lane"]`` layout, and
+    the resulting ``hc.vload`` after ``--convert-hc-front-to-hc`` has
+    three index positions wired through verbatim.
+
+    No new frontend code path is needed for this — the Python ->
+    hc_front lowering already passes positional ``vload`` args through
+    as indices, the resolver already counts the leading positional
+    params of ``offset`` as ``index_syms``, and the C++ verifier on
+    ``hc-verify-static-shapes`` admits up to ``index_syms.size()``
+    indices. This test pins all three contracts at once.
+
+    Lives at module scope alongside its kernel for the same PEP 563 +
+    eval_str reason as the layout-parameter test.
+    """
+    import subprocess
+
+    from hc._native_paths import hc_opt_path
+
+    _ensure_hc_front_bindings_available()
+
+    resolved = resolve_front_ir(_selector_layout_vload_kernel)
+    front_text = str(resolved.module)
+    # Resolver-side: the kernel-parameter layout carries the selector
+    # tail; the body-call indices stay positional.
+    assert 'index_syms = ["i", "j", "lane"]' in front_text, front_text
+
+    result = subprocess.run(
+        [str(hc_opt_path()), "--convert-hc-front-to-hc"],
+        input=front_text,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (
+        result.returncode == 0
+    ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    hc_text = result.stdout
+    # The BufferType's LayoutAttr is the captured selector layout (no
+    # default-strided fallback).
+    assert "$STRIDE_" not in hc_text, hc_text
+    assert 'index_syms = ["i", "j", "lane"]' in hc_text, hc_text
+    # The vload must end up with three index operands wired through —
+    # one more than the rank-2 buffer source's dimension count.
+    assert "hc.vload" in hc_text, hc_text
+    vload_line = next(line for line in hc_text.splitlines() if "hc.vload" in line)
+    operand_block = vload_line.split("[", 1)[1].split("]", 1)[0]
+    assert operand_block.count(",") == 2, vload_line
 
 
 def test_buffer_class_getitem_captures_trailing_index_map_as_layout() -> None:

@@ -277,7 +277,7 @@ def _layout_storage_size(
         if layout.params is None
         else layout.storage_size(*shape, params)
     )
-    size = _layout_int(raw, what="layout storage size")
+    size = layout_int(raw, what="layout storage size")
     if size < 0:
         raise SimulatorError("layout storage size must be non-negative")
     return size
@@ -303,7 +303,7 @@ def _validate_layout_offsets(
             if layout.params is None
             else layout.offset(*index, *shape, params)
         )
-        offset = _layout_int(raw, what="layout offset")
+        offset = layout_int(raw, what="layout offset")
         if offset < 0 or offset >= storage_size:
             raise SimulatorError("layout offset is out of bounds")
         if offset in seen:
@@ -347,7 +347,7 @@ def _validate_selector_layout_offsets(
             if layout.params is None
             else layout.offset(*index, *zero_selectors, *shape, params)
         )
-        offset = _layout_int(raw, what="layout offset")
+        offset = layout_int(raw, what="layout offset")
         if offset < 0 or offset >= storage_size:
             raise SimulatorError(
                 "selector layout offset is out of bounds at zero-selector probe"
@@ -360,7 +360,7 @@ def _validate_selector_layout_offsets(
         seen.add(offset)
 
 
-def _layout_int(value: Any, *, what: str) -> int:
+def layout_int(value: Any, *, what: str) -> int:
     if isinstance(value, bool):
         raise SimulatorError(f"{what} must be an integer")
     try:

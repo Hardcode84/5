@@ -56,6 +56,18 @@ _SELECTOR_NON_INJECTIVE_LAYOUT = index_map(
     offset=lambda i, lane, n: lane,
 )
 
+# Interleaved per-lane gather: with `_INTERLEAVED_LANES` lanes, lane `L`'s
+# element `k` lives at flat offset `k * _INTERLEAVED_LANES + L` — strided
+# reads with stride = lane count. The zero-selector probe walks `k = 0..N-1`
+# and sees offsets `[0, lanes, 2*lanes, ...]`, all in `[0, lanes * N)` and
+# pairwise distinct.
+_INTERLEAVED_LANES = 4
+_INTERLEAVED_PER_LANE = 3
+_INTERLEAVED_LAYOUT = index_map(
+    storage_size=lambda n: n * _INTERLEAVED_LANES,
+    offset=lambda k, lane, n: k * _INTERLEAVED_LANES + lane,
+)
+
 _EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
     [
         [1, 3],
@@ -521,6 +533,60 @@ def test_resolve_layout_rejects_shape_rank_mismatch() -> None:
     # rather than by an opaque TypeError from inside the lambda.
     with pytest.raises(sim.SimulatorError, match="rank"):
         resolve_layout(_PER_LANE_VECTOR_LAYOUT, (2, 3))
+
+
+def test_vload_selector_layout_gathers_per_lane() -> None:
+    total = _INTERLEAVED_LANES * _INTERLEAVED_PER_LANE
+
+    @kernel(work_shape=(_INTERLEAVED_LANES,), group_shape=(1,))
+    def gather_kernel(
+        group,
+        src: Buffer[total, np.int64],
+        dst: Buffer[_INTERLEAVED_LANES, _INTERLEAVED_PER_LANE, np.int64],
+    ) -> None:
+        lane = group.work_offset[0]
+        vec = group.vload(
+            src,
+            lane,
+            shape=(_INTERLEAVED_PER_LANE,),
+            layout=_INTERLEAVED_LAYOUT,
+        )
+        group.store(dst[lane, :], vec)
+
+    src_data = np.arange(total, dtype=np.int64)
+    dst_data = np.zeros((_INTERLEAVED_LANES, _INTERLEAVED_PER_LANE), dtype=np.int64)
+
+    sim.launch(gather_kernel, src_data, dst_data)
+
+    expected = src_data.reshape(_INTERLEAVED_PER_LANE, _INTERLEAVED_LANES).T
+    np.testing.assert_array_equal(dst_data, expected)
+
+
+def test_vload_selector_layout_rejects_wrong_selector_count() -> None:
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group, src: Buffer[12, np.int64]) -> None:
+        # Layout demands one selector; pass zero. Surfaces as a
+        # SimulatorError naming the arity, not a TypeError from inside
+        # the offset lambda.
+        _ = group.vload(src, shape=(3,), layout=_INTERLEAVED_LAYOUT)
+
+    src_data = np.arange(12, dtype=np.int64)
+    with pytest.raises(sim.SimulatorError, match="selector"):
+        sim.launch(bad, src_data)
+
+
+def test_vload_positional_indices_rejected_without_selector_layout() -> None:
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def bad(group, src: Buffer[12, np.int64]) -> None:
+        # No layout on the call AND no selector layout on the source,
+        # but a positional index is supplied. There's nowhere to bind
+        # it, so we surface a focused error rather than silently
+        # ignoring the operand.
+        _ = group.vload(src, 1, shape=(3,))
+
+    src_data = np.arange(12, dtype=np.int64)
+    with pytest.raises(sim.SimulatorError, match="no selector-bearing layout"):
+        sim.launch(bad, src_data)
 
 
 def test_masked_load_respects_mask_value_and_mask_activity() -> None:

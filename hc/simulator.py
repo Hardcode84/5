@@ -33,6 +33,7 @@ from ._sim_types import (
     SimTensor,
     SimulatorError,
     SimVector,
+    layout_int,
     poison,
     resolve_layout,
 )
@@ -302,7 +303,7 @@ class SimCurrentGroup(CurrentGroup):
     def load(
         self,
         source: Any,
-        *,
+        *indices: Any,
         shape: Sequence[Any] | None = None,
         mask: SimTensor | SimVector | None = None,
         layout: Any = None,
@@ -313,6 +314,11 @@ class SimCurrentGroup(CurrentGroup):
         that tile in dense NumPy order and carries any `layout=` as validated
         metadata. If the source slice is larger than that tile, the extra
         source region is ignored.
+
+        Trailing positional `*indices` bind selector syms of a
+        selector-bearing layout; their count must equal the layout's
+        `selector_arity`. With no layout (or `selector_arity == 0`) no
+        positional indices are accepted.
         """
         self._require_workgroup_scope("group.load()")
         return cast(
@@ -320,6 +326,7 @@ class SimCurrentGroup(CurrentGroup):
             _load_value(
                 SimTensor,
                 source,
+                indices=indices,
                 shape=shape,
                 mask=mask,
                 env=self._env,
@@ -332,7 +339,7 @@ class SimCurrentGroup(CurrentGroup):
     def vload(
         self,
         source: Any,
-        *,
+        *indices: Any,
         shape: Sequence[Any] | None = None,
         mask: SimTensor | SimVector | None = None,
         layout: Any = None,
@@ -343,6 +350,7 @@ class SimCurrentGroup(CurrentGroup):
             _load_value(
                 SimVector,
                 source,
+                indices=indices,
                 shape=shape,
                 mask=mask,
                 env=self._env,
@@ -1305,6 +1313,7 @@ def _load_value(
     kind: type[SimTensor] | type[SimVector],
     source: Any,
     *,
+    indices: tuple[Any, ...],
     shape: Sequence[Any] | None,
     mask: SimTensor | SimVector | None,
     env: FrozenEnv,
@@ -1315,10 +1324,12 @@ def _load_value(
     if (shape is None) == (mask is None):
         raise SimulatorError("load requires exactly one of shape= or mask=")
     if mask is not None:
-        return _load_masked(kind, source, mask, layout=layout)
+        return _load_masked(kind, source, mask, indices=indices, layout=layout)
     resolved = _resolve_runtime_shape(shape, env, literal_names, static=static)
     resolved_layout = resolve_layout(layout, resolved)
-    return _copy_loaded_value(kind, source, resolved, layout=resolved_layout)
+    return _copy_loaded_value(
+        kind, source, resolved, indices=indices, layout=resolved_layout
+    )
 
 
 def _load_masked(
@@ -1326,11 +1337,14 @@ def _load_masked(
     source: Any,
     mask: SimTensor | SimVector,
     *,
+    indices: tuple[Any, ...],
     layout: Any,
 ) -> SimTensor | SimVector:
     _require_bool_mask(mask)
     resolved_layout = resolve_layout(layout, mask.shape)
-    copied = _copy_loaded_value(kind, source, mask.shape, layout=resolved_layout)
+    copied = _copy_loaded_value(
+        kind, source, mask.shape, indices=indices, layout=resolved_layout
+    )
     active = np.logical_and(copied._mask, np.logical_and(mask._mask, mask._data))
     return kind(copied._data, active, layout=copied.layout)
 
@@ -1340,8 +1354,26 @@ def _copy_loaded_value(
     source: Any,
     shape: tuple[int, ...],
     *,
+    indices: tuple[Any, ...],
     layout: Any,
 ) -> SimTensor | SimVector:
+    if layout is not None and layout.selector_arity > 0:
+        if len(indices) != layout.selector_arity:
+            raise SimulatorError(
+                f"selector-bearing layout expects {layout.selector_arity} "
+                f"selector operand(s); got {len(indices)}"
+            )
+        return _gather_loaded_value(kind, source, shape, indices=indices, layout=layout)
+    if indices:
+        # Non-empty `indices` only have a defined meaning under a
+        # selector-bearing layout — there's no place else to bind them.
+        # Reject with a focused message rather than letting them fall
+        # through to a contiguous load whose semantics ignored the
+        # operands silently.
+        raise SimulatorError(
+            f"load/vload received {len(indices)} positional index operand(s) "
+            f"but the source has no selector-bearing layout to bind them"
+        )
     source_data, source_mask = _source_arrays(source)
     if source_data.ndim != len(shape):
         raise SimulatorError("load rank does not match the requested shape")
@@ -1354,6 +1386,46 @@ def _copy_loaded_value(
     )
     result_data[overlap] = source_data[overlap]
     result_mask[overlap] = source_mask[overlap]
+    return kind(result_data, result_mask, layout=layout)
+
+
+def _gather_loaded_value(
+    kind: type[SimTensor] | type[SimVector],
+    source: Any,
+    shape: tuple[int, ...],
+    *,
+    indices: tuple[Any, ...],
+    layout: Any,
+) -> SimTensor | SimVector:
+    """Evaluate the layout per logical element and gather scalars from source.
+
+    Mirrors what `hc-flatten-with-layouts` will produce post-lowering: the
+    layout's `offset(*logical_index, *selectors, *fragment_shape[, params])`
+    is computed once per logical position in `shape`, and the result reads
+    the source at that flat offset. OOB offsets clip to a zero/false slot
+    (same masking contract as the contiguous path). The result keeps the
+    same layout metadata so downstream consumers (`as_layout`, layout-aware
+    ops) see the selector-bearing layout was honoured.
+    """
+    selectors = tuple(layout_int(idx, what="selector operand") for idx in indices)
+    source_data, source_mask = _source_arrays(source)
+    flat_source = np.ravel(source_data)
+    flat_mask = np.ravel(source_mask)
+    result_data = np.zeros(shape, dtype=source_data.dtype)
+    result_mask = np.zeros(shape, dtype=bool)
+    spec = layout.spec
+    params = layout.params
+    for logical_index in _iter_indices(shape):
+        if spec.params is None:
+            raw = spec.offset(*logical_index, *selectors, *shape)
+        else:
+            raw = spec.offset(*logical_index, *selectors, *shape, params)
+        offset = layout_int(raw, what="layout offset")
+        if 0 <= offset < flat_source.size:
+            result_data[logical_index] = flat_source[offset]
+            result_mask[logical_index] = flat_mask[offset]
+        # else: OOB — leave zero/false, same clip-and-pad contract as the
+        # contiguous overlap path above.
     return kind(result_data, result_mask, layout=layout)
 
 

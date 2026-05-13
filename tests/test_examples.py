@@ -91,14 +91,9 @@ def test_gfx11_wmma_example_benches_on_real_hardware() -> None:
 
     a, b = make_demo_inputs(m=32, n=32, k=32, seed=17)
     # Modest m_outer/n_inner so the test runs in a few hundred ms even
-    # on a slow gfx11 host. `bench_on_hardware` no longer asserts the
-    # kernel output matches the numpy reference (a separate test —
-    # `test_gfx11_wmma_example_invokes_on_real_hardware` — already
-    # pins that contract), it just warns. This test is here to pin the
-    # bench surface: the right `BenchResult` shape comes out of the
-    # JIT + HIP path with monotonic ns samples and a coherent stats
-    # table, independent of whether the lowered kernel happens to be
-    # numerically right on the host's gfx11 hardware today.
+    # on a slow gfx11 host. `bench_on_hardware` asserts the kernel
+    # output matches the numpy reference before timing, so reaching the
+    # `BenchResult` assertions here is also implicit numerics coverage.
     result, _ = bench_on_hardware(a, b, n_inner=4, m_outer=5, warmup=1)
     assert result.kernel_name == "tiled_gfx11_wmma_matmul"
     assert result.m_outer == 5

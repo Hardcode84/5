@@ -65,6 +65,43 @@ func.func @vload_basic(%src: !hc.tensor<f32, ["M", "N"]>,
 
 // -----
 
+// Selector-bind `hc.vload`: source carries a layout whose `index_syms`
+// is `shape_syms` (2 entries) plus a trailing selector (`lane`). The
+// access supplies exactly one operand — the selector — and the rest
+// of the binding gets filled in by the rewriter: the leading two
+// `index_syms` (`i0`, `i1`) bind to the result's iter syms positionally
+// via identity-over-iter per-axis offsets, and `lane` rides along as an
+// `ambient` SSA / name pair so `hc-flatten-with-layouts` has a real
+// dataflow edge to compose against the layout's offset expression
+// instead of trying to recover the binding from surrounding scope. The
+// per-axis count stays equal to operand rank to honour the
+// `hc.generic` verifier; flatten pads the substitution against the
+// layout's index_syms internally. See the "Selectors in #hc.layout"
+// section of `doc/layouts.md`.
+// CHECK-LABEL: func.func @vload_selector_layout
+// CHECK: %[[FILL:[^ ]+]] = hc.vzeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_vector<f16, ["A", "B"]>
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"A">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"B">)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">]
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_vector<f16, ["A", "B"]>)
+// CHECK-SAME: ambient (%{{[^ ]+}} as "lane" : !hc.idx<"lane">)
+// CHECK-NOT: hc.vload
+func.func @vload_selector_layout(
+    %t: !hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1 + lane">>>,
+    %lane: !hc.idx<"lane">) -> !hc.bare_vector<f16, ["A", "B"]> {
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %b = hc.const<1 : i64> : !hc.idx<"B">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %v = hc.vload %t[%lane], shape %shape
+      : (!hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1 + lane">>>,
+         !hc.idx<"lane">, tuple<!hc.idx<"A">, !hc.idx<"B">>)
+        -> !hc.bare_vector<f16, ["A", "B"]>
+  return %v : !hc.bare_vector<f16, ["A", "B"]>
+}
+
+// -----
+
 // Store into a buffer: ptr-out `hc.generic` with no SSA result.
 // `%src` has identity offsets; `%dst` carries the multi-index
 // addressing. Body still forwards the source element so the

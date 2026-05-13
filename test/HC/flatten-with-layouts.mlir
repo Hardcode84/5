@@ -496,6 +496,43 @@ func.func @vload_selector_layout(
 
 // -----
 
+// Post-`hc-load-store-to-generic` shape for a selector-bind vload:
+// the `hc.generic` carries `shape_syms`-many per-axis offsets (one per
+// operand rank — the `hc.generic` verifier's contract), identity over
+// iter syms, with the selector SSA / name pair on the `ambient`
+// clause. Flatten composes the layout's offset `i0*d1 + i1 + lane`
+// substituting `d0→M, d1→K, i0→i_0, i1→i_1` and leaving `lane` free —
+// it stays as an ambient binding on the rewritten op so
+// `hc-lower-generic` can seed the per-lane scope from `%lane`'s SSA.
+// CHECK-LABEL: @generic_selector_layout
+// CHECK-SAME: %[[T:[^:]+]]: !hc.tensor<f16, ["K*M"]>
+// CHECK-SAME: %[[K:[^:]+]]: !hc.idx<"K">
+// CHECK-SAME: %[[M:[^:]+]]: !hc.idx<"M">
+// CHECK-SAME: %[[LANE:[^:]+]]: !hc.idx<"lane">
+// CHECK: hc.generic
+// CHECK-SAME: ins (%[[T]] at [#hc.expr<"i_1 + lane + K*i_0">] : !hc.tensor<f16, ["K*M"]>)
+// CHECK-SAME: ambient ({{[^)]*}}%[[LANE]] as "lane" : !hc.idx<"lane">)
+func.func @generic_selector_layout(
+    %t: !hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1 + lane">>>,
+    %lane: !hc.idx<"lane">,
+    %a: !hc.idx<"A">, %b: !hc.idx<"B">) {
+  %s = hc.tuple(%a, %b) : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %init = hc.vzeros shape %s : (tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.bare_vector<f16, ["A", "B"]>
+  %v = hc.generic
+      iter (parallel i_0 = %a : !hc.idx<"A">, parallel i_1 = %b : !hc.idx<"B">)
+      ins (%t at [#hc.expr<"i_0">, #hc.expr<"i_1">]
+           : !hc.tensor<f16, ["M", "K"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1", "lane"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"i0*d1 + i1 + lane">>>)
+      outs (%init at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_vector<f16, ["A", "B"]>)
+      ambient (%lane as "lane" : !hc.idx<"lane">)
+      -> (!hc.bare_vector<f16, ["A", "B"]>) {
+    ^bb0(%bv: f16, %iv: f16):
+      hc.yield %bv : f16
+  }
+  return
+}
+
+// -----
+
 // Layout-less identity composition: a 2D `hc.vload` on a layout-less
 // `!hc.bare_tensor` falls back to the
 // `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` identity offset.

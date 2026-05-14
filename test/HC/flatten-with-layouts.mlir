@@ -523,6 +523,46 @@ func.func @generic_uniform_layout(
 
 // -----
 
+// Non-injective layout under a 2-D iter space. The layout is the
+// per-lane WMMA-fragment shape from `doc/layouts.md` ("Non-injective
+// layouts"): 3-D logical `(M, K, LANE)`, 1-D `K`-sized storage,
+// `offset = i1` — every `(*, j, *)` slice collapses to the same flat
+// slot `j`. The `hc.generic` binds index_syms positionally to
+// `[i + i_0, j + i_1, lane]`. Substitution gives `offset := j + i_1`,
+// which drops `i_0` entirely: the source flat offset is constant
+// across the i_0 iteration. That is the implicit broadcast claim in
+// `doc/layouts.md` made structural — there is no `hc_front` axis tag,
+// no explicit gather, just the iter sym that the layout's offset
+// formula declines to mention.
+// CHECK-LABEL: @generic_noninjective_layout
+// CHECK-SAME: %[[T:[^:]+]]: !hc.tensor<f32, ["K"]>
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"A">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"B">)
+// CHECK-SAME: ins (%[[T]] at [#hc.expr<"i_1 + j">] : !hc.tensor<f32, ["K"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i_1 + B*i_0">]
+func.func @generic_noninjective_layout(
+    %t: !hc.tensor<f32, ["M", "K", "LANE"], #hc.layout<shape_syms = ["d0", "d1", "d2"], index_syms = ["i0", "i1", "i2"], params = {}, storage_size = #hc.expr<"d1">, offset = #hc.expr<"i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">, %lane: !hc.idx<"lane">,
+    %a: !hc.idx<"A">, %b: !hc.idx<"B">) {
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %init = hc.vzeros shape %shape
+      : (tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.bare_vector<f32, ["A", "B"]>
+  %v = hc.generic
+      iter (parallel i_0 = %a : !hc.idx<"A">,
+            parallel i_1 = %b : !hc.idx<"B">)
+      ins (%t at [#hc.expr<"i + i_0">, #hc.expr<"j + i_1">, #hc.expr<"lane">]
+           : !hc.tensor<f32, ["M", "K", "LANE"], #hc.layout<shape_syms = ["d0", "d1", "d2"], index_syms = ["i0", "i1", "i2"], params = {}, storage_size = #hc.expr<"d1">, offset = #hc.expr<"i1">>>)
+      outs (%init at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_vector<f32, ["A", "B"]>)
+      -> (!hc.bare_vector<f32, ["A", "B"]>) {
+  ^bb0(%bv: f32, %iv: f32):
+    hc.yield %bv : f32
+  }
+  return
+}
+
+// -----
+
 // Layout-less identity composition: a 2D `hc.vload` on a layout-less
 // `!hc.bare_tensor` falls back to the
 // `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}` identity offset.

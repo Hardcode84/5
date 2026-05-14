@@ -166,6 +166,55 @@ func.func @elementwise_two_outs(%n: index,
 
 // -----
 
+// 2D parallel iter with a non-injective source offset: `i_1 + j`
+// references only `i_1` (and ambient kernel-scope `j`), never `i_0`.
+// That's the post-flatten shape of a `hc.vload` against the per-lane
+// fragment layout in `doc/layouts.md` — flatten composes
+// `index_syms = [i, j, lane]` against the layout's `offset = i1`,
+// substitutes `i_1` for `j`'s position, and drops the broadcast axis
+// entirely. After lower-generic, the per-iter `hc.idx_apply` for the
+// source load lists exactly `{i_1, j}` and *not* `i_0`, so the load
+// offset is constant across i_0 — every i_0 iteration reads the
+// same scalar. The dst offset `i_1 + B*i_0` is the identity tile
+// layout and lists both iter syms; the stored value is the same
+// scalar repeated across i_0. That repetition is the implicit
+// broadcast the `doc/layouts.md` "Non-injective layouts" section
+// documents — no explicit gather op, just the iter sym that the
+// composed offset declines to mention.
+// CHECK-LABEL: func.func @noninjective_broadcast_2d
+// CHECK: scf.parallel (%[[II0:[^,]+]], %[[II1:[^)]+]])
+// CHECK:   hc.idx_apply (%{{[^ ]+}} as "B", %[[II0]] as "i_0", %[[II1]] as "i_1")
+// CHECK-SAME: -> !hc.idx<"i_1 + B*i_0">
+// CHECK:   %[[PD0:[^ ]+]] = hc.ptr_offset
+// CHECK:   hc.ptr_load %[[PD0]]
+// CHECK:   hc.idx_apply (%[[II1]] as "i_1", %{{[^ ]+}} as "j")
+// CHECK-SAME: -> !hc.idx<"i_1 + j">
+// CHECK:   %[[PS:[^ ]+]] = hc.ptr_offset
+// CHECK:   %[[V:[^ ]+]] = hc.ptr_load %[[PS]]
+// CHECK:   hc.idx_apply (%{{[^ ]+}} as "B", %[[II0]] as "i_0", %[[II1]] as "i_1")
+// CHECK-SAME: -> !hc.idx<"i_1 + B*i_0">
+// CHECK:   %[[PD1:[^ ]+]] = hc.ptr_offset
+// CHECK:   hc.ptr_store %[[V]], %[[PD1]]
+// CHECK-NOT: hc.generic
+func.func @noninjective_broadcast_2d(
+    %a: !hc.idx<"A">, %b: !hc.idx<"B">, %j: !hc.idx<"j">,
+    %src: !hc.ptr<global, f32>,
+    %dst: !hc.ptr<global, f32>) {
+  hc.generic
+      iter (parallel i_0 = %a : !hc.idx<"A">,
+            parallel i_1 = %b : !hc.idx<"B">)
+      ins (%src at [#hc.expr<"i_1 + j">] : !hc.ptr<global, f32>)
+      outs (%dst at [#hc.expr<"i_1 + B*i_0">] : !hc.ptr<global, f32>)
+      ambient (%b as "B" : !hc.idx<"B">, %j as "j" : !hc.idx<"j">)
+      -> () {
+  ^bb0(%v: f32, %d: f32):
+    hc.yield %v : f32
+  }
+  return
+}
+
+// -----
+
 // Pure-parallel 1D with a divisible bound (`!hc.idx<"32">`). The
 // partition search proves `32 % 32 == 0`, picks `(32,)`, and merges
 // every lane into one vector group of width 32. The outer

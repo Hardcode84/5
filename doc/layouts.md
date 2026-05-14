@@ -847,10 +847,18 @@ What does **not** yet do anything special with non-injective layouts:
 * Access op lowering. `hc.vload` reads contiguously from the composed
   base offset post-flatten. If the offset doesn't reference every
   iter axis, the corresponding axes broadcast — but that broadcast
-  is a side-effect of the per-lane vector.insert pattern in
-  `hc-launch-body`, not an explicit gather primitive. "Layout-driven
-  per-thread gather" with an explicit gather op stays on the deferred
-  list.
+  is a side-effect of `hc-lower-generic`'s per-iter scalar emit (one
+  `hc.idx_apply` + `hc.ptr_load` per iteration, lifted into the
+  result vector via `vector.insert` / `vector.from_elements` when
+  outs is a `!hc.bare_vector`, or replayed against the same flat
+  offset when outs is `!hc.ptr`). The two layers — flatten dropping
+  the unreferenced iter sym from the composed offset, and
+  lower-generic emitting a `hc.idx_apply` that only lists the iter
+  syms the offset mentions — are pinned by
+  `test/HC/flatten-with-layouts.mlir` (`@generic_noninjective_layout`)
+  and `test/HC/lower-generic.mlir` (`@noninjective_broadcast_2d`).
+  There is no explicit gather primitive; "layout-driven per-thread
+  gather" with a dedicated op stays on the deferred list.
 
 ## Out of scope (deferred)
 

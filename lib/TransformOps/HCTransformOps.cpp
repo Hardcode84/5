@@ -226,6 +226,68 @@ LogicalResult HCTransformCreateOp::verify() {
   return success();
 }
 
+// Materialise the runtime operand list from the transform op's input
+// handles: each handle must resolve to exactly one payload value.
+static DiagnosedSilenceableFailure
+collectPayloadOperands(HCTransformCreateOp self, xform::TransformState &state,
+                       SmallVectorImpl<Value> &out) {
+  for (auto [index, operand] : llvm::enumerate(self.getInputs())) {
+    Value payloadValue;
+    DiagnosedSilenceableFailure diag = requireSinglePayloadValue(
+        self, operand, state, Twine("operand ") + Twine(index), payloadValue);
+    if (!diag.succeeded())
+      return diag;
+    out.push_back(payloadValue);
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
+// Materialise the payload op's result types from `result_types` handles.
+// Each handle must resolve to exactly one parameter which itself must be
+// a TypeAttr.
+static DiagnosedSilenceableFailure
+collectPayloadResultTypes(HCTransformCreateOp self,
+                          xform::TransformState &state,
+                          SmallVectorImpl<Type> &out) {
+  for (auto [index, typeParam] : llvm::enumerate(self.getResultTypes())) {
+    Attribute attr;
+    DiagnosedSilenceableFailure diag = requireSingleParam(
+        self, typeParam, state, Twine("result type ") + Twine(index), attr);
+    if (!diag.succeeded())
+      return diag;
+    auto typeAttr = dyn_cast<TypeAttr>(attr);
+    if (!typeAttr)
+      return self.emitSilenceableError()
+             << "result type parameter " << index << " is not a TypeAttr";
+    out.push_back(typeAttr.getValue());
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
+// Materialise the payload op's attribute dictionary by concatenating the
+// static_attrs dict (if any) with the dynamic_attrs resolved from their
+// handles.
+static DiagnosedSilenceableFailure collectPayloadAttributes(
+    HCTransformCreateOp self, xform::TransformRewriter &rewriter,
+    xform::TransformState &state, SmallVectorImpl<NamedAttribute> &out) {
+  if (std::optional<DictionaryAttr> staticAttrs = self.getStaticAttrs())
+    llvm::append_range(out, staticAttrs->getValue());
+  for (auto [nameAttr, attrParam] :
+       llvm::zip_equal(self.getDynamicAttrNames(), self.getDynamicAttrs())) {
+    Attribute attr;
+    DiagnosedSilenceableFailure diag =
+        requireSingleParam(self, attrParam, state,
+                           Twine("dynamic attribute ") +
+                               Twine(cast<StringAttr>(nameAttr).getValue()),
+                           attr);
+    if (!diag.succeeded())
+      return diag;
+    out.push_back(
+        rewriter.getNamedAttr(cast<StringAttr>(nameAttr).getValue(), attr));
+  }
+  return DiagnosedSilenceableFailure::success();
+}
+
 DiagnosedSilenceableFailure
 HCTransformCreateOp::apply(xform::TransformRewriter &rewriter,
                            xform::TransformResults &results,
@@ -237,45 +299,19 @@ HCTransformCreateOp::apply(xform::TransformRewriter &rewriter,
     return diag;
 
   SmallVector<Value> payloadOperands;
-  for (auto [index, operand] : llvm::enumerate(getInputs())) {
-    Value payloadValue;
-    diag = requireSinglePayloadValue(
-        *this, operand, state, Twine("operand ") + Twine(index), payloadValue);
-    if (!diag.succeeded())
-      return diag;
-    payloadOperands.push_back(payloadValue);
-  }
+  diag = collectPayloadOperands(*this, state, payloadOperands);
+  if (!diag.succeeded())
+    return diag;
 
   SmallVector<Type> payloadResultTypes;
-  for (auto [index, typeParam] : llvm::enumerate(getResultTypes())) {
-    Attribute attr;
-    diag = requireSingleParam(*this, typeParam, state,
-                              Twine("result type ") + Twine(index), attr);
-    if (!diag.succeeded())
-      return diag;
-    auto typeAttr = dyn_cast<TypeAttr>(attr);
-    if (!typeAttr) {
-      return emitSilenceableError()
-             << "result type parameter " << index << " is not a TypeAttr";
-    }
-    payloadResultTypes.push_back(typeAttr.getValue());
-  }
+  diag = collectPayloadResultTypes(*this, state, payloadResultTypes);
+  if (!diag.succeeded())
+    return diag;
 
   SmallVector<NamedAttribute> payloadAttrs;
-  if (std::optional<DictionaryAttr> staticAttrs = getStaticAttrs())
-    llvm::append_range(payloadAttrs, staticAttrs->getValue());
-  for (auto [nameAttr, attrParam] :
-       llvm::zip_equal(getDynamicAttrNames(), getDynamicAttrs())) {
-    Attribute attr;
-    diag = requireSingleParam(*this, attrParam, state,
-                              Twine("dynamic attribute ") +
-                                  Twine(cast<StringAttr>(nameAttr).getValue()),
-                              attr);
-    if (!diag.succeeded())
-      return diag;
-    payloadAttrs.push_back(
-        rewriter.getNamedAttr(cast<StringAttr>(nameAttr).getValue(), attr));
-  }
+  diag = collectPayloadAttributes(*this, rewriter, state, payloadAttrs);
+  if (!diag.succeeded())
+    return diag;
 
   OperationState opState(insertionPoint->getLoc(), getOpName());
   opState.addOperands(payloadOperands);

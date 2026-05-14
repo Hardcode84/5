@@ -75,7 +75,6 @@ lib/IR/HCTypes.cpp:mlir::hc::shouldRefineHCType
 lib/IR/HCTypes.cpp:parseNestedLaunchContextType
 lib/IR/HCTypes.cpp:SliceType::parse
 lib/IR/HCTypes.cpp:staticShapeFromTupleType
-lib/TransformOps/HCTransformOps.cpp:HCTransformCreateOp::apply
 lib/Transforms/HCCanonicalizeLayoutsPass.cpp:buildCanonicalIdentity
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteBufferView
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteGenericOp

@@ -91,6 +91,46 @@ private:
   // `dumpStage`. Kept separate so the call sites stay readable.
   LogicalResult dumpLLVMModule(gpu::GPUModuleOp module, StringRef stage,
                                const llvm::Module &m);
+
+  // Validate the module's `targets` attr and unwrap the single
+  // `#rocdl.target` element. Anything else is a hard error with the
+  // offending attr surfaced in the diagnostic.
+  FailureOr<ROCDL::ROCDLTargetAttr>
+  validateAndExtractRocdlTarget(gpu::GPUModuleOp module);
+
+  // Build the AMDGPU target machine from the rocdl target attr and
+  // imprint its data layout / triple onto the just-translated LLVM
+  // module. Side effects on `llvmModule` are intentional — the data
+  // layout and triple must match the target machine for downstream
+  // emit / optimize to be well-defined.
+  FailureOr<std::unique_ptr<llvm::TargetMachine>>
+  buildTargetMachineFor(gpu::GPUModuleOp module,
+                        ROCDL::ROCDLTargetAttr rocdlTarget,
+                        llvm::Module &llvmModule);
+
+  // Run LLVM's standard optimization pipeline at the target machine's
+  // opt level. Dumps `1-post-opt.ll` on success.
+  LogicalResult optimizeLLVMModule(gpu::GPUModuleOp module,
+                                   llvm::Module &llvmModule,
+                                   llvm::TargetMachine &targetMachine);
+
+  // Translate optimized LLVM IR to ISA text. Dumps `2-isa.s`.
+  FailureOr<llvm::SmallString<0>>
+  emitISAFromLLVMModule(gpu::GPUModuleOp module, llvm::Module &llvmModule,
+                        llvm::TargetMachine &targetMachine);
+
+  // Assemble ISA text to an ELF object via the AMDGPU MC stack, then
+  // link with our own ld.lld into an HSACO. Dumps `2b-object.o` and
+  // `3-binary.hsaco` along the way.
+  FailureOr<SmallVector<char, 0>>
+  assembleAndLinkBinary(gpu::GPUModuleOp module, llvm::SmallString<0> &isa,
+                        llvm::TargetMachine &targetMachine);
+
+  // Attach the HSACO blob as a sibling `gpu.binary` op and drop the
+  // source `gpu.module`. The original rocdl target attr rides along
+  // on the object so launch-time pieces can still introspect the chip.
+  void attachBinaryAndEraseModule(gpu::GPUModuleOp module, Attribute targetAttr,
+                                  ArrayRef<char> binary);
 };
 
 LogicalResult HCLowerGPUToBinaryPass::dumpStage(gpu::GPUModuleOp module,
@@ -181,71 +221,67 @@ std::string HCLowerGPUToBinaryPass::resolveLldPath(gpu::GPUModuleOp module) {
   return {};
 }
 
-LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
+FailureOr<ROCDL::ROCDLTargetAttr>
+HCLowerGPUToBinaryPass::validateAndExtractRocdlTarget(gpu::GPUModuleOp module) {
   auto targets = module.getTargetsAttr();
-  if (!targets || targets.size() != 1)
-    return module.emitError("hc-lower-gpu-to-binary: gpu.module must carry "
-                            "exactly one target "
-                            "attribute (got ")
-           << (targets ? targets.size() : 0) << ")";
-
+  if (!targets || targets.size() != 1) {
+    module.emitError("hc-lower-gpu-to-binary: gpu.module must carry exactly "
+                     "one target attribute (got ")
+        << (targets ? targets.size() : 0) << ")";
+    return failure();
+  }
   Attribute targetAttr = targets[0];
   auto rocdlTarget = dyn_cast_if_present<ROCDL::ROCDLTargetAttr>(targetAttr);
-  if (!rocdlTarget)
-    return module.emitError(
-               "hc-lower-gpu-to-binary: only #rocdl.target<...> is supported "
-               "today (got ")
-           << targetAttr << ")";
+  if (!rocdlTarget) {
+    module.emitError("hc-lower-gpu-to-binary: only #rocdl.target<...> is "
+                     "supported today (got ")
+        << targetAttr << ")";
+    return failure();
+  }
+  return rocdlTarget;
+}
 
-  initializeAMDGPUTargetOnce();
-
-  // Step 1: gpu.module → llvm::Module. The ROCDL/LLVM/Builtin dialect
-  // translation interfaces must already be registered on the context's
-  // dialect registry; that's `mlir::registerAllToLLVMIRTranslations`,
-  // wired up by every entry point that runs this pass (hc-opt main +
-  // any future Python driver).
-  llvm::LLVMContext llvmContext;
-  std::unique_ptr<llvm::Module> llvmModule =
-      translateModuleToLLVMIR(module, llvmContext);
-  if (!llvmModule)
-    return module.emitError(
-        "hc-lower-gpu-to-binary: failed to translate gpu.module to LLVM IR");
-
-  // Step 2: build target machine from the rocdl target attr.
+FailureOr<std::unique_ptr<llvm::TargetMachine>>
+HCLowerGPUToBinaryPass::buildTargetMachineFor(
+    gpu::GPUModuleOp module, ROCDL::ROCDLTargetAttr rocdlTarget,
+    llvm::Module &llvmModule) {
   std::string lookupError;
   llvm::Triple triple(llvm::Triple::normalize(rocdlTarget.getTriple()));
   const llvm::Target *target =
       llvm::TargetRegistry::lookupTarget(triple, lookupError);
-  if (!target)
-    return module.emitError(
-               "hc-lower-gpu-to-binary: TargetRegistry lookup failed for ")
-           << rocdlTarget.getTriple() << ": " << lookupError;
+  if (!target) {
+    module.emitError(
+        "hc-lower-gpu-to-binary: TargetRegistry lookup failed for ")
+        << rocdlTarget.getTriple() << ": " << lookupError;
+    return failure();
+  }
 
   std::unique_ptr<llvm::TargetMachine> targetMachine(
       target->createTargetMachine(triple, rocdlTarget.getChip(),
                                   rocdlTarget.getFeatures(), {}, {}));
-  if (!targetMachine)
-    return module.emitError(
+  if (!targetMachine) {
+    module.emitError(
         "hc-lower-gpu-to-binary: failed to create AMDGPU target machine");
+    return failure();
+  }
   targetMachine->setOptLevel(
       static_cast<llvm::CodeGenOptLevel>(rocdlTarget.getO()));
 
-  llvmModule->setDataLayout(targetMachine->createDataLayout());
-  llvmModule->setTargetTriple(targetMachine->getTargetTriple());
+  llvmModule.setDataLayout(targetMachine->createDataLayout());
+  llvmModule.setTargetTriple(targetMachine->getTargetTriple());
+  return targetMachine;
+}
 
-  // Dump the pre-optimization LLVM module first so it survives an
-  // optimizer crash — historically the most informative artifact when
-  // the backend miscompiles, since it shows what the optimizer was
-  // handed before fold-the-world set in.
-  if (failed(dumpLLVMModule(module, "0-pre-opt.ll", *llvmModule)))
-    return failure();
-
-  // Step 3: optimize. Plain wrapper around LLVM's standard pipeline
-  // at the target's opt level; matches wave's `optimizeModule`.
+LogicalResult
+HCLowerGPUToBinaryPass::optimizeLLVMModule(gpu::GPUModuleOp module,
+                                           llvm::Module &llvmModule,
+                                           llvm::TargetMachine &targetMachine) {
+  // Plain wrapper around LLVM's standard pipeline at the target's opt
+  // level; matches wave's `optimizeModule`.
   auto optimizer =
-      makeOptimizingTransformer(static_cast<int>(targetMachine->getOptLevel()),
-                                /*sizeLevel=*/0, targetMachine.get());
-  if (auto err = optimizer(llvmModule.get())) {
+      makeOptimizingTransformer(static_cast<int>(targetMachine.getOptLevel()),
+                                /*sizeLevel=*/0, &targetMachine);
+  if (auto err = optimizer(&llvmModule)) {
     InFlightDiagnostic diag =
         module.emitError("hc-lower-gpu-to-binary: failed to optimize LLVM IR");
     llvm::handleAllErrors(std::move(err),
@@ -254,38 +290,44 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
                           });
     return failure();
   }
-  if (failed(dumpLLVMModule(module, "1-post-opt.ll", *llvmModule)))
-    return failure();
+  return dumpLLVMModule(module, "1-post-opt.ll", llvmModule);
+}
 
-  // Step 4: LLVM IR → ISA text.
+FailureOr<llvm::SmallString<0>> HCLowerGPUToBinaryPass::emitISAFromLLVMModule(
+    gpu::GPUModuleOp module, llvm::Module &llvmModule,
+    llvm::TargetMachine &targetMachine) {
   auto emitOpError = [&]() -> InFlightDiagnostic { return module.emitError(); };
   FailureOr<llvm::SmallString<0>> isa =
-      LLVM::ModuleToObject::translateModuleToISA(*llvmModule, *targetMachine,
+      LLVM::ModuleToObject::translateModuleToISA(llvmModule, targetMachine,
                                                  emitOpError);
   if (failed(isa))
     return failure();
   if (failed(dumpStage(module, "2-isa.s",
                        StringRef((*isa).data(), (*isa).size()))))
     return failure();
+  return isa;
+}
 
-  // Step 5: ISA → ELF object via the AMDGPU MC stack.
+FailureOr<SmallVector<char, 0>> HCLowerGPUToBinaryPass::assembleAndLinkBinary(
+    gpu::GPUModuleOp module, llvm::SmallString<0> &isa,
+    llvm::TargetMachine &targetMachine) {
+  auto emitOpError = [&]() -> InFlightDiagnostic { return module.emitError(); };
   FailureOr<SmallVector<char, 0>> object = ROCDL::assembleIsa(
-      llvm::StringRef((*isa).data(), (*isa).size()),
-      targetMachine->getTargetTriple().str(), targetMachine->getTargetCPU(),
-      targetMachine->getTargetFeatureString(), emitOpError);
+      llvm::StringRef(isa.data(), isa.size()),
+      targetMachine.getTargetTriple().str(), targetMachine.getTargetCPU(),
+      targetMachine.getTargetFeatureString(), emitOpError);
   if (failed(object))
     return failure();
   // Stage `2b` because we want this between `2-isa.s` and `3-binary.hsaco`
-  // in `ls | sort` — the assembled ELF is the input lld actually sees, so
-  // when the linker step fails the .o is what you reach for first. The
-  // MLIR `linkObjectCode` wrapper swallows lld's stderr and surfaces only
-  // a generic "lld invocation failed", so without this dump every linker
-  // bug starts with a re-run-with-extra-instrumentation step.
+  // in `ls | sort` — the assembled ELF is the input lld actually sees,
+  // so when the linker step fails the .o is what you reach for first.
+  // The MLIR `linkObjectCode` wrapper swallows lld's stderr and surfaces
+  // only a generic "lld invocation failed", so without this dump every
+  // linker bug starts with a re-run-with-extra-instrumentation step.
   if (failed(dumpStage(module, "2b-object.o",
                        StringRef(object->data(), object->size()))))
     return failure();
 
-  // Step 6: ELF → HSACO via ld.lld.
   std::string lld = resolveLldPath(module);
   if (lld.empty())
     return failure();
@@ -297,14 +339,18 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
   if (failed(dumpStage(module, "3-binary.hsaco",
                        StringRef(binary->data(), binary->size()))))
     return failure();
+  return binary;
+}
 
-  // Attach the blob as a gpu.binary sibling and drop the source module.
+void HCLowerGPUToBinaryPass::attachBinaryAndEraseModule(gpu::GPUModuleOp module,
+                                                        Attribute targetAttr,
+                                                        ArrayRef<char> binary) {
   // The `Binary` compilation target tells the GPU dialect that the
   // attached string is the final device blob (no further translation
   // needed downstream); the original rocdl target attr rides along so
   // the launch-time pieces can still introspect the chip if they want.
   Builder b(module.getContext());
-  StringAttr blob = b.getStringAttr(StringRef(binary->data(), binary->size()));
+  StringAttr blob = b.getStringAttr(StringRef(binary.data(), binary.size()));
   Attribute objectAttr = gpu::ObjectAttr::get(
       module.getContext(), targetAttr, gpu::CompilationTarget::Binary, blob,
       /*properties=*/DictionaryAttr{},
@@ -317,6 +363,56 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
                         builder.getArrayAttr({objectAttr}));
 
   module.erase();
+}
+
+LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
+  FailureOr<ROCDL::ROCDLTargetAttr> rocdlTargetOr =
+      validateAndExtractRocdlTarget(module);
+  if (failed(rocdlTargetOr))
+    return failure();
+  ROCDL::ROCDLTargetAttr rocdlTarget = *rocdlTargetOr;
+
+  initializeAMDGPUTargetOnce();
+
+  // gpu.module → llvm::Module. The ROCDL/LLVM/Builtin dialect translation
+  // interfaces must already be registered on the context's dialect
+  // registry; that's `mlir::registerAllToLLVMIRTranslations`, wired up by
+  // every entry point that runs this pass (hc-opt main + any future
+  // Python driver).
+  llvm::LLVMContext llvmContext;
+  std::unique_ptr<llvm::Module> llvmModule =
+      translateModuleToLLVMIR(module, llvmContext);
+  if (!llvmModule)
+    return module.emitError(
+        "hc-lower-gpu-to-binary: failed to translate gpu.module to LLVM IR");
+
+  FailureOr<std::unique_ptr<llvm::TargetMachine>> targetMachineOr =
+      buildTargetMachineFor(module, rocdlTarget, *llvmModule);
+  if (failed(targetMachineOr))
+    return failure();
+  std::unique_ptr<llvm::TargetMachine> targetMachine =
+      std::move(*targetMachineOr);
+
+  // Dump the pre-optimization LLVM module first so it survives an
+  // optimizer crash — historically the most informative artifact when
+  // the backend miscompiles, since it shows what the optimizer was
+  // handed before fold-the-world set in.
+  if (failed(dumpLLVMModule(module, "0-pre-opt.ll", *llvmModule)))
+    return failure();
+  if (failed(optimizeLLVMModule(module, *llvmModule, *targetMachine)))
+    return failure();
+
+  FailureOr<llvm::SmallString<0>> isa =
+      emitISAFromLLVMModule(module, *llvmModule, *targetMachine);
+  if (failed(isa))
+    return failure();
+
+  FailureOr<SmallVector<char, 0>> binary =
+      assembleAndLinkBinary(module, *isa, *targetMachine);
+  if (failed(binary))
+    return failure();
+
+  attachBinaryAndEraseModule(module, rocdlTarget, *binary);
   return success();
 }
 

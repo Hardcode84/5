@@ -1203,6 +1203,61 @@ LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+LogicalResult
+HCStripLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                              SmallVectorImpl<Type> &resultTypes) {
+  // Strip preserves carrier flavor — it drops the layout slot, not
+  // the semantic-vs-bare distinction. `vector -> vector` (no
+  // layout), `bare_vector -> bare_vector`, similarly for tensors.
+  // Mixing the flavor at the strip boundary would clash with
+  // downstream inference (e.g. an `hc.call_intrinsic` whose result
+  // is `vector<...>` and the loop's iter init type would conflict).
+  // Buffers don't have a bare counterpart in the v0 surface — the
+  // verifier rejects them, and we mirror that here by leaving the
+  // result un-refined so a later inference pass sees the existing
+  // placeholder. Pre-inference (`!hc.undef`) operands fall through
+  // to the same un-refined branch.
+  Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
+  if (!valueType || isHCUndefType(valueType)) {
+    resultTypes.push_back(getResult().getType());
+    return success();
+  }
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(valueType);
+  if (!shaped) {
+    resultTypes.push_back(getResult().getType());
+    return success();
+  }
+  Type elementType = shaped.getSymbolicElementType();
+  ShapeAttr shape = shaped.getSymbolicShape();
+  if (!elementType || !shape) {
+    resultTypes.push_back(getResult().getType());
+    return success();
+  }
+  MLIRContext *ctx = getContext();
+  if (isa<mlir::hc::VectorType>(valueType)) {
+    resultTypes.push_back(
+        mlir::hc::VectorType::get(ctx, elementType, shape, LayoutAttr{}));
+    return success();
+  }
+  if (isa<mlir::hc::BareVectorType>(valueType)) {
+    resultTypes.push_back(
+        mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{}));
+    return success();
+  }
+  if (isa<mlir::hc::TensorType>(valueType)) {
+    resultTypes.push_back(
+        mlir::hc::TensorType::get(ctx, elementType, shape, LayoutAttr{}));
+    return success();
+  }
+  if (isa<mlir::hc::BareTensorType>(valueType)) {
+    resultTypes.push_back(
+        mlir::hc::BareTensorType::get(ctx, elementType, shape, LayoutAttr{}));
+    return success();
+  }
+  resultTypes.push_back(getResult().getType());
+  return success();
+}
+
 LogicalResult HCVZerosOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                        SmallVectorImpl<Type> &resultTypes) {
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.front();

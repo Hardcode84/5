@@ -1614,6 +1614,88 @@ static LogicalResult verifyBarePredicateMask(Operation *op, Type type) {
   return success();
 }
 
+LogicalResult HCStripLayoutOp::verify() {
+  // Progressive typing: `!hc.undef` on either side is the pre-inference
+  // placeholder; the verifier runs at every fold boundary and rejecting
+  // here would refuse the IR right after parse / between inference
+  // sub-rounds. Same gate `hc.as_layout` uses.
+  Type valueType = getValue().getType();
+  Type resultType = getResult().getType();
+  if (!valueType || !resultType || isHCUndefType(valueType) ||
+      isHCUndefType(resultType))
+    return success();
+
+  auto valueShaped = dyn_cast<SymbolicallyShapedTypeInterface>(valueType);
+  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultType);
+  if (!valueShaped || !resultShaped)
+    return success();
+
+  // Result must have a null layout slot. The op exists exactly to
+  // drop the layout at a user-marked boundary — a layout-bearing
+  // result is a frontend bug; spell `hc.as_layout` instead for a
+  // relabel that preserves the layout slot.
+  if (resultShaped.getSymbolicLayout())
+    return emitOpError("result type must have no layout slot; "
+                       "use hc.as_layout to relabel a layout-bearing value");
+
+  // Buffers have no value-semantic counterpart in the v0 surface —
+  // their storage is host-side and `hc.as_layout` is the right
+  // primitive for buffer-level relabel. Routing a frontend mistake
+  // here to a clear diagnostic.
+  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
+    return emitOpError("hc.strip_layout does not apply to !hc.buffer; "
+                       "buffer storage lives host-side, the bare/non-bare "
+                       "distinction is value-semantic only");
+
+  // Flavor preservation: the strip drops the layout slot, it does
+  // not change the carrier kind. `vector -> vector` (without
+  // layout), `bare_vector -> bare_vector`, similarly for tensors.
+  // Switching kinds here would clash with downstream inference at
+  // every site where the post-strip value flows into a peer-typed
+  // op (the K-tile loop's iter init / result pair against the
+  // intrinsic's vector return is the motivating example).
+  bool sourceIsVector = isa<mlir::hc::VectorType>(valueType);
+  bool sourceIsBareVector = isa<mlir::hc::BareVectorType>(valueType);
+  bool sourceIsTensor = isa<mlir::hc::TensorType>(valueType);
+  bool sourceIsBareTensor = isa<mlir::hc::BareTensorType>(valueType);
+  bool resultIsVector = isa<mlir::hc::VectorType>(resultType);
+  bool resultIsBareVector = isa<mlir::hc::BareVectorType>(resultType);
+  bool resultIsTensor = isa<mlir::hc::TensorType>(resultType);
+  bool resultIsBareTensor = isa<mlir::hc::BareTensorType>(resultType);
+  if (sourceIsVector && !resultIsVector)
+    return emitOpError("vector operand requires vector result; got ")
+           << resultType;
+  if (sourceIsBareVector && !resultIsBareVector)
+    return emitOpError("bare_vector operand requires bare_vector result; got ")
+           << resultType;
+  if (sourceIsTensor && !resultIsTensor)
+    return emitOpError("tensor operand requires tensor result; got ")
+           << resultType;
+  if (sourceIsBareTensor && !resultIsBareTensor)
+    return emitOpError("bare_tensor operand requires bare_tensor result; got ")
+           << resultType;
+  if (!sourceIsVector && !sourceIsBareVector && !sourceIsTensor &&
+      !sourceIsBareTensor)
+    return emitOpError("operand must be a vector / tensor (semantic or "
+                       "bare); got ")
+           << valueType;
+
+  Type valueElem = valueShaped.getSymbolicElementType();
+  Type resultElem = resultShaped.getSymbolicElementType();
+  if (valueElem && resultElem && valueElem != resultElem)
+    return emitOpError("operand element type ")
+           << valueElem << " differs from result element type " << resultElem;
+
+  ShapeAttr valueShape = valueShaped.getSymbolicShape();
+  ShapeAttr resultShape = resultShaped.getSymbolicShape();
+  if (valueShape && resultShape && valueShape != resultShape)
+    return emitOpError("operand shape ")
+           << valueShape << " differs from result shape " << resultShape
+           << "; hc.strip_layout drops the layout, it doesn't reshape";
+
+  return success();
+}
+
 LogicalResult HCAsLayoutOp::verify() {
   // Progressive typing: any side still on `!hc.undef` (the v0
   // placeholder before inference fills in) can't be checked yet —

@@ -239,6 +239,50 @@ hc.func @vload_no_layout_attr(%buf: !hc.buffer<f32, ["M"]>,
 
 // -----
 
+// `hc.strip_layout` drops the layout slot but preserves the
+// carrier flavor: bare_vector operand re-types as a layout-less
+// bare_vector; a (semantic) vector operand re-types as a
+// layout-less vector. Operand below carries a non-injective layout
+// (storage_size = "m" > product = "m*k") describing a per-lane
+// projection over wave-wide storage; inference propagates the
+// operand's shape + element type and clears the layout.
+//
+// CHECK-LABEL: hc.func @strip_layout_infer_bare
+// CHECK: hc.strip_layout {{.*}} -> !hc.bare_vector<f32, ["8", "4"]>
+hc.func @strip_layout_infer_bare(
+    %v: !hc.bare_vector<f32, ["8", "4"],
+      #hc.layout<shape_syms = ["m", "k"], index_syms = ["i", "j"],
+                 params = {}, storage_size = #hc.expr<"m">,
+                 offset = #hc.expr<"i">>>) -> !hc.undef {
+  %r = hc.strip_layout %v
+      : !hc.bare_vector<f32, ["8", "4"],
+          #hc.layout<shape_syms = ["m", "k"], index_syms = ["i", "j"],
+                     params = {}, storage_size = #hc.expr<"m">,
+                     offset = #hc.expr<"i">>>
+      -> !hc.undef
+  hc.return %r : !hc.undef
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @strip_layout_infer_vector
+// CHECK: hc.strip_layout {{.*}} -> !hc.vector<f32, ["8"]>
+hc.func @strip_layout_infer_vector(
+    %v: !hc.vector<f32, ["8"],
+      #hc.layout<shape_syms = ["m"], index_syms = ["i"],
+                 params = {}, storage_size = #hc.expr<"256">,
+                 offset = #hc.expr<"i * 16">>>) -> !hc.undef {
+  %r = hc.strip_layout %v
+      : !hc.vector<f32, ["8"],
+          #hc.layout<shape_syms = ["m"], index_syms = ["i"],
+                     params = {}, storage_size = #hc.expr<"256">,
+                     offset = #hc.expr<"i * 16">>>
+      -> !hc.undef
+  hc.return %r : !hc.undef
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @buffer_views
 // CHECK: hc.buffer_view {{.*}} -> !hc.buffer<f32, ["4", "N"]>
 // CHECK: hc.buffer_dim {{.*}} -> !hc.idx<"4">

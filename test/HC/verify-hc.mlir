@@ -583,6 +583,104 @@ module {
 
 // -----
 
+// `hc.strip_layout` result must have a null layout slot. The op
+// exists exactly to drop the layout at a user-marked boundary; a
+// layout-bearing result is a frontend bug — spell `hc.as_layout`
+// for relabels that preserve a layout-bearing carrier.
+// CHECK: error: 'hc.strip_layout' op result type must have no layout slot
+module {
+  func.func @bad(
+      %src: !hc.bare_vector<f32, ["K"],
+        #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                   storage_size = #hc.expr<"256">,
+                   offset = #hc.expr<"i0 * 16">>>) {
+    %r = hc.strip_layout %src
+        : !hc.bare_vector<f32, ["K"],
+            #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                       storage_size = #hc.expr<"256">,
+                       offset = #hc.expr<"i0 * 16">>>
+        -> !hc.bare_vector<f32, ["K"],
+            #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                       storage_size = #hc.expr<"8">,
+                       offset = #hc.expr<"i0">>>
+    return
+  }
+}
+
+// -----
+
+// `hc.strip_layout` requires shape parity — the op drops the layout
+// slot, it doesn't reshape. Diverging shapes are rejected so the
+// emitter / inference can't accidentally collapse a strip with a
+// reshape.
+// CHECK: error: 'hc.strip_layout' op operand shape #hc.shape<["A", "B"]> differs from result shape #hc.shape<["C"]>
+module {
+  func.func @bad(
+      %src: !hc.bare_vector<f32, ["A", "B"]>) -> !hc.bare_vector<f32, ["C"]> {
+    %r = hc.strip_layout %src
+        : !hc.bare_vector<f32, ["A", "B"]> -> !hc.bare_vector<f32, ["C"]>
+    return %r : !hc.bare_vector<f32, ["C"]>
+  }
+}
+
+// -----
+
+// Strip preserves the carrier flavor — it only drops the layout
+// slot, it doesn't switch semantic-vs-bare or vector-vs-tensor. A
+// `bare_vector` operand requires a `bare_vector` result; a
+// `bare_tensor` result here is a frontend bug.
+// CHECK: error: 'hc.strip_layout' op bare_vector operand requires bare_vector result
+module {
+  func.func @bad(
+      %src: !hc.bare_vector<f32, ["K"]>) -> !hc.bare_tensor<f32, ["K"]> {
+    %r = hc.strip_layout %src
+        : !hc.bare_vector<f32, ["K"]> -> !hc.bare_tensor<f32, ["K"]>
+    return %r : !hc.bare_tensor<f32, ["K"]>
+  }
+}
+
+// -----
+
+// Strip preserves the semantic/bare distinction too: a (semantic)
+// `vector` operand requires a `vector` result; switching to
+// `bare_vector` at the strip site would clash with downstream
+// inference at every peer-typed use (the K-tile loop init / result
+// pair is the motivating example).
+// CHECK: error: 'hc.strip_layout' op vector operand requires vector result
+module {
+  func.func @bad(
+      %src: !hc.vector<f32, ["K"],
+        #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                   storage_size = #hc.expr<"256">,
+                   offset = #hc.expr<"i0 * 16">>>)
+      -> !hc.bare_vector<f32, ["K"]> {
+    %r = hc.strip_layout %src
+        : !hc.vector<f32, ["K"],
+            #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                       storage_size = #hc.expr<"256">,
+                       offset = #hc.expr<"i0 * 16">>>
+        -> !hc.bare_vector<f32, ["K"]>
+    return %r : !hc.bare_vector<f32, ["K"]>
+  }
+}
+
+// -----
+
+// Buffers have no bare counterpart in the v0 surface — buffer storage
+// is host-owned and the bare/non-bare distinction is value-semantic.
+// Diagnose loudly so misuse routes the user to ``hc.as_layout`` (which
+// does relabel buffer carriers) instead of silently emitting a no-op.
+// CHECK: error: 'hc.strip_layout' op hc.strip_layout does not apply to !hc.buffer
+module {
+  func.func @bad(%buf: !hc.buffer<f32, ["M", "N"]>) {
+    %r = hc.strip_layout %buf
+        : !hc.buffer<f32, ["M", "N"]> -> !hc.bare_tensor<f32, ["M", "N"]>
+    return
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.call' op 'missing' does not reference a valid hc.func
 module {
   func.func @bad(%x: !hc.undef) -> !hc.undef {

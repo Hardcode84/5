@@ -936,6 +936,52 @@ def HCWithInactiveOp : HC_Op<"with_inactive",
       "$value `,` $inactive attr-dict `:` functional-type(operands, results)";
 }
 
+def HCStripLayoutOp : HC_Op<"strip_layout",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary = "Drop a layout-bearing value's layout, project to bare storage.";
+  let description = [{
+    User-marked boundary that asserts the operand's layout no longer
+    applies and the value becomes a standalone bare carrier from this
+    point on. Spelt at the surface as ``as_layout(value, None)``.
+
+    Where ``hc.as_layout`` reinterprets a value's logical structure
+    while preserving the underlying storage span (operand and result
+    must agree on effective ``storage_size`` under ixsimpl), this op
+    *changes* that span: the operand's layout may declare a backing
+    larger than the dim product (a non-injective layout — broadcast,
+    per-lane WMMA fragment view into a wave-wide storage) and the
+    result re-types as bare with no layout, whose effective span is
+    the dim product. The storage-size divergence is the point — the
+    user is saying "the wave-wide / broadcast backing was an
+    addressing convenience at the source vload; the per-lane / per-
+    workitem fragment is a standalone value from here on".
+
+    Result and operand must agree on element type, shape, and flavor:
+    strip preserves the carrier kind (vector -> vector, bare_vector ->
+    bare_vector, tensor -> tensor, bare_tensor -> bare_tensor) and
+    only drops the layout slot. Switching flavor at the strip site
+    would clash with downstream inference at every peer-typed use
+    (the K-tile loop's iter init / result pair against an
+    intrinsic's vector return is the motivating example — see
+    ``examples/amdgpu_gfx11_wmma_matmul.py``). Buffers are rejected
+    outright: buffer storage is host-side and ``hc.as_layout`` is
+    the right primitive for buffer-level relabel.
+
+    Lowered pre-flatten by ``hc-lower-strip-layout`` into an
+    ``hc.vzeros`` plus ``hc.generic`` gather over the source's layout
+    offset, so the post-flatten pipeline only sees ordinary
+    ``hc.generic`` ops. The lowering is a no-op when the operand has
+    no layout (or carries the identity layout) — the bare type is
+    forwarded directly.
+  }];
+  let arguments = (ins HC_AnyShapedValueType:$value);
+  let results = (outs HC_AnyShapedValueType:$result);
+  let assemblyFormat = [{
+    $value attr-dict `:` type($value) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
 def HCAsLayoutOp : HC_Op<"as_layout",
     [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Change the layout of a tensor or vector value.";

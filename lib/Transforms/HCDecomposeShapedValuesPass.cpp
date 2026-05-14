@@ -903,6 +903,35 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
   }
 };
 
+// `hc.strip_layout` lives in the post-decompose surface as one
+// strip per channel: the original op operates on a semantic
+// shaped value, the decomposed form drops the layout on both the
+// data and mask channels independently. Mirrors `ConvertVecOp`'s
+// shape — single operand, two emitted ops, no indices.
+struct ConvertStripLayoutOp : public OpConversionPattern<HCStripLayoutOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCStripLayoutOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalType = op.getResult().getType();
+    if (!isSemanticShaped(originalType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getValue(), op, "strip_layout source");
+    if (failed(source))
+      return failure();
+    auto data = HCStripLayoutOp::create(
+        rewriter, op.getLoc(), bareDataType(originalType), source->first);
+    auto mask = HCStripLayoutOp::create(
+        rewriter, op.getLoc(), bareMaskType(originalType), source->second);
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getResult());
+    return success();
+  }
+};
+
 struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
   using Base::Base;
 
@@ -940,8 +969,9 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                ConvertCollectiveRegionOp<HCWorkitemRegionOp>,
                ConvertCollectiveRegionOp<HCSubgroupRegionOp>, ConvertStoreOp,
                ConvertReturnOp, ConvertYieldOp>(converter, ctx);
-  patterns.add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp,
-               ConvertGetItemOp, ConvertVecOp, ConvertWithInactiveOp>(converter,
+  patterns
+      .add<ConvertLoadOp, ConvertVLoadOp, ConvertBufferViewOp, ConvertGetItemOp,
+           ConvertVecOp, ConvertStripLayoutOp, ConvertWithInactiveOp>(converter,
                                                                       ctx);
   patterns
       .add<ConvertNullaryAllocOp<HCVZerosOp>, ConvertNullaryAllocOp<HCVOnesOp>,
@@ -1003,9 +1033,9 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
       });
   target.addDynamicallyLegalOp<
       HCCallOp, HCCallIntrinsicOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp,
-      HCBufferViewOp, HCGetItemOp, HCVecOp, HCWithInactiveOp, HCVZerosOp,
-      HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp, HCFullOp>(
-      [&](Operation *op) { return converter.isLegal(op); });
+      HCBufferViewOp, HCGetItemOp, HCVecOp, HCStripLayoutOp, HCWithInactiveOp,
+      HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp,
+      HCFullOp>([&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter);

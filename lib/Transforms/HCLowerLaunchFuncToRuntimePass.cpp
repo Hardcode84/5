@@ -162,6 +162,56 @@ private:
                          const FunctionCallBuilder &launchFuncBuilder);
 };
 
+static Value emitConstInt(OpBuilder &builder, Location loc, Type type,
+                          int64_t val) {
+  return LLVM::ConstantOp::create(builder, loc, type,
+                                  builder.getIntegerAttr(type, val));
+}
+
+static Value emitAlloca(OpBuilder &builder, Location loc, Type ptrType,
+                        Type elemType, int64_t size) {
+  Type i64Type = IntegerType::get(builder.getContext(), 64);
+  Value sizeVal = emitConstInt(builder, loc, i64Type, size);
+  return LLVM::AllocaOp::create(builder, loc, ptrType, elemType, sizeVal,
+                                /*alignment=*/0);
+}
+
+// HIP `kernelParams` convention: an array of `void*`, each pointing at
+// the storage holding one kernel argument. `alloca` per arg, store the
+// value, then build the array via insertvalue and spill the array
+// itself to one more alloca. Matches wave's recipe; matches what HIP's
+// `hipModuleLaunchKernel` documents.
+static Value packKernelArgs(OpBuilder &builder, Location loc, ValueRange args,
+                            Type ptrType) {
+  auto argsPtrArrayType = LLVM::LLVMArrayType::get(ptrType, args.size());
+  Value argsArray = LLVM::PoisonOp::create(builder, loc, argsPtrArrayType);
+  for (auto &&[i, arg] : llvm::enumerate(args)) {
+    Value argData = emitAlloca(builder, loc, ptrType, arg.getType(), 1);
+    LLVM::StoreOp::create(builder, loc, arg, argData);
+    argsArray =
+        LLVM::InsertValueOp::create(builder, loc, argsArray, argData, i);
+  }
+  Value argsArrayPtr = emitAlloca(builder, loc, ptrType, argsPtrArrayType, 1);
+  LLVM::StoreOp::create(builder, loc, argsArray, argsArrayPtr);
+  return argsArrayPtr;
+}
+
+// Cluster dims: the GPU dialect wires these as optional operands.
+// `gpu.launch_func` produced by our pipeline today never carries
+// cluster dims (we never call the cluster-aware overload of
+// `gpu-kernel-outlining`), so the Optional getters return null. Pass
+// 0 in that case — the runtime treats <=1 cluster as "no cluster" and
+// routes to the simpler launch entry point.
+static std::array<Value, 3> resolveClusterDims(OpBuilder &builder, Location loc,
+                                               gpu::LaunchFuncOp op,
+                                               Type i64Type) {
+  auto orZero = [&](Value v) -> Value {
+    return v ? v : emitConstInt(builder, loc, i64Type, 0);
+  };
+  return {orZero(op.getClusterSizeX()), orZero(op.getClusterSizeY()),
+          orZero(op.getClusterSizeZ())};
+}
+
 LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
     gpu::LaunchFuncOp op, ModuleOp mod, SymbolTable &symbolTable,
     const FunctionCallBuilder &loadFuncBuilder,
@@ -179,16 +229,6 @@ LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
   IRRewriter builder(context);
   builder.setInsertionPoint(op);
   Location loc = op.getLoc();
-
-  auto createConst = [&](Type type, int64_t val) -> Value {
-    return LLVM::ConstantOp::create(builder, loc, type,
-                                    builder.getIntegerAttr(type, val));
-  };
-  auto createAlloca = [&](Type elemType, int64_t size) -> Value {
-    Value sizeVal = createConst(i64Type, size);
-    return LLVM::AllocaOp::create(builder, loc, ptrType, elemType, sizeVal,
-                                  /*alignment=*/0);
-  };
 
   // Stream comes from the host wrapper's leading `!llvm.ptr` arg. The
   // host wrapper is the only function that contains gpu.launch_func ops
@@ -211,22 +251,19 @@ LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
                                           kernelName + "_handle");
 
   // `kernel_name + "\0"` so the runtime can pass it straight through to
-  // `hipModuleGetFunction`, which expects NUL-terminated input.
+  // `hipModuleGetFunction`, which expects NUL-terminated input. The HSACO
+  // blob is NOT NUL-terminated: ELF is self-describing and the size is
+  // passed alongside the pointer.
   SmallString<64> nameBuf(kernelName);
   nameBuf.push_back('\0');
   Value kernelNameStr = LLVM::createGlobalString(
       loc, builder, getUniqueLLVMGlobalName(mod, symbolTable, kernelName),
       nameBuf, LLVM::Linkage::Internal);
-
-  // The HSACO blob ships as a raw byte string — `createGlobalString`
-  // gives us back a pointer to its first byte, which is exactly what
-  // `hipModuleLoadData` wants. We do NOT NUL-terminate: ELF blobs are
-  // self-describing and the size is passed alongside the pointer.
   Value dataPtr = LLVM::createGlobalString(
       loc, builder,
       getUniqueLLVMGlobalName(mod, symbolTable, kernelName + "_data"), objData,
       LLVM::Linkage::Internal);
-  Value dataSize = createConst(i64Type, objData.size());
+  Value dataSize = emitConstInt(builder, loc, i64Type, objData.size());
 
   Value funcObject =
       loadFuncBuilder
@@ -234,44 +271,18 @@ LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
                   {stream, kernelHandle, dataPtr, dataSize, kernelNameStr})
           ->getResult(0);
 
-  // HIP `kernelParams` convention: an array of `void*`, each pointing
-  // at the storage holding one kernel argument. `alloca` per arg, store
-  // the value, then build the array via insertvalue and spill the array
-  // itself to one more alloca. Matches wave's recipe; matches what HIP's
-  // `hipModuleLaunchKernel` documents.
-  Value sharedMemoryBytes = createConst(i32Type, 0);
+  Value sharedMemoryBytes = emitConstInt(builder, loc, i32Type, 0);
   ValueRange args = op.getKernelOperands();
-  auto argsPtrArrayType = LLVM::LLVMArrayType::get(ptrType, args.size());
-  Value argsArray = LLVM::PoisonOp::create(builder, loc, argsPtrArrayType);
-  for (auto &&[i, arg] : llvm::enumerate(args)) {
-    Value argData = createAlloca(arg.getType(), 1);
-    LLVM::StoreOp::create(builder, loc, arg, argData);
-    argsArray =
-        LLVM::InsertValueOp::create(builder, loc, argsArray, argData, i);
-  }
-  Value argsArrayPtr = createAlloca(argsPtrArrayType, 1);
-  LLVM::StoreOp::create(builder, loc, argsArray, argsArrayPtr);
-  Value argsCount = createConst(i32Type, args.size());
+  Value argsArrayPtr = packKernelArgs(builder, loc, args, ptrType);
+  Value argsCount = emitConstInt(builder, loc, i32Type, args.size());
 
-  // Cluster dims: the GPU dialect wires these as optional operands.
-  // `gpu.launch_func` produced by our pipeline today never carries
-  // cluster dims (we never call the cluster-aware overload of
-  // `gpu-kernel-outlining`), so the Optional getters return null. Pass
-  // 0 in that case — the runtime treats <=1 cluster as "no cluster" and
-  // routes to the simpler launch entry point.
-  Value clusterX =
-      op.getClusterSizeX() ? op.getClusterSizeX() : createConst(i64Type, 0);
-  Value clusterY =
-      op.getClusterSizeY() ? op.getClusterSizeY() : createConst(i64Type, 0);
-  Value clusterZ =
-      op.getClusterSizeZ() ? op.getClusterSizeZ() : createConst(i64Type, 0);
-
+  std::array<Value, 3> cluster = resolveClusterDims(builder, loc, op, i64Type);
   launchFuncBuilder.create(loc, builder,
                            {stream, funcObject, sharedMemoryBytes,
                             op.getGridSizeX(), op.getGridSizeY(),
                             op.getGridSizeZ(), op.getBlockSizeX(),
-                            op.getBlockSizeY(), op.getBlockSizeZ(), clusterX,
-                            clusterY, clusterZ, argsArrayPtr, argsCount});
+                            op.getBlockSizeY(), op.getBlockSizeZ(), cluster[0],
+                            cluster[1], cluster[2], argsArrayPtr, argsCount});
   builder.eraseOp(op);
   return success();
 }

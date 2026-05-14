@@ -326,27 +326,38 @@ static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
 }
 
 // Compose `sourceLayout` against a `hc.buffer_view`'s per-axis
-// disposition. For every scalar-indexed axis k we substitute
-// `index_syms[k]` (the layout's coordinate name for that axis) with
-// the scalar's `IdxType` expression and `shape_syms[k]` (the layout's
-// dim-alias name) with the operand's actual dim expression, then
-// drop both names from the residual layout's slot lists. Slice axes
-// and implicit pass-through axes keep their slots and contribute no
-// substitution. The substitution also runs through every `ExprAttr`
-// in the params dict so derived params (`row_stride = 4 + d1`) stay
-// well-formed against the residual shape sym set.
+// disposition. The substitution rules per axis:
 //
-// Slice-axis index rebinding (`index_syms[k] -> lower + step *
-// index_syms[k]` for non-trivial slices) is intentionally not
-// performed here: the current `hc.slice_expr` surface only emits
-// `[0 : dim : 1]` from the frontend's `[:]` lowering, and any non-
-// trivial slice would also need axis-extent rewriting that doesn't
-// fit cleanly in the type-inference loop. Tracked separately on the
-// slice-relayout follow-up.
-static FailureOr<LayoutAttr>
-composeBufferViewLayout(LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
-                        ArrayRef<bool> keepAxis,
-                        ArrayRef<ExprAttr> scalarValueExpr, Operation *op) {
+//   * Scalar-indexed axes: substitute `index_syms[k]` with the
+//     scalar's `IdxType` expression and `shape_syms[k]` with the
+//     operand's actual dim expression, then drop both names from the
+//     residual layout's slot lists.
+//   * Trivial-slice axes (`[:]`, `[0:dim:1]` — sliced extent equals
+//     the operand's dim, lower defaults to 0, step defaults to 1):
+//     keep both slots in the residual, no substitution. The original
+//     index/shape sym names continue to refer to the operand's axis
+//     k.
+//   * Non-trivial slice axes (`[lo:hi:st]` where any of lower /
+//     upper / step departs from the trivial defaults): substitute
+//     `index_syms[k]` with `lower + step * index_syms[k]` and (if the
+//     sliced extent differs from the operand's dim) substitute
+//     `shape_syms[k]` with the operand's dim expression. Both slots
+//     remain in the residual's lists to satisfy
+//     `shape_syms.size() == index_syms.size() == rank`; the
+//     substituted names are reachable through their handles in the
+//     rebound expressions but no longer appear as bare references in
+//     the offset / storage_size / params formulas.
+//   * Implicit pass-through axes (more axes than subscript entries):
+//     keep both slots, no substitution. Same as trivial slices.
+//
+// The substitution also runs through every `ExprAttr` in the params
+// dict so derived params (`row_stride = 4 + d1`) stay well-formed
+// against the residual shape sym set.
+static FailureOr<LayoutAttr> composeBufferViewLayout(
+    LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
+    ArrayRef<bool> keepAxis, ArrayRef<ExprAttr> scalarValueExpr,
+    ArrayRef<ExprAttr> sliceLowerExpr, ArrayRef<ExprAttr> sliceStepExpr,
+    ArrayRef<bool> sliceShapeChanged, Operation *op) {
   MLIRContext *ctx = op->getContext();
   ArrayRef<Attribute> shapeSyms = sourceLayout.getShapeSyms();
   ArrayRef<Attribute> indexSyms = sourceLayout.getIndexSyms();
@@ -360,6 +371,10 @@ composeBufferViewLayout(LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
   if (indexSyms.size() != baseDims.size())
     return failure();
   if (keepAxis.size() != baseDims.size())
+    return failure();
+  if (sliceLowerExpr.size() != baseDims.size() ||
+      sliceStepExpr.size() != baseDims.size() ||
+      sliceShapeChanged.size() != baseDims.size())
     return failure();
 
   sym::Store &store = symbolStore(ctx);
@@ -380,10 +395,60 @@ composeBufferViewLayout(LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
     return success();
   };
 
+  // ixsimpl canonicalises `0` / `1` to a single hash-consed handle,
+  // so structural-equality checks against these leaves let us skip
+  // the `m -> 0 + 1 * m` self-substitution that would otherwise
+  // bloat trivial-slice offsets.
+  auto zeroLeaf = sym::composeExprInt(store, 0);
+  auto oneLeaf = sym::composeExprInt(store, 1);
+  if (failed(zeroLeaf) || failed(oneLeaf))
+    return failure();
+  ExprAttr zeroAttr = ExprAttr::get(ctx, *zeroLeaf);
+  ExprAttr oneAttr = ExprAttr::get(ctx, *oneLeaf);
+
   for (unsigned k = 0; k < baseDims.size(); ++k) {
     if (keepAxis[k]) {
       remainShapeSyms.push_back(shapeSyms[k]);
       remainIndexSyms.push_back(indexSyms[k]);
+      ExprAttr lowerExpr = sliceLowerExpr[k];
+      ExprAttr stepExpr = sliceStepExpr[k];
+      // Pass-through axes (more axes than subscripts) have empty
+      // slice exprs and structurally cannot have a shape change;
+      // they shortcut to the trivial-slice "no substitution" branch.
+      if (!lowerExpr || !stepExpr)
+        continue;
+      // The sliced-extent-changed flag drives shape_syms[k]
+      // substitution independently of the index rebind: a slice
+      // like `[0:hi]` over a dim-M axis (with hi != M) keeps the
+      // trivial index relation (lower 0, step 1) but the residual's
+      // shape_sym would otherwise bind to `hi` instead of the
+      // operand's M.
+      auto dimExpr = dyn_cast<ExprAttr>(baseDims[k]);
+      if (!dimExpr)
+        return failure();
+      if (sliceShapeChanged[k]) {
+        StringRef shapeName = cast<StringAttr>(shapeSyms[k]).getValue();
+        if (failed(pushPair(shapeName, dimExpr.getValue())))
+          return failure();
+      }
+      bool indexRebind = lowerExpr != zeroAttr || stepExpr != oneAttr;
+      if (indexRebind) {
+        StringRef indexName = cast<StringAttr>(indexSyms[k]).getValue();
+        auto indexSymHandle = sym::composeExprSym(store, indexName);
+        if (failed(indexSymHandle))
+          return failure();
+        auto stepMul =
+            sym::composeExprBinary(store, stepExpr.getValue(),
+                                   sym::ExprBinaryOp::Mul, *indexSymHandle);
+        if (failed(stepMul))
+          return failure();
+        auto rebound = sym::composeExprBinary(store, lowerExpr.getValue(),
+                                              sym::ExprBinaryOp::Add, *stepMul);
+        if (failed(rebound))
+          return failure();
+        targets.push_back(const_cast<ixs_node *>(indexSymHandle->raw()));
+        replacements.push_back(const_cast<ixs_node *>(rebound->raw()));
+      }
       continue;
     }
     auto dimExpr = dyn_cast<ExprAttr>(baseDims[k]);
@@ -463,13 +528,28 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
   // or implicit pass-through); for the scalar-consumed axes
   // `scalarValueExpr[k]` carries the index value's `IdxType` expression
   // so the layout composer can substitute it into the residual offset.
+  // For slice-subscripted axes `sliceLowerExpr[k]` / `sliceStepExpr[k]`
+  // carry the slice's lower / step (defaulting to 0 / 1 when omitted),
+  // and `sliceShapeChanged[k]` records whether the sliced extent
+  // departs from the operand's dim — both inputs feed the
+  // non-trivial-slice substitutions in `composeBufferViewLayout`.
+  // Implicit pass-through axes (more axes than subscripts) leave the
+  // slice arrays empty / false; the layout composer treats them as
+  // trivial.
+  //
   // The vector-root "collective suffix" branch indexes beyond
-  // `baseDims.size()` and doesn't populate either array — layout
+  // `baseDims.size()` and doesn't populate any of these arrays — layout
   // composition is only meaningful within the source's logical rank.
   SmallVector<bool> keepAxis;
   SmallVector<ExprAttr> scalarValueExpr;
+  SmallVector<ExprAttr> sliceLowerExpr;
+  SmallVector<ExprAttr> sliceStepExpr;
+  SmallVector<bool> sliceShapeChanged;
   keepAxis.reserve(baseDims.size());
   scalarValueExpr.reserve(baseDims.size());
+  sliceLowerExpr.reserve(baseDims.size());
+  sliceStepExpr.reserve(baseDims.size());
+  sliceShapeChanged.reserve(baseDims.size());
   unsigned axis = 0;
   bool vectorRoot =
       isa<mlir::hc::VectorType, mlir::hc::BareVectorType>(sourceType);
@@ -497,9 +577,30 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
       FailureOr<ExprAttr> dim = inferSliceViewDim(baseDim, slice, op);
       if (failed(dim))
         return currentResultType;
+      // Capture lower / step from the slice type so the layout
+      // composer can rebind `index_syms[k]` to `lower + step *
+      // index_syms[k]`. Missing parts default to Python slice
+      // semantics (lower = 0, step = 1).
+      Type lowerType = slice.getLowerType();
+      Type stepType = slice.getStepType();
+      std::optional<ExprAttr> lower =
+          lowerType ? idxExprAttr(lowerType) : std::optional<ExprAttr>();
+      std::optional<ExprAttr> step =
+          stepType ? idxExprAttr(stepType) : std::optional<ExprAttr>();
+      if ((lowerType && !lower) || (stepType && !step))
+        return currentResultType;
+      FailureOr<ExprAttr> zero = defaultZeroExpr(op);
+      FailureOr<ExprAttr> one = defaultOneExpr(op);
+      if (failed(zero) || failed(one))
+        return failure();
+      ExprAttr lowerExpr = lower.value_or(*zero);
+      ExprAttr stepExpr = step.value_or(*one);
       resultDims.push_back(*dim);
       keepAxis.push_back(true);
       scalarValueExpr.push_back({});
+      sliceLowerExpr.push_back(lowerExpr);
+      sliceStepExpr.push_back(stepExpr);
+      sliceShapeChanged.push_back(*dim != baseDim);
       ++axis;
       continue;
     }
@@ -515,6 +616,9 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
       if (sourceLayout && !scalarExpr)
         return currentResultType;
       scalarValueExpr.push_back(scalarExpr);
+      sliceLowerExpr.push_back({});
+      sliceStepExpr.push_back({});
+      sliceShapeChanged.push_back(false);
       ++axis;
       continue;
     }
@@ -525,6 +629,9 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
     resultDims.push_back(baseDims[axis]);
     keepAxis.push_back(true);
     scalarValueExpr.push_back({});
+    sliceLowerExpr.push_back({});
+    sliceStepExpr.push_back({});
+    sliceShapeChanged.push_back(false);
   }
 
   LayoutAttr resultLayout;
@@ -536,7 +643,8 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
     // layout, malformed shape entry, ...) leave the result type
     // un-refined and let a later inference pass try again.
     FailureOr<LayoutAttr> composed = composeBufferViewLayout(
-        sourceLayout, baseDims, keepAxis, scalarValueExpr, op);
+        sourceLayout, baseDims, keepAxis, scalarValueExpr, sliceLowerExpr,
+        sliceStepExpr, sliceShapeChanged, op);
     if (failed(composed))
       return currentResultType;
     resultLayout = *composed;

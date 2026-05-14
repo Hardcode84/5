@@ -115,10 +115,15 @@ Inference (`hc-infer-types`) propagates layouts:
   under ixsimpl. See *Late-bound symbols and reinterpret /
   Shape-changing `hc.as_layout`* below.
 * `hc.buffer_view`: a layout-bearing source composes scalar subscripts
-  into the residual layout — `index_syms[k]` substitutes the scalar's
-  expression, `shape_syms[k]` substitutes the operand's dim entry,
-  and both slots are dropped from the residual layout. Slice
-  subscripts keep their slots and pass through unchanged. See
+  and non-trivial slice rebinds into the residual layout —
+  `index_syms[k]` substitutes the scalar's expression, `shape_syms[k]`
+  substitutes the operand's dim entry, and both slots are dropped
+  from the residual layout. For non-trivial slices (`[lo:hi:st]` with
+  `lower != 0` or `step != 1` or sliced extent `!=` operand dim),
+  `index_syms[k]` rebinds to `lower + step * index_syms[k]` and
+  `shape_syms[k]` substitutes the operand's dim (slots stay to keep
+  the rank invariant). Trivial slices (`[:]`, `[0:dim:1]`) and
+  implicit pass-through axes keep their slots unchanged. See
   *Late-bound symbols and reinterpret / `hc.buffer_view`* below.
 
 The collective return suffix from `@group.subgroups` / `@group.workitems`
@@ -234,12 +239,16 @@ Deferred slices (out of scope here):
   ixsimpl are rejected by the verifier — there's no `hc.generic`
   copy fallback, layouts that need to materially repack data go
   through `hc.generic` directly.
-* **`hc.buffer_view` strided-slice offset composition.** Buffer
-  views whose source has no layout (or has a layout that doesn't
-  cleanly absorb the subscript stream) still rely on the strided-
-  slice branch below for layout-less rank-reduction. Today the
-  chain walk lives in `hc-lower-launch-body`; eventually flatten will
-  fuse the chain into the sliced operand's layout directly.
+* **`hc.buffer_view` layout-less strided-slice offset composition.**
+  Buffer views whose source has *no* layout still rely on the
+  layout-less strided-slice branch below for rank-reduction. Buffer
+  views with a layout-bearing source compose the slice's `lower` /
+  `step` into the residual layout's `index_syms[k]` at type
+  inference time (see *`hc.buffer_view` composes scalar indices and
+  slice rebinds into the layout*) so the flatten identity branch
+  picks them up. Today the layout-less chain walk lives in
+  `hc-lower-launch-body`; eventually flatten will fuse the chain
+  into the sliced operand's layout directly.
 * **`i1` byte-per-element retirement.** The hand-coded `i1` mask
   handling in `HCLowerLaunchBodyPass.cpp` needs flatten to emit a
   byte-per-element layout for `i1` shaped types as a default. Until
@@ -908,12 +917,17 @@ the logical structure of the value it's attached to:
 * **Free symbols in `offset` / `storage_size`** — names not declared
   on the layout that the surrounding kernel scope supplies at
   lowering time. Authored directly on the layout.
-* **`hc.buffer_view` composes scalar subscripts into the residual
-  layout** — slicing a layout-bearing source with a scalar value
-  substitutes the matching `index_syms` entry into the layout's
-  offset / storage_size and drops both slots from the residual rank.
-  The substituted scalar typically pins a kernel-scope sym, which
-  surfaces as a free symbol in the view's residual layout.
+* **`hc.buffer_view` composes scalar subscripts and non-trivial slice
+  rebinds into the residual layout** — a scalar subscript substitutes
+  the matching `index_syms` entry into the layout's offset /
+  storage_size and drops both slots from the residual rank. A
+  non-trivial slice (`[lo:hi:st]` whose `lower != 0`, `step != 1`, or
+  whose sliced extent differs from the operand's dim) rebinds
+  `index_syms[k] -> lower + step * index_syms[k]` and substitutes
+  `shape_syms[k]` with the operand's dim, both slots staying to keep
+  the rank invariant. The substituted scalar / slice bounds typically
+  pin kernel-scope syms, which surface as free symbols in the view's
+  residual layout.
 * **Shape-changing `hc.as_layout`** — reinterprets a value's logical
   rank / extents without touching storage, guarded by an effective-
   `storage_size` equality check under ixsimpl. The 1-D-allocation-as-
@@ -1003,44 +1017,73 @@ gather path documented above runs against in-layout symbols only;
 free-sym binding for the simulator is its own follow-up. Pinned by
 `tests/test_simulator.py::test_resolve_layout_rejects_free_syms`.
 
-### `hc.buffer_view` composes scalar indices into the layout
+### `hc.buffer_view` composes scalar indices and slice rebinds into the layout
 
 `hc.buffer_view` on a layout-bearing source is the second free-sym
-introduction site. For every axis `k` consumed by a scalar subscript,
-`inferBufferViewResult`
-(`lib/IR/HCInferTypeOpInterface.cpp::composeBufferViewLayout`):
+introduction site. `inferBufferViewResult`
+(`lib/IR/HCInferTypeOpInterface.cpp::composeBufferViewLayout`)
+composes the operand layout against the per-axis subscript stream:
 
-* substitutes `index_syms[k]` in the layout's `offset` /
-  `storage_size` (and every `params` value) with the scalar's
-  `IdxType` expression;
-* substitutes `shape_syms[k]` with the operand's actual dim entry;
-* drops both names from the residual layout's slot lists, so the
-  residual rank matches the residual shape.
+* **Scalar axes** (`v[buf_idx]`): substitute `index_syms[k]` with the
+  scalar's `IdxType` expression, substitute `shape_syms[k]` with the
+  operand's actual dim entry, and drop both names from the residual
+  layout's slot lists.
+* **Trivial slice axes** (`v[:]`, `v[0:dim:1]` — `lower` defaults to
+  0, `step` defaults to 1, and the sliced extent structurally equals
+  the operand's dim): keep both slots unchanged. The original sym
+  names continue to refer to the operand's axis `k`.
+* **Non-trivial slice axes** (`v[lo:hi:st]` — any of the three departs
+  from the trivial defaults): rebind `index_syms[k]` to `lower + step
+  * index_syms[k]` and (when the sliced extent differs from the
+  operand's dim) substitute `shape_syms[k]` with the operand's dim
+  entry. Both slots remain in the residual lists so the rank invariant
+  `shape_syms.size() == index_syms.size() == result_rank` survives;
+  the substituted names are reachable through their handles in the
+  rebound expression but no longer appear as bare references in the
+  offset / storage_size / params formulas.
+* **Implicit pass-through axes** (subscripts shorter than the source
+  rank): same as trivial slice — keep slots, no substitution.
 
-Slice subscripts and implicit-pass-through axes keep their slots and
-contribute no substitution. The substituted scalar typically pins a
-kernel-scope sym (a `!hc.idx<"buf_idx">` kernel arg, a block-arg loop
-IV); that sym then appears in the residual layout as a free symbol
-and binds through the same mechanism described above.
+Substituted scalars and slice bounds typically pin kernel-scope syms
+(a `!hc.idx<"buf_idx">` kernel arg, a block-arg loop IV, a kernel-arg
+`row0`); those syms then surface in the residual layout as free
+symbols and bind through the same mechanism described above.
 
-The motivating shape is multi-buffered LDS expressed as a 4-D layout
-`(BUF, M, N, LANE)`. Slicing the leading axis with `lds_4d[buf_idx]`
-produces a 3-D residual view whose `offset` already bakes in the
-`buf_idx*M*N*L` shift — the caller never declares `buf_idx` on the
-layout, it surfaces as a free sym after composition and binds from
-the buffer_view's index operand at lowering time.
+Two motivating shapes:
 
-Slice-axis index rebinding (`index_syms[k] := lower + step *
-index_syms[k]` for non-trivial `[lower:upper:step]` slices) is
-intentionally deferred — the frontend's `[:]` lowering only emits
-trivial slices today, and non-trivial slices would also need axis-
-extent rewriting that doesn't fit cleanly in the type-inference loop.
+* **Multi-buffered LDS**: a 4-D layout `(BUF, M, N, LANE)` sliced with
+  `lds_4d[buf_idx]` collapses to a 3-D residual whose `offset` already
+  bakes in the `buf_idx*M*N*L` shift. The caller never declares
+  `buf_idx` on the layout; it surfaces as a free sym after composition
+  and binds from the buffer_view's index operand at lowering time.
+* **WMMA per-lane fragments**: a 3-D layout `(M, N, LANE)` over a 2-D
+  buffer accessed with `c.as_layout(...)[row0 : row0 + WMMA_M : 2,
+  col0, lane]` — the leading slice's `lower = row0` and `step = 2`
+  rebind `index_syms[0]` to `row0 + 2 * index_syms[0]`, the trailing
+  scalars substitute `col0` / `lane`, and the residual is a 1-D
+  per-lane fragment whose `storage_size = M*N` matches the operand's
+  flat span so the flatten identity branch forwards through.
+
+The flatten identity branch keys off the residual `storage_size`
+structurally matching the operand's. `composeBufferViewLayout` keeps
+this contract for non-trivial slices by substituting `shape_syms[k]`
+with the operand's dim entry whenever the sliced extent departs from
+it — without that substitution the residual `storage_size` would bind
+the layout's local name to the sliced extent and the identity branch
+would mis-fire. The downstream access patterns
+(`ComposeLoadOffsets` / `ComposeVLoadOffsets` / `ComposeStoreOffsets`
+in `lib/Transforms/HCFlattenWithLayoutsPass.cpp`) accept 1-D
+layout-bearing sources too, so a 1-D residual feeds the post-flatten
+offset compose just like a multi-D one.
 
 LIT coverage:
 `@buffer_view_layout_multibuf`,
 `@buffer_view_layout_mixed_scalar_slice`,
-`@buffer_view_layout_all_slice` in `test/HC/infer-types.mlir`;
-`@buffer_view_layout_multibuf_forwards_source` in
+`@buffer_view_layout_all_slice`,
+`@buffer_view_layout_strided_slice`,
+`@buffer_view_layout_lower_slice` in `test/HC/infer-types.mlir`;
+`@buffer_view_layout_multibuf_forwards_source`,
+`@buffer_view_strided_slice_then_vload` in
 `test/HC/flatten-with-layouts.mlir`.
 
 ### Shape-changing `hc.as_layout`

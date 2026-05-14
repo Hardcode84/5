@@ -939,8 +939,18 @@ struct ComposeLoadOffsets : public ComposeAccessOffsetBase<HCLoadOp> {
   LogicalResult
   matchAndRewrite(HCLoadOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getIndices().size() == 1)
-      return failure();
+    // Already-flat single-index loads against a layout-less buffer
+    // need no offset folding — the generic retype handles the operand
+    // type. Layout-bearing 1D sources (the buffer_view-with-strided-
+    // slice residual that `composeBufferViewLayout` produces) still
+    // need composition, so keep going when the pre-flatten source's
+    // type carries a layout.
+    if (op.getIndices().size() == 1) {
+      auto shaped =
+          dyn_cast<SymbolicallyShapedTypeInterface>(op.getBuffer().getType());
+      if (!shaped || !shaped.getSymbolicLayout())
+        return failure();
+    }
     if (adaptor.getBuffer().empty())
       return failure();
     Value flatBuffer = adaptor.getBuffer().front();
@@ -993,8 +1003,15 @@ struct ComposeVLoadOffsets : public ComposeAccessOffsetBase<HCVLoadOp> {
   LogicalResult
   matchAndRewrite(HCVLoadOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getIndices().size() == 1)
-      return failure();
+    // See `ComposeLoadOffsets` — 1D layout-bearing sources (the
+    // buffer_view-with-strided-slice residual that
+    // `composeBufferViewLayout` produces) still need composition.
+    if (op.getIndices().size() == 1) {
+      auto shaped =
+          dyn_cast<SymbolicallyShapedTypeInterface>(op.getSource().getType());
+      if (!shaped || !shaped.getSymbolicLayout())
+        return failure();
+    }
     if (adaptor.getSource().empty())
       return failure();
     Value flatSource = adaptor.getSource().front();
@@ -1047,8 +1064,14 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
   LogicalResult
   matchAndRewrite(HCStoreOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getIndices().size() == 1)
-      return failure();
+    // See `ComposeLoadOffsets` — 1D layout-bearing destinations still
+    // need composition.
+    if (op.getIndices().size() == 1) {
+      auto shaped =
+          dyn_cast<SymbolicallyShapedTypeInterface>(op.getDest().getType());
+      if (!shaped || !shaped.getSymbolicLayout())
+        return failure();
+    }
     if (adaptor.getDest().empty())
       return failure();
     Value flatDest = adaptor.getDest().front();

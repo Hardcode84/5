@@ -924,3 +924,79 @@ func.func @buffer_view_layout_multibuf_forwards_source(
                                      storage_size = #hc.expr<"BUF*l*m*n">,
                                      offset = #hc.expr<"il + l*(in + n*(im + buf_idx*m))">>>
 }
+
+// -----
+
+// End-to-end pin for non-trivial-slice composition: a 2-D layout-
+// bearing source is sub-viewed with `[row0:row0+16:2, col0]` and the
+// 1-D residual is then `hc.vload`'d. `composeBufferViewLayout`
+// rebinds `index_syms[0] = "im" -> row0 + 2*im` and substitutes
+// `shape_syms[0] = "m" -> M`, so the residual layout's offset reads
+// `col0 + N*(2*im + row0)` and `storage_size = M*N` (matching the
+// operand's flat span). The flatten identity branch then forwards
+// the operand's flat carrier through to the vload, and the relaxed
+// 1-index access path materialises the composed offset via
+// `hc.idx_apply`. Without `5-cua4`, the residual would mis-bind `m`
+// to the sliced extent (`8`), the storage check would diverge from
+// the operand's `M*N`, and the vload would land on an uncomposed
+// flat offset.
+// CHECK-LABEL: @buffer_view_strided_slice_then_vload
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.tensor<f32, ["M*N"]>
+// CHECK-SAME: %[[BM:[^:]+]]: !hc.idx<"M">, %[[BN:[^:]+]]: !hc.idx<"N">
+// CHECK-SAME: %[[R0:[^:]+]]: !hc.idx<"row0">, %[[C0:[^:]+]]: !hc.idx<"col0">
+// CHECK-SAME: %[[I:[^:]+]]: !hc.idx<"i">
+// CHECK-NOT: hc.buffer_view
+// CHECK: %[[C0F:.*]] = hc.idx_apply () : () -> !hc.idx<"col0">
+// CHECK: %[[R0F:.*]] = hc.idx_apply () : () -> !hc.idx<"row0">
+// CHECK: %[[OFF:.*]] = hc.idx_apply (%[[BN]] as "N", %[[C0F]] as "col0", %[[I]] as "i", %[[R0F]] as "row0")
+// CHECK-SAME: -> !hc.idx<"col0 + N*(2*i + row0)">
+// CHECK: hc.vload %[[SRC]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.tensor<f32, ["M*N"]>, !hc.idx<"col0 + N*(2*i + row0)">, tuple<!hc.idx<"8">>) -> !hc.bare_vector<f32, ["8"]>
+func.func @buffer_view_strided_slice_then_vload(
+    %c: !hc.tensor<f32, ["M", "N"],
+                   #hc.layout<shape_syms = ["m", "n"],
+                              index_syms = ["im", "in"],
+                              params = {},
+                              storage_size = #hc.expr<"m*n">,
+                              offset = #hc.expr<"im*n + in">>>,
+    %row0: !hc.idx<"row0">,
+    %col0: !hc.idx<"col0">,
+    %i: !hc.idx<"i">) {
+  %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+  %two = hc.const<2 : i64> : !hc.idx<"2">
+  %eight = hc.const<8 : i64> : !hc.idx<"8">
+  %row_stop = hc.add %row0, %sixteen
+      : (!hc.idx<"row0">, !hc.idx<"16">) -> !hc.idx<"row0 + 16">
+  %strided = hc.slice_expr(lower = %row0 upper = %row_stop step = %two)
+      : (!hc.idx<"row0">, !hc.idx<"row0 + 16">, !hc.idx<"2">)
+        -> !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">,
+                     step = !hc.idx<"2">>
+  %v = hc.buffer_view %c[%strided, %col0]
+      : (!hc.tensor<f32, ["M", "N"],
+                    #hc.layout<shape_syms = ["m", "n"],
+                               index_syms = ["im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"m*n">,
+                               offset = #hc.expr<"im*n + in">>>,
+         !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">,
+                   step = !hc.idx<"2">>,
+         !hc.idx<"col0">)
+      -> !hc.tensor<f32, ["8"],
+                    #hc.layout<shape_syms = ["m"],
+                               index_syms = ["im"],
+                               params = {},
+                               storage_size = #hc.expr<"M*N">,
+                               offset = #hc.expr<"col0 + N*(2*im + row0)">>>
+  %shape = hc.tuple(%eight)
+      : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+  %frag = hc.vload %v[%i], shape %shape
+      : (!hc.tensor<f32, ["8"],
+                    #hc.layout<shape_syms = ["m"],
+                               index_syms = ["im"],
+                               params = {},
+                               storage_size = #hc.expr<"M*N">,
+                               offset = #hc.expr<"col0 + N*(2*im + row0)">>>,
+         !hc.idx<"i">,
+         tuple<!hc.idx<"8">>)
+      -> !hc.bare_vector<f32, ["8"]>
+  return
+}

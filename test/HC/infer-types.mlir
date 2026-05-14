@@ -278,10 +278,10 @@ hc.func @buffer_view_layout_mixed_scalar_slice(
 
 // CHECK-LABEL: hc.func @buffer_view_layout_all_slice
 // No scalar indices: every layout slot survives, `offset` and
-// `storage_size` are unchanged. Pins the "slice-axis pass-through"
-// half of the composition contract so future slice-rebinding work
-// (`index_syms[k] := lower + step * index_syms[k]` for non-trivial
-// slices) doesn't accidentally regress the trivial-slice path.
+// `storage_size` are unchanged. Pins the trivial-slice composition
+// contract (`lower = 0`, step defaulting to 1, sliced extent ==
+// operand dim) so the non-trivial-slice rebinding below doesn't
+// accidentally regress this baseline.
 // CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["M", "N"], <shape_syms = ["m", "n"], index_syms = ["im", "in"], params = {}, storage_size = #hc.expr<"m*n">, offset = #hc.expr<"in + im*n">>>
 hc.func @buffer_view_layout_all_slice(
     %lds: !hc.tensor<f32, ["M", "N"],
@@ -300,6 +300,77 @@ hc.func @buffer_view_layout_all_slice(
                                storage_size = #hc.expr<"m*n">,
                                offset = #hc.expr<"im*n + in">>>,
          !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"M">>) -> !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Non-trivial slice with `lower = row0`, `step = 2`, plus a scalar on
+// the trailing axis. The slice axis stays in the residual rank, but
+// `composeBufferViewLayout` substitutes the layout's `index_syms[0]`
+// ("im") with `row0 + 2 * im` and `shape_syms[0]` ("m") with the
+// operand's actual `M` dim — without the latter the residual
+// `storage_size` would bind `m` to the sliced extent and lose the
+// physical-storage equivalence that the flatten pass identity
+// branch keys off of. The scalar axis (axis 1) substitutes "in" with
+// `col0` and "n" with `N`, exactly like the trivial-slice +
+// scalar mix below.
+// CHECK-LABEL: hc.func @buffer_view_layout_strided_slice
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["8"], <shape_syms = ["m"], index_syms = ["im"], params = {}, storage_size = #hc.expr<"M*N">, offset = #hc.expr<"col0 + N*(2*im + row0)">>>
+hc.func @buffer_view_layout_strided_slice(
+    %lds: !hc.tensor<f32, ["M", "N"],
+                     #hc.layout<shape_syms = ["m", "n"],
+                                index_syms = ["im", "in"],
+                                params = {},
+                                storage_size = #hc.expr<"m*n">,
+                                offset = #hc.expr<"im*n + in">>>,
+    %row0: !hc.idx<"row0">,
+    %col0: !hc.idx<"col0">) -> !hc.undef {
+  %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+  %two = hc.const<2 : i64> : !hc.idx<"2">
+  %row_stop = hc.add %row0, %sixteen
+      : (!hc.idx<"row0">, !hc.idx<"16">) -> !hc.idx<"row0 + 16">
+  %strided = hc.slice_expr(lower = %row0 upper = %row_stop step = %two)
+      : (!hc.idx<"row0">, !hc.idx<"row0 + 16">, !hc.idx<"2">) -> !hc.undef
+  %v = hc.buffer_view %lds[%strided, %col0]
+      : (!hc.tensor<f32, ["M", "N"],
+                    #hc.layout<shape_syms = ["m", "n"],
+                               index_syms = ["im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"m*n">,
+                               offset = #hc.expr<"im*n + in">>>,
+         !hc.undef, !hc.idx<"col0">) -> !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// Non-trivial slice with `lower = lo`, no explicit `step` (default 1).
+// Shape rebind fires because the sliced extent (`hi - lo`) doesn't
+// structurally match the operand's `M` dim; the index rebind also
+// fires because `lower` isn't 0. The trailing axis is an implicit
+// pass-through (more axes than subscript entries) — the layout
+// keeps `n` / `in` in the residual without substitution because
+// pass-through axes carry no slice info.
+// CHECK-LABEL: hc.func @buffer_view_layout_lower_slice
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["hi - lo", "N"], <shape_syms = ["m", "n"], index_syms = ["im", "in"], params = {}, storage_size = #hc.expr<"M*n">, offset = #hc.expr<"in + n*(im + lo)">>>
+hc.func @buffer_view_layout_lower_slice(
+    %lds: !hc.tensor<f32, ["M", "N"],
+                     #hc.layout<shape_syms = ["m", "n"],
+                                index_syms = ["im", "in"],
+                                params = {},
+                                storage_size = #hc.expr<"m*n">,
+                                offset = #hc.expr<"im*n + in">>>,
+    %row_slice: !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">>)
+    -> !hc.undef {
+  %v = hc.buffer_view %lds[%row_slice]
+      : (!hc.tensor<f32, ["M", "N"],
+                    #hc.layout<shape_syms = ["m", "n"],
+                               index_syms = ["im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"m*n">,
+                               offset = #hc.expr<"im*n + in">>>,
+         !hc.slice<lower = !hc.idx<"lo">, upper = !hc.idx<"hi">>) -> !hc.undef
   hc.return %v : !hc.undef
 }
 

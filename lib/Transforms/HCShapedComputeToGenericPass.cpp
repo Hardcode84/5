@@ -171,14 +171,19 @@ static Value promoteScalar(OpBuilder &builder, Location loc, Value v,
   return HCAsTypeOp::create(builder, loc, target, v, TypeAttr::get(target));
 }
 
-// Rewrite a single `hc.matmul lhs, rhs -> out` into an `hc.zeros` +
-// `hc.generic` pair. v0 only handles rank-2 operands and a uniform
-// arith family on inputs and output (all-float or all-int). Mixed
-// input element types promote through `hc.astype` to the output
-// element type. Returns failure (and leaves the op alone) on
-// anything unsupported so the original op survives for downstream
-// diagnostics.
-static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
+// M / N / K dimensions extracted from a v0-rank-2 matmul whose operand
+// and result shapes have been shape-agreement-checked.
+struct MatmulShape {
+  ExprAttr mDim;
+  ExprAttr nDim;
+  ExprAttr kDim;
+};
+
+// Rank-2 + shape-agreement check across lhs, rhs, out. K must agree
+// between operands; M and N must agree across inputs and output. A
+// shape disagreement is a hard `failure()` so the caller can leave
+// the original op for downstream diagnostics.
+static FailureOr<MatmulShape> validateMatmulShape(HCMatmulOp op) {
   auto lhsShape = getOperandShape(op.getLhs());
   auto rhsShape = getOperandShape(op.getRhs());
   auto outShape = getOperandShape(op.getResult());
@@ -192,14 +197,38 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   ExprAttr nDim = (*rhsShape)[1];
   ExprAttr mOut = (*outShape)[0];
   ExprAttr nOut = (*outShape)[1];
-  // K must agree between operands; M and N must agree across inputs
-  // and output. If the symbolic shapes disagree, the original op
-  // wouldn't have type-checked — bail to leave the IR untouched.
   // ExprHandle defines `==` only; pre-C++20 doesn't synthesize `!=`.
   if (!(kDim.getValue() == kDim2.getValue()) ||
       !(mDim.getValue() == mOut.getValue()) ||
       !(nDim.getValue() == nOut.getValue()))
     return failure();
+  return MatmulShape{mDim, nDim, kDim};
+}
+
+// v0 only accepts a uniform arith family across operands. Mixed FP / int
+// won't promote cleanly via `hc.astype` for the matmul body without
+// picking a sign convention; we punt in that case.
+static bool matmulElementsSupported(Type lhsElem, Type rhsElem, Type outElem) {
+  if (!isa<FloatType, IntegerType>(outElem))
+    return false;
+  return isa<FloatType>(outElem) == isa<FloatType>(lhsElem) &&
+         isa<FloatType>(outElem) == isa<FloatType>(rhsElem);
+}
+
+// Rewrite a single `hc.matmul lhs, rhs -> out` into an `hc.zeros` +
+// `hc.generic` pair. v0 only handles rank-2 operands and a uniform
+// arith family on inputs and output (all-float or all-int). Mixed
+// input element types promote through `hc.astype` to the output
+// element type. Returns failure (and leaves the op alone) on
+// anything unsupported so the original op survives for downstream
+// diagnostics.
+static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
+  FailureOr<MatmulShape> shapeDims = validateMatmulShape(op);
+  if (failed(shapeDims))
+    return failure();
+  ExprAttr mDim = shapeDims->mDim;
+  ExprAttr nDim = shapeDims->nDim;
+  ExprAttr kDim = shapeDims->kDim;
 
   auto lhsTy = cast<mlir::hc::TensorType>(op.getLhs().getType());
   auto rhsTy = cast<mlir::hc::TensorType>(op.getRhs().getType());
@@ -207,12 +236,7 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   Type lhsElem = lhsTy.getElementType();
   Type rhsElem = rhsTy.getElementType();
   Type outElem = outTy.getElementType();
-  if (!isa<FloatType, IntegerType>(outElem))
-    return failure();
-  // Mixed FP / int won't promote cleanly via `hc.astype` for the
-  // matmul body without picking a sign convention; punt.
-  if (isa<FloatType>(outElem) != isa<FloatType>(lhsElem) ||
-      isa<FloatType>(outElem) != isa<FloatType>(rhsElem))
+  if (!matmulElementsSupported(lhsElem, rhsElem, outElem))
     return failure();
 
   MLIRContext *ctx = op.getContext();
@@ -270,31 +294,87 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   return success();
 }
 
+// Validated reduce input/output shapes and the reduction axis. The
+// per-axis-dim agreement (input minus `axis` equals output) has been
+// verified.
+struct ReduceShape {
+  SmallVector<ExprAttr> valShape;
+  SmallVector<ExprAttr> outShape;
+  uint64_t axis;
+};
+
+// v0 acceptance: keepdims=false, valid axis, rank-1-smaller result with
+// non-axis dims matching positionally. Anything off the path is left
+// alone for downstream diagnostics.
+static FailureOr<ReduceShape> validateReduceShape(HCReduceOp op) {
+  if (op.getKeepdims())
+    return failure();
+  auto vs = getOperandShape(op.getValue());
+  auto os = getOperandShape(op.getResult());
+  if (failed(vs) || failed(os))
+    return failure();
+  uint64_t axis = op.getAxis();
+  if (axis >= vs->size())
+    return failure();
+  if (os->size() + 1 != vs->size())
+    return failure();
+  for (size_t i = 0, j = 0; i < vs->size(); ++i) {
+    if (i == axis)
+      continue;
+    if (!((*vs)[i].getValue() == (*os)[j].getValue()))
+      return failure();
+    ++j;
+  }
+  return ReduceShape{std::move(*vs), std::move(*os), axis};
+}
+
+// Build parallel iter sym names (`i_<n>`) and bound values for every
+// non-axis input position in input order. The reduction sym (`r`) is
+// the caller's concern — it's a single name independent of the rank.
+static void buildReduceParallelIters(OpBuilder &builder, Location loc,
+                                     MLIRContext *ctx,
+                                     ArrayRef<ExprAttr> valShape, uint64_t axis,
+                                     SmallVectorImpl<StringAttr> &syms,
+                                     SmallVectorImpl<Value> &bounds) {
+  syms.reserve(valShape.size() - 1);
+  bounds.reserve(valShape.size() - 1);
+  for (size_t i = 0; i < valShape.size(); ++i) {
+    if (i == axis)
+      continue;
+    syms.push_back(StringAttr::get(ctx, ("i_" + Twine(syms.size())).str()));
+    bounds.push_back(materializeIdxBound(builder, loc, valShape[i]));
+  }
+}
+
+// Per-axis offsets for the reduce input: parallel iters fill non-axis
+// positions in input order; the reduction iter fills `axis`.
+static ArrayAttr buildReduceInputOffsets(MLIRContext *ctx, sym::Store &store,
+                                         size_t inputRank, uint64_t axis,
+                                         ArrayRef<StringAttr> parallelSyms,
+                                         StringAttr reductionSym) {
+  SmallVector<Attribute> inAxisExprs;
+  inAxisExprs.reserve(inputRank);
+  size_t parallelCursor = 0;
+  for (size_t i = 0; i < inputRank; ++i) {
+    StringRef name = (i == axis) ? reductionSym.getValue()
+                                 : parallelSyms[parallelCursor++].getValue();
+    auto handle = sym::composeExprSym(store, name);
+    assert(succeeded(handle) && "iter sym name must compose to an expression");
+    inAxisExprs.push_back(ExprAttr::get(ctx, *handle));
+  }
+  return ArrayAttr::get(ctx, inAxisExprs);
+}
+
 // Rewrite a single `hc.reduce val, kind, axis -> out` into an
 // identity fill + `hc.generic`. v0 only handles `keepdims = false`,
 // floats fully (sum / max / min) and integer sum. Other shapes
 // leave the op alone for downstream diagnostics.
 static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
-  if (op.getKeepdims())
+  FailureOr<ReduceShape> shape = validateReduceShape(op);
+  if (failed(shape))
     return failure();
-  auto valShape = getOperandShape(op.getValue());
-  auto outShape = getOperandShape(op.getResult());
-  if (failed(valShape) || failed(outShape))
-    return failure();
-  uint64_t axis = op.getAxis();
-  if (axis >= valShape->size())
-    return failure();
-  // For keepdims = false the result rank is one less than the input;
-  // the result shape is the input shape with `axis` dropped.
-  if (outShape->size() + 1 != valShape->size())
-    return failure();
-  for (size_t i = 0, j = 0; i < valShape->size(); ++i) {
-    if (i == axis)
-      continue;
-    if (!((*valShape)[i].getValue() == (*outShape)[j].getValue()))
-      return failure();
-    ++j;
-  }
+  ArrayRef<ExprAttr> valShape = shape->valShape;
+  uint64_t axis = shape->axis;
 
   auto valTy = cast<mlir::hc::TensorType>(op.getValue().getType());
   auto outTy = dyn_cast<mlir::hc::TensorType>(op.getResult().getType());
@@ -314,25 +394,19 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
 
   // Materialize iter bounds in iter-sym order: parallel iters track
   // every non-`axis` input dimension in input order, then a single
-  // reduction iter for `axis`. Naming uses `i_<n>` for parallels
-  // and `r` for the reduction so the printed IR reads cleanly even
-  // for large ranks.
+  // reduction iter for `axis`. Naming uses `i_<n>` for parallels and
+  // `r` for the reduction so the printed IR reads cleanly even for
+  // large ranks.
   SmallVector<StringAttr> parallelSyms;
   SmallVector<Value> parallelBounds;
-  parallelSyms.reserve(outShape->size());
-  parallelBounds.reserve(outShape->size());
-  for (size_t i = 0; i < valShape->size(); ++i) {
-    if (i == axis)
-      continue;
-    parallelSyms.push_back(
-        StringAttr::get(ctx, ("i_" + Twine(parallelSyms.size())).str()));
-    parallelBounds.push_back(materializeIdxBound(builder, loc, (*valShape)[i]));
-  }
+  buildReduceParallelIters(builder, loc, ctx, valShape, axis, parallelSyms,
+                           parallelBounds);
   StringAttr reductionSym = StringAttr::get(ctx, "r");
-  Value reductionBound = materializeIdxBound(builder, loc, (*valShape)[axis]);
+  Value reductionBound = materializeIdxBound(builder, loc, valShape[axis]);
 
-  Value shape = buildShapeTuple(builder, loc, parallelBounds);
-  Value fill = emitReduceIdentityFill(builder, loc, op.getKind(), outTy, shape);
+  Value shapeTuple = buildShapeTuple(builder, loc, parallelBounds);
+  Value fill =
+      emitReduceIdentityFill(builder, loc, op.getKind(), outTy, shapeTuple);
 
   SmallVector<Attribute> iterSymList(parallelSyms.begin(), parallelSyms.end());
   iterSymList.push_back(reductionSym);
@@ -342,19 +416,8 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   iterKindList.push_back(IterKindAttr::get(ctx, IterKind::Reduction));
   ArrayAttr iterKinds = ArrayAttr::get(ctx, iterKindList);
 
-  // Per-axis offsets for the input: parallel iters fill non-axis
-  // positions in input order; the reduction iter fills `axis`.
-  SmallVector<Attribute> inAxisExprs;
-  inAxisExprs.reserve(valShape->size());
-  size_t parallelCursor = 0;
-  for (size_t i = 0; i < valShape->size(); ++i) {
-    StringRef name = (i == axis) ? reductionSym.getValue()
-                                 : parallelSyms[parallelCursor++].getValue();
-    auto handle = sym::composeExprSym(store, name);
-    assert(succeeded(handle) && "iter sym name must compose to an expression");
-    inAxisExprs.push_back(ExprAttr::get(ctx, *handle));
-  }
-  ArrayAttr inOffset = ArrayAttr::get(ctx, inAxisExprs);
+  ArrayAttr inOffset = buildReduceInputOffsets(
+      ctx, store, valShape.size(), axis, parallelSyms, reductionSym);
   ArrayAttr outOffset = offsetArrayFromIterSyms(ctx, store, parallelSyms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOffset});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOffset});

@@ -125,5 +125,3 @@ lib/Transforms/HCPromoteNamesPass.cpp:promoteForRange
 lib/Transforms/HCPromoteNamesPass.cpp:promoteIf
 lib/Transforms/HCPromoteNamesPass.cpp:promoteNestedScope
 lib/Transforms/HCPromoteNamesPass.cpp:scanAndPromoteBlock
-lib/Transforms/HCShapedComputeToGenericPass.cpp:rewriteMatmul
-lib/Transforms/HCShapedComputeToGenericPass.cpp:rewriteReduce

@@ -595,6 +595,86 @@ def test_group_vload_layout_uses_native_shape_when_slice_fits() -> None:
     assert np.array_equal(dst, src[0:2, 0:3])
 
 
+def test_as_layout_on_buffer_slice_round_trips_through_layout_positions() -> None:
+    # `as_layout(buffer_slice, layout, shape=(...))` reinterprets the
+    # slice's access pattern through the layout. Subscripting gives a
+    # `LayoutBufferSlice` whose flat positions are the layout's
+    # offsets — `group.vload` gathers through them, `group.store`
+    # scatters back through the same offsets, and a multiply-by-10
+    # round trip should land every cell back at its original times
+    # ten with no aliasing.
+    wave_lanes = 32
+    frag = 8
+    wmma_m = 16
+    wmma_n = 16
+    stride = wave_lanes // wmma_n
+
+    layout = index_map(
+        storage_size=lambda lc, fc: wmma_m * wmma_n,
+        offset=lambda lane, fi, lc, fc: (lane // wmma_n + fi * stride) * wmma_n
+        + (lane % wmma_n),
+    )
+
+    @kernel(work_shape=(wave_lanes,), group_shape=(wave_lanes,))
+    def per_lane_x10(group, c: Buffer[sym.M, sym.N, np.float32]) -> None:
+        @group.workitems
+        def each(wi):
+            lane = wi.local_id()[0]
+            c_lane = as_layout(c[0:wmma_m, 0:wmma_n], layout, shape=(wave_lanes, frag))
+            value = group.vload(c_lane[lane, :], shape=(frag,))
+            group.store(c_lane[lane, :], value * np.float32(10.0))
+
+        each()
+
+    c = np.arange(wmma_m * wmma_n, dtype=np.float32).reshape(wmma_m, wmma_n)
+    expected = c * 10.0
+    sim.launch(per_lane_x10, c)
+    assert np.allclose(c, expected)
+
+
+def test_as_layout_on_buffer_slice_masks_oob_intent_positions() -> None:
+    # Partial-tile case: the buffer is smaller than the layout's
+    # logical extent, so per-lane positions past the clipped extent
+    # have to drop on both load and store. `as_layout(c[tile], LAY,
+    # shape=...)` followed by `[lane, :]` realises this OOB contract
+    # by clipping the per-position multi-index against the underlying
+    # buffer's actual shape — out-of-bounds reads mask False, out-of-
+    # bounds writes are dropped silently, matching the layout-aware
+    # gather/scatter contract on the load side.
+    wave_lanes = 32
+    frag = 8
+    wmma_m = 16
+    wmma_n = 16
+    stride = wave_lanes // wmma_n
+
+    layout = index_map(
+        storage_size=lambda lc, fc: wmma_m * wmma_n,
+        offset=lambda lane, fi, lc, fc: (lane // wmma_n + fi * stride) * wmma_n
+        + (lane % wmma_n),
+    )
+
+    @kernel(work_shape=(wave_lanes,), group_shape=(wave_lanes,))
+    def per_lane_x10(group, c: Buffer[sym.M, sym.N, np.float32]) -> None:
+        @group.workitems
+        def each(wi):
+            lane = wi.local_id()[0]
+            c_lane = as_layout(c[0:wmma_m, 0:wmma_n], layout, shape=(wave_lanes, frag))
+            value = group.vload(c_lane[lane, :], shape=(frag,))
+            group.store(c_lane[lane, :], value * np.float32(10.0))
+
+        each()
+
+    # Buffer is 10x12 — the (0:16, 0:16) tile clips to 10x12; the
+    # per-lane positions for lanes whose `lane // wmma_n == 0` land
+    # at rows 0, 2, 4, 6, 8 (in-bounds) and 10, 12, 14 (OOB). Those
+    # OOB lanes drop the load (mask False) and skip the store; the
+    # in-bounds cells round-trip x10 cleanly with no aliasing.
+    c = np.arange(10 * 12, dtype=np.float32).reshape(10, 12).copy()
+    expected = c * 10.0
+    sim.launch(per_lane_x10, c)
+    assert np.allclose(c, expected)
+
+
 def test_resolve_layout_accepts_noninjective_layout() -> None:
     # Non-injective layouts are first-class. The resolver records the
     # storage_size and shape without complaining that multiple logical

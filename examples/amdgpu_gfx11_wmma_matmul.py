@@ -49,25 +49,21 @@ The per-lane accumulator addressing is captured once as
 ``WAVE_ACC_FRAG_LAYOUT`` — an ``index_map`` whose offset
 ``(lane // 16 + fi * 2) * 16 + (lane % 16)`` maps each
 ``(lane, fragment_index)`` pair to a position inside the flat 16x16
-output tile. ``init_wmma_acc`` and ``store_wmma_tile`` realise that
-same formula as a strided two-dimensional ``c[row_slice, col_slice]``
-view — the form the simulator handles via numpy strides and the gpu
-path lowers through ``hc.generic``. Reading both sites off a single
-declared layout removes the per-lane slice-arithmetic glue the
-previous revision needed.
+output tile. ``init_wmma_acc`` loads through it via the wave-
+cooperative ``group.vload(c_tile, shape=(WAVE_LANES,
+WMMA_ACC_FRAGMENT), layout=WAVE_ACC_FRAG_LAYOUT)`` form;
+``store_wmma_tile`` realises the same arithmetic as the inverse
+strided ``c[row_slice, col_slice]`` view because the substrate
+doesn't yet carry a symmetric ``group.store(c_tile, value,
+layout=...)`` (or equivalently a buffer-side ``as_layout`` with a
+shape-changing reinterpretation that ``hc.store`` would consume —
+the simulator's ``LayoutBufferView`` / ``LayoutBufferSlice`` is the
+runtime side of that future symmetric path).
 
-The direct layout-driven form (``group.vload(c_tile,
-shape=(WAVE_LANES, WMMA_ACC_FRAGMENT), layout=WAVE_ACC_FRAG_LAYOUT)``
-plus a per-lane ``[lane, :]`` subscript and the explicit
-``as_layout(..., None)`` strip) now compiles end-to-end through the
+The direct layout-driven load form compiles end-to-end through the
 substrate via ``hc-distribute-wave-layouts``, which factors the lane
 axis out of the wave-cooperative carrier before ``hc.generic``
-lowering. The simulator's layout-driven gather still walks the
-numpy-clipped source's flat extent rather than the layout's
-``storage_size``, so partial-tile shapes miss the per-element mask
-the strided form stamps correctly; the layout-driven form will swap
-in once the simulator's gather OOB-pads the source up to
-``storage_size``.
+lowering.
 """
 
 from __future__ import annotations
@@ -373,8 +369,9 @@ def init_wmma_acc(group, c, row0, col0):
         # back to plain so the result flows into the accumulator
         # carrier shape WMMA's recipe expects. The layout's offset
         # formula encodes the per-lane (row, col) addressing once;
-        # the strided `hc.buffer_view` form keeps a redundant copy
-        # in `store_wmma_tile` below until a symmetric scatter lands.
+        # the strided `hc.buffer_view` form in `store_wmma_tile` keeps
+        # a redundant copy until a symmetric layout-aware scatter
+        # lands on `group.store`.
         #
         # Two substrate guarantees keep this clean:
         #   - `hc-distribute-wave-layouts` factors the leading `lane`
@@ -435,9 +432,14 @@ def store_wmma_tile(group, c, row0, col0, acc) -> None:
         # strided `c[row_slice, col_slice]` view — the form the
         # simulator scatters via numpy strides and the gpu path lowers
         # through `hc.generic`. A symmetric layout-aware scatter on
-        # `group.store` would let us shed the manual inverse; until
-        # then the formula here must stay in lockstep with the
-        # `WAVE_ACC_FRAG_LAYOUT` declaration above.
+        # `group.store` (or equivalently a buffer-side `as_layout`
+        # with a shape-changing reinterpretation that `hc.store`
+        # would consume) would let us shed the manual inverse; the
+        # simulator's `LayoutBufferView` / `LayoutBufferSlice` is the
+        # runtime side of that future symmetric path. Until the
+        # substrate carries it through compile, the formula here must
+        # stay in lockstep with the `WAVE_ACC_FRAG_LAYOUT`
+        # declaration above.
         group.store(
             c[
                 row0 + lane // WMMA_N : row0 + WMMA_M : WMMA_ACC_ROW_STRIDE,

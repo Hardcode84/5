@@ -174,12 +174,27 @@ def index_map(
     )
 
 
-def as_layout(value: SupportsAsLayout, layout: Any = None) -> Any:
-    """Request an explicit layout on a layout-aware value."""
+def as_layout(
+    value: SupportsAsLayout,
+    layout: Any = None,
+    *,
+    shape: Any = None,
+) -> Any:
+    """Request an explicit layout on a layout-aware value.
+
+    `shape=` is only meaningful for pointer-rooted shaped values
+    (`!hc.buffer`-like wrappers): the layout's reinterpreted extent
+    isn't carried by the underlying pointer storage, so the caller
+    has to declare it explicitly — same way `hc.as_layout` carries
+    the reinterpreted shape on its result type when the source is a
+    buffer. Tensor/vector callers leave `shape=` as None.
+    """
     method = getattr(value, "as_layout", None)
     if method is None:
         raise TypeError("as_layout() expects a layout-aware value")
-    return method(layout)
+    if shape is None:
+        return method(layout)
+    return method(layout, shape=shape)
 
 
 @dataclass(frozen=True)

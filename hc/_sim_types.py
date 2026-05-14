@@ -372,6 +372,19 @@ class KernelBuffer:
     def __setitem__(self, index: Any, value: Any) -> None:
         self._array[index] = value
 
+    def as_layout(
+        self,
+        layout: Any = None,
+        *,
+        shape: Sequence[int] | None = None,
+    ) -> LayoutBufferView:
+        """Reinterpret the whole buffer via `layout`.
+
+        Same semantics as `BufferSlice.as_layout`. The buffer's
+        intent shape is its plain shape (no clipping applied yet).
+        """
+        return _make_layout_buffer_view(self._array, self.shape, layout, shape)
+
 
 class BufferSlice:
     """Numpy-clipped slice view plus the user's pre-clip extent per axis.
@@ -435,6 +448,273 @@ class BufferSlice:
         if sliced is None:
             return self._view[index]
         return sliced
+
+    def as_layout(
+        self,
+        layout: Any = None,
+        *,
+        shape: Sequence[int] | None = None,
+    ) -> LayoutBufferView:
+        """Reinterpret this buffer slice's access pattern through `layout`.
+
+        Mirrors `hc.as_layout` on a buffer source. The buffer-side
+        verifier explicitly skips the storage-size structural check
+        because pointer-rooted shaped storage holds whatever the
+        user-supplied allocation contains; a non-injective layout
+        over the same physical storage is a legitimate
+        reinterpretation. The simulator mirrors that by attaching the
+        resolved layout without size enforcement against the slice's
+        intent shape.
+
+        `shape=` declares the layout's reinterpreted extent (the
+        result of `hc.as_layout` on the MLIR side carries this on its
+        result type). It is required for buffer sources because the
+        layout's `shape_syms` aren't bound by the underlying buffer's
+        own shape — pointer storage and logical extent are
+        independent concepts here.
+        """
+        return _make_layout_buffer_view(self._view, self._intent_shape, layout, shape)
+
+
+class LayoutBufferView:
+    """A buffer (or buffer slice) reinterpreted via a layout.
+
+    `as_layout(c_tile, WAVE_ACC_FRAG_LAYOUT, shape=(WAVE_LANES,
+    WMMA_ACC_FRAGMENT))` on a `(WMMA_M, WMMA_N)` buffer slice yields
+    a layout-bearing view of shape `(WAVE_LANES, WMMA_ACC_FRAGMENT)`
+    whose subscript applies the layout's offset to compute the per-
+    element flat position in the underlying tile. Per-lane
+    subscripts like `view[lane, :]` give a `(WMMA_ACC_FRAGMENT,)`
+    `LayoutBufferSlice` rooted at the lane's per-element positions —
+    the runtime side of a symmetric `hc.buffer_view` of a layout-
+    bearing buffer, and the natural target for both the load
+    (`group.vload`) and the store (`group.store`) against the same
+    layout, killing the strided per-lane slice arithmetic the manual
+    inverse forms otherwise need.
+
+    Mirrors `hc.as_layout` on a buffer source: the verifier
+    explicitly skips the storage-size structural check for buffers
+    (`HCAsLayoutOp::verify`), so the layout shape need not equal the
+    underlying intent's flat extent.
+    """
+
+    __array_priority__ = 1000
+
+    def __init__(
+        self,
+        base: Array,
+        intent_shape: tuple[int, ...],
+        layout: ResolvedLayout,
+    ) -> None:
+        self._base = base
+        self._intent_shape = intent_shape
+        self._layout = layout
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._layout.shape
+
+    @property
+    def layout(self) -> ResolvedLayout:
+        return self._layout
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return self._base.dtype
+
+    @property
+    def ndim(self) -> int:
+        return len(self._layout.shape)
+
+    def __repr__(self) -> str:
+        return f"LayoutBufferView(shape={self.shape}, dtype={self.dtype})"
+
+    def __getitem__(self, index: Any) -> LayoutBufferSlice:
+        return _layout_subscript(self._base, self._intent_shape, self._layout, index)
+
+
+class LayoutBufferSlice:
+    """A `LayoutBufferView` subscripted to a concrete set of positions.
+
+    Carries the explicit flat positions (into the underlying base's
+    *intent* shape) for each output cell. Loads gather through these
+    positions; stores scatter through them. Mirrors `hc.buffer_view`
+    of a layout-bearing buffer whose subscript stream has bound
+    enough axes for `composeBufferViewLayout` to leave a residual
+    addressing expression — except materialised as concrete flat
+    indices instead of a symbolic offset expression.
+
+    `positions` are intent-shape flat indices, not raw NumPy view
+    flat indices, so OOB intent positions (positions past the
+    clipped base extent) mask False at load/store time without
+    aliasing into a different cell of the clipped ravel.
+    """
+
+    __array_priority__ = 1000
+
+    def __init__(
+        self,
+        base: Array,
+        intent_shape: tuple[int, ...],
+        positions: Array,
+    ) -> None:
+        self._base = base
+        self._intent_shape = intent_shape
+        self._positions = positions
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in self._positions.shape)
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return self._base.dtype
+
+    @property
+    def ndim(self) -> int:
+        return int(self._positions.ndim)
+
+    def __repr__(self) -> str:
+        return f"LayoutBufferSlice(shape={self.shape}, dtype={self.dtype})"
+
+
+def _make_layout_buffer_view(
+    base: Array,
+    intent_shape: tuple[int, ...],
+    layout: Any,
+    shape: Sequence[int] | None,
+) -> LayoutBufferView:
+    """Resolve `layout` against the explicit `shape` and wrap `base`.
+
+    The layout's `shape_syms` bind to the *reinterpreted* extent —
+    not the underlying buffer's intent shape. Buffers on `hc.as_layout`
+    skip the storage-size structural check (`HCAsLayoutOp::verify`)
+    because pointer-rooted shaped storage holds whatever the user-
+    supplied allocation contains; the layout's offset is the
+    substrate's contract with the addressing it encodes and the
+    simulator's gather / scatter clips against the actual NumPy view
+    at access time.
+    """
+    if layout is None:
+        raise SimulatorError("as_layout on a buffer requires a layout")
+    if not isinstance(layout, IndexMap):
+        raise SimulatorError("as_layout layout must be an IndexMap")
+    if shape is None:
+        raise SimulatorError(
+            "as_layout on a buffer requires shape=(...) — the layout's "
+            "reinterpreted extent isn't carried by the underlying "
+            "pointer storage"
+        )
+    declared = tuple(int(dim) for dim in shape)
+    resolved = resolve_layout(layout, declared)
+    if resolved is None:
+        raise SimulatorError("layout resolution failed")
+    return LayoutBufferView(base, intent_shape, resolved)
+
+
+def _layout_subscript(
+    base: Array,
+    intent_shape: tuple[int, ...],
+    layout: ResolvedLayout,
+    index: Any,
+) -> LayoutBufferSlice:
+    """Materialise `layout.offset` over the subscripted positions.
+
+    Iterates the output positions (the cross product of the slice
+    axes, with scalar axes pinned), evaluates `layout.offset` for
+    each, and packs the results into a `LayoutBufferSlice`. Output
+    rank matches the number of slice axes in the index, dropping
+    axes consumed by scalar subscripts — mirrors NumPy slice
+    semantics so `view[lane, :]` is rank-1 and `view[:, :]` is
+    rank-2.
+    """
+    layout_rank = len(layout.shape)
+    padded = _pad_layout_subscript(index, layout_rank)
+    axis_values, slice_axes, output_shape = _resolve_layout_axes(layout, padded)
+    eval_offset = _make_layout_offset_evaluator(layout)
+    positions = _materialise_layout_positions(
+        eval_offset, axis_values, slice_axes, output_shape
+    )
+    return LayoutBufferSlice(base, intent_shape, positions)
+
+
+def _pad_layout_subscript(index: Any, rank: int) -> tuple[Any, ...]:
+    index_tuple = index if isinstance(index, tuple) else (index,)
+    if len(index_tuple) > rank:
+        raise SimulatorError("layout-view subscript exceeds the layout's rank")
+    return index_tuple + (slice(None),) * (rank - len(index_tuple))
+
+
+def _resolve_layout_axes(
+    layout: ResolvedLayout,
+    padded: Sequence[Any],
+) -> tuple[list[Sequence[int]], list[int], list[int]]:
+    """Split a padded subscript into per-axis value lists.
+
+    Slice axes contribute the full `range(start, stop, step)`; scalar
+    axes pin a singleton list. `slice_axes` records which layout
+    axes survive into the output rank — same shape contract NumPy's
+    subscripting follows.
+    """
+    axis_values: list[Sequence[int]] = []
+    slice_axes: list[int] = []
+    output_shape: list[int] = []
+    for axis, idx in enumerate(padded):
+        bound = int(layout.shape[axis])
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(bound)
+            values = list(range(start, stop, step))
+            axis_values.append(values)
+            slice_axes.append(axis)
+            output_shape.append(len(values))
+        else:
+            axis_values.append((_resolve_scalar_index(idx, bound),))
+    return axis_values, slice_axes, output_shape
+
+
+def _resolve_scalar_index(idx: Any, bound: int) -> int:
+    scalar = int(idx)
+    if scalar < 0:
+        scalar += bound
+    if scalar < 0 or scalar >= bound:
+        raise SimulatorError("layout-view scalar subscript out of bounds")
+    return scalar
+
+
+def _make_layout_offset_evaluator(
+    layout: ResolvedLayout,
+) -> Callable[[Sequence[int]], int]:
+    spec = layout.spec
+    params = layout.params
+    shape = layout.shape
+
+    def eval_offset(coords: Sequence[int]) -> int:
+        if spec.params is None:
+            raw = spec.offset(*coords, *shape)
+        else:
+            raw = spec.offset(*coords, *shape, params)
+        return layout_int(raw, what="layout offset")
+
+    return eval_offset
+
+
+def _materialise_layout_positions(
+    eval_offset: Callable[[Sequence[int]], int],
+    axis_values: Sequence[Sequence[int]],
+    slice_axes: Sequence[int],
+    output_shape: Sequence[int],
+) -> Array:
+    layout_rank = len(axis_values)
+    if not output_shape:
+        coords = [axis_values[axis][0] for axis in range(layout_rank)]
+        return np.array(eval_offset(coords), dtype=np.int64)
+    positions = np.zeros(tuple(output_shape), dtype=np.int64)
+    for output_index in np.ndindex(*output_shape):
+        coords = [axis_values[axis][0] for axis in range(layout_rank)]
+        for out_pos, layout_axis in enumerate(slice_axes):
+            coords[layout_axis] = axis_values[layout_axis][output_index[out_pos]]
+        positions[output_index] = eval_offset(coords)
+    return positions
 
 
 def _slice_with_intent(

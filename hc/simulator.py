@@ -29,6 +29,8 @@ from ._sim_types import (
     BufferSlice,
     KernelBuffer,
     LaunchError,
+    LayoutBufferSlice,
+    LayoutBufferView,
     Poison,
     PoisonError,
     ResolvedLayout,
@@ -1374,6 +1376,21 @@ def _copy_loaded_value(
     *,
     layout: ResolvedLayout | None,
 ) -> SimTensor | SimVector:
+    if isinstance(source, LayoutBufferSlice):
+        # A layout-buffer slice already carries the per-element
+        # positions resolved through `as_layout`'s declared layout
+        # — no further layout composition is needed at the vload.
+        # Mirrors `hc.buffer_view` of a layout-bearing buffer whose
+        # subscript stream has bound enough axes to leave the
+        # gather addressing as concrete offsets.
+        if tuple(shape) != tuple(source.shape):
+            raise SimulatorError("vload shape does not match the layout slice's shape")
+        return _gather_loaded_from_layout_slice(kind, source)
+    if isinstance(source, LayoutBufferView):
+        raise SimulatorError(
+            "vload on a layout buffer view must first be subscripted "
+            "(e.g. view[lane, :]) to pin the per-element positions"
+        )
     source_data, source_mask, source_intent = _source_arrays(source)
     if layout is not None:
         # Layout-bearing reads interpret the source's flat storage
@@ -1405,6 +1422,57 @@ def _copy_loaded_value(
     result_data[overlap] = source_data[overlap]
     result_mask[overlap] = source_mask[overlap]
     return kind(result_data, result_mask, layout=None)
+
+
+def _gather_loaded_from_layout_slice(
+    kind: type[SimTensor] | type[SimVector],
+    source: LayoutBufferSlice,
+) -> SimTensor | SimVector:
+    """Gather a `LayoutBufferSlice`'s concrete positions into a value.
+
+    The slice's `positions` array carries flat indices into the
+    underlying base's *intent* shape. OOB positions (positions past
+    the clipped base) mask False rather than alias into a different
+    cell — same masking contract as the layout-aware gather over a
+    clipped slice.
+    """
+    base = source._base
+    output_shape = tuple(int(dim) for dim in source._positions.shape)
+    result_data = np.zeros(output_shape, dtype=base.dtype)
+    result_mask = np.zeros(output_shape, dtype=bool)
+    for output_index, multi in _iter_layout_slice_positions(source, output_shape):
+        result_data[output_index] = base[multi]
+        result_mask[output_index] = True
+    return kind(result_data, result_mask, layout=None)
+
+
+def _iter_layout_slice_positions(
+    source: LayoutBufferSlice,
+    output_shape: tuple[int, ...],
+) -> Iterator[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Yield `(output_index, multi)` pairs for in-bounds slice cells.
+
+    `multi` is the unraveled coordinate in the underlying base's
+    actual NumPy shape; OOB cells (intent-flat out of range or
+    multi-index past the clipped base) are skipped silently so loads
+    mask False and stores drop. Centralises the clip-against-NumPy
+    bookkeeping `_gather_loaded_from_layout_slice` and
+    `_scatter_into_layout_slice` share.
+    """
+    intent_shape = source._intent_shape
+    positions = source._positions
+    base_shape = tuple(int(dim) for dim in source._base.shape)
+    intent_flat = int(np.prod(intent_shape)) if intent_shape else 1
+    index_space = np.ndindex(*output_shape) if output_shape else [()]
+    for output_index in index_space:
+        flat = int(positions[output_index])
+        if not (0 <= flat < intent_flat):
+            continue
+        multi_raw = np.unravel_index(flat, intent_shape) if intent_shape else ()
+        multi = tuple(int(m) for m in multi_raw)
+        if any(multi[d] >= base_shape[d] for d in range(len(base_shape))):
+            continue
+        yield output_index, multi
 
 
 def _gather_loaded_value(
@@ -1575,6 +1643,14 @@ def _store_value(target: Any, value: Any) -> None:
             raise SimulatorError("store target is read-only")
         _store_masked(target._data, target._mask, value)
         return
+    if isinstance(target, LayoutBufferSlice):
+        _scatter_into_layout_slice(target, value)
+        return
+    if isinstance(target, LayoutBufferView):
+        raise SimulatorError(
+            "store into a layout buffer view must first be subscripted "
+            "(e.g. view[lane, :]) to pin the per-element positions"
+        )
     if isinstance(target, BufferSlice):
         _store_masked(target._view, None, value)
         return
@@ -1585,6 +1661,44 @@ def _store_value(target: Any, value: Any) -> None:
         _store_masked(target, None, value)
         return
     raise SimulatorError("store target must be a numpy buffer or tensor view")
+
+
+def _scatter_into_layout_slice(
+    target: LayoutBufferSlice,
+    value: Any,
+) -> None:
+    """Scatter `value` into `target`'s base at the slice's positions.
+
+    OOB positions (positions past the clipped base) drop the write
+    silently — same OOB contract as layout-aware loads, which mask
+    False rather than alias. Per-position masked writes mean a
+    `False` lane in a `SimTensor` / `SimVector` value won't overwrite
+    its base cell, mirroring the load-side masking on the symmetric
+    `vload`.
+    """
+    if isinstance(value, Poison):
+        raise SimulatorError("cannot store a poison scalar")
+    output_shape = tuple(int(dim) for dim in target._positions.shape)
+    value_data, value_mask = _resolve_layout_scatter_value(value, output_shape)
+    base = target._base
+    for output_index, multi in _iter_layout_slice_positions(target, output_shape):
+        if not bool(value_mask[output_index]):
+            continue
+        base[multi] = value_data[output_index]
+
+
+def _resolve_layout_scatter_value(
+    value: Any,
+    output_shape: tuple[int, ...],
+) -> tuple[BufferValue, np.ndarray[Any, np.dtype[np.bool_]]]:
+    if isinstance(value, SimTensor | SimVector):
+        if tuple(value.shape) != output_shape:
+            raise SimulatorError(
+                "store value shape does not match the layout slice's shape"
+            )
+        return value._data, value._mask
+    data = np.broadcast_to(np.asarray(value), output_shape).copy()
+    return data, np.ones(output_shape, dtype=bool)
 
 
 def _store_masked(

@@ -60,5 +60,5 @@ repos:
         entry: lizard
         language: python
         additional_dependencies: [lizard==1.21.6]
-        types: [python]
-        args: [-l, python, -C, "10", -L, "100"]
+        types_or: [python, c, c++]
+        args: [-l, python, -l, cpp, -C, "10", -L, "100", -W, whitelizard.txt]

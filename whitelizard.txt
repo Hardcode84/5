@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: 2026 hc contributors
+#
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+# Lizard complexity / length whitelist.
+#
+# Format: <relative_path>:<function_name>, one entry per line.
+# C++ qualifiers are written as-is (Class::method, ns::ns::func).
+# Multiple overloads of the same name share one entry.
+# Blank lines and lines starting with "#" are ignored.
+#
+# Every entry below names a function that exceeds the limits set in
+# .pre-commit-config.yaml (CCN > 10 or length > 100 lines). This file is
+# the regression baseline: legacy code that predates the hook is grandfathered
+# in; new C/C++ code must respect the limits.
+#
+# Goal: shrink this file. To close out a function, refactor it under the
+# thresholds and delete its line. Adding a new entry should be accompanied
+# by an explicit justification in the commit message.
+
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:alphaRenameInlinedBody
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:appendLayoutBoundSymbols
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:buildDefaultStridedBufferLayout
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:coerceNumpyLiteral
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:ConvertHCFrontToHCPass::runOnOperation
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:layoutAttrFromRef
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::collectStaticLaunchGeometryRanks
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerAssign
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerCall
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerCallable
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerCapturingRegion
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerDslMethodCall
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerFor
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerInlinedRegion
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerLayoutOpCall
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerMemOp
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerOp
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerSubscript
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::lowerUnaryBaseMethod
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::materializeParameters
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::tryEmitLaunchGeo
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:parameterTypeFromDict
+lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:typeFromContractDict
+lib/Front/Transforms/HCFrontFoldRegionDefsPass.cpp:foldAfterRegion
+lib/Front/Transforms/HCFrontInlinePass.cpp:HCFrontInlinePass::runOnOperation
+lib/Front/Transforms/HCFrontInlinePass.cpp:Inliner::inlineAt
+lib/IR/HCAttrs.cpp:LayoutAttr::parse
+lib/IR/HCAttrs.cpp:LayoutAttr::verify
+lib/IR/HCAttrs.cpp:mlir::hc::composeAccessOffsetExpr
+lib/IR/HCAttrs.cpp:mlir::hc::computeStorageSizeExpr
+lib/IR/HCInferTypeOpInterface.cpp:composeBufferViewLayout
+lib/IR/HCInferTypeOpInterface.cpp:HCStripLayoutOp::inferHCTypes
+lib/IR/HCInferTypeOpInterface.cpp:inferBufferViewResult
+lib/IR/HCInferTypeOpInterface.cpp:inferGetItemResult
+lib/IR/HCInferTypeOpInterface.cpp:inferIndexBinary
+lib/IR/HCInferTypeOpInterface.cpp:inferIndexCmp
+lib/IR/HCInferTypeOpInterface.cpp:inferLaunchGeometryTypes
+lib/IR/HCInferTypeOpInterface.cpp:inferSliceViewDim
+lib/IR/HCOps.cpp:HCAsLayoutOp::verify
+lib/IR/HCOps.cpp:HCForRangeOp::verify
+lib/IR/HCOps.cpp:HCGenericOp::parse
+lib/IR/HCOps.cpp:HCGenericOp::verify
+lib/IR/HCOps.cpp:HCIntrinsicOp::parse
+lib/IR/HCOps.cpp:HCIntrinsicOp::verify
+lib/IR/HCOps.cpp:HCReturnOp::verify
+lib/IR/HCOps.cpp:HCStripLayoutOp::verify
+lib/IR/HCOps.cpp:mlir::hc::postFlattenLiftMatches
+lib/IR/HCOps.cpp:parseGenericAmbientClause
+lib/IR/HCOps.cpp:parseGenericIterClause
+lib/IR/HCOps.cpp:parseGenericOperandClause
+lib/IR/HCOps.cpp:parseOptionalFunctionSignature
+lib/IR/HCTypes.cpp:GroupType::parse
+lib/IR/HCTypes.cpp:mlir::hc::joinHCTypes
+lib/IR/HCTypes.cpp:mlir::hc::shouldRefineHCType
+lib/IR/HCTypes.cpp:parseNestedLaunchContextType
+lib/IR/HCTypes.cpp:SliceType::parse
+lib/IR/HCTypes.cpp:staticShapeFromTupleType
+lib/Runtime/HipRuntime.cpp:hc_rt_init
+lib/TransformOps/HCTransformOps.cpp:HCTransformCreateOp::apply
+lib/Transforms/HCCanonicalizeLayoutsPass.cpp:buildCanonicalIdentity
+lib/Transforms/HCDecomposeShapedValuesPass.cpp:convertIntrinsicParameters
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteBufferView
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteGenericOp
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:shapeFromAllocOperand
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:substituteAndOptionallyDropAxis
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:substituteInType
+lib/Transforms/HCDistributeWaveLayoutsPass.cpp:tryFactorWaveLayout
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:buildFlattenAuxArgsMeta
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:collectImplicitSyms
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:composeAccessBaseOffset
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeBufferViewOffsets::matchAndRewrite
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeGenericOffsets::matchAndRewrite
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeLoadOffsets::matchAndRewrite
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeVLoadOffsets::matchAndRewrite
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:HCFlattenWithLayoutsPass::runOnOperation
+lib/Transforms/HCFlattenWithLayoutsPass.cpp:RetypeAnyHCOp::matchAndRewrite
+lib/Transforms/HCInferGenericBoundsPass.cpp:inferOnGeneric
+lib/Transforms/HCInferTypesPass.cpp:HCTypeAnalysis::visitNonControlFlowArguments
+lib/Transforms/HCInferTypesPass.cpp:joinConcreteTypesWithPolicy
+lib/Transforms/HCInferTypesPass.cpp:liftCollectiveReturnType
+lib/Transforms/HCInferTypesPass.cpp:renumberSyntheticJoinSymbols
+lib/Transforms/HCInferTypesPass.cpp:rewriteSyntheticJoinSymbols
+lib/Transforms/HCInferTypesPass.cpp:updateCallableFunctionType
+lib/Transforms/HCLoadStoreToGenericPass.cpp:extractAxisIndex
+lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteLoadLike
+lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteLoadMask
+lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteStore
+lib/Transforms/HCLowerGenericPass.cpp:bindIterSymsInClone
+lib/Transforms/HCLowerGenericPass.cpp:cloneBody
+lib/Transforms/HCLowerGenericPass.cpp:diagnoseUnsupported
+lib/Transforms/HCLowerGenericPass.cpp:emitInnerBodyClones
+lib/Transforms/HCLowerGenericPass.cpp:lowerCollective
+lib/Transforms/HCLowerGenericPass.cpp:lowerValueOuts
+lib/Transforms/HCLowerGenericPass.cpp:lowerWithPartition
+lib/Transforms/HCLowerGPUToBinaryPass.cpp:HCLowerGPUToBinaryPass::lowerOne
+lib/Transforms/HCLowerKernelsToGPULaunchPass.cpp:cloneKernelBodyIntoLaunch
+lib/Transforms/HCLowerKernelsToGPULaunchPass.cpp:lowerKernel
+lib/Transforms/HCLowerLaunchBodyPass.cpp:collectBoundValues
+lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertBufferViewOp::matchAndRewrite
+lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertForRangeOp::matchAndRewrite
+lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertIfOp::matchAndRewrite
+lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertLoadLikeOp::matchAndRewrite
+lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertStoreOp::matchAndRewrite
+lib/Transforms/HCLowerLaunchBodyPass.cpp:loadVectorFromPtrView
+lib/Transforms/HCLowerLaunchBodyPass.cpp:makeLaunchBodyLoweringTarget
+lib/Transforms/HCLowerLaunchBodyPass.cpp:resolveKernelArg
+lib/Transforms/HCLowerLaunchBodyPass.cpp:resolvePtrViewSource
+lib/Transforms/HCLowerLaunchBodyPass.cpp:resolveToBundleIndex
+lib/Transforms/HCLowerLaunchFuncToRuntimePass.cpp:HCLowerLaunchFuncToRuntimePass::lowerOne
+lib/Transforms/HCLowerStripLayoutPass.cpp:lowerStripLayout
+lib/Transforms/HCMaterializeBoundExprsPass.cpp:HCMaterializeBoundExprsPass::runOnOperation
+lib/Transforms/HCMaterializeBoundExprsPass.cpp:verifyMaterializedExprSymbols
+lib/Transforms/HCPromoteNamesPass.cpp:promoteForRange
+lib/Transforms/HCPromoteNamesPass.cpp:promoteIf
+lib/Transforms/HCPromoteNamesPass.cpp:promoteNestedScope
+lib/Transforms/HCPromoteNamesPass.cpp:scanAndPromoteBlock
+lib/Transforms/HCShapedComputeToGenericPass.cpp:rewriteMatmul
+lib/Transforms/HCShapedComputeToGenericPass.cpp:rewriteReduce
+lib/Transforms/HCSpecializeLiteralsPass.cpp:specializeKernel

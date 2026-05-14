@@ -78,6 +78,98 @@ static Operation *tailReturnOrNull(hc_front::CallOp call, bool &dead) {
   return ret;
 }
 
+// `op` is a `hc_front.name` naming the region (`local` ref kind, name
+// matches the region's). Returns the name op for that match, or a null
+// op handle to mean "skip; not a candidate".
+static hc_front::NameOp matchNameForRegion(Operation &op, StringRef regionN) {
+  auto nameOp = dyn_cast<hc_front::NameOp>(&op);
+  if (!nameOp || nameOp.getName() != regionN)
+    return {};
+  auto ref = nameOp->getAttrOfType<DictionaryAttr>("ref");
+  if (!ref)
+    return {};
+  auto kind = ref.getAs<StringAttr>("kind");
+  if (!kind || kind.getValue() != "local")
+    return {};
+  return nameOp;
+}
+
+// Resolve the single, same-block call op that consumes `nameOp`'s result
+// as its callee. Returns null when the local is plumbed elsewhere (more
+// than one use, used as a call argument, used outside the block, ...).
+static hc_front::CallOp matchSingleCallUse(hc_front::NameOp nameOp,
+                                           Block *block) {
+  if (!nameOp->hasOneUse())
+    return {};
+  auto call = dyn_cast<hc_front::CallOp>(*nameOp->getUsers().begin());
+  if (!call || call.getCallee() != nameOp.getResult())
+    return {};
+  if (call->getBlock() != block)
+    return {};
+  return call;
+}
+
+// Higher-order rejection: callee position is the only fold-safe use of
+// the local. Mirroring use as a call argument anywhere makes the local
+// observable elsewhere, so we bail.
+static bool localPassedAsCallArg(hc_front::NameOp nameOp,
+                                 hc_front::CallOp call) {
+  for (Value arg : call.getArguments())
+    if (arg.getDefiningOp() == nameOp.getOperation())
+      return true;
+  return false;
+}
+
+// `return inner()` is only folded when the ghost trail (region, name,
+// call, return) is the entire enclosing tail with no intervening sibling
+// ops. Otherwise conversion would reorder unrelated siblings.
+template <typename RegionOpT>
+static bool
+tailTrailAlignedForReturn(RegionOpT regionOp, hc_front::NameOp nameOp,
+                          hc_front::CallOp call, Operation *tailReturn) {
+  Block *block = regionOp->getBlock();
+  if (&*std::next(Block::iterator(regionOp)) != nameOp.getOperation())
+    return false;
+  if (&*std::next(Block::iterator(nameOp)) != call.getOperation())
+    return false;
+  if (&*std::next(Block::iterator(call)) != tailReturn)
+    return false;
+  return std::next(Block::iterator(tailReturn)) == block->end();
+}
+
+// Try to match and fold one ghost triad starting at `op`. Returns true
+// when a fold actually happened (and the caller should stop scanning),
+// false to mean "no match here, keep scanning". The mutation side-effect
+// is intentional: matching and rewriting are intertwined enough that
+// splitting them again would just bring back the search/state plumbing.
+template <typename RegionOpT>
+static bool tryFoldGhostTriad(RegionOpT regionOp, Operation &op,
+                              StringRef regionN, Block *block) {
+  hc_front::NameOp nameOp = matchNameForRegion(op, regionN);
+  if (!nameOp)
+    return false;
+  hc_front::CallOp call = matchSingleCallUse(nameOp, block);
+  if (!call)
+    return false;
+  if (localPassedAsCallArg(nameOp, call))
+    return false;
+
+  bool callResultDead = false;
+  Operation *tailReturn = tailReturnOrNull(call, callResultDead);
+  if (!tailReturn && !callResultDead)
+    return false;
+
+  if (tailReturn) {
+    if (!tailTrailAlignedForReturn(regionOp, nameOp, call, tailReturn))
+      return false;
+    regionOp.setTailReturnAttr(UnitAttr::get(regionOp.getContext()));
+    tailReturn->erase();
+  }
+  call.erase();
+  nameOp.erase();
+  return true;
+}
+
 template <typename RegionOpT> static void foldAfterRegion(RegionOpT regionOp) {
   std::optional<StringRef> regionNameOpt = regionOp.getName();
   if (!regionNameOpt || regionNameOpt->empty())
@@ -87,73 +179,17 @@ template <typename RegionOpT> static void foldAfterRegion(RegionOpT regionOp) {
   // Scan forward through the same block for the ghost triad. The
   // Python frontend emits the `hc_front.name` immediately after the
   // region, but bare unused calls may appear after unrelated sibling
-  // ops, so we scan forward. Tail-return folds are stricter below:
-  // conversion emits the callable return at the region site, so no
-  // intervening siblings can be skipped. The pattern is selected by
-  // full predicate, not by uniqueness: even if several `hc_front.name`
-  // ops share the region's string name, the first valid ghost use wins.
+  // ops, so we scan forward. Tail-return folds are stricter (see
+  // `tailTrailAlignedForReturn` — conversion emits the callable return
+  // at the region site, so no intervening siblings can be skipped).
+  // The pattern is selected by full predicate, not by uniqueness: even
+  // if several `hc_front.name` ops share the region's string name, the
+  // first valid ghost use wins.
   Block *block = regionOp->getBlock();
   for (Operation &op : llvm::make_early_inc_range(llvm::make_range(
-           std::next(Block::iterator(regionOp)), block->end()))) {
-    auto nameOp = dyn_cast<hc_front::NameOp>(&op);
-    if (!nameOp)
-      continue;
-    if (nameOp.getName() != regionN)
-      continue;
-    auto ref = nameOp->getAttrOfType<DictionaryAttr>("ref");
-    if (!ref)
-      continue;
-    auto kind = ref.getAs<StringAttr>("kind");
-    if (!kind || kind.getValue() != "local")
-      continue;
-
-    // The matching `hc_front.name` must be used as the callee of
-    // exactly one `hc_front.call`; otherwise the local is plumbed
-    // elsewhere and the fold is unsafe.
-    if (!nameOp->hasOneUse())
-      continue;
-    auto call = dyn_cast<hc_front::CallOp>(*nameOp->getUsers().begin());
-    if (!call || call.getCallee() != nameOp.getResult())
-      continue;
-    if (call->getBlock() != block)
-      continue;
-    // Don't fold if the local is also passed as a call argument
-    // (higher-order use); callee is the canonical position. `continue`
-    // rather than `return` so a later same-named `name` op can still
-    // match if the emitter ever produces one.
-    bool localAsArg = false;
-    for (Value arg : call.getArguments()) {
-      if (arg.getDefiningOp() == nameOp.getOperation()) {
-        localAsArg = true;
-        break;
-      }
-    }
-    if (localAsArg)
-      continue;
-
-    bool callResultDead = false;
-    Operation *tailReturn = tailReturnOrNull(call, callResultDead);
-    if (!tailReturn && !callResultDead)
-      continue;
-
-    if (tailReturn) {
-      // `return inner()` is only folded when the ghost trail is the entire
-      // enclosing tail. Otherwise conversion would reorder sibling ops.
-      if (&*std::next(Block::iterator(regionOp)) != nameOp.getOperation())
-        continue;
-      if (&*std::next(Block::iterator(nameOp)) != call.getOperation())
-        continue;
-      if (&*std::next(Block::iterator(call)) != tailReturn)
-        continue;
-      if (std::next(Block::iterator(tailReturn)) != block->end())
-        continue;
-      regionOp.setTailReturnAttr(UnitAttr::get(regionOp.getContext()));
-      tailReturn->erase();
-    }
-    call.erase();
-    nameOp.erase();
-    return;
-  }
+           std::next(Block::iterator(regionOp)), block->end())))
+    if (tryFoldGhostTriad(regionOp, op, regionN, block))
+      return;
 }
 
 struct HCFrontFoldRegionDefsPass

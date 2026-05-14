@@ -54,6 +54,50 @@ static Fn requireSymbol(ModuleHandle module, const char *name) {
   return reinterpret_cast<Fn>(raw);
 }
 
+// Single source of truth for "init already ran successfully". Used by both
+// the fast pre-lock check and the post-lock re-check; keeping it as one
+// predicate keeps the two sites from drifting if a mandatory symbol is
+// added.
+static bool allMandatorySymbolsBound() {
+  return g_hipModuleLaunchKernel && g_hipGetErrorName && g_hipGetErrorString &&
+         g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction &&
+         g_hipStreamSynchronize;
+}
+
+static ModuleHandle openHipModule() {
+#if defined(__linux__)
+  ModuleHandle module = dlopen("libamdhip64.so", RTLD_NOW);
+  if (!module) {
+    const char *err = dlerror();
+    throw std::runtime_error("hc_rt_init: failed to dlopen libamdhip64.so: " +
+                             std::string(err ? err : "(no error message)"));
+  }
+  return module;
+#endif
+}
+
+static void bindMandatorySymbols(ModuleHandle module) {
+  g_hipModuleLaunchKernel =
+      requireSymbol<hipModuleLaunchKernel_t>(module, "hipModuleLaunchKernel");
+  g_hipGetErrorName =
+      requireSymbol<hipGetErrorName_t>(module, "hipGetErrorName");
+  g_hipGetErrorString =
+      requireSymbol<hipGetErrorString_t>(module, "hipGetErrorString");
+  g_hipModuleUnload =
+      requireSymbol<hipModuleUnload_t>(module, "hipModuleUnload");
+  g_hipModuleLoadData =
+      requireSymbol<hipModuleLoadData_t>(module, "hipModuleLoadData");
+  g_hipModuleGetFunction =
+      requireSymbol<hipModuleGetFunction_t>(module, "hipModuleGetFunction");
+  // Mandatory: the bench-path `hc_rt_launch_kernel_repeat` needs it for
+  // the trailing sync, and any HIP install we'd care about exports it.
+  // Listing as mandatory here (rather than lazy on first bench call) keeps
+  // the failure mode consistent — either `hc_rt_init` succeeds and the
+  // whole ABI is callable, or it throws.
+  g_hipStreamSynchronize =
+      requireSymbol<hipStreamSynchronize_t>(module, "hipStreamSynchronize");
+}
+
 // Translates a hipError_t into a runtime_error with both the symbolic
 // name and the human-readable message, including the location where the
 // call originated (so a launch failure points at the launch site rather
@@ -84,49 +128,19 @@ static Fn requireSymbol(ModuleHandle module, const char *name) {
   } while (0)
 
 extern "C" void hc_rt_init() {
-  // Mutex-serialized double-checked initialization. The check is `&&`'d
-  // across all mandatory symbols so a partial init (e.g. previous run
-  // threw mid-bind) re-runs cleanly.
+  // Mutex-serialized double-checked initialization. The predicate covers
+  // every mandatory symbol so a partial init (e.g. previous run threw
+  // mid-bind) re-runs cleanly.
   static std::mutex init_mutex;
-  if (g_hipModuleLaunchKernel && g_hipGetErrorName && g_hipGetErrorString &&
-      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction &&
-      g_hipStreamSynchronize)
+  if (allMandatorySymbolsBound())
     return;
 
   std::lock_guard<std::mutex> guard(init_mutex);
-  if (g_hipModuleLaunchKernel && g_hipGetErrorName && g_hipGetErrorString &&
-      g_hipModuleUnload && g_hipModuleLoadData && g_hipModuleGetFunction &&
-      g_hipStreamSynchronize)
+  if (allMandatorySymbolsBound())
     return;
 
-#if defined(__linux__)
-  ModuleHandle module = dlopen("libamdhip64.so", RTLD_NOW);
-  if (!module) {
-    const char *err = dlerror();
-    throw std::runtime_error("hc_rt_init: failed to dlopen libamdhip64.so: " +
-                             std::string(err ? err : "(no error message)"));
-  }
-#endif
-
-  g_hipModuleLaunchKernel =
-      requireSymbol<hipModuleLaunchKernel_t>(module, "hipModuleLaunchKernel");
-  g_hipGetErrorName =
-      requireSymbol<hipGetErrorName_t>(module, "hipGetErrorName");
-  g_hipGetErrorString =
-      requireSymbol<hipGetErrorString_t>(module, "hipGetErrorString");
-  g_hipModuleUnload =
-      requireSymbol<hipModuleUnload_t>(module, "hipModuleUnload");
-  g_hipModuleLoadData =
-      requireSymbol<hipModuleLoadData_t>(module, "hipModuleLoadData");
-  g_hipModuleGetFunction =
-      requireSymbol<hipModuleGetFunction_t>(module, "hipModuleGetFunction");
-  // Mandatory: the bench-path `hc_rt_launch_kernel_repeat` needs it for
-  // the trailing sync, and any HIP install we'd care about exports it.
-  // Listing as mandatory here (rather than lazy on first bench call) keeps
-  // the failure mode consistent — either `hc_rt_init` succeeds and the
-  // whole ABI is callable, or it throws.
-  g_hipStreamSynchronize =
-      requireSymbol<hipStreamSynchronize_t>(module, "hipStreamSynchronize");
+  ModuleHandle module = openHipModule();
+  bindMandatorySymbols(module);
 
   // Optional — older HIPs predate `hipDrvLaunchKernelEx`. We only need
   // it on the cluster-launch path; missing here is reported lazily.

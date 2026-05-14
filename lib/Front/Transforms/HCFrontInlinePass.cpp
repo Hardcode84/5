@@ -123,32 +123,85 @@ private:
   llvm::StringMap<hc_front::FuncOp> &inlinableFuncs;
   hc_front::ValueType valueTy;
 
+  // Resolve and arity-check the call against the registered inlinable
+  // funcs. Diagnoses missing func / cycle / param-attr / arity-mismatch
+  // up front so the rest of `inlineAt` can stay on the happy path.
+  FailureOr<hc_front::FuncOp>
+  resolveAndValidateCallee(hc_front::CallOp call, StringRef calleeName,
+                           ArrayRef<StringRef> chain) {
+    auto funcIt = inlinableFuncs.find(calleeName);
+    if (funcIt == inlinableFuncs.end())
+      return call.emitOpError("no inlinable `hc_front.func` named `")
+             << calleeName << "'";
+    for (StringRef caller : chain)
+      if (caller == calleeName)
+        return call.emitOpError("recursive inline through `")
+               << calleeName << "'";
+    hc_front::FuncOp func = funcIt->second;
+
+    auto params = func->getAttrOfType<ArrayAttr>("parameters");
+    if (!params)
+      return func.emitOpError("inlinable func missing `parameters` attribute");
+    if (call.getArguments().size() != params.size())
+      return call.emitOpError("inline call arity ")
+             << call.getArguments().size() << " does not match callee `"
+             << calleeName << "' parameter count " << params.size();
+    return func;
+  }
+
+  // Mint a fresh `hc_front.inlined_region` and clone the callee's body
+  // into it. `emplaceBlock()` creates an empty block with no args; the
+  // inlined body doesn't use block args — parameter bindings flow via
+  // operands + the `parameters` attribute, consumed at conversion time.
+  hc_front::InlinedRegionOp cloneFuncBodyIntoRegion(hc_front::CallOp call,
+                                                    hc_front::FuncOp func,
+                                                    StringRef calleeName,
+                                                    ArrayAttr params,
+                                                    unsigned nResults) {
+    MLIRContext *ctx = call.getContext();
+    SmallVector<Type> resultTypes(nResults, valueTy);
+    OpBuilder builder(call);
+    StringAttr calleeAttr = StringAttr::get(ctx, calleeName);
+    auto regionOp = hc_front::InlinedRegionOp::create(
+        builder, call.getLoc(), resultTypes, calleeAttr, call.getArguments());
+    regionOp->setAttr("parameters", params);
+
+    Block *destBlock = &regionOp.getBody().emplaceBlock();
+    OpBuilder cloneBuilder(destBlock, destBlock->begin());
+    IRMapping mapping;
+    Block &srcBlock = func.getBody().front();
+    for (Operation &srcOp : srcBlock)
+      cloneBuilder.clone(srcOp, mapping);
+    return regionOp;
+  }
+
+  // Wire the call's SSA users through to the new region's result. If
+  // the callee has multiple explicit return operands, the converter
+  // packages them into a tuple at result #0; either way, result #0 is
+  // the single carrier the user-facing SSA sees.
+  LogicalResult wireCallResultUses(hc_front::CallOp call,
+                                   hc_front::InlinedRegionOp regionOp,
+                                   StringRef calleeName, unsigned nResults) {
+    if (nResults == 0) {
+      if (!call.getResult().use_empty())
+        return call.emitOpError("inline callee `")
+               << calleeName
+               << "' returns no value but the call result is used";
+      return success();
+    }
+    call.getResult().replaceAllUsesWith(regionOp.getResult(0));
+    return success();
+  }
+
   LogicalResult inlineAt(hc_front::CallOp call, ArrayRef<StringRef> chain) {
     auto nameOp = call.getCallee().getDefiningOp<hc_front::NameOp>();
     StringRef calleeName = nameOp.getName();
 
-    auto funcIt = inlinableFuncs.find(calleeName);
-    if (funcIt == inlinableFuncs.end()) {
-      return call.emitOpError("no inlinable `hc_front.func` named `")
-             << calleeName << "'";
-    }
-    for (StringRef caller : chain) {
-      if (caller == calleeName) {
-        return call.emitOpError("recursive inline through `")
-               << calleeName << "'";
-      }
-    }
-    hc_front::FuncOp func = funcIt->second;
-
-    auto params = func->getAttrOfType<ArrayAttr>("parameters");
-    if (!params) {
-      return func.emitOpError("inlinable func missing `parameters` attribute");
-    }
-    if (call.getArguments().size() != params.size()) {
-      return call.emitOpError("inline call arity ")
-             << call.getArguments().size() << " does not match callee `"
-             << calleeName << "' parameter count " << params.size();
-    }
+    FailureOr<hc_front::FuncOp> funcOr =
+        resolveAndValidateCallee(call, calleeName, chain);
+    if (failed(funcOr))
+      return failure();
+    hc_front::FuncOp func = *funcOr;
 
     FailureOr<hc_front::ReturnOp> retOr = findSingleReturn(func);
     if (failed(retOr))
@@ -157,56 +210,78 @@ private:
     // list. A tuple operand is one first-class value; tuple destructuring is
     // handled later by conversion through `hc.getitem`.
     unsigned nResults = retOr->getValues().size();
+    auto params = func->getAttrOfType<ArrayAttr>("parameters");
 
-    MLIRContext *ctx = call.getContext();
-    SmallVector<Type> resultTypes(nResults, valueTy);
+    hc_front::InlinedRegionOp regionOp =
+        cloneFuncBodyIntoRegion(call, func, calleeName, params, nResults);
 
-    OpBuilder builder(call);
-    StringAttr calleeAttr = StringAttr::get(ctx, calleeName);
-    auto regionOp = hc_front::InlinedRegionOp::create(
-        builder, call.getLoc(), resultTypes, calleeAttr, call.getArguments());
-    regionOp->setAttr("parameters", params);
-
-    // Clone the func body into the new region. `emplaceBlock()`
-    // creates an empty block with no args; the inlined body doesn't
-    // use block args — parameter bindings flow via operands + the
-    // `parameters` attribute, consumed at conversion time.
-    Block *destBlock = &regionOp.getBody().emplaceBlock();
-    OpBuilder cloneBuilder(destBlock, destBlock->begin());
-    IRMapping mapping;
-    Block &srcBlock = func.getBody().front();
-    for (Operation &srcOp : srcBlock) {
-      cloneBuilder.clone(srcOp, mapping);
-    }
-
-    // Replace the call's SSA users. If the callee has multiple explicit
-    // return operands, the converter packages them into a tuple at result #0.
-    if (nResults == 0) {
-      if (!call.getResult().use_empty()) {
-        return call.emitOpError("inline callee `")
-               << calleeName
-               << "' returns no value but the call result is used";
-      }
-    } else {
-      call.getResult().replaceAllUsesWith(regionOp.getResult(0));
-    }
+    if (failed(wireCallResultUses(call, regionOp, calleeName, nResults)))
+      return failure();
     call.erase();
 
-    // Recurse into the freshly-cloned body so any nested inline calls
-    // inside the callee expand at this site too. `nameOp` is the
-    // original call's callee — only erase if it has no more uses.
+    // `nameOp` is the original call's callee — only erase if it has
+    // no more uses.
     Operation *calleeNameOp = nameOp.getOperation();
     if (calleeNameOp->use_empty())
       calleeNameOp->erase();
 
+    // Recurse into the freshly-cloned body so any nested inline calls
+    // inside the callee expand at this site too.
     SmallVector<StringRef> newChain(chain.begin(), chain.end());
     newChain.push_back(calleeName);
-    if (failed(inlineReachable(regionOp, newChain)))
-      return failure();
-
-    return success();
+    return inlineReachable(regionOp, newChain);
   }
 };
+
+// True iff `op` is a `hc_front.func` carrying `ref.kind = "inline"`.
+static bool isInlinableFuncOp(Operation &op) {
+  auto funcOp = dyn_cast<hc_front::FuncOp>(op);
+  if (!funcOp)
+    return false;
+  auto refAttr = funcOp->getAttrOfType<DictionaryAttr>("ref");
+  if (!refAttr)
+    return false;
+  auto kindAttr = refAttr.getAs<StringAttr>("kind");
+  return kindAttr && kindAttr.getValue() == "inline";
+}
+
+// First pass: gather every top-level inline helper into a name -> FuncOp
+// map. Duplicate names are a hard error — the inliner uses string-keyed
+// lookup, so a duplicate would silently pick one and drop the other.
+static LogicalResult
+collectInlinableFuncs(Operation *root,
+                      llvm::StringMap<hc_front::FuncOp> &inlinableFuncs) {
+  for (Region &region : root->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &topOp : block) {
+        if (!isInlinableFuncOp(topOp))
+          continue;
+        auto funcOp = cast<hc_front::FuncOp>(topOp);
+        StringRef name = funcOp.getName();
+        auto [_, inserted] = inlinableFuncs.try_emplace(name, funcOp);
+        if (!inserted)
+          return funcOp.emitOpError("duplicate inlinable func name `")
+                 << name << "'; names must be unique within a module";
+      }
+    }
+  }
+  return success();
+}
+
+// Third pass: inline at every real call site across the module. Inline
+// helpers themselves were processed earlier (their bodies cloned at use
+// sites) and are skipped here to avoid re-walking.
+static LogicalResult inlineAtAllRealSites(Inliner &inliner, Operation *root) {
+  for (Region &region : root->getRegions())
+    for (Block &block : region)
+      for (Operation &topOp : block) {
+        if (isInlinableFuncOp(topOp))
+          continue;
+        if (failed(inliner.inlineReachable(&topOp, /*chain=*/{})))
+          return failure();
+      }
+  return success();
+}
 
 struct HCFrontInlinePass
     : public hc_front::impl::HCFrontInlineBase<HCFrontInlinePass> {
@@ -217,38 +292,10 @@ struct HCFrontInlinePass
     MLIRContext *ctx = &getContext();
 
     llvm::StringMap<hc_front::FuncOp> inlinableFuncs;
-    auto visitTopLevelOps = [&](auto callback) -> LogicalResult {
-      for (Region &region : root->getRegions())
-        for (Block &block : region)
-          for (Operation &topOp : block)
-            if (failed(callback(topOp)))
-              return failure();
-      return success();
-    };
-
-    if (failed(visitTopLevelOps([&](Operation &topOp) -> LogicalResult {
-          auto funcOp = dyn_cast<hc_front::FuncOp>(topOp);
-          if (!funcOp)
-            return success();
-          auto refAttr = funcOp->getAttrOfType<DictionaryAttr>("ref");
-          if (!refAttr)
-            return success();
-          auto kindAttr = refAttr.getAs<StringAttr>("kind");
-          if (!kindAttr || kindAttr.getValue() != "inline")
-            return success();
-          StringRef name = funcOp.getName();
-          auto [_, inserted] = inlinableFuncs.try_emplace(name, funcOp);
-          if (!inserted) {
-            funcOp.emitOpError("duplicate inlinable func name `")
-                << name << "'; names must be unique within a module";
-            return failure();
-          }
-          return success();
-        }))) {
+    if (failed(collectInlinableFuncs(root, inlinableFuncs))) {
       signalPassFailure();
       return;
     }
-
     if (inlinableFuncs.empty())
       return;
 
@@ -267,20 +314,7 @@ struct HCFrontInlinePass
       }
     }
 
-    // Inline at every real call site across the module.
-    if (failed(visitTopLevelOps([&](Operation &topOp) -> LogicalResult {
-          if (isa<hc_front::FuncOp>(topOp)) {
-            auto refAttr = topOp.getAttrOfType<DictionaryAttr>("ref");
-            auto kindAttr =
-                refAttr ? refAttr.getAs<StringAttr>("kind") : StringAttr();
-            if (kindAttr && kindAttr.getValue() == "inline")
-              return success(); // already processed as a helper body above.
-          }
-          if (failed(inliner.inlineReachable(&topOp, /*chain=*/{}))) {
-            return failure();
-          }
-          return success();
-        }))) {
+    if (failed(inlineAtAllRealSites(inliner, root))) {
       signalPassFailure();
       return;
     }

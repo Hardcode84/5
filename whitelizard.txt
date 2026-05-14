@@ -41,8 +41,6 @@ lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::materializeParameters
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::tryEmitLaunchGeo
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:parameterTypeFromDict
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:typeFromContractDict
-lib/Front/Transforms/HCFrontInlinePass.cpp:HCFrontInlinePass::runOnOperation
-lib/Front/Transforms/HCFrontInlinePass.cpp:Inliner::inlineAt
 lib/IR/HCAttrs.cpp:LayoutAttr::parse
 lib/IR/HCAttrs.cpp:LayoutAttr::verify
 lib/IR/HCAttrs.cpp:mlir::hc::composeAccessOffsetExpr

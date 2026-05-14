@@ -83,6 +83,7 @@ from hc import (
     Buffer,
     WorkGroup,
     WorkItem,
+    as_layout,
     idx_type,
     index_map,
     kernel,
@@ -366,38 +367,32 @@ def init_wmma_acc(group, c, row0, col0):
     @group.workitems
     def init(wi):
         lane = wi.local_id()[0]
-        # Slice the per-lane strided fragment out of the 16x16 C tile.
-        # The row and column expressions are the same arithmetic
-        # `WAVE_ACC_FRAG_LAYOUT.offset` encodes — single source of truth
-        # for the per-lane addressing, realised here as a strided
-        # `hc.buffer_view`. `vload`'s clip-and-pad rule sets the mask
-        # channel true exactly where the corresponding C element is
-        # in-bounds, OOB positions zero out; `c` arrives zero-initialised
-        # per the accumulator contract so the data channel is zero
-        # everywhere and the loaded vector serves directly as the
-        # running accumulator without poisoning the WMMA `a*b + acc`
-        # math.
+        # Layout-driven load: hand the whole `16x16` C tile to a
+        # `vload` carrying `WAVE_ACC_FRAG_LAYOUT`, then subscript out
+        # this lane's `(WMMA_ACC_FRAGMENT,)` row and strip the layout
+        # back to plain so the result flows into the accumulator
+        # carrier shape WMMA's recipe expects. The layout's offset
+        # formula encodes the per-lane (row, col) addressing once;
+        # the strided `hc.buffer_view` form keeps a redundant copy
+        # in `store_wmma_tile` below until a symmetric scatter lands.
         #
-        # The substrate's `hc-distribute-wave-layouts` pass unblocks
-        # the direct layout-driven form (`group.vload(c_tile,
-        # shape=(WAVE_LANES, WMMA_ACC_FRAGMENT), layout=
-        # WAVE_ACC_FRAG_LAYOUT)` + per-lane `[lane, :]` subscript +
-        # `as_layout(..., None)` strip) through the compile pipeline,
-        # but the simulator's layout-driven gather still walks the
-        # numpy-clipped source flat extent rather than the layout's
-        # storage_size — partial-tile shapes miss the per-element
-        # mask the way this strided form gets right. Strided form
-        # stays here as the right side of that simulator gap; switch
-        # back once the simulator's `_gather_loaded_value` learns to
-        # OOB-pad the source up to `layout.storage_size`.
-        bounds = group.vload(
-            c[
-                row0 + lane // WMMA_N : row0 + WMMA_M : WMMA_ACC_ROW_STRIDE,
-                col0 + lane % WMMA_N : col0 + lane % WMMA_N + 1,
-            ],
-            shape=(WMMA_ACC_FRAGMENT, 1),
+        # Two substrate guarantees keep this clean:
+        #   - `hc-distribute-wave-layouts` factors the leading `lane`
+        #     axis out of the layout-bearing carriers before
+        #     `hc.generic` decomposition, so per-lane peers see the
+        #     `(WMMA_ACC_FRAGMENT,)` slice and not the wave-cooperative
+        #     `(WAVE_LANES, WMMA_ACC_FRAGMENT)` tile.
+        #   - The simulator's gather OOB-pads the clipped slice up to
+        #     the slice's intent shape, so partial-tile cases (M/N
+        #     not multiples of WMMA_M/WMMA_N) mask False at the right
+        #     per-element positions instead of aliasing in-bounds
+        #     cells from the clipped ravel.
+        wave_acc = group.vload(
+            c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N],
+            shape=(WAVE_LANES, WMMA_ACC_FRAGMENT),
+            layout=WAVE_ACC_FRAG_LAYOUT,
         )
-        return bounds[:, 0]
+        return as_layout(wave_acc[lane, :], None)
 
     return init()
 

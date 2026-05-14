@@ -313,6 +313,184 @@ def layout_int(value: Any, *, what: str) -> int:
         raise SimulatorError(f"{what} must be an integer") from exc
 
 
+class KernelBuffer:
+    """Wrapper for kernel `ndarray` arguments that preserves slice intent.
+
+    The kernel sees a NumPy-ish object whose `__getitem__` records the
+    user's pre-clip slice extent in addition to the natural NumPy
+    clipped view. A layout-driven `vload` against a sliced buffer
+    needs the *intent* shape — e.g. `(WMMA_M, WMMA_N)` — to OOB-pad
+    the source up to the layout's `storage_size`. NumPy alone clips
+    silently at the buffer's bounds, so by the time `vload` sees the
+    slice the user's logical extent is gone.
+
+    Stays duck-type compatible with `np.ndarray` for the attributes
+    kernels actually touch (`shape`, `dtype`, `ndim`, `size`,
+    `__array__`, `__setitem__`). Anything fancier (Ellipsis,
+    `np.newaxis`, advanced indexing) falls through to NumPy with no
+    intent tracking — those patterns don't drive layout-aware loads.
+    """
+
+    __array_priority__ = 1000
+
+    def __init__(self, array: Array) -> None:
+        if not isinstance(array, np.ndarray):
+            raise TypeError("KernelBuffer wraps numpy.ndarray only")
+        self._array = array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in self._array.shape)
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return self._array.dtype
+
+    @property
+    def ndim(self) -> int:
+        return int(self._array.ndim)
+
+    @property
+    def size(self) -> int:
+        return int(self._array.size)
+
+    def __len__(self) -> int:
+        return len(self._array)
+
+    def __array__(self, dtype: Any = None) -> Array:
+        return self._array if dtype is None else self._array.astype(dtype)
+
+    def __repr__(self) -> str:
+        return f"KernelBuffer(shape={self.shape}, dtype={self.dtype})"
+
+    def __getitem__(self, index: Any) -> Any:
+        sliced = _slice_with_intent(self._array, index)
+        if sliced is None:
+            return self._array[index]
+        return sliced
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        self._array[index] = value
+
+
+class BufferSlice:
+    """Numpy-clipped slice view plus the user's pre-clip extent per axis.
+
+    `view` is the natural NumPy slice (clipped at the buffer's
+    bounds). `intent_shape` is what the user's slice expression
+    *would* have shaped if the buffer were large enough — i.e.
+    `(stop - start)` (or its strided ceil-divide) per axis. The
+    simulator's gather path consumes `intent_shape` to OOB-pad the
+    source up to the layout's logical extent; the dense overlap path
+    keeps using the clipped view and is unaffected.
+    """
+
+    __array_priority__ = 1000
+
+    def __init__(self, view: Array, intent_shape: tuple[int, ...]) -> None:
+        self._view = view
+        self._intent_shape = intent_shape
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(int(dim) for dim in self._view.shape)
+
+    @property
+    def intent_shape(self) -> tuple[int, ...]:
+        return self._intent_shape
+
+    @property
+    def dtype(self) -> np.dtype[Any]:
+        return self._view.dtype
+
+    @property
+    def ndim(self) -> int:
+        return int(self._view.ndim)
+
+    @property
+    def size(self) -> int:
+        return int(self._view.size)
+
+    def __len__(self) -> int:
+        return len(self._view)
+
+    def __array__(self, dtype: Any = None) -> Array:
+        return self._view if dtype is None else self._view.astype(dtype)
+
+    def __repr__(self) -> str:
+        return (
+            f"BufferSlice(shape={self.shape}, intent={self._intent_shape}, "
+            f"dtype={self.dtype})"
+        )
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        self._view[index] = value
+
+    def __getitem__(self, index: Any) -> Any:
+        # Chained slicing: re-derive intent against the previous
+        # intent shape (not the clipped view) so OOB extents
+        # compose. Kernels in the tree don't currently double-slice,
+        # but the API would lie if it forgot the outer extent.
+        sliced = _slice_with_intent(self._view, index, parent_intent=self._intent_shape)
+        if sliced is None:
+            return self._view[index]
+        return sliced
+
+
+def _slice_with_intent(
+    array: Array,
+    index: Any,
+    *,
+    parent_intent: tuple[int, ...] | None = None,
+) -> BufferSlice | None:
+    """Build a `BufferSlice` from an `ndarray` plus a slice index.
+
+    Returns `None` for index patterns the wrapper deliberately doesn't
+    track (advanced indexing, Ellipsis, `None`/`np.newaxis`, scalar
+    indices that drop rank, mixed shapes) so the caller can fall
+    through to plain NumPy. The dropped cases aren't reachable from
+    layout-driven loads in the current frontend; revisit if a
+    kernel ever needs them.
+    """
+    index_tuple = index if isinstance(index, tuple) else (index,)
+    if not all(isinstance(idx, slice) for idx in index_tuple):
+        return None
+    if len(index_tuple) > array.ndim:
+        return None
+    base_shape = parent_intent if parent_intent is not None else array.shape
+    padded = index_tuple + (slice(None),) * (array.ndim - len(index_tuple))
+    intent: list[int] = []
+    for axis, idx in enumerate(padded):
+        extent = _slice_intent_extent(idx, int(base_shape[axis]))
+        if extent is None:
+            return None
+        intent.append(extent)
+    view = array[index]
+    if not isinstance(view, np.ndarray):
+        return None
+    return BufferSlice(view, tuple(intent))
+
+
+def _slice_intent_extent(idx: slice, bound: int) -> int | None:
+    """Pre-clip element count for a single-axis slice against a bound.
+
+    `(stop - start)` with the usual stride ceil-divide. `bound` is the
+    intent shape on that axis (so chained slicing composes against
+    the outer intent, not the inner clipped view). A zero step is a
+    contract violation in NumPy too — surfaced as `None` so the
+    wrapper falls through to NumPy's own `ValueError` rather than
+    silently masking it.
+    """
+    start = 0 if idx.start is None else int(idx.start)
+    stop = bound if idx.stop is None else int(idx.stop)
+    step = 1 if idx.step is None else int(idx.step)
+    if step == 0:
+        return None
+    if step > 0:
+        return (max(0, stop - start) + step - 1) // step
+    return (max(0, start - stop) + (-step) - 1) // (-step)
+
+
 class _MaskedValue:
     __array_priority__ = 1000
 

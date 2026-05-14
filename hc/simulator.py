@@ -26,6 +26,8 @@ from typing import Any, cast, get_args, get_origin
 import numpy as np
 
 from ._sim_types import (
+    BufferSlice,
+    KernelBuffer,
     LaunchError,
     Poison,
     PoisonError,
@@ -916,6 +918,12 @@ def _run_workgroups(
         _ceil_div(work, local)
         for work, local in zip(work_shape, group_shape, strict=True)
     )
+    # Wrap buffer args in `KernelBuffer` so the kernel's `c[a:b, c:d]`
+    # records the user's pre-clip slice extent. Layout-driven `vload`
+    # needs the *intent* shape to OOB-pad the source up to the
+    # layout's `storage_size`; NumPy's natural clipping would
+    # otherwise erase it.
+    wrapped_args, wrapped_kwargs = _wrap_kernel_buffer_args(fn, bound)
     for group_id in _iterate_indices(group_counts):
         work_offset = tuple(
             group_id[idx] * group_shape[idx] for idx in range(len(group_shape))
@@ -930,7 +938,29 @@ def _run_workgroups(
             literal_names=literal_names,
         )
         with _execution_state(group, target):
-            fn(group, *bound.args, **bound.kwargs)
+            fn(group, *wrapped_args, **wrapped_kwargs)
+
+
+def _wrap_kernel_buffer_args(
+    fn: Callable[..., Any], bound: inspect.BoundArguments
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    annotations = _resolved_annotations(fn)
+    signature = inspect.signature(fn)
+    launch_params = list(signature.parameters.values())[1:]
+    positional_names = [param.name for param in launch_params]
+
+    def wrap(name: str, value: Any) -> Any:
+        annotation = annotations.get(name, inspect.Signature.empty)
+        if isinstance(annotation, BufferSpec) and isinstance(value, np.ndarray):
+            return KernelBuffer(value)
+        return value
+
+    wrapped_args = tuple(
+        wrap(positional_names[index] if index < len(positional_names) else "", value)
+        for index, value in enumerate(bound.args)
+    )
+    wrapped_kwargs = {name: wrap(name, value) for name, value in bound.kwargs.items()}
+    return wrapped_args, wrapped_kwargs
 
 
 @contextmanager
@@ -1047,7 +1077,7 @@ def _current_execution_state() -> _ExecutionState | None:
 
 
 def _signature_value(value: Any) -> Any:
-    if isinstance(value, (SimTensor, SimVector, np.ndarray)):
+    if isinstance(value, (SimTensor, SimVector, np.ndarray, KernelBuffer, BufferSlice)):
         return _CallValueSignature(value)
     return value
 
@@ -1344,16 +1374,22 @@ def _copy_loaded_value(
     *,
     layout: ResolvedLayout | None,
 ) -> SimTensor | SimVector:
-    source_data, source_mask = _source_arrays(source)
+    source_data, source_mask, source_intent = _source_arrays(source)
     if layout is not None:
         # Layout-bearing reads interpret the source's flat storage
         # through `layout.offset` per logical position — mirrors what
         # `hc-flatten-with-layouts` produces post-lowering and lets
         # non-injective layouts (broadcasts, per-lane fragments)
         # observe the actual addressing they encode. Source rank is
-        # irrelevant in this regime; we ravel and gather.
+        # irrelevant in this regime; we pad to the intent shape (so
+        # OOB cells in a clipped slice mask False) and gather.
         return _gather_loaded_value(
-            kind, source_data, source_mask, shape, layout=layout
+            kind,
+            source_data,
+            source_mask,
+            shape,
+            layout=layout,
+            source_intent=source_intent,
         )
     # No layout: dense logical-shape overlap copy. Layout-less loads
     # are the simulator's identity contract — the user reads the
@@ -1378,6 +1414,7 @@ def _gather_loaded_value(
     shape: tuple[int, ...],
     *,
     layout: ResolvedLayout,
+    source_intent: tuple[int, ...] | None,
 ) -> SimTensor | SimVector:
     """Evaluate `layout.offset` per logical position and gather from flat source.
 
@@ -1389,9 +1426,18 @@ def _gather_loaded_value(
     the no-layout side. Free-sym layouts are rejected upstream by
     `resolve_layout`; runtime-bound symbols are the lowering pipeline's
     job, not the simulator's.
+
+    When `source_intent` differs from `source_data.shape`, the source
+    came from a slice that NumPy clipped (e.g. `c[16:32, 16:32]` on a
+    `(17, 19)` buffer). The layout's offset addresses the user's
+    *logical* tile, not the clipped view — so flatten the user's
+    intent shape, not the clipped one. OOB cells fall in the zero /
+    false padding region and mask False, matching what a layout-aware
+    HW load would see.
     """
-    flat_source = np.ravel(source_data)
-    flat_mask = np.ravel(source_mask)
+    flat_source, flat_mask = _flatten_for_gather(
+        source_data, source_mask, source_intent
+    )
     result_data = np.zeros(shape, dtype=source_data.dtype)
     result_mask = np.zeros(shape, dtype=bool)
     spec = layout.spec
@@ -1406,6 +1452,46 @@ def _gather_loaded_value(
             result_data[logical_index] = flat_source[offset]
             result_mask[logical_index] = flat_mask[offset]
     return kind(result_data, result_mask, layout=layout)
+
+
+def _flatten_for_gather(
+    source_data: np.ndarray[Any, np.dtype[Any]],
+    source_mask: np.ndarray[Any, np.dtype[np.bool_]],
+    source_intent: tuple[int, ...] | None,
+) -> tuple[
+    np.ndarray[Any, np.dtype[Any]],
+    np.ndarray[Any, np.dtype[np.bool_]],
+]:
+    """Ravel the source for a gather, OOB-padding to the user's intent shape.
+
+    When the source's NumPy shape matches the slice's intent there is
+    nothing to pad. When the user's slice extended past the buffer's
+    bounds NumPy returned a smaller view, but the layout's offset is
+    formulated against the *intent* shape's row-major flat extent. We
+    materialize the padded logical tile (zero / False outside the
+    overlap) so per-element ravel indices line up with what the
+    layout's `offset` was authored against.
+    """
+    if (
+        source_intent is None
+        or source_data.ndim == 0
+        or tuple(source_data.shape) == tuple(source_intent)
+    ):
+        return np.ravel(source_data), np.ravel(source_mask)
+    if len(source_intent) != source_data.ndim:
+        # Shouldn't happen — the wrapper preserves rank — but a rank
+        # mismatch would silently misread cells, so fall back to the
+        # clipped ravel rather than guess.
+        return np.ravel(source_data), np.ravel(source_mask)
+    padded_data = np.zeros(source_intent, dtype=source_data.dtype)
+    padded_mask = np.zeros(source_intent, dtype=bool)
+    overlap = tuple(
+        slice(0, min(int(source_intent[axis]), int(source_data.shape[axis])))
+        for axis in range(source_data.ndim)
+    )
+    padded_data[overlap] = source_data[overlap]
+    padded_mask[overlap] = source_mask[overlap]
+    return np.ravel(padded_data), np.ravel(padded_mask)
 
 
 def _resolve_runtime_shape(
@@ -1425,16 +1511,35 @@ def _resolve_runtime_shape(
 
 def _source_arrays(
     source: Any,
-) -> tuple[BufferValue, np.ndarray[Any, np.dtype[np.bool_]]]:
+) -> tuple[
+    BufferValue,
+    np.ndarray[Any, np.dtype[np.bool_]],
+    tuple[int, ...] | None,
+]:
+    """Return `(data, mask, intent_shape)` for a load source.
+
+    `intent_shape` is the user's pre-clip slice extent per axis when
+    the source is a `BufferSlice` whose NumPy view was clipped at the
+    buffer's bound. For all other sources (simulator values,
+    `KernelBuffer`s passed whole, raw arrays) it equals the data's
+    NumPy shape — no padding is needed. The gather path consumes the
+    triple; the dense overlap path ignores intent_shape.
+    """
     if isinstance(source, Poison):
         raise SimulatorError("cannot load from a poison scalar")
     if isinstance(source, SimTensor | SimVector):
-        return source._data, source._mask
+        return source._data, source._mask, tuple(source._data.shape)
+    if isinstance(source, BufferSlice):
+        view = source._view
+        return view, np.ones(view.shape, dtype=bool), source.intent_shape
+    if isinstance(source, KernelBuffer):
+        array = source._array
+        return array, np.ones(array.shape, dtype=bool), tuple(array.shape)
     if isinstance(source, np.ndarray):
-        return source, np.ones(source.shape, dtype=bool)
+        return source, np.ones(source.shape, dtype=bool), tuple(source.shape)
     array = np.asarray(source)
     if array.ndim == 0:
-        return array, np.ones((), dtype=bool)
+        return array, np.ones((), dtype=bool), ()
     raise SimulatorError("load source must be a numpy array or simulator value")
 
 
@@ -1469,6 +1574,12 @@ def _store_value(target: Any, value: Any) -> None:
         if target._read_only:
             raise SimulatorError("store target is read-only")
         _store_masked(target._data, target._mask, value)
+        return
+    if isinstance(target, BufferSlice):
+        _store_masked(target._view, None, value)
+        return
+    if isinstance(target, KernelBuffer):
+        _store_masked(target._array, None, value)
         return
     if isinstance(target, np.ndarray):
         _store_masked(target, None, value)

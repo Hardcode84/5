@@ -523,6 +523,78 @@ def test_group_vload_gather_clips_out_of_bounds_offsets() -> None:
     assert np.array_equal(seen_data[0], np.array([7, 8, 9, 0, 0], dtype=np.int64))
 
 
+def test_group_vload_layout_pads_clipped_slice_to_intent_shape() -> None:
+    # 2D analogue of the 1D clip test. The kernel asks for the
+    # `(2, 4)` tile rooted at `(0, 0)`; the buffer is only `(1, 3)`,
+    # so NumPy clips the slice to `(1, 3)`. A row-major layout
+    # addresses the user's *logical* tile (`i * 4 + j`) — the
+    # simulator pads the clipped view up to `(2, 4)` so flat offsets
+    # `[3, 4..7]` land in the zero/False padding region and mask
+    # False, instead of falling off the end of the clipped ravel and
+    # silently misreading valid cells (e.g. `flat[3]` in a `(1, 3)`
+    # view would otherwise be OOB-clipped, but for a `(16, 3)` view
+    # in the WMMA case it would alias `c[1, 16]`).
+    row_major = index_map(
+        storage_size=lambda lc, fc: lc * fc,
+        offset=lambda i, j, lc, fc: i * fc + j,
+    )
+    seen_masks: list[np.ndarray] = []
+    seen_data: list[np.ndarray] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def gather(group, src: Buffer[1, 3], dst: Buffer[2, 4]) -> None:
+        tile = group.vload(
+            src[0:2, 0:4],
+            shape=(2, 4),
+            layout=row_major,
+        )
+        seen_masks.append(tile._mask.copy())
+        seen_data.append(tile._data.copy())
+        group.store(dst, tile.with_inactive(value=-1))
+
+    src = np.array([[1, 2, 3]], dtype=np.int64)
+    dst = np.zeros((2, 4), dtype=np.int64)
+
+    sim.launch(gather, src, dst)
+
+    expected_data = np.array([[1, 2, 3, 0], [0, 0, 0, 0]], dtype=np.int64)
+    expected_mask = np.array([[True, True, True, False], [False, False, False, False]])
+    expected_dst = np.array([[1, 2, 3, -1], [-1, -1, -1, -1]], dtype=np.int64)
+    assert np.array_equal(seen_data[0], expected_data)
+    assert np.array_equal(seen_masks[0], expected_mask)
+    assert np.array_equal(dst, expected_dst)
+
+
+def test_group_vload_layout_uses_native_shape_when_slice_fits() -> None:
+    # The intent-shape padding is a no-op when the user's slice fits
+    # entirely inside the buffer — the dense overlap covers the whole
+    # logical tile and no zero/False cells appear. Pinning the
+    # not-clipped path so the wrapper doesn't accidentally pad sources
+    # whose intent already matches the NumPy view.
+    row_major = index_map(
+        storage_size=lambda lc, fc: lc * fc,
+        offset=lambda i, j, lc, fc: i * fc + j,
+    )
+    seen_masks: list[np.ndarray] = []
+    seen_data: list[np.ndarray] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def gather(group, src: Buffer[4, 4], dst: Buffer[2, 3]) -> None:
+        tile = group.vload(src[0:2, 0:3], shape=(2, 3), layout=row_major)
+        seen_masks.append(tile._mask.copy())
+        seen_data.append(tile._data.copy())
+        group.store(dst, tile)
+
+    src = np.arange(16, dtype=np.int64).reshape(4, 4)
+    dst = np.zeros((2, 3), dtype=np.int64)
+
+    sim.launch(gather, src, dst)
+
+    assert np.array_equal(seen_data[0], src[0:2, 0:3])
+    assert np.array_equal(seen_masks[0], np.ones((2, 3), dtype=bool))
+    assert np.array_equal(dst, src[0:2, 0:3])
+
+
 def test_resolve_layout_accepts_noninjective_layout() -> None:
     # Non-injective layouts are first-class. The resolver records the
     # storage_size and shape without complaining that multiple logical

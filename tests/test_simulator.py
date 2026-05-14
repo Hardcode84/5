@@ -491,6 +491,25 @@ def test_resolve_layout_rejects_unbalanced_offset_arity() -> None:
         resolve_layout(unbalanced, (3,))
 
 
+def test_resolve_layout_rejects_free_syms() -> None:
+    # Free syms are a compile-only feature for now: the lowering
+    # pipeline binds them from the surrounding kernel scope (aux idx
+    # operands, ancestor block args, ambient launch geometry), but
+    # the simulator has no analogous scope and can't make up values
+    # for them. Surface that as a located SimulatorError instead of
+    # a TypeError from inside the lambda. The gather path that
+    # closes the gap is tracked separately under the simulator
+    # free-sym slice (see `doc/layouts.md` "Free symbols in layout
+    # offsets" deferred-work list).
+    with_free = index_map(
+        storage_size=lambda M, N: M * N,
+        offset=lambda i, j, M, N, *, row0: (row0 + i) * N + j,
+        free_syms=("row0",),
+    )
+    with pytest.raises(sim.SimulatorError, match="free_syms"):
+        resolve_layout(with_free, (4, 4))
+
+
 def test_masked_load_respects_mask_value_and_mask_activity() -> None:
     out = np.zeros((4,), dtype=np.int64)
 

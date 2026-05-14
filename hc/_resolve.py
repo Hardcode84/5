@@ -642,11 +642,14 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
 
     shape_param_names = _layout_shape_param_names(layout)
     index_param_names = _layout_index_param_names(layout, shape_param_names)
+    free_sym_names = tuple(layout.free_syms)
+    _validate_free_syms(layout, shape_param_names, index_param_names)
 
     ctx = Context()
     syms = SymbolNamespace(ctx)
     shape_syms = tuple(syms[n] for n in shape_param_names)
     index_syms = tuple(syms[n] for n in index_param_names)
+    free_syms = {name: syms[name] for name in free_sym_names}
 
     params_exprs, params_named = _layout_eval_params(layout, syms, shape_syms)
 
@@ -654,7 +657,7 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
         (*shape_syms, params_named) if layout.params is not None else shape_syms
     )
     storage_call = _layout_invoke(
-        layout.storage_size, storage_args, role="storage_size"
+        layout.storage_size, storage_args, role="storage_size", kwargs=free_syms
     )
 
     offset_args = (
@@ -662,7 +665,9 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
         if layout.params is not None
         else (*index_syms, *shape_syms)
     )
-    offset_call = _layout_invoke(layout.offset, offset_args, role="offset")
+    offset_call = _layout_invoke(
+        layout.offset, offset_args, role="offset", kwargs=free_syms
+    )
 
     # The ref payload carries raw ``Expr`` carriers (and a name->Expr table
     # for params); the encoder (``_OpClassifier._to_attr``) builds typed
@@ -679,6 +684,36 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
         "storage_size": storage_call,
         "offset": offset_call,
     }
+
+
+def _validate_free_syms(
+    layout: IndexMap,
+    shape_param_names: tuple[str, ...],
+    index_param_names: tuple[str, ...],
+) -> None:
+    """Reject duplicate / colliding ``free_syms`` before evaluation.
+
+    `LayoutAttr::verify` already enforces a single namespace across
+    shape / index / params, but it only sees the post-lambda payload;
+    a Python-side conflict would surface as an opaque dup-name error
+    deep in MLIR. Catch it here so the diagnostic names the offending
+    layout descriptor and the colliding token.
+    """
+    reserved = set(shape_param_names) | set(index_param_names)
+    if layout.params is not None:
+        reserved.update(_layout_positional_names(layout.params, role="params"))
+    seen_free: set[str] = set()
+    for name in layout.free_syms:
+        if not name:
+            raise FrontendError("free_syms entries must be non-empty strings")
+        if name in reserved:
+            raise FrontendError(
+                f"free_syms entry {name!r} collides with a shape / index / "
+                "params sym name"
+            )
+        if name in seen_free:
+            raise FrontendError(f"duplicate free_syms entry {name!r}")
+        seen_free.add(name)
 
 
 def _layout_eval_params(
@@ -712,26 +747,56 @@ def _layout_eval_params(
     return params_exprs, params_named
 
 
-def _layout_invoke(fn: Any, args: tuple[Any, ...], *, role: str) -> Any:
-    """Call ``fn(*args)`` and rewrap any exception as a ``FrontendError``.
+def _layout_invoke(
+    fn: Any,
+    args: tuple[Any, ...],
+    *,
+    role: str,
+    kwargs: Mapping[str, Any] | None = None,
+) -> Any:
+    """Call ``fn(*args, **kwargs_subset)`` and rewrap exceptions as ``FrontendError``.
 
     User-supplied lambdas may raise anything (``TypeError`` on a missing
     operator, ``KeyError`` on a typoed param, ...); flatten those into
     a layout-descriptor diagnostic that names the offending callable's
-    role instead of leaking the raw exception class.
+    role instead of leaking the raw exception class. ``kwargs`` carries
+    the layout-wide ``free_syms`` bindings, but each lambda only binds
+    a subset (the ones declared keyword-only on its own signature);
+    pass exactly that subset so lambdas that don't reference a given
+    free sym aren't forced to swallow it.
     """
     try:
+        if kwargs:
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError) as exc:
+                raise FrontendError(f"cannot inspect {role}: {exc}") from None
+            wanted = {
+                param.name
+                for param in sig.parameters.values()
+                if param.kind == inspect.Parameter.KEYWORD_ONLY
+            }
+            subset = {name: value for name, value in kwargs.items() if name in wanted}
+            return fn(*args, **subset)
         return fn(*args)
     except Exception as exc:
         raise FrontendError(f"{role}(...) raised {type(exc).__name__}: {exc}") from None
 
 
-def _layout_positional_names(fn: Any, *, role: str) -> tuple[str, ...]:
-    """Names of ``fn``'s positional args (no varargs, no kw-only, no defaults).
+def _layout_positional_names(
+    fn: Any,
+    *,
+    role: str,
+    allowed_kwonly: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Names of ``fn``'s positional args (no varargs, no defaults).
 
     Layout lambdas must be straight positional shape -> ... -> params so
     the simulator and the symbolic evaluator agree on slot binding; any
     other signature shape produces a located diagnostic via ``role``.
+    Keyword-only parameters named in ``allowed_kwonly`` (the layout's
+    ``free_syms``) are permitted and not returned — the caller binds
+    them separately.
     """
     try:
         sig = inspect.signature(fn)
@@ -739,6 +804,22 @@ def _layout_positional_names(fn: Any, *, role: str) -> tuple[str, ...]:
         raise FrontendError(f"cannot inspect {role}: {exc}") from None
     names: list[str] = []
     for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.KEYWORD_ONLY:
+            # Each lambda may bind a subset of the layout's free_syms;
+            # any keyword-only parameter outside that subset is a typo
+            # the layout author should hear about. Lambdas that don't
+            # reference a given free sym simply omit it.
+            if param.name not in allowed_kwonly:
+                raise FrontendError(
+                    f"{role} keyword-only parameter {param.name!r} is not "
+                    "declared in the layout's free_syms"
+                )
+            if param.default is not inspect.Parameter.empty:
+                raise FrontendError(
+                    f"{role} free-sym parameter {param.name!r} must not "
+                    "have a default value"
+                )
+            continue
         if param.kind not in (
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -761,11 +842,17 @@ def _layout_shape_param_names(layout: IndexMap) -> tuple[str, ...]:
     Priority: ``params`` (when present) — it takes only shape syms, so
     its full signature is the shape-sym list. Without ``params``,
     ``storage_size``'s signature is the shape-sym list (and offset's
-    trailing slots must match).
+    trailing slots must match). Free syms (keyword-only) are tolerated
+    on both lambdas but never returned as shape names.
     """
+    free = frozenset(layout.free_syms)
     if layout.params is not None:
-        return _layout_positional_names(layout.params, role="layout params")
-    return _layout_positional_names(layout.storage_size, role="layout storage_size")
+        return _layout_positional_names(
+            layout.params, role="layout params", allowed_kwonly=free
+        )
+    return _layout_positional_names(
+        layout.storage_size, role="layout storage_size", allowed_kwonly=free
+    )
 
 
 def _layout_index_param_names(
@@ -774,14 +861,19 @@ def _layout_index_param_names(
     """Resolve the layout's index-sym names from ``offset``'s prefix.
 
     Convention from `doc/layouts.md`:
-        offset(i, j, ..., *shape_syms[, params])
-    Index syms occupy the leading slots, shape syms the next
-    ``len(shape_syms)`` slots, and ``params`` (when present) trails.
-    `LayoutAttr` enforces `index_syms.size() == shape_syms.size()` so
-    the index prefix must be exactly the same length as the shape
+        offset(i, j, ..., *shape_syms[, params], *, free_syms...)
+    Index syms occupy the leading positional slots, shape syms the
+    next ``len(shape_syms)`` positional slots, and ``params`` (when
+    present) the last positional slot. Free syms appear as keyword-
+    only parameters after ``*`` and never count toward the positional
+    arity. `LayoutAttr` enforces `index_syms.size() == shape_syms.size()`
+    so the index prefix must be exactly the same length as the shape
     suffix.
     """
-    offset_names = _layout_positional_names(layout.offset, role="layout offset")
+    free = frozenset(layout.free_syms)
+    offset_names = _layout_positional_names(
+        layout.offset, role="layout offset", allowed_kwonly=free
+    )
     trailing = 1 if layout.params is not None else 0
     n_shape = len(shape_param_names)
     expected = 2 * n_shape + trailing

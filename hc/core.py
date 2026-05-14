@@ -144,6 +144,15 @@ class IndexMap:
     params: Callable[..., Any] | None
     storage_size: Callable[..., Any]
     offset: Callable[..., Any]
+    # Names the layout's `offset` / `storage_size` may reference
+    # without declaring them as shape / index / params syms. Resolved
+    # at access time from the surrounding kernel scope (kernel-arg
+    # aux, ancestor block argument, ambient launch geometry); see
+    # `doc/layouts.md` "Free symbols in layout offsets". Each name
+    # arrives in the lambdas as a keyword argument with a
+    # `hc.symbols.Symbol` value — `offset=lambda i, j, M, N, *, row0:
+    # ...` is the canonical signature shape.
+    free_syms: tuple[str, ...] = ()
 
 
 class SupportsAsLayout(Protocol):
@@ -155,8 +164,14 @@ def index_map(
     params: Callable[..., Any] | None = None,
     storage_size: Callable[..., Any],
     offset: Callable[..., Any],
+    free_syms: tuple[str, ...] = (),
 ) -> IndexMap:
-    return IndexMap(params=params, storage_size=storage_size, offset=offset)
+    return IndexMap(
+        params=params,
+        storage_size=storage_size,
+        offset=offset,
+        free_syms=tuple(free_syms),
+    )
 
 
 def as_layout(value: SupportsAsLayout, layout: Any = None) -> Any:

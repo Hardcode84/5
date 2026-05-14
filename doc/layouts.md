@@ -860,6 +860,82 @@ What does **not** yet do anything special with non-injective layouts:
   There is no explicit gather primitive; "layout-driven per-thread
   gather" with a dedicated op stays on the deferred list.
 
+## Free symbols in layout offsets
+
+A layout's `offset` and `storage_size` formulas may reference symbol
+names that aren't declared on the layout itself — names that aren't
+in `shape_syms`, `index_syms`, or `params`. They're called *free
+symbols* and represent kernel-scope bindings the lowering pipeline
+resolves at access time:
+
+* Kernel-arg aux idx values surfaced by `hc-flatten-with-layouts`'
+  type expansion (the leading positional carrier + one `!hc.idx<sym>`
+  aux per name in `collectImplicitSyms`).
+* Ancestor block arguments that pin a single bare sym in their type
+  (an `scf.for` induction variable typed `!hc.idx<sym>`, an
+  `hc_front` kernel scope sym, …).
+* Ambient launch geometry (`$WG0`, `$WI1`, `$WGS2`, …) that
+  `hc-lower-launch-body` injects into the apply's bound-values map.
+
+The verifier accepts a layout with any combination of free symbol
+names; nothing is rejected up front. Lowering is **lazy**: the apply
+emitted at the access site lists the bindings it can supply (operand
+expansion + scope walk), and `hc-lower-launch-body` walks the
+composed offset expression at the apply node. If every free symbol
+resolves, the apply lowers to plain `arith` ops. If any doesn't, the
+pass fails with a diagnostic that names the unresolved sym, the
+apply op, and the candidate scopes it searched — see
+`test/HC/lower-launch-body-invalid.mlir` (`@unknown_symbol`) for the
+exact wording. There is no flatten-time "you forgot to bind X"
+diagnostic by design; the same composed offset may be lowered under
+different ambient scopes (different `gpu.launch` regions, different
+`hc.intrinsic` bodies), and the binding contract is a property of
+the *lowering site*, not the layout.
+
+Authoring shape:
+
+```mlir
+#hc.layout<shape_syms = ["M", "N"],
+           index_syms = ["i0", "i1"],
+           params = {},
+           storage_size = #hc.expr<"M*N">,
+           offset = #hc.expr<"(row0 + i0)*N + i1">>
+```
+
+`row0` is a free sym. Attaching this layout to a `!hc.tensor<f32,
+["M", "N"], #hc.layout<...>>` gives the 1-to-N type expansion the
+implicit syms `{M, N, row0}` — `row0` appears as an extra aux
+`!hc.idx<"row0">` trailing the flat carrier on every function arg /
+call result the type passes through. Access ops bind `row0` from
+that aux in the post-flatten `hc.idx_apply`; see
+`test/HC/flatten-with-layouts.mlir` (`@free_sym_in_offset`) for the
+exact CHECK lines.
+
+Frontend (`hc.core.index_map`):
+
+```python
+my_layout = index_map(
+    storage_size=lambda M, N: M * N,
+    offset=lambda i, j, M, N, *, row0, col0:
+        (row0 + i) * N + col0 + j,
+    free_syms=("row0", "col0"),
+)
+```
+
+The `free_syms=` kwarg names the kernel-scope symbols; each lambda
+binds the subset it references as keyword-only parameters after `*`.
+`_classify_index_map` runs the lambda with `hc.symbols.Symbol`
+instances for the declared free names, so the resulting `#hc.expr`
+keeps `row0` / `col0` as bare leaves. Frontend collision checks
+guarantee `free_syms` is disjoint from `shape_syms` / `index_syms` /
+`params` keys before MLIR sees the dict attribute.
+
+What the simulator does today: free-sym layouts route through
+`resolve_layout` and bail with a `SimulatorError` that names the
+declared free syms. The simulator path has no surrounding kernel
+scope to query and can't make up runtime values; the gather-path
+work that closes the gap lives on the deferred list.
+
 ## Out of scope (deferred)
 
 * **Layout-driven per-thread gather op.** A standalone `hc.gather`

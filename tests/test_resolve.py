@@ -889,3 +889,81 @@ def test_index_map_classifier_diagnoses_mismatched_shape_names() -> None:
     msg = str(exc_info.value)
     assert "shape parameters" in msg
     assert "disagree" in msg
+
+
+def test_index_map_classifier_accepts_free_syms() -> None:
+    """A layout that declares ``free_syms`` keeps those names as free
+    symbols in the resulting ``offset`` / ``storage_size`` expressions
+    so the lowering pipeline can bind them from the surrounding kernel
+    scope (kernel-arg aux, ancestor block argument, ambient launch
+    geometry). See `doc/layouts.md` "Free symbols in layout offsets".
+    """
+    from hc._resolve import _index_map_ref
+    from hc.core import index_map
+
+    L = index_map(
+        storage_size=lambda M, N: M * N,
+        offset=lambda i, j, M, N, *, row0, col0: (row0 + i) * N + col0 + j,
+        free_syms=("row0", "col0"),
+    )
+    ref = _index_map_ref(L)
+    assert ref["kind"] == "layout"
+    assert ref["shape_syms"] == ("M", "N")
+    assert ref["index_syms"] == ("i", "j")
+    # The free sym names show up as bare symbol leaves in the offset
+    # expression. We don't assert on the full canonical form here —
+    # `ixsimpl` rearranges terms — but every free-sym name must appear
+    # somewhere in the rendered offset.
+    offset_text = str(ref["offset"])
+    assert "row0" in offset_text
+    assert "col0" in offset_text
+    # storage_size doesn't reference free syms; it stays pure.
+    assert str(ref["storage_size"]) == "M*N"
+
+
+def test_index_map_classifier_rejects_undeclared_kwonly() -> None:
+    """Keyword-only parameters on a layout lambda must be declared in
+    ``free_syms`` — they're the only kw-only slot a layout is allowed
+    to claim, and an undeclared name is almost always a typo for a
+    shape sym or a missed entry in ``free_syms``.
+    """
+    from hc._resolve import _classify_index_map
+    from hc.core import index_map
+
+    L = index_map(
+        storage_size=lambda M, N: M * N,
+        offset=lambda i, j, M, N, *, row0: row0 + i * N + j,
+        # `row0` is keyword-only but `free_syms` is empty.
+        free_syms=(),
+    )
+    with pytest.raises(FrontendError) as exc_info:
+        _classify_index_map("L", L)
+    msg = str(exc_info.value)
+    assert "row0" in msg
+    assert "free_syms" in msg
+
+
+def test_index_map_classifier_rejects_free_sym_collision() -> None:
+    """``free_syms`` shares the dialect-side LayoutAttr name pool with
+    ``shape_syms`` / ``index_syms`` / ``params`` keys. Catch collisions
+    Python-side so the diagnostic points at the offending classifier
+    instead of bubbling out of MLIR with a generic dup-name error.
+    """
+    from hc._resolve import _classify_index_map
+    from hc.core import index_map
+
+    L = index_map(
+        storage_size=lambda M, N: M * N,
+        # `M` is a shape sym; claiming it as a free sym would alias
+        # the slot. `M` is unreferenced on the offset's kw-only side
+        # so `_layout_invoke`'s subset filter never asks the lambda
+        # for it — the collision check has to fire before lambda
+        # inspection or the bug slides through.
+        offset=lambda i, j, M, N: i * N + j,
+        free_syms=("M",),
+    )
+    with pytest.raises(FrontendError) as exc_info:
+        _classify_index_map("L", L)
+    msg = str(exc_info.value)
+    assert "free_syms" in msg
+    assert "'M'" in msg

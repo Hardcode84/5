@@ -639,6 +639,13 @@ private:
     StringRef name(ixs_node_sym_name(node));
     if (Value value = boundValues.lookup(name))
       return value;
+    // Record the first miss so the caller can emit a diagnostic
+    // naming the unresolved symbol. We don't emit here because
+    // ExprLowerer is a per-node walker without access to the op
+    // surface that should own the diagnostic. The caller checks
+    // `lastUnresolvedSymbol()` on failure.
+    if (unresolvedSymbol.empty())
+      unresolvedSymbol = name.str();
     return failure();
   }
 
@@ -804,6 +811,17 @@ private:
   OpBuilder &builder;
   Location loc;
   const BoundValues &boundValues;
+  std::string unresolvedSymbol;
+
+public:
+  // First symbol name that lowerSymbol couldn't bind during the most
+  // recent `lower(...)` call. Empty if every reachable symbol was
+  // bound. Callers use this to plant a diagnostic that names the
+  // missing sym instead of the generic "failed to lower" message,
+  // matching the contract in `doc/layouts.md` "Free symbols in
+  // layout offsets" (validation is delayed to lowering, and the
+  // error has to identify the offending name).
+  StringRef lastUnresolvedSymbol() const { return unresolvedSymbol; }
 };
 
 static Type convertIntrinsicBoundaryType(Type type,
@@ -921,8 +939,16 @@ struct ConvertIdxApplyOp : public OpConversionPattern<HCIdxApplyOp> {
         op, rewriter, op.getSymbolsAttr(), adaptor.getOperands());
     ExprLowerer lowerer(rewriter, op.getLoc(), boundValues);
     FailureOr<Value> lowered = lowerer.lower(idx.getExpr());
-    if (failed(lowered))
+    if (failed(lowered)) {
+      StringRef sym = lowerer.lastUnresolvedSymbol();
+      if (!sym.empty())
+        return op.emitOpError("cannot lower idx_apply: free symbol '")
+               << sym << "' has no binding in the surrounding scope "
+               << "(launch geometry, kernel-arg aux idx, or ancestor block "
+                  "argument); supply it via the access op's aux operands or "
+                  "the producing op's binding slot";
       return op.emitOpError("failed to lower idx_apply expression");
+    }
     rewriter.replaceOp(op, *lowered);
     return success();
   }
@@ -942,8 +968,13 @@ struct ConvertPredApplyOp : public OpConversionPattern<HCPredApplyOp> {
         op, rewriter, op.getSymbolsAttr(), adaptor.getOperands());
     ExprLowerer lowerer(rewriter, op.getLoc(), boundValues);
     FailureOr<Value> lowered = lowerer.lower(pred.getPred());
-    if (failed(lowered))
+    if (failed(lowered)) {
+      StringRef sym = lowerer.lastUnresolvedSymbol();
+      if (!sym.empty())
+        return op.emitOpError("cannot lower pred_apply: free symbol '")
+               << sym << "' has no binding in the surrounding scope";
       return op.emitOpError("failed to lower pred_apply predicate");
+    }
     rewriter.replaceOp(op, *lowered);
     return success();
   }

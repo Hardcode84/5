@@ -154,6 +154,18 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
         return layout
     if not isinstance(layout, IndexMap):
         raise SimulatorError("layout must be an IndexMap or None")
+    # Free syms are kernel-scope bindings resolved by the lowering
+    # pipeline at access time. The simulator path doesn't have a
+    # surrounding kernel scope to query, so layouts that declare
+    # free syms fall off the simulator entirely. Tracked separately
+    # under the simulator gather path; see `doc/layouts.md` "Free
+    # symbols in layout offsets" and the deferred-work list there.
+    if layout.free_syms:
+        raise SimulatorError(
+            "layout declares free_syms "
+            f"{tuple(layout.free_syms)!r}; the simulator path does not yet "
+            "bind kernel-scope free symbols (compile-only feature)"
+        )
     _validate_layout_arities(layout, resolved_shape)
     params = _layout_params(layout, resolved_shape)
     storage_size = _layout_storage_size(layout, resolved_shape, params)

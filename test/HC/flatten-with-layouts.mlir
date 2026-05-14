@@ -523,6 +523,42 @@ func.func @generic_uniform_layout(
 
 // -----
 
+// Free symbol in a layout's `offset`: a name that's not in
+// `shape_syms`, `index_syms`, or `params`. The layout author has
+// chosen to leave `row0` undeclared so the resulting access shifts
+// every row by a kernel-scope value the caller supplies. Flatten
+// folds free names through the same `collectImplicitSyms` aux walk
+// it uses for `params`-derived names: the value's 1-to-N expansion
+// gains a trailing `!hc.idx<"row0">` slot, and the access-site
+// rewriter binds it in the composed offset's `hc.idx_apply` next to
+// the dim aux and the access indices. Lowering is responsible for
+// supplying the SSA; the layout attribute carries no contract about
+// where `row0` comes from. See `doc/layouts.md` "Free symbols in
+// layout offsets" for the contract.
+// CHECK-LABEL: @free_sym_in_offset
+// CHECK-SAME: %[[T:[^:]+]]: !hc.tensor<f32, ["M*N"]>
+// CHECK-SAME: %[[M:[^:]+]]: !hc.idx<"M">, %[[N:[^:]+]]: !hc.idx<"N">
+// CHECK-SAME: %[[R0:[^:]+]]: !hc.idx<"row0">
+// CHECK-SAME: %[[I:[^:]+]]: !hc.idx<"i">, %[[J:[^:]+]]: !hc.idx<"j">
+// CHECK: %[[OFF:.*]] = hc.idx_apply (%[[N]] as "N", %[[I]] as "i", %[[J]] as "j", %[[R0]] as "row0")
+// CHECK-SAME: : (!hc.idx<"N">, !hc.idx<"i">, !hc.idx<"j">, !hc.idx<"row0">) -> !hc.idx<"j + N*(i + row0)">
+// CHECK: hc.vload %[[T]][%[[OFF]]], shape %{{[^ ]+}} : (!hc.tensor<f32, ["M*N"]>, !hc.idx<"j + N*(i + row0)">, tuple<!hc.idx<"16">, !hc.idx<"16">>) -> !hc.bare_vector<f32, ["256"]>
+func.func @free_sym_in_offset(
+    %t: !hc.tensor<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"(row0 + i0)*d1 + i1">>>,
+    %i: !hc.idx<"i">, %j: !hc.idx<"j">) {
+  %sixteen = hc.const<16 : i64> : !hc.idx<"16">
+  %shape = hc.tuple(%sixteen, %sixteen)
+      : (!hc.idx<"16">, !hc.idx<"16">) -> tuple<!hc.idx<"16">, !hc.idx<"16">>
+  %v = hc.vload %t[%i, %j], shape %shape
+      : (!hc.tensor<f32, ["M", "N"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"d0*d1">, offset = #hc.expr<"(row0 + i0)*d1 + i1">>>,
+         !hc.idx<"i">, !hc.idx<"j">,
+         tuple<!hc.idx<"16">, !hc.idx<"16">>)
+        -> !hc.bare_vector<f32, ["16", "16"]>
+  return
+}
+
+// -----
+
 // Non-injective layout under a 2-D iter space. The layout is the
 // per-lane WMMA-fragment shape from `doc/layouts.md` ("Non-injective
 // layouts"): 3-D logical `(M, K, LANE)`, 1-D `K`-sized storage,

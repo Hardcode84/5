@@ -28,44 +28,21 @@ _REVERSED_VECTOR_LAYOUT = index_map(
     offset=lambda i, n: n - 1 - i,
 )
 
-_INVALID_VECTOR_LAYOUT = index_map(
+# Out-of-bounds layout: offset(n-1, n) = 2*n - 1, which is >= storage_size = n
+# for any n >= 1. The resolver's bounds probe should reject it.
+_OOB_VECTOR_LAYOUT = index_map(
     storage_size=lambda n: n,
-    offset=lambda i, n: 0,
+    offset=lambda i, n: n + i,
 )
 
-# Selector-bearing layout: each lane owns `n` contiguous slots; the
-# accessor at `i` for a given `lane` lives at `lane * n + i`. The
-# resolve-time probe uses the all-zero selector tuple, so the recorded
-# storage_size is per-selector-tuple (one lane's slice).
-_PER_LANE_VECTOR_LAYOUT = index_map(
-    storage_size=lambda n: n,
-    offset=lambda i, lane, n: lane * n + i,
-)
-
-# Selector layout whose offset overshoots storage at the zero-selector
-# probe — offset 2 lands outside `[0, storage_size=2)` for shape (4,).
-_SELECTOR_OOB_LAYOUT = index_map(
-    storage_size=lambda n: n // 2,
-    offset=lambda i, lane, n: lane + i,
-)
-
-# Selector layout that collapses every logical index onto offset 0 at the
-# zero-selector probe; per-selector-tuple injectivity fires.
-_SELECTOR_NON_INJECTIVE_LAYOUT = index_map(
-    storage_size=lambda n: n,
-    offset=lambda i, lane, n: lane,
-)
-
-# Interleaved per-lane gather: with `_INTERLEAVED_LANES` lanes, lane `L`'s
-# element `k` lives at flat offset `k * _INTERLEAVED_LANES + L` — strided
-# reads with stride = lane count. The zero-selector probe walks `k = 0..N-1`
-# and sees offsets `[0, lanes, 2*lanes, ...]`, all in `[0, lanes * N)` and
-# pairwise distinct.
-_INTERLEAVED_LANES = 4
-_INTERLEAVED_PER_LANE = 3
-_INTERLEAVED_LAYOUT = index_map(
-    storage_size=lambda n: n * _INTERLEAVED_LANES,
-    offset=lambda k, lane, n: k * _INTERLEAVED_LANES + lane,
+# Non-injective uniform layout: distinct logical indices `(i, j)` may
+# map to the same flat offset (storage smaller than the logical-shape
+# product). LayoutAttr no longer enforces injectivity — broadcast /
+# per-lane-fragment layouts express their semantics through the
+# offset formula, and the resolver accepts them without complaint.
+_NONINJECTIVE_VECTOR_LAYOUT = index_map(
+    storage_size=lambda n, m: n,
+    offset=lambda i, j, n, m: i,
 )
 
 _EXPECTED_SUBGROUP_AND_WORKITEM_STATE = np.array(
@@ -472,121 +449,46 @@ def test_laid_out_vector_ops_reject_mismatched_layouts() -> None:
         _ = lhs + rhs
 
 
-def test_invalid_layout_is_rejected() -> None:
+def test_layout_out_of_bounds_offset_is_rejected() -> None:
     vec = sim.SimVector(
         np.array([1, 2, 3], dtype=np.int64),
         np.array([True, True, True]),
-    )
-
-    with pytest.raises(sim.SimulatorError, match="injective"):
-        as_layout(vec, layout=_INVALID_VECTOR_LAYOUT)
-
-
-def test_resolve_layout_records_selector_arity() -> None:
-    resolved = resolve_layout(_PER_LANE_VECTOR_LAYOUT, (3,))
-    assert resolved is not None
-    assert resolved.selector_arity == 1
-    # storage_size stays per-selector-tuple (one lane's slice), unlike the
-    # global logical_size = 3 the non-selector validator would demand.
-    assert resolved.storage_size == 3
-    assert resolved.shape == (3,)
-
-
-def test_as_layout_accepts_selector_bearing_layout() -> None:
-    vec = sim.SimVector(
-        np.array([1, 2, 3], dtype=np.int64),
-        np.array([True, True, True]),
-    )
-
-    relaid = as_layout(vec, layout=_PER_LANE_VECTOR_LAYOUT)
-
-    assert relaid.layout is not None
-    assert relaid.layout.selector_arity == 1
-    # Payload stays logical; selectors don't reshape simulator storage.
-    assert relaid[0] == 1
-    assert relaid[2] == 3
-
-
-def test_selector_layout_offset_out_of_bounds_rejected() -> None:
-    vec = sim.SimVector(
-        np.array([1, 2, 3, 4], dtype=np.int64),
-        np.array([True, True, True, True]),
     )
 
     with pytest.raises(sim.SimulatorError, match="out of bounds"):
-        as_layout(vec, layout=_SELECTOR_OOB_LAYOUT)
+        as_layout(vec, layout=_OOB_VECTOR_LAYOUT)
 
 
-def test_selector_layout_non_injective_at_zero_probe_rejected() -> None:
-    vec = sim.SimVector(
-        np.array([1, 2, 3], dtype=np.int64),
-        np.array([True, True, True]),
-    )
+def test_resolve_layout_accepts_noninjective_layout() -> None:
+    # Non-injective layouts are first-class. The resolver records the
+    # storage_size and shape without complaining that multiple logical
+    # indices collapse to the same flat slot.
+    resolved = resolve_layout(_NONINJECTIVE_VECTOR_LAYOUT, (3, 4))
 
-    with pytest.raises(sim.SimulatorError, match="per selector tuple"):
-        as_layout(vec, layout=_SELECTOR_NON_INJECTIVE_LAYOUT)
+    assert resolved is not None
+    assert resolved.storage_size == 3
+    assert resolved.shape == (3, 4)
 
 
 def test_resolve_layout_rejects_shape_rank_mismatch() -> None:
-    # `storage_size` takes one shape sym, so any non-rank-1 value is a
+    # `storage_size` takes two shape syms, so any other rank is a
     # contract violation that resolve_layout should diagnose by name
     # rather than by an opaque TypeError from inside the lambda.
     with pytest.raises(sim.SimulatorError, match="rank"):
-        resolve_layout(_PER_LANE_VECTOR_LAYOUT, (2, 3))
+        resolve_layout(_NONINJECTIVE_VECTOR_LAYOUT, (3,))
 
 
-def test_vload_selector_layout_gathers_per_lane() -> None:
-    total = _INTERLEAVED_LANES * _INTERLEAVED_PER_LANE
-
-    @kernel(work_shape=(_INTERLEAVED_LANES,), group_shape=(1,))
-    def gather_kernel(
-        group,
-        src: Buffer[total, np.int64],
-        dst: Buffer[_INTERLEAVED_LANES, _INTERLEAVED_PER_LANE, np.int64],
-    ) -> None:
-        lane = group.work_offset[0]
-        vec = group.vload(
-            src,
-            lane,
-            shape=(_INTERLEAVED_PER_LANE,),
-            layout=_INTERLEAVED_LAYOUT,
-        )
-        group.store(dst[lane, :], vec)
-
-    src_data = np.arange(total, dtype=np.int64)
-    dst_data = np.zeros((_INTERLEAVED_LANES, _INTERLEAVED_PER_LANE), dtype=np.int64)
-
-    sim.launch(gather_kernel, src_data, dst_data)
-
-    expected = src_data.reshape(_INTERLEAVED_PER_LANE, _INTERLEAVED_LANES).T
-    np.testing.assert_array_equal(dst_data, expected)
-
-
-def test_vload_selector_layout_rejects_wrong_selector_count() -> None:
-    @kernel(work_shape=(1,), group_shape=(1,))
-    def bad(group, src: Buffer[12, np.int64]) -> None:
-        # Layout demands one selector; pass zero. Surfaces as a
-        # SimulatorError naming the arity, not a TypeError from inside
-        # the offset lambda.
-        _ = group.vload(src, shape=(3,), layout=_INTERLEAVED_LAYOUT)
-
-    src_data = np.arange(12, dtype=np.int64)
-    with pytest.raises(sim.SimulatorError, match="selector"):
-        sim.launch(bad, src_data)
-
-
-def test_vload_positional_indices_rejected_without_selector_layout() -> None:
-    @kernel(work_shape=(1,), group_shape=(1,))
-    def bad(group, src: Buffer[12, np.int64]) -> None:
-        # No layout on the call AND no selector layout on the source,
-        # but a positional index is supplied. There's nowhere to bind
-        # it, so we surface a focused error rather than silently
-        # ignoring the operand.
-        _ = group.vload(src, 1, shape=(3,))
-
-    src_data = np.arange(12, dtype=np.int64)
-    with pytest.raises(sim.SimulatorError, match="no selector-bearing layout"):
-        sim.launch(bad, src_data)
+def test_resolve_layout_rejects_unbalanced_offset_arity() -> None:
+    # `LayoutAttr` requires `index_syms.size() == shape_syms.size()`,
+    # which means `offset` takes `2 * rank + params_slot` positional
+    # parameters. A lambda with the wrong index/shape split surfaces
+    # as a SimulatorError, not a TypeError from inside the lambda.
+    unbalanced = index_map(
+        storage_size=lambda n: n,
+        offset=lambda i, j, n: i,
+    )
+    with pytest.raises(sim.SimulatorError, match="offset arity"):
+        resolve_layout(unbalanced, (3,))
 
 
 def test_masked_load_respects_mask_value_and_mask_activity() -> None:

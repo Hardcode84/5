@@ -58,14 +58,6 @@ class ResolvedLayout:
     shape: tuple[int, ...]
     params: dict[str, Any]
     storage_size: int
-    # Number of trailing `offset(...)` parameters past the shape syms — i.e.
-    # selectors in the `#hc.layout` sense. `selector_arity == 0` is a plain
-    # logical->storage layout; `selector_arity > 0` means the offset takes
-    # extra symbols bound at access time (per-lane, per-wave, ...) and the
-    # `storage_size` is per-selector-tuple. The simulator stores selector
-    # layouts as metadata; per-element gather under a selector layout is
-    # tracked separately.
-    selector_arity: int = 0
 
 
 class SimulatorError(RuntimeError):
@@ -147,14 +139,11 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
     """Resolve validated layout metadata for a concrete logical shape.
 
     The simulator keeps dense NumPy payloads and uses the resolved layout as
-    logical-placement metadata for values that still preserve that mapping.
-
-    Selector-bearing layouts (offset signature wider than shape syms; see
-    `doc/layouts.md` under "Selectors in `#hc.layout`") are accepted as
-    metadata. Their offsets reference symbols that are bound externally at
-    access time, so global injectivity over the logical shape is the wrong
-    invariant; we run a zero-selector smoke probe to catch obviously
-    malformed offsets and otherwise treat the layout as opaque metadata.
+    logical-placement metadata. Layout offsets may be non-injective —
+    distinct logical indices mapping to the same storage offset is a
+    first-class feature (per-lane fragments, broadcast layouts, ...) —
+    so we validate bounds (every offset lands inside `storage_size`) but
+    do not enforce injectivity.
     """
     resolved_shape = tuple(int(dim) for dim in shape)
     if layout is None:
@@ -165,37 +154,30 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
         return layout
     if not isinstance(layout, IndexMap):
         raise SimulatorError("layout must be an IndexMap or None")
-    selector_arity = _layout_selector_arity(layout, resolved_shape)
+    _validate_layout_arities(layout, resolved_shape)
     params = _layout_params(layout, resolved_shape)
     storage_size = _layout_storage_size(layout, resolved_shape, params)
-    if selector_arity == 0:
-        _validate_layout_offsets(layout, resolved_shape, params, storage_size)
-    else:
-        _validate_selector_layout_offsets(
-            layout, resolved_shape, params, storage_size, selector_arity
-        )
+    _validate_layout_offsets(layout, resolved_shape, params, storage_size)
     return ResolvedLayout(
         spec=layout,
         shape=resolved_shape,
         params=params,
         storage_size=storage_size,
-        selector_arity=selector_arity,
     )
 
 
-def _layout_selector_arity(layout: IndexMap, shape: tuple[int, ...]) -> int:
-    """Selectors = `len(index_syms) - len(shape_syms)`, inferred from arities.
+def _validate_layout_arities(layout: IndexMap, shape: tuple[int, ...]) -> None:
+    """Confirm the layout's lambda signatures match the contract.
 
-    Layout signature contract (matches `_resolve.py` / `doc/layouts.md`):
-        storage_size(*shape_syms[, params])     -> arity = R + t
-        offset(*index_syms, *shape_syms[, params]) -> arity = (R + S) + R + t
+    Contract (mirrors `_resolve.py` / `doc/layouts.md`):
+        storage_size(*shape_syms[, params])           -> arity = R + t
+        offset(*index_syms, *shape_syms[, params])    -> arity = R + R + t
 
-    where `R = len(shape_syms)`, `S = len(index_syms) - len(shape_syms)` is
-    the selector count, and `t in {0, 1}` is the optional `params` slot.
-    The simulator inspects arities directly rather than importing the
-    frontend's helpers (which raise `FrontendError`); we surface signature
-    surprises as `SimulatorError` so the diagnostic source matches the
-    validator that fired.
+    where R = rank and t in {0, 1} is the optional params slot. We
+    inspect arities directly rather than importing the frontend's
+    helpers (which raise `FrontendError`); signature surprises surface
+    as `SimulatorError` so the diagnostic source matches the validator
+    that fired.
     """
     trailing = 1 if layout.params is not None else 0
     storage_arity = _layout_positional_arity(
@@ -213,19 +195,14 @@ def _layout_selector_arity(layout: IndexMap, shape: tuple[int, ...]) -> int:
             f"layout storage_size takes {shape_arity} shape parameter(s) "
             f"but the value has rank {len(shape)}"
         )
-    index_arity = offset_arity - shape_arity - trailing
-    if index_arity < 1:
+    expected_offset_arity = 2 * shape_arity + trailing
+    if offset_arity != expected_offset_arity:
         raise SimulatorError(
-            f"layout offset takes {index_arity} index parameter(s); "
-            f"needs at least 1"
+            f"layout offset arity ({offset_arity}) must equal "
+            f"`2 * rank + params_slot` ({expected_offset_arity}); index_syms "
+            f"and shape_syms have to be the same length under the uniform "
+            f"layout contract (see doc/layouts.md)"
         )
-    selector_arity = index_arity - shape_arity
-    if selector_arity < 0:
-        raise SimulatorError(
-            f"layout offset has fewer index parameters ({index_arity}) "
-            f"than the shape's rank ({shape_arity})"
-        )
-    return selector_arity
 
 
 def _layout_positional_arity(fn: Callable[..., Any], *, role: str) -> int:
@@ -289,14 +266,21 @@ def _validate_layout_offsets(
     params: dict[str, Any],
     storage_size: int,
 ) -> None:
+    """Bounds-check the layout's offset at every logical index.
+
+    Non-injective layouts are allowed (multiple logical indices may map
+    to the same storage offset — that's how per-lane fragments and
+    broadcast layouts work). We only check that every offset lands
+    inside `[0, storage_size)`, catching obvious typos (wrong sym name
+    in the formula, negative results, out-of-range arithmetic) without
+    enforcing the injectivity invariant the user may intentionally have
+    relaxed.
+    """
     logical_size = int(np.prod(shape))
-    if storage_size < logical_size:
-        raise SimulatorError("layout storage size is smaller than the logical shape")
     if logical_size == 0:
         return
     if logical_size > _LAYOUT_VALIDATION_LIMIT:
         return
-    seen: set[int] = set()
     for index in np.ndindex(shape):
         raw = (
             layout.offset(*index, *shape)
@@ -306,58 +290,6 @@ def _validate_layout_offsets(
         offset = layout_int(raw, what="layout offset")
         if offset < 0 or offset >= storage_size:
             raise SimulatorError("layout offset is out of bounds")
-        if offset in seen:
-            raise SimulatorError(
-                "layout offset must be injective over the logical shape"
-            )
-        seen.add(offset)
-
-
-def _validate_selector_layout_offsets(
-    layout: IndexMap,
-    shape: tuple[int, ...],
-    params: dict[str, Any],
-    storage_size: int,
-    selector_arity: int,
-) -> None:
-    """Smoke-probe a selector-bearing layout at the zero-selector tuple.
-
-    The full injectivity contract spans every (logical_index, selector)
-    pair, which the simulator can't enumerate without knowing the selector
-    value ranges — selectors are bound by external machinery (per-lane,
-    per-wave, ...) the resolve site doesn't see. Probing at all-zero
-    selectors catches the common malformations (offset references the
-    wrong sym, returns a non-integer, walks past `storage_size`, collides
-    within a single selector tuple) without making up bounds that don't
-    exist in the contract. Anything subtler shows up at access time once
-    the gather primitive lands.
-    """
-    if storage_size < 0:
-        raise SimulatorError("layout storage size must be non-negative")
-    logical_size = int(np.prod(shape))
-    if logical_size == 0:
-        return
-    if logical_size > _LAYOUT_VALIDATION_LIMIT:
-        return
-    zero_selectors = (0,) * selector_arity
-    seen: set[int] = set()
-    for index in np.ndindex(shape):
-        raw = (
-            layout.offset(*index, *zero_selectors, *shape)
-            if layout.params is None
-            else layout.offset(*index, *zero_selectors, *shape, params)
-        )
-        offset = layout_int(raw, what="layout offset")
-        if offset < 0 or offset >= storage_size:
-            raise SimulatorError(
-                "selector layout offset is out of bounds at zero-selector probe"
-            )
-        if offset in seen:
-            raise SimulatorError(
-                "selector layout offset must be injective per selector tuple "
-                "(violated at zero-selector probe)"
-            )
-        seen.add(offset)
 
 
 def layout_int(value: Any, *, what: str) -> int:

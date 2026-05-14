@@ -121,6 +121,15 @@ module attributes {transform.with_named_sequence} {
     // that erases the slot wholesale.
     %m10a = transform.apply_registered_pass "hc-canonicalize-layouts" to %m10
         : (!transform.any_op) -> !transform.any_op
+    // Materialise `hc.strip_layout` — the user-marked layout-drop
+    // boundary — into the `hc.generic` surface before the rest of
+    // the shape-to-generic funnel fires. Strip is structurally
+    // identical to a layout-aware `hc.vload` (gather elements via
+    // the source's layout offset into a bare init), so the rewrite
+    // shape mirrors the load-side lowering and the post-flatten
+    // pipeline only ever sees ordinary `hc.generic` ops.
+    %m10s = transform.apply_registered_pass "hc-lower-strip-layout" to %m10a
+        : (!transform.any_op) -> !transform.any_op
     // Funnel the shaped op surface into `hc.generic` so the post-flatten
     // codegen has a single op family to lower. Each rewriter is
     // conservative — `hc.matmul` / `hc.reduce` v0 wants rank-2 / single-axis
@@ -132,7 +141,7 @@ module attributes {transform.with_named_sequence} {
     // `!hc.undef` iter bounds the per-element rewriter emitted from the
     // operand shapes. Order: rewriters before bounds inference so the pass
     // sees every fresh `hc.generic`.
-    %m10b = transform.apply_registered_pass "hc-shaped-compute-to-generic" to %m10a
+    %m10b = transform.apply_registered_pass "hc-shaped-compute-to-generic" to %m10s
         : (!transform.any_op) -> !transform.any_op
     %m10c = transform.apply_registered_pass "hc-elementwise-to-generic" to %m10b
         : (!transform.any_op) -> !transform.any_op

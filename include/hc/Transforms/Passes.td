@@ -167,6 +167,46 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
   ];
 }
 
+def HCLowerStripLayout : Pass<"hc-lower-strip-layout"> {
+  let summary = "Rewrite hc.strip_layout into hc.vzeros + hc.generic gather.";
+  let description = [{
+    Materialises ``hc.strip_layout`` — the user-marked boundary that
+    drops the operand's layout — into the body-driven ``hc.generic``
+    surface the post-flatten pipeline understands. Conceptual mirror
+    of ``hc-load-store-to-generic`` and ``hc-shaped-compute-to-generic``:
+    one shape-rewriting op funnels into ``hc.generic`` + identity
+    init.
+
+    For ``%dst = hc.strip_layout %src : T_src -> T_dst`` the rewrite
+    emits an ``hc.vzeros`` (or ``hc.zeros`` for tensor-flavoured
+    operands) sized to the result shape and an ``hc.generic`` with
+    parallel iters per result axis. The operand carries identity
+    per-axis offsets (``[i_0, i_1, ...]``); flatten substitutes those
+    into the operand's layout offset at ``index_syms[k]`` and yields
+    the gather offset post-flatten. The result carries identity
+    offsets that compose to ``i_0 + i_1 * stride + ...`` against the
+    identity (dim-product) layout. Body is the trivial element copy.
+
+    Layout-less operands collapse straight to the bare result without
+    emitting the generic — flatten would compose the identity layout
+    over the operand's shape and the generic would degenerate into a
+    no-op copy. Skipping it keeps the post-rewrite IR tight on the
+    common case (the user reached for ``as_layout(value, None)``
+    defensively but the producer already gave them bare).
+
+    Bails (op stays for downstream diagnostics):
+      * Operand isn't an HC-shaped value (``!hc.undef``, raw pointer,
+        non-shaped scalars) — strip has no work to do on a non-shaped
+        carrier; the verifier rejects these at parse time.
+      * Operand or result shape carries non-``#hc.expr`` dim entries
+        (``#hc.dyn`` sentinel, builder placeholder) — no symbolic
+        bound to materialise the iter range from.
+      * Operand has a layout but it's not on a vector / tensor
+        carrier (``!hc.buffer`` is rejected by the verifier).
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
   let summary = "Rewrite hc.matmul / hc.reduce into hc.generic + identity fill.";
   let description = [{

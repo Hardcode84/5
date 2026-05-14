@@ -234,6 +234,53 @@ func.func @as_layout_collapses(
 
 // -----
 
+// Shape-changing `hc.as_layout` round-trip: a 1-D `!hc.bare_tensor`
+// reinterpreted as a 4-D layout-bearing `!hc.tensor` via the
+// relaxed verifier. The flatten converter collapses both endpoints
+// to the same 1-D `!hc.tensor<f32, ["2*L*M*N"]>` carrier (the
+// operand was already at that shape; the result's layout
+// `storage_size = b*m*n*l` substitutes back to the same product).
+// `DropAsLayout` forwards the operand expansion through, and the
+// builtin `unrealized_conversion_cast` bridges the bare→non-bare
+// type seam the flatten converter doesn't dissolve on its own.
+// CHECK-LABEL: @as_layout_shape_change_collapses_to_1d
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.bare_tensor<f32, ["2*L*M*N"]>
+// CHECK: %[[CAST:.*]]:4 = builtin.unrealized_conversion_cast %[[SRC]]
+// CHECK-SAME: : !hc.bare_tensor<f32, ["2*L*M*N"]>
+// CHECK-SAME: to !hc.tensor<f32, ["2*L*M*N"]>, !hc.idx<"L">, !hc.idx<"M">, !hc.idx<"N">
+// CHECK-NOT: hc.as_layout
+// CHECK: return %[[CAST]]#0, %[[CAST]]#1, %[[CAST]]#2, %[[CAST]]#3
+func.func @as_layout_shape_change_collapses_to_1d(
+    %lds_1d: !hc.bare_tensor<f32, ["2*M*N*L"]>)
+    -> !hc.tensor<f32, ["2", "M", "N", "L"],
+                  #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                             index_syms = ["ib", "im", "in", "il"],
+                             params = {},
+                             storage_size = #hc.expr<"b*m*n*l">,
+                             offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>> {
+  %v = hc.as_layout %lds_1d,
+       layout = (#hc.layout<shape_syms = ["b", "m", "n", "l"],
+                            index_syms = ["ib", "im", "in", "il"],
+                            params = {},
+                            storage_size = #hc.expr<"b*m*n*l">,
+                            offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>)
+       : !hc.bare_tensor<f32, ["2*M*N*L"]>
+         -> !hc.tensor<f32, ["2", "M", "N", "L"],
+                       #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                  index_syms = ["ib", "im", "in", "il"],
+                                  params = {},
+                                  storage_size = #hc.expr<"b*m*n*l">,
+                                  offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+  return %v : !hc.tensor<f32, ["2", "M", "N", "L"],
+                          #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                     index_syms = ["ib", "im", "in", "il"],
+                                     params = {},
+                                     storage_size = #hc.expr<"b*m*n*l">,
+                                     offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+}
+
+// -----
+
 // 1D layout-less IR is a fixed point for non-buffers: the converter
 // reports the tensor type legal-on-arrival and skips the rebuild.
 // Buffers always collapse to the `[?]` sentinel even when the input

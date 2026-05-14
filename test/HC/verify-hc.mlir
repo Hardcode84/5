@@ -463,6 +463,84 @@ module {
 
 // -----
 
+// Shape-changing `hc.as_layout` is allowed iff operand and result
+// describe the same physical storage. Here the bare carrier holds
+// `2*M*N*L` elements but the 4-D layout-bearing view declares the
+// outer dim as `3` — the substituted layout `storage_size` is
+// `3*L*M*N`, distinct from the operand's `2*L*M*N`, so the
+// reinterpretation is unsafe and the verifier rejects it. The
+// diagnostic names both canonical expressions and the contract.
+// CHECK: error: 'hc.as_layout' op storage size mismatch: operand addresses #hc.expr<"2*L*M*N"> elements, result layout addresses #hc.expr<"3*L*M*N">; hc.as_layout reinterprets without resizing
+module {
+  func.func @bad(
+      %lds_1d: !hc.bare_tensor<f32, ["2*M*N*L"]>)
+      -> !hc.tensor<f32, ["3", "M", "N", "L"],
+                    #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                               index_syms = ["ib", "im", "in", "il"],
+                               params = {},
+                               storage_size = #hc.expr<"b*m*n*l">,
+                               offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>> {
+    %v = hc.as_layout %lds_1d,
+         layout = (#hc.layout<shape_syms = ["b", "m", "n", "l"],
+                              index_syms = ["ib", "im", "in", "il"],
+                              params = {},
+                              storage_size = #hc.expr<"b*m*n*l">,
+                              offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>)
+         : !hc.bare_tensor<f32, ["2*M*N*L"]>
+           -> !hc.tensor<f32, ["3", "M", "N", "L"],
+                         #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                    index_syms = ["ib", "im", "in", "il"],
+                                    params = {},
+                                    storage_size = #hc.expr<"b*m*n*l">,
+                                    offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+    return %v : !hc.tensor<f32, ["3", "M", "N", "L"],
+                            #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                       index_syms = ["ib", "im", "in", "il"],
+                                       params = {},
+                                       storage_size = #hc.expr<"b*m*n*l">,
+                                       offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+  }
+}
+
+// -----
+
+// Element-type mismatch is also caught: as_layout is a relabel of
+// addressing, not of payload type. The diagnostic flags the type
+// pair so the misuse is clear.
+// CHECK: error: 'hc.as_layout' op operand element type 'f32' differs from result element type 'f16'
+module {
+  func.func @bad(
+      %src: !hc.bare_tensor<f32, ["M*N"]>)
+      -> !hc.tensor<f16, ["M", "N"],
+                    #hc.layout<shape_syms = ["m", "n"],
+                               index_syms = ["im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"m*n">,
+                               offset = #hc.expr<"im*n + in">>> {
+    %v = hc.as_layout %src,
+         layout = (#hc.layout<shape_syms = ["m", "n"],
+                              index_syms = ["im", "in"],
+                              params = {},
+                              storage_size = #hc.expr<"m*n">,
+                              offset = #hc.expr<"im*n + in">>)
+         : !hc.bare_tensor<f32, ["M*N"]>
+           -> !hc.tensor<f16, ["M", "N"],
+                         #hc.layout<shape_syms = ["m", "n"],
+                                    index_syms = ["im", "in"],
+                                    params = {},
+                                    storage_size = #hc.expr<"m*n">,
+                                    offset = #hc.expr<"im*n + in">>>
+    return %v : !hc.tensor<f16, ["M", "N"],
+                            #hc.layout<shape_syms = ["m", "n"],
+                                       index_syms = ["im", "in"],
+                                       params = {},
+                                       storage_size = #hc.expr<"m*n">,
+                                       offset = #hc.expr<"im*n + in">>>
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.call' op 'missing' does not reference a valid hc.func
 module {
   func.func @bad(%x: !hc.undef) -> !hc.undef {

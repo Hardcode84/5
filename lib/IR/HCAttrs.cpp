@@ -384,3 +384,71 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return emitError() << "missing offset";
   return success();
 }
+
+namespace mlir::hc {
+
+mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
+                                                 LayoutAttr layout,
+                                                 ShapeAttr originalShape) {
+  if (!originalShape)
+    return failure();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+
+  if (!layout) {
+    ArrayRef<Attribute> dims = originalShape.getDims();
+    if (dims.empty()) {
+      auto one = sym::composeExprInt(store, 1);
+      if (failed(one))
+        return failure();
+      return ExprAttr::get(ctx, *one);
+    }
+    auto firstExpr = dyn_cast<ExprAttr>(dims.front());
+    if (!firstExpr)
+      return failure();
+    sym::ExprHandle product = firstExpr.getValue();
+    for (Attribute dim : dims.drop_front()) {
+      auto dimExpr = dyn_cast<ExprAttr>(dim);
+      if (!dimExpr)
+        return failure();
+      auto next = sym::composeExprBinary(store, product, sym::ExprBinaryOp::Mul,
+                                         dimExpr.getValue());
+      if (failed(next))
+        return failure();
+      product = *next;
+    }
+    return ExprAttr::get(ctx, product);
+  }
+
+  ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
+  ArrayRef<Attribute> dims = originalShape.getDims();
+  if (shapeSyms.size() != dims.size())
+    return failure();
+
+  SmallVector<ixs_node *> targets;
+  SmallVector<ixs_node *> replacements;
+  targets.reserve(shapeSyms.size());
+  replacements.reserve(shapeSyms.size());
+  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
+    auto symStr = dyn_cast<StringAttr>(sym);
+    auto dimExpr = dyn_cast<ExprAttr>(dim);
+    if (!symStr || !dimExpr)
+      return failure();
+    auto symHandle = sym::composeExprSym(store, symStr.getValue());
+    if (failed(symHandle))
+      return failure();
+    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
+    replacements.push_back(const_cast<ixs_node *>(dimExpr.getValue().raw()));
+  }
+
+  sym::Session session(store);
+  ixs_node *bound = ixs_subs_multi(
+      session.raw(),
+      const_cast<ixs_node *>(layout.getStorageSize().getValue().raw()),
+      static_cast<uint32_t>(targets.size()), targets.data(),
+      replacements.data());
+  if (!bound)
+    return failure();
+  return ExprAttr::get(ctx, sym::ExprHandle(bound));
+}
+
+} // namespace mlir::hc

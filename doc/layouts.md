@@ -109,8 +109,22 @@ Inference (`hc-infer-types`) propagates layouts:
 * shape-changing (reshape, broadcast, reduction): drops to default.
 * `hc.matmul`: default unless both operands carry the same layout *and*
   the result shape matches both of theirs (rare).
-* `hc.as_layout`: replaces the operand layout with the operand of its
-  attribute, no other change.
+* `hc.as_layout`: replaces the operand layout with the op attribute.
+  Operand and result may also differ in rank/shape — the verifier
+  accepts the pair iff their effective `storage_size` expressions
+  agree under ixsimpl (operand's `storage_size` substituted with its
+  dim entries vs result-side same). 1-D bare carriers reinterpreted
+  as multi-D layout-bearing views (the multibuffer-LDS pattern with a
+  4-D `(BUF, M, N, LANE)` layout over a flat allocation) flow through
+  this. Element type must still match; payload reinterpretation
+  belongs to `hc.astype`, not here. See
+  `@as_layout_shape_change_storage_match` in
+  `test/HC/ops-buffer-data.mlir` for the positive form,
+  `test/HC/verify-hc.mlir` for the storage-mismatch and
+  element-type-mismatch diagnostics, and
+  `test/HC/flatten-with-layouts.mlir`
+  (`@as_layout_shape_change_collapses_to_1d`) for the flatten
+  round-trip back to the 1-D carrier.
 
 The collective return suffix from `@group.subgroups` / `@group.workitems`
 is **not** part of `#hc.layout`. The langref rule "dense suffix appended

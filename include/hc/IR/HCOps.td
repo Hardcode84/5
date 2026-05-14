@@ -938,16 +938,39 @@ def HCAsLayoutOp : HC_Op<"as_layout",
     see the custom parse/print in `lib/IR/HCOps.cpp` for the lookahead
     rationale. Lifted out of `attr-dict` so the surface reads like the
     other explicit keyword-argument ops (`hc.reduce`, `hc.astype`).
+
+    Operand and result may differ in rank/shape — `hc.as_layout` is the
+    surface for reinterpreting a value's logical structure without
+    touching the underlying storage. The verifier guards safety by
+    requiring operand and result to address the same physical span:
+    each side's effective `storage_size` (the layout's
+    `storage_size` after binding `shape_syms` to the type's dim
+    entries, or the product of dims when the type has no layout)
+    must canonicalize to the same `#hc.expr` value. ixsimpl
+    hash-consing gives that comparison structural meaning, not just
+    textual. A 1-D bare allocation reinterpreted as a 4-D
+    layout-bearing view (`storage_size = "b * m * n * l"` on the
+    layout side, product `2 * M * N * L` on the bare side) is the
+    motivating shape; see `doc/layouts.md` and
+    `@as_layout_shape_change_storage_match` in
+    `test/HC/ops-buffer-data.mlir`.
+
+    Both semantic (`!hc.tensor` / `!hc.vector`) and bare
+    (`!hc.bare_tensor` / `!hc.bare_vector`) shaped values are
+    accepted on either side: the relabel is a pure type op and
+    composes with the source decomposition that introduces the
+    bare carriers.
   }];
   let arguments = (ins
-    HC_ShapedValueType:$value,
+    HC_AnyShapedValueType:$value,
     HC_LayoutAttr:$layout
   );
-  let results = (outs HC_ShapedValueType:$result);
+  let results = (outs HC_AnyShapedValueType:$result);
   let assemblyFormat = [{
     $value `,` `layout` `=` custom<HCAsLayoutAttr>($layout) attr-dict `:`
     type($value) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

@@ -409,7 +409,7 @@ def HC_SymBindingValueType : AnyTypeOf<[
 ]>;
 
 // Shaped values for ops that only make sense on tensors/vectors
-// (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`).
+// (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`).
 // `!hc.undef` is admitted for the same pre-inference reason as above.
 def HC_ShapedValueType : AnyTypeOf<[
   HC_UndefType,
@@ -421,6 +421,17 @@ def HC_ShapedValueType : AnyTypeOf<[
 // are decomposed. Kept separate from `HC_ShapedValueType` so source-semantic ops
 // opt into the split representation deliberately.
 def HC_BareShapedValueType : AnyTypeOf<[
+  HC_BareTensorType,
+  HC_BareVectorType,
+]>;
+
+// Both flavors at once: used by ops that bridge the semantic / bare
+// split without taking a side (`hc.as_layout`, which is a pure
+// relabel and composes with decomposition).
+def HC_AnyShapedValueType : AnyTypeOf<[
+  HC_UndefType,
+  HC_TensorType,
+  HC_VectorType,
   HC_BareTensorType,
   HC_BareVectorType,
 ]>;

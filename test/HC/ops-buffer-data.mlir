@@ -113,6 +113,50 @@ func.func @as_layout_structured(%v: !hc.undef) -> !hc.undef {
   return %r : !hc.undef
 }
 
+// Shape-changing `hc.as_layout`: a 1-D bare carrier reinterpreted as
+// a 4-D layout-bearing view. The verifier accepts the pair because
+// the operand's storage_size (`2*L*M*N` from the explicit dim product
+// on a layout-less bare tensor) equals the result layout's
+// storage_size `b*m*n*l` after binding `b -> 2, m -> M, n -> N, l ->
+// L`. ixsimpl hash-cons gives that comparison structural meaning, so
+// the two cannot disagree on operand ordering or factoring.
+//
+// `lds_4d[buf_idx]` and `lds_4d[buf_idx, im_slice, in_slice, il_slice]`
+// in the multibuffered LDS pattern feed off this reinterpretation —
+// see `doc/layouts.md` "Free symbols in layout offsets".
+// CHECK-LABEL: func.func @as_layout_shape_change_storage_match
+// CHECK: hc.as_layout %{{[^,]+}}, layout = (#hc.layout<shape_syms = ["b", "m", "n", "l"]
+// CHECK-SAME: : !hc.bare_tensor<f32, ["2*L*M*N"]>
+// CHECK-SAME: -> !hc.tensor<f32, ["2", "M", "N", "L"]
+func.func @as_layout_shape_change_storage_match(
+    %lds_1d: !hc.bare_tensor<f32, ["2*M*N*L"]>)
+    -> !hc.tensor<f32, ["2", "M", "N", "L"],
+                  #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                             index_syms = ["ib", "im", "in", "il"],
+                             params = {},
+                             storage_size = #hc.expr<"b*m*n*l">,
+                             offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>> {
+  %v = hc.as_layout %lds_1d,
+       layout = (#hc.layout<shape_syms = ["b", "m", "n", "l"],
+                            index_syms = ["ib", "im", "in", "il"],
+                            params = {},
+                            storage_size = #hc.expr<"b*m*n*l">,
+                            offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>)
+       : !hc.bare_tensor<f32, ["2*M*N*L"]>
+         -> !hc.tensor<f32, ["2", "M", "N", "L"],
+                       #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                  index_syms = ["ib", "im", "in", "il"],
+                                  params = {},
+                                  storage_size = #hc.expr<"b*m*n*l">,
+                                  offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+  return %v : !hc.tensor<f32, ["2", "M", "N", "L"],
+                          #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                     index_syms = ["ib", "im", "in", "il"],
+                                     params = {},
+                                     storage_size = #hc.expr<"b*m*n*l">,
+                                     offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
+}
+
 // CHECK-LABEL: func.func @allocators
 // CHECK: hc.vzeros shape %{{.*}} : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
 // CHECK: hc.vones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>

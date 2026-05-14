@@ -1606,6 +1606,78 @@ static LogicalResult verifyBarePredicateMask(Operation *op, Type type) {
   return success();
 }
 
+LogicalResult HCAsLayoutOp::verify() {
+  // Progressive typing: any side still on `!hc.undef` (the v0
+  // placeholder before inference fills in) can't be checked yet —
+  // the verifier runs at every fold boundary and would otherwise
+  // reject legitimate pre-inference IR. The same gate applies to
+  // shapes that haven't crystallized into all-ExprAttr entries
+  // (intermediate `?` sentinels or builder-stamped placeholders);
+  // the storage-size compose only makes sense once both sides know
+  // their dims.
+  Type valueType = getValue().getType();
+  Type resultType = getResult().getType();
+  if (!valueType || !resultType || isHCUndefType(valueType) ||
+      isHCUndefType(resultType))
+    return success();
+
+  auto valueShaped = dyn_cast<SymbolicallyShapedTypeInterface>(valueType);
+  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultType);
+  if (!valueShaped || !resultShaped)
+    return success();
+
+  Type valueElem = valueShaped.getSymbolicElementType();
+  Type resultElem = resultShaped.getSymbolicElementType();
+  if (valueElem && resultElem && valueElem != resultElem)
+    return emitOpError("operand element type ")
+           << valueElem << " differs from result element type " << resultElem
+           << "; hc.as_layout reinterprets the layout, not the data type";
+
+  ShapeAttr valueShape = valueShaped.getSymbolicShape();
+  ShapeAttr resultShape = resultShaped.getSymbolicShape();
+  if (!valueShape || !resultShape)
+    return success();
+
+  // `computeStorageSizeExpr` wants every dim entry to be an
+  // `ExprAttr` — buffers' `?` sentinel doesn't appear on `as_layout`
+  // surfaces (the op consumes shaped tensors / vectors that carry
+  // symbolic extents), but a malformed builder could plant one.
+  // Skip the check in that case; the cast-to-`ExprAttr` inside
+  // `computeStorageSizeExpr` would assert otherwise.
+  auto allDimsAreExprs = [](ShapeAttr s) {
+    return llvm::all_of(s.getDims(), [](Attribute a) {
+      return llvm::isa_and_nonnull<ExprAttr>(a);
+    });
+  };
+  if (!allDimsAreExprs(valueShape) || !allDimsAreExprs(resultShape))
+    return success();
+
+  MLIRContext *ctx = getContext();
+  FailureOr<ExprAttr> valueStorage =
+      computeStorageSizeExpr(ctx, valueShaped.getSymbolicLayout(), valueShape);
+  if (failed(valueStorage))
+    return success();
+  FailureOr<ExprAttr> resultStorage =
+      computeStorageSizeExpr(ctx, getLayout(), resultShape);
+  if (failed(resultStorage))
+    return success();
+
+  // ixsimpl hash-cons gives canonical handles per (store, expr); the
+  // raw-pointer equality on the underlying nodes is structural
+  // equivalence under the same normalization both sides went
+  // through. Two textually different formulas that reduce to the
+  // same canonical form (`M*N*4` vs `4*N*M`) compare equal here.
+  if (*valueStorage != *resultStorage)
+    return emitOpError("storage size mismatch: operand addresses ")
+           << *valueStorage << " elements, result layout addresses "
+           << *resultStorage
+           << "; hc.as_layout reinterprets without resizing — the layouts'"
+              " effective storage_size (operand's dims bound into its layout"
+              " or the dim product when absent vs the explicit result"
+              " layout's storage_size bound to the result's dims) must agree";
+  return success();
+}
+
 LogicalResult HCLoadMaskOp::verify() {
   return verifyBarePredicateMask(getOperation(), getMask().getType());
 }

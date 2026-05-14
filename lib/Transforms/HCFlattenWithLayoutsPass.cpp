@@ -215,60 +215,11 @@ static LogicalResult buildAuxIdxTypes(MLIRContext *ctx,
 // `ixs_subs_multi` wants raw `ixs_node *` arrays for both targets
 // and replacements, so we collect those via `composeExprSym` /
 // `getNode()` and let the substitution canonicalize through the same
-// store any other producer of these expressions would.
-static FailureOr<ExprAttr> computeStorageSizeExpr(MLIRContext *ctx,
-                                                  LayoutAttr layout,
-                                                  ShapeAttr originalShape) {
-  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
-
-  if (!layout) {
-    ArrayRef<Attribute> dims = originalShape.getDims();
-    if (dims.empty()) {
-      auto one = sym::composeExprInt(store, 1);
-      if (failed(one))
-        return failure();
-      return ExprAttr::get(ctx, *one);
-    }
-    sym::ExprHandle product = llvm::cast<ExprAttr>(dims[0]).getValue();
-    for (Attribute dim : dims.drop_front()) {
-      auto next = sym::composeExprBinary(store, product, sym::ExprBinaryOp::Mul,
-                                         llvm::cast<ExprAttr>(dim).getValue());
-      if (failed(next))
-        return failure();
-      product = *next;
-    }
-    return ExprAttr::get(ctx, product);
-  }
-
-  ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
-  ArrayRef<Attribute> dims = originalShape.getDims();
-  if (shapeSyms.size() != dims.size())
-    return failure();
-
-  SmallVector<ixs_node *> targets;
-  SmallVector<ixs_node *> replacements;
-  targets.reserve(shapeSyms.size());
-  replacements.reserve(shapeSyms.size());
-  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
-    auto symHandle =
-        sym::composeExprSym(store, llvm::cast<StringAttr>(sym).getValue());
-    if (failed(symHandle))
-      return failure();
-    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
-    replacements.push_back(
-        const_cast<ixs_node *>(llvm::cast<ExprAttr>(dim).getValue().raw()));
-  }
-
-  sym::Session session(store);
-  ixs_node *bound = ixs_subs_multi(
-      session.raw(),
-      const_cast<ixs_node *>(layout.getStorageSize().getValue().raw()),
-      static_cast<uint32_t>(targets.size()), targets.data(),
-      replacements.data());
-  if (!bound)
-    return failure();
-  return ExprAttr::get(ctx, sym::ExprHandle(bound));
-}
+// store any other producer of these expressions would. The actual
+// composition lives in `lib/IR/HCAttrs.cpp::computeStorageSizeExpr`
+// — promoted to a public helper so the `hc.as_layout` verifier
+// uses the same path; the comment above documents the contract for
+// both call sites.
 
 // Pull the symbolic expression that names the SSA index value at an
 // access site. Three legal sources:

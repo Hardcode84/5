@@ -55,30 +55,17 @@ static LogicalResult verifyResultShape(Operation *op, Type resultType,
 }
 
 static LogicalResult verifyIndexStructure(Operation *op, ValueRange indices,
-                                          Type sourceType,
                                           ShapeAttr sourceShape) {
-  // Indices bind a prefix of the source's index_syms: tile coords for
-  // a plain shape, tile coords + selectors for a `#hc.layout` whose
-  // `index_syms` is strictly longer than `shape_syms` (see
-  // HC_LayoutAttr description). Bind count is `index_syms.size()` if a
-  // layout is attached, else the rank of the shape (implicit identity
-  // layout). Fewer than the full bind count is legal — the trailing
-  // tile dims get filled by the source/result shape.
+  // Indices bind positionally to the source's logical axes. The bind
+  // count is the rank of the shape (which `LayoutAttr`'s verifier pins
+  // to `index_syms.size()` when a layout is attached). Fewer than the
+  // full bind count is legal — the trailing axes get filled by the
+  // source/result shape.
   size_t maxArity = sourceShape.getDims().size();
-  if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(sourceType))
-    if (LayoutAttr layout = shaped.getSymbolicLayout())
-      maxArity = layout.getIndexSyms().size();
-  if (indices.size() > maxArity) {
-    auto diag = op->emitOpError("has ")
-                << indices.size() << " index operand(s) for source bind count "
-                << maxArity;
-    if (maxArity != sourceShape.getDims().size())
-      diag.attachNote() << "source layout's index_syms is " << maxArity
-                        << " (rank " << sourceShape.getDims().size() << " + "
-                        << (maxArity - sourceShape.getDims().size())
-                        << " selector(s))";
-    return diag;
-  }
+  if (indices.size() > maxArity)
+    return op->emitOpError("has ")
+           << indices.size() << " index operand(s) for source rank "
+           << maxArity;
   for (auto [idx, value] : llvm::enumerate(indices)) {
     Type type = value.getType();
     if (isa<IdxType, SliceType>(type) || type.isIntOrIndex())
@@ -105,7 +92,7 @@ static LogicalResult verifyStaticShapeOp(HCStaticShapeOpInterface shapeOp) {
              << source.getType();
 
     if (failed(verifyIndexStructure(op, shapeOp.getStaticShapeIndexOperands(),
-                                    source.getType(), sourceShapeAttr)))
+                                    sourceShapeAttr)))
       return failure();
   }
   return verifyResultShape(op, shapeOp.getStaticShapedResultType(),

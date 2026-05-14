@@ -317,43 +317,17 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   ValueRange indices = op.getIndices();
   MLIRContext *ctx = op.getContext();
 
-  // Selector-bind detection. A source whose `#hc.layout` has more
-  // `index_syms` than `shape_syms` is selector-bearing (see the
-  // selectors section of `doc/layouts.md`); the trailing
-  // `selector_arity` entries bind at the access op via the operand
-  // list, while the leading `shape_arity` entries get bound to the
-  // result's per-axis iter syms here. Selector binding is detected
-  // structurally rather than via a flag — same predicate as
-  // `_layout_selector_arity` in `hc/_sim_types.py`, kept name-free so
-  // canonicalisation can drop a layout that lost its selectors without
-  // bumping anything dialect-side.
-  auto sourceShaped =
-      dyn_cast<SymbolicallyShapedTypeInterface>(source.getType());
-  LayoutAttr sourceLayout =
-      sourceShaped ? sourceShaped.getSymbolicLayout() : LayoutAttr{};
-  size_t shapeArity = sourceLayout ? sourceLayout.getShapeSyms().size() : 0;
-  size_t indexArity = sourceLayout ? sourceLayout.getIndexSyms().size() : 0;
-  size_t selectorArity = indexArity > shapeArity ? indexArity - shapeArity : 0;
-  bool selectorBind = selectorArity > 0 && indices.size() == selectorArity &&
-                      tileShape->size() == shapeArity;
-
-  // Non-selector path: empty index list is a legal shape
-  // (`hc.load %t[], shape ...`): it means the access addresses the
-  // operand at the tile origin, which is just the iter syms with no
-  // addressing addend. Non-empty lists must rank-match the tile shape
-  // — anything else is inconsistent IR the access op's own checks
-  // would have caught.
-  if (!selectorBind) {
-    if (!indices.empty() && indices.size() != tileShape->size())
-      return failure();
-  }
-  SmallVector<AxisIndex> axes;
-  if (!selectorBind) {
-    auto axesOr = collectAxisIndices(ctx, store, indices);
-    if (failed(axesOr))
-      return failure();
-    axes = std::move(*axesOr);
-  }
+  // Empty index list is a legal shape (`hc.load %t[], shape ...`): the
+  // access addresses the operand at the tile origin, which is just the
+  // iter syms with no addressing addend. Non-empty lists must rank-
+  // match the tile shape — anything else is inconsistent IR the access
+  // op's own checks would have caught.
+  if (!indices.empty() && indices.size() != tileShape->size())
+    return failure();
+  auto axesOr = collectAxisIndices(ctx, store, indices);
+  if (failed(axesOr))
+    return failure();
+  SmallVector<AxisIndex> axes = std::move(*axesOr);
 
   Type srcElem = bodyArgElementType(source.getType());
   Type resElem = bodyArgElementType(resultTy);
@@ -366,63 +340,26 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   Value shapeTuple = buildShapeTuple(builder, loc, common.iterBounds);
   Value initOut = emitValueInit(builder, loc, resultTy, shapeTuple);
 
-  // Per-axis source offset array. The verifier on `hc.generic` pins
-  // `ins_offsets[k]` to operand rank (one expr per axis), so for
-  // selector binds we emit identity over the iter syms (length
-  // `shapeArity` = source rank). The trailing selector slots of the
-  // layout's `index_syms` stay free in the layout's stored offset
-  // expression; `hc-flatten-with-layouts` is responsible for padding
-  // the per-axis exprs with selector-identity entries before calling
-  // `composeAccessOffsetExpr`, then ambient binding resolves the SSA.
-  // For non-selector binds we delegate to the existing
-  // `composeMemoryOffsetArray` which sums `base + step * iter` per
-  // iter axis.
-  ArrayAttr inOff;
-  ArrayAttr ambientSymsAttr = ArrayAttr::get(ctx, {});
-  ValueRange ambientIdxs{};
-  if (selectorBind) {
-    SmallVector<Attribute> perAxis;
-    perAxis.reserve(shapeArity);
-    for (StringAttr iterSym : common.iterSyms) {
-      auto handle = sym::composeExprSym(store, iterSym.getValue());
-      if (failed(handle))
-        return failure();
-      perAxis.push_back(ExprAttr::get(ctx, *handle));
-    }
-    SmallVector<Attribute> selectorSyms;
-    selectorSyms.reserve(selectorArity);
-    for (size_t k = 0; k < selectorArity; ++k) {
-      auto name =
-          llvm::cast<StringAttr>(sourceLayout.getIndexSyms()[shapeArity + k]);
-      selectorSyms.push_back(name);
-    }
-    inOff = ArrayAttr::get(ctx, perAxis);
-    ambientSymsAttr = ArrayAttr::get(ctx, selectorSyms);
-    ambientIdxs = indices;
-  } else {
-    auto inOffOr = composeMemoryOffsetArray(ctx, store, axes, common.iterSyms);
-    if (failed(inOffOr))
-      return failure();
-    inOff = *inOffOr;
-  }
+  // Per-axis source offset = `base_k + step_k * iter_k`. Slice index
+  // operands give `(lower, step)`; scalar index operands give `(expr,
+  // 1)`. Flatten substitutes these per-axis exprs into the layout's
+  // offset formula at `index_syms[k]`, producing the flat storage
+  // offset.
+  auto inOffOr = composeMemoryOffsetArray(ctx, store, axes, common.iterSyms);
+  if (failed(inOffOr))
+    return failure();
+  ArrayAttr inOff = *inOffOr;
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
 
   SmallVector<Value> insArr{source};
   SmallVector<Value> outsArr{initOut};
-  // For non-selector binds no ambient sym SSA is captured at this
-  // surface; the offset attrs carry the free names and ambient-context
-  // resolution handles them. For selector binds we hand flatten the
-  // SSA / name pairs up-front so it doesn't have to re-discover them
-  // from the surrounding scope — the selector operands aren't
-  // necessarily reachable by name walk (e.g. when they come from a
-  // workitem id that's been rewritten away by the time flatten runs).
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{resultTy}, common.iterSymsAttr,
       ValueRange(common.iterBounds), common.iterKindsAttr, ValueRange(insArr),
-      ValueRange(outsArr), /*ambient_idxs=*/ambientIdxs,
-      /*ambient_idx_syms=*/ambientSymsAttr, insOffsets, outsOffsets);
+      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
   Block *body = new Block();
   BlockArgument bv = body->addArgument(srcElem, loc);

@@ -67,19 +67,19 @@ func.func @identity_all_five(
 
 // -----
 
-// Selector-bearing layouts (`index_syms` strictly longer than
-// `shape_syms`) are never the identity — the identity contract is
-// rightmost-fastest over the tile dims alone, and the selector tail
-// has no analogue. Preserve them through the pass without trying to
-// build a canonical identity that wouldn't cover the selectors.
-// CHECK-LABEL: @selector_layout_preserved
-// CHECK-SAME: %arg0: !hc.tensor<f16, ["M", "K"], <
+// Non-injective layouts (offset doesn't reference every index_sym,
+// or storage smaller than the logical-shape product) are never the
+// identity — the identity contract is `rightmost-fastest * dims`,
+// which is injective by construction. Preserve them through the pass
+// without trying to canonicalize.
+// CHECK-LABEL: @noninjective_layout_preserved
+// CHECK-SAME: %arg0: !hc.tensor<f16, ["M", "K", "LANE"], <
 // CHECK-SAME: index_syms = ["i", "j", "lane"]
 // CHECK-SAME: storage_size = #hc.expr<"K">
 // CHECK-SAME: offset = #hc.expr<"j">
-func.func @selector_layout_preserved(
-    %a: !hc.tensor<f16, ["M", "K"],
-                   #hc.layout<shape_syms = ["M", "K"],
+func.func @noninjective_layout_preserved(
+    %a: !hc.tensor<f16, ["M", "K", "LANE"],
+                   #hc.layout<shape_syms = ["M", "K", "LANE"],
                               index_syms = ["i", "j", "lane"],
                               params = {},
                               storage_size = #hc.expr<"K">,

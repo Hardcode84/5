@@ -151,12 +151,9 @@ static bool isIdentityLayout(LayoutAttr layout, ShapeAttr shape) {
   ArrayRef<Attribute> indexSyms = layout.getIndexSyms();
   if (shape.getDims().size() != shapeSyms.size())
     return false;
-  // Selector-bearing layouts (index_syms strictly longer than shape_syms,
-  // see HC_LayoutAttr description) are never the identity — their offset
-  // expression references the trailing selector symbols by construction,
-  // and the identity contract is "rightmost-fastest over the tile dims
-  // alone." Bail without trying to build the canonical identity, which
-  // wouldn't include the selectors anyway.
+  // `LayoutAttr` enforces `shape_syms.size() == index_syms.size()`; the
+  // identity contract is "rightmost-fastest over the dims" with one
+  // index per axis.
   if (shapeSyms.size() != indexSyms.size())
     return false;
   if (!layout.getParams().empty())

@@ -377,40 +377,12 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
   ArrayRef<Attribute> indexSyms = layout.getIndexSyms();
   if (shapeSyms.size() != dims.size())
     return failure();
-  // Two binding modes against the layout's `index_syms`:
-  //
-  // * Full bind: the caller hands us `indexSyms.size()` exprs — the
-  //   classic `hc.vload` / `hc.store` shape with one operand per
-  //   index_sym (including selectors as trailing operands). Substitute
-  //   each `index_syms[k]` with `indexExprs[k]` positionally.
-  //
-  // * Per-axis bind (`hc.generic` operands under a selector-bearing
-  //   layout): the caller has `shapeSyms.size()` per-axis offset exprs,
-  //   one per operand rank. Pad with selector-identity exprs for the
-  //   trailing `indexSyms.size() - shapeSyms.size()` slots so the
-  //   substitution loop still sees `index_syms.size()` exprs; selector
-  //   syms then stay free in the composed offset and the surrounding
-  //   `hc.generic`'s ambient binding resolves them downstream.
-  //
-  // Reject anything else — partial bindings on a non-selector layout
-  // or unexpected arities are inconsistent IR.
-  SmallVector<ExprAttr> effectiveIndexExprs;
-  if (indexExprs.size() == indexSyms.size()) {
-    effectiveIndexExprs.assign(indexExprs.begin(), indexExprs.end());
-  } else if (indexExprs.size() == shapeSyms.size() &&
-             indexSyms.size() > shapeSyms.size()) {
-    effectiveIndexExprs.reserve(indexSyms.size());
-    effectiveIndexExprs.append(indexExprs.begin(), indexExprs.end());
-    for (size_t k = shapeSyms.size(); k < indexSyms.size(); ++k) {
-      auto name = llvm::cast<StringAttr>(indexSyms[k]).getValue();
-      auto handle = sym::composeExprSym(store, name);
-      if (failed(handle))
-        return failure();
-      effectiveIndexExprs.push_back(ExprAttr::get(ctx, *handle));
-    }
-  } else {
+  // Full-bind contract: one expr per `index_syms` slot. `LayoutAttr`'s
+  // verifier already enforces `shape_syms.size() == index_syms.size()`,
+  // so callers (access op pre-rewrite, hc.generic per-axis offset)
+  // both hand us `rank` exprs. Reject anything else as inconsistent IR.
+  if (indexExprs.size() != indexSyms.size())
     return failure();
-  }
 
   // Single substitution pass over `shape_syms ++ index_syms`. Params
   // intentionally don't expand here — they survive as free symbols in
@@ -440,7 +412,7 @@ composeAccessOffsetExpr(MLIRContext *ctx, LayoutAttr layout,
                         dimExpr.getValue())))
       return failure();
   }
-  for (auto [sym, idx] : llvm::zip_equal(indexSyms, effectiveIndexExprs)) {
+  for (auto [sym, idx] : llvm::zip_equal(indexSyms, indexExprs)) {
     if (failed(
             pushPair(llvm::cast<StringAttr>(sym).getValue(), idx.getValue())))
       return failure();

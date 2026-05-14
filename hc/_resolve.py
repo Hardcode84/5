@@ -651,7 +651,7 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     index_syms = tuple(syms[n] for n in index_param_names)
     free_syms = {name: syms[name] for name in free_sym_names}
 
-    params_exprs, params_named = _layout_eval_params(layout, syms, shape_syms)
+    params_exprs, params_named = _layout_eval_params(layout, ctx, syms, shape_syms)
 
     storage_args = (
         (*shape_syms, params_named) if layout.params is not None else shape_syms
@@ -659,6 +659,7 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     storage_call = _layout_invoke(
         layout.storage_size, storage_args, role="storage_size", kwargs=free_syms
     )
+    storage_call = _coerce_layout_expr(storage_call, ctx)
 
     offset_args = (
         (*index_syms, *shape_syms, params_named)
@@ -668,6 +669,7 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     offset_call = _layout_invoke(
         layout.offset, offset_args, role="offset", kwargs=free_syms
     )
+    offset_call = _coerce_layout_expr(offset_call, ctx)
 
     # The ref payload carries raw ``Expr`` carriers (and a name->Expr table
     # for params); the encoder (``_OpClassifier._to_attr``) builds typed
@@ -718,6 +720,7 @@ def _validate_free_syms(
 
 def _layout_eval_params(
     layout: IndexMap,
+    ctx: Any,
     syms: Any,
     shape_syms: tuple[Any, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -742,9 +745,28 @@ def _layout_eval_params(
     for key, expr in raw.items():
         if not isinstance(key, str):
             raise FrontendError(f"params(...) key {key!r} is not a string")
-        params_exprs[key] = expr
+        params_exprs[key] = _coerce_layout_expr(expr, ctx)
         params_named[key] = syms[key]
     return params_exprs, params_named
+
+
+def _coerce_layout_expr(value: Any, ctx: Any) -> Any:
+    """Wrap a bare ``int`` in ``ctx.const(...)`` so encoders see an ``Expr``.
+
+    Layout ``storage_size`` / ``offset`` / params values that never touch
+    a shape / index / params sym (e.g. ``lambda lc, fc: WMMA_M*WMMA_N``)
+    evaluate to a plain ``int``. The ref payload encoder routes bare
+    ``int`` to ``i64Attr``, but ``LayoutAttr`` requires ``ExprAttr`` for
+    those slots — coercing at the classifier boundary keeps the type
+    contract uniform without forcing every layout author to spell
+    ``ctx.const(...)`` or attach a no-op shape-sym factor like
+    ``lc*0 + 256``.
+    """
+    if isinstance(value, bool):
+        raise FrontendError("layout expression cannot be a boolean")
+    if isinstance(value, int):
+        return ctx.const(int(value))
+    return value
 
 
 def _layout_invoke(

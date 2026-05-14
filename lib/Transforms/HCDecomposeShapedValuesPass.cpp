@@ -273,6 +273,58 @@ static SmallVector<Value> materializeTargetCast(OpBuilder &builder,
       .getResults();
 }
 
+// Append the per-component split names for a parameter whose converted
+// type list has size N>1. Slot 0/1 use the canonical "data"/"mask"
+// suffixes; higher slots fall back to numeric ".2", ".3", ... .
+static void appendSplitParameterNames(MLIRContext *ctx, StringRef name,
+                                      size_t typeCount,
+                                      SmallVectorImpl<Attribute> &out) {
+  StringRef suffixes[] = {"data", "mask"};
+  for (auto [index, suffix] : llvm::enumerate(suffixes)) {
+    if (index >= typeCount)
+      break;
+    SmallString<32> splitName(name);
+    splitName += ".";
+    splitName += suffix;
+    out.push_back(StringAttr::get(ctx, splitName));
+  }
+  for (size_t index = 2; index < typeCount; ++index) {
+    SmallString<32> splitName(name);
+    splitName += ".";
+    splitName += Twine(index).str();
+    out.push_back(StringAttr::get(ctx, splitName));
+  }
+}
+
+// Resolve one parameter slot. `inputIndex` is bumped iff the parameter
+// isn't a const kwarg. Returns failure if the converter fails or the
+// input index runs past the function type — both surface as a `{}`
+// ArrayAttr from the caller, which the rewrite reads as "give up".
+static LogicalResult
+convertOneParameter(MLIRContext *ctx, StringAttr parameter,
+                    const llvm::SmallDenseSet<StringRef> &constKwargs,
+                    FunctionType originalFnType, const TypeConverter &converter,
+                    unsigned &inputIndex,
+                    SmallVectorImpl<Attribute> &converted) {
+  StringRef name = parameter.getValue();
+  if (constKwargs.contains(name)) {
+    converted.push_back(parameter);
+    return success();
+  }
+  if (inputIndex >= originalFnType.getNumInputs())
+    return failure();
+  SmallVector<Type> convertedTypes;
+  if (failed(converter.convertType(originalFnType.getInput(inputIndex++),
+                                   convertedTypes)))
+    return failure();
+  if (convertedTypes.size() == 1) {
+    converted.push_back(parameter);
+    return success();
+  }
+  appendSplitParameterNames(ctx, name, convertedTypes.size(), converted);
+  return success();
+}
+
 static ArrayAttr convertIntrinsicParameters(HCIntrinsicOp op,
                                             FunctionType originalFnType,
                                             const TypeConverter &converter) {
@@ -288,39 +340,11 @@ static ArrayAttr convertIntrinsicParameters(HCIntrinsicOp op,
   MLIRContext *ctx = op.getContext();
   SmallVector<Attribute> converted;
   unsigned inputIndex = 0;
-  for (StringAttr parameter : parameters.getAsRange<StringAttr>()) {
-    StringRef name = parameter.getValue();
-    if (constKwargs.contains(name)) {
-      converted.push_back(parameter);
-      continue;
-    }
-    if (inputIndex >= originalFnType.getNumInputs())
+  for (StringAttr parameter : parameters.getAsRange<StringAttr>())
+    if (failed(convertOneParameter(ctx, parameter, constKwargs, originalFnType,
+                                   converter, inputIndex, converted)))
       return {};
 
-    SmallVector<Type> convertedTypes;
-    if (failed(converter.convertType(originalFnType.getInput(inputIndex++),
-                                     convertedTypes)))
-      return {};
-    if (convertedTypes.size() == 1) {
-      converted.push_back(parameter);
-      continue;
-    }
-    StringRef suffixes[] = {"data", "mask"};
-    for (auto [index, suffix] : llvm::enumerate(suffixes)) {
-      if (index >= convertedTypes.size())
-        break;
-      SmallString<32> splitName(name);
-      splitName += ".";
-      splitName += suffix;
-      converted.push_back(StringAttr::get(ctx, splitName));
-    }
-    for (unsigned index = 2; index < convertedTypes.size(); ++index) {
-      SmallString<32> splitName(name);
-      splitName += ".";
-      splitName += Twine(index).str();
-      converted.push_back(StringAttr::get(ctx, splitName));
-    }
-  }
   if (inputIndex != originalFnType.getNumInputs())
     return {};
   return ArrayAttr::get(ctx, converted);

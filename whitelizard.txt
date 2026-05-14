@@ -77,7 +77,6 @@ lib/IR/HCTypes.cpp:SliceType::parse
 lib/IR/HCTypes.cpp:staticShapeFromTupleType
 lib/TransformOps/HCTransformOps.cpp:HCTransformCreateOp::apply
 lib/Transforms/HCCanonicalizeLayoutsPass.cpp:buildCanonicalIdentity
-lib/Transforms/HCDecomposeShapedValuesPass.cpp:convertIntrinsicParameters
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteBufferView
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteGenericOp
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:shapeFromAllocOperand

@@ -789,82 +789,78 @@ take over their indexing/memory work.
 | layout slot | semantic and bare types | semantic types need it for `layout=` capture; bare types need it for the post-decompose passes; both is consistent |
 | buffer layout default | fully strided (np/torch) | every np/torch input already produces one; non-contiguous slices work without a host-side copy; user-supplied buffer layouts extend the same machinery later |
 
-## Selectors in `#hc.layout`
+## Non-injective layouts
 
-A layout whose `index_syms` is strictly longer than its `shape_syms` is
-**selector-bearing**: the trailing `index_syms` entries are *selectors*,
-extra symbols the access op also binds at its call site rather than the
-producer materialising in the type's shape. Example for a per-lane row
-fragment of a WMMA tile:
+`LayoutAttr` enforces `index_syms.size() == shape_syms.size()`: every
+logical axis has both an extent (`shape_syms[k]`) and a coordinate
+(`index_syms[k]`), and access ops bind one operand per axis. Per-lane
+fragments, broadcast layouts, and similar "many logical indices share
+one storage slot" patterns express that **through the offset formula**,
+not by adding extra index_syms.
+
+Concretely: a layout is *non-injective* when distinct logical-index
+tuples map to the same storage offset (so `storage_size` can be — and
+usually is — strictly smaller than the logical-shape product). The
+verifier doesn't try to prove injectivity in either direction; it's
+the layout author's contract. Example for a per-lane row fragment of
+a WMMA tile expressed as a 3-D logical shape `(M, K, LANE)` collapsed
+to a 1-D `K`-sized storage:
 
 ```mlir
-#hc.layout<["N"], ["i", "lane"],
-           [],
-           "N", "lane * N + i">
+#hc.layout<shape_syms = ["M", "K", "LANE"],
+           index_syms = ["i", "j", "lane"],
+           params = {},
+           storage_size = #hc.expr<"K">,
+           offset = #hc.expr<"j">>
 ```
 
-`shape_syms = ["N"]` names the single carrier dim of a rank-1 vector
-fragment. `index_syms = ["i", "lane"]` adds `lane` past the rank.
-`storage_size = N` is **per-selector-tuple** — one lane's slice of
-physical storage, not the whole tile — and `offset` is free to
-reference `lane`. The selectors are plain `#hc.expr` symbols; there's
-no enum, no separate field, no ambient binding. The same mechanism
-that resolves `i` resolves `lane`: through an additional operand on the
-access op.
+`shape_syms` names the three logical extents. `index_syms` names the
+three access coordinates (one per axis, same rank as `shape_syms`).
+`storage_size = K` says the physical storage is a single K-column;
+`offset = j` says element `(i, j, lane)` lives at flat slot `j`, so
+every `(i, *, lane)` slice reads the *same* K row. That's a deliberate
+broadcast — multiple lanes seeing the same row data.
 
 Consumer rules:
 
-* `hc.load`, `hc.vload`, `hc.store`, `hc.load_mask` accept `indices`
-  whose count is anywhere in `[0, len(index_syms)]`. Up to `rank`
-  indices bind tile coords; anything past `rank` binds selectors in
-  declared order. `hc-verify-static-shapes` enforces the upper bound and
-  prints a note when the source carries selectors so the diagnostic
-  names them.
-* `hc-canonicalize-layouts` never folds a selector-bearing layout to
-  identity. The identity contract is "rightmost-fastest over tile dims
-  alone" and a selector-bearing offset references symbols outside that
-  set by construction.
-* `hc-flatten-with-layouts` composes the variadic operands through the
-  layout's `offset` expression: zip `index_syms` against the access op's
-  operand list (tile coords + selectors), substitute, and the result is
-  the single 1D offset the post-flatten access op carries.
-* The frontend's `index_map(..., offset=lambda i, j, lane, M, K: ...)`
-  serialises selectors from the offset lambda's positional args. The
-  same `Buffer[..., layout]` slot accepts selector-bearing layouts; the
-  per-call binding goes through `group.vload(buf, i, j, lane,
-  shape=...)`.
+* `hc.load`, `hc.vload`, `hc.store`, `hc.load_mask` bind one operand
+  per `index_syms` entry; `hc-verify-static-shapes` enforces
+  `indices.size() <= rank` (fewer is legal — trailing axes pick up
+  iter syms from the result tile). Each operand can be a scalar
+  (pinned coord) or `!hc.slice` (iter sweep).
+* `hc-canonicalize-layouts` only folds layouts where the offset
+  formula matches the canonical "rightmost-fastest * dims" identity.
+  Non-injective offsets and offsets referencing fewer than `rank`
+  index_syms aren't the identity, so the pass leaves them alone.
+* `hc-flatten-with-layouts` composes the indices against the layout's
+  `offset` expression by zip-substituting `index_syms[k] -> indices[k]`
+  and `shape_syms[k] -> source_dims[k]`, then handing the resulting
+  single-element offset to the post-flatten access op.
+* The frontend's `index_map(..., offset=lambda i, j, lane, M, K, L: ...)`
+  serialises both `index_syms` and `shape_syms` from the lambda's
+  positional parameter names. `Buffer[..., layout]` accepts any uniform
+  layout; per-call access goes through standard subscripting:
+  `group.vload(buf[i, j, lane], shape=...)`.
 
-What does **not** yet do anything with selectors:
+What does **not** yet do anything special with non-injective layouts:
 
-* Simulator. `resolve_layout` is built for logical→storage maps and
-  rejects selector-bearing layouts (its injectivity check sees
-  `storage_size < logical_size` and bails). Selector binding needs a
-  different validation model — "selector externally supplied, evaluate
-  offset per access" — that the simulator doesn't carry today.
 * Access op lowering. `hc.vload` reads contiguously from the composed
-  base offset. The flatten pass collapses the extra operands into that
-  base, but no consumer evaluates `offset(i, lane, ...)` per logical
-  element and gathers; "layout-driven per-thread gather" is a separate
-  primitive (see *Out of scope* below).
-
-So selectors are wireable end-to-end through the parser, type system,
-canonicalize, flatten, verifier, and frontend — but the *behaviour*
-(gather semantics under a selector layout) is still on the deferred
-list. The gfx11 WMMA example continues to express fragment access via
-Python slicing for now; the helpers stay as in
-`examples/amdgpu_gfx11_wmma_matmul.py`.
+  base offset post-flatten. If the offset doesn't reference every
+  iter axis, the corresponding axes broadcast — but that broadcast
+  is a side-effect of the per-lane vector.insert pattern in
+  `hc-launch-body`, not an explicit gather primitive. "Layout-driven
+  per-thread gather" with an explicit gather op stays on the deferred
+  list.
 
 ## Out of scope (deferred)
 
-* **Layout-driven per-thread gather.** An access op whose attached
-  `#hc.layout` is evaluated per logical element with selectors bound at
-  the call site, gathering from the source at each computed offset. The
-  WMMA example's B-fragment column reads and accumulator strided-row
-  reads are the motivating shape. Needs op-level semantic (extend
-  `hc.vload` or new `hc.gather`), simulator path that honours
-  selector-bearing layouts, and at least one backend lowering. Tracked
-  in the bead tracker; the rewrite of the gfx11 WMMA example is a
-  follow-up to that.
+* **Layout-driven per-thread gather op.** A standalone `hc.gather`
+  whose semantics evaluate `offset` per logical element and pull
+  scalars from the source. The WMMA example's B-fragment column
+  reads and accumulator strided-row reads are the motivating shape,
+  but they're expressible today through the standard subscript +
+  vload pattern plus the implicit broadcast described above. A
+  dedicated op would give backend lowerings a cleaner contract.
 * **Dynamic LDS allocation.** A launch-time-sized `hc.alloc` needs a
   runtime hook the host wrapper doesn't have today.
 * **User-supplied buffer layouts.** The IR slot is there from day one;

@@ -298,6 +298,41 @@ static Type bodyArgElementType(Type t) {
 
 // ----- hc.load / hc.vload -----------------------------------------------
 
+// Compose ins_offsets[0] for a load whose source rank differs from the
+// result tile rank. The result type's layout maps `index_syms` → a
+// single flat offset into source storage. Substituting iter syms
+// (i_0, i_1, ...) for `index_syms` and the tile's per-axis bound
+// expressions for `shape_syms` produces an expression in iter syms
+// that is exactly the source's 0-axis index per iter point. Returns a
+// single-element `ArrayAttr` wrapping that expression; bails when the
+// source isn't rank-1 (no general decomposition of a scalar layout
+// offset onto multi-dim source axes) or the layout / shape parities
+// don't line up. Caller has already confirmed the result type carries
+// the layout.
+static FailureOr<ArrayAttr> composeBroadcastSourceOffset(
+    MLIRContext *ctx, LayoutAttr layout, ArrayRef<ExprAttr> tileShape,
+    ArrayRef<StringAttr> iterSyms, ArrayRef<ExprAttr> srcShape) {
+  if (srcShape.size() != 1)
+    return failure();
+  if (!layout)
+    return failure();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  SmallVector<ExprAttr> iterExprs;
+  iterExprs.reserve(iterSyms.size());
+  for (StringAttr name : iterSyms) {
+    auto handle = sym::composeExprSym(store, name.getValue());
+    if (failed(handle))
+      return failure();
+    iterExprs.push_back(ExprAttr::get(ctx, *handle));
+  }
+  SmallVector<Attribute> dims(tileShape.begin(), tileShape.end());
+  auto shape = ShapeAttr::get(ctx, dims);
+  auto offset = composeAccessOffsetExpr(ctx, layout, shape, iterExprs);
+  if (failed(offset))
+    return failure();
+  return ArrayAttr::get(ctx, {Attribute(*offset)});
+}
+
 // Common load rewriter for both `hc.load` and `hc.vload`. The two ops
 // have identical operand layouts (source, indices, shape) and the
 // only difference is which value-init op the result type wants.
@@ -336,6 +371,26 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   if (!srcElem || !resElem || srcElem != resElem)
     return failure();
 
+  auto srcShape = getOperandShape(source.getType());
+  if (failed(srcShape))
+    return failure();
+  // Non-injective broadcast path: source rank < tile rank means the
+  // user-supplied layout encodes how iter axes collapse onto source
+  // storage (e.g. `offset = j` for `vload(src=rank1, shape=(M,K,L))`
+  // emits each row K times). The verifier on `hc.generic` requires
+  // `ins_offsets[k]` arity to match operand `k` rank, so the
+  // per-axis-per-iter form the same-rank case uses would over-count.
+  // The layout's offset substituted with iter syms is the right
+  // per-source-axis offset; only rank-1 source has a well-defined
+  // decomposition (a scalar offset doesn't split across N>1 axes).
+  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultTy);
+  LayoutAttr resultLayout =
+      resultShaped ? resultShaped.getSymbolicLayout() : LayoutAttr{};
+  bool broadcastFromRank1 =
+      indices.empty() && srcShape->size() != tileShape->size();
+  if (broadcastFromRank1 && (srcShape->size() != 1 || !resultLayout))
+    return failure();
+
   Location loc = op.getLoc();
   OpBuilder builder(op);
   CommonRewriteData common = buildCommon(builder, loc, *tileShape);
@@ -347,10 +402,19 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   // 1)`. Flatten substitutes these per-axis exprs into the layout's
   // offset formula at `index_syms[k]`, producing the flat storage
   // offset.
-  auto inOffOr = composeMemoryOffsetArray(ctx, store, axes, common.iterSyms);
-  if (failed(inOffOr))
-    return failure();
-  ArrayAttr inOff = *inOffOr;
+  ArrayAttr inOff;
+  if (broadcastFromRank1) {
+    auto inOffOr = composeBroadcastSourceOffset(ctx, resultLayout, *tileShape,
+                                                common.iterSyms, *srcShape);
+    if (failed(inOffOr))
+      return failure();
+    inOff = *inOffOr;
+  } else {
+    auto inOffOr = composeMemoryOffsetArray(ctx, store, axes, common.iterSyms);
+    if (failed(inOffOr))
+      return failure();
+    inOff = *inOffOr;
+  }
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});

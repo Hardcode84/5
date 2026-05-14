@@ -41,14 +41,6 @@ lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::materializeParameters
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:Lowerer::tryEmitLaunchGeo
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:parameterTypeFromDict
 lib/Conversion/HCFrontToHC/HCFrontToHCPass.cpp:typeFromContractDict
-lib/IR/HCInferTypeOpInterface.cpp:composeBufferViewLayout
-lib/IR/HCInferTypeOpInterface.cpp:HCStripLayoutOp::inferHCTypes
-lib/IR/HCInferTypeOpInterface.cpp:inferBufferViewResult
-lib/IR/HCInferTypeOpInterface.cpp:inferGetItemResult
-lib/IR/HCInferTypeOpInterface.cpp:inferIndexBinary
-lib/IR/HCInferTypeOpInterface.cpp:inferIndexCmp
-lib/IR/HCInferTypeOpInterface.cpp:inferLaunchGeometryTypes
-lib/IR/HCInferTypeOpInterface.cpp:inferSliceViewDim
 lib/IR/HCOps.cpp:HCAsLayoutOp::verify
 lib/IR/HCOps.cpp:HCForRangeOp::verify
 lib/IR/HCOps.cpp:HCGenericOp::parse

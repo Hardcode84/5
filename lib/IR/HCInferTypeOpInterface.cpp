@@ -153,6 +153,31 @@ static LogicalResult requireOperandCount(Operation *op, ArrayRef<Type> operands,
          << expected << " operand type fact(s), got " << operands.size();
 }
 
+// Idx-vs-idx arm of `inferIndexBinary`. Caller has already checked
+// that at least one operand is an `IdxType`; this resolves the
+// expression-composition and pinning cases and appends a single
+// result.
+static LogicalResult
+inferIndexBinaryIdxArm(Type lhs, Type rhs, bool lhsIdx, bool rhsIdx,
+                       sym::ExprBinaryOp opKind, Operation *op,
+                       SmallVectorImpl<Type> &resultTypes) {
+  if (lhsIdx != rhsIdx) {
+    resultTypes.push_back({});
+    return success();
+  }
+  std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
+  std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
+  if (!lhsExpr || !rhsExpr) {
+    resultTypes.push_back(getUnpinnedIdxType(op->getContext()));
+    return success();
+  }
+  FailureOr<ExprAttr> expr = composeExprAttr(*lhsExpr, opKind, *rhsExpr, op);
+  if (failed(expr))
+    return failure();
+  resultTypes.push_back(IdxType::get(op->getContext(), *expr));
+  return success();
+}
+
 static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
                                       sym::ExprBinaryOp opKind, Operation *op,
                                       SmallVectorImpl<Type> &resultTypes) {
@@ -167,23 +192,9 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
 
   bool lhsIdx = isa<IdxType>(lhs);
   bool rhsIdx = isa<IdxType>(rhs);
-  if (lhsIdx || rhsIdx) {
-    if (lhsIdx != rhsIdx) {
-      resultTypes.push_back({});
-      return success();
-    }
-    std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
-    std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
-    if (!lhsExpr || !rhsExpr) {
-      resultTypes.push_back(getUnpinnedIdxType(op->getContext()));
-      return success();
-    }
-    FailureOr<ExprAttr> expr = composeExprAttr(*lhsExpr, opKind, *rhsExpr, op);
-    if (failed(expr))
-      return failure();
-    resultTypes.push_back(IdxType::get(op->getContext(), *expr));
-    return success();
-  }
+  if (lhsIdx || rhsIdx)
+    return inferIndexBinaryIdxArm(lhs, rhs, lhsIdx, rhsIdx, opKind, op,
+                                  resultTypes);
 
   if (lhs == rhs && (lhs.isIntOrIndexOrFloat() ||
                      isa<mlir::hc::TensorType, mlir::hc::VectorType>(lhs))) {
@@ -191,6 +202,29 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
     return success();
   }
   resultTypes.push_back({});
+  return success();
+}
+
+// Idx-vs-idx arm of `inferIndexCmp`. Mirror of
+// `inferIndexBinaryIdxArm` but yields a `PredType` result.
+static LogicalResult inferIndexCmpIdxArm(Type lhs, Type rhs, bool lhsIdx,
+                                         bool rhsIdx, sym::PredCmpOp predKind,
+                                         Operation *op,
+                                         SmallVectorImpl<Type> &resultTypes) {
+  if (lhsIdx != rhsIdx) {
+    resultTypes.push_back({});
+    return success();
+  }
+  std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
+  std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
+  if (!lhsExpr || !rhsExpr) {
+    resultTypes.push_back(getUnpinnedPredType(op->getContext()));
+    return success();
+  }
+  FailureOr<PredAttr> pred = composePredAttr(*lhsExpr, predKind, *rhsExpr, op);
+  if (failed(pred))
+    return failure();
+  resultTypes.push_back(PredType::get(op->getContext(), *pred));
   return success();
 }
 
@@ -208,24 +242,9 @@ static LogicalResult inferIndexCmp(ArrayRef<Type> operands,
 
   bool lhsIdx = isa<IdxType>(lhs);
   bool rhsIdx = isa<IdxType>(rhs);
-  if (lhsIdx || rhsIdx) {
-    if (lhsIdx != rhsIdx) {
-      resultTypes.push_back({});
-      return success();
-    }
-    std::optional<ExprAttr> lhsExpr = idxExprAttr(lhs);
-    std::optional<ExprAttr> rhsExpr = idxExprAttr(rhs);
-    if (!lhsExpr || !rhsExpr) {
-      resultTypes.push_back(getUnpinnedPredType(op->getContext()));
-      return success();
-    }
-    FailureOr<PredAttr> pred =
-        composePredAttr(*lhsExpr, predKind, *rhsExpr, op);
-    if (failed(pred))
-      return failure();
-    resultTypes.push_back(PredType::get(op->getContext(), *pred));
-    return success();
-  }
+  if (lhsIdx || rhsIdx)
+    return inferIndexCmpIdxArm(lhs, rhs, lhsIdx, rhsIdx, predKind, op,
+                               resultTypes);
 
   if (lhs == rhs && lhs.isIntOrIndexOrFloat()) {
     resultTypes.push_back(IntegerType::get(op->getContext(), 1));
@@ -283,46 +302,252 @@ static FailureOr<ExprAttr> composeDivExprAttr(ExprAttr lhs, ExprAttr rhs,
   return composeExprAttr(lhs, sym::ExprBinaryOp::Div, rhs, op);
 }
 
-static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
-                                             Operation *op) {
-  Type lowerType = slice.getLowerType();
-  Type upperType = slice.getUpperType();
-  Type stepType = slice.getStepType();
-
-  if (!lowerType && !upperType && !stepType)
-    return baseDim;
-
-  std::optional<ExprAttr> lower =
-      lowerType ? idxExprAttr(lowerType) : std::optional<ExprAttr>();
-  std::optional<ExprAttr> upper =
-      upperType ? idxExprAttr(upperType) : std::optional<ExprAttr>();
-  std::optional<ExprAttr> step =
-      stepType ? idxExprAttr(stepType) : std::optional<ExprAttr>();
-  if ((lowerType && !lower) || (upperType && !upper) || (stepType && !step))
+// Bound-type → optional pinned `ExprAttr`. A null type means the bound
+// was elided (`std::nullopt`); a non-null type must carry a pinned
+// `IdxType` expression or we fail outright.
+static FailureOr<std::optional<ExprAttr>> optionalIdxExprAttr(Type t) {
+  if (!t)
+    return std::optional<ExprAttr>();
+  std::optional<ExprAttr> expr = idxExprAttr(t);
+  if (!expr)
     return failure();
+  return expr;
+}
 
+// `stop - start`, with `start` defaulting to 0 and `stop` defaulting
+// to the operand's base dim when the slice elides the bound.
+static FailureOr<ExprAttr> composeSliceViewExtent(ExprAttr baseDim,
+                                                  std::optional<ExprAttr> lower,
+                                                  std::optional<ExprAttr> upper,
+                                                  Operation *op) {
   FailureOr<ExprAttr> zero = defaultZeroExpr(op);
   if (failed(zero))
     return failure();
   ExprAttr start = lower.value_or(*zero);
   ExprAttr stop = upper.value_or(baseDim);
-  FailureOr<ExprAttr> extent = composeSubExprAttr(stop, start, op);
-  if (failed(extent))
-    return failure();
+  return composeSubExprAttr(stop, start, op);
+}
 
-  if (!stepType)
-    return *extent;
-
+// `ceil(extent / step)`, with a fast path when `step == 1`. Caller
+// has already verified that a step was supplied.
+static FailureOr<ExprAttr> scaleSliceViewExtent(ExprAttr extent, ExprAttr step,
+                                                Operation *op) {
   FailureOr<ExprAttr> one = defaultOneExpr(op);
   if (failed(one))
     return failure();
-  if (*step == *one)
-    return *extent;
-
-  FailureOr<ExprAttr> scaled = composeDivExprAttr(*extent, *step, op);
+  if (step == *one)
+    return extent;
+  FailureOr<ExprAttr> scaled = composeDivExprAttr(extent, step, op);
   if (failed(scaled))
     return failure();
   return composeCeilExprAttr(*scaled, op);
+}
+
+static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
+                                             Operation *op) {
+  Type lowerType = slice.getLowerType();
+  Type upperType = slice.getUpperType();
+  Type stepType = slice.getStepType();
+  if (!lowerType && !upperType && !stepType)
+    return baseDim;
+
+  FailureOr<std::optional<ExprAttr>> lower = optionalIdxExprAttr(lowerType);
+  FailureOr<std::optional<ExprAttr>> upper = optionalIdxExprAttr(upperType);
+  FailureOr<std::optional<ExprAttr>> step = optionalIdxExprAttr(stepType);
+  if (failed(lower) || failed(upper) || failed(step))
+    return failure();
+
+  FailureOr<ExprAttr> extent =
+      composeSliceViewExtent(baseDim, *lower, *upper, op);
+  if (failed(extent))
+    return failure();
+  if (!stepType)
+    return *extent;
+  return scaleSliceViewExtent(*extent, **step, op);
+}
+
+namespace {
+// Accumulator for symbolic-leaf substitutions inside a
+// `hc.buffer_view` layout rewrite. Holds the parallel
+// `targets[i] -> replacements[i]` arrays in the raw form
+// `ixs_subs_multi` expects, plus helpers to (a) extend the lists
+// from named-symbol replacements and (b) apply them to an
+// `ExprAttr`.
+struct LayoutSubBuilder {
+  MLIRContext *ctx;
+  sym::Store &store;
+  SmallVector<ixs_node *> targets;
+  SmallVector<ixs_node *> replacements;
+
+  LayoutSubBuilder(MLIRContext *c, sym::Store &s) : ctx(c), store(s) {}
+
+  LogicalResult pushSymPair(StringRef name, sym::ExprHandle replacement) {
+    FailureOr<sym::ExprHandle> symHandle = sym::composeExprSym(store, name);
+    if (failed(symHandle))
+      return failure();
+    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
+    replacements.push_back(const_cast<ixs_node *>(replacement.raw()));
+    return success();
+  }
+
+  FailureOr<ExprAttr> apply(ExprAttr in) const {
+    if (!in)
+      return ExprAttr{};
+    if (targets.empty())
+      return in;
+    sym::Session session(store);
+    ixs_node *out =
+        ixs_subs_multi(session.raw(), const_cast<ixs_node *>(in.getNode()),
+                       static_cast<uint32_t>(targets.size()),
+                       const_cast<ixs_node **>(targets.data()),
+                       const_cast<ixs_node **>(replacements.data()));
+    if (!out)
+      return failure();
+    return ExprAttr::get(ctx, sym::ExprHandle(out));
+  }
+};
+} // namespace
+
+// Cross-check that every per-axis input array is rank-aligned with
+// `baseDims` so we don't accidentally substitute against a
+// partially-typed source (rank-0 placeholder + layout, retype
+// intermediate, ...).
+static LogicalResult verifyBufferViewLayoutRanks(
+    ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> indexSyms,
+    ArrayRef<Attribute> baseDims, ArrayRef<bool> keepAxis,
+    ArrayRef<ExprAttr> sliceLowerExpr, ArrayRef<ExprAttr> sliceStepExpr,
+    ArrayRef<bool> sliceShapeChanged) {
+  size_t rank = baseDims.size();
+  if (shapeSyms.size() != rank || indexSyms.size() != rank ||
+      keepAxis.size() != rank || sliceLowerExpr.size() != rank ||
+      sliceStepExpr.size() != rank || sliceShapeChanged.size() != rank)
+    return failure();
+  return success();
+}
+
+// Non-trivial slice axes substitute the index sym with
+// `lower + step * index_sym`. Caller has already established that at
+// least one of (lower, step) departs from (0, 1).
+static LogicalResult appendSliceIndexRebind(LayoutSubBuilder &builder,
+                                            StringRef indexName,
+                                            ExprAttr lowerExpr,
+                                            ExprAttr stepExpr) {
+  FailureOr<sym::ExprHandle> indexSymHandle =
+      sym::composeExprSym(builder.store, indexName);
+  if (failed(indexSymHandle))
+    return failure();
+  FailureOr<sym::ExprHandle> stepMul =
+      sym::composeExprBinary(builder.store, stepExpr.getValue(),
+                             sym::ExprBinaryOp::Mul, *indexSymHandle);
+  if (failed(stepMul))
+    return failure();
+  FailureOr<sym::ExprHandle> rebound = sym::composeExprBinary(
+      builder.store, lowerExpr.getValue(), sym::ExprBinaryOp::Add, *stepMul);
+  if (failed(rebound))
+    return failure();
+  builder.targets.push_back(const_cast<ixs_node *>(indexSymHandle->raw()));
+  builder.replacements.push_back(const_cast<ixs_node *>(rebound->raw()));
+  return success();
+}
+
+// Kept (sliced) axis: drive the shape-sym / index-sym rebinds dictated
+// by the slice's per-axis policy. Caller has already pushed the
+// shape/index slot into the residual layout's lists.
+static LogicalResult composeKeptAxisSubstitutions(
+    LayoutSubBuilder &builder, Attribute baseDim, Attribute shapeSymAttr,
+    Attribute indexSymAttr, ExprAttr lowerExpr, ExprAttr stepExpr,
+    bool sliceShapeChanged, ExprAttr zeroAttr, ExprAttr oneAttr) {
+  // Pass-through axes (more axes than subscripts) have empty slice
+  // exprs and structurally cannot have a shape change; they shortcut
+  // to the trivial-slice "no substitution" branch.
+  if (!lowerExpr || !stepExpr)
+    return success();
+  auto dimExpr = dyn_cast<ExprAttr>(baseDim);
+  if (!dimExpr)
+    return failure();
+  if (sliceShapeChanged) {
+    StringRef shapeName = cast<StringAttr>(shapeSymAttr).getValue();
+    if (failed(builder.pushSymPair(shapeName, dimExpr.getValue())))
+      return failure();
+  }
+  if (lowerExpr == zeroAttr && stepExpr == oneAttr)
+    return success();
+  StringRef indexName = cast<StringAttr>(indexSymAttr).getValue();
+  return appendSliceIndexRebind(builder, indexName, lowerExpr, stepExpr);
+}
+
+// Scalar-indexed axis: substitute both the shape sym (operand dim)
+// and the index sym (scalar value). The slot is dropped from the
+// residual's lists.
+static LogicalResult composeScalarAxisSubstitutions(LayoutSubBuilder &builder,
+                                                    Attribute baseDim,
+                                                    Attribute shapeSymAttr,
+                                                    Attribute indexSymAttr,
+                                                    ExprAttr scalarExpr) {
+  auto dimExpr = dyn_cast<ExprAttr>(baseDim);
+  if (!dimExpr || !scalarExpr)
+    return failure();
+  StringRef shapeName = cast<StringAttr>(shapeSymAttr).getValue();
+  StringRef indexName = cast<StringAttr>(indexSymAttr).getValue();
+  if (failed(builder.pushSymPair(shapeName, dimExpr.getValue())))
+    return failure();
+  return builder.pushSymPair(indexName, scalarExpr.getValue());
+}
+
+// Rewrite every `ExprAttr` value inside `params` through `builder`;
+// non-expr entries pass through untouched. Returns the rebuilt
+// dictionary (empty when `params` was null) so the layout's params
+// continue to refer to canonical handles after the rebind.
+static FailureOr<DictionaryAttr>
+rewriteLayoutParams(DictionaryAttr params, const LayoutSubBuilder &builder,
+                    MLIRContext *ctx) {
+  if (!params)
+    return DictionaryAttr::get(ctx, {});
+  SmallVector<NamedAttribute> newParams;
+  newParams.reserve(params.size());
+  for (NamedAttribute kv : params) {
+    auto exprAttr = dyn_cast<ExprAttr>(kv.getValue());
+    if (!exprAttr) {
+      newParams.push_back(kv);
+      continue;
+    }
+    FailureOr<ExprAttr> subsed = builder.apply(exprAttr);
+    if (failed(subsed))
+      return failure();
+    newParams.emplace_back(kv.getName(), *subsed);
+  }
+  return DictionaryAttr::get(ctx, newParams);
+}
+
+// Walk each axis, push the appropriate substitution into `builder`
+// and (for kept axes) record the residual layout's slot in
+// `remainShapeSyms`/`remainIndexSyms`. Caller has already verified
+// rank alignment across all per-axis arrays.
+static LogicalResult composeBufferViewAxes(
+    LayoutSubBuilder &builder, ArrayRef<Attribute> baseDims,
+    ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> indexSyms,
+    ArrayRef<bool> keepAxis, ArrayRef<ExprAttr> scalarValueExpr,
+    ArrayRef<ExprAttr> sliceLowerExpr, ArrayRef<ExprAttr> sliceStepExpr,
+    ArrayRef<bool> sliceShapeChanged, ExprAttr zeroAttr, ExprAttr oneAttr,
+    SmallVectorImpl<Attribute> &remainShapeSyms,
+    SmallVectorImpl<Attribute> &remainIndexSyms) {
+  for (unsigned k = 0; k < baseDims.size(); ++k) {
+    if (keepAxis[k]) {
+      remainShapeSyms.push_back(shapeSyms[k]);
+      remainIndexSyms.push_back(indexSyms[k]);
+      if (failed(composeKeptAxisSubstitutions(
+              builder, baseDims[k], shapeSyms[k], indexSyms[k],
+              sliceLowerExpr[k], sliceStepExpr[k], sliceShapeChanged[k],
+              zeroAttr, oneAttr)))
+        return failure();
+      continue;
+    }
+    if (failed(composeScalarAxisSubstitutions(builder, baseDims[k],
+                                              shapeSyms[k], indexSyms[k],
+                                              scalarValueExpr[k])))
+      return failure();
+  }
+  return success();
 }
 
 // Compose `sourceLayout` against a `hc.buffer_view`'s per-axis
@@ -361,148 +586,256 @@ static FailureOr<LayoutAttr> composeBufferViewLayout(
   MLIRContext *ctx = op->getContext();
   ArrayRef<Attribute> shapeSyms = sourceLayout.getShapeSyms();
   ArrayRef<Attribute> indexSyms = sourceLayout.getIndexSyms();
-  // `LayoutAttr::verify` already pins
-  // `shape_syms.size() == index_syms.size()`; cross-check against
-  // the operand's rank so we don't accidentally substitute against
-  // a partially-typed source (rank-0 placeholder + layout, retype
-  // intermediate, ...).
-  if (shapeSyms.size() != baseDims.size())
-    return failure();
-  if (indexSyms.size() != baseDims.size())
-    return failure();
-  if (keepAxis.size() != baseDims.size())
-    return failure();
-  if (sliceLowerExpr.size() != baseDims.size() ||
-      sliceStepExpr.size() != baseDims.size() ||
-      sliceShapeChanged.size() != baseDims.size())
+  if (failed(verifyBufferViewLayoutRanks(shapeSyms, indexSyms, baseDims,
+                                         keepAxis, sliceLowerExpr,
+                                         sliceStepExpr, sliceShapeChanged)))
     return failure();
 
   sym::Store &store = symbolStore(ctx);
-  SmallVector<ixs_node *> targets;
-  SmallVector<ixs_node *> replacements;
-  SmallVector<Attribute> remainShapeSyms;
-  SmallVector<Attribute> remainIndexSyms;
-  remainShapeSyms.reserve(baseDims.size());
-  remainIndexSyms.reserve(baseDims.size());
-
-  auto pushPair = [&](StringRef name,
-                      sym::ExprHandle replacement) -> LogicalResult {
-    auto symHandle = sym::composeExprSym(store, name);
-    if (failed(symHandle))
-      return failure();
-    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
-    replacements.push_back(const_cast<ixs_node *>(replacement.raw()));
-    return success();
-  };
-
+  LayoutSubBuilder builder(ctx, store);
   // ixsimpl canonicalises `0` / `1` to a single hash-consed handle,
   // so structural-equality checks against these leaves let us skip
   // the `m -> 0 + 1 * m` self-substitution that would otherwise
   // bloat trivial-slice offsets.
-  auto zeroLeaf = sym::composeExprInt(store, 0);
-  auto oneLeaf = sym::composeExprInt(store, 1);
+  FailureOr<sym::ExprHandle> zeroLeaf = sym::composeExprInt(store, 0);
+  FailureOr<sym::ExprHandle> oneLeaf = sym::composeExprInt(store, 1);
   if (failed(zeroLeaf) || failed(oneLeaf))
     return failure();
   ExprAttr zeroAttr = ExprAttr::get(ctx, *zeroLeaf);
   ExprAttr oneAttr = ExprAttr::get(ctx, *oneLeaf);
 
-  for (unsigned k = 0; k < baseDims.size(); ++k) {
-    if (keepAxis[k]) {
-      remainShapeSyms.push_back(shapeSyms[k]);
-      remainIndexSyms.push_back(indexSyms[k]);
-      ExprAttr lowerExpr = sliceLowerExpr[k];
-      ExprAttr stepExpr = sliceStepExpr[k];
-      // Pass-through axes (more axes than subscripts) have empty
-      // slice exprs and structurally cannot have a shape change;
-      // they shortcut to the trivial-slice "no substitution" branch.
-      if (!lowerExpr || !stepExpr)
-        continue;
-      // The sliced-extent-changed flag drives shape_syms[k]
-      // substitution independently of the index rebind: a slice
-      // like `[0:hi]` over a dim-M axis (with hi != M) keeps the
-      // trivial index relation (lower 0, step 1) but the residual's
-      // shape_sym would otherwise bind to `hi` instead of the
-      // operand's M.
-      auto dimExpr = dyn_cast<ExprAttr>(baseDims[k]);
-      if (!dimExpr)
-        return failure();
-      if (sliceShapeChanged[k]) {
-        StringRef shapeName = cast<StringAttr>(shapeSyms[k]).getValue();
-        if (failed(pushPair(shapeName, dimExpr.getValue())))
-          return failure();
-      }
-      bool indexRebind = lowerExpr != zeroAttr || stepExpr != oneAttr;
-      if (indexRebind) {
-        StringRef indexName = cast<StringAttr>(indexSyms[k]).getValue();
-        auto indexSymHandle = sym::composeExprSym(store, indexName);
-        if (failed(indexSymHandle))
-          return failure();
-        auto stepMul =
-            sym::composeExprBinary(store, stepExpr.getValue(),
-                                   sym::ExprBinaryOp::Mul, *indexSymHandle);
-        if (failed(stepMul))
-          return failure();
-        auto rebound = sym::composeExprBinary(store, lowerExpr.getValue(),
-                                              sym::ExprBinaryOp::Add, *stepMul);
-        if (failed(rebound))
-          return failure();
-        targets.push_back(const_cast<ixs_node *>(indexSymHandle->raw()));
-        replacements.push_back(const_cast<ixs_node *>(rebound->raw()));
-      }
-      continue;
-    }
-    auto dimExpr = dyn_cast<ExprAttr>(baseDims[k]);
-    ExprAttr scalarExpr = scalarValueExpr[k];
-    if (!dimExpr || !scalarExpr)
-      return failure();
-    StringRef shapeName = cast<StringAttr>(shapeSyms[k]).getValue();
-    StringRef indexName = cast<StringAttr>(indexSyms[k]).getValue();
-    if (failed(pushPair(shapeName, dimExpr.getValue())) ||
-        failed(pushPair(indexName, scalarExpr.getValue())))
-      return failure();
-  }
+  SmallVector<Attribute> remainShapeSyms;
+  SmallVector<Attribute> remainIndexSyms;
+  remainShapeSyms.reserve(baseDims.size());
+  remainIndexSyms.reserve(baseDims.size());
+  if (failed(composeBufferViewAxes(builder, baseDims, shapeSyms, indexSyms,
+                                   keepAxis, scalarValueExpr, sliceLowerExpr,
+                                   sliceStepExpr, sliceShapeChanged, zeroAttr,
+                                   oneAttr, remainShapeSyms, remainIndexSyms)))
+    return failure();
 
-  auto applySubs = [&](ExprAttr in) -> FailureOr<ExprAttr> {
-    if (!in)
-      return ExprAttr{};
-    if (targets.empty())
-      return in;
-    sym::Session session(store);
-    ixs_node *out =
-        ixs_subs_multi(session.raw(), const_cast<ixs_node *>(in.getNode()),
-                       static_cast<uint32_t>(targets.size()), targets.data(),
-                       replacements.data());
-    if (!out)
-      return failure();
-    return ExprAttr::get(ctx, sym::ExprHandle(out));
-  };
-
-  FailureOr<ExprAttr> newStorage = applySubs(sourceLayout.getStorageSize());
+  FailureOr<ExprAttr> newStorage = builder.apply(sourceLayout.getStorageSize());
   if (failed(newStorage))
     return failure();
-  FailureOr<ExprAttr> newOffset = applySubs(sourceLayout.getOffset());
+  FailureOr<ExprAttr> newOffset = builder.apply(sourceLayout.getOffset());
   if (failed(newOffset))
     return failure();
+  FailureOr<DictionaryAttr> newParams =
+      rewriteLayoutParams(sourceLayout.getParams(), builder, ctx);
+  if (failed(newParams))
+    return failure();
 
-  DictionaryAttr params = sourceLayout.getParams();
-  SmallVector<NamedAttribute> newParams;
-  if (params) {
-    for (NamedAttribute kv : params) {
-      auto exprAttr = dyn_cast<ExprAttr>(kv.getValue());
-      if (!exprAttr) {
-        newParams.push_back(kv);
-        continue;
-      }
-      FailureOr<ExprAttr> subsed = applySubs(exprAttr);
-      if (failed(subsed))
-        return failure();
-      newParams.emplace_back(kv.getName(), *subsed);
-    }
-  }
-  DictionaryAttr newParamsAttr = DictionaryAttr::get(ctx, newParams);
-
-  return LayoutAttr::get(ctx, remainShapeSyms, remainIndexSyms, newParamsAttr,
+  return LayoutAttr::get(ctx, remainShapeSyms, remainIndexSyms, *newParams,
                          *newStorage, *newOffset);
+}
+
+// Per-axis classification result for `inferBufferViewResult`. The
+// layout composer consumes these as parallel arrays; here they're
+// bundled so the per-axis classifiers can return one struct.
+//
+//   * `keep` is true for slice-subscripted axes (and pass-throughs)
+//     that survive in the residual rank, false for scalar-consumed
+//     axes whose slot drops out.
+//   * `resultDim` is populated only for kept axes.
+//   * `scalarValueExpr` carries the scalar index's `IdxType`
+//     expression for the layout-offset substitution; empty for kept
+//     axes.
+//   * `sliceLowerExpr` / `sliceStepExpr` capture the slice's lower /
+//     step (defaulting to 0 / 1); empty for non-slice cases.
+//   * `sliceShapeChanged` records whether the sliced extent departs
+//     from the operand's dim.
+struct BufferViewAxisEntry {
+  Attribute resultDim;
+  bool keep = false;
+  ExprAttr scalarValueExpr;
+  ExprAttr sliceLowerExpr;
+  ExprAttr sliceStepExpr;
+  bool sliceShapeChanged = false;
+};
+
+// Per-source-axis arrays consumed by `composeBufferViewLayout`. All
+// vectors stay rank-aligned with the source's logical shape; the
+// vector-root "collective suffix" branch never appends to any of
+// them.
+struct BufferViewAxisArrays {
+  SmallVector<Attribute> resultDims;
+  SmallVector<bool> keepAxis;
+  SmallVector<ExprAttr> scalarValueExpr;
+  SmallVector<ExprAttr> sliceLowerExpr;
+  SmallVector<ExprAttr> sliceStepExpr;
+  SmallVector<bool> sliceShapeChanged;
+
+  void reserve(size_t n) {
+    resultDims.reserve(n);
+    keepAxis.reserve(n);
+    scalarValueExpr.reserve(n);
+    sliceLowerExpr.reserve(n);
+    sliceStepExpr.reserve(n);
+    sliceShapeChanged.reserve(n);
+  }
+
+  void append(const BufferViewAxisEntry &e) {
+    if (e.keep)
+      resultDims.push_back(e.resultDim);
+    keepAxis.push_back(e.keep);
+    scalarValueExpr.push_back(e.scalarValueExpr);
+    sliceLowerExpr.push_back(e.sliceLowerExpr);
+    sliceStepExpr.push_back(e.sliceStepExpr);
+    sliceShapeChanged.push_back(e.sliceShapeChanged);
+  }
+};
+
+// Slice subscript handler. Defaults missing slice parts to 0 / 1
+// per Python semantics and computes the residual extent through
+// `inferSliceViewDim`. Returns `nullopt` to mean "bail to
+// currentResultType" (malformed slice bound) and `failure()` only
+// for hard sym-store errors.
+static FailureOr<std::optional<BufferViewAxisEntry>>
+classifyBufferViewSliceAxis(ExprAttr baseDim, SliceType slice, Operation *op) {
+  FailureOr<ExprAttr> dim = inferSliceViewDim(baseDim, slice, op);
+  if (failed(dim))
+    return std::optional<BufferViewAxisEntry>();
+  FailureOr<std::optional<ExprAttr>> lower =
+      optionalIdxExprAttr(slice.getLowerType());
+  FailureOr<std::optional<ExprAttr>> step =
+      optionalIdxExprAttr(slice.getStepType());
+  if (failed(lower) || failed(step))
+    return std::optional<BufferViewAxisEntry>();
+  FailureOr<ExprAttr> zero = defaultZeroExpr(op);
+  FailureOr<ExprAttr> one = defaultOneExpr(op);
+  if (failed(zero) || failed(one))
+    return failure();
+
+  BufferViewAxisEntry entry;
+  entry.resultDim = *dim;
+  entry.keep = true;
+  entry.sliceLowerExpr = lower->value_or(*zero);
+  entry.sliceStepExpr = step->value_or(*one);
+  entry.sliceShapeChanged = *dim != baseDim;
+  return std::optional<BufferViewAxisEntry>(entry);
+}
+
+// Scalar subscript handler. Only `IdxType` carries a symbolic
+// expression; a plain `index` / `i64` indexed against a layout-bearing
+// source means we can't substitute a name into the layout offset, so
+// we bail.
+static std::optional<BufferViewAxisEntry>
+classifyBufferViewScalarAxis(Type indexType, LayoutAttr sourceLayout) {
+  ExprAttr scalarExpr;
+  if (auto idxExpr = idxExprAttr(indexType))
+    scalarExpr = *idxExpr;
+  if (sourceLayout && !scalarExpr)
+    return std::nullopt;
+  BufferViewAxisEntry entry;
+  entry.scalarValueExpr = scalarExpr;
+  return entry;
+}
+
+// Implicit pass-through axis (more source axes than subscripts):
+// keep the slot and inherit the operand's dim.
+static BufferViewAxisEntry buildPassThroughAxisEntry(Attribute baseDim) {
+  BufferViewAxisEntry entry;
+  entry.resultDim = baseDim;
+  entry.keep = true;
+  return entry;
+}
+
+// Subscripts past the source's logical rank are only legal on a
+// vector root (workitem/subgroup-lifted collective suffix). Once the
+// local axes are consumed, the typed suffix indices refine no local
+// result dimensions and must just type-check.
+static bool acceptsExtraSubscript(bool vectorRoot, Type indexType) {
+  if (!vectorRoot || !indexType || isHCUndefType(indexType))
+    return false;
+  return isa<SliceType, IdxType>(indexType) || indexType.isIntOrIndex();
+}
+
+// Dispatcher: pick the slice / scalar arm based on `indexType`'s
+// type and append the resulting entry to `arrays`. Returns `false`
+// to mean "bail to currentResultType".
+static FailureOr<bool> classifyOneBufferViewAxis(BufferViewAxisArrays &arrays,
+                                                 ExprAttr baseDim,
+                                                 Type indexType,
+                                                 LayoutAttr sourceLayout,
+                                                 Operation *op) {
+  if (auto slice = dyn_cast<SliceType>(indexType)) {
+    FailureOr<std::optional<BufferViewAxisEntry>> entry =
+        classifyBufferViewSliceAxis(baseDim, slice, op);
+    if (failed(entry))
+      return failure();
+    if (!*entry)
+      return false;
+    arrays.append(**entry);
+    return true;
+  }
+  if (isa<IdxType>(indexType) || indexType.isIntOrIndex()) {
+    std::optional<BufferViewAxisEntry> entry =
+        classifyBufferViewScalarAxis(indexType, sourceLayout);
+    if (!entry)
+      return false;
+    arrays.append(*entry);
+    return true;
+  }
+  return false;
+}
+
+// Walk every subscript against the source's logical rank, building
+// the per-axis arrays consumed by the layout composer. Returns
+// `nullopt` to mean "bail to currentResultType"; `failure()` for
+// hard errors only.
+static FailureOr<std::optional<BufferViewAxisArrays>>
+classifyBufferViewIndices(ArrayRef<Type> indexTypes,
+                          ArrayRef<Attribute> baseDims, bool vectorRoot,
+                          LayoutAttr sourceLayout, Operation *op) {
+  BufferViewAxisArrays arrays;
+  arrays.reserve(baseDims.size());
+  unsigned axis = 0;
+  for (Type indexType : indexTypes) {
+    if (axis >= baseDims.size()) {
+      if (!acceptsExtraSubscript(vectorRoot, indexType))
+        return std::optional<BufferViewAxisArrays>();
+      continue;
+    }
+    auto baseDim = dyn_cast<ExprAttr>(baseDims[axis]);
+    if (!baseDim || !indexType || isHCUndefType(indexType))
+      return std::optional<BufferViewAxisArrays>();
+    FailureOr<bool> ok =
+        classifyOneBufferViewAxis(arrays, baseDim, indexType, sourceLayout, op);
+    if (failed(ok))
+      return failure();
+    if (!*ok)
+      return std::optional<BufferViewAxisArrays>();
+    ++axis;
+  }
+  for (; axis < baseDims.size(); ++axis)
+    arrays.append(buildPassThroughAxisEntry(baseDims[axis]));
+  return std::optional<BufferViewAxisArrays>(std::move(arrays));
+}
+
+// Result type selector. The shape comes from `arrays.resultDims`;
+// the rank-0 vector-root case collapses to the element type.
+static Type buildBufferViewResultType(Type sourceType, bool vectorRoot,
+                                      Type elementType,
+                                      ArrayRef<Attribute> resultDims,
+                                      LayoutAttr resultLayout,
+                                      MLIRContext *ctx) {
+  ShapeAttr resultShape = ShapeAttr::get(ctx, resultDims);
+  if (isa<mlir::hc::BufferType>(sourceType))
+    return mlir::hc::BufferType::get(ctx, elementType, resultShape,
+                                     resultLayout);
+  if (vectorRoot) {
+    if (resultDims.empty())
+      return elementType;
+    if (isa<mlir::hc::BareVectorType>(sourceType))
+      return mlir::hc::BareVectorType::get(ctx, elementType, resultShape,
+                                           resultLayout);
+    return mlir::hc::VectorType::get(ctx, elementType, resultShape,
+                                     resultLayout);
+  }
+  if (isa<mlir::hc::BareTensorType>(sourceType))
+    return mlir::hc::BareTensorType::get(ctx, elementType, resultShape,
+                                         resultLayout);
+  return mlir::hc::TensorType::get(ctx, elementType, resultShape, resultLayout);
 }
 
 static FailureOr<Type> inferBufferViewResult(Type sourceType,
@@ -522,152 +855,37 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
     sourceLayout = shaped.getSymbolicLayout();
 
   ArrayRef<Attribute> baseDims = shape.getDims();
-  SmallVector<Attribute> resultDims;
-  // Parallel arrays tracking per-source-axis disposition. `keepAxis[k]`
-  // is true iff axis k survives in the residual rank (slice subscript
-  // or implicit pass-through); for the scalar-consumed axes
-  // `scalarValueExpr[k]` carries the index value's `IdxType` expression
-  // so the layout composer can substitute it into the residual offset.
-  // For slice-subscripted axes `sliceLowerExpr[k]` / `sliceStepExpr[k]`
-  // carry the slice's lower / step (defaulting to 0 / 1 when omitted),
-  // and `sliceShapeChanged[k]` records whether the sliced extent
-  // departs from the operand's dim — both inputs feed the
-  // non-trivial-slice substitutions in `composeBufferViewLayout`.
-  // Implicit pass-through axes (more axes than subscripts) leave the
-  // slice arrays empty / false; the layout composer treats them as
-  // trivial.
-  //
-  // The vector-root "collective suffix" branch indexes beyond
-  // `baseDims.size()` and doesn't populate any of these arrays — layout
-  // composition is only meaningful within the source's logical rank.
-  SmallVector<bool> keepAxis;
-  SmallVector<ExprAttr> scalarValueExpr;
-  SmallVector<ExprAttr> sliceLowerExpr;
-  SmallVector<ExprAttr> sliceStepExpr;
-  SmallVector<bool> sliceShapeChanged;
-  keepAxis.reserve(baseDims.size());
-  scalarValueExpr.reserve(baseDims.size());
-  sliceLowerExpr.reserve(baseDims.size());
-  sliceStepExpr.reserve(baseDims.size());
-  sliceShapeChanged.reserve(baseDims.size());
-  unsigned axis = 0;
   bool vectorRoot =
       isa<mlir::hc::VectorType, mlir::hc::BareVectorType>(sourceType);
-  for (Type indexType : indexTypes) {
-    if (axis >= baseDims.size()) {
-      // Workitem/subgroup-lifted vectors carry collective suffix axes in
-      // syntax even though the vector type stores only the participant-local
-      // shape. Once local axes are consumed, typed suffix indices refine no
-      // local result dimensions.
-      if (!vectorRoot)
-        return currentResultType;
-      if (!indexType || isHCUndefType(indexType))
-        return currentResultType;
-      if (isa<SliceType, IdxType>(indexType) || indexType.isIntOrIndex())
-        continue;
-      return currentResultType;
-    }
-    auto baseDim = dyn_cast<ExprAttr>(baseDims[axis]);
-    if (!baseDim)
-      return currentResultType;
-
-    if (!indexType || isHCUndefType(indexType))
-      return currentResultType;
-    if (auto slice = dyn_cast<SliceType>(indexType)) {
-      FailureOr<ExprAttr> dim = inferSliceViewDim(baseDim, slice, op);
-      if (failed(dim))
-        return currentResultType;
-      // Capture lower / step from the slice type so the layout
-      // composer can rebind `index_syms[k]` to `lower + step *
-      // index_syms[k]`. Missing parts default to Python slice
-      // semantics (lower = 0, step = 1).
-      Type lowerType = slice.getLowerType();
-      Type stepType = slice.getStepType();
-      std::optional<ExprAttr> lower =
-          lowerType ? idxExprAttr(lowerType) : std::optional<ExprAttr>();
-      std::optional<ExprAttr> step =
-          stepType ? idxExprAttr(stepType) : std::optional<ExprAttr>();
-      if ((lowerType && !lower) || (stepType && !step))
-        return currentResultType;
-      FailureOr<ExprAttr> zero = defaultZeroExpr(op);
-      FailureOr<ExprAttr> one = defaultOneExpr(op);
-      if (failed(zero) || failed(one))
-        return failure();
-      ExprAttr lowerExpr = lower.value_or(*zero);
-      ExprAttr stepExpr = step.value_or(*one);
-      resultDims.push_back(*dim);
-      keepAxis.push_back(true);
-      scalarValueExpr.push_back({});
-      sliceLowerExpr.push_back(lowerExpr);
-      sliceStepExpr.push_back(stepExpr);
-      sliceShapeChanged.push_back(*dim != baseDim);
-      ++axis;
-      continue;
-    }
-    if (isa<IdxType>(indexType) || indexType.isIntOrIndex()) {
-      keepAxis.push_back(false);
-      // Only `IdxType` carries a symbolic expression. A plain `index`
-      // or `i64` indexed against a layout-bearing source means we
-      // can't substitute a name into the layout's offset; bail back
-      // to the conservative no-refinement result.
-      ExprAttr scalarExpr;
-      if (auto idxExpr = idxExprAttr(indexType))
-        scalarExpr = *idxExpr;
-      if (sourceLayout && !scalarExpr)
-        return currentResultType;
-      scalarValueExpr.push_back(scalarExpr);
-      sliceLowerExpr.push_back({});
-      sliceStepExpr.push_back({});
-      sliceShapeChanged.push_back(false);
-      ++axis;
-      continue;
-    }
+  FailureOr<std::optional<BufferViewAxisArrays>> classification =
+      classifyBufferViewIndices(indexTypes, baseDims, vectorRoot, sourceLayout,
+                                op);
+  if (failed(classification))
+    return failure();
+  if (!*classification)
     return currentResultType;
-  }
-
-  for (; axis < baseDims.size(); ++axis) {
-    resultDims.push_back(baseDims[axis]);
-    keepAxis.push_back(true);
-    scalarValueExpr.push_back({});
-    sliceLowerExpr.push_back({});
-    sliceStepExpr.push_back({});
-    sliceShapeChanged.push_back(false);
-  }
+  const BufferViewAxisArrays &arrays = **classification;
 
   LayoutAttr resultLayout;
   if (sourceLayout) {
     // Vector-root collective-suffix indices (beyond `baseDims.size()`)
-    // would have already early-returned `continue`, so by the time we
-    // reach the layout compose `keepAxis` covers exactly the source
-    // rank. If composition fails (non-`IdxType` scalar against a
-    // layout, malformed shape entry, ...) leave the result type
-    // un-refined and let a later inference pass try again.
+    // were dropped during classification, so by the time we reach the
+    // layout compose `keepAxis` covers exactly the source rank. If
+    // composition fails (non-`IdxType` scalar against a layout,
+    // malformed shape entry, ...) leave the result type un-refined
+    // and let a later inference pass try again.
     FailureOr<LayoutAttr> composed = composeBufferViewLayout(
-        sourceLayout, baseDims, keepAxis, scalarValueExpr, sliceLowerExpr,
-        sliceStepExpr, sliceShapeChanged, op);
+        sourceLayout, baseDims, arrays.keepAxis, arrays.scalarValueExpr,
+        arrays.sliceLowerExpr, arrays.sliceStepExpr, arrays.sliceShapeChanged,
+        op);
     if (failed(composed))
       return currentResultType;
     resultLayout = *composed;
   }
 
-  ShapeAttr resultShape = ShapeAttr::get(op->getContext(), resultDims);
-  if (isa<mlir::hc::BufferType>(sourceType))
-    return Type(mlir::hc::BufferType::get(op->getContext(), elementType,
-                                          resultShape, resultLayout));
-  if (vectorRoot) {
-    if (resultDims.empty())
-      return elementType;
-    if (isa<mlir::hc::BareVectorType>(sourceType))
-      return Type(mlir::hc::BareVectorType::get(op->getContext(), elementType,
-                                                resultShape, resultLayout));
-    return Type(mlir::hc::VectorType::get(op->getContext(), elementType,
-                                          resultShape, resultLayout));
-  }
-  if (isa<mlir::hc::BareTensorType>(sourceType))
-    return Type(mlir::hc::BareTensorType::get(op->getContext(), elementType,
-                                              resultShape, resultLayout));
-  return Type(mlir::hc::TensorType::get(op->getContext(), elementType,
-                                        resultShape, resultLayout));
+  return buildBufferViewResultType(sourceType, vectorRoot, elementType,
+                                   arrays.resultDims, resultLayout,
+                                   op->getContext());
 }
 
 // Optional `layout` attribute on load/alloc/`hc.vec` producer ops: when
@@ -735,22 +953,13 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
   return sym::getIntegerLiteralValue(sym::ExprHandle(expr->getNode()));
 }
 
-static FailureOr<Type>
-inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
-  if (!sourceType)
-    return Type{};
-  if (isa<mlir::hc::VectorType>(sourceType))
-    return inferBufferViewResult(sourceType, indexTypes, Type{}, op);
-  auto tuple = dyn_cast<TupleType>(sourceType);
-  if (!tuple) {
-    if (isa<UndefType, mlir::hc::BufferType, mlir::hc::TensorType,
-            mlir::hc::VectorType>(sourceType))
-      return Type{};
-    op->emitOpError("getitem base type ")
-        << sourceType
-        << " cannot be refined; expected tuple, buffer, tensor, or vector";
-    return failure();
-  }
+// Resolve a tuple `[idx]` subscript to a non-negative slot index,
+// accounting for Python negative-index semantics. Emits an op error
+// and returns failure when the subscript isn't a static integer or
+// falls outside `[-size, size)`.
+static FailureOr<size_t> resolveTupleGetItemIndex(ArrayRef<Type> indexTypes,
+                                                  TupleType tuple,
+                                                  Operation *op) {
   if (indexTypes.size() != 1) {
     op->emitOpError(
         "tuple getitem expects exactly one index after inference, got ")
@@ -769,17 +978,38 @@ inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
         << indexTypes.front();
     return failure();
   }
-  int64_t originalIndex = *index;
-  int64_t normalizedIndex = originalIndex;
+  int64_t normalized = *index;
   int64_t tupleSize = static_cast<int64_t>(tuple.size());
-  if (normalizedIndex < 0 && normalizedIndex >= -tupleSize)
-    normalizedIndex += tupleSize;
-  if (normalizedIndex < 0 || normalizedIndex >= tupleSize) {
+  if (normalized < 0 && normalized >= -tupleSize)
+    normalized += tupleSize;
+  if (normalized < 0 || normalized >= tupleSize) {
     op->emitOpError("tuple index ")
-        << originalIndex << " out of bounds for tuple of size " << tupleSize;
+        << *index << " out of bounds for tuple of size " << tupleSize;
     return failure();
   }
-  return tuple.getType(static_cast<size_t>(normalizedIndex));
+  return static_cast<size_t>(normalized);
+}
+
+static FailureOr<Type>
+inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
+  if (!sourceType)
+    return Type{};
+  if (isa<mlir::hc::VectorType>(sourceType))
+    return inferBufferViewResult(sourceType, indexTypes, Type{}, op);
+  auto tuple = dyn_cast<TupleType>(sourceType);
+  if (!tuple) {
+    if (isa<UndefType, mlir::hc::BufferType, mlir::hc::TensorType,
+            mlir::hc::VectorType>(sourceType))
+      return Type{};
+    op->emitOpError("getitem base type ")
+        << sourceType
+        << " cannot be refined; expected tuple, buffer, tensor, or vector";
+    return failure();
+  }
+  FailureOr<size_t> slot = resolveTupleGetItemIndex(indexTypes, tuple, op);
+  if (failed(slot))
+    return failure();
+  return tuple.getType(*slot);
 }
 
 static bool allResultsAreUndef(Operation *op) {
@@ -856,6 +1086,69 @@ static FailureOr<Type> groupSizeType(ShapeAttr shape, Operation *op) {
   return Type(IdxType::get(ctx, product));
 }
 
+// Launch-axis id family (`group_id`, `local_id`, `subgroup_id`,
+// `work_offset`). Returns `nullopt` when `raw` isn't one of those op
+// kinds.
+static std::optional<LogicalResult>
+tryInferLaunchAxisIdTypes(Operation *raw, unsigned count,
+                          SmallVectorImpl<Type> &types) {
+  if (isa<HCGroupIdOp>(raw))
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::GroupId, count,
+                                    types);
+  if (isa<HCLocalIdOp>(raw))
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::LocalId, count,
+                                    types);
+  if (isa<HCSubgroupIdOp>(raw))
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::SubgroupId, count,
+                                    types);
+  if (isa<HCWorkOffsetOp>(raw))
+    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::WorkOffset, count,
+                                    types);
+  return std::nullopt;
+}
+
+// Launch shape projectors (`group_shape`, `work_shape`). Reads the
+// matching shape attribute off `metadata` and stamps it across all
+// results.
+static std::optional<LogicalResult>
+tryInferLaunchShapeTypes(Operation *raw, MLIRContext *ctx,
+                         const LaunchContextMetadata &metadata, unsigned count,
+                         SmallVectorImpl<Type> &types) {
+  if (isa<HCGroupShapeOp>(raw)) {
+    appendShapeIdxTypes(ctx, metadata.groupShape, count, types);
+    return success();
+  }
+  if (isa<HCWorkShapeOp>(raw)) {
+    appendShapeIdxTypes(ctx, metadata.workShape, count, types);
+    return success();
+  }
+  return std::nullopt;
+}
+
+// Launch scalar accessors (`group_size`, `wave_size`). Produces one
+// `IdxType` from the relevant aggregate (product of `group_shape`,
+// or `subgroup_size` directly).
+static std::optional<LogicalResult>
+tryInferLaunchScalarTypes(Operation *raw, MLIRContext *ctx,
+                          const LaunchContextMetadata &metadata,
+                          SmallVectorImpl<Type> &types) {
+  if (isa<HCGroupSizeOp>(raw)) {
+    FailureOr<Type> type = groupSizeType(metadata.groupShape, raw);
+    if (failed(type))
+      return failure();
+    types.push_back(*type);
+    return success();
+  }
+  if (isa<HCWaveSizeOp>(raw)) {
+    if (ExprAttr size = metadata.subgroupSize)
+      types.push_back(IdxType::get(ctx, size));
+    else
+      types.push_back(getUnpinnedIdxType(ctx));
+    return success();
+  }
+  return std::nullopt;
+}
+
 template <typename OpT>
 static LogicalResult inferLaunchGeometryTypes(OpT op,
                                               ArrayRef<Type> operandTypes,
@@ -870,41 +1163,12 @@ static LogicalResult inferLaunchGeometryTypes(OpT op,
   MLIRContext *ctx = op.getContext();
   Operation *raw = op.getOperation();
   unsigned count = op->getNumResults();
-  if (isa<HCGroupIdOp>(raw))
-    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::GroupId, count,
-                                    types);
-  if (isa<HCLocalIdOp>(raw))
-    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::LocalId, count,
-                                    types);
-  if (isa<HCSubgroupIdOp>(raw))
-    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::SubgroupId, count,
-                                    types);
-  if (isa<HCWorkOffsetOp>(raw))
-    return appendLaunchAxisIdxTypes(raw, LaunchGeoMethod::WorkOffset, count,
-                                    types);
-  if (isa<HCGroupShapeOp>(raw)) {
-    appendShapeIdxTypes(ctx, metadata->groupShape, count, types);
-    return success();
-  }
-  if (isa<HCWorkShapeOp>(raw)) {
-    appendShapeIdxTypes(ctx, metadata->workShape, count, types);
-    return success();
-  }
-  if (isa<HCGroupSizeOp>(raw)) {
-    FailureOr<Type> type = groupSizeType(metadata->groupShape, raw);
-    if (failed(type))
-      return failure();
-    types.push_back(*type);
-    return success();
-  }
-  if (isa<HCWaveSizeOp>(raw)) {
-    if (ExprAttr size = metadata->subgroupSize) {
-      types.push_back(IdxType::get(ctx, size));
-      return success();
-    }
-    types.push_back(getUnpinnedIdxType(ctx));
-    return success();
-  }
+  if (auto r = tryInferLaunchAxisIdTypes(raw, count, types))
+    return *r;
+  if (auto r = tryInferLaunchShapeTypes(raw, ctx, *metadata, count, types))
+    return *r;
+  if (auto r = tryInferLaunchScalarTypes(raw, ctx, *metadata, types))
+    return *r;
 
   types.append(op.getResultTypes().begin(), op.getResultTypes().end());
   return success();
@@ -1203,12 +1467,27 @@ LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+// Strip preserves carrier flavor — drops the layout slot, not the
+// semantic-vs-bare distinction. Returns the rebuilt type for the
+// carrier kinds we know how to strip; returns null for everything
+// else (buffer, unknown), at which point the caller leaves the
+// result un-refined.
+static Type stripLayoutForCarrier(Type valueType, Type elementType,
+                                  ShapeAttr shape, MLIRContext *ctx) {
+  if (isa<mlir::hc::VectorType>(valueType))
+    return mlir::hc::VectorType::get(ctx, elementType, shape, LayoutAttr{});
+  if (isa<mlir::hc::BareVectorType>(valueType))
+    return mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{});
+  if (isa<mlir::hc::TensorType>(valueType))
+    return mlir::hc::TensorType::get(ctx, elementType, shape, LayoutAttr{});
+  if (isa<mlir::hc::BareTensorType>(valueType))
+    return mlir::hc::BareTensorType::get(ctx, elementType, shape, LayoutAttr{});
+  return {};
+}
+
 LogicalResult
 HCStripLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
                               SmallVectorImpl<Type> &resultTypes) {
-  // Strip preserves carrier flavor — it drops the layout slot, not
-  // the semantic-vs-bare distinction. `vector -> vector` (no
-  // layout), `bare_vector -> bare_vector`, similarly for tensors.
   // Mixing the flavor at the strip boundary would clash with
   // downstream inference (e.g. an `hc.call_intrinsic` whose result
   // is `vector<...>` and the loop's iter init type would conflict).
@@ -1233,28 +1512,9 @@ HCStripLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
     resultTypes.push_back(getResult().getType());
     return success();
   }
-  MLIRContext *ctx = getContext();
-  if (isa<mlir::hc::VectorType>(valueType)) {
-    resultTypes.push_back(
-        mlir::hc::VectorType::get(ctx, elementType, shape, LayoutAttr{}));
-    return success();
-  }
-  if (isa<mlir::hc::BareVectorType>(valueType)) {
-    resultTypes.push_back(
-        mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{}));
-    return success();
-  }
-  if (isa<mlir::hc::TensorType>(valueType)) {
-    resultTypes.push_back(
-        mlir::hc::TensorType::get(ctx, elementType, shape, LayoutAttr{}));
-    return success();
-  }
-  if (isa<mlir::hc::BareTensorType>(valueType)) {
-    resultTypes.push_back(
-        mlir::hc::BareTensorType::get(ctx, elementType, shape, LayoutAttr{}));
-    return success();
-  }
-  resultTypes.push_back(getResult().getType());
+  Type stripped =
+      stripLayoutForCarrier(valueType, elementType, shape, getContext());
+  resultTypes.push_back(stripped ? stripped : getResult().getType());
   return success();
 }
 

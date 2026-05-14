@@ -93,10 +93,6 @@ lib/Transforms/HCInferTypesPass.cpp:liftCollectiveReturnType
 lib/Transforms/HCInferTypesPass.cpp:renumberSyntheticJoinSymbols
 lib/Transforms/HCInferTypesPass.cpp:rewriteSyntheticJoinSymbols
 lib/Transforms/HCInferTypesPass.cpp:updateCallableFunctionType
-lib/Transforms/HCLoadStoreToGenericPass.cpp:extractAxisIndex
-lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteLoadLike
-lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteLoadMask
-lib/Transforms/HCLoadStoreToGenericPass.cpp:rewriteStore
 lib/Transforms/HCLowerGenericPass.cpp:bindIterSymsInClone
 lib/Transforms/HCLowerGenericPass.cpp:cloneBody
 lib/Transforms/HCLowerGenericPass.cpp:diagnoseUnsupported

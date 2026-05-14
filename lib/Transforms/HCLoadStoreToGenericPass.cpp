@@ -91,14 +91,49 @@ struct AxisIndex {
   ExprAttr step;
 };
 
+// Extract the bound expression off a pinned `!hc.idx<expr>`. Anything
+// else — raw `index`, untyped `!hc.idx`, non-idx — fails: there's no
+// symbolic name to bind into a `lower + step*iter` offset.
+static FailureOr<ExprAttr> extractPinnedIdxExpr(Type t) {
+  auto idx = llvm::dyn_cast<IdxType>(t);
+  if (!idx || !idx.getExpr())
+    return failure();
+  return idx.getExpr();
+}
+
+// `(base, step)` for a slice index operand. Accepts default-step
+// slices (`step = 1`) and pinned `!hc.idx<expr>` lower / step. Anything
+// else fails the whole rewrite — silently lowering would emit an
+// offset the launch-body would walk without the stride contribution.
+static FailureOr<AxisIndex> extractAxisIndexFromSlice(MLIRContext *ctx,
+                                                      sym::Store &store,
+                                                      SliceType slice,
+                                                      ExprAttr stepOne) {
+  ExprAttr base;
+  if (Type lowerTy = slice.getLowerType()) {
+    auto lowerExpr = extractPinnedIdxExpr(lowerTy);
+    if (failed(lowerExpr))
+      return failure();
+    base = *lowerExpr;
+  } else {
+    auto zero = sym::composeExprInt(store, 0);
+    if (failed(zero))
+      return failure();
+    base = ExprAttr::get(ctx, *zero);
+  }
+  ExprAttr step = stepOne;
+  if (Type stepTy = slice.getStepType()) {
+    auto stepExpr = extractPinnedIdxExpr(stepTy);
+    if (failed(stepExpr))
+      return failure();
+    step = *stepExpr;
+  }
+  return AxisIndex{base, step};
+}
+
 // Extract `(base, step)` for one access op index operand. Mirrors
 // `extractAccessIndexExpr` in `hc-flatten-with-layouts` on the slice
-// branch — accepts default-step slices (`step = 1`) and pinned
-// `!hc.idx<expr>` lower / step. Non-pinned slice parts (`!hc.undef` or
-// other), raw `index`, and untyped `!hc.idx` fail the rewrite: there's
-// no symbolic name to bind into a `lower + step*iter` offset, and
-// silently lowering would emit an offset the launch-body would walk
-// without the stride contribution.
+// branch.
 static FailureOr<AxisIndex>
 extractAxisIndex(MLIRContext *ctx, sym::Store &store, Type indexType) {
   auto litOne = sym::composeExprInt(store, 1);
@@ -106,34 +141,13 @@ extractAxisIndex(MLIRContext *ctx, sym::Store &store, Type indexType) {
     return failure();
   ExprAttr stepOne = ExprAttr::get(ctx, *litOne);
   if (auto idx = llvm::dyn_cast<IdxType>(indexType)) {
-    if (ExprAttr expr = idx.getExpr())
-      return AxisIndex{expr, stepOne};
-    return failure();
+    auto expr = extractPinnedIdxExpr(idx);
+    if (failed(expr))
+      return failure();
+    return AxisIndex{*expr, stepOne};
   }
-  if (auto slice = llvm::dyn_cast<SliceType>(indexType)) {
-    ExprAttr base;
-    if (Type lowerTy = slice.getLowerType()) {
-      auto lowerIdx = llvm::dyn_cast<IdxType>(lowerTy);
-      if (!lowerIdx || !lowerIdx.getExpr())
-        return failure();
-      base = lowerIdx.getExpr();
-    } else {
-      auto zero = sym::composeExprInt(store, 0);
-      if (failed(zero))
-        return failure();
-      base = ExprAttr::get(ctx, *zero);
-    }
-    ExprAttr step;
-    if (Type stepTy = slice.getStepType()) {
-      auto stepIdx = llvm::dyn_cast<IdxType>(stepTy);
-      if (!stepIdx || !stepIdx.getExpr())
-        return failure();
-      step = stepIdx.getExpr();
-    } else {
-      step = stepOne;
-    }
-    return AxisIndex{base, step};
-  }
+  if (auto slice = llvm::dyn_cast<SliceType>(indexType))
+    return extractAxisIndexFromSlice(ctx, store, slice, stepOne);
   return failure();
 }
 
@@ -333,6 +347,114 @@ static FailureOr<ArrayAttr> composeBroadcastSourceOffset(
   return ArrayAttr::get(ctx, {Attribute(*offset)});
 }
 
+// Validated preflight state for the load rewriter: source shape, the
+// per-axis indices, and whether the access is a non-injective rank-1
+// broadcast (source rank < tile rank, with the iter axes collapsing
+// onto storage via the result layout).
+struct LoadPreflight {
+  SmallVector<AxisIndex> axes;
+  SmallVector<ExprAttr> srcShape;
+  LayoutAttr resultLayout;
+  bool broadcastFromRank1;
+};
+
+// Element-type match check between source and result: both must be
+// shaped, with matching element types. Failure means the rewriter
+// can't safely emit a typed body block and the op stays for later
+// inference / diagnostics.
+static LogicalResult checkLoadElementTypesMatch(Type srcTy, Type resultTy) {
+  Type srcElem = bodyArgElementType(srcTy);
+  Type resElem = bodyArgElementType(resultTy);
+  if (!srcElem || !resElem || srcElem != resElem)
+    return failure();
+  return success();
+}
+
+// Classify the access shape: same-rank (offsets per-axis) vs.
+// rank-1 broadcast (layout-driven). Returns the broadcast flag plus
+// the layout attribute (null when the result type isn't a shaped /
+// has no layout).
+//
+// Non-injective broadcast path: source rank < tile rank means the
+// user-supplied layout encodes how iter axes collapse onto source
+// storage (e.g. `offset = j` for `vload(src=rank1, shape=(M,K,L))`
+// emits each row K times). Only rank-1 source has a well-defined
+// decomposition (a scalar offset doesn't split across N>1 axes).
+static LogicalResult classifyLoadAccess(Type resultTy, ValueRange indices,
+                                        ArrayRef<ExprAttr> srcShape,
+                                        ArrayRef<ExprAttr> tileShape,
+                                        bool &broadcastFromRank1,
+                                        LayoutAttr &resultLayout) {
+  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultTy);
+  resultLayout = resultShaped ? resultShaped.getSymbolicLayout() : LayoutAttr{};
+  broadcastFromRank1 = indices.empty() && srcShape.size() != tileShape.size();
+  if (broadcastFromRank1 && (srcShape.size() != 1 || !resultLayout))
+    return failure();
+  return success();
+}
+
+// All the bail-out checks a load rewrite needs before it starts
+// mutating IR. Validates rank parity, harvests the per-axis indices,
+// confirms the element types match, and computes the broadcast
+// classification.
+static FailureOr<LoadPreflight>
+preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
+                  Type resultTy, ValueRange indices,
+                  ArrayRef<ExprAttr> tileShape) {
+  // Empty index list is a legal shape (`hc.load %t[], shape ...`): the
+  // access addresses the operand at the tile origin, which is just the
+  // iter syms with no addressing addend. Non-empty lists must rank-
+  // match the tile shape — anything else is inconsistent IR the access
+  // op's own checks would have caught.
+  if (!indices.empty() && indices.size() != tileShape.size())
+    return failure();
+  auto axesOr = collectAxisIndices(ctx, store, indices);
+  if (failed(axesOr))
+    return failure();
+
+  if (failed(checkLoadElementTypesMatch(source.getType(), resultTy)))
+    return failure();
+
+  auto srcShape = getOperandShape(source.getType());
+  if (failed(srcShape))
+    return failure();
+
+  bool broadcastFromRank1 = false;
+  LayoutAttr resultLayout;
+  if (failed(classifyLoadAccess(resultTy, indices, *srcShape, tileShape,
+                                broadcastFromRank1, resultLayout)))
+    return failure();
+
+  return LoadPreflight{std::move(*axesOr), std::move(*srcShape), resultLayout,
+                       broadcastFromRank1};
+}
+
+// Pick the right ins_offsets[0] for a load: layout-driven on the
+// rank-1 broadcast path; per-axis `base + step*iter` for the
+// same-rank path.
+static FailureOr<ArrayAttr>
+composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
+                      const LoadPreflight &pf, ArrayRef<ExprAttr> tileShape,
+                      ArrayRef<StringAttr> iterSyms) {
+  if (pf.broadcastFromRank1)
+    return composeBroadcastSourceOffset(ctx, pf.resultLayout, tileShape,
+                                        iterSyms, pf.srcShape);
+  return composeMemoryOffsetArray(ctx, store, pf.axes, iterSyms);
+}
+
+// Emit a fresh block carrying one src arg and one dst arg, terminated
+// with `hc.yield %src` — the trivial "copy element through" body the
+// load rewrites all share.
+static void populateLoadBody(HCGenericOp generic, Type srcElem, Type resElem,
+                             Location loc) {
+  Block *body = new Block();
+  BlockArgument bv = body->addArgument(srcElem, loc);
+  body->addArgument(resElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+  HCYieldOp::create(bodyBuilder, loc, ValueRange{bv});
+}
+
 // Common load rewriter for both `hc.load` and `hc.vload`. The two ops
 // have identical operand layouts (source, indices, shape) and the
 // only difference is which value-init op the result type wants.
@@ -351,44 +473,10 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   else
     source = op.getSource();
 
-  ValueRange indices = op.getIndices();
   MLIRContext *ctx = op.getContext();
-
-  // Empty index list is a legal shape (`hc.load %t[], shape ...`): the
-  // access addresses the operand at the tile origin, which is just the
-  // iter syms with no addressing addend. Non-empty lists must rank-
-  // match the tile shape — anything else is inconsistent IR the access
-  // op's own checks would have caught.
-  if (!indices.empty() && indices.size() != tileShape->size())
-    return failure();
-  auto axesOr = collectAxisIndices(ctx, store, indices);
-  if (failed(axesOr))
-    return failure();
-  SmallVector<AxisIndex> axes = std::move(*axesOr);
-
-  Type srcElem = bodyArgElementType(source.getType());
-  Type resElem = bodyArgElementType(resultTy);
-  if (!srcElem || !resElem || srcElem != resElem)
-    return failure();
-
-  auto srcShape = getOperandShape(source.getType());
-  if (failed(srcShape))
-    return failure();
-  // Non-injective broadcast path: source rank < tile rank means the
-  // user-supplied layout encodes how iter axes collapse onto source
-  // storage (e.g. `offset = j` for `vload(src=rank1, shape=(M,K,L))`
-  // emits each row K times). The verifier on `hc.generic` requires
-  // `ins_offsets[k]` arity to match operand `k` rank, so the
-  // per-axis-per-iter form the same-rank case uses would over-count.
-  // The layout's offset substituted with iter syms is the right
-  // per-source-axis offset; only rank-1 source has a well-defined
-  // decomposition (a scalar offset doesn't split across N>1 axes).
-  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultTy);
-  LayoutAttr resultLayout =
-      resultShaped ? resultShaped.getSymbolicLayout() : LayoutAttr{};
-  bool broadcastFromRank1 =
-      indices.empty() && srcShape->size() != tileShape->size();
-  if (broadcastFromRank1 && (srcShape->size() != 1 || !resultLayout))
+  auto pf = preflightLoadLike(ctx, store, source, resultTy, op.getIndices(),
+                              *tileShape);
+  if (failed(pf))
     return failure();
 
   Location loc = op.getLoc();
@@ -397,26 +485,12 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   Value shapeTuple = buildShapeTuple(builder, loc, common.iterBounds);
   Value initOut = emitValueInit(builder, loc, resultTy, shapeTuple);
 
-  // Per-axis source offset = `base_k + step_k * iter_k`. Slice index
-  // operands give `(lower, step)`; scalar index operands give `(expr,
-  // 1)`. Flatten substitutes these per-axis exprs into the layout's
-  // offset formula at `index_syms[k]`, producing the flat storage
-  // offset.
-  ArrayAttr inOff;
-  if (broadcastFromRank1) {
-    auto inOffOr = composeBroadcastSourceOffset(ctx, resultLayout, *tileShape,
-                                                common.iterSyms, *srcShape);
-    if (failed(inOffOr))
-      return failure();
-    inOff = *inOffOr;
-  } else {
-    auto inOffOr = composeMemoryOffsetArray(ctx, store, axes, common.iterSyms);
-    if (failed(inOffOr))
-      return failure();
-    inOff = *inOffOr;
-  }
+  auto inOff =
+      composeLoadInsOffsets(ctx, store, *pf, *tileShape, common.iterSyms);
+  if (failed(inOff))
+    return failure();
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
-  ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
+  ArrayAttr insOffsets = ArrayAttr::get(ctx, {*inOff});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
 
   SmallVector<Value> insArr{source};
@@ -427,12 +501,9 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
       ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  Block *body = new Block();
-  BlockArgument bv = body->addArgument(srcElem, loc);
-  body->addArgument(resElem, loc);
-  generic.getBody().push_back(body);
-  OpBuilder bodyBuilder(body, body->begin());
-  HCYieldOp::create(bodyBuilder, loc, ValueRange{bv});
+  Type srcElem = bodyArgElementType(source.getType());
+  Type resElem = bodyArgElementType(resultTy);
+  populateLoadBody(generic, srcElem, resElem, loc);
 
   op->replaceAllUsesWith(generic.getResults());
   op->erase();
@@ -484,6 +555,115 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 //   * Rank-0 mask (no slice axes) — pathological shape that should
 //     have been folded earlier; if it ever lands, `hc-full-mask` is
 //     the right primitive.
+// Per-axis (lo, step, src-dim) carriers, slice axes only — scalar
+// idx axes drop out of the result rank by construction so they
+// contribute no iter dimension and no bounds term.
+struct SliceAxisInfo {
+  ExprAttr lo;
+  ExprAttr step;
+  ExprAttr srcDim;
+};
+
+// Collect the slice-only axes from `hc.load_mask`'s indices. Returns
+// failure when an index isn't a recognized pinned slice (raw `index`,
+// untyped `!hc.idx`, slice with non-pinned lower/step), or when the
+// resulting slice-axis count doesn't equal the result tile rank, or
+// when there are no slice axes at all (rank-0 mask is a pathological
+// shape — `hc-full-mask` is the right primitive).
+static FailureOr<SmallVector<SliceAxisInfo>>
+collectMaskSliceAxes(MLIRContext *ctx, sym::Store &store, ValueRange indices,
+                     ArrayRef<ExprAttr> srcShape,
+                     ArrayRef<ExprAttr> tileShape) {
+  SmallVector<SliceAxisInfo> sliceAxes;
+  for (auto [idx, srcDim] : llvm::zip_equal(indices, srcShape)) {
+    Type indexTy = idx.getType();
+    if (!isa<SliceType>(indexTy))
+      continue;
+    auto axis = extractAxisIndex(ctx, store, indexTy);
+    if (failed(axis))
+      return failure();
+    sliceAxes.push_back({axis->base, axis->step, srcDim});
+  }
+  if (sliceAxes.size() != tileShape.size() || sliceAxes.empty())
+    return failure();
+  return sliceAxes;
+}
+
+// Compose the structural per-axis comparison `lo + step * i_k < D_k`
+// for one slice axis. Step==1 is folded so the printed cmp matches the
+// scalar-idx caller form.
+static FailureOr<sym::PredHandle>
+composeSliceAxisBound(sym::Store &store, StringAttr iterSym,
+                      const SliceAxisInfo &info) {
+  auto iterHandle = sym::composeExprSym(store, iterSym.getValue());
+  if (failed(iterHandle))
+    return failure();
+  sym::ExprHandle term = *iterHandle;
+  std::optional<int64_t> stepLit =
+      sym::getIntegerLiteralValue(info.step.getValue());
+  if (!stepLit || *stepLit != 1) {
+    auto mul = sym::composeExprBinary(store, info.step.getValue(),
+                                      sym::ExprBinaryOp::Mul, term);
+    if (failed(mul))
+      return failure();
+    term = *mul;
+  }
+  auto sum = sym::composeExprBinary(store, info.lo.getValue(),
+                                    sym::ExprBinaryOp::Add, term);
+  if (failed(sum))
+    return failure();
+  return sym::composePredCmp(store, *sum, sym::PredCmpOp::Lt,
+                             info.srcDim.getValue());
+}
+
+// Build the conjunction of per-axis bounds across every slice axis.
+// Hash-consing shares identical bounds expressions with any other
+// producer, so two load_masks reading the same buffer with the same
+// slice geometry emit one pred_apply each pointing at the same
+// canonical node.
+static FailureOr<sym::PredHandle>
+composeMaskConjunction(sym::Store &store, ArrayRef<SliceAxisInfo> sliceAxes,
+                       ArrayRef<StringAttr> iterSyms) {
+  std::optional<sym::PredHandle> conjunction;
+  for (auto [k, info] : llvm::enumerate(sliceAxes)) {
+    auto cmp = composeSliceAxisBound(store, iterSyms[k], info);
+    if (failed(cmp))
+      return failure();
+    if (!conjunction) {
+      conjunction = *cmp;
+      continue;
+    }
+    auto andP = sym::composePredAnd(store, *conjunction, *cmp);
+    if (failed(andP))
+      return failure();
+    conjunction = *andP;
+  }
+  return *conjunction;
+}
+
+// Emit the predicate body of a `hc.load_mask` rewrite: a `hc.pred_apply`
+// pinned with `conjunction`, bridged through a `unrealized_conversion_cast`
+// to the unpinned `!hc.pred` element type, yielded.
+static void populateMaskBody(HCGenericOp generic, MLIRContext *ctx,
+                             Location loc, Type predElem,
+                             sym::PredHandle conjunction) {
+  Block *body = new Block();
+  body->addArgument(predElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+
+  PredAttr predAttr = PredAttr::get(ctx, conjunction);
+  Type pinnedTy = PredType::get(ctx, predAttr);
+  Value predPinned = HCPredApplyOp::create(bodyBuilder, loc, pinnedTy,
+                                           /*operands=*/ValueRange{},
+                                           bodyBuilder.getStrArrayAttr({}))
+                         .getResult();
+  Value predUnpinned =
+      UnrealizedConversionCastOp::create(bodyBuilder, loc, predElem, predPinned)
+          .getResult(0);
+  HCYieldOp::create(bodyBuilder, loc, ValueRange{predUnpinned});
+}
+
 static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
   Type resultTy = op.getMask().getType();
   auto tileShape = getOperandShape(resultTy);
@@ -500,28 +680,11 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
     return failure();
   MLIRContext *ctx = op.getContext();
 
-  // Per-axis (lo, step, src-dim) carriers, slice axes only — scalar
-  // idx axes drop out of the result rank by construction so they
-  // contribute no iter dimension and no bounds term.
-  struct SliceAxisInfo {
-    ExprAttr lo;
-    ExprAttr step;
-    ExprAttr srcDim;
-  };
-  SmallVector<SliceAxisInfo> sliceAxes;
-  for (auto [idx, srcDim] : llvm::zip_equal(indices, *srcShape)) {
-    Type indexTy = idx.getType();
-    if (!isa<SliceType>(indexTy))
-      continue;
-    auto axis = extractAxisIndex(ctx, store, indexTy);
-    if (failed(axis))
-      return failure();
-    sliceAxes.push_back({axis->base, axis->step, srcDim});
-  }
-  if (sliceAxes.size() != tileShape->size())
+  auto sliceAxesOr =
+      collectMaskSliceAxes(ctx, store, indices, *srcShape, *tileShape);
+  if (failed(sliceAxesOr))
     return failure();
-  if (sliceAxes.empty())
-    return failure();
+  SmallVector<SliceAxisInfo> sliceAxes = std::move(*sliceAxesOr);
 
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -540,61 +703,12 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
       /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
+  auto conjunction = composeMaskConjunction(store, sliceAxes, common.iterSyms);
+  if (failed(conjunction))
+    return failure();
+
   Type predElem = getUnpinnedPredType(ctx);
-  Block *body = new Block();
-  body->addArgument(predElem, loc);
-  generic.getBody().push_back(body);
-  OpBuilder bodyBuilder(body, body->begin());
-
-  // Per-axis predicate `lo + step * i_k < D_k`, conjuncted across all
-  // slice axes via the structural compose API. Hash-consing shares
-  // identical bounds expressions with any other producer, so two
-  // load_masks reading the same buffer with the same slice geometry
-  // emit one pred_apply each pointing at the same canonical node.
-  std::optional<sym::PredHandle> conjunction;
-  for (auto [k, info] : llvm::enumerate(sliceAxes)) {
-    StringAttr iterSym = common.iterSyms[k];
-    auto iterHandle = sym::composeExprSym(store, iterSym.getValue());
-    if (failed(iterHandle))
-      return failure();
-    sym::ExprHandle term = *iterHandle;
-    std::optional<int64_t> stepLit =
-        sym::getIntegerLiteralValue(info.step.getValue());
-    if (!stepLit || *stepLit != 1) {
-      auto mul = sym::composeExprBinary(store, info.step.getValue(),
-                                        sym::ExprBinaryOp::Mul, term);
-      if (failed(mul))
-        return failure();
-      term = *mul;
-    }
-    auto sum = sym::composeExprBinary(store, info.lo.getValue(),
-                                      sym::ExprBinaryOp::Add, term);
-    if (failed(sum))
-      return failure();
-    auto cmp = sym::composePredCmp(store, *sum, sym::PredCmpOp::Lt,
-                                   info.srcDim.getValue());
-    if (failed(cmp))
-      return failure();
-    if (!conjunction) {
-      conjunction = *cmp;
-    } else {
-      auto andP = sym::composePredAnd(store, *conjunction, *cmp);
-      if (failed(andP))
-        return failure();
-      conjunction = *andP;
-    }
-  }
-
-  PredAttr predAttr = PredAttr::get(ctx, *conjunction);
-  Type pinnedTy = PredType::get(ctx, predAttr);
-  Value predPinned = HCPredApplyOp::create(bodyBuilder, loc, pinnedTy,
-                                           /*operands=*/ValueRange{},
-                                           bodyBuilder.getStrArrayAttr({}))
-                         .getResult();
-  Value predUnpinned =
-      UnrealizedConversionCastOp::create(bodyBuilder, loc, predElem, predPinned)
-          .getResult(0);
-  HCYieldOp::create(bodyBuilder, loc, ValueRange{predUnpinned});
+  populateMaskBody(generic, ctx, loc, predElem, *conjunction);
 
   op->replaceAllUsesWith(generic.getResults());
   op->erase();
@@ -603,7 +717,44 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
 
 // ----- hc.store ---------------------------------------------------------
 
-static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
+// Validated preflight state for the store rewriter.
+struct StorePreflight {
+  SmallVector<ExprAttr> tileShape;
+  SmallVector<AxisIndex> axes;
+  Type srcElem;
+  Type dstElem;
+  Type maskElem; // null when there's no mask
+};
+
+// Element-type match between src and dst, plus mask element type
+// extraction. Returns failure on mismatch or on a mask whose tile rank
+// doesn't match `tileShape`.
+static LogicalResult collectStoreElementTypes(HCStoreOp op,
+                                              ArrayRef<ExprAttr> tileShape,
+                                              Type &srcElem, Type &dstElem,
+                                              Type &maskElem) {
+  srcElem = bodyArgElementType(op.getSource().getType());
+  dstElem = bodyArgElementType(op.getDest().getType());
+  if (!srcElem || !dstElem || srcElem != dstElem)
+    return failure();
+  if (Value mask = op.getMask()) {
+    auto maskShape = getOperandShape(mask.getType());
+    if (failed(maskShape) || maskShape->size() != tileShape.size())
+      return failure();
+    maskElem = bodyArgElementType(mask.getType());
+    if (!maskElem)
+      return failure();
+  }
+  return success();
+}
+
+// Validates the store's operand shapes and element types. Tensor-dst
+// is rejected (separate slice); src and dst element types must match;
+// when present, mask must match `src`'s tile shape (the
+// `hc.store` verifier already enforces this, but the body block needs
+// the element type extracted up front).
+static FailureOr<StorePreflight>
+preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
   // Tensor / bare_tensor dst is workgroup-shared LDS storage; the IR
   // models it as a value-typed operand even though the runtime
   // semantic is in-place mutation. A clean rewrite would need to
@@ -611,60 +762,73 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   // subsequent use of `%dst`, which crosses op boundaries we can't
   // resolve in a local rewrite. Buffer dst falls through cleanly
   // because polymorphic outs already model ptr/buffer in-place writes
-  // without an SSA result. Tensor-dst stores are a separate slice.
-  Value dst = op.getDest();
-  if (!isa<BufferType>(dst.getType()))
+  // without an SSA result.
+  if (!isa<BufferType>(op.getDest().getType()))
     return failure();
 
-  Value src = op.getSource();
-  Type srcTy = src.getType();
-  auto tileShape = getOperandShape(srcTy);
+  auto tileShape = getOperandShape(op.getSource().getType());
   if (failed(tileShape))
     return failure();
 
   ValueRange indices = op.getIndices();
   if (!indices.empty() && indices.size() != tileShape->size())
     return failure();
-  MLIRContext *ctx = op.getContext();
   auto axes = collectAxisIndices(ctx, store, indices);
   if (failed(axes))
     return failure();
 
-  Type srcElem = bodyArgElementType(srcTy);
-  Type dstElem = bodyArgElementType(dst.getType());
-  if (!srcElem || !dstElem || srcElem != dstElem)
+  Type srcElem, dstElem, maskElem;
+  if (failed(
+          collectStoreElementTypes(op, *tileShape, srcElem, dstElem, maskElem)))
     return failure();
 
-  // Masked path: the mask operand rides as an extra ins slot with
-  // identity offsets (same shape as `src`, both tile-local). The body
-  // loads the mask element alongside the src element and terminates
-  // with `hc.yield_predicated` instead of `hc.yield`; the lowering
-  // routes that through `hc.ptr_store_pred` at the dst's ins-slot
-  // offset, so masked-out lanes leave the existing dst contents in
-  // place. Mask must be the same shape as src (the `hc.store`
-  // verifier already enforces this); we don't carry separate axes
-  // because the mask's offsets are identity by construction.
+  return StorePreflight{std::move(*tileShape), std::move(*axes), srcElem,
+                        dstElem, maskElem};
+}
+
+// Build the body block of the store generic: src arg, optional mask
+// arg, dst arg, terminated with `hc.yield_predicated` (masked) or
+// plain `hc.yield`. The masked terminator routes through
+// `hc.ptr_store_pred` downstream so masked-out lanes leave the
+// existing dst contents in place.
+static void populateStoreBody(HCGenericOp generic, const StorePreflight &pf,
+                              Location loc, bool hasMask) {
+  Block *body = new Block();
+  BlockArgument sv = body->addArgument(pf.srcElem, loc);
+  BlockArgument mv;
+  if (hasMask)
+    mv = body->addArgument(pf.maskElem, loc);
+  body->addArgument(pf.dstElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+  if (hasMask)
+    HCYieldPredicatedOp::create(bodyBuilder, loc, ValueRange{sv},
+                                ValueRange{mv});
+  else
+    HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
+}
+
+static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
+  MLIRContext *ctx = op.getContext();
+  auto pf = preflightStore(ctx, store, op);
+  if (failed(pf))
+    return failure();
+
+  Value src = op.getSource();
+  Value dst = op.getDest();
   Value mask = op.getMask();
-  Type maskElem;
-  if (mask) {
-    auto maskShape = getOperandShape(mask.getType());
-    if (failed(maskShape))
-      return failure();
-    if (maskShape->size() != tileShape->size())
-      return failure();
-    maskElem = bodyArgElementType(mask.getType());
-    if (!maskElem)
-      return failure();
-  }
 
   Location loc = op.getLoc();
   OpBuilder builder(op);
-  CommonRewriteData common = buildCommon(builder, loc, *tileShape);
+  CommonRewriteData common = buildCommon(builder, loc, pf->tileShape);
 
   ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
-  auto outOffArr = composeMemoryOffsetArray(ctx, store, *axes, common.iterSyms);
+  auto outOffArr =
+      composeMemoryOffsetArray(ctx, store, pf->axes, common.iterSyms);
   if (failed(outOffArr))
     return failure();
+  // Masked path: mask rides as an extra ins slot with identity offsets
+  // (same shape as src, both tile-local).
   SmallVector<Attribute> insOffArr{inOff};
   SmallVector<Value> insArr{src};
   if (mask) {
@@ -681,19 +845,7 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
       ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  Block *body = new Block();
-  BlockArgument sv = body->addArgument(srcElem, loc);
-  BlockArgument mv;
-  if (mask)
-    mv = body->addArgument(maskElem, loc);
-  body->addArgument(dstElem, loc);
-  generic.getBody().push_back(body);
-  OpBuilder bodyBuilder(body, body->begin());
-  if (mask)
-    HCYieldPredicatedOp::create(bodyBuilder, loc, ValueRange{sv},
-                                ValueRange{mv});
-  else
-    HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
+  populateStoreBody(generic, *pf, loc, /*hasMask=*/(bool)mask);
 
   op->erase();
   return success();

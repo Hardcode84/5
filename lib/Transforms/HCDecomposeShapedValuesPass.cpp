@@ -645,11 +645,19 @@ struct ConvertLoadOp : public OpConversionPattern<HCLoadOp> {
     auto data =
         HCLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
                          *buffer, indices, *shape, /*layout=*/LayoutAttr{});
-    auto mask =
-        HCLoadMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
-                             *buffer, indices, *shape);
-    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
-                                 mask.getMask());
+    // Same broadcast-mask rationale as `ConvertVLoadOp`: empty indices
+    // means there are no per-axis slice carriers to plant a predicate
+    // from, so the layout is the user's contract for legal addressing
+    // and `hc.full_mask` is the right seed.
+    Value maskValue = indices.empty()
+                          ? HCFullMaskOp::create(rewriter, op.getLoc(),
+                                                 bareMaskType(originalType))
+                                .getMask()
+                          : HCLoadMaskOp::create(rewriter, op.getLoc(),
+                                                 bareMaskType(originalType),
+                                                 *buffer, indices, *shape)
+                                .getMask();
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(), maskValue);
     return success();
   }
 };
@@ -694,6 +702,18 @@ struct ConvertVLoadOp : public OpConversionPattern<HCVLoadOp> {
                             maskSource, indices, *shape,
                             /*layout=*/LayoutAttr{})
               .getResult();
+    } else if (indices.empty()) {
+      // Broadcast vload (source rank < tile rank, no per-axis indices).
+      // `hc.load_mask` plants its predicate per slice axis from the
+      // index carriers; with no indices there is nothing to plant from,
+      // and the user's layout is the contract for legal addressing into
+      // the flat source. Emit `hc.full_mask` directly — same primitive
+      // the allocator path uses for whole-shape-known-valid carriers.
+      // Keeps `hc-load-store-to-generic`'s `rewriteLoadMask` from
+      // bailing on `indices.size() != srcShape.size()`.
+      maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
+                                       bareMaskType(originalType))
+                      .getMask();
     } else {
       maskValue = HCLoadMaskOp::create(rewriter, op.getLoc(),
                                        bareMaskType(originalType), dataSource,

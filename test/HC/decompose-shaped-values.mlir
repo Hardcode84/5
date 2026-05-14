@@ -308,17 +308,21 @@ hc.func @subgroup_region_result(%local: !hc.vector<f32, ["4"]>)
 // bare data and the bare mask carriers so `hc-flatten-with-layouts` can later
 // compose the per-iter offset against the same broadcast — dropping the
 // layout here would silently materialise the broadcast into a full identity
-// tile before flatten ever sees it.
+// tile before flatten ever sees it. Empty indices route the mask through
+// `hc.full_mask` instead of `hc.load_mask`: with no per-axis slice carriers
+// there is nothing to plant a predicate from, and the layout is the user's
+// contract for legal addressing into the flat source.
 //
 // CHECK-LABEL: func.func @noninjective_layout_preserved
 // CHECK: %[[VLOAD:.*]] = hc.vload
 // CHECK-SAME: -> !hc.bare_vector<si64, ["M", "K", "LANE"],
 // CHECK-SAME: storage_size = #hc.expr<"K">
 // CHECK-SAME: offset = #hc.expr<"j">
-// CHECK: hc.load_mask
-// CHECK-SAME: -> !hc.bare_vector<!hc.pred, ["M", "K", "LANE"],
+// CHECK: hc.full_mask
+// CHECK-SAME: : !hc.bare_vector<!hc.pred, ["M", "K", "LANE"],
 // CHECK-SAME: storage_size = #hc.expr<"K">
 // CHECK-SAME: offset = #hc.expr<"j">
+// CHECK-NOT: hc.load_mask
 // CHECK-NOT: !hc.vector
 func.func @noninjective_layout_preserved(%buf: !hc.buffer<si64, ["K"]>) {
   %m = hc.const<2 : i64> : !hc.idx<"M">
@@ -333,6 +337,37 @@ func.func @noninjective_layout_preserved(%buf: !hc.buffer<si64, ["K"]>) {
         -> !hc.vector<si64, ["M", "K", "LANE"],
                       #hc.layout<shape_syms = ["M", "K", "L"],
                                  index_syms = ["i", "j", "lane"],
+                                 params = {},
+                                 storage_size = #hc.expr<"K">,
+                                 offset = #hc.expr<"j">>>
+  return
+}
+
+// -----
+
+// `hc.load` mirrors the vload broadcast rule: an empty index list has no
+// per-axis slice to plant a predicate from, so the mask becomes
+// `hc.full_mask` (whole-shape-valid by the layout contract) instead of
+// `hc.load_mask` (which would later trip `rewriteLoadMask` on the rank
+// mismatch between zero indices and the rank-1 source).
+//
+// CHECK-LABEL: func.func @noninjective_load_empty_indices
+// CHECK: hc.load
+// CHECK-SAME: -> !hc.bare_tensor<si64, ["M", "K"]
+// CHECK: hc.full_mask
+// CHECK-SAME: : !hc.bare_tensor<!hc.pred, ["M", "K"]
+// CHECK-NOT: hc.load_mask
+func.func @noninjective_load_empty_indices(%buf: !hc.buffer<si64, ["K"]>) {
+  %m = hc.const<2 : i64> : !hc.idx<"M">
+  %k = hc.const<4 : i64> : !hc.idx<"K">
+  %shape = hc.tuple(%m, %k)
+      : (!hc.idx<"M">, !hc.idx<"K">)
+        -> tuple<!hc.idx<"M">, !hc.idx<"K">>
+  %tile = hc.load %buf[], shape %shape
+      : (!hc.buffer<si64, ["K"]>, tuple<!hc.idx<"M">, !hc.idx<"K">>)
+        -> !hc.tensor<si64, ["M", "K"],
+                      #hc.layout<shape_syms = ["M", "K"],
+                                 index_syms = ["i", "j"],
                                  params = {},
                                  storage_size = #hc.expr<"K">,
                                  offset = #hc.expr<"j">>>

@@ -93,7 +93,8 @@ def HC_SliceType : HC_Type<"Slice", "slice",
 // layout is the v0 default and the canonical-fold target.
 
 def HC_BufferType : HC_Type<"Buffer", "buffer",
-    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
+     DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic buffer type";
   let description = [{
     Initial semantic buffer type carrying an element type and a shape
@@ -121,7 +122,8 @@ def HC_BufferType : HC_Type<"Buffer", "buffer",
 }
 
 def HC_TensorType : HC_Type<"Tensor", "tensor",
-    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
+     DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic tensor type";
   let description = [{
     Initial semantic tensor type carrying an element type and a symbolic shape
@@ -145,7 +147,8 @@ def HC_TensorType : HC_Type<"Tensor", "tensor",
 }
 
 def HC_VectorType : HC_Type<"Vector", "vector",
-    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
+     DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic vector type";
   let description = [{
     Immutable fixed-size vector value. Carries an element type and a symbolic
@@ -170,7 +173,8 @@ def HC_VectorType : HC_Type<"Vector", "vector",
 }
 
 def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
-    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
+     DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Compiler-internal tensor data without semantic validity.";
   let description = [{
     Raw shaped tensor container produced by HC normalization before upstream
@@ -195,7 +199,8 @@ def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
 }
 
 def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
-    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>]> {
+    [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
+     DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Compiler-internal vector data without semantic validity.";
   let description = [{
     Raw shaped vector container produced by HC normalization before upstream

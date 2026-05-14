@@ -375,6 +375,51 @@ Type mlir::hc::BufferType::cloneWithSymbolicShape(ShapeAttr shape) const {
   return BufferType::get(getContext(), getElementType(), shape, getLayout());
 }
 
+namespace {
+
+// Same flavor + same element + same shape → join the layout slot.
+//
+// Equal layouts keep the layout. One side bare and the other
+// layout-bearing widens to the layout-bearing form: the layout
+// declares the underlying storage (its `storage_size` may differ from
+// the dim product, e.g. a 256-element backing under an 8-element
+// logical shape for per-lane WMMA fragments). The bare side, by
+// contract, describes the identity layout — strictly less specific.
+// Picking the layout-bearing side is the only join that preserves
+// storage semantics; widening to bare would silently drop the
+// non-identity backing the layout side commits to and produce IR
+// that misrepresents the actual allocation downstream of `hc-flatten-
+// with-layouts`.
+//
+// Two distinct non-null layouts are incompatible — there's no
+// principled tiebreaker, so the join fails and the caller falls back
+// to "no common type". Same goes for element / shape mismatch.
+template <typename ShapedT>
+static Type joinShapedSameFlavor(ShapedT lhs, Type rhsRaw) {
+  auto rhs = dyn_cast<ShapedT>(rhsRaw);
+  if (!rhs)
+    return {};
+  if (lhs.getElementType() != rhs.getElementType())
+    return {};
+  if (lhs.getShape() != rhs.getShape())
+    return {};
+  LayoutAttr lhsLayout = lhs.getLayout();
+  LayoutAttr rhsLayout = rhs.getLayout();
+  if (lhsLayout == rhsLayout)
+    return lhs;
+  if (!lhsLayout)
+    return rhs;
+  if (!rhsLayout)
+    return lhs;
+  return {};
+}
+
+} // namespace
+
+Type mlir::hc::BufferType::joinHCType(Type other) const {
+  return joinShapedSameFlavor(*this, other);
+}
+
 mlir::LogicalResult
 mlir::hc::TensorType::verify(function_ref<InFlightDiagnostic()> emitError,
                              Type elementType, ShapeAttr shape,
@@ -397,6 +442,10 @@ Type mlir::hc::TensorType::cloneWithSymbolicShape(ShapeAttr shape) const {
   return TensorType::get(getContext(), getElementType(), shape, getLayout());
 }
 
+Type mlir::hc::TensorType::joinHCType(Type other) const {
+  return joinShapedSameFlavor(*this, other);
+}
+
 mlir::LogicalResult
 mlir::hc::VectorType::verify(function_ref<InFlightDiagnostic()> emitError,
                              Type elementType, ShapeAttr shape,
@@ -417,6 +466,10 @@ Type mlir::hc::VectorType::cloneWithSymbolicLayout(LayoutAttr layout) const {
 }
 Type mlir::hc::VectorType::cloneWithSymbolicShape(ShapeAttr shape) const {
   return VectorType::get(getContext(), getElementType(), shape, getLayout());
+}
+
+Type mlir::hc::VectorType::joinHCType(Type other) const {
+  return joinShapedSameFlavor(*this, other);
 }
 
 mlir::LogicalResult
@@ -446,6 +499,10 @@ Type mlir::hc::BareTensorType::cloneWithSymbolicShape(ShapeAttr shape) const {
                              getLayout());
 }
 
+Type mlir::hc::BareTensorType::joinHCType(Type other) const {
+  return joinShapedSameFlavor(*this, other);
+}
+
 mlir::LogicalResult
 mlir::hc::BareVectorType::verify(function_ref<InFlightDiagnostic()> emitError,
                                  Type elementType, ShapeAttr shape,
@@ -471,6 +528,10 @@ Type mlir::hc::BareVectorType::cloneWithSymbolicLayout(
 Type mlir::hc::BareVectorType::cloneWithSymbolicShape(ShapeAttr shape) const {
   return BareVectorType::get(getContext(), getElementType(), shape,
                              getLayout());
+}
+
+Type mlir::hc::BareVectorType::joinHCType(Type other) const {
+  return joinShapedSameFlavor(*this, other);
 }
 
 // `subgroup_size` is the wavefront width: always strictly positive when

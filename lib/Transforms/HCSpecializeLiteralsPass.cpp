@@ -106,40 +106,51 @@ composeSubstitutionPairs(HCKernelOp kernel, DictionaryAttr bindings,
   return success();
 }
 
+// Apply a list of (target, replacement) substitutions to a single symbolic
+// handle. Templated so the same machinery serves both `ExprHandle` and
+// `PredHandle` — the two have identical substitution semantics and
+// re-implementing the body for each just invites them to drift apart.
+template <typename Handle>
+static Handle substituteHandle(sym::Session &session, Handle handle,
+                               ArrayRef<ixs_node *> targets,
+                               ArrayRef<ixs_node *> replacements) {
+  if (!handle)
+    return handle;
+  ixs_node *result =
+      ixs_subs_multi(session.raw(), const_cast<ixs_node *>(handle.raw()),
+                     static_cast<uint32_t>(targets.size()), targets.data(),
+                     replacements.data());
+  return Handle(result ? result : handle.raw());
+}
+
+// Block-argument types ride on each block (not on the parent op's
+// attributes), so `AttrTypeReplacer::recursivelyReplaceElementsIn` does
+// not visit them. Walk the regions explicitly after the op tree walk.
+static void retypeBlockArguments(Operation *op, AttrTypeReplacer &replacer) {
+  for (Region &region : op->getRegions())
+    for (Block &block : region)
+      for (BlockArgument arg : block.getArguments()) {
+        Type rewritten = replacer.replace(arg.getType());
+        if (rewritten && rewritten != arg.getType())
+          arg.setType(rewritten);
+      }
+}
+
 // Substitute every reachable `#hc.expr` / `#hc.pred` (and through them
 // every `#hc.shape`, `#hc.layout`, `!hc.idx`, `!hc.pred`, shaped type)
 // inside the kernel body. `replaceTypes=true` covers block-argument types
 // — kernel-arg buffer shapes, region IV types — so no symbolic carrier
-// for a bound name survives. The kernel's own `literal_bindings` attribute
-// is the input to this rewrite, so we skip it explicitly via a guarding
-// replacement that fires before the generic ExprAttr / PredAttr ones.
-static void specializeKernel(HCKernelOp kernel, DictionaryAttr bindings,
-                             sym::Store &store, ArrayRef<ixs_node *> targets,
+// for a bound name survives.
+static void specializeKernel(HCKernelOp kernel, sym::Store &store,
+                             ArrayRef<ixs_node *> targets,
                              ArrayRef<ixs_node *> replacements) {
   sym::Session session(store);
-  auto substExpr = [&](sym::ExprHandle handle) -> sym::ExprHandle {
-    if (!handle)
-      return handle;
-    ixs_node *result =
-        ixs_subs_multi(session.raw(), const_cast<ixs_node *>(handle.raw()),
-                       static_cast<uint32_t>(targets.size()), targets.data(),
-                       replacements.data());
-    return sym::ExprHandle(result ? result : handle.raw());
-  };
-  auto substPred = [&](sym::PredHandle handle) -> sym::PredHandle {
-    if (!handle)
-      return handle;
-    ixs_node *result =
-        ixs_subs_multi(session.raw(), const_cast<ixs_node *>(handle.raw()),
-                       static_cast<uint32_t>(targets.size()), targets.data(),
-                       replacements.data());
-    return sym::PredHandle(result ? result : handle.raw());
-  };
 
   AttrTypeReplacer replacer;
   replacer.addReplacement(
       [&](ExprAttr attr) -> std::pair<Attribute, WalkResult> {
-        sym::ExprHandle replaced = substExpr(attr.getValue());
+        sym::ExprHandle replaced =
+            substituteHandle(session, attr.getValue(), targets, replacements);
         if (replaced == attr.getValue())
           return {attr, WalkResult::skip()};
         // `ExprAttr` wraps an opaque `ixs_node *` (not an MLIR
@@ -151,7 +162,8 @@ static void specializeKernel(HCKernelOp kernel, DictionaryAttr bindings,
       });
   replacer.addReplacement(
       [&](PredAttr attr) -> std::pair<Attribute, WalkResult> {
-        sym::PredHandle replaced = substPred(attr.getValue());
+        sym::PredHandle replaced =
+            substituteHandle(session, attr.getValue(), targets, replacements);
         if (replaced == attr.getValue())
           return {attr, WalkResult::skip()};
         return {PredAttr::get(attr.getContext(), replaced), WalkResult::skip()};
@@ -163,26 +175,17 @@ static void specializeKernel(HCKernelOp kernel, DictionaryAttr bindings,
   // rewritten alongside the body. The `literal_bindings` dict only
   // holds `IntegerAttr` values, so the `ExprAttr` / `PredAttr`
   // replacements registered above don't match anything inside it —
-  // safe to recurse through. Block-argument types ride on each block
-  // (not on the parent op's attributes), so walk them explicitly
-  // after the op tree walk.
+  // safe to recurse through.
   replacer.recursivelyReplaceElementsIn(kernel, /*replaceAttrs=*/true,
                                         /*replaceLocs=*/false,
                                         /*replaceTypes=*/true);
-  for (Region &region : kernel->getRegions())
-    for (Block &block : region)
-      for (BlockArgument arg : block.getArguments()) {
-        Type rewritten = replacer.replace(arg.getType());
-        if (rewritten && rewritten != arg.getType())
-          arg.setType(rewritten);
-      }
+  retypeBlockArguments(kernel, replacer);
 
   // Drop the consumed `literal_bindings` so a downstream re-run is a
   // no-op and a `hc_ir_text` snapshot doesn't suggest there is more
   // specialization to do. `literals` stays put — it's the declaration,
   // not the bound state.
   kernel.removeLiteralBindingsAttr();
-  (void)bindings;
 }
 
 struct HCSpecializeLiteralsPass
@@ -212,7 +215,7 @@ struct HCSpecializeLiteralsPass
           if (failed(composeSubstitutionPairs(kernel, bindings, store, targets,
                                               replacements)))
             return WalkResult::interrupt();
-          specializeKernel(kernel, bindings, store, targets, replacements);
+          specializeKernel(kernel, store, targets, replacements);
           return WalkResult::advance();
         });
     if (status.wasInterrupted())

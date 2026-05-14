@@ -111,97 +111,73 @@ static TopLevelNameFacts collectTopLevelNameFacts(Block &block) {
   return facts;
 }
 
-// Two-phase linear scan over `block`'s non-terminator ops:
-//
-//   Phase 1 (preflight): walk the block with a presence-only binding
-//   set. Every `hc.assign` adds its name; every `hc.name_load` must
-//   be bound (via the seeded keys, a prior in-block assign, or
-//   `capture`); every `NameStoreRegionOpInterface` op must have an
-//   assign/load-free subtree. The first violation emits a diagnostic
-//   and returns `failure()` before any IR mutation.
-//
-//   Phase 2 (commit): preflight proved every read resolves, so this
-//   sweep can't emit diagnostics. `hc.assign` binds, `hc.name_load`
-//   either resolves from `binding` or triggers a real (IR-mutating)
-//   `capture()` call, and residual ops get erased in one pass at the
-//   end. `NameStoreRegionOpInterface` ops are already known clean
-//   from preflight; the commit loop skips them.
-//
-// Atomicity guarantee: **within a single call**, either every
-// in-`block` mutation runs or none do. That is the guarantee the
-// callable-level flat sweep in `promoteCallable` relies on — a
-// failing user body bubbles out as a clean pass failure. It is
-// **not** a pipeline-wide guarantee: `promoteForRange` / `promoteIf`
-// restructure the outer IR (`takeBody`, result-extended clone)
-// before calling this function, so if the scan failed there, the
-// module would still be torn. Those callers sidestep the problem by
-// seeding `binding` with every reachable name and then treating any
-// scan failure as a pass-invariant break (fatal abort), not a
-// recoverable failure — see their call sites for the rationale.
-//
-// The `capture` factory is a capture-from-outer-scope hook: invoked
-// only on truly unbound reads, its returned Value seeds the binding
-// so repeated reads share the same snapshot. `capture = nullptr`
-// disables outer capture — used at the callable top level (no outer
-// to reach for) and inside the `hc.for_range` / `hc.if` scans (the
-// caller pre-seeds `binding` for every reachable name).
-static LogicalResult scanAndPromoteBlock(Block &block,
-                                         llvm::StringMap<Value> &binding,
-                                         SnapFactory capture = nullptr) {
-  // Phase 1 (preflight): validate every reachable name has a binding
-  // without mutating any IR. Diagnostics fire here, not in phase 2.
-  {
-    llvm::StringSet<> bound;
-    for (const auto &kv : binding)
-      bound.insert(kv.getKey());
-    for (Operation &op : block.without_terminator()) {
-      if (auto assign = dyn_cast<HCAssignOp>(&op)) {
-        bound.insert(assign.getName());
+// True iff `op` is a `NameStoreRegionOpInterface` op whose subtree
+// still contains `hc.assign` / `hc.name_load`. The preflight pass
+// uses this to catch promoters that left residual name-store ops
+// behind (or a new op kind that joined the interface without a
+// matching case in `promoteRegionOp`'s dispatch).
+static bool hasStaleNameStoreOps(Operation &op) {
+  bool stale = false;
+  op.walk([&](Operation *inner) {
+    if (isa<HCAssignOp, HCNameLoadOp>(inner)) {
+      stale = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return stale;
+}
+
+// Phase 1 of `scanAndPromoteBlock`: walk `block` with a presence-only
+// binding set. Every `hc.assign` adds its name; every `hc.name_load`
+// must be bound (via the seeded keys, a prior in-block assign, or
+// `capture`); every `NameStoreRegionOpInterface` op must have an
+// assign/load-free subtree. Returns `failure()` after emitting a
+// diagnostic on the first violation, without mutating IR.
+static LogicalResult preflightNameBindings(Block &block,
+                                           const llvm::StringMap<Value> &seeded,
+                                           bool haveCapture) {
+  llvm::StringSet<> bound;
+  for (const auto &kv : seeded)
+    bound.insert(kv.getKey());
+  for (Operation &op : block.without_terminator()) {
+    if (auto assign = dyn_cast<HCAssignOp>(&op)) {
+      bound.insert(assign.getName());
+      continue;
+    }
+    if (auto load = dyn_cast<HCNameLoadOp>(&op)) {
+      if (bound.contains(load.getName()))
+        continue;
+      if (haveCapture) {
+        bound.insert(load.getName());
         continue;
       }
-      if (auto load = dyn_cast<HCNameLoadOp>(&op)) {
-        if (bound.contains(load.getName()))
-          continue;
-        if (capture) {
-          bound.insert(load.getName());
-          continue;
-        }
-        return load.emitOpError("read of name '")
-               << load.getName()
-               << "' that has no reaching `hc.assign` in the enclosing "
-                  "scope; the frontend must emit an assign before every "
-                  "read, or the promotion must see a prior iter_arg / "
-                  "region result";
-      }
-      if (isa<NameStoreRegionOpInterface>(&op)) {
-        bool stale = false;
-        op.walk([&](Operation *inner) {
-          if (isa<HCAssignOp, HCNameLoadOp>(inner)) {
-            stale = true;
-            return WalkResult::interrupt();
-          }
-          return WalkResult::advance();
-        });
-        // Two failure modes produce this: (a) a new op kind joined the
-        // `NameStoreRegionOpInterface` without a matching case in
-        // `promoteRegionOp`'s dispatch, or (b) an existing promoter
-        // left residual name-store ops in the body. Both are pass
-        // bugs, not frontend bugs — diagnose, don't silently lower.
-        if (stale)
-          return op.emitOpError(
-              "region-carrying op still contains `hc.assign` / "
-              "`hc.name_load` after promotion; either a new "
-              "NameStoreRegionOpInterface op kind joined the interface "
-              "without a matching case in `promoteRegionOp`, or a "
-              "promoter left residual name-store ops in the body");
-      }
+      return load.emitOpError("read of name '")
+             << load.getName()
+             << "' that has no reaching `hc.assign` in the enclosing "
+                "scope; the frontend must emit an assign before every "
+                "read, or the promotion must see a prior iter_arg / "
+                "region result";
     }
+    if (isa<NameStoreRegionOpInterface>(&op) && hasStaleNameStoreOps(op))
+      return op.emitOpError(
+          "region-carrying op still contains `hc.assign` / "
+          "`hc.name_load` after promotion; either a new "
+          "NameStoreRegionOpInterface op kind joined the interface "
+          "without a matching case in `promoteRegionOp`, or a "
+          "promoter left residual name-store ops in the body");
   }
+  return success();
+}
 
-  // Phase 2 (commit): preflight passed, so every load is guaranteed
-  // resolvable. The only failure mode here would be a preflight/commit
-  // desync (future-us rewrites one without the other) — handled with a
-  // loud, release-safe abort rather than a stripped-under-NDEBUG assert.
+// Phase 2 of `scanAndPromoteBlock`: preflight passed, so every load
+// is guaranteed resolvable. `hc.assign` binds, `hc.name_load` either
+// resolves from `binding` or triggers a real (IR-mutating)
+// `capture()` call, and residual ops get erased in one pass at the
+// end. The only failure mode here is a preflight/commit desync —
+// handled with a loud, release-safe abort.
+static void commitNameRewrites(Block &block, llvm::StringMap<Value> &binding,
+                               SnapFactory capture) {
   SmallVector<Operation *> toErase;
   for (Operation &op : block.without_terminator()) {
     if (auto assign = dyn_cast<HCAssignOp>(&op)) {
@@ -229,6 +205,36 @@ static LogicalResult scanAndPromoteBlock(Block &block,
   }
   for (Operation *o : toErase)
     o->erase();
+}
+
+// Two-phase linear scan over `block`'s non-terminator ops; see
+// `preflightNameBindings` / `commitNameRewrites` for the per-phase
+// contracts.
+//
+// Atomicity guarantee: **within a single call**, either every
+// in-`block` mutation runs or none do. That is the guarantee the
+// callable-level flat sweep in `promoteCallable` relies on — a
+// failing user body bubbles out as a clean pass failure. It is
+// **not** a pipeline-wide guarantee: `promoteForRange` / `promoteIf`
+// restructure the outer IR (`takeBody`, result-extended clone)
+// before calling this function, so if the scan failed there, the
+// module would still be torn. Those callers sidestep the problem by
+// seeding `binding` with every reachable name and then treating any
+// scan failure as a pass-invariant break (fatal abort), not a
+// recoverable failure — see their call sites for the rationale.
+//
+// The `capture` factory is a capture-from-outer-scope hook: invoked
+// only on truly unbound reads, its returned Value seeds the binding
+// so repeated reads share the same snapshot. `capture = nullptr`
+// disables outer capture — used at the callable top level (no outer
+// to reach for) and inside the `hc.for_range` / `hc.if` scans (the
+// caller pre-seeds `binding` for every reachable name).
+static LogicalResult scanAndPromoteBlock(Block &block,
+                                         llvm::StringMap<Value> &binding,
+                                         SnapFactory capture = nullptr) {
+  if (failed(preflightNameBindings(block, binding, /*haveCapture=*/!!capture)))
+    return failure();
+  commitNameRewrites(block, binding, capture);
   return success();
 }
 
@@ -349,6 +355,80 @@ extractIvSelfBinds(Block &body, BlockArgument ivArg) {
   return binds;
 }
 
+// Drops IV self-bind names from every name-fact set. The leading
+// `hc.assign "<n>", %iv` ops are erased by `extractIvSelfBinds`
+// before `collectTopLevelNameFacts` runs, but the user may still
+// have `i = expr` shadow writes or `use(i)` reads in the body; those
+// stay loop-local instead of becoming iter_args.
+//
+// Shadow semantics: the shadow write is consumed by the body scan
+// (`binding["i"]` gets overwritten and subsequent reads resolve to
+// the shadowed value), but is *not* promoted to an iter_arg /
+// iter_result. The outer scope does not see the shadowed value
+// after the loop — that diverges from Python's leaking-loop-variable
+// semantics, but making it leak would require synthesizing an outer
+// snap for the IV name, which doesn't exist at this layer. The
+// Python driver is expected to reject IV-name shadowing before it
+// reaches MLIR; this block is the belt to that suspenders.
+static void dropIvSelfBindNamesFromFacts(
+    TopLevelNameFacts &facts,
+    const llvm::SmallDenseMap<StringAttr, Value> &ivSelfBinds) {
+  for (auto &kv : ivSelfBinds) {
+    facts.reads.remove(kv.first);
+    facts.writes.remove(kv.first);
+    facts.snapshot.remove(kv.first);
+  }
+}
+
+// Builds the extended iter_init list for a `hc.for_range` rebuild.
+// Read-first carriers seed from their outer snap; write-first
+// carriers seed from `hc.undef_value`. The first in-body assign
+// overwrites the iter_arg before any load sees it, and zero-trip
+// leaves the placeholder flowing out as the op's result — matching
+// "name stays undefined if the loop never ran".
+static SmallVector<Value> buildExtendedIterInits(OpBuilder &builder,
+                                                 Location loc, Type undefTy,
+                                                 HCForRangeOp op,
+                                                 ArrayRef<StringAttr> carried,
+                                                 const SnapMap &snapValues) {
+  SmallVector<Value> newIterInits(op.getIterInits().begin(),
+                                  op.getIterInits().end());
+  for (StringAttr name : carried) {
+    auto it = snapValues.find(name);
+    if (it != snapValues.end()) {
+      newIterInits.push_back(it->second);
+      continue;
+    }
+    LDBG() << "write-first `hc.for_range` carrier '" << name.getValue()
+           << "' at " << loc;
+    auto placeholder = HCUndefValueOp::create(builder, loc, undefTy);
+    newIterInits.push_back(placeholder.getResult());
+  }
+  return newIterInits;
+}
+
+// Seeds the body-scan `binding` with every name guaranteed to have
+// a value: IV self-bind names resolve to %iv directly; every
+// carried name starts out as its iter_arg; every snapshot name as
+// its outer-scope snap value. `binding` covers `snapshot ∪ carried
+// ∪ ivSelfBinds`, which is every top-level name that can appear in
+// a `hc.name_load` within the loop body, so the scan can never hit
+// the reaching-def diagnostic.
+static llvm::StringMap<Value> seedForRangeBodyBinding(
+    const llvm::SmallDenseMap<StringAttr, Value> &ivSelfBinds,
+    const NameSet &snapshot, const SnapMap &snapValues,
+    ArrayRef<StringAttr> carried,
+    const llvm::SmallDenseMap<StringAttr, BlockArgument> &iterArgFor) {
+  llvm::StringMap<Value> binding;
+  for (auto &kv : ivSelfBinds)
+    binding[kv.first.getValue()] = kv.second;
+  for (StringAttr name : snapshot)
+    binding[name.getValue()] = snapValues.lookup(name);
+  for (StringAttr name : carried)
+    binding[name.getValue()] = iterArgFor.lookup(name);
+  return binding;
+}
+
 // Promote `op`, a `hc.for_range`, so every `hc.assign` / `hc.name_load`
 // inside its body is rewritten in terms of iter_args and `hc.yield`.
 // The old op is replaced with a new one with extended iter_inits /
@@ -368,63 +448,21 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   auto ivSelfBinds = extractIvSelfBinds(oldBody, ivArg);
 
   TopLevelNameFacts facts = collectTopLevelNameFacts(oldBody);
-  // IV self-bind names may still appear as reads in the body (the
-  // user's code says `for i in ...: use(i)`); drop them from both
-  // sets so snapshot / iter_init computation treats them as loop-
-  // local, not carried.
-  //
-  // `facts.writes` membership is the IV-name-shadow case: the user wrote
-  // `for i in ...: i = expr`. The leading self-bind is already
-  // stripped by `extractIvSelfBinds`, but a remaining in-body
-  // `hc.assign "i", %expr` still lands here in `facts.writes`. Dropping
-  // it means the shadow write is consumed by the body scan
-  // (`binding["i"]` gets overwritten and subsequent `hc.name_load
-  // "i"` reads resolve to %expr) but is *not* promoted to an
-  // iter_arg / iter_result. The shadow stays loop-local — the outer
-  // scope does not see the shadowed value after the loop.
-  //
-  // That diverges from Python's leaking-loop-variable semantics, but
-  // making it leak here would require synthesizing an outer snap for
-  // the IV name, which is not a thing that exists at this layer
-  // (the IV is a block arg, not a name in the outer store). The
-  // Python driver is expected to reject IV-name shadowing before it
-  // reaches MLIR; this block is the belt to that suspenders.
-  for (auto &kv : ivSelfBinds) {
-    facts.reads.remove(kv.first);
-    facts.writes.remove(kv.first);
-    facts.snapshot.remove(kv.first);
-  }
+  dropIvSelfBindNamesFromFacts(facts, ivSelfBinds);
   if (facts.reads.empty() && facts.writes.empty() && ivSelfBinds.empty())
     return success();
 
   SmallVector<StringAttr> carried(facts.writes.begin(), facts.writes.end());
 
-  MLIRContext *ctx = op.getContext();
-  Type undefTy = UndefType::get(ctx);
+  Type undefTy = UndefType::get(op.getContext());
   Location loc = op.getLoc();
 
   OpBuilder builder(op);
   SnapMap snapValues;
   materializeSnapshots(builder, loc, undefTy, facts.snapshot, snapValues);
 
-  // iter_inits: read-first carriers seed from their outer snap; write-first
-  // carriers seed from `hc.undef_value`. The first in-body assign overwrites
-  // the iter_arg before any load sees it, and zero-trip leaves the placeholder
-  // flowing out as the op's result, matching "name stays undefined if the loop
-  // never ran".
-  SmallVector<Value> newIterInits(op.getIterInits().begin(),
-                                  op.getIterInits().end());
-  for (StringAttr name : carried) {
-    auto it = snapValues.find(name);
-    if (it != snapValues.end()) {
-      newIterInits.push_back(it->second);
-      continue;
-    }
-    LDBG() << "write-first `hc.for_range` carrier '" << name.getValue()
-           << "' at " << op.getLoc();
-    auto placeholder = HCUndefValueOp::create(builder, loc, undefTy);
-    newIterInits.push_back(placeholder.getResult());
-  }
+  SmallVector<Value> newIterInits =
+      buildExtendedIterInits(builder, loc, undefTy, op, carried, snapValues);
 
   SmallVector<Type> newResultTypes(op.getIterResults().getTypes().begin(),
                                    op.getIterResults().getTypes().end());
@@ -445,30 +483,12 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   for (StringAttr name : carried)
     iterArgFor[name] = body.addArgument(undefTy, loc);
 
-  // Seed the scan: IV self-bind names resolve to %iv directly; every
-  // carried name starts out as its iter_arg; every read-only
-  // snapshot name as its outer-scope snap value. A `hc.assign`
-  // encountered during the scan overwrites the binding; the yield
-  // rebuild picks up whatever the last write left.
-  //
-  // `binding` is seeded with `facts.snapshot ∪ carried ∪ ivSelfBinds`;
-  // together these cover every top-level name that can appear in a
-  // `hc.name_load` within `body` (snapshot = read-first names,
-  // carried = write-set = every assigned name), so the scan cannot
-  // emit the reaching-def diagnostic here. The only remaining
-  // failure mode is the stale-NameStoreRegionOpInterface check — a
-  // pass bug, not a frontend bug. By this point we've already
-  // restructured the outer IR (new op + `takeBody`), so a soft
-  // `return failure()` would leak a torn module; abort fatally
-  // instead.
-  llvm::StringMap<Value> binding;
-  for (auto &kv : ivSelfBinds)
-    binding[kv.first.getValue()] = kv.second;
-  for (StringAttr name : facts.snapshot)
-    binding[name.getValue()] = snapValues[name];
-  for (StringAttr name : carried)
-    binding[name.getValue()] = iterArgFor[name];
-
+  // By this point we've already restructured the outer IR (new op +
+  // `takeBody`), so a soft `return failure()` would leak a torn
+  // module; preflight guarantees no diagnostic remains, so any
+  // failure here is a pass-invariant break — abort fatally.
+  llvm::StringMap<Value> binding = seedForRangeBodyBinding(
+      ivSelfBinds, facts.snapshot, snapValues, carried, iterArgFor);
   if (failed(scanAndPromoteBlock(body, binding)))
     llvm::report_fatal_error(
         "hc-promote-names: scan of `hc.for_range` body failed after the "
@@ -492,47 +512,68 @@ static LogicalResult promoteForRange(HCForRangeOp op) {
   return success();
 }
 
-// Promote `op`, a `hc.if`, so every `hc.assign` / `hc.name_load` inside
-// either branch is rewritten in terms of op results and `hc.yield`
-// values. Semantics match Python's: a name assigned in one branch but
-// not the other retains its outer binding in the silent branch (i.e.
-// that branch yields the snapshot value).
-static LogicalResult promoteIf(HCIfOp op) {
-  Block &thenBlock = op.getThenRegion().front();
-  Region &elseRegion = op.getElseRegion();
-
-  // Per-branch name facts. `hc.if` promotion needs these split
-  // because the snapshot policy depends on branch symmetry: a name
-  // written in both branches is fully redefined on every path and
-  // doesn't need an outer-scope snap, while a name written in only one
-  // branch still needs the outer value to fall back to on the silent
-  // branch.
-  TopLevelNameFacts thenFacts = collectTopLevelNameFacts(thenBlock);
+// Bundles the per-branch facts that the rest of `promoteIf` consumes.
+struct IfBranchFacts {
+  TopLevelNameFacts thenFacts;
   TopLevelNameFacts elseFacts;
-  bool hasElse = !elseRegion.empty();
-  if (hasElse)
-    elseFacts = collectTopLevelNameFacts(elseRegion.front());
-  if (thenFacts.reads.empty() && thenFacts.writes.empty() &&
-      elseFacts.reads.empty() && elseFacts.writes.empty())
-    return success();
+  bool hasElse;
+};
 
-  NameSet carriedSet;
-  for (StringAttr n : thenFacts.writes)
-    carriedSet.insert(n);
-  for (StringAttr n : elseFacts.writes)
-    carriedSet.insert(n);
-  SmallVector<StringAttr> carried(carriedSet.begin(), carriedSet.end());
+// True iff neither branch reads or writes any name — nothing to
+// promote and the caller can early-out.
+static bool isNoOpIf(const IfBranchFacts &f) {
+  return f.thenFacts.reads.empty() && f.thenFacts.writes.empty() &&
+         f.elseFacts.reads.empty() && f.elseFacts.writes.empty();
+}
 
-  // `snapshot` is the set of names that need an outer-scope snap:
-  //   - every name read in any branch (the branch may read it before
-  //     any in-branch write), plus
-  //   - every carried name that isn't written on every path (the
-  //     silent-branch yield must fall back to the outer value).
-  //
-  // A name written symmetrically in both branches (and not read) needs
-  // no snap — each branch's own write provides the yield value, so an
-  // outer snap would be a spurious `hc.name_load` that the flat sweep
-  // would then fail to resolve when no outer binding exists.
+// Union of writes across both branches; this is exactly the set of
+// names that need to be carried out via the rebuilt op's results.
+static SmallVector<StringAttr> computeIfCarried(const IfBranchFacts &f,
+                                                NameSet &carriedSet) {
+  for (StringAttr n : f.thenFacts.writes)
+    carriedSet.insert(n);
+  for (StringAttr n : f.elseFacts.writes)
+    carriedSet.insert(n);
+  return SmallVector<StringAttr>(carriedSet.begin(), carriedSet.end());
+}
+
+// Creates the replacement `hc.if` with `op`'s original results
+// followed by one `!hc.undef` slot per carried name, and transfers
+// both branch regions over. An empty else region gets emplaced when
+// carried names demand a symmetric yield; otherwise we leave it
+// empty (the verifier is fine with that when `newOp` has no
+// results).
+static HCIfOp buildIfShellOp(OpBuilder &builder, Location loc, Type undefTy,
+                             HCIfOp op, ArrayRef<StringAttr> carried) {
+  SmallVector<Type> newResultTypes(op.getResultTypes().begin(),
+                                   op.getResultTypes().end());
+  for (size_t i = 0, e = carried.size(); i < e; ++i)
+    newResultTypes.push_back(undefTy);
+
+  Region &elseRegion = op.getElseRegion();
+  auto newOp = HCIfOp::create(builder, loc, newResultTypes, op.getCond());
+  newOp.getThenRegion().takeBody(op.getThenRegion());
+  if (!elseRegion.empty())
+    newOp.getElseRegion().takeBody(elseRegion);
+  else if (!carried.empty())
+    newOp.getElseRegion().emplaceBlock();
+  return newOp;
+}
+
+// Computes the set of names that need an outer-scope snap for `hc.if`
+// promotion:
+//   - every name read in any branch (the branch may read it before
+//     any in-branch write), plus
+//   - every carried name that isn't written on every path (the
+//     silent-branch yield must fall back to the outer value).
+//
+// A name written symmetrically in both branches (and not read) needs
+// no snap — each branch's own write provides the yield value, so an
+// outer snap would be a spurious `hc.name_load` that the flat sweep
+// would then fail to resolve when no outer binding exists.
+static NameSet computeIfSnapshot(const TopLevelNameFacts &thenFacts,
+                                 const TopLevelNameFacts &elseFacts,
+                                 const NameSet &carriedSet, bool hasElse) {
   NameSet snapshot = thenFacts.reads;
   for (StringAttr n : elseFacts.reads)
     snapshot.insert(n);
@@ -542,55 +583,70 @@ static LogicalResult promoteIf(HCIfOp op) {
     if (!symmetric)
       snapshot.insert(n);
   }
+  return snapshot;
+}
 
-  MLIRContext *ctx = op.getContext();
-  Type undefTy = UndefType::get(ctx);
+// Scans one branch of a `hc.if` and replaces its yield with the
+// carried-name values. `binding` is seeded from the shared snapshot
+// (every in-branch read is in `snapshot`), so `scanAndPromoteBlock`
+// can't hit the reaching-def diagnostic. The only remaining failure
+// mode is a stale-NameStoreRegionOpInterface check — a pass bug,
+// and the outer IR has already been restructured here, so any
+// failure is treated as a fatal invariant break.
+static void scanAndRebuildIfBranch(Block &block, const NameSet &snapshot,
+                                   const SnapMap &snapValues,
+                                   ArrayRef<StringAttr> carried, Location loc) {
+  llvm::StringMap<Value> binding;
+  for (StringAttr name : snapshot)
+    binding[name.getValue()] = snapValues.lookup(name);
+  ensureYieldTerminator(block, loc);
+  if (failed(scanAndPromoteBlock(block, binding)))
+    llvm::report_fatal_error(
+        "hc-promote-names: scan of `hc.if` branch failed after the outer "
+        "IR was already restructured (pass invariant violation)");
+  rewriteYieldWithCarried(block, binding, carried, loc);
+}
+
+// Promote `op`, a `hc.if`, so every `hc.assign` / `hc.name_load` inside
+// either branch is rewritten in terms of op results and `hc.yield`
+// values. Semantics match Python's: a name assigned in one branch but
+// not the other retains its outer binding in the silent branch (i.e.
+// that branch yields the snapshot value).
+static LogicalResult promoteIf(HCIfOp op) {
+  // Per-branch name facts. `hc.if` promotion needs these split
+  // because the snapshot policy depends on branch symmetry: a name
+  // written in both branches is fully redefined on every path and
+  // doesn't need an outer-scope snap, while a name written in only one
+  // branch still needs the outer value to fall back to on the silent
+  // branch.
+  IfBranchFacts f;
+  f.thenFacts = collectTopLevelNameFacts(op.getThenRegion().front());
+  f.hasElse = !op.getElseRegion().empty();
+  if (f.hasElse)
+    f.elseFacts = collectTopLevelNameFacts(op.getElseRegion().front());
+  if (isNoOpIf(f))
+    return success();
+
+  NameSet carriedSet;
+  SmallVector<StringAttr> carried = computeIfCarried(f, carriedSet);
+
+  NameSet snapshot =
+      computeIfSnapshot(f.thenFacts, f.elseFacts, carriedSet, f.hasElse);
+
+  Type undefTy = UndefType::get(op.getContext());
   Location loc = op.getLoc();
 
   OpBuilder builder(op);
   SnapMap snapValues;
   materializeSnapshots(builder, loc, undefTy, snapshot, snapValues);
 
-  SmallVector<Type> newResultTypes(op.getResultTypes().begin(),
-                                   op.getResultTypes().end());
-  for (size_t i = 0, e = carried.size(); i < e; ++i)
-    newResultTypes.push_back(undefTy);
+  HCIfOp newOp = buildIfShellOp(builder, loc, undefTy, op, carried);
 
-  auto newOp = HCIfOp::create(builder, loc, newResultTypes, op.getCond());
-  newOp.getThenRegion().takeBody(op.getThenRegion());
-  // If the old op had an else region, move it as-is; otherwise synthesize
-  // an empty else block when carried names demand a symmetric yield. If
-  // neither applies (no carried names, no old else), leave the new else
-  // region empty — the verifier is fine with that when `newOp` has no
-  // results.
-  if (!elseRegion.empty())
-    newOp.getElseRegion().takeBody(elseRegion);
-  else if (!carried.empty())
-    newOp.getElseRegion().emplaceBlock();
-
-  // Per-branch scan. `binding` is seeded from the shared `snapshot`
-  // set, which includes every in-branch read (see the `snapshot`
-  // construction above), so `scanAndPromoteBlock` cannot hit the
-  // reaching-def diagnostic for either branch. The only remaining
-  // failure mode is the stale-NameStoreRegionOpInterface check — a
-  // pass bug, and the outer IR has already been restructured here,
-  // so any failure is treated as a fatal invariant break to avoid
-  // leaking a torn module.
-  auto processBranch = [&](Block &block) {
-    llvm::StringMap<Value> binding;
-    for (StringAttr name : snapshot)
-      binding[name.getValue()] = snapValues[name];
-    ensureYieldTerminator(block, loc);
-    if (failed(scanAndPromoteBlock(block, binding)))
-      llvm::report_fatal_error(
-          "hc-promote-names: scan of `hc.if` branch failed after the outer "
-          "IR was already restructured (pass invariant violation)");
-    rewriteYieldWithCarried(block, binding, carried, loc);
-  };
-
-  processBranch(newOp.getThenRegion().front());
+  scanAndRebuildIfBranch(newOp.getThenRegion().front(), snapshot, snapValues,
+                         carried, loc);
   if (!newOp.getElseRegion().empty())
-    processBranch(newOp.getElseRegion().front());
+    scanAndRebuildIfBranch(newOp.getElseRegion().front(), snapshot, snapValues,
+                           carried, loc);
 
   builder.setInsertionPointAfter(newOp);
   writebackCarriedResults(builder, loc, newOp, carried,
@@ -602,6 +658,25 @@ static LogicalResult promoteIf(HCIfOp op) {
 
   op.erase();
   return success();
+}
+
+// Rebuilds `op` (a `HCWorkitemRegionOp` or `HCSubgroupRegionOp`) with
+// the supplied result types, copying the op-kind-specific `captures`
+// attribute through the concrete accessor. Reading `captures` by
+// accessor keeps the pass tied to the ODS surface — a rename in
+// HCOps.td breaks the build here, not at runtime.
+static Operation *rebuildNestedScopeOp(OpBuilder &builder, Location loc,
+                                       Operation *op,
+                                       ArrayRef<Type> newResultTypes) {
+  if (auto wi = dyn_cast<HCWorkitemRegionOp>(op))
+    return HCWorkitemRegionOp::create(builder, loc, newResultTypes,
+                                      wi.getCapturesAttr());
+  if (auto sg = dyn_cast<HCSubgroupRegionOp>(op))
+    return HCSubgroupRegionOp::create(builder, loc, newResultTypes,
+                                      sg.getCapturesAttr());
+  llvm::report_fatal_error(
+      "hc-promote-names: promoteNestedScope dispatched on an op kind it "
+      "doesn't know how to rebuild (pass invariant violation)");
 }
 
 // Promote `op`, a `hc.workitem_region` or `hc.subgroup_region`, as a
@@ -637,8 +712,7 @@ static LogicalResult promoteNestedScope(Operation *op) {
     return success();
   Block &bodyBlock = body.front();
 
-  MLIRContext *ctx = op->getContext();
-  Type undefTy = UndefType::get(ctx);
+  Type undefTy = UndefType::get(op->getContext());
   Location loc = op->getLoc();
 
   OpBuilder outerBuilder(op);
@@ -670,24 +744,8 @@ static LogicalResult promoteNestedScope(Operation *op) {
     carried.push_back(cast<StringAttr>(a));
 
   SmallVector<Type> newResultTypes(carried.size(), undefTy);
-
-  // Only the op-kind choice needs a typed case; the rest of the
-  // surgery is type-erased through `Operation *`. Reading the
-  // `captures` attr through the concrete op accessor (rather than
-  // by string key) keeps the pass tied to the ODS surface — a
-  // rename in HCOps.td breaks the build here, not at runtime.
-  Operation *newOp = nullptr;
-  if (auto wi = dyn_cast<HCWorkitemRegionOp>(op)) {
-    newOp = HCWorkitemRegionOp::create(outerBuilder, loc, newResultTypes,
-                                       wi.getCapturesAttr());
-  } else if (auto sg = dyn_cast<HCSubgroupRegionOp>(op)) {
-    newOp = HCSubgroupRegionOp::create(outerBuilder, loc, newResultTypes,
-                                       sg.getCapturesAttr());
-  } else {
-    llvm::report_fatal_error(
-        "hc-promote-names: promoteNestedScope dispatched on an op kind it "
-        "doesn't know how to rebuild (pass invariant violation)");
-  }
+  Operation *newOp =
+      rebuildNestedScopeOp(outerBuilder, loc, op, newResultTypes);
   newOp->getRegion(0).takeBody(body);
   Block &newBody = newOp->getRegion(0).front();
 
@@ -695,9 +753,6 @@ static LogicalResult promoteNestedScope(Operation *op) {
   // not after. `create` left the builder positioned past `newOp`.
   outerBuilder.setInsertionPoint(newOp);
 
-  // Same lazy-capture scan as the scan-only shape; reads unbound
-  // locally still reach an outer-scope snapshot.
-  //
   // Outer IR has already been restructured here (`takeBody` moved
   // the body out of the old op), so a soft `return failure()` would
   // leave a torn module. Preflight guarantees no user-facing

@@ -240,17 +240,21 @@ def test_group_load_accepts_layout_and_preserves_logical_contents() -> None:
     seen: list[tuple[int, int]] = []
 
     @kernel(work_shape=(1,), group_shape=(1,))
-    def load_layout(group, src: Buffer[2, 3], dst: Buffer[2, 3]) -> None:
+    def load_layout(group, src: Buffer[2, 4], dst: Buffer[2, 3]) -> None:
         tile = group.load(src, shape=(2, 3), layout=_ROW_PADDED_LAYOUT)
         seen.append((tile.layout.storage_size, tile.layout.params["row_stride"]))
         group.store(dst, tile + 1)
 
-    src = np.arange(6, dtype=np.int64).reshape(2, 3)
+    # Padded storage: row stride 4, last column is padding the
+    # logical (2, 3) tile doesn't see. `_ROW_PADDED_LAYOUT`'s
+    # `offset = i * (h+1) + j` skips the padding slot, so the
+    # gather reads the logical 2x3 sub-block out of the flat 8.
+    src = np.array([[0, 1, 2, -1], [3, 4, 5, -1]], dtype=np.int64)
     dst = np.zeros((2, 3), dtype=np.int64)
 
     sim.launch(load_layout, src, dst)
 
-    assert np.array_equal(dst, src + 1)
+    assert np.array_equal(dst, np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int64))
     assert seen == [(8, 4)]
 
 
@@ -457,6 +461,66 @@ def test_layout_out_of_bounds_offset_is_rejected() -> None:
 
     with pytest.raises(sim.SimulatorError, match="out of bounds"):
         as_layout(vec, layout=_OOB_VECTOR_LAYOUT)
+
+
+def test_group_vload_gathers_through_noninjective_broadcast_layout() -> None:
+    # Per-lane row fragment: storage holds a single K-row; the
+    # offset formula `j` ignores `i` and `lane`, so every (i, lane)
+    # pair reads the same K-row out of the flat source. Pins the
+    # gather path's broadcast semantics — under the old contiguous
+    # copy a rank-1 source against a rank-3 logical tile failed at
+    # the rank check before the layout could even speak.
+    M, K, LANE = 2, 4, 3
+    broadcast_layout = index_map(
+        storage_size=lambda M, K, L: K,
+        offset=lambda i, j, lane, M, K, L: j,
+    )
+    seen: list[int] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def broadcast(group, src: Buffer[K], dst: Buffer[M, K, LANE]) -> None:
+        tile = group.vload(src, shape=(M, K, LANE), layout=broadcast_layout)
+        seen.append(tile.layout.storage_size)
+        group.store(dst, tile)
+
+    src = np.array([10, 20, 30, 40], dtype=np.int64)
+    dst = np.zeros((M, K, LANE), dtype=np.int64)
+
+    sim.launch(broadcast, src, dst)
+
+    expected = np.broadcast_to(src.reshape(1, K, 1), (M, K, LANE)).copy()
+    assert np.array_equal(dst, expected)
+    assert seen == [K]
+
+
+def test_group_vload_gather_clips_out_of_bounds_offsets() -> None:
+    # Storage size validates against the layout but flat source may
+    # be smaller (e.g. the user pre-trimmed). OOB offsets clip to a
+    # zero/false slot — same masking contract as the no-layout
+    # overlap copy. Pinning so a future refactor doesn't silently
+    # swap clipping for a hard error.
+    short_then_pad_layout = index_map(
+        storage_size=lambda n: n,
+        offset=lambda i, n: i,
+    )
+    seen_masks: list[np.ndarray] = []
+    seen_data: list[np.ndarray] = []
+
+    @kernel(work_shape=(1,), group_shape=(1,))
+    def short(group, src: Buffer[3], dst: Buffer[5]) -> None:
+        tile = group.vload(src, shape=(5,), layout=short_then_pad_layout)
+        seen_masks.append(tile._mask.copy())
+        seen_data.append(tile._data.copy())
+        group.store(dst, tile.with_inactive(value=-1))
+
+    src = np.array([7, 8, 9], dtype=np.int64)
+    dst = np.zeros((5,), dtype=np.int64)
+
+    sim.launch(short, src, dst)
+
+    assert np.array_equal(dst, np.array([7, 8, 9, -1, -1], dtype=np.int64))
+    assert np.array_equal(seen_masks[0], np.array([True, True, True, False, False]))
+    assert np.array_equal(seen_data[0], np.array([7, 8, 9, 0, 0], dtype=np.int64))
 
 
 def test_resolve_layout_accepts_noninjective_layout() -> None:

@@ -29,10 +29,12 @@ from ._sim_types import (
     LaunchError,
     Poison,
     PoisonError,
+    ResolvedLayout,
     ScopeError,
     SimTensor,
     SimulatorError,
     SimVector,
+    layout_int,
     poison,
     resolve_layout,
 )
@@ -1340,15 +1342,23 @@ def _copy_loaded_value(
     source: Any,
     shape: tuple[int, ...],
     *,
-    layout: Any,
+    layout: ResolvedLayout | None,
 ) -> SimTensor | SimVector:
-    # The simulator keeps dense payloads in logical-shape order; the
-    # layout (if any) rides as metadata for downstream layout-aware
-    # consumers. Non-injective layouts and storage smaller than the
-    # logical shape are validated at `resolve_layout` time but don't
-    # affect the dense copy: the user-facing semantic is "read the
-    # logical tile," and the simulator's job is to present it densely.
     source_data, source_mask = _source_arrays(source)
+    if layout is not None:
+        # Layout-bearing reads interpret the source's flat storage
+        # through `layout.offset` per logical position — mirrors what
+        # `hc-flatten-with-layouts` produces post-lowering and lets
+        # non-injective layouts (broadcasts, per-lane fragments)
+        # observe the actual addressing they encode. Source rank is
+        # irrelevant in this regime; we ravel and gather.
+        return _gather_loaded_value(
+            kind, source_data, source_mask, shape, layout=layout
+        )
+    # No layout: dense logical-shape overlap copy. Layout-less loads
+    # are the simulator's identity contract — the user reads the
+    # logical tile from a matching-rank source, and any source / shape
+    # mismatch surfaces here rather than inside NumPy.
     if source_data.ndim != len(shape):
         raise SimulatorError("load rank does not match the requested shape")
     result_data = np.zeros(shape, dtype=source_data.dtype)
@@ -1358,6 +1368,43 @@ def _copy_loaded_value(
     )
     result_data[overlap] = source_data[overlap]
     result_mask[overlap] = source_mask[overlap]
+    return kind(result_data, result_mask, layout=None)
+
+
+def _gather_loaded_value(
+    kind: type[SimTensor] | type[SimVector],
+    source_data: np.ndarray[Any, np.dtype[Any]],
+    source_mask: np.ndarray[Any, np.dtype[np.bool_]],
+    shape: tuple[int, ...],
+    *,
+    layout: ResolvedLayout,
+) -> SimTensor | SimVector:
+    """Evaluate `layout.offset` per logical position and gather from flat source.
+
+    Minimum-viable form for non-injective layouts: the offset is a
+    pure function of `(index_syms, shape_syms[, params])`, so the
+    O(prod(shape)) Python loop is the same shape as the bounds probe
+    in `_validate_layout_offsets`. OOB offsets clip to a zero / false
+    slot — same masking contract as the contiguous overlap path on
+    the no-layout side. Free-sym layouts are rejected upstream by
+    `resolve_layout`; runtime-bound symbols are the lowering pipeline's
+    job, not the simulator's.
+    """
+    flat_source = np.ravel(source_data)
+    flat_mask = np.ravel(source_mask)
+    result_data = np.zeros(shape, dtype=source_data.dtype)
+    result_mask = np.zeros(shape, dtype=bool)
+    spec = layout.spec
+    params = layout.params
+    for logical_index in _iter_indices(shape):
+        if spec.params is None:
+            raw = spec.offset(*logical_index, *shape)
+        else:
+            raw = spec.offset(*logical_index, *shape, params)
+        offset = layout_int(raw, what="layout offset")
+        if 0 <= offset < flat_source.size:
+            result_data[logical_index] = flat_source[offset]
+            result_mask[logical_index] = flat_mask[offset]
     return kind(result_data, result_mask, layout=layout)
 
 

@@ -877,6 +877,20 @@ What does **not** yet do anything special with non-injective layouts:
   There is no explicit gather primitive; "layout-driven per-thread
   gather" with a dedicated op stays on the deferred list.
 
+What does:
+
+* Simulator `group.load` / `group.vload`. A layout-bearing read
+  ravels the source and reads `flat_source[layout.offset(*logical,
+  *shape[, params])]` per logical position. The same O(prod(shape))
+  walk the bounds probe already runs; OOB offsets clip to a zero /
+  false slot, same masking contract as the no-layout overlap copy.
+  Pinned by `tests/test_simulator.py`
+  (`test_group_vload_gathers_through_noninjective_broadcast_layout`,
+  `test_group_vload_gather_clips_out_of_bounds_offsets`,
+  `test_group_load_accepts_layout_and_preserves_logical_contents`).
+  Free-sym layouts still bail at `resolve_layout` — the simulator
+  has no surrounding kernel scope to bind from.
+
 Non-injectivity is orthogonal to where the symbols *bind*: a layout
 can be injective on its declared `(shape_syms, index_syms)` set yet
 still reference names from the surrounding kernel scope (a
@@ -984,8 +998,9 @@ guarantee `free_syms` is disjoint from `shape_syms` / `index_syms` /
 What the simulator does today: free-sym layouts route through
 `resolve_layout` and bail with a `SimulatorError` that names the
 declared free syms. The simulator path has no surrounding kernel
-scope to query and can't make up runtime values; the gather-path
-work that closes the gap lives on the deferred list. Pinned by
+scope to query and can't make up runtime values. The non-injective
+gather path documented above runs against in-layout symbols only;
+free-sym binding for the simulator is its own follow-up. Pinned by
 `tests/test_simulator.py::test_resolve_layout_rejects_free_syms`.
 
 ### `hc.buffer_view` composes scalar indices into the layout

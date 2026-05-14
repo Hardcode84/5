@@ -425,15 +425,21 @@ def HC_BareShapedValueType : AnyTypeOf<[
   HC_BareVectorType,
 ]>;
 
-// Both flavors at once: used by ops that bridge the semantic / bare
-// split without taking a side (`hc.as_layout`, which is a pure
-// relabel and composes with decomposition).
+// Both flavors at once plus the memory carrier: `hc.as_layout` is a
+// pure relabel that composes with decomposition (semantic ↔ bare) and
+// applies equally to pointer-rooted shaped storage (`!hc.buffer`),
+// since reinterpreting a buffer's access pattern is the motivating
+// shape for WMMA / multibuffered LDS. The storage_size verifier is
+// relaxed for the buffer side — see `HCAsLayoutOp::verify` — because
+// a buffer's named dims are a proxy for the actual allocation, not a
+// declaration of its byte extent.
 def HC_AnyShapedValueType : AnyTypeOf<[
   HC_UndefType,
   HC_TensorType,
   HC_VectorType,
   HC_BareTensorType,
   HC_BareVectorType,
+  HC_BufferType,
 ]>;
 
 def HC_TensorLikeValueType : AnyTypeOf<[

@@ -1638,10 +1638,21 @@ LogicalResult HCAsLayoutOp::verify() {
   if (!valueShape || !resultShape)
     return success();
 
+  // Pointer-rooted shaped values (`!hc.buffer`) hold whatever the
+  // user-supplied allocation contains; the named dims are a proxy for
+  // the addressable extent, not a declaration of the underlying byte
+  // size. A non-injective layout on a buffer (`storage_size <
+  // product(dims)`, e.g. broadcast / per-lane fragment views) is a
+  // legitimate reinterpretation — the gather/scatter path bounds-clips
+  // against the actual flat allocation at runtime, not against the
+  // layout's declared `storage_size`. Skip the structural check when
+  // either side is a buffer; the value-semantic (tensor / vector /
+  // bare) path stays strict because its dims *are* the allocation.
+  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
+    return success();
+
   // `computeStorageSizeExpr` wants every dim entry to be an
-  // `ExprAttr` — buffers' `?` sentinel doesn't appear on `as_layout`
-  // surfaces (the op consumes shaped tensors / vectors that carry
-  // symbolic extents), but a malformed builder could plant one.
+  // `ExprAttr`; a malformed builder could plant a non-Expr placeholder.
   // Skip the check in that case; the cast-to-`ExprAttr` inside
   // `computeStorageSizeExpr` would assert otherwise.
   auto allDimsAreExprs = [](ShapeAttr s) {

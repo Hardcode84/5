@@ -157,6 +157,48 @@ func.func @as_layout_shape_change_storage_match(
                                      offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>
 }
 
+// `hc.as_layout` on a `!hc.buffer` operand accepts a non-injective
+// layout whose `storage_size` does not equal the product of the
+// buffer's named dims. A buffer's named dims are a proxy for its
+// addressable extent — the actual allocation lives behind the
+// pointer and isn't known at IR time. The bounds-clip happens at
+// runtime against the real flat span (gather/scatter path), so a
+// declared `storage_size = K` against `product(M, K, LANE)` is a
+// legitimate broadcast reinterpretation, not a verifier-time error.
+// The value-semantic (tensor / vector / bare) path stays strict —
+// see `verify-hc.mlir` for the negative pin.
+// CHECK-LABEL: func.func @as_layout_buffer_noninjective
+// CHECK: hc.as_layout %{{.*}} : !hc.buffer<f32, ["M", "K", "LANE"]>
+// CHECK-SAME: -> !hc.buffer<f32, ["M", "K", "LANE"], <{{.*}}storage_size = #hc.expr<"k">{{.*}}>>
+func.func @as_layout_buffer_noninjective(
+    %buf: !hc.buffer<f32, ["M", "K", "LANE"]>)
+    -> !hc.buffer<f32, ["M", "K", "LANE"],
+                  #hc.layout<shape_syms = ["m", "k", "l"],
+                             index_syms = ["i", "j", "z"],
+                             params = {},
+                             storage_size = #hc.expr<"k">,
+                             offset = #hc.expr<"j">>> {
+  %v = hc.as_layout %buf,
+       layout = (#hc.layout<shape_syms = ["m", "k", "l"],
+                            index_syms = ["i", "j", "z"],
+                            params = {},
+                            storage_size = #hc.expr<"k">,
+                            offset = #hc.expr<"j">>)
+       : !hc.buffer<f32, ["M", "K", "LANE"]>
+         -> !hc.buffer<f32, ["M", "K", "LANE"],
+                       #hc.layout<shape_syms = ["m", "k", "l"],
+                                  index_syms = ["i", "j", "z"],
+                                  params = {},
+                                  storage_size = #hc.expr<"k">,
+                                  offset = #hc.expr<"j">>>
+  return %v : !hc.buffer<f32, ["M", "K", "LANE"],
+                          #hc.layout<shape_syms = ["m", "k", "l"],
+                                     index_syms = ["i", "j", "z"],
+                                     params = {},
+                                     storage_size = #hc.expr<"k">,
+                                     offset = #hc.expr<"j">>>
+}
+
 // CHECK-LABEL: func.func @allocators
 // CHECK: hc.vzeros shape %{{.*}} : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
 // CHECK: hc.vones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>

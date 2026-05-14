@@ -127,7 +127,17 @@ Inference (`hc-infer-types`) propagates layouts:
   `layout.storage_size`. `hc.as_layout` itself stays useful for the
   explicit `.as_layout(...)` surface — e.g. reinterpreting a value
   returned from elsewhere, or shape-changing reinterprets — and its
-  storage_size verifier still runs in that path.
+  storage_size verifier still runs in that path for value-semantic
+  operands (tensor / vector / bare) where the dims *are* the
+  allocation. For pointer-rooted operands (`!hc.buffer`) the storage
+  check is skipped: a buffer's named dims are a proxy for the
+  addressable extent, not a declaration of its byte size, so layouts
+  whose `storage_size` legitimately diverges from `product(dims)`
+  (broadcasts, per-lane WMMA fragments, multibuffered LDS reinterprets)
+  are accepted on the ptr side. The runtime gather/scatter path bounds-
+  clips against the real flat allocation rather than the layout's
+  declared `storage_size`. Element-type and shape-rank checks stay
+  strict on both sides.
 * `hc.buffer_view`: a layout-bearing source composes scalar subscripts
   and non-trivial slice rebinds into the residual layout —
   `index_syms[k]` substitutes the scalar's expression, `shape_syms[k]`

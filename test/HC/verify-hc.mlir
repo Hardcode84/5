@@ -504,6 +504,48 @@ module {
 
 // -----
 
+// Value-semantic (`!hc.vector`) operand: dims *are* the allocation,
+// so the storage_size check stays strict. A layout declaring
+// `storage_size = k` against `product(M, K, LANE) = M*K*LANE` is a
+// real mismatch (a non-injective overlay would require pointer-rooted
+// storage to back the broadcast, and the gather-on-read contract).
+// The pointer-rooted (`!hc.buffer`) relaxation in
+// `HCAsLayoutOp::verify` is the dual of this pin; both paths
+// exercise `computeStorageSizeExpr` to keep the helper honest.
+// CHECK: error: 'hc.as_layout' op storage size mismatch: operand addresses #hc.expr<"K*LANE*M"> elements, result layout addresses #hc.expr<"K">; hc.as_layout reinterprets without resizing
+module {
+  func.func @bad(
+      %src: !hc.vector<f32, ["M", "K", "LANE"]>)
+      -> !hc.vector<f32, ["M", "K", "LANE"],
+                    #hc.layout<shape_syms = ["m", "k", "l"],
+                               index_syms = ["i", "j", "z"],
+                               params = {},
+                               storage_size = #hc.expr<"k">,
+                               offset = #hc.expr<"j">>> {
+    %v = hc.as_layout %src,
+         layout = (#hc.layout<shape_syms = ["m", "k", "l"],
+                              index_syms = ["i", "j", "z"],
+                              params = {},
+                              storage_size = #hc.expr<"k">,
+                              offset = #hc.expr<"j">>)
+         : !hc.vector<f32, ["M", "K", "LANE"]>
+           -> !hc.vector<f32, ["M", "K", "LANE"],
+                         #hc.layout<shape_syms = ["m", "k", "l"],
+                                    index_syms = ["i", "j", "z"],
+                                    params = {},
+                                    storage_size = #hc.expr<"k">,
+                                    offset = #hc.expr<"j">>>
+    return %v : !hc.vector<f32, ["M", "K", "LANE"],
+                            #hc.layout<shape_syms = ["m", "k", "l"],
+                                       index_syms = ["i", "j", "z"],
+                                       params = {},
+                                       storage_size = #hc.expr<"k">,
+                                       offset = #hc.expr<"j">>>
+  }
+}
+
+// -----
+
 // Element-type mismatch is also caught: as_layout is a relabel of
 // addressing, not of payload type. The diagnostic flags the type
 // pair so the misuse is clear.

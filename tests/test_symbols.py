@@ -250,6 +250,29 @@ def test_context_mismatch_raises() -> None:
         _ = lhs + rhs
 
 
+def test_floor_ceil_propagate_non_default_context() -> None:
+    # `Symbol // int` and `Symbol % int` (and their floor/ceil
+    # building blocks) must succeed for symbols whose context is not
+    # the module-default one; `_resolve._index_map_ref` builds a fresh
+    # `Context()` per IndexMap classification, so any non-default-ctx
+    # failure here cascades into "layout descriptor offset(...) raised
+    # ContextMismatchError" at the use site.
+    ctx = hs.Context()
+    syms = hs.SymbolNamespace(ctx)
+    lane = syms["lane"]
+    fi = syms["fi"]
+
+    floored = hs.floor(lane / 16)
+    assert floored.ctx is ctx
+
+    ceiled = hs.ceil(lane / 16)
+    assert ceiled.ctx is ctx
+
+    # Composed forms — the WMMA per-lane fragment offset shape.
+    offset = (lane // 16 + fi * 2) * 16 + (lane % 16)
+    assert offset.ctx is ctx
+
+
 def test_parse_reports_symbol_error() -> None:
     with pytest.raises(hs.SymbolError, match="parse error"):
         hs.parse("W +")

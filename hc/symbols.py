@@ -482,12 +482,21 @@ def rat(num: int, den: int) -> Expr:
 
 
 def floor(expr: ExprLike) -> Expr:
-    coerced = _coerce_expr(expr)
+    # `_coerce_expr(expr)` defaults to `_default_context()` when called
+    # without an explicit ctx, so an `Expr` from a non-default context
+    # (e.g. one the `_resolve._index_map_ref` classifier built) would
+    # trip `_ensure_same_context`. Take the input's context up front
+    # whenever the caller already produced an `Expr`; this lines up with
+    # how the binary helpers resolve ctx via `_coerce_binary_exprs`.
+    ctx = expr.ctx if isinstance(expr, Node) else None
+    coerced = _coerce_expr(expr, ctx)
     return _wrap_expr(_ixs.floor(coerced._raw), coerced.ctx)
 
 
 def ceil(expr: ExprLike) -> Expr:
-    coerced = _coerce_expr(expr)
+    # Same context-propagation rule as `floor` above.
+    ctx = expr.ctx if isinstance(expr, Node) else None
+    coerced = _coerce_expr(expr, ctx)
     return _wrap_expr(_ixs.ceil(coerced._raw), coerced.ctx)
 
 

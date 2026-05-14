@@ -62,12 +62,6 @@ lib/IR/HCOps.cpp:parseGenericAmbientClause
 lib/IR/HCOps.cpp:parseGenericIterClause
 lib/IR/HCOps.cpp:parseGenericOperandClause
 lib/IR/HCOps.cpp:parseOptionalFunctionSignature
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteBufferView
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteGenericOp
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:shapeFromAllocOperand
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:substituteAndOptionallyDropAxis
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:substituteInType
-lib/Transforms/HCDistributeWaveLayoutsPass.cpp:tryFactorWaveLayout
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:buildFlattenAuxArgsMeta
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:collectImplicitSyms
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:composeAccessBaseOffset

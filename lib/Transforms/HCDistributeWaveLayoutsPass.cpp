@@ -147,47 +147,48 @@ static bool referencesSymbol(sym::PredHandle pred, StringRef target) {
   return found;
 }
 
-// Try to factor `layout.offset` along `layout.index_syms[0]`.
-// Returns nullopt when the offset isn't affine in the lane sym with a
-// constant stride, or the layout / shape parities don't support a
-// clean lane distribution.
-static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
-                                                            ShapeAttr shape,
-                                                            int64_t waveSize,
-                                                            sym::Store &store) {
+// True iff `layout` and `shape` agree on rank: both must be present,
+// non-empty, and index_syms / shape_syms / dims share the same arity.
+static bool layoutShapeHaveMatchedRank(LayoutAttr layout, ShapeAttr shape) {
   if (!layout || !shape)
-    return std::nullopt;
+    return false;
   ArrayRef<Attribute> indexSyms = layout.getIndexSyms();
   ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
   ArrayRef<Attribute> dims = shape.getDims();
   if (indexSyms.empty() || shapeSyms.empty() || dims.empty())
-    return std::nullopt;
-  if (indexSyms.size() != dims.size() || shapeSyms.size() != dims.size())
-    return std::nullopt;
+    return false;
+  return indexSyms.size() == dims.size() && shapeSyms.size() == dims.size();
+}
 
-  auto laneSymAttr = dyn_cast<StringAttr>(indexSyms[0]);
-  if (!laneSymAttr)
+// Validate the layout / shape headers and pull the lane index sym
+// name off the leading entry. Returns nullopt if the layout / shape
+// don't agree on rank, the leading index sym isn't a StringAttr, or
+// the leading shape dim doesn't match the wave extent.
+static std::optional<StringRef>
+extractWaveLaneSym(LayoutAttr layout, ShapeAttr shape, int64_t waveSize) {
+  if (!layoutShapeHaveMatchedRank(layout, shape))
     return std::nullopt;
-  StringRef laneSym = laneSymAttr.getValue();
-
-  auto firstDim = dyn_cast<ExprAttr>(dims[0]);
-  if (!firstDim)
+  auto laneSymAttr = dyn_cast<StringAttr>(layout.getIndexSyms()[0]);
+  auto firstDim = dyn_cast<ExprAttr>(shape.getDims()[0]);
+  if (!laneSymAttr || !firstDim)
     return std::nullopt;
   auto firstDimInt = sym::getIntegerLiteralValue(firstDim.getValue());
   if (!firstDimInt || *firstDimInt != waveSize)
     return std::nullopt;
+  return laneSymAttr.getValue();
+}
 
-  sym::ExprHandle offset = layout.getOffset().getValue();
-  // Residue = offset[lane := 0].
+// Probe the lane axis of `offset` for an affine factorization: the
+// residue at `lane := 0` must not still mention `lane`, and `offset[lane :=
+// 1] - residue` must be a positive constant stride. Caller has
+// already validated the layout / shape headers.
+static std::optional<std::pair<sym::ExprHandle, int64_t>>
+probeLaneStride(sym::Store &store, sym::ExprHandle offset, StringRef laneSym) {
   auto residue = substituteInt(store, offset, laneSym, 0);
   if (failed(residue))
     return std::nullopt;
-  // Residue must not still mention the lane sym (i.e. offset is
-  // separable in lane).
   if (referencesSymbol(*residue, laneSym))
     return std::nullopt;
-  // Stride probe: offset[lane := 1] - residue. If the result is a
-  // constant integer the offset is linear in `lane` with that stride.
   auto laneIs1 = substituteInt(store, offset, laneSym, 1);
   if (failed(laneIs1))
     return std::nullopt;
@@ -199,22 +200,25 @@ static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
   if (failed(strideExpr))
     return std::nullopt;
   auto strideInt = sym::getIntegerLiteralValue(*strideExpr);
-  if (!strideInt)
+  if (!strideInt || *strideInt <= 0)
     return std::nullopt;
-  int64_t laneStride = *strideInt;
-  if (laneStride <= 0)
-    return std::nullopt;
+  return std::make_pair(*residue, *strideInt);
+}
 
-  // Storage size must be a constant divisible by wave_size, and the
-  // wave's span `lane_stride * (wave_size - 1) + 1` must fit. The
-  // simplest sufficient condition the v0 recogniser accepts is
-  // `storage_size == lane_stride * wave_size * <per_lane_extent>` for
-  // some positive per-lane extent — i.e. the lane axis tiles
-  // `lane_stride * wave_size` slots, leaving the residual to encode
-  // the per-lane extent. We don't enforce the exact tiling here; the
-  // storage_size of the per-lane peer is just `storage_size /
-  // wave_size`.
-  ExprAttr storageAttr = layout.getStorageSize();
+// Validate that `storage_size` is a positive constant divisible by
+// `waveSize`; produce `storage_size / waveSize` as the per-lane peer's
+// storage extent.
+//
+// The simplest sufficient condition the v0 recogniser accepts is
+// `storage_size == lane_stride * wave_size * <per_lane_extent>` for
+// some positive per-lane extent — i.e. the lane axis tiles
+// `lane_stride * wave_size` slots, leaving the residual to encode
+// the per-lane extent. We don't enforce the exact tiling here; the
+// storage_size of the per-lane peer is just `storage_size /
+// wave_size`.
+static std::optional<sym::ExprHandle>
+computePerLaneStorage(sym::Store &store, ExprAttr storageAttr,
+                      int64_t waveSize) {
   auto storageInt = sym::getIntegerLiteralValue(storageAttr.getValue());
   if (!storageInt || *storageInt <= 0)
     return std::nullopt;
@@ -223,8 +227,33 @@ static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
   auto perLaneStorage = sym::composeExprInt(store, *storageInt / waveSize);
   if (failed(perLaneStorage))
     return std::nullopt;
+  return *perLaneStorage;
+}
 
-  return WaveFactorization{*residue, laneStride, *perLaneStorage, laneSym};
+// Try to factor `layout.offset` along `layout.index_syms[0]`.
+// Returns nullopt when the offset isn't affine in the lane sym with a
+// constant stride, or the layout / shape parities don't support a
+// clean lane distribution.
+static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
+                                                            ShapeAttr shape,
+                                                            int64_t waveSize,
+                                                            sym::Store &store) {
+  auto laneSym = extractWaveLaneSym(layout, shape, waveSize);
+  if (!laneSym)
+    return std::nullopt;
+
+  auto strideOr =
+      probeLaneStride(store, layout.getOffset().getValue(), *laneSym);
+  if (!strideOr)
+    return std::nullopt;
+
+  auto perLaneStorage =
+      computePerLaneStorage(store, layout.getStorageSize(), waveSize);
+  if (!perLaneStorage)
+    return std::nullopt;
+
+  return WaveFactorization{strideOr->first, strideOr->second, *perLaneStorage,
+                           *laneSym};
 }
 
 // Compute the per-lane peer of `shaped`: drop the first shape dim and
@@ -319,29 +348,32 @@ static LogicalResult patchAllocShape(Operation *op, Value newShape,
   return success();
 }
 
-// Read the alloc op's `shape` SSA tuple's element types and return
-// the per-axis dim exprs they pin. Each tuple element must be
-// `!hc.idx<dim>` with a pinned expression; anything else returns
-// nullopt (we'd have no signal to compare against the result type's
+// Extract the `shape` SSA tuple operand off any of the six
+// nullary / fill alloc ops the rewrite touches. Returns null for
+// anything else.
+static Value getAllocShapeOperand(Operation *op) {
+  if (auto vz = dyn_cast<HCVZerosOp>(op))
+    return vz.getShape();
+  if (auto vo = dyn_cast<HCVOnesOp>(op))
+    return vo.getShape();
+  if (auto vf = dyn_cast<HCVFullOp>(op))
+    return vf.getShape();
+  if (auto z = dyn_cast<HCZerosOp>(op))
+    return z.getShape();
+  if (auto o = dyn_cast<HCOnesOp>(op))
+    return o.getShape();
+  if (auto f = dyn_cast<HCFullOp>(op))
+    return f.getShape();
+  return Value{};
+}
+
+// Pull pinned `!hc.idx<dim>` expressions off a `tuple<!hc.idx<...>,
+// ...>` type. Returns nullopt when any element isn't a pinned idx
+// (the rewriter has no signal to compare against the result type's
 // shape).
 static std::optional<SmallVector<Attribute>>
-shapeFromAllocOperand(Operation *op) {
-  Value shape;
-  if (auto vz = dyn_cast<HCVZerosOp>(op))
-    shape = vz.getShape();
-  else if (auto vo = dyn_cast<HCVOnesOp>(op))
-    shape = vo.getShape();
-  else if (auto vf = dyn_cast<HCVFullOp>(op))
-    shape = vf.getShape();
-  else if (auto z = dyn_cast<HCZerosOp>(op))
-    shape = z.getShape();
-  else if (auto o = dyn_cast<HCOnesOp>(op))
-    shape = o.getShape();
-  else if (auto f = dyn_cast<HCFullOp>(op))
-    shape = f.getShape();
-  else
-    return std::nullopt;
-  auto tupleTy = dyn_cast<TupleType>(shape.getType());
+pinnedDimsFromIdxTuple(Type tupleType) {
+  auto tupleTy = dyn_cast<TupleType>(tupleType);
   if (!tupleTy)
     return std::nullopt;
   SmallVector<Attribute> dims;
@@ -356,6 +388,16 @@ shapeFromAllocOperand(Operation *op) {
     dims.push_back(expr);
   }
   return dims;
+}
+
+// Read the alloc op's `shape` SSA tuple's element types and return
+// the per-axis dim exprs they pin.
+static std::optional<SmallVector<Attribute>>
+shapeFromAllocOperand(Operation *op) {
+  Value shape = getAllocShapeOperand(op);
+  if (!shape)
+    return std::nullopt;
+  return pinnedDimsFromIdxTuple(shape.getType());
 }
 
 // Update a wave-distributable nullary / fill alloc to match the type
@@ -485,64 +527,84 @@ static LayoutAttr substituteLayoutAttr(MLIRContext *ctx, sym::Store &store,
                          layout.getParams(), newStorage, newOffset);
 }
 
+// Per-type-kind handlers for `substituteInType`. Each returns the
+// rewritten type, `ty` when nothing changed, or `Type{}` (i.e. null)
+// on a substitution failure the caller propagates upstream.
+static Type substituteInIdx(MLIRContext *ctx, sym::Store &store, IdxType ty,
+                            StringRef targetName, sym::ExprHandle replacement) {
+  auto e = ty.getExpr();
+  if (!e)
+    return ty;
+  auto newAttr = substituteExprAttr(ctx, store, e, targetName, replacement);
+  if (!newAttr)
+    return Type();
+  if (newAttr == e)
+    return ty;
+  return IdxType::get(ctx, newAttr);
+}
+
+static Type substituteInPred(MLIRContext *ctx, sym::Store &store, PredType ty,
+                             StringRef targetName,
+                             sym::ExprHandle replacement) {
+  auto p = ty.getPred();
+  if (!p || !referencesSymbol(p.getValue(), targetName))
+    return ty;
+  auto subs = substituteOnePred(store, p.getValue(), targetName, replacement);
+  if (failed(subs))
+    return Type();
+  return PredType::get(ctx, PredAttr::get(ctx, *subs));
+}
+
+static Type substituteInSlice(MLIRContext *ctx, sym::Store &store, SliceType ty,
+                              StringRef targetName,
+                              sym::ExprHandle replacement) {
+  Type lo =
+      substituteInType(ctx, store, ty.getLowerType(), targetName, replacement);
+  Type hi =
+      substituteInType(ctx, store, ty.getUpperType(), targetName, replacement);
+  Type step =
+      substituteInType(ctx, store, ty.getStepType(), targetName, replacement);
+  if (lo == ty.getLowerType() && hi == ty.getUpperType() &&
+      step == ty.getStepType())
+    return ty;
+  return SliceType::get(ctx, lo, hi, step);
+}
+
+static Type substituteInShaped(MLIRContext *ctx, sym::Store &store,
+                               SymbolicallyShapedTypeInterface ty,
+                               StringRef targetName,
+                               sym::ExprHandle replacement) {
+  ShapeAttr newShape = substituteShapeAttr(ctx, store, ty.getSymbolicShape(),
+                                           targetName, replacement);
+  LayoutAttr newLayout = substituteLayoutAttr(
+      ctx, store, ty.getSymbolicLayout(), targetName, replacement);
+  if (!newShape)
+    return Type();
+  Type result = ty;
+  if (newShape != ty.getSymbolicShape())
+    result = ty.cloneWithSymbolicShape(newShape);
+  if (newLayout != ty.getSymbolicLayout()) {
+    auto asShaped = dyn_cast<SymbolicallyShapedTypeInterface>(result);
+    if (!asShaped)
+      return Type();
+    result = asShaped.cloneWithSymbolicLayout(newLayout);
+  }
+  return result;
+}
+
 static Type substituteInType(MLIRContext *ctx, sym::Store &store, Type ty,
                              StringRef targetName,
                              sym::ExprHandle replacement) {
   if (!ty)
     return ty;
-  if (auto idx = dyn_cast<IdxType>(ty)) {
-    if (auto e = idx.getExpr()) {
-      auto newAttr = substituteExprAttr(ctx, store, e, targetName, replacement);
-      if (!newAttr)
-        return Type();
-      if (newAttr == e)
-        return ty;
-      return IdxType::get(ctx, newAttr);
-    }
-    return ty;
-  }
-  if (auto pred = dyn_cast<PredType>(ty)) {
-    if (auto p = pred.getPred()) {
-      if (!referencesSymbol(p.getValue(), targetName))
-        return ty;
-      auto subs =
-          substituteOnePred(store, p.getValue(), targetName, replacement);
-      if (failed(subs))
-        return Type();
-      return PredType::get(ctx, PredAttr::get(ctx, *subs));
-    }
-    return ty;
-  }
-  if (auto slice = dyn_cast<SliceType>(ty)) {
-    Type lo = substituteInType(ctx, store, slice.getLowerType(), targetName,
-                               replacement);
-    Type hi = substituteInType(ctx, store, slice.getUpperType(), targetName,
-                               replacement);
-    Type step = substituteInType(ctx, store, slice.getStepType(), targetName,
-                                 replacement);
-    if (lo == slice.getLowerType() && hi == slice.getUpperType() &&
-        step == slice.getStepType())
-      return ty;
-    return SliceType::get(ctx, lo, hi, step);
-  }
-  if (auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(ty)) {
-    ShapeAttr newShape = substituteShapeAttr(
-        ctx, store, shaped.getSymbolicShape(), targetName, replacement);
-    LayoutAttr newLayout = substituteLayoutAttr(
-        ctx, store, shaped.getSymbolicLayout(), targetName, replacement);
-    if (!newShape)
-      return Type();
-    Type result = ty;
-    if (newShape != shaped.getSymbolicShape())
-      result = shaped.cloneWithSymbolicShape(newShape);
-    if (newLayout != shaped.getSymbolicLayout()) {
-      auto asShaped = dyn_cast<SymbolicallyShapedTypeInterface>(result);
-      if (!asShaped)
-        return Type();
-      result = asShaped.cloneWithSymbolicLayout(newLayout);
-    }
-    return result;
-  }
+  if (auto idx = dyn_cast<IdxType>(ty))
+    return substituteInIdx(ctx, store, idx, targetName, replacement);
+  if (auto pred = dyn_cast<PredType>(ty))
+    return substituteInPred(ctx, store, pred, targetName, replacement);
+  if (auto slice = dyn_cast<SliceType>(ty))
+    return substituteInSlice(ctx, store, slice, targetName, replacement);
+  if (auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(ty))
+    return substituteInShaped(ctx, store, shaped, targetName, replacement);
   return ty;
 }
 
@@ -573,6 +635,31 @@ static LogicalResult substituteInRegionBody(Region &region, sym::Store &store,
   return success(!walkResult.wasInterrupted());
 }
 
+// Substitute `laneIterSym -> waveExpr` in one operand's per-axis
+// offset array, optionally dropping the leading axis. Returns null
+// on a malformed entry, a failed substitution, or a drop-from-empty.
+static ArrayAttr substituteOneOperandOffsets(MLIRContext *ctx, ArrayAttr inner,
+                                             StringRef laneIterSym,
+                                             sym::ExprHandle waveExpr,
+                                             sym::Store &store,
+                                             bool dropLeading) {
+  if (dropLeading && inner.empty())
+    return ArrayAttr{};
+  SmallVector<Attribute> rewritten;
+  rewritten.reserve(inner.size());
+  size_t start = dropLeading ? 1u : 0u;
+  for (size_t i = start; i < inner.size(); ++i) {
+    auto expr = dyn_cast<ExprAttr>(inner[i]);
+    if (!expr)
+      return ArrayAttr{};
+    auto subs = substituteOne(store, expr.getValue(), laneIterSym, waveExpr);
+    if (failed(subs))
+      return ArrayAttr{};
+    rewritten.push_back(ExprAttr::get(ctx, *subs));
+  }
+  return ArrayAttr::get(ctx, rewritten);
+}
+
 // Apply the lane-iter substitution to an entire operand-major offsets
 // attribute (`outs_offsets` / `ins_offsets` on `hc.generic`). The
 // outer array maps to operands; per-operand arrays are per-axis
@@ -594,21 +681,11 @@ substituteAndOptionallyDropAxis(MLIRContext *ctx, ArrayAttr perOperandOffsets,
     auto inner = dyn_cast<ArrayAttr>(entry);
     if (!inner)
       return ArrayAttr{};
-    SmallVector<Attribute> rewritten;
-    rewritten.reserve(inner.size());
-    size_t start = dropLeading[k] ? 1u : 0u;
-    if (dropLeading[k] && inner.empty())
+    ArrayAttr rewritten = substituteOneOperandOffsets(
+        ctx, inner, laneIterSym, *waveExpr, store, dropLeading[k]);
+    if (!rewritten)
       return ArrayAttr{};
-    for (size_t i = start; i < inner.size(); ++i) {
-      auto expr = dyn_cast<ExprAttr>(inner[i]);
-      if (!expr)
-        return ArrayAttr{};
-      auto subs = substituteOne(store, expr.getValue(), laneIterSym, *waveExpr);
-      if (failed(subs))
-        return ArrayAttr{};
-      rewritten.push_back(ExprAttr::get(ctx, *subs));
-    }
-    outer.push_back(ArrayAttr::get(ctx, rewritten));
+    outer.push_back(rewritten);
   }
   return ArrayAttr::get(ctx, outer);
 }
@@ -631,70 +708,118 @@ substituteAndOptionallyDropAxis(MLIRContext *ctx, ArrayAttr perOperandOffsets,
 //   * the generic carries reduction iters that name the lane iter sym
 //     (a wave reduction across the dropped axis would lose its
 //     accumulator semantics under the rewrite).
-static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
-                                      StringRef waveSym, sym::Store &store) {
-  MLIRContext *ctx = op.getContext();
-
-  ArrayAttr insOffsets = op.getInsOffsets();
-  ArrayAttr outsOffsets = op.getOutsOffsets();
-  // ValueRange views into `op`'s operand storage go stale the moment
-  // we mutate the operand list (the iter_bounds shrink below shifts
-  // the ins / outs segments earlier). Snapshot the SSA values into
-  // owned storage so subsequent `setType` calls land on the original
-  // outs operands, not the operand slot that used to hold them.
-  SmallVector<Value> ins(op.getIns().begin(), op.getIns().end());
-  SmallVector<Value> outs(op.getOuts().begin(), op.getOuts().end());
-
-  // Identify wave-distributable outs and the lane iter sym they share.
-  SmallVector<bool> outsDropLeading(outs.size(), false);
-  SmallVector<bool> insDropLeading(ins.size(), false);
-  SmallVector<Type> newOutsTypes(outs.size());
-  for (auto [k, out] : llvm::enumerate(outs))
-    newOutsTypes[k] = out.getType();
-
+// Bundles the classification state computed by `classifyWaveOuts`
+// before any IR mutation: the shared lane iter sym, per-out drop
+// flags, and the rewritten per-out types.
+struct WaveOutsClassification {
   StringRef laneIterSym;
+  SmallVector<bool> outsDropLeading;
+  SmallVector<Type> newOutsTypes;
+};
+
+// Pull the leading bare iter sym off operand `k`'s per-axis offset
+// array; failure means a malformed offsets entry the caller treats
+// as fatal.
+static FailureOr<StringRef>
+readLeadingIterSymOnOperand(ArrayAttr offsets, size_t k, sym::Store &store) {
+  auto perOperand = dyn_cast<ArrayAttr>(offsets[k]);
+  if (!perOperand || perOperand.empty())
+    return failure();
+  auto leading = dyn_cast<ExprAttr>(perOperand[0]);
+  if (!leading)
+    return failure();
+  auto iterSym = getBareIterSym(leading, store);
+  if (!iterSym)
+    return failure();
+  return *iterSym;
+}
+
+// True iff `out` carries a wave-distributable layout; if so, sets
+// `*factor` to the factorization (caller owns the lifetime). Reads
+// the layout + shape off the type interface.
+static bool isWaveDistributableOuts(Value out, int64_t waveSize,
+                                    sym::Store &store,
+                                    std::optional<WaveFactorization> &factor) {
+  factor.reset();
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(out.getType());
+  if (!shaped)
+    return false;
+  auto layout = shaped.getSymbolicLayout();
+  if (!layout)
+    return false;
+  factor =
+      tryFactorWaveLayout(layout, shaped.getSymbolicShape(), waveSize, store);
+  return factor.has_value();
+}
+
+// Inspect one outs operand `out` at index `k` and update
+// `classification` if it's a wave-distributable carrier. Returns
+// failure for outs whose offset array's leading entry can't be
+// resolved to a bare iter sym (we couldn't identify the lane axis
+// structurally) or whose distributed type can't be computed; signals
+// "non-wave outs, skip" via success() with `matched` set false.
+static LogicalResult tryClassifyWaveOut(Value out, size_t k,
+                                        ArrayAttr outsOffsets, int64_t waveSize,
+                                        StringRef waveSym, sym::Store &store,
+                                        WaveOutsClassification &c,
+                                        bool &matched) {
+  matched = false;
+  std::optional<WaveFactorization> factor;
+  if (!isWaveDistributableOuts(out, waveSize, store, factor))
+    return success();
+  auto iterSym = readLeadingIterSymOnOperand(outsOffsets, k, store);
+  if (failed(iterSym))
+    return failure();
+  if (!c.laneIterSym.empty() && *iterSym != c.laneIterSym)
+    return failure();
+  auto shaped = cast<SymbolicallyShapedTypeInterface>(out.getType());
+  Type newTy =
+      distributedTypeMaybeBare(shaped, waveSize, waveSym, store, *factor);
+  if (!newTy)
+    return failure();
+  c.laneIterSym = *iterSym;
+  c.outsDropLeading[k] = true;
+  c.newOutsTypes[k] = newTy;
+  matched = true;
+  return success();
+}
+
+// First pass: identify every wave-distributable outs operand and the
+// lane iter sym they share. Returns failure when at least one outs is
+// wave-distributable but resolution against the offsets attribute
+// fails, or when none are wave-distributable (nothing to rewrite).
+static FailureOr<WaveOutsClassification>
+classifyWaveOuts(ArrayRef<Value> outs, ArrayAttr outsOffsets, int64_t waveSize,
+                 StringRef waveSym, sym::Store &store) {
+  WaveOutsClassification c;
+  c.outsDropLeading.assign(outs.size(), false);
+  c.newOutsTypes.resize(outs.size());
+  for (auto [k, out] : llvm::enumerate(outs))
+    c.newOutsTypes[k] = out.getType();
   bool anyWaveOuts = false;
   for (auto [k, out] : llvm::enumerate(outs)) {
-    auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(out.getType());
-    if (!shaped)
-      continue;
-    auto layout = shaped.getSymbolicLayout();
-    if (!layout)
-      continue;
-    auto factor =
-        tryFactorWaveLayout(layout, shaped.getSymbolicShape(), waveSize, store);
-    if (!factor)
-      continue;
-    // The outs offset array must start with the lane iter sym so we
-    // can identify which iter axis to drop.
-    auto perOperand = dyn_cast<ArrayAttr>(outsOffsets[k]);
-    if (!perOperand || perOperand.empty())
+    bool matched = false;
+    if (failed(tryClassifyWaveOut(out, k, outsOffsets, waveSize, waveSym, store,
+                                  c, matched)))
       return failure();
-    auto leading = dyn_cast<ExprAttr>(perOperand[0]);
-    if (!leading)
-      return failure();
-    auto iterSym = getBareIterSym(leading, store);
-    if (!iterSym)
-      return failure();
-    if (!laneIterSym.empty() && *iterSym != laneIterSym)
-      return failure();
-    laneIterSym = *iterSym;
-    outsDropLeading[k] = true;
-    Type newTy =
-        distributedTypeMaybeBare(shaped, waveSize, waveSym, store, *factor);
-    if (!newTy)
-      return failure();
-    newOutsTypes[k] = newTy;
-    anyWaveOuts = true;
+    anyWaveOuts |= matched;
   }
   if (!anyWaveOuts)
     return failure();
+  return c;
+}
 
-  // Also identify wave-distributable INS so we can drop their leading
-  // offset axis in lockstep. The ins carrier is typically the same
-  // wave-cooperative value the outs writes (e.g. a `hc.buffer_view`
-  // forward that the rewrite collapses), but the rewrite handles both
-  // forms via the same offset-leading-iter-sym detector.
+// Second pass: identify wave-distributable INS so their leading
+// offset axis drops in lockstep with the outs side. The ins carrier
+// is typically the same wave-cooperative value the outs writes (e.g.
+// a `hc.buffer_view` forward the rewrite collapses), but the
+// rewrite handles both forms via the same offset-leading-iter-sym
+// detector. Soft-skip semantics — anything that doesn't look like a
+// wave-distributable ins is left alone; we don't reject the rewrite.
+static SmallVector<bool>
+classifyWaveIns(ArrayRef<Value> ins, ArrayAttr insOffsets, int64_t waveSize,
+                StringRef waveSym, StringRef laneIterSym, sym::Store &store) {
+  SmallVector<bool> insDropLeading(ins.size(), false);
   for (auto [k, in] : llvm::enumerate(ins)) {
     auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(in.getType());
     if (!shaped)
@@ -713,69 +838,76 @@ static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
     if (!leading)
       continue;
     auto iterSym = getBareIterSym(leading, store);
-    if (!iterSym)
-      continue;
-    if (*iterSym != laneIterSym)
+    if (!iterSym || *iterSym != laneIterSym)
       continue;
     insDropLeading[k] = true;
   }
+  return insDropLeading;
+}
 
-  ArrayAttr iterSyms = op.getIterSyms();
-  ValueRange iterBounds = op.getIterBounds();
-  ArrayAttr iterKinds = op.getIterKinds();
-  // Find the lane iter axis position by name.
-  std::optional<size_t> lanePos;
+// Locate the lane iter sym's index inside `iterSyms` and validate
+// it's `Parallel`. A reduction over the lane axis would be a wave
+// reduction the v0 doesn't model.
+static FailureOr<size_t> findAndValidateLaneIterPos(ArrayAttr iterSyms,
+                                                    ArrayAttr iterKinds,
+                                                    StringRef laneIterSym) {
   for (auto [i, s] : llvm::enumerate(iterSyms)) {
-    if (cast<StringAttr>(s).getValue() == laneIterSym) {
-      lanePos = i;
-      break;
-    }
-  }
-  if (!lanePos)
-    return failure();
-  // The dropped iter must be parallel (a reduction over the lane axis
-  // is a wave reduction the v0 doesn't model).
-  if (cast<IterKindAttr>(iterKinds[*lanePos]).getValue() != IterKind::Parallel)
-    return failure();
-
-  // Rebuild iter lists with the lane axis removed.
-  SmallVector<Attribute> newIterSymAttrs;
-  SmallVector<Value> newIterBounds;
-  SmallVector<Attribute> newIterKindAttrs;
-  newIterSymAttrs.reserve(iterSyms.size() - 1);
-  newIterBounds.reserve(iterBounds.size() - 1);
-  newIterKindAttrs.reserve(iterKinds.size() - 1);
-  for (auto [i, s] : llvm::enumerate(iterSyms)) {
-    if (i == *lanePos)
+    if (cast<StringAttr>(s).getValue() != laneIterSym)
       continue;
-    newIterSymAttrs.push_back(s);
-    newIterBounds.push_back(iterBounds[i]);
-    newIterKindAttrs.push_back(iterKinds[i]);
+    if (cast<IterKindAttr>(iterKinds[i]).getValue() != IterKind::Parallel)
+      return failure();
+    return i;
   }
+  return failure();
+}
 
-  // Substitute lane iter sym with waveSym in every remaining offset
-  // expression on both ins and outs.
-  ArrayAttr newInsOffsets = substituteAndOptionallyDropAxis(
-      ctx, insOffsets, laneIterSym, waveSym, store, insDropLeading);
-  ArrayAttr newOutsOffsets = substituteAndOptionallyDropAxis(
-      ctx, outsOffsets, laneIterSym, waveSym, store, outsDropLeading);
-  if (!newInsOffsets || !newOutsOffsets)
-    return failure();
+// Bundles the iter-list slices after dropping the lane axis.
+struct IterListsMinusLane {
+  SmallVector<Attribute> syms;
+  SmallVector<Value> bounds;
+  SmallVector<Attribute> kinds;
+};
 
-  // Apply mutations: iter lists, offset attrs, operand types, result
-  // types.
-  op.setIterSymsAttr(ArrayAttr::get(ctx, newIterSymAttrs));
-  op.getIterBoundsMutable().assign(newIterBounds);
-  op.setIterKindsAttr(ArrayAttr::get(ctx, newIterKindAttrs));
+// Rebuild the per-axis iter lists with the lane axis at `lanePos`
+// removed.
+static IterListsMinusLane buildIterListsWithoutLane(ArrayAttr iterSyms,
+                                                    ValueRange iterBounds,
+                                                    ArrayAttr iterKinds,
+                                                    size_t lanePos) {
+  IterListsMinusLane out;
+  out.syms.reserve(iterSyms.size() - 1);
+  out.bounds.reserve(iterBounds.size() - 1);
+  out.kinds.reserve(iterKinds.size() - 1);
+  for (auto [i, s] : llvm::enumerate(iterSyms)) {
+    if (i == lanePos)
+      continue;
+    out.syms.push_back(s);
+    out.bounds.push_back(iterBounds[i]);
+    out.kinds.push_back(iterKinds[i]);
+  }
+  return out;
+}
+
+// Apply all the producer-side mutations once classification has
+// committed: new iter lists, new offsets, retyped outs operands,
+// retyped results, and the in-body lane-sym substitution.
+static LogicalResult applyGenericRewriteMutations(
+    HCGenericOp op, MLIRContext *ctx, const IterListsMinusLane &iters,
+    ArrayAttr newInsOffsets, ArrayAttr newOutsOffsets, ArrayRef<Value> outs,
+    ArrayRef<Type> newOutsTypes, StringRef laneIterSym, StringRef waveSym,
+    sym::Store &store) {
+  op.setIterSymsAttr(ArrayAttr::get(ctx, iters.syms));
+  op.getIterBoundsMutable().assign(iters.bounds);
+  op.setIterKindsAttr(ArrayAttr::get(ctx, iters.kinds));
   op.setInsOffsetsAttr(newInsOffsets);
   op.setOutsOffsetsAttr(newOutsOffsets);
-  for (auto [k, out] : llvm::enumerate(outs)) {
+  for (auto [k, outRef] : llvm::enumerate(outs)) {
+    Value out = outRef;
     if (out.getType() != newOutsTypes[k])
       out.setType(newOutsTypes[k]);
   }
-  for (auto [k, res] : llvm::enumerate(op.getResults())) {
+  for (auto [k, res] : llvm::enumerate(op.getResults()))
     res.setType(newOutsTypes[k]);
-  }
   // The body's `hc.idx_apply` / `hc.pred_apply` ops still carry
   // `laneIterSym` in their result-type expressions (the iter sym was
   // an ambient binding from the surrounding generic, which we just
@@ -786,10 +918,48 @@ static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
   auto waveExpr = sym::composeExprSym(store, waveSym);
   if (failed(waveExpr))
     return failure();
-  if (failed(substituteInRegionBody(op.getRegion(), store, laneIterSym,
-                                    *waveExpr)))
+  return substituteInRegionBody(op.getRegion(), store, laneIterSym, *waveExpr);
+}
+
+static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
+                                      StringRef waveSym, sym::Store &store) {
+  MLIRContext *ctx = op.getContext();
+  ArrayAttr insOffsets = op.getInsOffsets();
+  ArrayAttr outsOffsets = op.getOutsOffsets();
+  // ValueRange views into `op`'s operand storage go stale the moment
+  // we mutate the operand list (the iter_bounds shrink below shifts
+  // the ins / outs segments earlier). Snapshot the SSA values into
+  // owned storage so subsequent `setType` calls land on the original
+  // outs operands, not the operand slot that used to hold them.
+  SmallVector<Value> ins(op.getIns().begin(), op.getIns().end());
+  SmallVector<Value> outs(op.getOuts().begin(), op.getOuts().end());
+
+  auto outsClass =
+      classifyWaveOuts(outs, outsOffsets, waveSize, waveSym, store);
+  if (failed(outsClass))
     return failure();
-  return success();
+  SmallVector<bool> insDropLeading = classifyWaveIns(
+      ins, insOffsets, waveSize, waveSym, outsClass->laneIterSym, store);
+
+  auto lanePos = findAndValidateLaneIterPos(op.getIterSyms(), op.getIterKinds(),
+                                            outsClass->laneIterSym);
+  if (failed(lanePos))
+    return failure();
+
+  IterListsMinusLane iters = buildIterListsWithoutLane(
+      op.getIterSyms(), op.getIterBounds(), op.getIterKinds(), *lanePos);
+
+  ArrayAttr newInsOffsets = substituteAndOptionallyDropAxis(
+      ctx, insOffsets, outsClass->laneIterSym, waveSym, store, insDropLeading);
+  ArrayAttr newOutsOffsets = substituteAndOptionallyDropAxis(
+      ctx, outsOffsets, outsClass->laneIterSym, waveSym, store,
+      outsClass->outsDropLeading);
+  if (!newInsOffsets || !newOutsOffsets)
+    return failure();
+
+  return applyGenericRewriteMutations(
+      op, ctx, iters, newInsOffsets, newOutsOffsets, outs,
+      outsClass->newOutsTypes, outsClass->laneIterSym, waveSym, store);
 }
 
 // Collapse a `hc.buffer_view` whose root is now per-lane (the
@@ -805,33 +975,47 @@ static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
 // open-ended slice the canonicalization passes prefer). Tightening
 // the recogniser later (e.g. accepting other full-range forms) is
 // additive.
+// True iff `firstTy` is a pinned `!hc.idx<expr>` whose expression
+// references `waveSym` — i.e. an index materialized from the
+// workitem region's lane scalar.
+static bool isLaneScalarIdx(IdxType firstTy, StringRef waveSym) {
+  if (!firstTy)
+    return false;
+  ExprAttr firstExpr = firstTy.getExpr();
+  if (!firstExpr)
+    return false;
+  bool found = false;
+  sym::walkSymbolNames(firstExpr.getValue(), [&](StringRef name) {
+    if (name == waveSym)
+      found = true;
+  });
+  return found;
+}
+
+// True iff every remaining index is an open-ended full `!hc.slice`
+// (no lower / upper / step pinned). Tightening the recogniser later
+// (other full-range forms) is additive.
+static bool allOpenEndedSlices(ValueRange indices) {
+  for (Value idx : indices) {
+    auto sliceTy = dyn_cast<SliceType>(idx.getType());
+    if (!sliceTy)
+      return false;
+    if (sliceTy.getLowerType() || sliceTy.getUpperType() ||
+        sliceTy.getStepType())
+      return false;
+  }
+  return true;
+}
+
 static LogicalResult rewriteBufferView(HCBufferViewOp op, StringRef waveSym) {
   ValueRange indices = op.getIndices();
   if (indices.empty())
     return failure();
-  // First index must be the lane scalar.
-  auto firstTy = dyn_cast<IdxType>(indices[0].getType());
-  if (!firstTy)
+  if (!isLaneScalarIdx(dyn_cast<IdxType>(indices[0].getType()), waveSym))
     return failure();
-  bool laneScalar = false;
-  ExprAttr firstExpr = firstTy.getExpr();
-  if (firstExpr) {
-    sym::walkSymbolNames(firstExpr.getValue(), [&](StringRef name) {
-      if (name == waveSym)
-        laneScalar = true;
-    });
-  }
-  if (!laneScalar)
+  if (!allOpenEndedSlices(indices.drop_front()))
     return failure();
-  // Remaining indices must be open-ended full slices.
-  for (Value idx : indices.drop_front()) {
-    auto sliceTy = dyn_cast<SliceType>(idx.getType());
-    if (!sliceTy)
-      return failure();
-    if (sliceTy.getLowerType() || sliceTy.getUpperType() ||
-        sliceTy.getStepType())
-      return failure();
-  }
+
   // Root must now be per-lane (i.e. the dim count matches the
   // per-axis subscript count minus 1).
   Value root = op.getBuffer();
@@ -841,6 +1025,7 @@ static LogicalResult rewriteBufferView(HCBufferViewOp op, StringRef waveSym) {
   ShapeAttr rootShape = rootShaped.getSymbolicShape();
   if (!rootShape || rootShape.getDims().size() != indices.size() - 1)
     return failure();
+
   // Element-type / shape parity check: the producer rewrite dropped
   // the leading axis and the lane sym out of the layout, leaving a
   // root whose remaining shape matches the view's result; the layout
@@ -853,9 +1038,8 @@ static LogicalResult rewriteBufferView(HCBufferViewOp op, StringRef waveSym) {
       dyn_cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
   if (!resShaped)
     return failure();
-  if (resShaped.getSymbolicShape() != rootShape)
-    return failure();
-  if (resShaped.getSymbolicElementType() != rootShaped.getSymbolicElementType())
+  if (resShaped.getSymbolicShape() != rootShape ||
+      resShaped.getSymbolicElementType() != rootShaped.getSymbolicElementType())
     return failure();
   op.getResult().replaceAllUsesWith(root);
   op.erase();

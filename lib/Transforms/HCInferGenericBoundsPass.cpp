@@ -70,47 +70,48 @@ static bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
   return offset.getValue() == *bareHandle;
 }
 
-static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
-  ArrayAttr iterSyms = op.getIterSymsAttr();
-  OperandRange iterBounds = op.getIterBounds();
-  ArrayAttr insOffsets = op.getInsOffsetsAttr();
-  ArrayAttr outsOffsets = op.getOutsOffsetsAttr();
-  OperandRange ins = op.getIns();
-  OperandRange outs = op.getOuts();
-
-  SmallVector<size_t> placeholderIters;
+// Iter syms whose bound is still a placeholder `hc.undef` — only those
+// need inference, the others were already bound by the producer.
+static SmallVector<size_t> findPlaceholderIters(OperandRange iterBounds) {
+  SmallVector<size_t> placeholders;
   for (auto [iterIdx, bound] : llvm::enumerate(iterBounds))
     if (isa_and_present<HCUndefValueOp>(bound.getDefiningOp()))
-      placeholderIters.push_back(iterIdx);
-  if (placeholderIters.empty())
-    return success();
+      placeholders.push_back(iterIdx);
+  return placeholders;
+}
 
-  // Collect every identity binding for every placeholder sym in one
-  // pass over the operand offsets. The per-iter list lets us flag
-  // conflicts and name both producers in the diagnostic.
-  SmallVector<SmallVector<ImpliedBound, 2>> bindings(placeholderIters.size());
-  auto scanRole = [&](OperandRange operands, ArrayAttr offsetsAttr,
-                      StringRef role) {
-    for (auto [opIdx, operand, perOperandAttr] :
-         llvm::enumerate(operands, offsetsAttr.getAsRange<ArrayAttr>())) {
-      for (auto [axis, axisAttr] :
-           llvm::enumerate(perOperandAttr.getAsRange<ExprAttr>())) {
-        for (auto [slot, iterIdx] : llvm::enumerate(placeholderIters)) {
-          StringRef sym = cast<StringAttr>(iterSyms[iterIdx]).getValue();
-          if (!offsetIsIdentitySym(store, axisAttr, sym))
-            continue;
-          ExprAttr dim = operandDimExpr(operand, axis);
-          if (!dim)
-            continue;
-          bindings[slot].push_back({dim, operand, axis, role, opIdx});
-        }
+// Collect every identity binding for every placeholder sym in one pass
+// over the offsets for a single role (ins or outs). The per-iter list
+// is grown so the diagnose step can flag conflicts and name both
+// producers in the diagnostic.
+static void collectImpliedBoundsForRole(
+    OperandRange operands, ArrayAttr offsetsAttr, StringRef role,
+    ArrayAttr iterSyms, ArrayRef<size_t> placeholderIters, sym::Store &store,
+    MutableArrayRef<SmallVector<ImpliedBound, 2>> bindings) {
+  for (auto [opIdx, operand, perOperandAttr] :
+       llvm::enumerate(operands, offsetsAttr.getAsRange<ArrayAttr>())) {
+    for (auto [axis, axisAttr] :
+         llvm::enumerate(perOperandAttr.getAsRange<ExprAttr>())) {
+      for (auto [slot, iterIdx] : llvm::enumerate(placeholderIters)) {
+        StringRef sym = cast<StringAttr>(iterSyms[iterIdx]).getValue();
+        if (!offsetIsIdentitySym(store, axisAttr, sym))
+          continue;
+        ExprAttr dim = operandDimExpr(operand, axis);
+        if (!dim)
+          continue;
+        bindings[slot].push_back({dim, operand, axis, role, opIdx});
       }
     }
-  };
-  scanRole(ins, insOffsets, "ins");
-  scanRole(outs, outsOffsets, "outs");
+  }
+}
 
-  // Diagnose first, mutate after — keeps the IR untouched on failure.
+// Diagnose first, mutate after — keeps the IR untouched on failure.
+// An iter sym with no identity occurrence in any operand offset, or
+// with conflicting dim expressions across operands, is a hard error.
+static LogicalResult
+diagnoseImpliedBoundConflicts(HCGenericOp op, ArrayAttr iterSyms,
+                              ArrayRef<size_t> placeholderIters,
+                              ArrayRef<SmallVector<ImpliedBound, 2>> bindings) {
   for (auto [slot, iterIdx] : llvm::enumerate(placeholderIters)) {
     StringRef sym = cast<StringAttr>(iterSyms[iterIdx]).getValue();
     ArrayRef<ImpliedBound> seen = bindings[slot];
@@ -123,24 +124,29 @@ static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
     for (ImpliedBound other : seen.drop_front()) {
       if (other.dim.getValue() == first.dim.getValue())
         continue;
-      InFlightDiagnostic diag =
-          op.emitOpError("iter sym '")
-          << sym << "' has conflicting implied bounds: " << first.role << " #"
-          << first.roleIdx << " axis " << first.axis << " implies " << first.dim
-          << ", " << other.role << " #" << other.roleIdx << " axis "
-          << other.axis << " implies " << other.dim;
-      return diag;
+      return op.emitOpError("iter sym '")
+             << sym << "' has conflicting implied bounds: " << first.role
+             << " #" << first.roleIdx << " axis " << first.axis << " implies "
+             << first.dim << ", " << other.role << " #" << other.roleIdx
+             << " axis " << other.axis << " implies " << other.dim;
     }
   }
+  return success();
+}
 
+// Materialise an `!hc.idx<dim>` SSA via empty-binding `hc.idx_apply`
+// for each placeholder. No explicit operand bindings: the dim
+// expression's free symbols are kernel / launch-context names whose
+// runtime SSA isn't known here. They stay ambient and the launch-body
+// lowering binds them through its existing walk.
+static void
+materializeInferredBounds(HCGenericOp op, OperandRange iterBounds,
+                          ArrayRef<size_t> placeholderIters,
+                          ArrayRef<SmallVector<ImpliedBound, 2>> bindings) {
   OpBuilder builder(op);
   for (auto [slot, iterIdx] : llvm::enumerate(placeholderIters)) {
     ImpliedBound bound = bindings[slot].front();
     auto idxType = IdxType::get(op.getContext(), bound.dim);
-    // No explicit operand bindings: the dim expression's free
-    // symbols are kernel / launch-context names whose runtime SSA
-    // isn't known here. They stay ambient and the launch-body
-    // lowering binds them through its existing walk.
     auto materialized =
         HCIdxApplyOp::create(builder, op.getLoc(), idxType, ValueRange{},
                              builder.getStrArrayAttr({}));
@@ -148,6 +154,26 @@ static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
         static_cast<unsigned>(iterBounds.getBeginOperandIndex() + iterIdx),
         materialized.getResult());
   }
+}
+
+static LogicalResult inferOnGeneric(HCGenericOp op, sym::Store &store) {
+  ArrayAttr iterSyms = op.getIterSymsAttr();
+  OperandRange iterBounds = op.getIterBounds();
+  SmallVector<size_t> placeholderIters = findPlaceholderIters(iterBounds);
+  if (placeholderIters.empty())
+    return success();
+
+  SmallVector<SmallVector<ImpliedBound, 2>> bindings(placeholderIters.size());
+  collectImpliedBoundsForRole(op.getIns(), op.getInsOffsetsAttr(), "ins",
+                              iterSyms, placeholderIters, store, bindings);
+  collectImpliedBoundsForRole(op.getOuts(), op.getOutsOffsetsAttr(), "outs",
+                              iterSyms, placeholderIters, store, bindings);
+
+  if (failed(diagnoseImpliedBoundConflicts(op, iterSyms, placeholderIters,
+                                           bindings)))
+    return failure();
+
+  materializeInferredBounds(op, iterBounds, placeholderIters, bindings);
   return success();
 }
 

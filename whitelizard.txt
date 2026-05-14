@@ -93,7 +93,6 @@ lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeLoadOffsets::matchAndRewrite
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeVLoadOffsets::matchAndRewrite
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:HCFlattenWithLayoutsPass::runOnOperation
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:RetypeAnyHCOp::matchAndRewrite
-lib/Transforms/HCInferGenericBoundsPass.cpp:inferOnGeneric
 lib/Transforms/HCInferTypesPass.cpp:HCTypeAnalysis::visitNonControlFlowArguments
 lib/Transforms/HCInferTypesPass.cpp:joinConcreteTypesWithPolicy
 lib/Transforms/HCInferTypesPass.cpp:liftCollectiveReturnType

@@ -23,6 +23,31 @@ bool mlir::hc::isHCUndefType(Type type) { return isa<UndefType>(type); }
 
 namespace {
 
+// Validate one tuple element as a pinned `!hc.idx<expr>`, push its
+// expression onto `dims`. On failure, routes through `diagOp` if
+// present (gives a per-op-error diagnostic) or returns silent
+// failure when called from the helper-style `get*` path.
+static LogicalResult collectTupleDim(Type dimType, size_t idx,
+                                     Operation *diagOp,
+                                     SmallVectorImpl<Attribute> &dims) {
+  auto dim = dyn_cast<IdxType>(dimType);
+  if (!dim) {
+    if (diagOp)
+      diagOp->emitOpError("shape dimension #")
+          << idx << " must be !hc.idx with a static expression, got "
+          << dimType;
+    return failure();
+  }
+  if (!dim.getExpr()) {
+    if (diagOp)
+      diagOp->emitOpError("shape dimension #")
+          << idx << " is dynamic; expected pinned !hc.idx expression";
+    return failure();
+  }
+  dims.push_back(dim.getExpr());
+  return success();
+}
+
 static FailureOr<ShapeAttr> staticShapeFromTupleType(Type shapeType,
                                                      Operation *diagOp) {
   if (!shapeType || isHCUndefType(shapeType)) {
@@ -43,23 +68,9 @@ static FailureOr<ShapeAttr> staticShapeFromTupleType(Type shapeType,
 
   SmallVector<Attribute> dims;
   dims.reserve(tuple.size());
-  for (auto [idx, dimType] : llvm::enumerate(tuple.getTypes())) {
-    auto dim = dyn_cast<IdxType>(dimType);
-    if (!dim) {
-      if (diagOp)
-        return diagOp->emitOpError("shape dimension #")
-               << idx << " must be !hc.idx with a static expression, got "
-               << dimType;
+  for (auto [idx, dimType] : llvm::enumerate(tuple.getTypes()))
+    if (failed(collectTupleDim(dimType, idx, diagOp, dims)))
       return failure();
-    }
-    if (!dim.getExpr()) {
-      if (diagOp)
-        return diagOp->emitOpError("shape dimension #")
-               << idx << " is dynamic; expected pinned !hc.idx expression";
-      return failure();
-    }
-    dims.push_back(dim.getExpr());
-  }
   return ShapeAttr::get(shapeType.getContext(), dims);
 }
 
@@ -75,6 +86,24 @@ mlir::hc::verifyStaticShapeFromTupleType(Type shapeType, Operation *diagOp) {
   return staticShapeFromTupleType(shapeType, diagOp);
 }
 
+// Element-wise join of two tuple types: a tuple is HC-joinable iff
+// its arity matches and every element pair joins. Result is a new
+// tuple in `lhs`'s context.
+static Type joinHCTupleTypes(TupleType lhs, TupleType rhs) {
+  if (lhs.size() != rhs.size())
+    return {};
+  SmallVector<Type> elements;
+  elements.reserve(lhs.size());
+  for (auto [lhsElement, rhsElement] :
+       llvm::zip_equal(lhs.getTypes(), rhs.getTypes())) {
+    Type joined = mlir::hc::joinHCTypes(lhsElement, rhsElement);
+    if (!joined)
+      return {};
+    elements.push_back(joined);
+  }
+  return TupleType::get(lhs.getContext(), elements);
+}
+
 Type mlir::hc::joinHCTypes(Type lhs, Type rhs) {
   if (lhs == rhs)
     return lhs;
@@ -88,21 +117,11 @@ Type mlir::hc::joinHCTypes(Type lhs, Type rhs) {
   if (auto joinable = dyn_cast<HCJoinableTypeInterface>(rhs))
     if (Type common = joinable.joinHCType(lhs))
       return common;
-
   auto lhsTuple = dyn_cast<TupleType>(lhs);
   auto rhsTuple = dyn_cast<TupleType>(rhs);
-  if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
+  if (!lhsTuple || !rhsTuple)
     return {};
-  SmallVector<Type> elements;
-  elements.reserve(lhsTuple.size());
-  for (auto [lhsElement, rhsElement] :
-       llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
-    Type joined = joinHCTypes(lhsElement, rhsElement);
-    if (!joined)
-      return {};
-    elements.push_back(joined);
-  }
-  return TupleType::get(lhs.getContext(), elements);
+  return joinHCTupleTypes(lhsTuple, rhsTuple);
 }
 
 bool mlir::hc::areHCProgressiveTypesCompatible(Type source, Type dest) {
@@ -124,6 +143,32 @@ bool mlir::hc::areHCBranchTypesCompatible(Type source, Type dest) {
   return static_cast<bool>(joinHCTypes(source, dest));
 }
 
+// Element-wise refinement check for two tuple types: a tuple is more
+// refined iff arity matches and at least one element pair refines.
+static bool shouldRefineHCTuple(TupleType current, TupleType inferred) {
+  if (current.size() != inferred.size())
+    return false;
+  return llvm::any_of(
+      llvm::zip_equal(current.getTypes(), inferred.getTypes()), [](auto pair) {
+        auto [currentElement, inferredElement] = pair;
+        return mlir::hc::shouldRefineHCType(currentElement, inferredElement);
+      });
+}
+
+// `!hc.idx<expr>` / `!hc.pred<pred>` refinement: a pinned inferred
+// type refines a non-pinned current of the same kind. Anything else
+// is "not a refinement" — caller treats `false` as "leave the
+// current type alone".
+static bool shouldRefineHCIdx(IdxType current, Type inferred) {
+  auto inferredIdx = dyn_cast<IdxType>(inferred);
+  return inferredIdx && !current.getExpr() && inferredIdx.getExpr();
+}
+
+static bool shouldRefineHCPred(PredType current, Type inferred) {
+  auto inferredPred = dyn_cast<PredType>(inferred);
+  return inferredPred && !current.getPred() && inferredPred.getPred();
+}
+
 bool mlir::hc::shouldRefineHCType(Type current, Type inferred) {
   if (!inferred || current == inferred)
     return false;
@@ -131,23 +176,12 @@ bool mlir::hc::shouldRefineHCType(Type current, Type inferred) {
     return true;
   if (auto currentTuple = dyn_cast<TupleType>(current)) {
     auto inferredTuple = dyn_cast<TupleType>(inferred);
-    if (!inferredTuple || currentTuple.size() != inferredTuple.size())
-      return false;
-    return llvm::any_of(
-        llvm::zip_equal(currentTuple.getTypes(), inferredTuple.getTypes()),
-        [](auto pair) {
-          auto [currentElement, inferredElement] = pair;
-          return shouldRefineHCType(currentElement, inferredElement);
-        });
+    return inferredTuple && shouldRefineHCTuple(currentTuple, inferredTuple);
   }
-  if (auto currentIdx = dyn_cast<IdxType>(current)) {
-    auto inferredIdx = dyn_cast<IdxType>(inferred);
-    return inferredIdx && !currentIdx.getExpr() && inferredIdx.getExpr();
-  }
-  if (auto currentPred = dyn_cast<PredType>(current)) {
-    auto inferredPred = dyn_cast<PredType>(inferred);
-    return inferredPred && !currentPred.getPred() && inferredPred.getPred();
-  }
+  if (auto currentIdx = dyn_cast<IdxType>(current))
+    return shouldRefineHCIdx(currentIdx, inferred);
+  if (auto currentPred = dyn_cast<PredType>(current))
+    return shouldRefineHCPred(currentPred, inferred);
   return false;
 }
 
@@ -671,45 +705,59 @@ static FailureOr<Type> parseSlicePartType(AsmParser &parser, StringRef key) {
   return type;
 }
 
-Type SliceType::parse(AsmParser &parser) {
-  MLIRContext *ctx = parser.getContext();
-  Type lowerType;
-  Type upperType;
-  Type stepType;
-  if (failed(parser.parseOptionalLess()))
-    return SliceType::get(ctx, lowerType, upperType, stepType);
-
+// Drives the `<key = value, key = value, ...>` body of an angle-
+// bracketed type literal. `handleField` parses one `key = value`
+// pair (caller is responsible for the value-side parse and for
+// emitting an "unknown parameter" diagnostic on miss). Consumes the
+// trailing `>`. Caller has already confirmed the `<` opener (or
+// skipped this call entirely when the literal omits the brackets).
+template <typename FieldHandler>
+static LogicalResult parseAngleBracketedFields(AsmParser &parser,
+                                               FieldHandler handleField) {
   while (true) {
     StringRef key;
     if (parser.parseKeyword(&key) || parser.parseEqual())
-      return {};
-
-    if (key == "lower") {
-      FailureOr<Type> parsed = parseSlicePartType(parser, key);
-      if (failed(parsed))
-        return {};
-      lowerType = *parsed;
-    } else if (key == "upper") {
-      FailureOr<Type> parsed = parseSlicePartType(parser, key);
-      if (failed(parsed))
-        return {};
-      upperType = *parsed;
-    } else if (key == "step") {
-      FailureOr<Type> parsed = parseSlicePartType(parser, key);
-      if (failed(parsed))
-        return {};
-      stepType = *parsed;
-    } else {
-      parser.emitError(parser.getCurrentLocation())
-          << "unknown !hc.slice parameter `" << key << "`";
-      return {};
-    }
-
+      return failure();
+    if (failed(handleField(key)))
+      return failure();
     if (failed(parser.parseOptionalComma()))
       break;
   }
+  return parser.parseGreater();
+}
 
-  if (parser.parseGreater())
+// Per-key parse for `!hc.slice<...>`. Routes the parsed `Type` to the
+// matching out-parameter, or emits a diagnostic for an unknown key.
+static LogicalResult parseSliceField(AsmParser &parser, StringRef key,
+                                     Type &lowerType, Type &upperType,
+                                     Type &stepType) {
+  Type *target = nullptr;
+  if (key == "lower")
+    target = &lowerType;
+  else if (key == "upper")
+    target = &upperType;
+  else if (key == "step")
+    target = &stepType;
+  if (!target) {
+    parser.emitError(parser.getCurrentLocation())
+        << "unknown !hc.slice parameter `" << key << "`";
+    return failure();
+  }
+  FailureOr<Type> parsed = parseSlicePartType(parser, key);
+  if (failed(parsed))
+    return failure();
+  *target = *parsed;
+  return success();
+}
+
+Type SliceType::parse(AsmParser &parser) {
+  MLIRContext *ctx = parser.getContext();
+  Type lowerType, upperType, stepType;
+  if (failed(parser.parseOptionalLess()))
+    return SliceType::get(ctx, lowerType, upperType, stepType);
+  if (failed(parseAngleBracketedFields(parser, [&](StringRef key) {
+        return parseSliceField(parser, key, lowerType, upperType, stepType);
+      })))
     return {};
   return SliceType::get(ctx, lowerType, upperType, stepType);
 }
@@ -759,48 +807,44 @@ Type SliceType::joinHCType(Type other) const {
   return SliceType::get(getContext(), lower, upper, step);
 }
 
+// Per-key parse for `!hc.group<...>`. `work_shape` / `group_shape`
+// parse as `#hc.shape`; `subgroup_size` routes through the dedicated
+// helper.
+static LogicalResult parseGroupField(AsmParser &parser, StringRef key,
+                                     ShapeAttr &workShape,
+                                     ShapeAttr &groupShape,
+                                     ExprAttr &subgroupSize) {
+  if (key == "work_shape" || key == "group_shape") {
+    FailureOr<ShapeAttr> parsed =
+        parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
+    if (failed(parsed))
+      return failure();
+    (key == "work_shape" ? workShape : groupShape) = *parsed;
+    return success();
+  }
+  if (key == "subgroup_size") {
+    FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
+    if (failed(parsed))
+      return failure();
+    subgroupSize = *parsed;
+    return success();
+  }
+  parser.emitError(parser.getCurrentLocation())
+      << "unknown !hc.group parameter `" << key << "`";
+  return failure();
+}
+
 Type GroupType::parse(AsmParser &parser) {
   MLIRContext *ctx = parser.getContext();
   SMLoc typeLoc = parser.getCurrentLocation();
-  ShapeAttr workShape;
-  ShapeAttr groupShape;
+  ShapeAttr workShape, groupShape;
   ExprAttr subgroupSize;
   if (failed(parser.parseOptionalLess()))
     return GroupType::get(ctx, workShape, groupShape, subgroupSize);
-
-  while (true) {
-    StringRef key;
-    if (parser.parseKeyword(&key) || parser.parseEqual())
-      return {};
-
-    if (key == "work_shape") {
-      FailureOr<ShapeAttr> parsed =
-          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
-      if (failed(parsed))
-        return {};
-      workShape = *parsed;
-    } else if (key == "group_shape") {
-      FailureOr<ShapeAttr> parsed =
-          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
-      if (failed(parsed))
-        return {};
-      groupShape = *parsed;
-    } else if (key == "subgroup_size") {
-      FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
-      if (failed(parsed))
-        return {};
-      subgroupSize = *parsed;
-    } else {
-      parser.emitError(parser.getCurrentLocation())
-          << "unknown !hc.group parameter `" << key << "`";
-      return {};
-    }
-
-    if (failed(parser.parseOptionalComma()))
-      break;
-  }
-
-  if (parser.parseGreater())
+  if (failed(parseAngleBracketedFields(parser, [&](StringRef key) {
+        return parseGroupField(parser, key, workShape, groupShape,
+                               subgroupSize);
+      })))
     return {};
   return GroupType::getChecked([&] { return parser.emitError(typeLoc); }, ctx,
                                workShape, groupShape, subgroupSize);
@@ -825,6 +869,32 @@ void GroupType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
+// Per-key parse for the nested launch-context types (workgroup /
+// subgroup carriers). Shares the `group_shape` / `subgroup_size`
+// schema with `!hc.group<...>`, minus the `work_shape` member.
+static LogicalResult parseLaunchContextField(AsmParser &parser, StringRef key,
+                                             ShapeAttr &groupShape,
+                                             ExprAttr &subgroupSize) {
+  if (key == "group_shape") {
+    FailureOr<ShapeAttr> parsed =
+        parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
+    if (failed(parsed))
+      return failure();
+    groupShape = *parsed;
+    return success();
+  }
+  if (key == "subgroup_size") {
+    FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
+    if (failed(parsed))
+      return failure();
+    subgroupSize = *parsed;
+    return success();
+  }
+  parser.emitError(parser.getCurrentLocation())
+      << "unknown launch-context parameter `" << key << "`";
+  return failure();
+}
+
 template <typename TypeT>
 static Type parseNestedLaunchContextType(AsmParser &parser) {
   MLIRContext *ctx = parser.getContext();
@@ -833,34 +903,9 @@ static Type parseNestedLaunchContextType(AsmParser &parser) {
   ExprAttr subgroupSize;
   if (failed(parser.parseOptionalLess()))
     return TypeT::get(ctx, groupShape, subgroupSize);
-
-  while (true) {
-    StringRef key;
-    if (parser.parseKeyword(&key) || parser.parseEqual())
-      return {};
-
-    if (key == "group_shape") {
-      FailureOr<ShapeAttr> parsed =
-          parseTypedAttr<ShapeAttr>(parser, key, "#hc.shape");
-      if (failed(parsed))
-        return {};
-      groupShape = *parsed;
-    } else if (key == "subgroup_size") {
-      FailureOr<ExprAttr> parsed = parseSubgroupSizeAttr(parser, key);
-      if (failed(parsed))
-        return {};
-      subgroupSize = *parsed;
-    } else {
-      parser.emitError(parser.getCurrentLocation())
-          << "unknown launch-context parameter `" << key << "`";
-      return {};
-    }
-
-    if (failed(parser.parseOptionalComma()))
-      break;
-  }
-
-  if (parser.parseGreater())
+  if (failed(parseAngleBracketedFields(parser, [&](StringRef key) {
+        return parseLaunchContextField(parser, key, groupShape, subgroupSize);
+      })))
     return {};
   return TypeT::getChecked([&] { return parser.emitError(typeLoc); }, ctx,
                            groupShape, subgroupSize);

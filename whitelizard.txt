@@ -62,12 +62,6 @@ lib/IR/HCOps.cpp:parseGenericAmbientClause
 lib/IR/HCOps.cpp:parseGenericIterClause
 lib/IR/HCOps.cpp:parseGenericOperandClause
 lib/IR/HCOps.cpp:parseOptionalFunctionSignature
-lib/IR/HCTypes.cpp:GroupType::parse
-lib/IR/HCTypes.cpp:mlir::hc::joinHCTypes
-lib/IR/HCTypes.cpp:mlir::hc::shouldRefineHCType
-lib/IR/HCTypes.cpp:parseNestedLaunchContextType
-lib/IR/HCTypes.cpp:SliceType::parse
-lib/IR/HCTypes.cpp:staticShapeFromTupleType
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteBufferView
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:rewriteGenericOp
 lib/Transforms/HCDistributeWaveLayoutsPass.cpp:shapeFromAllocOperand

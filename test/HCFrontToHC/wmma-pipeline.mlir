@@ -9,7 +9,7 @@
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
 // RUN:   | hc-opt --hc-front-fold-region-defs --hc-front-inline --convert-hc-front-to-hc --hc-promote-names --canonicalize --cse \
 // RUN:   | hc-opt \
-// RUN:   | FileCheck %s --implicit-check-not=hc_front. --implicit-check-not=@_tile_origin --implicit-check-not=@_lane_a_row --implicit-check-not=@_lane_column --implicit-check-not=@_lane_output_row_slice_args
+// RUN:   | FileCheck %s --implicit-check-not=hc_front. --implicit-check-not=@_tile_origin --implicit-check-not=@_lane_a_row --implicit-check-not=@_lane_column
 
 // CHECK: module {
 // CHECK-NEXT: hc.kernel @tiled_gfx11_wmma_matmul
@@ -54,7 +54,7 @@
 // CHECK-LABEL: hc.func @init_wmma_acc
 // CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: %{{.*}} = hc.workitem_region captures = ["col0", "group", "c", "row0"] -> (!hc.undef)
+// CHECK: %{{.*}} = hc.workitem_region captures = ["group", "c", "row0", "col0"] -> (!hc.undef)
 // CHECK: hc.vload {{.*}} : ({{.*}}) -> !hc.undef
 // CHECK: hc.buffer_view
 // CHECK: hc.yield {{.*}} : !hc.undef

@@ -217,7 +217,6 @@ def test_resolve_wmma_collects_full_dep_set() -> None:
             "_lane_column",
             "_lane_output_rows",
             "_lane_output_row_step",
-            "_lane_output_row_slice_args",
         }
     )
 

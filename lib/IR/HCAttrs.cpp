@@ -14,6 +14,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
+#include <array>
+
 using namespace mlir;
 using namespace mlir::hc;
 
@@ -234,12 +236,12 @@ static ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
   return success();
 }
 
-} // namespace
-
-Attribute LayoutAttr::parse(AsmParser &parser, Type) {
-  if (parser.parseLess())
-    return {};
-
+// Accumulator for the textual fields of a `#hc.layout` attribute.
+// `LayoutAttr::parse` drives one field at a time into this; the
+// individual flags are checked at the end so a missing field
+// produces a single "requires ..." diagnostic instead of a per-
+// field one.
+struct LayoutFields {
   SmallVector<Attribute> shapeSyms;
   SmallVector<Attribute> indexSyms;
   DictionaryAttr params;
@@ -250,64 +252,126 @@ Attribute LayoutAttr::parse(AsmParser &parser, Type) {
   bool gotParams = false;
   bool gotStorage = false;
   bool gotOffset = false;
+};
+
+// Mark `flag` seen, emitting a "duplicate field 'name'" diagnostic at
+// `nameLoc` if it had already been set.
+static ParseResult markFieldSeen(AsmParser &parser, llvm::SMLoc nameLoc,
+                                 StringRef name, bool &flag) {
+  if (flag)
+    return parser.emitError(nameLoc, "duplicate field '") << name << "'";
+  flag = true;
+  return success();
+}
+
+// Parse one `params = { ... }` value as a DictionaryAttr.
+static ParseResult parseLayoutParamsField(AsmParser &parser,
+                                          DictionaryAttr &out) {
+  llvm::SMLoc valueLoc = parser.getCurrentLocation();
+  Attribute attr;
+  if (parser.parseAttribute(attr))
+    return failure();
+  out = llvm::dyn_cast<DictionaryAttr>(attr);
+  if (!out)
+    return parser.emitError(valueLoc,
+                            "expected params to be a dictionary attribute");
+  return success();
+}
+
+// Per-field parsers. Each handles its own value parse but shares the
+// duplicate-check + flag-set via `markFieldSeen` on the relevant
+// LayoutFields flag.
+static ParseResult parseLayoutShapeSymsField(AsmParser &parser,
+                                             LayoutFields &out,
+                                             llvm::SMLoc nameLoc) {
+  if (failed(markFieldSeen(parser, nameLoc, "shape_syms", out.gotShape)))
+    return failure();
+  return parseQuotedNameList(parser, out.shapeSyms);
+}
+
+static ParseResult parseLayoutIndexSymsField(AsmParser &parser,
+                                             LayoutFields &out,
+                                             llvm::SMLoc nameLoc) {
+  if (failed(markFieldSeen(parser, nameLoc, "index_syms", out.gotIndex)))
+    return failure();
+  return parseQuotedNameList(parser, out.indexSyms);
+}
+
+static ParseResult parseLayoutParamsDispatch(AsmParser &parser,
+                                             LayoutFields &out,
+                                             llvm::SMLoc nameLoc) {
+  if (failed(markFieldSeen(parser, nameLoc, "params", out.gotParams)))
+    return failure();
+  return parseLayoutParamsField(parser, out.params);
+}
+
+static ParseResult parseLayoutStorageSizeField(AsmParser &parser,
+                                               LayoutFields &out,
+                                               llvm::SMLoc nameLoc) {
+  if (failed(markFieldSeen(parser, nameLoc, "storage_size", out.gotStorage)))
+    return failure();
+  llvm::SMLoc valueLoc = parser.getCurrentLocation();
+  return parseTypedAttribute<ExprAttr>(parser, valueLoc, "storage_size",
+                                       out.storageSize);
+}
+
+static ParseResult parseLayoutOffsetField(AsmParser &parser, LayoutFields &out,
+                                          llvm::SMLoc nameLoc) {
+  if (failed(markFieldSeen(parser, nameLoc, "offset", out.gotOffset)))
+    return failure();
+  llvm::SMLoc valueLoc = parser.getCurrentLocation();
+  return parseTypedAttribute<ExprAttr>(parser, valueLoc, "offset", out.offset);
+}
+
+// Table mapping `#hc.layout` field names to their parsers. Sized
+// statically so adding a new field is one line; the dispatcher
+// walks the array linearly (five entries — branchless on hot paths).
+struct LayoutFieldDispatch {
+  StringRef name;
+  ParseResult (*parse)(AsmParser &, LayoutFields &, llvm::SMLoc);
+};
+
+static const std::array<LayoutFieldDispatch, 5> kLayoutFieldDispatch = {{
+    {"shape_syms", &parseLayoutShapeSymsField},
+    {"index_syms", &parseLayoutIndexSymsField},
+    {"params", &parseLayoutParamsDispatch},
+    {"storage_size", &parseLayoutStorageSizeField},
+    {"offset", &parseLayoutOffsetField},
+}};
+
+// Parse one `<name> = <value>` field inside a `#hc.layout<...>` and
+// dispatch onto the matching per-field parser. Unknown names emit at
+// `nameLoc`. Returns failure on a malformed field, on a duplicate,
+// or on an unknown name.
+static ParseResult parseLayoutField(AsmParser &parser, LayoutFields &out) {
+  StringRef name;
+  llvm::SMLoc nameLoc = parser.getCurrentLocation();
+  if (parser.parseKeyword(&name) || parser.parseEqual())
+    return failure();
+  for (const auto &spec : kLayoutFieldDispatch)
+    if (spec.name == name)
+      return spec.parse(parser, out, nameLoc);
+  return parser.emitError(nameLoc)
+         << "unknown #hc.layout field '" << name << "'";
+}
+
+} // namespace
+
+Attribute LayoutAttr::parse(AsmParser &parser, Type) {
+  if (parser.parseLess())
+    return {};
+
+  LayoutFields fields;
   llvm::SMLoc startLoc = parser.getCurrentLocation();
 
-  auto parseField = [&]() -> ParseResult {
-    StringRef name;
-    llvm::SMLoc nameLoc = parser.getCurrentLocation();
-    if (parser.parseKeyword(&name) || parser.parseEqual())
-      return failure();
-    if (name == "shape_syms") {
-      if (gotShape)
-        return parser.emitError(nameLoc, "duplicate field 'shape_syms'");
-      gotShape = true;
-      return parseQuotedNameList(parser, shapeSyms);
-    }
-    if (name == "index_syms") {
-      if (gotIndex)
-        return parser.emitError(nameLoc, "duplicate field 'index_syms'");
-      gotIndex = true;
-      return parseQuotedNameList(parser, indexSyms);
-    }
-    if (name == "params") {
-      if (gotParams)
-        return parser.emitError(nameLoc, "duplicate field 'params'");
-      gotParams = true;
-      llvm::SMLoc valueLoc = parser.getCurrentLocation();
-      Attribute attr;
-      if (parser.parseAttribute(attr))
-        return failure();
-      params = llvm::dyn_cast<DictionaryAttr>(attr);
-      if (!params)
-        return parser.emitError(valueLoc,
-                                "expected params to be a dictionary attribute");
-      return success();
-    }
-    if (name == "storage_size") {
-      if (gotStorage)
-        return parser.emitError(nameLoc, "duplicate field 'storage_size'");
-      gotStorage = true;
-      llvm::SMLoc valueLoc = parser.getCurrentLocation();
-      return parseTypedAttribute<ExprAttr>(parser, valueLoc, "storage_size",
-                                           storageSize);
-    }
-    if (name == "offset") {
-      if (gotOffset)
-        return parser.emitError(nameLoc, "duplicate field 'offset'");
-      gotOffset = true;
-      llvm::SMLoc valueLoc = parser.getCurrentLocation();
-      return parseTypedAttribute<ExprAttr>(parser, valueLoc, "offset", offset);
-    }
-    return parser.emitError(nameLoc)
-           << "unknown #hc.layout field '" << name << "'";
-  };
-
-  if (parser.parseCommaSeparatedList(parseField))
+  if (parser.parseCommaSeparatedList(
+          [&]() -> ParseResult { return parseLayoutField(parser, fields); }))
     return {};
   if (parser.parseGreater())
     return {};
 
-  if (!gotShape || !gotIndex || !gotParams || !gotStorage || !gotOffset) {
+  if (!fields.gotShape || !fields.gotIndex || !fields.gotParams ||
+      !fields.gotStorage || !fields.gotOffset) {
     parser.emitError(startLoc,
                      "#hc.layout requires shape_syms, index_syms, params, "
                      "storage_size, offset");
@@ -315,8 +379,9 @@ Attribute LayoutAttr::parse(AsmParser &parser, Type) {
   }
 
   return LayoutAttr::getChecked([&] { return parser.emitError(startLoc); },
-                                parser.getContext(), shapeSyms, indexSyms,
-                                params, storageSize, offset);
+                                parser.getContext(), fields.shapeSyms,
+                                fields.indexSyms, fields.params,
+                                fields.storageSize, fields.offset);
 }
 
 void LayoutAttr::print(AsmPrinter &printer) const {
@@ -330,41 +395,35 @@ void LayoutAttr::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
-LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 ArrayRef<Attribute> shapeSyms,
-                                 ArrayRef<Attribute> indexSyms,
-                                 DictionaryAttr params, ExprAttr storageSize,
-                                 ExprAttr offset) {
-  // Single shared set: shape_syms / index_syms / params keys live in the
-  // same expression-symbol namespace at substitution time, so their names
-  // must be pairwise disjoint.
-  llvm::DenseSet<StringRef> seen;
-  auto checkNameList = [&](ArrayRef<Attribute> names,
-                           StringRef field) -> LogicalResult {
-    for (Attribute attr : names) {
-      auto str = llvm::dyn_cast_if_present<StringAttr>(attr);
-      if (!str)
-        return emitError() << "expected " << field
-                           << " entries to be string attributes";
-      if (str.getValue().empty())
-        return emitError() << field << " entries must be non-empty";
-      if (!seen.insert(str.getValue()).second)
-        return emitError() << "duplicate name '" << str.getValue()
-                           << "' across #hc.layout name lists";
-    }
-    return success();
-  };
-  if (failed(checkNameList(shapeSyms, "shape_syms")))
-    return failure();
-  if (failed(checkNameList(indexSyms, "index_syms")))
-    return failure();
-  if (shapeSyms.size() != indexSyms.size())
-    return emitError() << "shape_syms and index_syms must have the same "
-                          "length (got "
-                       << shapeSyms.size() << " vs " << indexSyms.size()
-                       << "); non-injective storage is expressed through "
-                          "`offset` / `storage_size`, not by adding extra "
-                          "index_syms";
+namespace {
+
+// Validate one `#hc.layout` quoted name list: every entry must be a
+// non-empty StringAttr, and each name must be unique across the
+// shared `seen` set (shape_syms / index_syms / params keys live in
+// the same expression-symbol namespace at substitution time).
+static LogicalResult
+verifyLayoutNameList(function_ref<InFlightDiagnostic()> emitError,
+                     ArrayRef<Attribute> names, StringRef field,
+                     llvm::DenseSet<StringRef> &seen) {
+  for (Attribute attr : names) {
+    auto str = llvm::dyn_cast_if_present<StringAttr>(attr);
+    if (!str)
+      return emitError() << "expected " << field
+                         << " entries to be string attributes";
+    if (str.getValue().empty())
+      return emitError() << field << " entries must be non-empty";
+    if (!seen.insert(str.getValue()).second)
+      return emitError() << "duplicate name '" << str.getValue()
+                         << "' across #hc.layout name lists";
+  }
+  return success();
+}
+
+// Validate the `params` dictionary: non-null, non-empty keys,
+// `#hc.expr` values, and key uniqueness against the shared `seen` set.
+static LogicalResult
+verifyLayoutParams(function_ref<InFlightDiagnostic()> emitError,
+                   DictionaryAttr params, llvm::DenseSet<StringRef> &seen) {
   if (!params)
     return emitError() << "expected params to be a non-null dictionary";
   for (NamedAttribute kv : params) {
@@ -378,12 +437,107 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
       return emitError() << "duplicate name '" << key
                          << "' across #hc.layout name lists";
   }
+  return success();
+}
+
+} // namespace
+
+LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 ArrayRef<Attribute> shapeSyms,
+                                 ArrayRef<Attribute> indexSyms,
+                                 DictionaryAttr params, ExprAttr storageSize,
+                                 ExprAttr offset) {
+  llvm::DenseSet<StringRef> seen;
+  if (failed(verifyLayoutNameList(emitError, shapeSyms, "shape_syms", seen)))
+    return failure();
+  if (failed(verifyLayoutNameList(emitError, indexSyms, "index_syms", seen)))
+    return failure();
+  if (shapeSyms.size() != indexSyms.size())
+    return emitError() << "shape_syms and index_syms must have the same "
+                          "length (got "
+                       << shapeSyms.size() << " vs " << indexSyms.size()
+                       << "); non-injective storage is expressed through "
+                          "`offset` / `storage_size`, not by adding extra "
+                          "index_syms";
+  if (failed(verifyLayoutParams(emitError, params, seen)))
+    return failure();
   if (!storageSize)
     return emitError() << "missing storage_size";
   if (!offset)
     return emitError() << "missing offset";
   return success();
 }
+
+namespace {
+
+// Product of `dims` for layout-less storage: row-major contiguous, no
+// padding, so `storage_size = d_0 * d_1 * ... * d_{n-1}`. Empty dims
+// (rank-0) is `1` — that's the convention the layout-driven path also
+// observes (`storage_size = 1` for scalar storage), so the two
+// branches stay shape-consistent.
+static FailureOr<sym::ExprHandle>
+identityShapeProduct(sym::Store &store, ArrayRef<Attribute> dims) {
+  if (dims.empty())
+    return sym::composeExprInt(store, 1);
+  auto firstExpr = dyn_cast<ExprAttr>(dims.front());
+  if (!firstExpr)
+    return failure();
+  sym::ExprHandle product = firstExpr.getValue();
+  for (Attribute dim : dims.drop_front()) {
+    auto dimExpr = dyn_cast<ExprAttr>(dim);
+    if (!dimExpr)
+      return failure();
+    auto next = sym::composeExprBinary(store, product, sym::ExprBinaryOp::Mul,
+                                       dimExpr.getValue());
+    if (failed(next))
+      return failure();
+    product = *next;
+  }
+  return product;
+}
+
+// Compose `(targets, replacements)` parallel arrays from a quoted
+// name list and matching `ExprAttr` replacements. Used to substitute
+// `shape_syms` / `index_syms` placeholders for actual operand
+// expressions before invoking ixsimpl's `ixs_subs_multi`.
+static LogicalResult
+collectSubstitutionPairs(sym::Store &store, ArrayRef<Attribute> nameAttrs,
+                         ArrayRef<Attribute> replacementAttrs,
+                         SmallVectorImpl<ixs_node *> &targets,
+                         SmallVectorImpl<ixs_node *> &replacements) {
+  for (auto [sym, replacementAttr] :
+       llvm::zip_equal(nameAttrs, replacementAttrs)) {
+    auto symStr = dyn_cast<StringAttr>(sym);
+    auto replExpr = dyn_cast<ExprAttr>(replacementAttr);
+    if (!symStr || !replExpr)
+      return failure();
+    auto symHandle = sym::composeExprSym(store, symStr.getValue());
+    if (failed(symHandle))
+      return failure();
+    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
+    replacements.push_back(const_cast<ixs_node *>(replExpr.getValue().raw()));
+  }
+  return success();
+}
+
+// Drive `ixs_subs_multi` on `expr`; returns the substituted handle or
+// failure if the engine rejected the input.
+static FailureOr<sym::ExprHandle>
+substituteMulti(sym::Store &store, sym::ExprHandle expr,
+                ArrayRef<ixs_node *> targets,
+                ArrayRef<ixs_node *> replacements) {
+  sym::Session session(store);
+  ixs_node *bound =
+      ixs_subs_multi(session.raw(), const_cast<ixs_node *>(expr.raw()),
+                     static_cast<uint32_t>(targets.size()),
+                     const_cast<ixs_node **>(targets.data()),
+                     const_cast<ixs_node **>(replacements.data()));
+  if (!bound)
+    return failure();
+  return sym::ExprHandle(bound);
+}
+
+} // namespace
 
 namespace mlir::hc {
 
@@ -395,28 +549,10 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
 
   if (!layout) {
-    ArrayRef<Attribute> dims = originalShape.getDims();
-    if (dims.empty()) {
-      auto one = sym::composeExprInt(store, 1);
-      if (failed(one))
-        return failure();
-      return ExprAttr::get(ctx, *one);
-    }
-    auto firstExpr = dyn_cast<ExprAttr>(dims.front());
-    if (!firstExpr)
+    auto product = identityShapeProduct(store, originalShape.getDims());
+    if (failed(product))
       return failure();
-    sym::ExprHandle product = firstExpr.getValue();
-    for (Attribute dim : dims.drop_front()) {
-      auto dimExpr = dyn_cast<ExprAttr>(dim);
-      if (!dimExpr)
-        return failure();
-      auto next = sym::composeExprBinary(store, product, sym::ExprBinaryOp::Mul,
-                                         dimExpr.getValue());
-      if (failed(next))
-        return failure();
-      product = *next;
-    }
-    return ExprAttr::get(ctx, product);
+    return ExprAttr::get(ctx, *product);
   }
 
   ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
@@ -428,27 +564,15 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
   SmallVector<ixs_node *> replacements;
   targets.reserve(shapeSyms.size());
   replacements.reserve(shapeSyms.size());
-  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
-    auto symStr = dyn_cast<StringAttr>(sym);
-    auto dimExpr = dyn_cast<ExprAttr>(dim);
-    if (!symStr || !dimExpr)
-      return failure();
-    auto symHandle = sym::composeExprSym(store, symStr.getValue());
-    if (failed(symHandle))
-      return failure();
-    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
-    replacements.push_back(const_cast<ixs_node *>(dimExpr.getValue().raw()));
-  }
-
-  sym::Session session(store);
-  ixs_node *bound = ixs_subs_multi(
-      session.raw(),
-      const_cast<ixs_node *>(layout.getStorageSize().getValue().raw()),
-      static_cast<uint32_t>(targets.size()), targets.data(),
-      replacements.data());
-  if (!bound)
+  if (failed(collectSubstitutionPairs(store, shapeSyms, dims, targets,
+                                      replacements)))
     return failure();
-  return ExprAttr::get(ctx, sym::ExprHandle(bound));
+
+  auto bound = substituteMulti(store, layout.getStorageSize().getValue(),
+                               targets, replacements);
+  if (failed(bound))
+    return failure();
+  return ExprAttr::get(ctx, *bound);
 }
 
 namespace {
@@ -488,6 +612,53 @@ identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
 
 } // namespace
 
+namespace {
+
+// Append one `(target, replacement)` pair, composing the target sym
+// handle on the fly. Used by `composeAccessOffsetExpr` to seed both
+// the shape-sym and index-sym substitutions into the same pair of
+// arrays before one `ixs_subs_multi` call.
+static LogicalResult
+appendSubstitutionPair(sym::Store &store, StringRef name,
+                       sym::ExprHandle replacement,
+                       SmallVectorImpl<ixs_node *> &targets,
+                       SmallVectorImpl<ixs_node *> &replacements) {
+  auto symHandle = sym::composeExprSym(store, name);
+  if (failed(symHandle))
+    return failure();
+  targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
+  replacements.push_back(const_cast<ixs_node *>(replacement.raw()));
+  return success();
+}
+
+// Stage the layout-driven substitutions: shape_syms[k] → dims[k],
+// index_syms[k] → indexExprs[k]. Caller has already checked rank
+// parity.
+static LogicalResult stageLayoutSubstitutions(
+    sym::Store &store, ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> dims,
+    ArrayRef<Attribute> indexSyms, ArrayRef<ExprAttr> indexExprs,
+    SmallVectorImpl<ixs_node *> &targets,
+    SmallVectorImpl<ixs_node *> &replacements) {
+  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
+    auto dimExpr = llvm::dyn_cast<ExprAttr>(dim);
+    if (!dimExpr)
+      return failure();
+    if (failed(appendSubstitutionPair(
+            store, llvm::cast<StringAttr>(sym).getValue(), dimExpr.getValue(),
+            targets, replacements)))
+      return failure();
+  }
+  for (auto [sym, idx] : llvm::zip_equal(indexSyms, indexExprs)) {
+    if (failed(appendSubstitutionPair(store,
+                                      llvm::cast<StringAttr>(sym).getValue(),
+                                      idx.getValue(), targets, replacements)))
+      return failure();
+  }
+  return success();
+}
+
+} // namespace
+
 mlir::FailureOr<ExprAttr>
 composeAccessOffsetExpr(mlir::MLIRContext *ctx, LayoutAttr layout,
                         ShapeAttr originalShape,
@@ -517,38 +688,15 @@ composeAccessOffsetExpr(mlir::MLIRContext *ctx, LayoutAttr layout,
   SmallVector<ixs_node *> replacements;
   targets.reserve(shapeSyms.size() + indexSyms.size());
   replacements.reserve(shapeSyms.size() + indexSyms.size());
-  auto pushPair = [&](StringRef name,
-                      sym::ExprHandle replacement) -> LogicalResult {
-    auto symHandle = sym::composeExprSym(store, name);
-    if (failed(symHandle))
-      return failure();
-    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
-    replacements.push_back(const_cast<ixs_node *>(replacement.raw()));
-    return success();
-  };
-  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
-    auto dimExpr = llvm::dyn_cast<ExprAttr>(dim);
-    if (!dimExpr)
-      return failure();
-    if (failed(pushPair(llvm::cast<StringAttr>(sym).getValue(),
-                        dimExpr.getValue())))
-      return failure();
-  }
-  for (auto [sym, idx] : llvm::zip_equal(indexSyms, indexExprs)) {
-    if (failed(
-            pushPair(llvm::cast<StringAttr>(sym).getValue(), idx.getValue())))
-      return failure();
-  }
-
-  sym::Session session(store);
-  ixs_node *bound = ixs_subs_multi(
-      session.raw(),
-      const_cast<ixs_node *>(layout.getOffset().getValue().raw()),
-      static_cast<uint32_t>(targets.size()), targets.data(),
-      replacements.data());
-  if (!bound)
+  if (failed(stageLayoutSubstitutions(store, shapeSyms, dims, indexSyms,
+                                      indexExprs, targets, replacements)))
     return failure();
-  return ExprAttr::get(ctx, sym::ExprHandle(bound));
+
+  auto bound = substituteMulti(store, layout.getOffset().getValue(), targets,
+                               replacements);
+  if (failed(bound))
+    return failure();
+  return ExprAttr::get(ctx, *bound);
 }
 
 } // namespace mlir::hc

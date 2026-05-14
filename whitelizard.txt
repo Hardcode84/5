@@ -106,8 +106,6 @@ lib/Transforms/HCLowerGenericPass.cpp:emitInnerBodyClones
 lib/Transforms/HCLowerGenericPass.cpp:lowerCollective
 lib/Transforms/HCLowerGenericPass.cpp:lowerValueOuts
 lib/Transforms/HCLowerGenericPass.cpp:lowerWithPartition
-lib/Transforms/HCLowerKernelsToGPULaunchPass.cpp:cloneKernelBodyIntoLaunch
-lib/Transforms/HCLowerKernelsToGPULaunchPass.cpp:lowerKernel
 lib/Transforms/HCLowerLaunchBodyPass.cpp:collectBoundValues
 lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertBufferViewOp::matchAndRewrite
 lib/Transforms/HCLowerLaunchBodyPass.cpp:ConvertForRangeOp::matchAndRewrite

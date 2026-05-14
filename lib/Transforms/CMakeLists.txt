@@ -5,6 +5,7 @@
 add_mlir_library(MLIRHCTransforms
   HCCanonicalizeLayoutsPass.cpp
   HCDecomposeShapedValuesPass.cpp
+  HCDistributeWaveLayoutsPass.cpp
   HCElementwiseToGenericPass.cpp
   HCEmitBenchWrapperPass.cpp
   HCFlattenWithLayoutsPass.cpp

@@ -147,7 +147,16 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m10d = transform.apply_registered_pass "hc-load-store-to-generic" to %m10c
         : (!transform.any_op) -> !transform.any_op
-    %m10e = transform.apply_registered_pass "hc-infer-generic-bounds" to %m10d
+    // Distribute wave-cooperative layout-bearing carriers (e.g. the AMD
+    // gfx11 WMMA accumulator's `<offset = 32*fi + lane>` accumulator)
+    // to their per-lane peers. Runs after the load/store generic funnel
+    // so every layout-bearing producer is in `hc.generic` shape, and
+    // before `hc-normalize-scope-regions` so the workitem-region binding
+    // for the lane sym is still visible to the rewrite. No-op for
+    // kernels that don't carry wave-distributable layouts.
+    %m10dw = transform.apply_registered_pass "hc-distribute-wave-layouts" to %m10d
+        : (!transform.any_op) -> !transform.any_op
+    %m10e = transform.apply_registered_pass "hc-infer-generic-bounds" to %m10dw
         : (!transform.any_op) -> !transform.any_op
     %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10e
         : (!transform.any_op) -> !transform.any_op

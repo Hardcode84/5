@@ -313,6 +313,76 @@ def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCDistributeWaveLayouts : Pass<"hc-distribute-wave-layouts"> {
+  let summary = "Convert wave-cooperative layout-bearing carriers to per-lane.";
+  let description = [{
+    Bridges between user-spelled wave-cooperative layouts (e.g. the
+    AMD gfx11 WMMA accumulator's `vector<["32", "8"], <offset = 32*fi
+    + lane, storage_size = 256, ...>>`) and the shape-suffix form the
+    rest of the substrate already understands.
+
+    Recognition. For every shaped Value with a `#hc.layout<...>`
+    attribute appearing inside a workitem region the pass tries to
+    factor the layout's `offset` against the first index sym:
+
+      `offset = index_syms[0] * <lane_stride> + <residue>`
+
+    where the first shape dim (positionally bound to `index_syms[0]`
+    by the layout's shape_syms slot) equals the launch context's
+    `subgroup_size` and `<residue>` is independent of
+    `index_syms[0]`. When the factorisation holds and `lane_stride *
+    wave_size` divides `storage_size`, the type is *wave-distributable*
+    along that first axis: each lane owns exactly `storage_size /
+    wave_size` slots strided by `lane_stride`.
+
+    Rewrite. The pass replaces every wave-distributable carrier with
+    its per-lane peer — first shape dim dropped, layout's lane sym
+    substituted by the workitem index sym (`$WI0`) in the offset,
+    storage_size divided by wave_size — and rewrites the producers /
+    consumers that span the wave/lane boundary:
+
+      * `hc.vzeros` / `hc.vones` / `hc.vfull` / `hc.zeros` / `hc.ones`
+        / `hc.full` allocators carrying the wide type lose their
+        first shape dim and their layout attribute, dropping to the
+        per-lane bare carrier (if the substituted layout is identity)
+        or the per-lane layout-bearing carrier (otherwise).
+      * `hc.generic` ops whose outs carry a wave-distributable type
+        drop the iter axis bound to the lane index sym, substitute
+        that iter sym with `$WI0` in every ins / outs offset, and
+        retype their results in lockstep with the outs allocator
+        rewrite. Iter bounds for the dropped axis are erased; the
+        ambient idx pinning is left untouched (downstream lowerings
+        resolve `$WI0` through the workitem region's binding).
+      * `hc.buffer_view %carrier[%lane_id, ...]` projections collapse
+        to a forward when the lane axis is the only one consumed by
+        a scalar index (the lane axis is gone from the producer's
+        type, so the view's projection becomes the identity on the
+        remaining axes).
+      * `hc.strip_layout` ops whose operand is now layout-free become
+        identity forwards (no allocator, no gather generic).
+
+    Boundary. The pass only fires inside `hc.workitem_region` bodies
+    — outside the region a per-lane carrier has nowhere to live (the
+    enclosing scope is the workgroup, not the lane). Wave-cooperative
+    carriers that escape the region get the trailing-suffix shape
+    treatment via `hc-normalize-scope-regions`; the two forms are not
+    interchangeable. The lane sym is sourced from the launch geo
+    method's `LocalId` axis 0 (`$WI0` under the substrate's current
+    naming) and the wave size from the kernel's `subgroup_size`.
+
+    Bails (op stays for downstream diagnostics):
+      * Layout's `offset` doesn't factor against `index_syms[0]`
+        (mixed cross-axis terms, non-affine in the lane sym,
+        residue still mentions the lane sym after substitution).
+      * `storage_size` isn't a constant multiple of `wave_size`, or
+        `lane_stride * wave_size > storage_size` (carrier doesn't
+        cleanly distribute).
+      * First shape dim isn't a constant equal to `wave_size`.
+      * Layout-bearing carrier lives outside any workitem region.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
   let summary = "Rewrite per-element shaped arith / cmp / astype ops into "
                 "hc.generic.";

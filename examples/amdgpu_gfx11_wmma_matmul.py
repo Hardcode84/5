@@ -56,20 +56,18 @@ path lowers through ``hc.generic``. Reading both sites off a single
 declared layout removes the per-lane slice-arithmetic glue the
 previous revision needed.
 
-The direct layout-driven form
-(``group.vload(c_tile, shape=(WAVE_LANES, WMMA_ACC_FRAGMENT),
-layout=WAVE_ACC_FRAG_LAYOUT)`` plus a per-lane ``[lane, :]`` subscript
-and the explicit ``as_layout(..., None)`` strip that ``hc.strip_layout``
-exposes) crosses a separate substrate boundary: the strip's lowering
-plants an ``hc.vzeros`` + ``hc.generic`` gather whose per-lane
-gather positions reference ``$WI0``, but ``hc-lower-generic``'s
-value-typed-operand path requires iter-only offsets and rejects
-the ambient sym. Unblocking that needs ``hc-lower-generic`` to
-emit dynamic-position ``vector.extract`` against the ambient
-bindings, or the wave-wide source to be hoisted to LDS so the
-strip lowers through the pointer path; the strided-slice form
-here stays as the right side of that substrate boundary in the
-meantime.
+The direct layout-driven form (``group.vload(c_tile,
+shape=(WAVE_LANES, WMMA_ACC_FRAGMENT), layout=WAVE_ACC_FRAG_LAYOUT)``
+plus a per-lane ``[lane, :]`` subscript and the explicit
+``as_layout(..., None)`` strip) now compiles end-to-end through the
+substrate via ``hc-distribute-wave-layouts``, which factors the lane
+axis out of the wave-cooperative carrier before ``hc.generic``
+lowering. The simulator's layout-driven gather still walks the
+numpy-clipped source's flat extent rather than the layout's
+``storage_size``, so partial-tile shapes miss the per-element mask
+the strided form stamps correctly; the layout-driven form will swap
+in once the simulator's gather OOB-pads the source up to
+``storage_size``.
 """
 
 from __future__ import annotations
@@ -150,7 +148,7 @@ def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:
 # `init_wmma_acc` and `store_wmma_tile` realise the same arithmetic
 # as a strided `c[row_slice, col_slice]` view. Single declared
 # formula, two call sites that decode it by hand — see the module
-# docstring for the substrate boundary the direct layout-driven form
+# docstring for the simulator gap the direct layout-driven form
 # still trips.
 WAVE_ACC_FRAG_LAYOUT = index_map(
     storage_size=lambda lc, fc: WMMA_M * WMMA_N,
@@ -379,6 +377,19 @@ def init_wmma_acc(group, c, row0, col0):
         # everywhere and the loaded vector serves directly as the
         # running accumulator without poisoning the WMMA `a*b + acc`
         # math.
+        #
+        # The substrate's `hc-distribute-wave-layouts` pass unblocks
+        # the direct layout-driven form (`group.vload(c_tile,
+        # shape=(WAVE_LANES, WMMA_ACC_FRAGMENT), layout=
+        # WAVE_ACC_FRAG_LAYOUT)` + per-lane `[lane, :]` subscript +
+        # `as_layout(..., None)` strip) through the compile pipeline,
+        # but the simulator's layout-driven gather still walks the
+        # numpy-clipped source flat extent rather than the layout's
+        # storage_size — partial-tile shapes miss the per-element
+        # mask the way this strided form gets right. Strided form
+        # stays here as the right side of that simulator gap; switch
+        # back once the simulator's `_gather_loaded_value` learns to
+        # OOB-pad the source up to `layout.storage_size`.
         bounds = group.vload(
             c[
                 row0 + lane // WMMA_N : row0 + WMMA_M : WMMA_ACC_ROW_STRIDE,

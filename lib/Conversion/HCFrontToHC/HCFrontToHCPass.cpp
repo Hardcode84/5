@@ -2973,6 +2973,23 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
     return failure();
   }
 
+  // Layout descriptor sentinel: ``as_layout(value, None)`` is the
+  // user-marked boundary that drops the value's layout (the operand's
+  // wave-wide / broadcast addressing convenience stops applying past
+  // this point — the result is a standalone bare carrier whose
+  // effective span is the dim product). Recognize the descriptor here
+  // by chasing back to the ``hc_front.constant`` producer; the
+  // emitter stamps ``python_kind = "NoneType"`` on the constant when
+  // the Python literal was ``None`` (see ``_constant_kind`` in
+  // ``hc/_frontend_mlir.py``). Anything else routes through
+  // ``readLayoutFromValue`` and emits ``hc.as_layout`` as before.
+  if (auto constOp = args[1].getDefiningOp<hc_front::ConstantOp>()) {
+    auto kind = constOp->getAttrOfType<StringAttr>("python_kind");
+    if (kind && kind.getValue() == "NoneType")
+      return {HCStripLayoutOp::create(builder, op.getLoc(), undef, value)
+                  .getResult()};
+  }
+
   FailureOr<LayoutAttr> layout =
       readLayoutFromValue(args[1], op.getOperation(), "as_layout layout");
   if (failed(layout))

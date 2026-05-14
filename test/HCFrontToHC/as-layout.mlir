@@ -96,3 +96,39 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// `as_layout(value, None)` is the user-marked strip boundary: the
+// None literal arrives as an `hc_front.constant` carrying the
+// `python_kind = "NoneType"` stamp (see ``_constant_kind`` in
+// ``hc/_frontend_mlir.py``), and FrontToHC routes it to
+// ``hc.strip_layout`` instead of ``hc.as_layout`` so the post-
+// projection per-lane fragment can drop its wave-wide layout at
+// the boundary the user marked.
+
+// CHECK-LABEL: hc.kernel @uses_strip_layout
+// CHECK: %[[V:.*]] = hc.name_load "v"
+// CHECK: %[[R:.*]] = hc.strip_layout %[[V]]
+// CHECK-SAME: !hc.undef -> !hc.undef
+// CHECK-NOT: hc.as_layout
+
+module {
+  hc_front.kernel "uses_strip_layout" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %layout_fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %none = hc_front.constant <"None"> {python_kind = "NoneType"}
+    %stripped = hc_front.call %layout_fn(%v, %none)
+    %tgt = hc_front.target_name "u"
+    hc_front.assign %tgt = %stripped
+    hc_front.return
+  }
+}

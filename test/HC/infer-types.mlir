@@ -210,6 +210,101 @@ hc.func @buffer_views(%buf: !hc.buffer<f32, ["M", "N"]>,
 
 // -----
 
+// CHECK-LABEL: hc.func @buffer_view_layout_multibuf
+// Slicing axis 0 of a 4-D layout-bearing tensor with a scalar
+// `!hc.idx<"buf_idx">` drops the `b` shape sym and the `ib` index
+// sym from the residual layout, substitutes them into the surviving
+// `offset` and `storage_size` expressions (`ib` -> `buf_idx`,
+// `b` -> the operand's actual `BUF` dim expr), and keeps the M / N /
+// LANE slots intact. `buf_idx` survives the composition as a free
+// symbol — the lowering pipeline binds it from the kernel scope per
+// `doc/layouts.md` "Free symbols in layout offsets". This is the
+// substrate the multi-buffered LDS example needs: a single 4-D
+// layout description that fans out into per-buffer residual views.
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["M", "N", "LANE"], <shape_syms = ["m", "n", "l"], index_syms = ["im", "in", "il"], params = {}, storage_size = #hc.expr<"BUF*l*m*n">, offset = #hc.expr<"il + l*(in + n*(im + buf_idx*m))">>>
+hc.func @buffer_view_layout_multibuf(
+    %lds: !hc.tensor<f32, ["BUF", "M", "N", "LANE"],
+                     #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                index_syms = ["ib", "im", "in", "il"],
+                                params = {},
+                                storage_size = #hc.expr<"b*m*n*l">,
+                                offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>,
+    %buf_idx: !hc.idx<"buf_idx">) -> !hc.undef {
+  %v = hc.buffer_view %lds[%buf_idx]
+      : (!hc.tensor<f32, ["BUF", "M", "N", "LANE"],
+                    #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                               index_syms = ["ib", "im", "in", "il"],
+                               params = {},
+                               storage_size = #hc.expr<"b*m*n*l">,
+                               offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>,
+         !hc.idx<"buf_idx">) -> !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @buffer_view_layout_mixed_scalar_slice
+// Scalar on axis 0 (BUF), `[0:M]` slice on axis 1 (M), implicit
+// pass-through on axis 2 (N). The scalar substitutes — `ib` and `b`
+// are dropped from the residual slot lists and folded into the
+// offset / storage_size — while the slice keeps its slot in place
+// and leaves the layout indexing unchanged. `M` flows back into the
+// residual storage_size as the dropped shape sym's source dim,
+// just like the all-scalar case.
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["M", "N"], <shape_syms = ["m", "n"], index_syms = ["im", "in"], params = {}, storage_size = #hc.expr<"BUF*m*n">, offset = #hc.expr<"in + n*(im + buf_idx*m)">>>
+hc.func @buffer_view_layout_mixed_scalar_slice(
+    %lds: !hc.tensor<f32, ["BUF", "M", "N"],
+                     #hc.layout<shape_syms = ["b", "m", "n"],
+                                index_syms = ["ib", "im", "in"],
+                                params = {},
+                                storage_size = #hc.expr<"b*m*n">,
+                                offset = #hc.expr<"(ib*m + im)*n + in">>>,
+    %buf_idx: !hc.idx<"buf_idx">,
+    %row_slice: !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"M">>)
+    -> !hc.undef {
+  %v = hc.buffer_view %lds[%buf_idx, %row_slice]
+      : (!hc.tensor<f32, ["BUF", "M", "N"],
+                    #hc.layout<shape_syms = ["b", "m", "n"],
+                               index_syms = ["ib", "im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"b*m*n">,
+                               offset = #hc.expr<"(ib*m + im)*n + in">>>,
+         !hc.idx<"buf_idx">,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"M">>) -> !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
+// CHECK-LABEL: hc.func @buffer_view_layout_all_slice
+// No scalar indices: every layout slot survives, `offset` and
+// `storage_size` are unchanged. Pins the "slice-axis pass-through"
+// half of the composition contract so future slice-rebinding work
+// (`index_syms[k] := lower + step * index_syms[k]` for non-trivial
+// slices) doesn't accidentally regress the trivial-slice path.
+// CHECK: hc.buffer_view {{.*}} -> !hc.tensor<f32, ["M", "N"], <shape_syms = ["m", "n"], index_syms = ["im", "in"], params = {}, storage_size = #hc.expr<"m*n">, offset = #hc.expr<"in + im*n">>>
+hc.func @buffer_view_layout_all_slice(
+    %lds: !hc.tensor<f32, ["M", "N"],
+                     #hc.layout<shape_syms = ["m", "n"],
+                                index_syms = ["im", "in"],
+                                params = {},
+                                storage_size = #hc.expr<"m*n">,
+                                offset = #hc.expr<"im*n + in">>>,
+    %row_slice: !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"M">>)
+    -> !hc.undef {
+  %v = hc.buffer_view %lds[%row_slice]
+      : (!hc.tensor<f32, ["M", "N"],
+                    #hc.layout<shape_syms = ["m", "n"],
+                               index_syms = ["im", "in"],
+                               params = {},
+                               storage_size = #hc.expr<"m*n">,
+                               offset = #hc.expr<"im*n + in">>>,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"M">>) -> !hc.undef
+  hc.return %v : !hc.undef
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @vector_views
 // CHECK: hc.buffer_view {{.*}} -> f32
 // CHECK: hc.buffer_view {{.*}} -> !hc.vector<f32, ["4"]>

@@ -820,3 +820,60 @@ func.func @buffer_view_rank_up_falls_through(
         -> !hc.bare_vector<f32, ["8"]>
   return %v : !hc.bare_vector<f32, ["8"]>
 }
+
+// -----
+
+// `hc.buffer_view` on a layout-bearing source where rank reduces via a
+// scalar subscript. `inferBufferViewResult` already substituted
+// `ib -> buf_idx` and `b -> BUF` into the residual layout, so the
+// source's and result's `storage_size` describe the same physical span
+// (`b*m*n*l` == `BUF*m*n*l` once `b` is the operand's `BUF` dim).
+// Both sides flatten to the same `!hc.tensor<f32, ["BUF*LANE*M*N"]>`
+// carrier and the identity branch forwards the source through. The
+// only delta in the result's 1-to-N expansion is the new `buf_idx`
+// implicit sym, which the source's bindings can't supply directly —
+// `resolveResultAuxValues` plants the naked `hc.idx_apply` against the
+// bare symbol so `hc-lower-launch-body` rebinds it from the ambient
+// scope at the buffer_view's location (the kernel-arg `buf_idx`).
+// CHECK-LABEL: @buffer_view_layout_multibuf_forwards_source
+// CHECK-SAME: %[[SRC:[^:]+]]: !hc.tensor<f32, ["BUF*LANE*M*N"]>
+// CHECK-SAME: %[[BUF:[^:]+]]: !hc.idx<"BUF">, %[[LANE:[^:]+]]: !hc.idx<"LANE">, %[[M:[^:]+]]: !hc.idx<"M">, %[[N:[^:]+]]: !hc.idx<"N">
+// CHECK-SAME: %[[BIDX:[^:]+]]: !hc.idx<"buf_idx">
+// CHECK-NOT: hc.buffer_view
+// CHECK: %[[FALLBACK:.*]] = hc.idx_apply () : () -> !hc.idx<"buf_idx">
+// CHECK: return %[[SRC]], %[[BUF]], %[[LANE]], %[[M]], %[[N]], %[[FALLBACK]]
+func.func @buffer_view_layout_multibuf_forwards_source(
+    %lds: !hc.tensor<f32, ["BUF", "M", "N", "LANE"],
+                     #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                                index_syms = ["ib", "im", "in", "il"],
+                                params = {},
+                                storage_size = #hc.expr<"b*m*n*l">,
+                                offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>,
+    %buf_idx: !hc.idx<"buf_idx">)
+    -> !hc.tensor<f32, ["M", "N", "LANE"],
+                  #hc.layout<shape_syms = ["m", "n", "l"],
+                             index_syms = ["im", "in", "il"],
+                             params = {},
+                             storage_size = #hc.expr<"BUF*l*m*n">,
+                             offset = #hc.expr<"il + l*(in + n*(im + buf_idx*m))">>> {
+  %v = hc.buffer_view %lds[%buf_idx]
+      : (!hc.tensor<f32, ["BUF", "M", "N", "LANE"],
+                    #hc.layout<shape_syms = ["b", "m", "n", "l"],
+                               index_syms = ["ib", "im", "in", "il"],
+                               params = {},
+                               storage_size = #hc.expr<"b*m*n*l">,
+                               offset = #hc.expr<"((ib*m + im)*n + in)*l + il">>>,
+         !hc.idx<"buf_idx">)
+      -> !hc.tensor<f32, ["M", "N", "LANE"],
+                    #hc.layout<shape_syms = ["m", "n", "l"],
+                               index_syms = ["im", "in", "il"],
+                               params = {},
+                               storage_size = #hc.expr<"BUF*l*m*n">,
+                               offset = #hc.expr<"il + l*(in + n*(im + buf_idx*m))">>>
+  return %v : !hc.tensor<f32, ["M", "N", "LANE"],
+                          #hc.layout<shape_syms = ["m", "n", "l"],
+                                     index_syms = ["im", "in", "il"],
+                                     params = {},
+                                     storage_size = #hc.expr<"BUF*l*m*n">,
+                                     offset = #hc.expr<"il + l*(in + n*(im + buf_idx*m))">>>
+}

@@ -1181,7 +1181,17 @@ struct ComposeBufferViewOffsets
     if (preShape.getDims().size() == op.getIndices().size() &&
         preShape.getDims().size() <= 1)
       return failure();
-    if (preShape.getDims().size() != op.getIndices().size())
+    // Non-layout sources still need the full-bind rank parity here: the
+    // strided-slice branch below only knows how to fold an `[indices..]`
+    // subscript stream when every axis is named. Layout-bearing sources
+    // route through the identity branch instead — the residual layout
+    // composed at `hc.buffer_view` type inference already bakes the
+    // scalar-axis substitutions into the result's offset, so the flat
+    // carriers on both sides describe the same physical storage and
+    // forwarding through is correct regardless of how many axes the
+    // subscript stream consumed.
+    if (!preFlattenSrc.getSymbolicLayout() &&
+        preShape.getDims().size() != op.getIndices().size())
       return failure();
 
     Type origResultType = op.getResult().getType();
@@ -1215,13 +1225,20 @@ struct ComposeBufferViewOffsets
       return success();
     };
 
-    // Identity: every scalar subscript hits an axis the flatten layout
-    // already factors out. The flat carrier shape matches the result's
-    // flat shape, so forwarding the source through is the right
-    // semantics. (Sanity: the source must also share the element type
-    // with the result. Cross-element-type view requests don't exist in
-    // the v0 surface, but a flat-shape coincidence with a different
-    // elt type would silently miscompile, so reject it here.)
+    // Identity: the flat carriers match between source and result, so
+    // the view describes the same physical storage. Two distinct cases
+    // converge here. (1) Full-bind on a layout-less source where every
+    // scalar subscript hits an axis the surrounding flatten layout has
+    // already factored out; the source-side strides land on the same
+    // 1-D carrier the result wants. (2) Layout-bearing source where
+    // `inferBufferViewResult` substituted scalar-axis index values into
+    // the result's offset and dropped the corresponding shape syms —
+    // residual `storage_size` still names the same physical span, the
+    // flat carrier types match, and the only delta is the relabel of
+    // the per-axis aux set, which `resolveResultAuxValues` rebinds from
+    // the source's expansion. Cross-element-type view requests don't
+    // exist in the v0 surface; reject any flat-shape coincidence that
+    // changes the element type before it can silently miscompile.
     if (flatSourceShaped.getSymbolicShape() ==
             flatResultShaped.getSymbolicShape() &&
         flatSource.getType() == flatResultType) {

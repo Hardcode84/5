@@ -911,6 +911,23 @@ that aux in the post-flatten `hc.idx_apply`; see
 `test/HC/flatten-with-layouts.mlir` (`@free_sym_in_offset`) for the
 exact CHECK lines.
 
+`hc.buffer_view` is a second introduction site: a scalar subscript
+on a layout-bearing source substitutes `index_syms[k]` with the
+scalar's `IdxType` expression and `shape_syms[k]` with the operand's
+actual dim entry, then drops both slots from the residual layout
+(`lib/IR/HCInferTypeOpInterface.cpp::composeBufferViewLayout`). The
+substituted value lands in the residual `offset` /  `storage_size` as
+a free sym whose binding is whatever the scalar value pinned in scope
+(usually a kernel-arg `!hc.idx<sym>`). This is how a multi-buffered
+LDS expressed as a 4-D layout `(BUF, M, N, LANE)` collapses to the
+per-buffer 3-D residual view when sliced by `lds_4d[buf_idx]` — the
+caller never has to name `buf_idx` on the layout, it shows up as a
+free sym after composition. See `test/HC/infer-types.mlir`
+(`@buffer_view_layout_multibuf`, `@buffer_view_layout_mixed_scalar_slice`)
+for the residual shapes and `test/HC/flatten-with-layouts.mlir`
+(`@buffer_view_layout_multibuf_forwards_source`) for the post-flatten
+form.
+
 Frontend (`hc.core.index_map`):
 
 ```python

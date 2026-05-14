@@ -108,19 +108,19 @@ func.func @nonlinear_payload() attributes {
   return
 }
 
-// `index_syms` longer than `shape_syms` is admitted: the trailing
-// entries are *selectors* (per-thread / per-lane axes the access op
-// binds with extra operands; see HC_LayoutAttr description). The
-// `offset` here references the trailing `lane` symbol, modeling a
-// WMMA-style fragment whose per-lane storage_size is the K column
-// height regardless of the logical (M, K) tile area.
-// CHECK-LABEL: @selector_layout
-// CHECK-SAME: shape_syms = ["M", "K"]
+// Non-injective layout: `index_syms.size() == shape_syms.size()` (the
+// verifier enforces this), but the offset formula collapses multiple
+// logical indices to the same storage slot. This models a WMMA-style
+// per-lane fragment as a 3-D logical shape (M, K, LANE) whose flat
+// storage is only the K column — lane and M are logical-only,
+// reading lane 0..LANE all returns the same K row.
+// CHECK-LABEL: @noninjective_layout
+// CHECK-SAME: shape_syms = ["M", "K", "LANE"]
 // CHECK-SAME: index_syms = ["i", "j", "lane"]
 // CHECK-SAME: storage_size = #hc.expr<"K">
 // CHECK-SAME: offset = #hc.expr<"j">
-func.func @selector_layout() attributes {
-  test.layout = #hc.layout<shape_syms = ["M", "K"],
+func.func @noninjective_layout() attributes {
+  test.layout = #hc.layout<shape_syms = ["M", "K", "LANE"],
                            index_syms = ["i", "j", "lane"],
                            params = {},
                            storage_size = #hc.expr<"K">,

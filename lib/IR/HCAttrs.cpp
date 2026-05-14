@@ -358,6 +358,13 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
     return failure();
   if (failed(checkNameList(indexSyms, "index_syms")))
     return failure();
+  if (shapeSyms.size() != indexSyms.size())
+    return emitError() << "shape_syms and index_syms must have the same "
+                          "length (got "
+                       << shapeSyms.size() << " vs " << indexSyms.size()
+                       << "); non-injective storage is expressed through "
+                          "`offset` / `storage_size`, not by adding extra "
+                          "index_syms";
   if (!params)
     return emitError() << "expected params to be a non-null dictionary";
   for (NamedAttribute kv : params) {

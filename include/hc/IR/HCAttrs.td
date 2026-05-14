@@ -157,20 +157,23 @@ def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
     either. Symbolic-engine-side substitution at the use site relies on
     that disjointness.
 
-    `index_syms` length is not pinned to the attached type's rank. The
-    first `rank` entries are the per-dim tile coordinates; any tail
-    entries are **selectors** — additional symbols the access op also
-    binds at its call site, used to express per-thread / per-lane
-    distribution patterns (e.g. a WMMA fragment with `index_syms =
-    ["i", "j", "lane"]` whose `offset` references `lane`). Selectors
-    are not a new field, not an enum, and not ambient: they are plain
-    `#hc.expr` symbols bound through the same mechanism as `i` / `j`,
-    via an extra operand on the access op. The verifier on `hc.load` /
-    `hc.vload` / `hc.store` / `hc.load_mask` requires the operand
-    `indices` length to match `len(index_syms)`. `storage_size` for a
-    selector-bearing layout is per-selector-tuple (e.g. per-lane for a
-    `["i","j","lane"]` layout); the consumer interprets that as
-    "one slice's worth of physical storage."
+    `shape_syms` and `index_syms` must have the same length and both
+    match the attached type's rank. Every `index_syms[k]` is the access
+    coordinate for logical axis `k`; every `shape_syms[k]` names the
+    extent of that axis. The N positional indices on `hc.load` /
+    `hc.vload` / `hc.store` / `hc.load_mask` bind to `index_syms` in
+    order; each may be a scalar (pin) or a slice (iter sweep over that
+    axis).
+
+    Non-injective offsets are allowed: distinct logical-index tuples
+    may map to the same flat storage offset. Per-lane fragments,
+    broadcast layouts, and similar patterns express this directly —
+    the logical shape carries the lane / wave extent and the layout's
+    offset collapses it. `storage_size` is the flat extent in elements
+    and may be smaller than the logical-shape product when the offset
+    is non-injective; consumers reading through the layout get the
+    canonical slot, consumers writing accept that lanes which collide
+    overwrite each other (use that intentionally or don't).
 
     All `#hc.expr` payloads go through the dialect symbolic store at
     construction so type uniquing across ixsimpl-canonical equality

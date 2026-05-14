@@ -51,13 +51,77 @@ struct CanonicalIdentity {
   sym::ExprHandle storage;
 };
 
+// Lift a list of StringAttr names into ixsimpl symbol handles. Caches the
+// per-name compose so that downstream builders can refer to each handle
+// by index without re-materialising it.
+static FailureOr<SmallVector<sym::ExprHandle>>
+liftSymbolHandles(sym::Store &store, ArrayRef<Attribute> names) {
+  SmallVector<sym::ExprHandle> handles;
+  handles.reserve(names.size());
+  for (Attribute name : names) {
+    auto handle =
+        sym::composeExprSym(store, llvm::cast<StringAttr>(name).getValue());
+    if (failed(handle))
+      return failure();
+    handles.push_back(*handle);
+  }
+  return handles;
+}
+
+// tailProducts[k] = prod_{j > k} shape[j]; rightmost stride is 1. Built
+// right-to-left so each partial result is itself canonical — matters for
+// pointer-equality comparison against any peer producer of the same
+// expression.
+static FailureOr<SmallVector<sym::ExprHandle>>
+buildTailProducts(sym::Store &store, ArrayRef<sym::ExprHandle> shapeHandles) {
+  size_t n = shapeHandles.size();
+  SmallVector<sym::ExprHandle> tailProducts(n);
+  auto one = sym::composeExprInt(store, 1);
+  if (failed(one))
+    return failure();
+  tailProducts[n - 1] = *one;
+  for (size_t k = n - 1; k > 0; --k) {
+    auto next = sym::composeExprBinary(store, shapeHandles[k],
+                                       sym::ExprBinaryOp::Mul, tailProducts[k]);
+    if (failed(next))
+      return failure();
+    tailProducts[k - 1] = *next;
+  }
+  return tailProducts;
+}
+
+// offset = sum_k (i_k * tailProducts[k]); the last term skips the
+// trivial multiply by 1 so the canonical form matches what ixsimpl
+// produces from a standard textual `... + i_{n-1}` expression.
+static FailureOr<sym::ExprHandle>
+buildOffsetSum(sym::Store &store, ArrayRef<sym::ExprHandle> indexHandles,
+               ArrayRef<sym::ExprHandle> tailProducts) {
+  size_t n = indexHandles.size();
+  sym::ExprHandle acc;
+  for (size_t k = 0; k < n; ++k) {
+    sym::ExprHandle term = indexHandles[k];
+    if (k + 1 != n) {
+      auto product = sym::composeExprBinary(
+          store, indexHandles[k], sym::ExprBinaryOp::Mul, tailProducts[k]);
+      if (failed(product))
+        return failure();
+      term = *product;
+    }
+    if (k == 0) {
+      acc = term;
+      continue;
+    }
+    auto sum = sym::composeExprBinary(store, acc, sym::ExprBinaryOp::Add, term);
+    if (failed(sum))
+      return failure();
+    acc = *sum;
+  }
+  return acc;
+}
+
 static FailureOr<CanonicalIdentity>
 buildCanonicalIdentity(sym::Store &store, ArrayRef<Attribute> shapeSyms,
                        ArrayRef<Attribute> indexSyms) {
-  auto liftSym = [&](Attribute name) -> FailureOr<sym::ExprHandle> {
-    return sym::composeExprSym(store, llvm::cast<StringAttr>(name).getValue());
-  };
-
   size_t n = shapeSyms.size();
   if (n == 0) {
     auto zero = sym::composeExprInt(store, 0);
@@ -67,75 +131,33 @@ buildCanonicalIdentity(sym::Store &store, ArrayRef<Attribute> shapeSyms,
     return CanonicalIdentity{*zero, *one};
   }
 
-  // Cache shape-syms once: liftSym creates a fresh ixs_node per call,
-  // and we'd otherwise materialize each shape symbol O(n) times across
-  // the offset / storage builds.
-  SmallVector<sym::ExprHandle> shapeHandles;
-  shapeHandles.reserve(n);
-  for (Attribute name : shapeSyms) {
-    auto handle = liftSym(name);
-    if (failed(handle))
-      return failure();
-    shapeHandles.push_back(*handle);
-  }
+  FailureOr<SmallVector<sym::ExprHandle>> shapeHandles =
+      liftSymbolHandles(store, shapeSyms);
+  if (failed(shapeHandles))
+    return failure();
+  FailureOr<SmallVector<sym::ExprHandle>> indexHandles =
+      liftSymbolHandles(store, indexSyms);
+  if (failed(indexHandles))
+    return failure();
 
-  // tailProducts[k] = prod_{j > k} shape[j]; rightmost stride is 1.
-  // Build right-to-left so each partial result is itself canonical.
-  SmallVector<sym::ExprHandle> tailProducts(n);
-  {
-    auto one = sym::composeExprInt(store, 1);
-    if (failed(one))
-      return failure();
-    tailProducts[n - 1] = *one;
-    for (size_t k = n - 1; k > 0; --k) {
-      auto next = sym::composeExprBinary(
-          store, shapeHandles[k], sym::ExprBinaryOp::Mul, tailProducts[k]);
-      if (failed(next))
-        return failure();
-      tailProducts[k - 1] = *next;
-    }
-  }
+  FailureOr<SmallVector<sym::ExprHandle>> tailProducts =
+      buildTailProducts(store, *shapeHandles);
+  if (failed(tailProducts))
+    return failure();
 
-  // offset = sum_k (i_k * tailProducts[k])
-  sym::ExprHandle offsetAcc;
-  bool offsetInit = false;
-  for (size_t k = 0; k < n; ++k) {
-    auto i_k = liftSym(indexSyms[k]);
-    if (failed(i_k))
-      return failure();
-    sym::ExprHandle term;
-    if (k + 1 == n) {
-      // Last dim's stride is 1 by construction; skip the trivial multiply
-      // so the canonical form matches what ixsimpl produces from a
-      // standard textual `... + i_{n-1}` expression.
-      term = *i_k;
-    } else {
-      auto product = sym::composeExprBinary(store, *i_k, sym::ExprBinaryOp::Mul,
-                                            tailProducts[k]);
-      if (failed(product))
-        return failure();
-      term = *product;
-    }
-    if (!offsetInit) {
-      offsetAcc = term;
-      offsetInit = true;
-    } else {
-      auto sum = sym::composeExprBinary(store, offsetAcc,
-                                        sym::ExprBinaryOp::Add, term);
-      if (failed(sum))
-        return failure();
-      offsetAcc = *sum;
-    }
-  }
+  FailureOr<sym::ExprHandle> offset =
+      buildOffsetSum(store, *indexHandles, *tailProducts);
+  if (failed(offset))
+    return failure();
 
   // storage = prod_k shape[k]; tailProducts[0] already holds prod_{j>0},
   // so multiply by shape[0] once.
-  auto storageHandle = sym::composeExprBinary(
-      store, shapeHandles[0], sym::ExprBinaryOp::Mul, tailProducts[0]);
-  if (failed(storageHandle))
+  auto storage = sym::composeExprBinary(
+      store, (*shapeHandles)[0], sym::ExprBinaryOp::Mul, (*tailProducts)[0]);
+  if (failed(storage))
     return failure();
 
-  return CanonicalIdentity{offsetAcc, *storageHandle};
+  return CanonicalIdentity{*offset, *storage};
 }
 
 // True iff `layout` is the identity-layout contract for `shape`.

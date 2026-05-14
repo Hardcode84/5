@@ -1372,12 +1372,6 @@ private:
 
   // Wrap a freshly-emitted tensor/vector result in `hc.as_layout` when
   // the originating call carried a `layout=` kwarg. Returns the
-  // unwrapped value when no kwarg is present, so the caller can write
-  // a uniform `return maybeApplyLayoutKwarg(call, v)` at every
-  // allocator/load exit. The post-emit overlay keeps the rest of the
-  // op-builder code paths untouched and lets `-hc-canonicalize-layouts`
-  // collapse the wrap when the captured layout is the identity.
-  FailureOr<Value> maybeApplyLayoutKwarg(hc_front::CallOp call, Value result);
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
                               Value base, const CallArgs &args);
 
@@ -2980,17 +2974,6 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
               .getResult()};
 }
 
-FailureOr<Value> Lowerer::maybeApplyLayoutKwarg(hc_front::CallOp call,
-                                                Value result) {
-  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
-  if (failed(layout))
-    return failure();
-  if (!*layout)
-    return result;
-  return {HCAsLayoutOp::create(builder, call.getLoc(), undef, result, *layout)
-              .getResult()};
-}
-
 FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
                                               const RefInfo &ref,
                                               const CallArgs &args) {
@@ -3051,8 +3034,11 @@ FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
   if (method == "vec") {
     if (failed(requireBase(method)))
       return failure();
-    return maybeApplyLayoutKwarg(
-        call, HCVecOp::create(builder, call.getLoc(), undef, base).getResult());
+    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+    if (failed(layout))
+      return failure();
+    return {HCVecOp::create(builder, call.getLoc(), undef, base, *layout)
+                .getResult()};
   }
   if (method == "with_inactive") {
     if (failed(requireBase(method)))
@@ -3145,14 +3131,17 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
       call.emitOpError("`") << method << "` shape did not lower to an hc value";
       return failure();
     }
+    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+    if (failed(layout))
+      return failure();
     Operation *op = method == "load"
                         ? HCLoadOp::create(builder, call.getLoc(), undef, src,
-                                           indices, shape)
+                                           indices, shape, *layout)
                               .getOperation()
                         : HCVLoadOp::create(builder, call.getLoc(), undef, src,
-                                            indices, shape)
+                                            indices, shape, *layout)
                               .getOperation();
-    return maybeApplyLayoutKwarg(call, op->getResult(0));
+    return op->getResult(0);
   }
   if (method == "store") {
     if (args.positional.size() < 2) {
@@ -3211,23 +3200,26 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
     FailureOr<TypeAttr> dtype = optionalDtype(method);
     if (failed(dtype))
       return failure();
-    Value result;
+    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+    if (failed(layout))
+      return failure();
+    Operation *op;
     if (method == "vzeros")
-      result = HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                   .getResult();
+      op = HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                              *layout);
     else if (method == "vones")
-      result = HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                   .getResult();
+      op = HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                             *layout);
     else if (method == "zeros")
-      result = HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                   .getResult();
+      op = HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                             *layout);
     else if (method == "ones")
-      result = HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                   .getResult();
+      op = HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                            *layout);
     else
-      result = HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype)
-                   .getResult();
-    return maybeApplyLayoutKwarg(call, result);
+      op = HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                             *layout);
+    return op->getResult(0);
   }
 
   if (method == "vfull" || method == "full") {
@@ -3247,14 +3239,17 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
       call.emitOpError("`") << method << "` missing `fill_value=` operand";
       return failure();
     }
-    Value result = method == "vfull"
-                       ? HCVFullOp::create(builder, call.getLoc(), undef, fill,
-                                           *shape, *dtype)
-                             .getResult()
-                       : HCFullOp::create(builder, call.getLoc(), undef, fill,
-                                          *shape, *dtype)
-                             .getResult();
-    return maybeApplyLayoutKwarg(call, result);
+    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+    if (failed(layout))
+      return failure();
+    Operation *op = method == "vfull"
+                        ? HCVFullOp::create(builder, call.getLoc(), undef, fill,
+                                            *shape, *dtype, *layout)
+                              .getOperation()
+                        : HCFullOp::create(builder, call.getLoc(), undef, fill,
+                                           *shape, *dtype, *layout)
+                              .getOperation();
+    return op->getResult(0);
   }
   llvm_unreachable("unknown memory DSL method");
 }

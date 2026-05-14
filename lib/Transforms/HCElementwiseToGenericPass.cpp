@@ -149,8 +149,10 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc,
 static Value emitInit(OpBuilder &builder, Location loc, Type resultTy,
                       Value shape) {
   if (isa<mlir::hc::VectorType, BareVectorType>(resultTy))
-    return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr());
-  return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr());
+    return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
+                              /*layout=*/LayoutAttr{});
+  return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
+                           /*layout=*/LayoutAttr{});
 }
 
 // Spec for one rewrite. Caller fills it in per source op; the

@@ -807,7 +807,8 @@ def HCLoadOp : HC_Op<"load",
   let arguments = (ins
     HC_BufferValueType:$buffer,
     Variadic<HC_ValueType>:$indices,
-    HC_TupleValueType:$shape
+    HC_TupleValueType:$shape,
+    OptionalAttr<HC_LayoutAttr>:$layout
   );
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{
@@ -829,7 +830,8 @@ def HCVLoadOp : HC_Op<"vload",
   let arguments = (ins
     HC_BufferOrTensorValueType:$source,
     Variadic<HC_ValueType>:$indices,
-    HC_TupleValueType:$shape
+    HC_TupleValueType:$shape,
+    OptionalAttr<HC_LayoutAttr>:$layout
   );
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{
@@ -903,7 +905,10 @@ def HCVecOp : HC_Op<"vec",
     memory; two `hc.vec` ops on the same tensor may observe different contents
     if a store is interleaved, so CSE must not collapse them blindly.
   }];
-  let arguments = (ins HC_TensorLikeValueType:$value);
+  let arguments = (ins
+    HC_TensorLikeValueType:$value,
+    OptionalAttr<HC_LayoutAttr>:$layout
+  );
   let results = (outs HC_VectorLikeValueType:$result);
   let assemblyFormat = "$value attr-dict `:` type($value) `->` type($result)";
 }
@@ -988,7 +993,8 @@ class HC_NullaryShapedAllocOp<string mnemonic, bit vectorResult>
       ]> {
   let arguments = (ins
     HC_TupleValueType:$shape,
-    OptionalAttr<TypeAttr>:$dtype
+    OptionalAttr<TypeAttr>:$dtype,
+    OptionalAttr<HC_LayoutAttr>:$layout
   );
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{
@@ -1015,7 +1021,8 @@ class HC_FillShapedAllocOp<string mnemonic, bit vectorResult>
   let arguments = (ins
     HC_ValueType:$value,
     HC_TupleValueType:$shape,
-    OptionalAttr<TypeAttr>:$dtype
+    OptionalAttr<TypeAttr>:$dtype,
+    OptionalAttr<HC_LayoutAttr>:$layout
   );
   let results = (outs HC_ValueType:$result);
   let assemblyFormat = [{

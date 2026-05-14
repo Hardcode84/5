@@ -221,8 +221,10 @@ composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
 static Value emitValueInit(OpBuilder &builder, Location loc, Type resultTy,
                            Value shape) {
   if (isa<mlir::hc::VectorType, BareVectorType>(resultTy))
-    return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr());
-  return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr());
+    return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
+                              /*layout=*/LayoutAttr{});
+  return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
+                           /*layout=*/LayoutAttr{});
 }
 
 // Common shape:

@@ -130,16 +130,19 @@ static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
     if (auto intTy = dyn_cast<IntegerType>(elem)) {
       auto zero = HCConstOp::create(builder, loc, elem,
                                     builder.getIntegerAttr(intTy, 0));
-      return HCFullOp::create(builder, loc, resultTy, zero, shape, TypeAttr());
+      return HCFullOp::create(builder, loc, resultTy, zero, shape, TypeAttr(),
+                              /*layout=*/LayoutAttr{});
     }
-    return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr());
+    return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
+                             /*layout=*/LayoutAttr{});
   }
   auto floatTy = cast<FloatType>(elem);
   bool negative = (kind == ReduceKind::Max);
   APFloat ident = APFloat::getInf(floatTy.getFloatSemantics(), negative);
   auto fill =
       HCConstOp::create(builder, loc, elem, builder.getFloatAttr(elem, ident));
-  return HCFullOp::create(builder, loc, resultTy, fill, shape, TypeAttr());
+  return HCFullOp::create(builder, loc, resultTy, fill, shape, TypeAttr(),
+                          /*layout=*/LayoutAttr{});
 }
 
 // Combinator used by `hc.reduce` body. Caller pre-validates with

@@ -624,13 +624,15 @@ def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
-def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
+def test_layout_kwarg_stamps_attr_on_producer() -> None:
     """End-to-end Python -> hc_front -> hc handshake: a kernel calling
     ``group.vzeros(shape=..., layout=A_LAYOUT)`` must reach
     ``-convert-hc-front-to-hc`` with the right ref payload and surface
-    as ``hc.vzeros`` + ``hc.as_layout``. The LIT side pins the C++
-    consumer on hand-written hc_front IR; this test pins the boundary
-    (resolver ref shape exactly matches the C++ reader contract).
+    as ``hc.vzeros`` carrying a ``layout = #hc.layout<...>`` attribute
+    on the producer op (no intermediate ``hc.as_layout``). The LIT
+    side pins the C++ consumer on hand-written hc_front IR; this test
+    pins the boundary (resolver ref shape exactly matches the C++
+    reader contract).
     """
     import subprocess
 
@@ -669,9 +671,11 @@ def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
     ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     hc_text = result.stdout
     assert "hc.vzeros" in hc_text, hc_text
-    assert "hc.as_layout" in hc_text, hc_text
-    # The captured layout overlay must carry both the row/col index
-    # symbols and the storage_size built from the IndexMap lambdas.
+    # The captured layout is stamped directly on the producer op as a
+    # `layout = #hc.layout<...>` attribute; no intermediate
+    # `hc.as_layout` is emitted for `layout=` kwargs.
+    assert "hc.as_layout" not in hc_text, hc_text
+    assert "layout = #hc.layout<" in hc_text, hc_text
     # ixsimpl is free to reorder commuting factors (``h*w`` vs ``w*h``)
     # so the test asserts presence-and-shape rather than a verbatim
     # spelling.

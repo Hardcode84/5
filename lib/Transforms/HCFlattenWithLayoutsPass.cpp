@@ -977,7 +977,8 @@ struct ComposeLoadOffsets : public ComposeAccessOffsetBase<HCLoadOp> {
 
     auto newLoad =
         HCLoadOp::create(rewriter, op.getLoc(), convertedResults.front(),
-                         flatBuffer, ValueRange{*base}, adaptor.getShape()[0]);
+                         flatBuffer, ValueRange{*base}, adaptor.getShape()[0],
+                         /*layout=*/LayoutAttr{});
 
     llvm::StringMap<Value> bindings;
     noteOperandBindings(op.getBuffer().getType(), adaptor.getBuffer(),
@@ -1038,7 +1039,8 @@ struct ComposeVLoadOffsets : public ComposeAccessOffsetBase<HCVLoadOp> {
 
     auto newVLoad =
         HCVLoadOp::create(rewriter, op.getLoc(), convertedResults.front(),
-                          flatSource, ValueRange{*base}, adaptor.getShape()[0]);
+                          flatSource, ValueRange{*base}, adaptor.getShape()[0],
+                          /*layout=*/LayoutAttr{});
 
     llvm::StringMap<Value> bindings;
     noteOperandBindings(op.getSource().getType(), adaptor.getSource(),

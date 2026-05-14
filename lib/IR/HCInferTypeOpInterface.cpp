@@ -670,28 +670,18 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                         resultShape, resultLayout));
 }
 
-// Look one step downstream: if the op's single result feeds exactly one
-// `hc.as_layout`, return that wrap's captured layout. The producer's
-// inference can then bake the captured layout into its result type, which
-// keeps the bare-→layout-bearing transition (operand storage = product of
-// dims, result storage = `layout.storage_size`) from ever materializing.
-// Without this fusion, non-injective layouts (broadcasts, per-lane WMMA
-// fragments — `layout.storage_size` < `product(shape)`) trip the
-// `hc.as_layout` storage_size verifier the moment inference pins the
-// load's bare result type. The single-use guard is load-bearing: a
-// branch with multiple consumers can't have its layout absorbed, since
-// non-`hc.as_layout` users would see a layout-bearing type they didn't
-// ask for.
-static LayoutAttr absorbDownstreamAsLayout(Operation *op) {
-  if (!op || op->getNumResults() != 1)
+// Optional `layout` attribute on load/alloc/`hc.vec` producer ops: when
+// FrontToHC sees a `layout=` kwarg on the call site it stamps the
+// captured `LayoutAttr` directly on the producing op rather than emitting
+// a separate `hc.as_layout` overlay. Inference reads it here and bakes
+// it into the result type so non-injective layouts (broadcasts, per-lane
+// WMMA fragments — `layout.storage_size` < `product(shape)`) flow
+// through without producing a bare→layout-bearing transition that the
+// `hc.as_layout` storage_size verifier would reject.
+static LayoutAttr producerLayoutAttr(Operation *op) {
+  if (!op)
     return {};
-  Value result = op->getResult(0);
-  if (!result.hasOneUse())
-    return {};
-  auto asLayout = dyn_cast<HCAsLayoutOp>(*result.user_begin());
-  if (!asLayout)
-    return {};
-  return asLayout.getLayoutAttr();
+  return op->getAttrOfType<LayoutAttr>("layout");
 }
 
 static Type inferLoadLikeResult(Type sourceType, Type shapeType,
@@ -702,7 +692,7 @@ static Type inferLoadLikeResult(Type sourceType, Type shapeType,
   Type elementType = getSymbolicElementType(sourceType);
   if (!elementType)
     return {};
-  LayoutAttr layout = absorbDownstreamAsLayout(op);
+  LayoutAttr layout = producerLayoutAttr(op);
   return vectorResult
              ? Type(mlir::hc::VectorType::get(op->getContext(), elementType,
                                               shape, layout))
@@ -723,7 +713,7 @@ static Type inferAllocLikeResult(Type resultType, Type shapeType,
     elementType = fillType;
   if (!elementType)
     return resultType;
-  LayoutAttr layout = absorbDownstreamAsLayout(op);
+  LayoutAttr layout = producerLayoutAttr(op);
   return vectorResult
              ? Type(mlir::hc::VectorType::get(op->getContext(), elementType,
                                               shape, layout))
@@ -1158,12 +1148,16 @@ LogicalResult HCGetItemOp::inferHCTypes(ArrayRef<Type> operandTypes,
 LogicalResult HCVecOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
   Type value = operandTypes.empty() ? Type{} : operandTypes.front();
+  LayoutAttr layout = getLayoutAttr();
   if (auto tensor = dyn_cast_or_null<mlir::hc::TensorType>(value)) {
     resultTypes.push_back(mlir::hc::VectorType::get(
-        getContext(), tensor.getElementType(), tensor.getShape()));
+        getContext(), tensor.getElementType(), tensor.getShape(), layout));
     return success();
   }
   if (auto bareTensor = dyn_cast_or_null<mlir::hc::BareTensorType>(value)) {
+    // Bare carriers carry no layout; if the source has been decomposed we
+    // can't honour `layout=` here anymore, but the original layout-bearing
+    // path will already have run on the semantic type before decomposition.
     resultTypes.push_back(mlir::hc::BareVectorType::get(
         getContext(), bareTensor.getElementType(), bareTensor.getShape()));
     return success();

@@ -6,17 +6,21 @@
 // vload`, plus the `vec` method on a base value) accept an optional
 // `layout=<captured-IndexMap>` keyword. The Python resolver classifies
 // the kwarg's value as `ref.kind = "layout"` carrying typed `#hc.expr`
-// pieces; this pass overlays the captured layout on the result via
-// `hc.as_layout`. The post-emit overlay keeps the allocator/load op
-// surface untouched and lets `-hc-canonicalize-layouts` collapse the
-// wrap when the captured layout is the identity.
+// pieces; this pass stamps the captured layout directly on the
+// producer op via its `layout` attribute. Inference later bakes the
+// attribute into the result type; `-hc-canonicalize-layouts` still
+// collapses any explicit `hc.as_layout` users when the layout is the
+// identity. No intermediate `hc.as_layout` is emitted for `layout=`
+// kwargs — the old overlay path tripped the `hc.as_layout`
+// storage_size verifier for non-injective layouts the moment the
+// load's bare result type was pinned.
 //
 // RUN: hc-opt --convert-hc-front-to-hc --split-input-file %s | FileCheck %s
 // RUN: hc-opt --convert-hc-front-to-hc --split-input-file %s | hc-opt --split-input-file | FileCheck %s
 
 // CHECK-LABEL: hc.kernel @zeros_with_layout
-// CHECK: %[[Z:.*]] = hc.zeros shape %{{.*}}
-// CHECK: hc.as_layout %[[Z]], layout = (#hc.layout<shape_syms = ["w", "h"], index_syms = ["i", "j"], params = {row_stride = #hc.expr<"4 + h">}, storage_size = #hc.expr<"row_stride*w">, offset = #hc.expr<"j + i*row_stride">>)
+// CHECK: hc.zeros shape %{{.*}} {layout = #hc.layout<shape_syms = ["w", "h"], index_syms = ["i", "j"], params = {row_stride = #hc.expr<"4 + h">}, storage_size = #hc.expr<"row_stride*w">, offset = #hc.expr<"j + i*row_stride">>}
+// CHECK-NOT: hc.as_layout
 module {
   hc_front.kernel "zeros_with_layout" attributes {
     decorators = ["kernel"],
@@ -51,8 +55,8 @@ module {
 // rank-1 case honest.
 
 // CHECK-LABEL: hc.kernel @vzeros_with_layout
-// CHECK: %[[V:.*]] = hc.vzeros shape %{{.*}}
-// CHECK: hc.as_layout %[[V]], layout = (#hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">>)
+// CHECK: hc.vzeros shape %{{.*}} {layout = #hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">>}
+// CHECK-NOT: hc.as_layout
 module {
   hc_front.kernel "vzeros_with_layout" attributes {
     decorators = ["kernel"],
@@ -80,12 +84,12 @@ module {
 
 // -----
 
-// `full` / `vfull`: fill_value via positional + layout= overlay both
-// hold; the wrap lands on the `hc.full` / `hc.vfull` result.
+// `full` / `vfull`: fill_value via positional + layout= attribute both
+// hold on the `hc.full` / `hc.vfull` op directly.
 
 // CHECK-LABEL: hc.kernel @full_with_layout
-// CHECK: %[[F:.*]] = hc.full %{{.*}}, shape %{{.*}}
-// CHECK: hc.as_layout %[[F]], layout = (#hc.layout<shape_syms = ["d0"]
+// CHECK: hc.full %{{.*}}, shape %{{.*}} {layout = #hc.layout<shape_syms = ["d0"]
+// CHECK-NOT: hc.as_layout
 module {
   hc_front.kernel "full_with_layout" attributes {
     decorators = ["kernel"],
@@ -116,11 +120,12 @@ module {
 
 // `load` / `vload`: the captured layout applies to the loaded tile,
 // not the source buffer. Source-buffer layout still flows from the
-// kernel parameter dict; this overlay only relabels the result type.
+// kernel parameter dict; the producer attribute only describes the
+// result type's layout.
 
 // CHECK-LABEL: hc.kernel @vload_with_layout
-// CHECK: %[[L:.*]] = hc.vload %{{.*}}, shape %{{.*}}
-// CHECK: hc.as_layout %[[L]], layout = (#hc.layout<shape_syms = ["d0"]
+// CHECK: hc.vload %{{.*}}, shape %{{.*}} {layout = #hc.layout<shape_syms = ["d0"]
+// CHECK-NOT: hc.as_layout
 module {
   hc_front.kernel "vload_with_layout" attributes {
     decorators = ["kernel"],
@@ -153,12 +158,12 @@ module {
 
 // -----
 
-// `x.vec()` with `layout=`: the same overlay pattern on a unary-base
+// `x.vec()` with `layout=`: same attribute pattern on a unary-base
 // DSL method.
 
 // CHECK-LABEL: hc.kernel @vec_with_layout
-// CHECK: %[[X:.*]] = hc.vec
-// CHECK: hc.as_layout %[[X]], layout = (#hc.layout<shape_syms = ["d0"]
+// CHECK: hc.vec %{{.*}} {layout = #hc.layout<shape_syms = ["d0"]
+// CHECK-NOT: hc.as_layout
 module {
   hc_front.kernel "vec_with_layout" attributes {
     decorators = ["kernel"],

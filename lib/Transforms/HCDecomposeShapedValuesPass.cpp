@@ -632,7 +632,7 @@ struct ConvertLoadOp : public OpConversionPattern<HCLoadOp> {
 
     auto data =
         HCLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
-                         *buffer, indices, *shape);
+                         *buffer, indices, *shape, /*layout=*/LayoutAttr{});
     auto mask =
         HCLoadMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
                              *buffer, indices, *shape);
@@ -674,12 +674,13 @@ struct ConvertVLoadOp : public OpConversionPattern<HCVLoadOp> {
     }
     auto data =
         HCVLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
-                          dataSource, indices, *shape);
+                          dataSource, indices, *shape, /*layout=*/LayoutAttr{});
     Value maskValue;
     if (maskSource) {
       maskValue =
           HCVLoadOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
-                            maskSource, indices, *shape)
+                            maskSource, indices, *shape,
+                            /*layout=*/LayoutAttr{})
               .getResult();
     } else {
       maskValue = HCLoadMaskOp::create(rewriter, op.getLoc(),
@@ -710,7 +711,7 @@ struct ConvertNullaryAllocOp : public OpConversionPattern<OpT> {
     if (failed(shape))
       return failure();
     auto data = OpT::create(rewriter, op.getLoc(), bareDataType(originalType),
-                            *shape, op.getDtypeAttr());
+                            *shape, op.getDtypeAttr(), /*layout=*/LayoutAttr{});
     auto mask =
         HCFullMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType));
     replaceSingleResultWithSplit(rewriter, op, data.getResult(),
@@ -738,7 +739,8 @@ struct ConvertFillAllocOp : public OpConversionPattern<OpT> {
     if (failed(fill) || failed(shape))
       return failure();
     auto data = OpT::create(rewriter, op.getLoc(), bareDataType(originalType),
-                            *fill, *shape, op.getDtypeAttr());
+                            *fill, *shape, op.getDtypeAttr(),
+                            /*layout=*/LayoutAttr{});
     auto mask =
         HCFullMaskOp::create(rewriter, op.getLoc(), bareMaskType(originalType));
     replaceSingleResultWithSplit(rewriter, op, data.getResult(),
@@ -857,10 +859,12 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
         expectSplit(adaptor.getValue(), op, "vec source");
     if (failed(source))
       return failure();
-    auto data = HCVecOp::create(rewriter, op.getLoc(),
-                                bareDataType(originalType), source->first);
-    auto mask = HCVecOp::create(rewriter, op.getLoc(),
-                                bareMaskType(originalType), source->second);
+    auto data =
+        HCVecOp::create(rewriter, op.getLoc(), bareDataType(originalType),
+                        source->first, /*layout=*/LayoutAttr{});
+    auto mask =
+        HCVecOp::create(rewriter, op.getLoc(), bareMaskType(originalType),
+                        source->second, /*layout=*/LayoutAttr{});
     replaceSingleResultWithSplit(rewriter, op, data.getResult(),
                                  mask.getResult());
     return success();

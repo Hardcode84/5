@@ -30,13 +30,24 @@ static bool isSemanticShaped(Type type) {
   return isa<mlir::hc::TensorType, mlir::hc::VectorType>(type);
 }
 
+// Decomposition into `(bareData, bareMask)` carries the semantic
+// carrier's layout onto both halves. The bare types' `LayoutAttr` slot
+// is what `hc-flatten-with-layouts` reads when composing per-access
+// offsets, so dropping the layout here would collapse every non-
+// injective access (broadcasts, per-lane WMMA fragments where
+// `storage_size < product(shape)`) to identity indexing — materialising
+// the access pattern instead of preserving it. The mask side mirrors
+// the data side so `hc.store`'s mask/source verifier still finds the
+// pair structurally consistent.
 static Type bareDataType(Type type) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+  LayoutAttr layout = shaped ? shaped.getSymbolicLayout() : LayoutAttr{};
   if (auto tensor = dyn_cast<mlir::hc::TensorType>(type))
     return BareTensorType::get(type.getContext(), tensor.getElementType(),
-                               tensor.getShape());
+                               tensor.getShape(), layout);
   if (auto vector = dyn_cast<mlir::hc::VectorType>(type))
     return BareVectorType::get(type.getContext(), vector.getElementType(),
-                               vector.getShape());
+                               vector.getShape(), layout);
   return {};
 }
 
@@ -45,12 +56,13 @@ static Type bareMaskType(Type type) {
   if (!shaped)
     return {};
   Type pred = getUnpinnedPredType(type.getContext());
+  LayoutAttr layout = shaped.getSymbolicLayout();
   if (isa<mlir::hc::TensorType, BareTensorType>(type))
     return BareTensorType::get(type.getContext(), pred,
-                               shaped.getSymbolicShape());
+                               shaped.getSymbolicShape(), layout);
   if (isa<mlir::hc::VectorType, BareVectorType>(type))
     return BareVectorType::get(type.getContext(), pred,
-                               shaped.getSymbolicShape());
+                               shaped.getSymbolicShape(), layout);
   return {};
 }
 

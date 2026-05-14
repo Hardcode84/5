@@ -882,6 +882,24 @@ Consumer rules:
   formula matches the canonical "rightmost-fastest * dims" identity.
   Non-injective offsets and offsets referencing fewer than `rank`
   index_syms aren't the identity, so the pass leaves them alone.
+* `hc-decompose-shaped-values` mirrors the layout from the semantic
+  `!hc.tensor` / `!hc.vector` onto both bare halves of the
+  `(bare data, bare mask)` pair. The mask carrier inherits the same
+  layout so `hc.store`'s mask/source verifier still finds the pair
+  structurally consistent post-decompose; `hc-flatten-with-layouts`
+  then reads the preserved layout off the bare carrier when composing
+  per-access offsets, the same way it does for the semantic input.
+  Dropping the layout here would collapse every non-injective access
+  to identity indexing — materialising the broadcast before flatten
+  ever sees it.
+* `hc-load-store-to-generic` consults the result type's layout on a
+  non-injective `hc.vload` whose source rank is smaller than the tile
+  rank (canonical case: rank-1 flat storage fanning out into a
+  multi-axis logical tile via a broadcast `offset`). Per-source-axis
+  offsets come from substituting iter syms into the result layout's
+  `offset` expression so the verifier's "one offset per operand axis"
+  contract holds across rank changes. Same-rank accesses keep the
+  existing per-axis `base + step * iter` form.
 * `hc-flatten-with-layouts` composes the indices against the layout's
   `offset` expression by zip-substituting `index_syms[k] -> indices[k]`
   and `shape_syms[k] -> source_dims[k]`, then handing the resulting

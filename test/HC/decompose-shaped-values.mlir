@@ -300,3 +300,41 @@ hc.func @subgroup_region_result(%local: !hc.vector<f32, ["4"]>)
   }
   hc.return %region : !hc.vector<f32, ["4", "2"]>
 }
+
+// -----
+
+// Non-injective layout on the vload result. The layout encodes a broadcast
+// (`storage_size < product(shape)`); decompose must preserve it on both the
+// bare data and the bare mask carriers so `hc-flatten-with-layouts` can later
+// compose the per-iter offset against the same broadcast — dropping the
+// layout here would silently materialise the broadcast into a full identity
+// tile before flatten ever sees it.
+//
+// CHECK-LABEL: func.func @noninjective_layout_preserved
+// CHECK: %[[VLOAD:.*]] = hc.vload
+// CHECK-SAME: -> !hc.bare_vector<si64, ["M", "K", "LANE"],
+// CHECK-SAME: storage_size = #hc.expr<"K">
+// CHECK-SAME: offset = #hc.expr<"j">
+// CHECK: hc.load_mask
+// CHECK-SAME: -> !hc.bare_vector<!hc.pred, ["M", "K", "LANE"],
+// CHECK-SAME: storage_size = #hc.expr<"K">
+// CHECK-SAME: offset = #hc.expr<"j">
+// CHECK-NOT: !hc.vector
+func.func @noninjective_layout_preserved(%buf: !hc.buffer<si64, ["K"]>) {
+  %m = hc.const<2 : i64> : !hc.idx<"M">
+  %k = hc.const<4 : i64> : !hc.idx<"K">
+  %lane = hc.const<3 : i64> : !hc.idx<"LANE">
+  %shape = hc.tuple(%m, %k, %lane)
+      : (!hc.idx<"M">, !hc.idx<"K">, !hc.idx<"LANE">)
+        -> tuple<!hc.idx<"M">, !hc.idx<"K">, !hc.idx<"LANE">>
+  %vec = hc.vload %buf[], shape %shape
+      : (!hc.buffer<si64, ["K"]>,
+         tuple<!hc.idx<"M">, !hc.idx<"K">, !hc.idx<"LANE">>)
+        -> !hc.vector<si64, ["M", "K", "LANE"],
+                      #hc.layout<shape_syms = ["M", "K", "L"],
+                                 index_syms = ["i", "j", "lane"],
+                                 params = {},
+                                 storage_size = #hc.expr<"K">,
+                                 offset = #hc.expr<"j">>>
+  return
+}

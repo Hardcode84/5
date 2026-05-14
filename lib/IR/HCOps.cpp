@@ -1583,17 +1583,25 @@ static Type bareShapedElement(Type type) {
   return shaped ? shaped.getSymbolicElementType() : Type{};
 }
 
+// Mask carrier shape *and layout* must match the data carrier so the
+// `hc.store` / `hc.with_inactive` / `hc.select` verifiers — which
+// reconstruct the expected mask type from the data type — accept the
+// pair after `hc-decompose-shaped-values` preserves layouts on bare
+// data/mask. A layout-less bare data carrier would still produce a
+// layout-less expected mask, so this helper inherits the layout when
+// the source has one.
 static Type barePredicateMaskType(Type type) {
   auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(type);
   if (!shaped)
     return {};
   Type pred = getUnpinnedPredType(type.getContext());
+  LayoutAttr layout = shaped.getSymbolicLayout();
   if (llvm::isa<BareTensorType>(type))
     return BareTensorType::get(type.getContext(), pred,
-                               shaped.getSymbolicShape());
+                               shaped.getSymbolicShape(), layout);
   if (llvm::isa<BareVectorType>(type))
     return BareVectorType::get(type.getContext(), pred,
-                               shaped.getSymbolicShape());
+                               shaped.getSymbolicShape(), layout);
   return {};
 }
 

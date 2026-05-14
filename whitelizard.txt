@@ -71,12 +71,6 @@ lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeLoadOffsets::matchAndRewrite
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:ComposeVLoadOffsets::matchAndRewrite
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:HCFlattenWithLayoutsPass::runOnOperation
 lib/Transforms/HCFlattenWithLayoutsPass.cpp:RetypeAnyHCOp::matchAndRewrite
-lib/Transforms/HCInferTypesPass.cpp:HCTypeAnalysis::visitNonControlFlowArguments
-lib/Transforms/HCInferTypesPass.cpp:joinConcreteTypesWithPolicy
-lib/Transforms/HCInferTypesPass.cpp:liftCollectiveReturnType
-lib/Transforms/HCInferTypesPass.cpp:renumberSyntheticJoinSymbols
-lib/Transforms/HCInferTypesPass.cpp:rewriteSyntheticJoinSymbols
-lib/Transforms/HCInferTypesPass.cpp:updateCallableFunctionType
 lib/Transforms/HCLowerGenericPass.cpp:bindIterSymsInClone
 lib/Transforms/HCLowerGenericPass.cpp:cloneBody
 lib/Transforms/HCLowerGenericPass.cpp:diagnoseUnsupported

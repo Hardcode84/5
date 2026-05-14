@@ -138,6 +138,71 @@ struct TypeFact {
 
 static bool containsSyntheticJoinSymbol(IdxType type);
 
+// Per-element join over two tuple types: zip and recurse, pushing /
+// popping the element index onto `elementPath` so the recursive call
+// can address the conflict location. Returns `{}` when arities don't
+// match or any element pair fails to join.
+template <typename JoinIdxConflictFn>
+static Type joinConcreteTuplesWithPolicy(TupleType lhsTuple, TupleType rhsTuple,
+                                         SmallVectorImpl<unsigned> &elementPath,
+                                         JoinIdxConflictFn joinIdxConflict) {
+  if (lhsTuple.size() != rhsTuple.size())
+    return {};
+  SmallVector<Type> elements;
+  elements.reserve(lhsTuple.size());
+  unsigned elementIndex = 0;
+  for (auto [lhsElement, rhsElement] :
+       llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
+    elementPath.push_back(elementIndex++);
+    Type joined = joinConcreteTypesWithPolicy(lhsElement, rhsElement,
+                                              elementPath, joinIdxConflict);
+    elementPath.pop_back();
+    if (!joined)
+      return {};
+    elements.push_back(joined);
+  }
+  return TupleType::get(lhsTuple.getContext(), elements);
+}
+
+// Conflict resolution between two pinned `!hc.idx<expr>` types. Once
+// a conflict has a synthetic representative, keep it stable across
+// later solver reruns and expressions derived from that
+// representative. Returns null when neither side has a synthetic
+// representative and the caller's conflict factory declines.
+template <typename JoinIdxConflictFn>
+static Type joinConcreteIdxWithPolicy(IdxType lhsIdx, IdxType rhsIdx, Type lhs,
+                                      Type rhs,
+                                      SmallVectorImpl<unsigned> &elementPath,
+                                      JoinIdxConflictFn joinIdxConflict) {
+  if (!lhsIdx.getExpr() || !rhsIdx.getExpr())
+    return {};
+  if (containsSyntheticJoinSymbol(lhsIdx))
+    return lhs;
+  if (containsSyntheticJoinSymbol(rhsIdx))
+    return rhs;
+  return joinIdxConflict(lhs.getContext(), elementPath);
+}
+
+// Tuple-vs-tuple arm of `joinConcreteTypesWithPolicy`, extracted to
+// keep the parent's branch count below the lizard CCN threshold.
+// `nullopt` means the tuple shape doesn't apply (neither side is a
+// tuple); a default-constructed `Type` is an explicit mismatch
+// (tuple-vs-non-tuple); a non-null `Type` is the joined tuple.
+template <typename JoinIdxConflictFn>
+static std::optional<Type>
+tryJoinConcreteTuplesWithPolicy(Type lhs, Type rhs,
+                                SmallVectorImpl<unsigned> &elementPath,
+                                JoinIdxConflictFn joinIdxConflict) {
+  auto lhsTuple = dyn_cast<TupleType>(lhs);
+  auto rhsTuple = dyn_cast<TupleType>(rhs);
+  if (!lhsTuple && !rhsTuple)
+    return std::nullopt;
+  if (!lhsTuple || !rhsTuple)
+    return Type{};
+  return Type(joinConcreteTuplesWithPolicy(lhsTuple, rhsTuple, elementPath,
+                                           joinIdxConflict));
+}
+
 template <typename JoinIdxConflictFn>
 static Type joinConcreteTypesWithPolicy(Type lhs, Type rhs,
                                         SmallVectorImpl<unsigned> &elementPath,
@@ -147,39 +212,16 @@ static Type joinConcreteTypesWithPolicy(Type lhs, Type rhs,
   if (isHCUndefType(rhs))
     return lhs;
 
-  auto lhsTuple = dyn_cast<TupleType>(lhs);
-  auto rhsTuple = dyn_cast<TupleType>(rhs);
-  if (lhsTuple || rhsTuple) {
-    if (!lhsTuple || !rhsTuple || lhsTuple.size() != rhsTuple.size())
-      return {};
-    SmallVector<Type> elements;
-    elements.reserve(lhsTuple.size());
-    unsigned elementIndex = 0;
-    for (auto [lhsElement, rhsElement] :
-         llvm::zip_equal(lhsTuple.getTypes(), rhsTuple.getTypes())) {
-      elementPath.push_back(elementIndex++);
-      Type joined = joinConcreteTypesWithPolicy(lhsElement, rhsElement,
-                                                elementPath, joinIdxConflict);
-      elementPath.pop_back();
-      if (!joined)
-        return {};
-      elements.push_back(joined);
-    }
-    return TupleType::get(lhs.getContext(), elements);
-  }
+  if (std::optional<Type> tuple = tryJoinConcreteTuplesWithPolicy(
+          lhs, rhs, elementPath, joinIdxConflict))
+    return *tuple;
 
   auto lhsIdx = dyn_cast<IdxType>(lhs);
   auto rhsIdx = dyn_cast<IdxType>(rhs);
-  if (lhsIdx && rhsIdx && lhsIdx.getExpr() && rhsIdx.getExpr()) {
-    // Once a conflict has a synthetic representative, keep it stable across
-    // later solver reruns and expressions derived from that representative.
-    if (containsSyntheticJoinSymbol(lhsIdx))
-      return lhs;
-    if (containsSyntheticJoinSymbol(rhsIdx))
-      return rhs;
-    if (Type joined = joinIdxConflict(lhs.getContext(), elementPath))
+  if (lhsIdx && rhsIdx)
+    if (Type joined = joinConcreteIdxWithPolicy(lhsIdx, rhsIdx, lhs, rhs,
+                                                elementPath, joinIdxConflict))
       return joined;
-  }
 
   return joinHCTypes(lhs, rhs);
 }
@@ -339,38 +381,43 @@ public:
     return success();
   }
 
-  void visitNonControlFlowArguments(
-      Operation *op, const RegionSuccessor &successor,
+  // Push the IV's seeding fact onto its lattice. An unknown or
+  // unpinned IV is still a distinct symbolic value; use the same
+  // representative machinery as idx joins so IV-derived expressions
+  // retain something to reason about.
+  void seedForRangeIvLattice(HCForRangeOp forRange, Type ivType,
+                             HCTypeLattice *ivLattice) {
+    if (isHCUndefType(ivType) || isUnpinnedIdxType(ivType))
+      propagateIfChanged(ivLattice, ivLattice->joinSyntheticIdxRepresentative(
+                                        forRange.getContext()));
+    else
+      join(ivLattice, factFromExistingType(ivType));
+  }
+
+  // HCForRangeOp branch of `visitNonControlFlowArguments`: seed the
+  // IV from the loop entry, then bind every iter_arg's lattice from
+  // its current type.
+  void visitForRangeNonControlFlowArguments(
+      HCForRangeOp forRange, const RegionSuccessor &successor,
       ValueRange nonSuccessorInputs,
-      ArrayRef<HCTypeLattice *> nonSuccessorInputLattices) override {
-    assert(nonSuccessorInputs.size() == nonSuccessorInputLattices.size() &&
-           "size mismatch");
+      ArrayRef<HCTypeLattice *> nonSuccessorInputLattices) {
+    if (!successor.isParent() && !nonSuccessorInputs.empty())
+      seedForRangeIvLattice(forRange, nonSuccessorInputs.front().getType(),
+                            nonSuccessorInputLattices.front());
+    for (auto [input, lattice] :
+         llvm::zip(nonSuccessorInputs.drop_front(),
+                   nonSuccessorInputLattices.drop_front()))
+      join(lattice, factFromExistingType(input.getType()));
+  }
 
-    if (auto forRange = dyn_cast<HCForRangeOp>(op)) {
-      if (!successor.isParent() && !nonSuccessorInputs.empty()) {
-        Type ivType = nonSuccessorInputs.front().getType();
-        HCTypeLattice *ivLattice = nonSuccessorInputLattices.front();
-        // An unknown or unpinned IV is still a distinct symbolic value; use the
-        // same representative machinery as idx joins so IV-derived expressions
-        // retain something to reason about.
-        if (isHCUndefType(ivType) || isUnpinnedIdxType(ivType))
-          propagateIfChanged(
-              ivLattice,
-              ivLattice->joinSyntheticIdxRepresentative(forRange.getContext()));
-        else
-          join(ivLattice, factFromExistingType(ivType));
-      }
-      for (auto [input, lattice] :
-           llvm::zip(nonSuccessorInputs.drop_front(),
-                     nonSuccessorInputLattices.drop_front()))
-        join(lattice, factFromExistingType(input.getType()));
-      return;
-    }
-
-    auto infer = dyn_cast<HCInferRegionArgTypeOpInterface>(op);
-    if (!infer)
-      return setAllToEntryStates(nonSuccessorInputLattices);
-
+  // HCInferRegionArgTypeOpInterface branch: invoke the op's region-
+  // arg type inference and broadcast the concrete results onto the
+  // lattices. Falls back to entry-state on inference failure or
+  // arity mismatch (the latter is a verifier bug).
+  void visitInferredRegionArguments(
+      HCInferRegionArgTypeOpInterface infer, const RegionSuccessor &successor,
+      ValueRange nonSuccessorInputs,
+      ArrayRef<HCTypeLattice *> nonSuccessorInputLattices) {
     SmallVector<Type> inferredTypes;
     if (failed(infer.inferHCRegionArgTypes(successor, nonSuccessorInputs,
                                            inferredTypes)))
@@ -379,11 +426,28 @@ public:
       assert(false && "region argument inference returned the wrong arity");
       return setAllToEntryStates(nonSuccessorInputLattices);
     }
-
     for (auto [lattice, type] :
          llvm::zip(nonSuccessorInputLattices, inferredTypes))
       if (type)
         join(lattice, TypeFact::concrete(type));
+  }
+
+  void visitNonControlFlowArguments(
+      Operation *op, const RegionSuccessor &successor,
+      ValueRange nonSuccessorInputs,
+      ArrayRef<HCTypeLattice *> nonSuccessorInputLattices) override {
+    assert(nonSuccessorInputs.size() == nonSuccessorInputLattices.size() &&
+           "size mismatch");
+
+    if (auto forRange = dyn_cast<HCForRangeOp>(op))
+      return visitForRangeNonControlFlowArguments(
+          forRange, successor, nonSuccessorInputs, nonSuccessorInputLattices);
+
+    auto infer = dyn_cast<HCInferRegionArgTypeOpInterface>(op);
+    if (!infer)
+      return setAllToEntryStates(nonSuccessorInputLattices);
+    visitInferredRegionArguments(infer, successor, nonSuccessorInputs,
+                                 nonSuccessorInputLattices);
   }
 
 protected:
@@ -670,37 +734,43 @@ static Type appendCollectiveSuffixToVector(Type type,
 }
 
 static FailureOr<Type> liftCollectiveReturnType(Operation *op, Type type,
+                                                ArrayRef<Attribute> suffix);
+
+// Element-wise lift over a tuple type: recurse into each element,
+// rejecting nested tuples (collective regions return flat tuples
+// only). Caller has already ruled out empty `suffix` and non-tuple
+// types.
+static FailureOr<Type> liftCollectiveTupleReturn(Operation *op, TupleType tuple,
+                                                 ArrayRef<Attribute> suffix) {
+  SmallVector<Type> elements;
+  elements.reserve(tuple.size());
+  for (Type element : tuple.getTypes()) {
+    if (isa<TupleType>(element))
+      return op->emitOpError("collective region cannot return nested tuple ")
+             << Type(tuple);
+    FailureOr<Type> lifted = liftCollectiveReturnType(op, element, suffix);
+    if (failed(lifted))
+      return failure();
+    elements.push_back(*lifted);
+  }
+  return Type(TupleType::get(tuple.getContext(), elements));
+}
+
+static FailureOr<Type> liftCollectiveReturnType(Operation *op, Type type,
                                                 ArrayRef<Attribute> suffix) {
   if (suffix.empty() || !type || isHCUndefType(type))
     return type;
-
   if (isa<mlir::hc::TensorType, mlir::hc::BareTensorType>(type))
     return op->emitOpError("collective region cannot return tensor value ")
            << type;
-
-  if (auto tuple = dyn_cast<TupleType>(type)) {
-    SmallVector<Type> elements;
-    elements.reserve(tuple.size());
-    for (Type element : tuple.getTypes()) {
-      if (isa<TupleType>(element))
-        return op->emitOpError("collective region cannot return nested tuple ")
-               << type;
-      FailureOr<Type> lifted = liftCollectiveReturnType(op, element, suffix);
-      if (failed(lifted))
-        return failure();
-      elements.push_back(*lifted);
-    }
-    return Type(TupleType::get(type.getContext(), elements));
-  }
-
+  if (auto tuple = dyn_cast<TupleType>(type))
+    return liftCollectiveTupleReturn(op, tuple, suffix);
   if (Type vector = appendCollectiveSuffixToVector(type, suffix))
     return vector;
-
   if (isCollectiveScalarType(type)) {
     ShapeAttr shape = ShapeAttr::get(type.getContext(), suffix);
     return Type(mlir::hc::VectorType::get(type.getContext(), type, shape));
   }
-
   return op->emitOpError("collective region cannot return value of type ")
          << type;
 }
@@ -765,6 +835,24 @@ static FailureOr<bool> updateYieldedRegionResultTypes(Operation *root,
   return changed;
 }
 
+// Merge one `hc.return`'s values into `resultFacts`, preferring a
+// strict refinement over the cumulative join. Out-of-arity returns
+// (a verifier bug at the boundary) are silently dropped — they'd
+// land on a missing fact slot otherwise.
+static void mergeReturnIntoFacts(HCReturnOp ret, DataFlowSolver &solver,
+                                 SmallVectorImpl<TypeFact> &resultFacts) {
+  for (auto [idx, value] : llvm::enumerate(ret.getValues())) {
+    if (idx >= resultFacts.size())
+      return;
+    TypeFact fact = factFromValue(solver, value);
+    if (resultFacts[idx].hasUsableType() && fact.hasUsableType() &&
+        shouldRefineHCType(resultFacts[idx].type, fact.type))
+      resultFacts[idx] = fact;
+    else
+      resultFacts[idx] = joinExistingFacts(resultFacts[idx], fact);
+  }
+}
+
 template <typename CallableOpT>
 static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
   auto fnTypeAttr = op.getFunctionTypeAttr();
@@ -779,18 +867,8 @@ static bool updateCallableFunctionType(CallableOpT op, DataFlowSolver &solver) {
     resultFacts.push_back(factFromExistingType(result));
 
   op.getBody().walk([&](HCReturnOp ret) {
-    if (nearestHCCallable(ret.getOperation()) != op.getOperation())
-      return;
-    for (auto [idx, value] : llvm::enumerate(ret.getValues())) {
-      if (idx >= resultFacts.size())
-        return;
-      TypeFact fact = factFromValue(solver, value);
-      if (resultFacts[idx].hasUsableType() && fact.hasUsableType() &&
-          shouldRefineHCType(resultFacts[idx].type, fact.type))
-        resultFacts[idx] = fact;
-      else
-        resultFacts[idx] = joinExistingFacts(resultFacts[idx], fact);
-    }
+    if (nearestHCCallable(ret.getOperation()) == op.getOperation())
+      mergeReturnIntoFacts(ret, solver, resultFacts);
   });
 
   SmallVector<Type> results;
@@ -958,64 +1036,90 @@ rewritePredAttr(MLIRContext *ctx, PredAttr attr,
 
 static FailureOr<Type>
 rewriteSyntheticJoinSymbols(Type type,
+                            ArrayRef<SymbolSubstitution> substitutions);
+
+// Per-type-kind dispatchers for `rewriteSyntheticJoinSymbols`. Each
+// returns the rewritten type, the unchanged `type` if nothing
+// rewrote, or failure if a sub-rewrite bailed.
+static FailureOr<Type>
+rewriteIdxSyntheticJoinSymbols(IdxType idx, MLIRContext *ctx,
+                               ArrayRef<SymbolSubstitution> substitutions) {
+  ExprAttr expr = idx.getExpr();
+  if (!expr)
+    return Type(idx);
+  FailureOr<ExprAttr> rewritten = rewriteExprAttr(ctx, expr, substitutions);
+  if (failed(rewritten))
+    return failure();
+  return Type(IdxType::get(ctx, *rewritten));
+}
+
+static FailureOr<Type>
+rewritePredSyntheticJoinSymbols(PredType pred, MLIRContext *ctx,
+                                ArrayRef<SymbolSubstitution> substitutions) {
+  PredAttr predicate = pred.getPred();
+  if (!predicate)
+    return Type(pred);
+  FailureOr<PredAttr> rewritten =
+      rewritePredAttr(ctx, predicate, substitutions);
+  if (failed(rewritten))
+    return failure();
+  return Type(PredType::get(ctx, *rewritten));
+}
+
+static FailureOr<Type>
+rewriteTupleSyntheticJoinSymbols(TupleType tuple, MLIRContext *ctx,
+                                 ArrayRef<SymbolSubstitution> substitutions) {
+  SmallVector<Type> elements;
+  elements.reserve(tuple.size());
+  bool changed = false;
+  for (Type element : tuple.getTypes()) {
+    FailureOr<Type> rewritten =
+        rewriteSyntheticJoinSymbols(element, substitutions);
+    if (failed(rewritten))
+      return failure();
+    changed |= *rewritten != element;
+    elements.push_back(*rewritten);
+  }
+  if (!changed)
+    return Type(tuple);
+  return Type(TupleType::get(ctx, elements));
+}
+
+static FailureOr<Type>
+rewriteSliceSyntheticJoinSymbols(SliceType slice, MLIRContext *ctx,
+                                 ArrayRef<SymbolSubstitution> substitutions) {
+  FailureOr<Type> lower =
+      rewriteSyntheticJoinSymbols(slice.getLowerType(), substitutions);
+  if (failed(lower))
+    return failure();
+  FailureOr<Type> upper =
+      rewriteSyntheticJoinSymbols(slice.getUpperType(), substitutions);
+  if (failed(upper))
+    return failure();
+  FailureOr<Type> step =
+      rewriteSyntheticJoinSymbols(slice.getStepType(), substitutions);
+  if (failed(step))
+    return failure();
+  if (*lower == slice.getLowerType() && *upper == slice.getUpperType() &&
+      *step == slice.getStepType())
+    return Type(slice);
+  return Type(SliceType::get(ctx, *lower, *upper, *step));
+}
+
+static FailureOr<Type>
+rewriteSyntheticJoinSymbols(Type type,
                             ArrayRef<SymbolSubstitution> substitutions) {
   if (!type)
     return type;
-
   MLIRContext *ctx = type.getContext();
-  if (auto idx = dyn_cast<IdxType>(type)) {
-    ExprAttr expr = idx.getExpr();
-    if (!expr)
-      return type;
-    FailureOr<ExprAttr> rewritten = rewriteExprAttr(ctx, expr, substitutions);
-    if (failed(rewritten))
-      return failure();
-    return IdxType::get(ctx, *rewritten);
-  }
-  if (auto pred = dyn_cast<PredType>(type)) {
-    PredAttr predicate = pred.getPred();
-    if (!predicate)
-      return type;
-    FailureOr<PredAttr> rewritten =
-        rewritePredAttr(ctx, predicate, substitutions);
-    if (failed(rewritten))
-      return failure();
-    return PredType::get(ctx, *rewritten);
-  }
-  if (auto tuple = dyn_cast<TupleType>(type)) {
-    SmallVector<Type> elements;
-    elements.reserve(tuple.size());
-    bool changed = false;
-    for (Type element : tuple.getTypes()) {
-      FailureOr<Type> rewritten =
-          rewriteSyntheticJoinSymbols(element, substitutions);
-      if (failed(rewritten))
-        return failure();
-      changed |= *rewritten != element;
-      elements.push_back(*rewritten);
-    }
-    if (!changed)
-      return type;
-    return TupleType::get(ctx, elements);
-  }
-  if (auto slice = dyn_cast<SliceType>(type)) {
-    FailureOr<Type> lower =
-        rewriteSyntheticJoinSymbols(slice.getLowerType(), substitutions);
-    if (failed(lower))
-      return failure();
-    FailureOr<Type> upper =
-        rewriteSyntheticJoinSymbols(slice.getUpperType(), substitutions);
-    if (failed(upper))
-      return failure();
-    FailureOr<Type> step =
-        rewriteSyntheticJoinSymbols(slice.getStepType(), substitutions);
-    if (failed(step))
-      return failure();
-    if (*lower == slice.getLowerType() && *upper == slice.getUpperType() &&
-        *step == slice.getStepType())
-      return type;
-    return SliceType::get(ctx, *lower, *upper, *step);
-  }
+  if (auto idx = dyn_cast<IdxType>(type))
+    return rewriteIdxSyntheticJoinSymbols(idx, ctx, substitutions);
+  if (auto pred = dyn_cast<PredType>(type))
+    return rewritePredSyntheticJoinSymbols(pred, ctx, substitutions);
+  if (auto tuple = dyn_cast<TupleType>(type))
+    return rewriteTupleSyntheticJoinSymbols(tuple, ctx, substitutions);
+  if (auto slice = dyn_cast<SliceType>(type))
+    return rewriteSliceSyntheticJoinSymbols(slice, ctx, substitutions);
   return type;
 }
 
@@ -1064,71 +1168,86 @@ rewriteCallableFunctionType(CallableOpT op,
   return success();
 }
 
+// Rewrite the function-type attribute on any callable kind that
+// carries one. Returns success when `op` isn't a callable (nothing
+// to do).
+static LogicalResult rewriteCallableFunctionTypeIfNeeded(
+    Operation *op, ArrayRef<SymbolSubstitution> substitutions) {
+  if (auto kernel = dyn_cast<HCKernelOp>(op))
+    return rewriteCallableFunctionType(kernel, substitutions);
+  if (auto func = dyn_cast<HCFuncOp>(op))
+    return rewriteCallableFunctionType(func, substitutions);
+  if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
+    return rewriteCallableFunctionType(intrinsic, substitutions);
+  return success();
+}
+
+// Rewrite every op-result's type and every nested block-arg's type
+// in-place. Used by `renumberSyntheticJoinSymbols`'s walk to update
+// types alongside the callable type-attr rewrite.
+static LogicalResult
+rewriteOpResultAndRegionTypes(Operation *op,
+                              ArrayRef<SymbolSubstitution> substitutions) {
+  for (OpResult opResult : op->getResults()) {
+    FailureOr<Type> newType =
+        rewriteSyntheticJoinSymbols(opResult.getType(), substitutions);
+    if (failed(newType))
+      return failure();
+    opResult.setType(*newType);
+  }
+  for (Region &region : op->getRegions())
+    for (Block &block : region)
+      for (BlockArgument arg : block.getArguments()) {
+        FailureOr<Type> newType =
+            rewriteSyntheticJoinSymbols(arg.getType(), substitutions);
+        if (failed(newType))
+          return failure();
+        arg.setType(*newType);
+      }
+  return success();
+}
+
 static LogicalResult
 renumberSyntheticJoinSymbols(Operation *root,
                              ArrayRef<SymbolSubstitution> substitutions) {
   if (substitutions.empty())
     return success();
-
   WalkResult walkStatus = root->walk([&](Operation *op) -> WalkResult {
-    if (auto kernel = dyn_cast<HCKernelOp>(op)) {
-      if (failed(rewriteCallableFunctionType(kernel, substitutions)))
-        return WalkResult::interrupt();
-    } else if (auto func = dyn_cast<HCFuncOp>(op)) {
-      if (failed(rewriteCallableFunctionType(func, substitutions)))
-        return WalkResult::interrupt();
-    } else if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op)) {
-      if (failed(rewriteCallableFunctionType(intrinsic, substitutions)))
-        return WalkResult::interrupt();
-    }
-
-    for (OpResult opResult : op->getResults()) {
-      FailureOr<Type> newType =
-          rewriteSyntheticJoinSymbols(opResult.getType(), substitutions);
-      if (failed(newType))
-        return WalkResult::interrupt();
-      opResult.setType(*newType);
-    }
-    for (Region &region : op->getRegions()) {
-      for (Block &block : region) {
-        for (BlockArgument arg : block.getArguments()) {
-          FailureOr<Type> newType =
-              rewriteSyntheticJoinSymbols(arg.getType(), substitutions);
-          if (failed(newType))
-            return WalkResult::interrupt();
-          arg.setType(*newType);
-        }
-      }
-    }
+    if (failed(rewriteCallableFunctionTypeIfNeeded(op, substitutions)))
+      return WalkResult::interrupt();
+    if (failed(rewriteOpResultAndRegionTypes(op, substitutions)))
+      return WalkResult::interrupt();
     return WalkResult::advance();
   });
   return failure(walkStatus.wasInterrupted());
 }
 
-static LogicalResult renumberSyntheticJoinSymbols(Operation *root) {
-  llvm::StringSet<> seen;
-  SmallVector<std::string> symbols;
-  root->walk([&](Operation *op) {
-    if (auto kernel = dyn_cast<HCKernelOp>(op))
-      collectSyntheticJoinSymbols(kernel, seen, symbols);
-    else if (auto func = dyn_cast<HCFuncOp>(op))
-      collectSyntheticJoinSymbols(func, seen, symbols);
-    else if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
-      collectSyntheticJoinSymbols(intrinsic, seen, symbols);
+// Collect every synthetic-join symbol reachable from `op`: callable
+// function-type slot, every op result type, every nested block-arg
+// type.
+static void
+collectSyntheticJoinSymbolsFromOp(Operation *op, llvm::StringSet<> &seen,
+                                  SmallVectorImpl<std::string> &symbols) {
+  if (auto kernel = dyn_cast<HCKernelOp>(op))
+    collectSyntheticJoinSymbols(kernel, seen, symbols);
+  else if (auto func = dyn_cast<HCFuncOp>(op))
+    collectSyntheticJoinSymbols(func, seen, symbols);
+  else if (auto intrinsic = dyn_cast<HCIntrinsicOp>(op))
+    collectSyntheticJoinSymbols(intrinsic, seen, symbols);
+  for (OpResult result : op->getResults())
+    collectSyntheticJoinSymbols(result.getType(), seen, symbols);
+  for (Region &region : op->getRegions())
+    for (Block &block : region)
+      for (BlockArgument arg : block.getArguments())
+        collectSyntheticJoinSymbols(arg.getType(), seen, symbols);
+}
 
-    for (OpResult result : op->getResults())
-      collectSyntheticJoinSymbols(result.getType(), seen, symbols);
-    for (Region &region : op->getRegions())
-      for (Block &block : region)
-        for (BlockArgument arg : block.getArguments())
-          collectSyntheticJoinSymbols(arg.getType(), seen, symbols);
-  });
-
-  // Build the (from, to) handles once via composeExprSym — both ends
-  // are bare symbol leaves, no parser required, and the canonical
-  // handles are what ixs_subs_multi compares against during rewrite.
-  auto *dialect = root->getContext()->getOrLoadDialect<HCDialect>();
-  sym::Store &store = dialect->getSymbolStore();
+// Build the (from, to) handles once via `composeExprSym` — both ends
+// are bare symbol leaves, no parser required, and the canonical
+// handles are what `ixs_subs_multi` compares against during rewrite.
+static FailureOr<SmallVector<SymbolSubstitution>>
+buildSyntheticJoinSubstitutions(sym::Store &store,
+                                ArrayRef<std::string> symbols) {
   SmallVector<SymbolSubstitution> substitutions;
   substitutions.reserve(symbols.size());
   for (auto [index, symbol] : llvm::enumerate(symbols)) {
@@ -1140,7 +1259,22 @@ static LogicalResult renumberSyntheticJoinSymbols(Operation *root) {
       return failure();
     substitutions.emplace_back(*from, *to);
   }
-  return renumberSyntheticJoinSymbols(root, substitutions);
+  return substitutions;
+}
+
+static LogicalResult renumberSyntheticJoinSymbols(Operation *root) {
+  llvm::StringSet<> seen;
+  SmallVector<std::string> symbols;
+  root->walk([&](Operation *op) {
+    collectSyntheticJoinSymbolsFromOp(op, seen, symbols);
+  });
+
+  auto *dialect = root->getContext()->getOrLoadDialect<HCDialect>();
+  sym::Store &store = dialect->getSymbolStore();
+  auto substitutions = buildSyntheticJoinSubstitutions(store, symbols);
+  if (failed(substitutions))
+    return failure();
+  return renumberSyntheticJoinSymbols(root, *substitutions);
 }
 
 struct HCInferTypesPass : public hc::impl::HCInferTypesBase<HCInferTypesPass> {

@@ -191,6 +191,36 @@ static void materializeValue(Value value, OpBuilder &builder) {
   value.replaceAllUsesExcept(replacement, replacement.getDefiningOp());
 }
 
+// First ambient symbol name referenced by `exprAttr` that isn't either
+// explicitly bound by the op or declared on the enclosing kernel.
+// Returns the empty string if no such name exists. Restricting to the
+// first hit keeps the diagnostic concise (operators care about the
+// missing declaration, not the full set).
+static std::string
+firstUndeclaredAmbientSymbolName(Attribute exprAttr, ArrayAttr explicitSymbols,
+                                 const BoundSymbolSet &boundSymbols) {
+  if (!exprAttr)
+    return {};
+  llvm::StringSet<> bound;
+  for (Attribute attr : explicitSymbols)
+    if (auto str = dyn_cast<StringAttr>(attr))
+      bound.insert(str.getValue());
+  std::string undeclared;
+  auto checkName = [&](StringRef name) {
+    if (!undeclared.empty())
+      return;
+    if (bound.contains(name))
+      return;
+    if (!isBoundSymbolName(name, boundSymbols))
+      undeclared = name.str();
+  };
+  if (auto expr = dyn_cast<ExprAttr>(exprAttr))
+    sym::walkSymbolNames(expr.getValue(), checkName);
+  if (auto pred = dyn_cast<PredAttr>(exprAttr))
+    sym::walkSymbolNames(pred.getValue(), checkName);
+  return undeclared;
+}
+
 // Validates that every severed apply op's residual ambient symbols
 // are declared on the enclosing kernel's `bound_symbols` attribute.
 // Any free symbol the op explicitly binds via its `symbols` list is
@@ -201,25 +231,8 @@ verifyMaterializedExprSymbols(Operation *root,
                               const BoundSymbolSet &boundSymbols) {
   auto check = [&](Operation *op, Attribute exprAttr,
                    ArrayAttr explicitSymbols) -> WalkResult {
-    if (!exprAttr)
-      return WalkResult::advance();
-    llvm::StringSet<> bound;
-    for (Attribute attr : explicitSymbols)
-      if (auto str = dyn_cast<StringAttr>(attr))
-        bound.insert(str.getValue());
-    std::string undeclared;
-    auto checkName = [&](StringRef name) {
-      if (!undeclared.empty())
-        return;
-      if (bound.contains(name))
-        return;
-      if (!isBoundSymbolName(name, boundSymbols))
-        undeclared = name.str();
-    };
-    if (auto expr = dyn_cast<ExprAttr>(exprAttr))
-      sym::walkSymbolNames(expr.getValue(), checkName);
-    if (auto pred = dyn_cast<PredAttr>(exprAttr))
-      sym::walkSymbolNames(pred.getValue(), checkName);
+    std::string undeclared = firstUndeclaredAmbientSymbolName(
+        exprAttr, explicitSymbols, boundSymbols);
     if (undeclared.empty())
       return WalkResult::advance();
     op->emitOpError("references undeclared bound symbol '")
@@ -243,6 +256,29 @@ verifyMaterializedExprSymbols(Operation *root,
   return failure(status.wasInterrupted());
 }
 
+// Walk `root` and collect every result + block-argument value that
+// belongs under an `hc.callable` and carries a symbolic carrier the
+// rewrite should sever. Returning the full list up front lets the
+// rewrite phase mutate IR without invalidating the walk's iteration.
+static SmallVector<Value>
+collectValuesToMaterialize(Operation *root,
+                           const BoundSymbolSet &boundSymbols) {
+  SmallVector<Value> values;
+  root->walk([&](Operation *op) {
+    for (OpResult result : op->getResults())
+      if (isNestedUnderHCCallable(result) &&
+          shouldMaterializeValue(result, boundSymbols))
+        values.push_back(result);
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          if (isNestedUnderHCCallable(arg) &&
+              shouldMaterializeValue(arg, boundSymbols))
+            values.push_back(arg);
+  });
+  return values;
+}
+
 struct HCMaterializeBoundExprsPass
     : public hc::impl::HCMaterializeBoundExprsBase<
           HCMaterializeBoundExprsPass> {
@@ -251,19 +287,7 @@ struct HCMaterializeBoundExprsPass
   void runOnOperation() override {
     Operation *root = getOperation();
     BoundSymbolSet boundSymbols = collectBoundSymbols(root);
-    SmallVector<Value> values;
-    root->walk([&](Operation *op) {
-      for (OpResult result : op->getResults())
-        if (isNestedUnderHCCallable(result) &&
-            shouldMaterializeValue(result, boundSymbols))
-          values.push_back(result);
-      for (Region &region : op->getRegions())
-        for (Block &block : region)
-          for (BlockArgument arg : block.getArguments())
-            if (isNestedUnderHCCallable(arg) &&
-                shouldMaterializeValue(arg, boundSymbols))
-              values.push_back(arg);
-    });
+    SmallVector<Value> values = collectValuesToMaterialize(root, boundSymbols);
 
     OpBuilder builder(root->getContext());
     for (Value value : values)

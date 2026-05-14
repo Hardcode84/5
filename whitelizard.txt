@@ -119,8 +119,6 @@ lib/Transforms/HCLowerLaunchBodyPass.cpp:makeLaunchBodyLoweringTarget
 lib/Transforms/HCLowerLaunchBodyPass.cpp:resolveKernelArg
 lib/Transforms/HCLowerLaunchBodyPass.cpp:resolvePtrViewSource
 lib/Transforms/HCLowerLaunchBodyPass.cpp:resolveToBundleIndex
-lib/Transforms/HCMaterializeBoundExprsPass.cpp:HCMaterializeBoundExprsPass::runOnOperation
-lib/Transforms/HCMaterializeBoundExprsPass.cpp:verifyMaterializedExprSymbols
 lib/Transforms/HCPromoteNamesPass.cpp:promoteForRange
 lib/Transforms/HCPromoteNamesPass.cpp:promoteIf
 lib/Transforms/HCPromoteNamesPass.cpp:promoteNestedScope

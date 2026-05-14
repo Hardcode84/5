@@ -57,12 +57,15 @@ _FIXTURE_LAYOUT = index_map(
     storage_size=lambda w, h: w * h,
     offset=lambda i, j, w, h: i * h + j,
 )
-# Selector-bearing layout fixture: rank-2 tile shape, one trailing
-# per-lane selector. See HC_LayoutAttr description for the convention
-# (index_syms strictly longer than shape_syms = selector tail).
-_FIXTURE_SELECTOR_LAYOUT = index_map(
-    storage_size=lambda d0, d1: d1,
-    offset=lambda i, j, lane, d0, d1: j,
+# Non-injective layout fixture: rank-3 logical shape with flat storage
+# the size of a single column — offset drops two of the three index
+# syms, so distinct logical indices land on the same storage slot.
+# `LayoutAttr` enforces `index_syms.size() == shape_syms.size()`; non-
+# injectivity is expressed through the offset formula, not by adding
+# extra index_syms.
+_FIXTURE_NONINJECTIVE_LAYOUT = index_map(
+    storage_size=lambda d0, d1, d2: d1,
+    offset=lambda i, j, lane, d0, d1, d2: j,
 )
 
 
@@ -80,15 +83,20 @@ def _as_layout_body_kernel(group, a: Buffer[_FIXTURE_M, _FIXTURE_N]) -> None:
     return
 
 
+_FIXTURE_LANE = sym.LANE
+
+
 @kernel(work_shape=(ceil_div(_FIXTURE_M, 16),), group_shape=(16,))
-def _selector_layout_vload_kernel(
+def _noninjective_layout_vload_kernel(
     group,
-    a: Buffer[_FIXTURE_M, _FIXTURE_K, np.float16, _FIXTURE_SELECTOR_LAYOUT],
+    a: Buffer[
+        _FIXTURE_M, _FIXTURE_K, _FIXTURE_LANE, np.float16, _FIXTURE_NONINJECTIVE_LAYOUT
+    ],
     i: sym.idx,
     j: sym.idx,
     lane: sym.idx,
 ) -> None:
-    _ = group.vload(a, i, j, lane, shape=(16,))
+    _ = group.vload(a[i, j, lane], shape=(16,))
     return
 
 
@@ -542,14 +550,13 @@ def test_resolve_index_map_without_params_emits_empty_table() -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
-def test_resolve_index_map_selector_layout_serializes() -> None:
-    """``IndexMap`` whose ``offset`` lambda lists more leading positional
-    parameters than the shape has dimensions: the trailing names beyond
-    rank are *selectors* (see HC_LayoutAttr description). The resolver
-    splits the offset signature into ``(index_syms, shape_syms,
-    [params])`` regardless of whether the index_sym tail is rank-wide,
-    so the ref payload carries ``index_syms`` strictly longer than
-    ``shape_syms`` without any selector-specific code path.
+def test_resolve_index_map_noninjective_layout_serializes() -> None:
+    """``IndexMap`` with a non-injective offset (multiple logical
+    indices collapsing to the same storage slot) serializes the same
+    way as any other rank-balanced layout. ``LayoutAttr`` requires
+    ``index_syms.size() == shape_syms.size()``, so the offset and
+    storage formulas just happen to drop some index axes — there's no
+    selector-specific encoding.
     """
     _ensure_hc_front_bindings_available()
 
@@ -559,16 +566,19 @@ def test_resolve_index_map_selector_layout_serializes() -> None:
 
     M = sym.M
     K = sym.K
+    LANE = sym.LANE
 
-    # A minimal WMMA-A-fragment-ish layout: rank-2 (M, K) tile, one
-    # per-lane selector; per-lane storage is just the K column.
+    # WMMA-A-fragment-ish layout: rank-3 logical shape (M, K, LANE)
+    # whose flat storage is the K column. Multiple (i, lane) pairs
+    # share each storage slot — fine, the layout describes a per-lane
+    # broadcast.
     A_FRAG = index_map(
-        storage_size=lambda d0, d1: d1,
-        offset=lambda i, j, lane, d0, d1: j,
+        storage_size=lambda d0, d1, d2: d1,
+        offset=lambda i, j, lane, d0, d1, d2: j,
     )
 
     @kernel(work_shape=(ceil_div(M, 16),), group_shape=(16,))
-    def uses_a_frag(group, a: Buffer[M, K]) -> None:
+    def uses_a_frag(group, a: Buffer[M, K, LANE]) -> None:
         _ = A_FRAG
         return
 
@@ -577,7 +587,7 @@ def test_resolve_index_map_selector_layout_serializes() -> None:
 
     (ref,) = name_refs["A_FRAG"]
     assert ref["kind"] == "layout"
-    assert ref["shape_syms"] == '["d0", "d1"]'
+    assert ref["shape_syms"] == '["d0", "d1", "d2"]'
     assert ref["index_syms"] == '["i", "j", "lane"]'
     assert ref["params"] == "{}"
     assert ref["storage_size"] == '#hc.expr<"d1">'
@@ -672,23 +682,19 @@ def test_layout_kwarg_overlays_hc_as_layout_on_tensor_allocator() -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
-def test_selector_index_layout_lands_on_vload_with_extra_operand() -> None:
-    """End-to-end pin: a selector-bearing layout drives an access op
-    with one more index operand than the source rank. The kernel calls
-    ``group.vload(tile, i, j, lane, shape=...)`` against a buffer
-    annotated with an ``index_syms = ["i", "j", "lane"]`` layout, and
-    the resulting ``hc.vload`` after ``--convert-hc-front-to-hc`` has
-    three index positions wired through verbatim.
+def test_noninjective_layout_lands_on_vload_with_full_bind() -> None:
+    """End-to-end pin: a buffer with a non-injective layout reaches
+    ``hc.vload`` through the standard subscript-then-vload pattern.
+    The kernel slices the rank-3 logical buffer via ``a[i, j, lane]``
+    and the resulting ``hc.vload`` after ``--convert-hc-front-to-hc``
+    carries one index operand per logical axis (full positional bind).
 
-    No new frontend code path is needed for this — the Python ->
-    hc_front lowering already passes positional ``vload`` args through
-    as indices, the resolver already counts the leading positional
-    params of ``offset`` as ``index_syms``, and the C++ verifier on
-    ``hc-verify-static-shapes`` admits up to ``index_syms.size()``
-    indices. This test pins all three contracts at once.
+    Pinning this end-to-end keeps the resolver, frontend lowering, and
+    layout serialization aligned with the uniform `index_syms.size()
+    == shape_syms.size()` invariant.
 
-    Lives at module scope alongside its kernel for the same PEP 563 +
-    eval_str reason as the layout-parameter test.
+    Lives at module scope alongside its kernel for the PEP 563 +
+    eval_str reason.
     """
     import subprocess
 
@@ -696,10 +702,10 @@ def test_selector_index_layout_lands_on_vload_with_extra_operand() -> None:
 
     _ensure_hc_front_bindings_available()
 
-    resolved = resolve_front_ir(_selector_layout_vload_kernel)
+    resolved = resolve_front_ir(_noninjective_layout_vload_kernel)
     front_text = str(resolved.module)
-    # Resolver-side: the kernel-parameter layout carries the selector
-    # tail; the body-call indices stay positional.
+    # Resolver-side: the kernel-parameter layout carries the three
+    # logical axes; the body-call subscript stays positional.
     assert 'index_syms = ["i", "j", "lane"]' in front_text, front_text
 
     result = subprocess.run(
@@ -713,12 +719,12 @@ def test_selector_index_layout_lands_on_vload_with_extra_operand() -> None:
         result.returncode == 0
     ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     hc_text = result.stdout
-    # The BufferType's LayoutAttr is the captured selector layout (no
-    # default-strided fallback).
+    # The BufferType's LayoutAttr is the captured non-injective layout
+    # (no default-strided fallback).
     assert "$STRIDE_" not in hc_text, hc_text
     assert 'index_syms = ["i", "j", "lane"]' in hc_text, hc_text
     # The vload must end up with three index operands wired through —
-    # one more than the rank-2 buffer source's dimension count.
+    # one per logical axis of the rank-3 source.
     assert "hc.vload" in hc_text, hc_text
     vload_line = next(line for line in hc_text.splitlines() if "hc.vload" in line)
     operand_block = vload_line.split("[", 1)[1].split("]", 1)[0]

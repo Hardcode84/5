@@ -773,25 +773,27 @@ def _layout_index_param_names(
 ) -> tuple[str, ...]:
     """Resolve the layout's index-sym names from ``offset``'s prefix.
 
-    Convention from `doc/langref.md`:
+    Convention from `doc/layouts.md`:
         offset(i, j, ..., *shape_syms[, params])
-    Index syms occupy the leading slots, shape syms the next ``len(shape_syms)``
-    slots, and ``params`` (when present) trails. Mismatches surface as
-    ``FrontendError`` rather than silently dropping or duplicating slots.
+    Index syms occupy the leading slots, shape syms the next
+    ``len(shape_syms)`` slots, and ``params`` (when present) trails.
+    `LayoutAttr` enforces `index_syms.size() == shape_syms.size()` so
+    the index prefix must be exactly the same length as the shape
+    suffix.
     """
     offset_names = _layout_positional_names(layout.offset, role="layout offset")
     trailing = 1 if layout.params is not None else 0
     n_shape = len(shape_param_names)
-    if len(offset_names) < n_shape + trailing + 1:
+    expected = 2 * n_shape + trailing
+    if len(offset_names) != expected:
         raise FrontendError(
-            f"offset(...) needs at least one index parameter plus "
-            f"{n_shape} shape parameter(s)"
-            + (" and a params dict" if trailing else "")
-            + f"; got {offset_names!r}"
+            f"offset(...) must have exactly {expected} positional "
+            f"parameter(s) ({n_shape} index sym(s) + {n_shape} shape sym(s)"
+            + (" + params dict" if trailing else "")
+            + f"); got {offset_names!r}"
         )
-    n_index = len(offset_names) - n_shape - trailing
-    index_names = offset_names[:n_index]
-    shape_tail = offset_names[n_index : n_index + n_shape]
+    index_names = offset_names[:n_shape]
+    shape_tail = offset_names[n_shape : 2 * n_shape]
     if shape_tail != shape_param_names:
         raise FrontendError(
             f"offset(...) shape parameters {shape_tail!r} disagree with "

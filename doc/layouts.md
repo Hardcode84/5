@@ -114,6 +114,19 @@ Inference (`hc-infer-types`) propagates layouts:
   guards safety by comparing effective `storage_size` expressions
   under ixsimpl. See *Late-bound symbols and reinterpret /
   Shape-changing `hc.as_layout`* below.
+* `hc.vload` / `hc.load` (and allocators `hc.vzeros`, `hc.vones`,
+  `hc.zeros`, `hc.ones`, `hc.empty`, `hc.vfull`, `hc.full`): when the
+  single consumer of the result is an `hc.as_layout`, inference bakes
+  the wrap's captured layout into the producer's result type. The
+  resulting `hc.as_layout` is then a same-type same-layout wrap and
+  the storage_size verifier matches by construction. The fusion is
+  what lets non-injective `layout=` kwargs (broadcasts, per-lane
+  fragments where `storage_size < product(shape)`) survive the
+  pipeline: without it the bare→layout-bearing transition reports
+  `product(shape)` against `layout.storage_size` and the verifier
+  flags the mismatch. Multi-user producers don't fuse — the bare
+  type stays so the non-as_layout consumers keep their expected
+  signature.
 * `hc.buffer_view`: a layout-bearing source composes scalar subscripts
   and non-trivial slice rebinds into the residual layout —
   `index_syms[k]` substitutes the scalar's expression, `shape_syms[k]`

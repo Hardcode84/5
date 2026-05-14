@@ -174,6 +174,96 @@ hc.func @loads(%buf: !hc.buffer<f32, ["M", "N"]>, %i: !hc.idx<"0">,
 
 // -----
 
+// `hc.vload` whose single user is an `hc.as_layout` absorbs the wrap's
+// captured layout into its inferred result type. The bake-in is what
+// keeps the post-emit `hc.as_layout` storage_size verifier happy when
+// the captured layout is non-injective (`layout.storage_size` <
+// `product(shape)`): without it the bare→layout-bearing transition
+// reports operand storage = `product(shape)` against the layout's
+// `storage_size`, and the verifier flags the mismatch the moment
+// inference pins the operand. The as_layout itself stays in the IR
+// as a same-type same-layout wrap; downstream canonicalisation folds
+// the redundant op when its operand already carries the captured
+// layout.
+//
+// CHECK-LABEL: hc.func @vload_absorbs_aslayout_layout
+// CHECK: %[[V:.*]] = hc.vload {{.*}} -> !hc.vector<f32, ["16", "16", "32"], <{{.*}}storage_size = #hc.expr<"k*m">, offset = #hc.expr<"j + i*k">>>
+// CHECK-NEXT: hc.as_layout %[[V]], layout = (#hc.layout<{{.*}}storage_size = #hc.expr<"k*m">, offset = #hc.expr<"j + i*k">>) : !hc.vector<f32, ["16", "16", "32"], <{{.*}}storage_size = #hc.expr<"k*m">, offset = #hc.expr<"j + i*k">>> -> !hc.vector<f32, ["16", "16", "32"], <{{.*}}storage_size = #hc.expr<"k*m">, offset = #hc.expr<"j + i*k">>>
+hc.func @vload_absorbs_aslayout_layout(%buf: !hc.buffer<f32, ["M"]>,
+                                       %z: !hc.idx<"0">) -> !hc.undef {
+  %m = hc.const<16 : i64> : !hc.undef
+  %k = hc.const<16 : i64> : !hc.undef
+  %lane = hc.const<32 : i64> : !hc.undef
+  %shape = hc.tuple(%m, %k, %lane)
+      : (!hc.undef, !hc.undef, !hc.undef) -> !hc.undef
+  %v = hc.vload %buf[%z], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, !hc.undef) -> !hc.undef
+  %r = hc.as_layout %v, layout =
+      (#hc.layout<shape_syms = ["m", "k", "lane"],
+                  index_syms = ["i", "j", "l"], params = {},
+                  storage_size = #hc.expr<"m*k">,
+                  offset = #hc.expr<"j + i*k">>)
+      : !hc.undef -> !hc.undef
+  hc.return %r : !hc.undef
+}
+
+// -----
+
+// `hc.vzeros` + `hc.as_layout`: allocator path. Element type comes from the
+// `dtype` attribute, shape from the tuple operand. The fusion absorbs the
+// captured layout into the vzeros' inferred result type just like the load
+// path; the matching wrap stays put for canonicalisation to handle.
+//
+// CHECK-LABEL: hc.func @vzeros_absorbs_aslayout_layout
+// CHECK: %[[Z:.*]] = hc.vzeros {{.*}} -> !hc.vector<f32, ["8", "4"], <{{.*}}storage_size = #hc.expr<"m">, offset = #hc.expr<"i">>>
+// CHECK-NEXT: hc.as_layout %[[Z]], layout = (#hc.layout<{{.*}}storage_size = #hc.expr<"m">, offset = #hc.expr<"i">>) : !hc.vector<f32, ["8", "4"], <{{.*}}storage_size = #hc.expr<"m">, offset = #hc.expr<"i">>> -> !hc.vector<f32, ["8", "4"], <{{.*}}storage_size = #hc.expr<"m">, offset = #hc.expr<"i">>>
+hc.func @vzeros_absorbs_aslayout_layout() -> !hc.undef {
+  %m = hc.const<8 : i64> : !hc.undef
+  %n = hc.const<4 : i64> : !hc.undef
+  %shape = hc.tuple(%m, %n) : (!hc.undef, !hc.undef) -> !hc.undef
+  %z = hc.vzeros shape %shape {dtype = f32} : (!hc.undef) -> !hc.undef
+  %r = hc.as_layout %z, layout =
+      (#hc.layout<shape_syms = ["m", "n"], index_syms = ["i", "j"],
+                  params = {}, storage_size = #hc.expr<"m">,
+                  offset = #hc.expr<"i">>)
+      : !hc.undef -> !hc.undef
+  hc.return %r : !hc.undef
+}
+
+// -----
+
+// Multiple users on the producer disable fusion: a layout baked into the
+// load's result type would force every consumer (including those that
+// didn't ask for the captured layout) to observe it, so the fusion only
+// fires for the single-use case. Both wraps observe the bare inferred
+// type; the storage_size verifier check still runs against the bare
+// operand. (Same shape between operand and result here, so the verifier
+// is happy; this LIT pins the conservative behaviour rather than the
+// non-injective storage edge case.)
+//
+// CHECK-LABEL: hc.func @vload_multi_use_no_fusion
+// CHECK: %[[V:.*]] = hc.vload {{.*}} -> !hc.vector<f32, ["16"]>
+// CHECK: hc.as_layout %[[V]], layout = {{.*}} : !hc.vector<f32, ["16"]> -> !hc.vector<f32, ["16"]>
+// CHECK: hc.as_layout %[[V]], layout = {{.*}} : !hc.vector<f32, ["16"]> -> !hc.vector<f32, ["16"]>
+hc.func @vload_multi_use_no_fusion(%buf: !hc.buffer<f32, ["M"]>,
+                                   %z: !hc.idx<"0">) -> (!hc.undef, !hc.undef) {
+  %m = hc.const<16 : i64> : !hc.undef
+  %shape = hc.tuple(%m) : (!hc.undef) -> !hc.undef
+  %v = hc.vload %buf[%z], shape %shape
+      : (!hc.buffer<f32, ["M"]>, !hc.idx<"0">, !hc.undef) -> !hc.undef
+  %r1 = hc.as_layout %v, layout =
+      (#hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                  storage_size = #hc.expr<"d0">, offset = #hc.expr<"i0">>)
+      : !hc.undef -> !hc.undef
+  %r2 = hc.as_layout %v, layout =
+      (#hc.layout<shape_syms = ["d0"], index_syms = ["i0"], params = {},
+                  storage_size = #hc.expr<"d0">, offset = #hc.expr<"i0">>)
+      : !hc.undef -> !hc.undef
+  hc.return %r1, %r2 : !hc.undef, !hc.undef
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @buffer_views
 // CHECK: hc.buffer_view {{.*}} -> !hc.buffer<f32, ["4", "N"]>
 // CHECK: hc.buffer_dim {{.*}} -> !hc.idx<"4">

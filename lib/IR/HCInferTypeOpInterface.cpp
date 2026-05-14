@@ -670,6 +670,30 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                         resultShape, resultLayout));
 }
 
+// Look one step downstream: if the op's single result feeds exactly one
+// `hc.as_layout`, return that wrap's captured layout. The producer's
+// inference can then bake the captured layout into its result type, which
+// keeps the bare-→layout-bearing transition (operand storage = product of
+// dims, result storage = `layout.storage_size`) from ever materializing.
+// Without this fusion, non-injective layouts (broadcasts, per-lane WMMA
+// fragments — `layout.storage_size` < `product(shape)`) trip the
+// `hc.as_layout` storage_size verifier the moment inference pins the
+// load's bare result type. The single-use guard is load-bearing: a
+// branch with multiple consumers can't have its layout absorbed, since
+// non-`hc.as_layout` users would see a layout-bearing type they didn't
+// ask for.
+static LayoutAttr absorbDownstreamAsLayout(Operation *op) {
+  if (!op || op->getNumResults() != 1)
+    return {};
+  Value result = op->getResult(0);
+  if (!result.hasOneUse())
+    return {};
+  auto asLayout = dyn_cast<HCAsLayoutOp>(*result.user_begin());
+  if (!asLayout)
+    return {};
+  return asLayout.getLayoutAttr();
+}
+
 static Type inferLoadLikeResult(Type sourceType, Type shapeType,
                                 bool vectorResult, Operation *op) {
   ShapeAttr shape = getStaticShapeFromTupleType(shapeType);
@@ -678,10 +702,12 @@ static Type inferLoadLikeResult(Type sourceType, Type shapeType,
   Type elementType = getSymbolicElementType(sourceType);
   if (!elementType)
     return {};
-  return vectorResult ? Type(mlir::hc::VectorType::get(op->getContext(),
-                                                       elementType, shape))
-                      : Type(mlir::hc::TensorType::get(op->getContext(),
-                                                       elementType, shape));
+  LayoutAttr layout = absorbDownstreamAsLayout(op);
+  return vectorResult
+             ? Type(mlir::hc::VectorType::get(op->getContext(), elementType,
+                                              shape, layout))
+             : Type(mlir::hc::TensorType::get(op->getContext(), elementType,
+                                              shape, layout));
 }
 
 static Type inferAllocLikeResult(Type resultType, Type shapeType,
@@ -697,10 +723,12 @@ static Type inferAllocLikeResult(Type resultType, Type shapeType,
     elementType = fillType;
   if (!elementType)
     return resultType;
-  return vectorResult ? Type(mlir::hc::VectorType::get(op->getContext(),
-                                                       elementType, shape))
-                      : Type(mlir::hc::TensorType::get(op->getContext(),
-                                                       elementType, shape));
+  LayoutAttr layout = absorbDownstreamAsLayout(op);
+  return vectorResult
+             ? Type(mlir::hc::VectorType::get(op->getContext(), elementType,
+                                              shape, layout))
+             : Type(mlir::hc::TensorType::get(op->getContext(), elementType,
+                                              shape, layout));
 }
 
 static Type inferTupleResult(ArrayRef<Type> elementTypes, Operation *op) {

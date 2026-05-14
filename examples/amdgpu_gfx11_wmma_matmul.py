@@ -58,17 +58,18 @@ previous revision needed.
 
 The direct layout-driven form
 (``group.vload(c_tile, shape=(WAVE_LANES, WMMA_ACC_FRAGMENT),
-layout=WAVE_ACC_FRAG_LAYOUT)`` plus a per-lane ``[lane, :]`` subscript)
-trips a deeper substrate boundary than the join-on-layout work in this
-revision: the layout's ``storage_size`` (256, the wave-wide backing)
-diverges from the per-workitem dim product (8) when
-``hc-flatten-with-layouts`` materialises the layout, while the bare
-``wmma_gfx11`` intrinsic result flattens through the dim product —
-the two sides of the K-tile loop's iter_init / iter_result pair end up
-with incompatible flat extents. Reconciling that needs the intrinsic
-recipe to plumb a matching layout (or the projection at the lane
-boundary to strip the wave-wide backing); the strided-slice form here
-stays as the right side of that substrate boundary in the meantime.
+layout=WAVE_ACC_FRAG_LAYOUT)`` plus a per-lane ``[lane, :]`` subscript
+and the explicit ``as_layout(..., None)`` strip that ``hc.strip_layout``
+exposes) crosses a separate substrate boundary: the strip's lowering
+plants an ``hc.vzeros`` + ``hc.generic`` gather whose per-lane
+gather positions reference ``$WI0``, but ``hc-lower-generic``'s
+value-typed-operand path requires iter-only offsets and rejects
+the ambient sym. Unblocking that needs ``hc-lower-generic`` to
+emit dynamic-position ``vector.extract`` against the ambient
+bindings, or the wave-wide source to be hoisted to LDS so the
+strip lowers through the pointer path; the strided-slice form
+here stays as the right side of that substrate boundary in the
+meantime.
 """
 
 from __future__ import annotations

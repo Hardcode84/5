@@ -95,6 +95,83 @@ static Value emitBareInit(OpBuilder &builder, Location loc, Type resultTy,
                            /*layout=*/LayoutAttr{});
 }
 
+// Extract the per-axis ExprAttr dim list from a shaped type's symbolic
+// shape, or fail if the shape is absent or any dim is not an ExprAttr.
+static FailureOr<SmallVector<ExprAttr>>
+collectTileShape(SymbolicallyShapedTypeInterface shaped) {
+  ShapeAttr shape = shaped.getSymbolicShape();
+  if (!shape)
+    return failure();
+  SmallVector<ExprAttr> tile;
+  tile.reserve(shape.getDims().size());
+  for (Attribute dim : shape.getDims()) {
+    auto e = dyn_cast<ExprAttr>(dim);
+    if (!e)
+      return failure();
+    tile.push_back(e);
+  }
+  return tile;
+}
+
+// Per-axis iter spec for the generic op: sym name, bound SSA, and the
+// matching attributes for the op's `iter_syms` / `iter_kinds` arrays.
+// All axes are Parallel for the strip rewrite.
+struct ParallelIterSpace {
+  SmallVector<StringAttr> syms;
+  SmallVector<Value> bounds;
+  SmallVector<Attribute> symAttrs;
+  SmallVector<Attribute> kindAttrs;
+};
+
+// Iter syms `i_0`, ..., `i_{r-1}` (parallel) — matches the naming the
+// load-side rewriter uses; collisions with body-local names are
+// structurally unlikely and the verifier catches them. Bounds come
+// from the result shape's per-axis dim exprs, materialised as
+// `!hc.idx<dim>` via empty-binding `hc.idx_apply`.
+static ParallelIterSpace buildParallelIterSpace(OpBuilder &builder,
+                                                Location loc,
+                                                ArrayRef<ExprAttr> tile) {
+  MLIRContext *ctx = builder.getContext();
+  ParallelIterSpace space;
+  space.syms.reserve(tile.size());
+  space.bounds.reserve(tile.size());
+  space.symAttrs.reserve(tile.size());
+  space.kindAttrs.reserve(tile.size());
+  for (auto [k, dim] : llvm::enumerate(tile)) {
+    auto sym = StringAttr::get(ctx, ("i_" + Twine(k)).str());
+    space.syms.push_back(sym);
+    space.symAttrs.push_back(sym);
+    space.bounds.push_back(materializeIdxBound(builder, loc, dim));
+    space.kindAttrs.push_back(IterKindAttr::get(ctx, IterKind::Parallel));
+  }
+  return space;
+}
+
+// Build the element-copy generic: one parallel iter per axis, identity
+// per-axis offsets on both source and init, body yields the source
+// element so the init's value goes unread.
+static HCGenericOp
+emitElementCopyGeneric(OpBuilder &builder, Location loc, Type resTy,
+                       Type srcElem, Type resElem, Value src, Value initOut,
+                       const ParallelIterSpace &iters, ArrayAttr insOffsets,
+                       ArrayAttr outsOffsets) {
+  MLIRContext *ctx = builder.getContext();
+  auto generic = HCGenericOp::create(
+      builder, loc, /*resultTypes=*/TypeRange{resTy},
+      ArrayAttr::get(ctx, iters.symAttrs), ValueRange(iters.bounds),
+      ArrayAttr::get(ctx, iters.kindAttrs), ValueRange(src),
+      ValueRange(initOut), /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
+
+  Block *body = new Block();
+  BlockArgument bv = body->addArgument(srcElem, loc);
+  body->addArgument(resElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+  HCYieldOp::create(bodyBuilder, loc, ValueRange{bv});
+  return generic;
+}
+
 static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   Value src = op.getValue();
   Type srcTy = src.getType();
@@ -122,17 +199,9 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   // agree; we read from the result side so a missing op-side shape
   // bails this rewrite cleanly without surfacing the operand /
   // result divergence elsewhere.
-  ShapeAttr resShape = resShaped.getSymbolicShape();
-  if (!resShape)
+  FailureOr<SmallVector<ExprAttr>> tileShape = collectTileShape(resShaped);
+  if (failed(tileShape))
     return failure();
-  SmallVector<ExprAttr> tileShape;
-  tileShape.reserve(resShape.getDims().size());
-  for (Attribute dim : resShape.getDims()) {
-    auto e = dyn_cast<ExprAttr>(dim);
-    if (!e)
-      return failure();
-    tileShape.push_back(e);
-  }
 
   Type srcElem = srcShaped.getSymbolicElementType();
   Type resElem = resShaped.getSymbolicElementType();
@@ -143,31 +212,12 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
 
-  // Iter syms `i_0`, ..., `i_{r-1}` (parallel) — matches the naming
-  // the load-side rewriter uses; collisions with body-local names are
-  // structurally unlikely and the verifier catches them. Bounds come
-  // from the result shape's per-axis dim exprs, materialised as
-  // `!hc.idx<dim>` via empty-binding `hc.idx_apply`.
-  SmallVector<StringAttr> iterSyms;
-  SmallVector<Value> iterBounds;
-  SmallVector<Attribute> iterSymAttrs;
-  SmallVector<Attribute> iterKindAttrs;
-  iterSyms.reserve(tileShape.size());
-  iterBounds.reserve(tileShape.size());
-  iterSymAttrs.reserve(tileShape.size());
-  iterKindAttrs.reserve(tileShape.size());
-  for (auto [k, dim] : llvm::enumerate(tileShape)) {
-    auto sym = StringAttr::get(ctx, ("i_" + Twine(k)).str());
-    iterSyms.push_back(sym);
-    iterSymAttrs.push_back(sym);
-    iterBounds.push_back(materializeIdxBound(builder, loc, dim));
-    iterKindAttrs.push_back(IterKindAttr::get(ctx, IterKind::Parallel));
-  }
+  ParallelIterSpace iters = buildParallelIterSpace(builder, loc, *tileShape);
 
   // Allocate bare destination matching the result type. The bare
   // allocators don't take a layout attribute on emission — the
   // result type's layout is null by `hc.strip_layout`'s verifier.
-  Value shapeTuple = buildShapeTuple(builder, loc, iterBounds);
+  Value shapeTuple = buildShapeTuple(builder, loc, iters.bounds);
   Value initOut = emitBareInit(builder, loc, resTy, shapeTuple);
 
   // Per-axis offsets on both operands are identity (the iter syms).
@@ -178,29 +228,14 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   // a layout-and/or-flavor change) flatten composes the identity
   // layout, which collapses the per-axis exprs into the linear
   // dim-product offset — a trivial element copy.
-  ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, iterSyms);
-  ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, iterSyms);
+  ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, iters.syms);
+  ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, iters.syms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
 
-  SmallVector<Value> insArr{src};
-  SmallVector<Value> outsArr{initOut};
-  auto generic = HCGenericOp::create(
-      builder, loc, /*resultTypes=*/TypeRange{resTy},
-      ArrayAttr::get(ctx, iterSymAttrs), ValueRange(iterBounds),
-      ArrayAttr::get(ctx, iterKindAttrs), ValueRange(insArr),
-      ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
-      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
-
-  // Body: yield the loaded source element. The generic body takes one
-  // block arg per operand (source elem, then init elem); the yield
-  // forwards the source's value, leaving the init's value unread.
-  Block *body = new Block();
-  BlockArgument bv = body->addArgument(srcElem, loc);
-  body->addArgument(resElem, loc);
-  generic.getBody().push_back(body);
-  OpBuilder bodyBuilder(body, body->begin());
-  HCYieldOp::create(bodyBuilder, loc, ValueRange{bv});
+  HCGenericOp generic =
+      emitElementCopyGeneric(builder, loc, resTy, srcElem, resElem, src,
+                             initOut, iters, insOffsets, outsOffsets);
 
   op.getResult().replaceAllUsesWith(generic.getResult(0));
   op.erase();

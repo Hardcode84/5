@@ -451,4 +451,104 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
   return ExprAttr::get(ctx, sym::ExprHandle(bound));
 }
 
+namespace {
+
+// Identity row-major offset for a layout-less operand:
+// `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}`. Returns `0` for
+// rank-0. Caller verifies rank parity between `dims` and `indexExprs`.
+static FailureOr<sym::ExprHandle>
+identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
+                     ArrayRef<Attribute> dims) {
+  auto zero = sym::composeExprInt(store, 0);
+  if (failed(zero))
+    return failure();
+  if (indexExprs.empty())
+    return *zero;
+  sym::ExprHandle accum = *zero;
+  for (size_t i = 0; i < indexExprs.size(); ++i) {
+    sym::ExprHandle term = indexExprs[i].getValue();
+    for (size_t j = i + 1; j < dims.size(); ++j) {
+      auto dimExpr = llvm::dyn_cast<ExprAttr>(dims[j]);
+      if (!dimExpr)
+        return failure();
+      auto next = sym::composeExprBinary(store, term, sym::ExprBinaryOp::Mul,
+                                         dimExpr.getValue());
+      if (failed(next))
+        return failure();
+      term = *next;
+    }
+    auto added =
+        sym::composeExprBinary(store, accum, sym::ExprBinaryOp::Add, term);
+    if (failed(added))
+      return failure();
+    accum = *added;
+  }
+  return accum;
+}
+
+} // namespace
+
+mlir::FailureOr<ExprAttr>
+composeAccessOffsetExpr(mlir::MLIRContext *ctx, LayoutAttr layout,
+                        ShapeAttr originalShape,
+                        mlir::ArrayRef<ExprAttr> indexExprs) {
+  if (!originalShape)
+    return failure();
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  ArrayRef<Attribute> dims = originalShape.getDims();
+
+  if (!layout) {
+    if (dims.size() != indexExprs.size())
+      return failure();
+    auto offset = identityLayoutOffset(store, indexExprs, dims);
+    if (failed(offset))
+      return failure();
+    return ExprAttr::get(ctx, *offset);
+  }
+
+  ArrayRef<Attribute> shapeSyms = layout.getShapeSyms();
+  ArrayRef<Attribute> indexSyms = layout.getIndexSyms();
+  if (shapeSyms.size() != dims.size())
+    return failure();
+  if (indexExprs.size() != indexSyms.size())
+    return failure();
+
+  SmallVector<ixs_node *> targets;
+  SmallVector<ixs_node *> replacements;
+  targets.reserve(shapeSyms.size() + indexSyms.size());
+  replacements.reserve(shapeSyms.size() + indexSyms.size());
+  auto pushPair = [&](StringRef name,
+                      sym::ExprHandle replacement) -> LogicalResult {
+    auto symHandle = sym::composeExprSym(store, name);
+    if (failed(symHandle))
+      return failure();
+    targets.push_back(const_cast<ixs_node *>(symHandle->raw()));
+    replacements.push_back(const_cast<ixs_node *>(replacement.raw()));
+    return success();
+  };
+  for (auto [sym, dim] : llvm::zip_equal(shapeSyms, dims)) {
+    auto dimExpr = llvm::dyn_cast<ExprAttr>(dim);
+    if (!dimExpr)
+      return failure();
+    if (failed(pushPair(llvm::cast<StringAttr>(sym).getValue(),
+                        dimExpr.getValue())))
+      return failure();
+  }
+  for (auto [sym, idx] : llvm::zip_equal(indexSyms, indexExprs)) {
+    if (failed(
+            pushPair(llvm::cast<StringAttr>(sym).getValue(), idx.getValue())))
+      return failure();
+  }
+
+  sym::Session session(store);
+  ixs_node *bound = ixs_subs_multi(
+      session.raw(),
+      const_cast<ixs_node *>(layout.getOffset().getValue().raw()),
+      static_cast<uint32_t>(targets.size()), targets.data(),
+      replacements.data());
+  if (!bound)
+    return failure();
+  return ExprAttr::get(ctx, sym::ExprHandle(bound));
+}
+
 } // namespace mlir::hc

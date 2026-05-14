@@ -48,6 +48,24 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
                                                  LayoutAttr layout,
                                                  ShapeAttr originalShape);
 
+// Compose the linear access offset expression for accessing a shaped
+// operand with `layout` and `originalShape` at the per-axis index
+// expressions `indexExprs`. Substitutes `shape_syms` positionally
+// with the operand's shape entries and `index_syms` positionally with
+// `indexExprs`, then evaluates `layout.offset`. When `layout` is null,
+// falls back to the identity layout's row-major offset over `dims`.
+// Returns failure on rank mismatch or ixsimpl composition failure.
+//
+// Public so multiple passes (`hc-flatten-with-layouts`,
+// `hc-load-store-to-generic`'s broadcast/non-injective vload path)
+// share one canonical substitution, which keeps the hash-consed
+// offset handles aligned across passes and the resulting offsets
+// textually identical.
+mlir::FailureOr<ExprAttr>
+composeAccessOffsetExpr(mlir::MLIRContext *ctx, LayoutAttr layout,
+                        ShapeAttr originalShape,
+                        mlir::ArrayRef<ExprAttr> indexExprs);
+
 } // namespace mlir::hc
 
 #endif // HC_IR_HCATTRS_H

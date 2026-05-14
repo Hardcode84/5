@@ -62,6 +62,48 @@ def HCInferTypes : Pass<"hc-infer-types"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCSpecializeLiterals : Pass<"hc-specialize-literals"> {
+  let summary = "Substitute literal-bound symbols with integer constants.";
+  let description = [{
+    Folds compile-time literal bindings into the IR before shape-sensitive
+    passes get a vote. Reads `literal_bindings` (a `DictionaryAttr` of
+    `name -> IntegerAttr<i64>`) from each enclosing `hc.kernel`, walks
+    every reachable `#hc.expr`, `#hc.pred`, `#hc.shape`, `#hc.layout`,
+    `!hc.idx`, `!hc.pred`, and shaped-type carrier inside the kernel
+    body, substitutes each named symbol with its bound integer via
+    ixsimpl's hash-consed substitution, and rebuilds the surrounding
+    attribute / type stack with `AttrTypeReplacer`. The consumed
+    `literal_bindings` is dropped from the kernel so a subsequent run
+    is a no-op and `hc_ir_text` snapshots are self-contained.
+
+    Bindings live in the IR (on the kernel op) rather than on a pass
+    option so a `compile().hc_ir_text` snapshot reproduces the
+    specialized IR when fed back through `hc-opt -hc-specialize-literals`,
+    LIT cases hand-write the same shape as the launcher emits, and the
+    declaration / valuation split lives in two clearly-named slots:
+    `literals = ["K"]` declares which symbols *can* be bound;
+    `literal_bindings = {K = 4 : i64}` says what they're bound to here.
+
+    Why a separate pass instead of late-binding inside each consumer:
+    once K is folded to a literal, every downstream pass —
+    `hc-verify-static-shapes`, `hc-decompose-shaped-values`,
+    `hc-flatten-with-layouts`, `hc-lower-launch-body` — sees concrete
+    dims without any new substitution plumbing. Keeps the specialization
+    point a single explicit step in the schedule; a user-supplied
+    schedule that drops the pass keeps the unspecialized IR (matching
+    the `hc.compile` docstring claim that `front_ir`/`hc_ir` stay
+    symbolic until specialization runs).
+
+    Validation: each binding key must appear in the kernel's `literals`
+    whitelist when one is present (matches the Python-side
+    `hc.compile(symbols=...)` rejection of undeclared keys); each binding
+    value must be an `IntegerAttr`. Both failures fire as op errors and
+    fail the pass. An absent `literal_bindings` is the unspecialized
+    case — the pass walks past it without rewriting.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
   let summary = "Verify SSA shape operands have static HC shape metadata.";
   let description = [{

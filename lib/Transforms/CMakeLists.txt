@@ -25,6 +25,7 @@ add_mlir_library(MLIRHCTransforms
   HCNormalizeScopeRegionsPass.cpp
   HCPromoteNamesPass.cpp
   HCShapedComputeToGenericPass.cpp
+  HCSpecializeLiteralsPass.cpp
   HCVerifyStaticShapesPass.cpp
   LaunchUtils.cpp
 

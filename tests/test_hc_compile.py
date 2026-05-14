@@ -358,6 +358,65 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
+def test_compile_specializes_literal_bindings_into_ir(tmp_path: Path) -> None:
+    # `hc-specialize-literals` is the single fold point for compile-time
+    # bindings; the front-IR snapshot must carry the dict (so a re-run
+    # against the snapshot reproduces the specialized hc-IR) and the
+    # post-pipeline hc-IR must contain the bound integer rather than
+    # the original symbolic name. Without this fold, downstream passes
+    # like `hc-lower-launch-body` reject ops that require static dims
+    # (`hc.vzeros`, `hc.vfull`, ...) on a symbolic carrier — that's the
+    # path this test pins shut against future regressions.
+    script = tmp_path / "compile_specialize.py"
+    script.write_text(textwrap.dedent("""
+            import numpy as np
+
+            import hc
+            from hc import Buffer, CompiledKernel, CurrentGroup, kernel
+
+            K = hc.sym.K
+
+
+            @kernel(work_shape=(1,), group_shape=(1,), literals={K})
+            def specialize_me(group: CurrentGroup, dst: Buffer[K, np.float32]) -> None:
+                z = group.vzeros(shape=(K,), dtype=np.float32)
+                dst[:] = z
+
+
+            def main() -> None:
+                handle = hc.compile(specialize_me, {K: 4})
+                assert isinstance(handle, CompiledKernel)
+                # Front-IR snapshot has bindings stamped — the snapshot
+                # is reproducible against `hc-opt` from this point on.
+                assert "literal_bindings = {K = 4 : i64}" in handle.front_ir_text, (
+                    handle.front_ir_text
+                )
+                # Post-pipeline IR must not contain a symbolic `K` carrier
+                # anymore; the pass dropped the bindings dict and folded
+                # K -> 4 into every shape / type / op-shape reference.
+                assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
+                assert "literal_bindings" not in handle.hc_ir_text, (
+                    handle.hc_ir_text
+                )
+                # Specialization unblocked the launch-body lowering for
+                # `vzeros` on a previously-symbolic dim — the host wrapper
+                # made it through `gpu-to-llvm`. Without the fold this is
+                # exactly the assertion that would fire.
+                assert "llvm.func @specialize_me" in handle.hc_ir_text, (
+                    handle.hc_ir_text
+                )
+                print("OK")
+
+
+            if __name__ == "__main__":
+                main()
+            """))
+
+    result = _run_compile_smoke(script)
+    assert result.stdout.strip().endswith("OK"), result.stdout
+
+
+@_SKIP_HC_FRONT_DIALECT_TESTS
 def test_default_compile_schedule_verifies_static_shapes(tmp_path: Path) -> None:
     script = tmp_path / "compile_static_shape_failure.py"
     script.write_text(textwrap.dedent("""

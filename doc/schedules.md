@@ -30,7 +30,9 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m3 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m2
         : (!transform.any_op) -> !transform.any_op
-    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3
+    %m3a = transform.apply_registered_pass "hc-specialize-literals" to %m3
+        : (!transform.any_op) -> !transform.any_op
+    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3a
         : (!transform.any_op) -> !transform.any_op
     %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
         : (!transform.any_op) -> !transform.any_op
@@ -104,6 +106,28 @@ schedule — they need a ROCDL-equivalent of upstream's
 `gpu-lower-to-nvvm-pipeline` (workgroup memref address-space mapping,
 kernel ABI, scf/vector lowering inside `gpu.module`) which is a
 substantively separate piece of work tracked as a follow-up.
+
+Literal specialization runs immediately after the front-to-hc handshake.
+Each `hc_front.kernel` arrives carrying a `literal_bindings = {name = i64}`
+dict that the Python launcher (`hc.compile(symbols={K: 4, ...})`) stamped
+before the schedule started; `convert-hc-front-to-hc` carries the dict
+across to the resulting `hc.kernel`, and `hc-specialize-literals` walks
+every reachable `#hc.expr` / `#hc.pred` (and through them every
+`#hc.shape`, `#hc.layout`, `!hc.idx`, `!hc.pred`, and shaped-type carrier)
+inside the kernel body and substitutes the bound integer in place via
+ixsimpl's hash-consed substitution. The consumed `literal_bindings` is
+dropped from the kernel afterwards so a subsequent re-run is a no-op,
+and the `hc_ir` snapshot is self-contained — feeding it back through
+`hc-opt -hc-specialize-literals` reproduces the same IR. The `literals`
+whitelist on the kernel stays put; it's the declaration of which names
+*may* be bound, not the bound state. Once specialization has run, every
+shape-sensitive downstream pass (`hc-verify-static-shapes`,
+`hc-decompose-shaped-values`, `hc-flatten-with-layouts`,
+`hc-lower-launch-body`) sees concrete dims without any per-consumer
+substitution plumbing. A schedule that drops the pass keeps the
+unspecialized IR — partial specialization (or none) is legal, and
+the downstream passes will fail loud where they need a concrete dim
+they don't have.
 
 Bound symbolic expression materialization runs after type inference so it can
 see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope

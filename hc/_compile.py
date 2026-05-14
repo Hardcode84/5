@@ -332,9 +332,9 @@ def compile(
     byte-identical to today and `.bench(...)` raises with a pointer
     back here.
 
-    Bindings are stored on the returned handle but the current pipeline
-    does not substitute them into the emitted IR; `front_ir`/`hc_ir`
-    stay symbolic until specialization lands.
+    Bindings are folded into the IR by `hc-specialize-literals` (see
+    `doc/schedules.md`). `front_ir` is the pre-specialization snapshot
+    with the binding dict attached; `hc_ir` is fully specialized.
     """
 
     metadata = getattr(kernel_fn, "__hc_kernel__", None)
@@ -358,6 +358,7 @@ def compile(
     context = prepared_context()
     resolved = resolve_front_ir(kernel_fn, context=context)
     front_module = resolved.module
+    _stamp_literal_bindings(front_module, bindings, context)
     front_ir_text, pipeline_module = _snapshot_and_clone_front_ir(front_module, context)
     result = run_front_to_hc(
         pipeline_module, schedule=schedule, target=target, bench=bench
@@ -380,6 +381,41 @@ def compile(
         target=target,
         bench_wrapper_name=bench_wrapper_name,
     )
+
+
+def _stamp_literal_bindings(
+    module: Any,
+    bindings: Mapping[str, int],
+    context: Any,
+) -> None:
+    """Attach `literal_bindings = {name = i64}` to every `hc_front.kernel`.
+
+    Stamped before the front-IR snapshot so the snapshot is reproducible
+    (re-run `hc-opt` against it and the same specialized `hc_ir` falls
+    out), and so `convert-hc-front-to-hc` can carry the dict over to the
+    corresponding `hc.kernel` for `hc-specialize-literals` to consume.
+    Empty `bindings` is a no-op — leaves the IR byte-identical to the
+    unspecialized path. `hc_front.kernel` is the right anchor (not
+    `hc_front.func` / `hc_front.intrinsic`): only kernels are
+    specialization roots, so a helper that happens to reference `K`
+    sees the substitution through its kernel caller, not through its
+    own metadata.
+    """
+    if not bindings:
+        return
+    from .mlir import ir
+
+    with context, ir.Location.unknown():
+        i64 = ir.IntegerType.get_signless(64, context=context)
+        entries = {
+            str(name): ir.IntegerAttr.get(i64, int(value))
+            for name, value in bindings.items()
+        }
+        dict_attr = ir.DictAttr.get(entries, context=context)
+        for op in module.body.operations:
+            if op.operation.name != "hc_front.kernel":
+                continue
+            op.operation.attributes["literal_bindings"] = dict_attr
 
 
 def _normalise_bindings(

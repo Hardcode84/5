@@ -80,7 +80,19 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m3 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m2
         : (!transform.any_op) -> !transform.any_op
-    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3
+    // Specialization is the single explicit fold point for literal
+    // bindings (`hc.compile(symbols={K: 4, ...})` stamps the
+    // `literal_bindings` dict on each `hc.kernel`; this pass reads
+    // them and substitutes every reachable `#hc.expr`/`#hc.pred` and
+    // shape / layout / shaped-type carrier with the bound integers).
+    // Runs immediately after the front-to-hc handshake so every later
+    // pass — type inference, static-shape verification, decomposition,
+    // flatten, launch-body lowering — sees concrete dims uniformly.
+    // No-op when no kernel carries `literal_bindings`, so the
+    // unspecialized `hc.compile(kernel)` path stays byte-identical.
+    %m3a = transform.apply_registered_pass "hc-specialize-literals" to %m3
+        : (!transform.any_op) -> !transform.any_op
+    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3a
         : (!transform.any_op) -> !transform.any_op
     %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
         : (!transform.any_op) -> !transform.any_op

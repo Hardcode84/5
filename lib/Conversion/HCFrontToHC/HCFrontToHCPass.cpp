@@ -1469,6 +1469,7 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
               /*group_shape=*/ShapeAttr(),
               /*subgroup_size=*/IntegerAttr(), /*bound_symbols=*/ArrayAttr(),
               /*literals=*/ArrayAttr(),
+              /*literal_bindings=*/DictionaryAttr(),
               /*requirements=*/ConstraintSetAttr());
           hcKernel.getBody().push_back(entry);
           // Shape-like metadata travels as string arrays in hc_front;
@@ -1498,6 +1499,13 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
               hcKernel.getGroupShapeAttr()));
           if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
             hcKernel.setLiteralsAttr(lits);
+          // `literal_bindings` rides on `hc_front.kernel` when the launcher
+          // (`hc.compile(symbols={...})`) has pinned concrete integer values
+          // for the specialization point. Carry it over so the downstream
+          // `hc-specialize-literals` pass can fold them into the IR.
+          if (auto binds =
+                  frontOp->getAttrOfType<DictionaryAttr>("literal_bindings"))
+            hcKernel.setLiteralBindingsAttr(binds);
           return &kernel.getBody();
         });
   }

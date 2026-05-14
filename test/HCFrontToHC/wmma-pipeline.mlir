@@ -54,7 +54,7 @@
 // CHECK-LABEL: hc.func @init_wmma_acc
 // CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: %{{.*}} = hc.workitem_region captures = ["group", "c", "row0", "col0"] -> (!hc.undef)
+// CHECK: %{{.*}} = hc.workitem_region captures = ["col0", "group", "c", "row0"] -> (!hc.undef)
 // CHECK: hc.vload {{.*}} : ({{.*}}) -> !hc.undef
 // CHECK: hc.buffer_view
 // CHECK: hc.yield {{.*}} : !hc.undef

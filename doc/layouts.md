@@ -110,21 +110,16 @@ Inference (`hc-infer-types`) propagates layouts:
 * `hc.matmul`: default unless both operands carry the same layout *and*
   the result shape matches both of theirs (rare).
 * `hc.as_layout`: replaces the operand layout with the op attribute.
-  Operand and result may also differ in rank/shape — the verifier
-  accepts the pair iff their effective `storage_size` expressions
-  agree under ixsimpl (operand's `storage_size` substituted with its
-  dim entries vs result-side same). 1-D bare carriers reinterpreted
-  as multi-D layout-bearing views (the multibuffer-LDS pattern with a
-  4-D `(BUF, M, N, LANE)` layout over a flat allocation) flow through
-  this. Element type must still match; payload reinterpretation
-  belongs to `hc.astype`, not here. See
-  `@as_layout_shape_change_storage_match` in
-  `test/HC/ops-buffer-data.mlir` for the positive form,
-  `test/HC/verify-hc.mlir` for the storage-mismatch and
-  element-type-mismatch diagnostics, and
-  `test/HC/flatten-with-layouts.mlir`
-  (`@as_layout_shape_change_collapses_to_1d`) for the flatten
-  round-trip back to the 1-D carrier.
+  Operand and result may also differ in rank / shape; the verifier
+  guards safety by comparing effective `storage_size` expressions
+  under ixsimpl. See *Late-bound symbols and reinterpret /
+  Shape-changing `hc.as_layout`* below.
+* `hc.buffer_view`: a layout-bearing source composes scalar subscripts
+  into the residual layout — `index_syms[k]` substitutes the scalar's
+  expression, `shape_syms[k]` substitutes the operand's dim entry,
+  and both slots are dropped from the residual layout. Slice
+  subscripts keep their slots and pass through unchanged. See
+  *Late-bound symbols and reinterpret / `hc.buffer_view`* below.
 
 The collective return suffix from `@group.subgroups` / `@group.workitems`
 is **not** part of `#hc.layout`. The langref rule "dense suffix appended
@@ -195,9 +190,13 @@ is attached); multi-index lists on `hc.load` / `hc.store` / `hc.vload`
 collapse to a single `hc.idx_apply`-materialized 1D base offset by
 the same path. `hc.load_mask` is rewritten to an `hc.generic` upstream
 by `hc-load-store-to-generic`, so it reaches flatten via the
-generic-offset compose path with the rest. `hc.buffer_view` stays
-as-is — its sub-view semantics differ from a single base offset and
-are deferred.
+generic-offset compose path with the rest. `hc.buffer_view` on a
+layout-bearing source folds away once `hc-infer-types` has composed
+scalar subscripts into the residual layout — the flat carriers on
+both endpoints describe the same physical storage, so flatten
+forwards the source's expansion through unchanged (see *Late-bound
+symbols and reinterpret / `hc.buffer_view`*); the layout-less /
+strided-slice path still does its own offset composition below.
 
 What runs:
 
@@ -222,20 +221,24 @@ What runs:
    `func.return` / `func.call` / SCF structural ops route through
    the upstream populators.
 4. `hc.as_layout` drops unconditionally: both endpoints route
-   through the converter and the relabel becomes cosmetic.
+   through the converter, their `storage_size` expressions agree
+   (the verifier guarantees it), and the relabel becomes cosmetic.
+   Shape-changing reinterpret (e.g. 1-D bare carrier presented as
+   N-D layout view) collapses to the same flat carrier on both
+   sides, so the operand expansion passes through verbatim.
 
 Deferred slices (out of scope here):
 
-* **`hc.as_layout` structural difference.** When source and
-  destination layouts disagree under ixsimpl equality, the op
-  becomes an `hc.generic` copy between the two offset expressions.
-  v0 always drops the op (correctness is preserved only when the
-  layouts agree on the underlying storage-size expression).
-* **`hc.buffer_view` per-access offset composition.** A buffer
-  view slices a sub-region whose offset chain isn't a single base
-  expression in the parent's address space, so the load / store /
-  vload composers above don't fold through it. Today the chain
-  walk lives in `hc-lower-launch-body`; eventually flatten will
+* **`hc.as_layout` with disagreeing storage.** Operand and result
+  whose effective `storage_size` expressions don't unify under
+  ixsimpl are rejected by the verifier — there's no `hc.generic`
+  copy fallback, layouts that need to materially repack data go
+  through `hc.generic` directly.
+* **`hc.buffer_view` strided-slice offset composition.** Buffer
+  views whose source has no layout (or has a layout that doesn't
+  cleanly absorb the subscript stream) still rely on the strided-
+  slice branch below for layout-less rank-reduction. Today the
+  chain walk lives in `hc-lower-launch-body`; eventually flatten will
   fuse the chain into the sliced operand's layout directly.
 * **`i1` byte-per-element retirement.** The hand-coded `i1` mask
   handling in `HCLowerLaunchBodyPass.cpp` needs flatten to emit a
@@ -874,13 +877,48 @@ What does **not** yet do anything special with non-injective layouts:
   There is no explicit gather primitive; "layout-driven per-thread
   gather" with a dedicated op stays on the deferred list.
 
-## Free symbols in layout offsets
+Non-injectivity is orthogonal to where the symbols *bind*: a layout
+can be injective on its declared `(shape_syms, index_syms)` set yet
+still reference names from the surrounding kernel scope (a
+`!hc.idx<"buf_idx">` kernel arg, an ancestor `scf.for`'s induction
+var). Those late-bound names — and the IR moves that introduce them
+(authoring a free sym directly, slicing a layout-bearing source with
+`hc.buffer_view`, reinterpreting a 1-D carrier as a multi-D view with
+`hc.as_layout`) — are covered next.
+
+## Late-bound symbols and reinterpret
+
+Three IR moves let a layout reach beyond its own slot lists or change
+the logical structure of the value it's attached to:
+
+* **Free symbols in `offset` / `storage_size`** — names not declared
+  on the layout that the surrounding kernel scope supplies at
+  lowering time. Authored directly on the layout.
+* **`hc.buffer_view` composes scalar subscripts into the residual
+  layout** — slicing a layout-bearing source with a scalar value
+  substitutes the matching `index_syms` entry into the layout's
+  offset / storage_size and drops both slots from the residual rank.
+  The substituted scalar typically pins a kernel-scope sym, which
+  surfaces as a free symbol in the view's residual layout.
+* **Shape-changing `hc.as_layout`** — reinterprets a value's logical
+  rank / extents without touching storage, guarded by an effective-
+  `storage_size` equality check under ixsimpl. The 1-D-allocation-as-
+  N-D-layout-bearing-view pattern (multibuffered LDS) routes through
+  here.
+
+The common thread: layouts describe addressing, not allocation, and
+the lowering pipeline binds the symbolic surface against the actual
+SSA values that pass through the access site. Validation is lazy on
+purpose — the same composed offset may lower under different ambient
+scopes, so the binding contract is a property of the *lowering site*,
+not the layout.
+
+### Free symbols in `offset` / `storage_size`
 
 A layout's `offset` and `storage_size` formulas may reference symbol
-names that aren't declared on the layout itself — names that aren't
-in `shape_syms`, `index_syms`, or `params`. They're called *free
-symbols* and represent kernel-scope bindings the lowering pipeline
-resolves at access time:
+names that aren't in `shape_syms`, `index_syms`, or `params`. They're
+called *free symbols* and represent kernel-scope bindings the
+lowering pipeline resolves at access time:
 
 * Kernel-arg aux idx values surfaced by `hc-flatten-with-layouts`'
   type expansion (the leading positional carrier + one `!hc.idx<sym>`
@@ -891,9 +929,9 @@ resolves at access time:
 * Ambient launch geometry (`$WG0`, `$WI1`, `$WGS2`, …) that
   `hc-lower-launch-body` injects into the apply's bound-values map.
 
-The verifier accepts a layout with any combination of free symbol
-names; nothing is rejected up front. Lowering is **lazy**: the apply
-emitted at the access site lists the bindings it can supply (operand
+`LayoutAttr::verify` accepts any combination of free symbol names;
+nothing is rejected up front. Lowering is **lazy**: the apply emitted
+at the access site lists the bindings it can supply (operand
 expansion + scope walk), and `hc-lower-launch-body` walks the
 composed offset expression at the apply node. If every free symbol
 resolves, the apply lowers to plain `arith` ops. If any doesn't, the
@@ -901,10 +939,7 @@ pass fails with a diagnostic that names the unresolved sym, the
 apply op, and the candidate scopes it searched — see
 `test/HC/lower-launch-body-invalid.mlir` (`@unknown_symbol`) for the
 exact wording. There is no flatten-time "you forgot to bind X"
-diagnostic by design; the same composed offset may be lowered under
-different ambient scopes (different `gpu.launch` regions, different
-`hc.intrinsic` bodies), and the binding contract is a property of
-the *lowering site*, not the layout.
+diagnostic by design.
 
 Authoring shape:
 
@@ -925,23 +960,6 @@ that aux in the post-flatten `hc.idx_apply`; see
 `test/HC/flatten-with-layouts.mlir` (`@free_sym_in_offset`) for the
 exact CHECK lines.
 
-`hc.buffer_view` is a second introduction site: a scalar subscript
-on a layout-bearing source substitutes `index_syms[k]` with the
-scalar's `IdxType` expression and `shape_syms[k]` with the operand's
-actual dim entry, then drops both slots from the residual layout
-(`lib/IR/HCInferTypeOpInterface.cpp::composeBufferViewLayout`). The
-substituted value lands in the residual `offset` /  `storage_size` as
-a free sym whose binding is whatever the scalar value pinned in scope
-(usually a kernel-arg `!hc.idx<sym>`). This is how a multi-buffered
-LDS expressed as a 4-D layout `(BUF, M, N, LANE)` collapses to the
-per-buffer 3-D residual view when sliced by `lds_4d[buf_idx]` — the
-caller never has to name `buf_idx` on the layout, it shows up as a
-free sym after composition. See `test/HC/infer-types.mlir`
-(`@buffer_view_layout_multibuf`, `@buffer_view_layout_mixed_scalar_slice`)
-for the residual shapes and `test/HC/flatten-with-layouts.mlir`
-(`@buffer_view_layout_multibuf_forwards_source`) for the post-flatten
-form.
-
 Frontend (`hc.core.index_map`):
 
 ```python
@@ -959,13 +977,99 @@ binds the subset it references as keyword-only parameters after `*`.
 instances for the declared free names, so the resulting `#hc.expr`
 keeps `row0` / `col0` as bare leaves. Frontend collision checks
 guarantee `free_syms` is disjoint from `shape_syms` / `index_syms` /
-`params` keys before MLIR sees the dict attribute.
+`params` keys before MLIR sees the dict attribute. Pytest coverage:
+`tests/test_resolve.py::test_index_map_classifier_accepts_free_syms`,
+`..._rejects_undeclared_kwonly`, `..._rejects_free_sym_collision`.
 
 What the simulator does today: free-sym layouts route through
 `resolve_layout` and bail with a `SimulatorError` that names the
 declared free syms. The simulator path has no surrounding kernel
 scope to query and can't make up runtime values; the gather-path
-work that closes the gap lives on the deferred list.
+work that closes the gap lives on the deferred list. Pinned by
+`tests/test_simulator.py::test_resolve_layout_rejects_free_syms`.
+
+### `hc.buffer_view` composes scalar indices into the layout
+
+`hc.buffer_view` on a layout-bearing source is the second free-sym
+introduction site. For every axis `k` consumed by a scalar subscript,
+`inferBufferViewResult`
+(`lib/IR/HCInferTypeOpInterface.cpp::composeBufferViewLayout`):
+
+* substitutes `index_syms[k]` in the layout's `offset` /
+  `storage_size` (and every `params` value) with the scalar's
+  `IdxType` expression;
+* substitutes `shape_syms[k]` with the operand's actual dim entry;
+* drops both names from the residual layout's slot lists, so the
+  residual rank matches the residual shape.
+
+Slice subscripts and implicit-pass-through axes keep their slots and
+contribute no substitution. The substituted scalar typically pins a
+kernel-scope sym (a `!hc.idx<"buf_idx">` kernel arg, a block-arg loop
+IV); that sym then appears in the residual layout as a free symbol
+and binds through the same mechanism described above.
+
+The motivating shape is multi-buffered LDS expressed as a 4-D layout
+`(BUF, M, N, LANE)`. Slicing the leading axis with `lds_4d[buf_idx]`
+produces a 3-D residual view whose `offset` already bakes in the
+`buf_idx*M*N*L` shift — the caller never declares `buf_idx` on the
+layout, it surfaces as a free sym after composition and binds from
+the buffer_view's index operand at lowering time.
+
+Slice-axis index rebinding (`index_syms[k] := lower + step *
+index_syms[k]` for non-trivial `[lower:upper:step]` slices) is
+intentionally deferred — the frontend's `[:]` lowering only emits
+trivial slices today, and non-trivial slices would also need axis-
+extent rewriting that doesn't fit cleanly in the type-inference loop.
+
+LIT coverage:
+`@buffer_view_layout_multibuf`,
+`@buffer_view_layout_mixed_scalar_slice`,
+`@buffer_view_layout_all_slice` in `test/HC/infer-types.mlir`;
+`@buffer_view_layout_multibuf_forwards_source` in
+`test/HC/flatten-with-layouts.mlir`.
+
+### Shape-changing `hc.as_layout`
+
+`hc.as_layout` is a pure relabel — same storage, new logical
+descriptor. The relaxed verifier accepts operand and result types
+that differ in rank / shape, provided both sides address the same
+physical span. "Same span" is the effective `storage_size`:
+
+* with a layout, `layout.storage_size` after substituting
+  `layout.shape_syms` with the type's dim entries;
+* without a layout, the product of the type's dims (the default
+  identity layout's storage size).
+
+ixsimpl hash-consing makes the comparison structural — two textually
+different expressions that reduce to the same canonical form
+compare equal. Element type must still match; payload reinterpretation
+is `hc.astype`'s job, not this op's.
+
+Operand and result accept either flavor of the shaped split
+(`!hc.tensor`, `!hc.vector`, `!hc.bare_tensor`, `!hc.bare_vector`);
+the op is a pure relabel and composes with the decomposition that
+introduces the bare carriers.
+
+The motivating shape: a 1-D bare allocation reinterpreted as a 4-D
+layout-bearing view, so `hc.buffer_view` can then slice across the
+leading axis (e.g. a multi-buffered LDS arena allocated as a flat
+`!hc.bare_tensor<f32, ["2*M*N*L"]>` and presented as
+`!hc.tensor<f32, ["2","M","N","L"], #hc.layout<...>>`). Flatten
+collapses both endpoints back to the same 1-D carrier, and
+`DropAsLayout` forwards the operand expansion through.
+
+Same `computeStorageSizeExpr` (`lib/IR/HCAttrs.cpp`) feeds both the
+verifier and the flatten 1-D-collapse, so the canonical handle the
+two compare against is the one and only canonical handle for that
+storage expression.
+
+LIT coverage:
+`@as_layout_shape_change_storage_match` in
+`test/HC/ops-buffer-data.mlir` for the positive form;
+`test/HC/verify-hc.mlir` for the storage-mismatch and
+element-type-mismatch diagnostics;
+`@as_layout_shape_change_collapses_to_1d` in
+`test/HC/flatten-with-layouts.mlir` for the flatten round-trip.
 
 ## Out of scope (deferred)
 

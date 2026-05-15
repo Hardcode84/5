@@ -321,6 +321,77 @@ module {
     hc_front.return
   }
 
+  // Python-side `CurrentGroup.shape` exposes the launch-geo
+  // `group_shape` getter under the short attribute alias `shape`,
+  // which collides by name with buffer / tensor `.shape`. The
+  // dispatch resolves `group.shape[N]` to the launch-geo tuple +
+  // `hc.getitem` path (matching `group.group_id[N]` etc.) and only
+  // falls back to `hc.buffer_dim` when the base isn't a launch
+  // context handle — see `axis_bounds` below for the buffer side.
+  // CHECK-LABEL: hc.kernel @group_shape_alias
+  // CHECK: %[[GSV:.*]] = hc.group_shape %arg0 : (!hc.group) -> !hc.idx<"$WGS0">
+  // CHECK: %[[GST:.*]] = hc.tuple(%[[GSV]])
+  // CHECK: hc.getitem %[[GST]]
+  hc_front.kernel "group_shape_alias" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %sh_attr = hc_front.attr %grp, "shape" {ref = {kind = "dsl_method", method = "shape"}}
+    %sh0 = hc_front.subscript %sh_attr[%ax0]
+    %t_sh = hc_front.target_name "sh0"
+    hc_front.assign %t_sh = %sh0
+    hc_front.return
+  }
+
+  // Explicit `kind = "launch_context"` parameter under a non-"group"
+  // name (Python-side `def k(g: CurrentGroup, ...)` emits this
+  // shape). Pins the kind-attr branch of `isLaunchContextFrontParam`
+  // separately from the implicit "group" rule covered above.
+  // CHECK-LABEL: hc.kernel @group_shape_alias_explicit_kind
+  // CHECK: %[[GSV:.*]] = hc.group_shape %arg0 : (!hc.group) -> !hc.idx<"$WGS0">
+  // CHECK: %[[GST:.*]] = hc.tuple(%[[GSV]])
+  // CHECK: hc.getitem %[[GST]]
+  hc_front.kernel "group_shape_alias_explicit_kind" attributes {
+    parameters = [{kind = "launch_context", launch_context = "group", name = "g"}]
+  } {
+    %grp = hc_front.name "g" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %sh_attr = hc_front.attr %grp, "shape" {ref = {kind = "dsl_method", method = "shape"}}
+    %sh0 = hc_front.subscript %sh_attr[%ax0]
+    %t_sh = hc_front.target_name "sh0"
+    hc_front.assign %t_sh = %sh0
+    hc_front.return
+  }
+
+  // Local-bound alias: `g = group.shape; g[N]` should hit the same
+  // launch-geo tuple + getitem path as the inline `group.shape[N]`
+  // form — `trySubscriptFolds` traces the local name back to the
+  // attr at its source.
+  // CHECK-LABEL: hc.kernel @group_shape_alias_local
+  // CHECK: %[[GSV:.*]]:2 = hc.group_shape %arg0
+  // CHECK: %[[GST:.*]] = hc.tuple(%[[GSV]]#0, %[[GSV]]#1)
+  // CHECK: hc.getitem %[[GST]]
+  // CHECK: hc.getitem %[[GST]]
+  hc_front.kernel "group_shape_alias_local" attributes {
+    parameters = [{name = "group"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %sh_attr = hc_front.attr %grp, "shape" {ref = {kind = "dsl_method", method = "shape"}}
+    %t_g = hc_front.target_name "g"
+    hc_front.assign %t_g = %sh_attr
+    %g = hc_front.name "g" {ctx = "load", ref = {kind = "local"}}
+    %g0 = hc_front.subscript %g[%ax0]
+    %g1 = hc_front.subscript %g[%ax1]
+    %t_g0 = hc_front.target_name "g0"
+    hc_front.assign %t_g0 = %g0
+    %t_g1 = hc_front.target_name "g1"
+    hc_front.assign %t_g1 = %g1
+    hc_front.return
+  }
+
   // Boundary coverage:
   //   * launch-geo at axis=31 (one below the pass-internal cap) must lower
   //     cleanly — regression guard on the launch-geo bounds check.

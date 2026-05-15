@@ -2305,6 +2305,75 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   return Value();
 }
 
+// Closest ancestor (inclusive of self's parent chain) carrying a
+// front-pass `parameters` attribute — typically the enclosing kernel
+// or helper-function op. Lets the alias dispatch below stay agnostic
+// to which front-pass region kind owns the parameters list.
+static Operation *findFrontParamsHost(Operation *startOp) {
+  for (Operation *parent = startOp->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->hasAttr("parameters"))
+      return parent;
+  return nullptr;
+}
+
+// Linear scan of the `parameters` array for the entry whose `name`
+// string matches. Returns a null `DictionaryAttr` on miss.
+static DictionaryAttr findFrontParamDict(Operation *paramHost, StringRef name) {
+  auto params = paramHost->getAttrOfType<ArrayAttr>("parameters");
+  if (!params)
+    return {};
+  for (Attribute paramAttr : params) {
+    auto dict = dyn_cast<DictionaryAttr>(paramAttr);
+    if (!dict)
+      continue;
+    auto nameAttr = dict.getAs<StringAttr>("name");
+    if (nameAttr && nameAttr.getValue() == name)
+      return dict;
+  }
+  return {};
+}
+
+// Walks the enclosing front-pass region(s) for a `parameters` dict
+// and decides whether `nameOp` binds to a launch-context entry. The
+// lowered base value's MLIR type is the erased `!hc.undef` placeholder
+// at conversion time — the kernel block argument only acquires its
+// launch-context (`!hc.group` / `!hc.workitem` / `!hc.subgroup`) type
+// after `-hc-promote-names` — so the front-pass `parameters` attribute
+// is the only authoritative source available here.
+//
+// Used to disambiguate the Python-side `shape` alias (which on
+// `CurrentGroup` / `WorkItem` / `SubGroup` is the launch-geo
+// `group_shape` getter) from buffer / tensor shape queries on the
+// same attribute name.
+static bool isLaunchContextFrontParam(hc_front::NameOp nameOp) {
+  RefInfo ref = RefInfo::get(nameOp);
+  if (ref.getKind() != "param")
+    return false;
+  StringRef name = nameOp.getName();
+  Operation *paramHost = findFrontParamsHost(nameOp.getOperation());
+  if (!paramHost)
+    return false;
+  DictionaryAttr param = findFrontParamDict(paramHost, name);
+  if (!param)
+    return false;
+  if (auto kindAttr = param.getAs<StringAttr>("kind"))
+    if (kindAttr.getValue() == "launch_context")
+      return true;
+  // `buildImplicitGroupParameterType` synthesizes a `!hc.group` type
+  // for a non-scoped kernel parameter literally named `group` even
+  // when no explicit `launch_context` kind is stamped; mirror that
+  // here so the alias dispatch agrees with parameter typing.
+  bool scoped = !!paramHost->getAttrOfType<StringAttr>("scope");
+  return !scoped && name == "group";
+}
+
+static bool isLaunchContextFrontBase(Value baseFront) {
+  auto nameOp =
+      dyn_cast_if_present<hc_front::NameOp>(baseFront.getDefiningOp());
+  return nameOp && isLaunchContextFrontParam(nameOp);
+}
+
 FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
   // Most attribute chains (`group.load`, `buf.shape`, ...) are folded
   // into the parent call or subscript and don't produce a standalone
@@ -2344,20 +2413,30 @@ FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
         HCConstOp::create(builder, op.getLoc(), undef, TypeAttr::get(*dtypeTy))
             .getResult()};
   }
-  if (std::optional<LaunchGeoMethodInfo> info =
-          classifyLaunchGeoMethod(op.getName())) {
-    FailureOr<Value> baseOr =
-        lowerValueOperand(op.getBase(), op.getOperation(), "launch-geo base");
-    if (failed(baseOr))
-      return failure();
-    Value base = *baseOr;
-    if (!base)
-      return Value();
-    std::optional<unsigned> requiredRank =
-        getStaticLaunchGeometryRank(op.getBase(), op.getName());
-    return tryEmitLaunchGeo(*info, base, op.getLoc(), requiredRank);
-  }
-  return Value();
+  // Strict (name-only) classification handles the canonical method
+  // spellings — `group_id`, `local_id`, `work_offset`, `group_shape`,
+  // etc. The Python-side `CurrentGroup.shape` alias collides by name
+  // with buffer / tensor `.shape`, so disambiguate by walking the
+  // front-pass `parameters` dict on the enclosing kernel — that's the
+  // earliest checkpoint where the base's launch-context-ness is
+  // available (lowered base types are still the erased placeholder).
+  std::optional<LaunchGeoMethodInfo> info =
+      classifyLaunchGeoMethod(op.getName());
+  if (!info && op.getName() == "shape" &&
+      isLaunchContextFrontBase(op.getBase()))
+    info = getLaunchGeoMethodInfo(LaunchGeoMethod::GroupShape);
+  if (!info)
+    return Value();
+  FailureOr<Value> baseOr =
+      lowerValueOperand(op.getBase(), op.getOperation(), "launch-geo base");
+  if (failed(baseOr))
+    return failure();
+  Value base = *baseOr;
+  if (!base)
+    return Value();
+  std::optional<unsigned> requiredRank =
+      getStaticLaunchGeometryRank(op.getBase(), op.getName());
+  return tryEmitLaunchGeo(*info, base, op.getLoc(), requiredRank);
 }
 
 FailureOr<Value> Lowerer::emitConstantFromRef(Location loc, const RefInfo &ref,
@@ -3962,6 +4041,14 @@ static void noteAttrSubscriptLaunchGeoRank(
   StringRef method = attr.getName();
   std::optional<LaunchGeoMethodInfo> methodInfo =
       classifyLaunchGeoMethod(method);
+  // `group.shape[N]` lands on the Python alias whose canonical name is
+  // `group_shape`. The base hasn't been lowered yet at this pre-walk,
+  // so resolve the alias optimistically: the recorded hint is only
+  // queried under launch-geo dispatch in `lowerAttr`, and a stray
+  // `buffer.shape` entry is dead weight there (the buffer-dim path
+  // never consults the rank table).
+  if (!methodInfo && method == "shape")
+    methodInfo = getLaunchGeoMethodInfo(LaunchGeoMethod::GroupShape);
   if (!methodInfo || methodInfo->isScalar())
     return;
   std::optional<unsigned> rank =
@@ -4011,6 +4098,9 @@ static void noteCallSubscriptLaunchGeoRank(
   StringRef method = attr.getName();
   std::optional<LaunchGeoMethodInfo> methodInfo =
       classifyLaunchGeoMethod(method);
+  // See `noteAttrSubscriptLaunchGeoRank` for the alias rationale.
+  if (!methodInfo && method == "shape")
+    methodInfo = getLaunchGeoMethodInfo(LaunchGeoMethod::GroupShape);
   if (!methodInfo || methodInfo->isScalar())
     return;
   std::optional<unsigned> rank = allSubscriptUsesRank(call.getResult());
@@ -4259,9 +4349,18 @@ FailureOr<Value>
 Lowerer::tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
                                         hc_front::AttrOp attr, Value idxVal,
                                         IntegerAttr ax) {
+  if (!idxVal)
+    return Value();
   std::optional<LaunchGeoMethodInfo> methodInfo =
       classifyLaunchGeoMethod(attr.getName());
-  if (!idxVal || !methodInfo)
+  // `group.shape[N]` etc. — same alias dispatch as `lowerAttr` uses
+  // for the bare attr; see `isLaunchContextFrontParam` for why we
+  // walk the front-pass `parameters` dict rather than inspecting the
+  // lowered base type.
+  if (!methodInfo && attr.getName() == "shape" &&
+      isLaunchContextFrontBase(attr.getBase()))
+    methodInfo = getLaunchGeoMethodInfo(LaunchGeoMethod::GroupShape);
+  if (!methodInfo)
     return Value();
   if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
     return failure();
@@ -4289,12 +4388,14 @@ FailureOr<Value> Lowerer::tryLowerAttrSubscript(hc_front::SubscriptOp op,
   Value idxVal = *idxValOr;
   IntegerAttr ax = indexConstantAxisAttr(idxVal);
   if (attr.getName() == "shape") {
-    // `x.shape[N]` only makes sense for buffer/tensor/vector bases;
-    // the buffer-dim fold needs the base SSA value, not the cached
-    // attr value (which is null for `shape` today). Launch-context
-    // `shape` access (e.g. `group.shape[N]`) still falls through here
-    // and emits buffer_dim — resolving that correctly needs a
-    // type-aware dispatch on the base's launch-context vs buffer kind.
+    // `x.shape[N]` lowers two different ways depending on whether the
+    // base is a buffer / tensor / vector (→ `hc.buffer_dim`) or a
+    // launch-context handle (→ `hc.getitem` against the cached
+    // `hc.group_shape` tuple). Disambiguate using the front-pass
+    // parameter binding; the lowered base's MLIR type is still the
+    // erased `!hc.undef` placeholder at this point.
+    if (isLaunchContextFrontBase(attr.getBase()))
+      return tryLowerLaunchGeoAttrSubscript(op, attr, idxVal, ax);
     FailureOr<Value> baseValOr =
         lowerValueOperand(attr.getBase(), op.getOperation(), "subscript base");
     if (failed(baseValOr))

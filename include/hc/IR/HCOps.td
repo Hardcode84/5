@@ -1400,7 +1400,8 @@ def HCMatmulOp : HC_Op<"matmul", [Pure]> {
       "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def HCReduceOp : HC_Op<"reduce", [Pure]> {
+def HCReduceOp : HC_Op<"reduce",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Reduce `$value` along `$axis` using `$kind`.";
   let description = [{
     `$kind` is the typed `#hc<reduce_kind ...>` enum (`sum` / `max` / `min`);

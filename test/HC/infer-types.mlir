@@ -569,6 +569,62 @@ hc.func @pow_inference(%x: f32, %e: f32, %m: !hc.idx<"M">) {
 
 // -----
 
+// `hc.reduce` inference drops the `axis` dim from the input shape so
+// the post-inference IR carries a concrete result type for
+// `hc-shaped-compute-to-generic`'s shape validation. Without this
+// rule the result stays `!hc.undef`, the rewriter bails, and
+// `hc-flatten-with-layouts` later collapses the operand to a single
+// product dim while leaving `axis = 2` in place — the verifier then
+// catches an out-of-range axis far from the source. Layout drops on
+// the result because the reduced dim was part of the operand's index
+// space (carrying the input layout's name list past the collapse
+// would dangle a stale dim sym).
+// CHECK-LABEL: hc.func @reduce_drops_axis
+// CHECK: hc.reduce {{.*}} kind = sum, axis = 2 : !hc.tensor<f32, ["G0", "G1", "H"]> -> !hc.tensor<f32, ["G0", "G1"]>
+hc.func @reduce_drops_axis(%t: !hc.tensor<f32, ["G0", "G1", "H"]>) {
+  %r = hc.reduce %t, kind = sum, axis = 2 : !hc.tensor<f32, ["G0", "G1", "H"]> -> !hc.undef
+  hc.return
+}
+
+// -----
+
+// `keepdims = true` keeps the rank and pins the reduced dim to literal
+// `1` so the result still has a place to slot in beside `keepdims =
+// false` consumers in the same kernel.
+// CHECK-LABEL: hc.func @reduce_keepdims_pins_one
+// CHECK: hc.reduce {{.*}} kind = max, axis = 1, keepdims = true : !hc.tensor<f32, ["A", "B", "C"]> -> !hc.tensor<f32, ["A", "1", "C"]>
+hc.func @reduce_keepdims_pins_one(%t: !hc.tensor<f32, ["A", "B", "C"]>) {
+  %r = hc.reduce %t, kind = max, axis = 1, keepdims = true : !hc.tensor<f32, ["A", "B", "C"]> -> !hc.undef
+  hc.return
+}
+
+// -----
+
+// `hc.vector` runs through the same shape transform as the tensor case
+// — drop the axis dim, preserve the element type. Vectors are the
+// surface for per-lane fragments, so a lane-product reduction picks
+// up the right post-reduce vector shape via this rule.
+// CHECK-LABEL: hc.func @reduce_vector_drops_axis
+// CHECK: hc.reduce {{.*}} kind = sum, axis = 1 : !hc.vector<f32, ["L", "K"]> -> !hc.vector<f32, ["L"]>
+hc.func @reduce_vector_drops_axis(%t: !hc.vector<f32, ["L", "K"]>) {
+  %r = hc.reduce %t, kind = sum, axis = 1 : !hc.vector<f32, ["L", "K"]> -> !hc.undef
+  hc.return
+}
+
+// -----
+
+// Pre-inference `!hc.undef` value type stays unknown — inference has
+// nothing to fold against, and the rewriter will retry once whatever
+// produces `%t` gets its own type.
+// CHECK-LABEL: hc.func @reduce_undef_value_stays_undef
+// CHECK: hc.reduce {{.*}} kind = sum, axis = 0 : !hc.undef -> !hc.undef
+hc.func @reduce_undef_value_stays_undef(%t: !hc.undef) {
+  %r = hc.reduce %t, kind = sum, axis = 0 : !hc.undef -> !hc.undef
+  hc.return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @untyped_string_const_stays_unknown
 // CHECK: hc.const<"gfx11"> : !hc.undef
 hc.func @untyped_string_const_stays_unknown {

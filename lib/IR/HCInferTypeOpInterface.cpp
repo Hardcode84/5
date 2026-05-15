@@ -1691,6 +1691,81 @@ LogicalResult HCEmptyOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+// `keepdims = false` drops the axis dim (rank shrinks by one);
+// `keepdims = true` replaces it with literal `1`. Pulled out so the
+// outer op-inference can stay a flat sequence of guards.
+static FailureOr<SmallVector<Attribute>>
+collapseReduceShape(ArrayRef<Attribute> dims, uint64_t axis, bool keepdims,
+                    Operation *diagOp) {
+  SmallVector<Attribute> outDims;
+  outDims.reserve(keepdims ? dims.size() : dims.size() - 1);
+  if (!keepdims) {
+    for (auto [idx, dim] : llvm::enumerate(dims))
+      if (idx != axis)
+        outDims.push_back(dim);
+    return outDims;
+  }
+  FailureOr<ExprAttr> one = composeIntExprAttr(1, diagOp);
+  if (failed(one))
+    return failure();
+  for (auto [idx, dim] : llvm::enumerate(dims))
+    outDims.push_back(idx == axis ? Attribute(*one) : dim);
+  return outDims;
+}
+
+// `hc.reduce`'s ODS pins the operand to `HC_ShapedValueType`
+// (`!hc.undef` / `!hc.tensor` / `!hc.vector`); bare carriers can't
+// surface (`hc-decompose-shaped-values` either rewrites the reduce
+// up-front or fails legality), so the dispatcher only mirrors the two
+// semantic flavors. Layout is intentionally dropped — the reduced
+// axis was part of the operand's index space, and carrying the
+// operand layout's name list past the collapse would dangle a stale
+// dim sym.
+static Type rebuildReduceResultType(Type valueType, Type elem,
+                                    ShapeAttr outShape) {
+  MLIRContext *ctx = elem.getContext();
+  if (isa<mlir::hc::TensorType>(valueType))
+    return mlir::hc::TensorType::get(ctx, elem, outShape, LayoutAttr{});
+  if (isa<mlir::hc::VectorType>(valueType))
+    return mlir::hc::VectorType::get(ctx, elem, outShape, LayoutAttr{});
+  return {};
+}
+
+// `hc.reduce` collapses `$value`'s `$axis` dim. Without an inference
+// rule the result stays `!hc.undef` after `hc-infer-types`, which makes
+// `hc-shaped-compute-to-generic` bail (it needs both input and output
+// shapes to validate the reduce surface). The flatten pass then
+// retypes the surviving reduce's operand to a single product dim and
+// the verifier catches the out-of-range axis. Refining the result
+// here keeps the reduce rewritable before flatten and lets the
+// existing rewriter own the only post-rewrite shape contract.
+//
+// Anything not shaped (`!hc.undef`, non-shaped builtins) keeps the
+// result unknown so the next inference barrier or the verifier
+// handles it.
+LogicalResult HCReduceOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                       SmallVectorImpl<Type> &resultTypes) {
+  Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
+  auto shaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(valueType);
+  ShapeAttr shape = shaped ? shaped.getSymbolicShape() : ShapeAttr{};
+  // Out-of-range axis is the verifier's job once the operand type is
+  // concrete; we bail with no inference so the diagnostic fires
+  // against the typed input instead of being masked by a refined
+  // result.
+  if (!shape || getAxis() >= shape.getDims().size()) {
+    resultTypes.push_back({});
+    return success();
+  }
+  FailureOr<SmallVector<Attribute>> outDims =
+      collapseReduceShape(shape.getDims(), getAxis(), getKeepdims(), *this);
+  if (failed(outDims))
+    return failure();
+  ShapeAttr outShape = ShapeAttr::get(getContext(), *outDims);
+  resultTypes.push_back(rebuildReduceResultType(
+      valueType, shaped.getSymbolicElementType(), outShape));
+  return success();
+}
+
 LogicalResult
 HCForRangeOp::inferHCRegionArgTypes(RegionSuccessor successor,
                                     ValueRange nonSuccessorInputs,

@@ -11,6 +11,13 @@
 // diagnostics still fire.
 //
 // RUN: hc-opt --hc-shaped-compute-to-generic %s --split-input-file | FileCheck %s
+// Integration: with `-hc-infer-types` in front, a reduce whose result
+// arrives `!hc.undef` from the front pass gets its shape filled in
+// before this pass runs and routes through the same rewrite. Pins the
+// chain that the canonical schedule depends on (the front pass emits
+// undef-result reduces; without inference the rewriter would bail and
+// the downstream flatten would corrupt the operand shape).
+// RUN: hc-opt --hc-infer-types --hc-shaped-compute-to-generic %s --split-input-file | FileCheck %s --check-prefix=INFER
 
 // Plain f32 matmul. Iter syms `i`, `j`, `k`; ins addressed `[i,k]`
 // and `[k,j]`; outs `[i,j]`. Body keeps the body in HC scalar ops
@@ -220,4 +227,29 @@ func.func @noop_int_max(%a: !hc.tensor<i32, ["M", "N"]>)
   %r = hc.reduce %a, kind = max, axis = 0
       : !hc.tensor<i32, ["M", "N"]> -> !hc.tensor<i32, ["N"]>
   return %r : !hc.tensor<i32, ["N"]>
+}
+
+// -----
+
+// Integration anchor for the front-pass-emitted shape: rank-3 reduce
+// with `!hc.undef` result (the shape the front pass produces today)
+// gets inferred to rank-2 by `-hc-infer-types`, after which the v0
+// rewriter accepts it and emits the parallel-i_0/i_1 + reduction-r
+// generic. Without the inference rule the reduce would stay
+// `!hc.undef`, the rewriter would bail, and `hc-flatten-with-layouts`
+// later would corrupt the operand to a single-product shape with an
+// out-of-range axis — the bug this integration pins. Anchored on
+// `hc.func` because `-hc-infer-types` only refines values nested
+// under HC callables (`hc.kernel` / `hc.func` / `hc.intrinsic`); the
+// canonical pipeline routes the reduce through `hc.kernel` so this
+// is the structural shape that matters.
+// INFER-LABEL: hc.func @reduce_undef_result_rank3
+// INFER: hc.generic
+// INFER-SAME: iter (parallel i_0 = {{.+}} : !hc.idx<"G0">, parallel i_1 = {{.+}} : !hc.idx<"G1">, reduction r = {{.+}} : !hc.idx<"H">)
+// INFER-NOT: hc.reduce
+hc.func @reduce_undef_result_rank3(%a: !hc.tensor<f32, ["G0", "G1", "H"]>)
+    -> !hc.undef {
+  %r = hc.reduce %a, kind = sum, axis = 2
+      : !hc.tensor<f32, ["G0", "G1", "H"]> -> !hc.undef
+  hc.return %r : !hc.undef
 }

@@ -1641,7 +1641,7 @@ def _store_value(target: Any, value: Any) -> None:
     if isinstance(target, SimTensor):
         if target._read_only:
             raise SimulatorError("store target is read-only")
-        _store_masked(target._data, target._mask, value)
+        _store_masked(target._data, target._mask, value, intent_shape=target.shape)
         return
     if isinstance(target, LayoutBufferSlice):
         _scatter_into_layout_slice(target, value)
@@ -1652,13 +1652,15 @@ def _store_value(target: Any, value: Any) -> None:
             "(e.g. view[lane, :]) to pin the per-element positions"
         )
     if isinstance(target, BufferSlice):
-        _store_masked(target._view, None, value)
+        _store_masked(target._view, None, value, intent_shape=target.intent_shape)
         return
     if isinstance(target, KernelBuffer):
-        _store_masked(target._array, None, value)
+        _store_masked(target._array, None, value, intent_shape=target.shape)
         return
     if isinstance(target, np.ndarray):
-        _store_masked(target, None, value)
+        _store_masked(
+            target, None, value, intent_shape=tuple(int(dim) for dim in target.shape)
+        )
         return
     raise SimulatorError("store target must be a numpy buffer or tensor view")
 
@@ -1702,12 +1704,16 @@ def _resolve_layout_scatter_value(
 
 
 def _store_masked(
-    target_data: np.ndarray[Any, np.dtype[Any]], target_mask: Any, value: Any
+    target_data: np.ndarray[Any, np.dtype[Any]],
+    target_mask: Any,
+    value: Any,
+    *,
+    intent_shape: tuple[int, ...],
 ) -> None:
     if isinstance(value, Poison):
         raise SimulatorError("cannot store a poison scalar")
     if isinstance(value, SimTensor | SimVector):
-        _store_from_value(target_data, target_mask, value)
+        _store_from_value(target_data, target_mask, value, intent_shape=intent_shape)
         return
     target_data[...] = value
     if target_mask is not None:
@@ -1718,9 +1724,20 @@ def _store_from_value(
     target_data: np.ndarray[Any, np.dtype[Any]],
     target_mask: Any,
     value: SimTensor | SimVector,
+    *,
+    intent_shape: tuple[int, ...],
 ) -> None:
-    if target_data.ndim != value.ndim:
-        raise SimulatorError("store source and target ranks must match")
+    # Reject shape mismatches up front. The destination's NumPy view
+    # may be a clipped slice (intent extended past the buffer's edge),
+    # but the *source* tile has to match the user's logical extent
+    # exactly — otherwise the per-element overlap below would silently
+    # fill whatever overlaps and zero-pad the rest, masking real bugs
+    # like transposed-broadcast typos behind plausible-looking output.
+    if value.shape != intent_shape:
+        raise SimulatorError(
+            f"store source shape {value.shape} does not match destination "
+            f"shape {intent_shape}"
+        )
     overlap = tuple(
         slice(0, min(target_data.shape[idx], value.shape[idx]))
         for idx in range(target_data.ndim)

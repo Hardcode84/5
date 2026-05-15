@@ -164,10 +164,18 @@ def test_launch_runs_workgroup_pairwise_kernel() -> None:
         out: Buffer[W1, W2],
     ) -> None:
         gid = group.work_offset
-        lhs = group.load(x1[gid[0] :], shape=(group.shape[0], x1.shape[1]))
-        rhs = group.load(x2[gid[1] :], shape=(group.shape[1], x2.shape[1]))
+        g0, g1 = group.shape
+        lhs = group.load(x1[gid[0] :], shape=(g0, x1.shape[1]))
+        rhs = group.load(x2[gid[1] :], shape=(g1, x2.shape[1]))
         diff = ((lhs[:, None, :] - rhs[None, :, :]) ** 2).sum(axis=2)
-        group.store(out[gid[0] :, gid[1] :], np.sqrt(diff))
+        # Explicit-stop slicing pins the destination tile at the
+        # workgroup's `group.shape`. The simulator's `group.store`
+        # requires `source.shape == dest_slice.shape` so off-by-one
+        # / transposed-broadcast bugs fail loudly; open-ended slices
+        # past the buffer edge fall back to per-element NumPy
+        # clipping, which carries the source's boundary mask but
+        # leaves shape mismatches invisible.
+        group.store(out[gid[0] : gid[0] + g0, gid[1] : gid[1] + g1], np.sqrt(diff))
 
     x1 = np.arange(15, dtype=np.float32).reshape(5, 3)
     x2 = np.arange(18, dtype=np.float32).reshape(6, 3) / 3.0
@@ -177,6 +185,41 @@ def test_launch_runs_workgroup_pairwise_kernel() -> None:
 
     expected = np.sqrt(((x1[:, None, :] - x2[None, :, :]) ** 2).sum(axis=2))
     assert np.allclose(out, expected)
+
+
+def test_group_store_rejects_shape_mismatched_source() -> None:
+    # Verbatim langref WG-level broadcast `x1[None, :, :] - x2[:, None, :]`
+    # produces a `(g1, g0, H)` tile, summed to `(g1, g0)`. The
+    # destination tile is `(g0, g1)`. The simulator used to fall through
+    # to NumPy per-position writes and silently emit `reference.T`-
+    # clipped output; we now expect a loud shape-mismatch error. The
+    # destination uses explicit-stop slicing so the dest shape matches
+    # the workgroup tile exactly, isolating the failure to the
+    # transposed broadcast.
+    W1 = sym.W1
+    W2 = sym.W2
+    H = sym.H
+
+    @kernel(work_shape=(W1, W2), group_shape=(2, 3))
+    def transposed(
+        group,
+        x1: Buffer[W1, H],
+        x2: Buffer[W2, H],
+        out: Buffer[W1, W2],
+    ) -> None:
+        gid = group.work_offset
+        g0, g1 = group.shape
+        lhs = group.load(x1[gid[0] :], shape=(g0, x1.shape[1]))
+        rhs = group.load(x2[gid[1] :], shape=(g1, x2.shape[1]))
+        diff = ((lhs[None, :, :] - rhs[:, None, :]) ** 2).sum(axis=2)
+        group.store(out[gid[0] : gid[0] + g0, gid[1] : gid[1] + g1], np.sqrt(diff))
+
+    x1 = np.arange(4, dtype=np.float32).reshape(2, 2)
+    x2 = np.arange(6, dtype=np.float32).reshape(3, 2)
+    out = np.zeros((2, 3), dtype=np.float32)
+
+    with pytest.raises(sim.SimulatorError, match=r"store source shape .* destination"):
+        sim.launch(transposed, x1, x2, out)
 
 
 def test_zero_sized_work_shape_is_a_noop() -> None:
@@ -226,7 +269,7 @@ def test_vector_load_and_store_preserve_active_elements_only() -> None:
     def add_vec(group, x: Buffer[W], y: Buffer[W]) -> None:
         gid = group.work_offset[0]
         vec = group.vload(x[gid:], shape=(4,))
-        group.store(y[gid:], vec + 2)
+        group.store(y[gid : gid + 4], vec + 2)
 
     x = np.arange(6, dtype=np.float32)
     y = np.zeros((6,), dtype=np.float32)
@@ -783,7 +826,7 @@ def test_ufunc_out_updates_tensor_destination() -> None:
         right = group.load(rhs[gid:], shape=(4,))
         tmp = group.zeros(shape=(4,), dtype=lhs.dtype)
         np.subtract(left, right, out=tmp)
-        group.store(out[gid:], tmp)
+        group.store(out[gid : gid + 4], tmp)
 
     lhs = np.arange(6, dtype=np.float32)
     rhs = np.arange(6, dtype=np.float32) / 2
@@ -1184,7 +1227,7 @@ def test_group_vload_and_vector_store_work_in_workitem_scope() -> None:
         def inner(wi) -> None:
             gid = wi.global_id()[0]
             vec = group.vload(src[gid:], shape=(1,))
-            group.store(dst[gid:], vec + 2)
+            group.store(dst[gid : gid + 1], vec + 2)
 
         inner()
 
@@ -1278,7 +1321,7 @@ def test_intrinsic_verify_hook_receives_scope_and_arguments() -> None:
         def inner(wi) -> None:
             gid = wi.global_id()[0]
             vec = group.vload(src[gid:], shape=(1,))
-            group.store(dst[gid:], add_delta(vec, delta=2))
+            group.store(dst[gid : gid + 1], add_delta(vec, delta=2))
 
         inner()
 

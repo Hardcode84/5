@@ -52,16 +52,18 @@ def pairwise_distance_wg_kernel(
     # open-ended slices let `group.load` clip against `X1.shape[0]` /
     # `X2.shape[0]` and stamp the boundary mask onto the loaded tile.
     gid = group.work_offset
+    g0, g1 = group.shape
 
-    x1 = group.load(X1[gid[0] :], shape=(group.shape[0], X1.shape[1]))
-    x2 = group.load(X2[gid[1] :], shape=(group.shape[1], X2.shape[1]))
+    x1 = group.load(X1[gid[0] :], shape=(g0, X1.shape[1]))
+    x2 = group.load(X2[gid[1] :], shape=(g1, X2.shape[1]))
 
     # Broadcasting subtraction lifts both operands to rank-3.
     # `x1[:, None, :]` shape `(g0, 1, H)`, `x2[None, :, :]` shape
     # `(1, g1, H)`, broadcast difference shape `(g0, g1, H)`. `**2`
     # then `sum(axis=2)` collapses over `H`, leaving `(g0, g1)`
-    # aligned with the `D[gid[0]:, gid[1]:]` destination tile so
-    # `D[i, j] = sqrt(sum_k (X1[i, k] - X2[j, k])**2)`.
+    # aligned with the `D[gid[0]:gid[0]+g0, gid[1]:gid[1]+g1]`
+    # destination tile so `D[i, j] = sqrt(sum_k (X1[i, k] - X2[j,
+    # k])**2)`.
     #
     # `doc/langref.md`'s WG-level form writes the broadcast as
     # `(x1[None, :, :] - x2[:, None, :])` instead — that pattern
@@ -72,9 +74,13 @@ def pairwise_distance_wg_kernel(
     # accordingly. The langref text is being tracked separately.
     diff = ((x1[:, None, :] - x2[None, :, :]) ** 2).sum(axis=2)
 
-    # `D[gid[0]:, gid[1]:]` open-ended on both axes — `group.store`
-    # masks off lanes whose `(i, j)` falls outside `D[W1, W2]`.
-    group.store(D[gid[0] :, gid[1] :], np.sqrt(diff))
+    # Explicit-stop slicing pins the destination tile to `(g0, g1)` so
+    # `group.store` can validate `source.shape == dest_slice.shape`.
+    # NumPy clips the slice at the buffer edge for boundary
+    # workgroups; the source's mask (from `group.load`'s shape= bounds
+    # check) carries the boundary OOB cells as False so the
+    # per-element overlap drops them rather than producing garbage.
+    group.store(D[gid[0] : gid[0] + g0, gid[1] : gid[1] + g1], np.sqrt(diff))
 
 
 def reference_pairwise_distance(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:

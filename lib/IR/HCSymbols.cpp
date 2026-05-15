@@ -267,6 +267,18 @@ FailureOr<ExprHandle> mlir::hc::sym::composeExprCeil(Store &store,
                     "failed to compose hc.expr");
 }
 
+FailureOr<ExprHandle> mlir::hc::sym::composeExprFloor(Store &store,
+                                                      ExprHandle valueHandle,
+                                                      std::string *diagnostic) {
+  Session session(store);
+  ixs_node *value =
+      importNode(session, valueHandle.raw(), diagnostic, "hc.expr");
+  if (!value)
+    return failure();
+  return finishExpr(session.raw(), ixs_floor(session.raw(), value), diagnostic,
+                    "failed to compose hc.expr");
+}
+
 FailureOr<ExprHandle> mlir::hc::sym::composeExprNeg(Store &store,
                                                     ExprHandle valueHandle,
                                                     std::string *diagnostic) {

@@ -492,3 +492,98 @@ func.func @load_mask_basic(%buf: !hc.buffer<f32, ["M", "N"]>) -> !hc.bare_vector
          tuple<!hc.idx<"8">, !hc.idx<"1">>) -> !hc.bare_vector<!hc.pred, ["8", "1"]>
   return %m : !hc.bare_vector<!hc.pred, ["8", "1"]>
 }
+
+// -----
+
+// Layout-driven gather load. The result type carries a layout whose
+// `storage_size` matches the rank-2 slice's flat capacity (`16 * 16
+// = 256`), so the rewriter inverts the layout's `offset` to
+// per-axis source coordinates instead of the trivial `lo + iter`
+// identity. The decomposition is `base_k + Mod(floor(flat /
+// inner_prod_k), extent_k)`, with the last axis skipping the floor
+// div. This is the path the AMD gfx11 WMMA accumulator init takes
+// — the C-side tile is laid out per-lane, per-fragment via the
+// `WAVE_ACC_FRAG_LAYOUT` (lane = i_0, fi = i_1; `32*i_1 + i_0`
+// folds onto a flat 256-cell tile span), and the layout-driven
+// decomposition recovers the `(lane // 16 + fi * 2, lane % 16)`
+// per-element coords that the matching `store_wmma_tile` writes
+// back through a strided buffer-view. Without this path the load
+// would carry identity offsets and misaddress every lane > 0.
+// CHECK-LABEL: func.func @vload_layout_gather
+// CHECK: %[[FILL:.+]] = hc.vzeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_vector<f32, ["16", "16"]
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"16">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"16">)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"row0 + Mod(2*i_1 + floor(1/16*i_0), 16)">, #hc.expr<"col0 + Mod(i_0, 16)">] : !hc.buffer<f32, ["M", "N"]>)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">, #hc.expr<"i_1">]
+// CHECK-NOT: hc.vload
+func.func @vload_layout_gather(%buf: !hc.buffer<f32, ["M", "N"]>,
+                               %lo0: !hc.idx<"row0">,
+                               %hi0: !hc.idx<"row0 + 16">,
+                               %lo1: !hc.idx<"col0">,
+                               %hi1: !hc.idx<"col0 + 16">,
+                               %step: !hc.idx<"1">)
+    -> !hc.bare_vector<f32, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>> {
+  %a = hc.const<16 : i64> : !hc.idx<"16">
+  %b = hc.const<16 : i64> : !hc.idx<"16">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"16">, !hc.idx<"16">) -> tuple<!hc.idx<"16">, !hc.idx<"16">>
+  %s0 = hc.slice_expr(lower = %lo0 upper = %hi0 step = %step)
+      : (!hc.idx<"row0">, !hc.idx<"row0 + 16">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">, step = !hc.idx<"1">>
+  %s1 = hc.slice_expr(lower = %lo1 upper = %hi1 step = %step)
+      : (!hc.idx<"col0">, !hc.idx<"col0 + 16">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"col0">, upper = !hc.idx<"col0 + 16">, step = !hc.idx<"1">>
+  %v = hc.vload %buf[%s0, %s1], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>,
+         !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">, step = !hc.idx<"1">>,
+         !hc.slice<lower = !hc.idx<"col0">, upper = !hc.idx<"col0 + 16">, step = !hc.idx<"1">>,
+         tuple<!hc.idx<"16">, !hc.idx<"16">>)
+        -> !hc.bare_vector<f32, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+  return %v : !hc.bare_vector<f32, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+}
+
+// -----
+
+// Layout-driven gather mask: mirror of `@vload_layout_gather` for
+// `hc.load_mask`. The per-axis bound check becomes
+// `decomposed_offset_k < srcDim_k` instead of the per-iter
+// `lo + step*iter < srcDim`, so the predicate's "in-bounds" view
+// matches the data path's layout-driven addressing. The WMMA
+// accumulator init relies on this: without the layout-aware mask,
+// lanes whose decomposed `(row, col)` runs off the partial-tile
+// `c[M, N]` would still mask True and the final store would scatter
+// past `c`'s end on M/N not multiples of `WMMA_M`/`WMMA_N`.
+// CHECK-LABEL: func.func @load_mask_layout_gather
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"16">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"16">)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">]
+// CHECK: ^bb0(%{{[^:]+}}: !hc.pred):
+// CHECK:   %[[P:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + row0 + Mod(2*i_1 + floor(1/16*i_0), 16) < 0 & -N + col0 + Mod(i_0, 16) < 0">
+// CHECK:   %[[U:.+]] = builtin.unrealized_conversion_cast %[[P]]
+// CHECK:   hc.yield %[[U]] : !hc.pred
+// CHECK-NOT: hc.load_mask
+func.func @load_mask_layout_gather(%buf: !hc.buffer<f32, ["M", "N"]>,
+                                   %lo0: !hc.idx<"row0">,
+                                   %hi0: !hc.idx<"row0 + 16">,
+                                   %lo1: !hc.idx<"col0">,
+                                   %hi1: !hc.idx<"col0 + 16">,
+                                   %step: !hc.idx<"1">)
+    -> !hc.bare_vector<!hc.pred, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>> {
+  %a = hc.const<16 : i64> : !hc.idx<"16">
+  %b = hc.const<16 : i64> : !hc.idx<"16">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"16">, !hc.idx<"16">) -> tuple<!hc.idx<"16">, !hc.idx<"16">>
+  %s0 = hc.slice_expr(lower = %lo0 upper = %hi0 step = %step)
+      : (!hc.idx<"row0">, !hc.idx<"row0 + 16">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">, step = !hc.idx<"1">>
+  %s1 = hc.slice_expr(lower = %lo1 upper = %hi1 step = %step)
+      : (!hc.idx<"col0">, !hc.idx<"col0 + 16">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"col0">, upper = !hc.idx<"col0 + 16">, step = !hc.idx<"1">>
+  %m = hc.load_mask %buf[%s0, %s1], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>,
+         !hc.slice<lower = !hc.idx<"row0">, upper = !hc.idx<"row0 + 16">, step = !hc.idx<"1">>,
+         !hc.slice<lower = !hc.idx<"col0">, upper = !hc.idx<"col0 + 16">, step = !hc.idx<"1">>,
+         tuple<!hc.idx<"16">, !hc.idx<"16">>)
+        -> !hc.bare_vector<!hc.pred, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+  return %m : !hc.bare_vector<!hc.pred, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+}

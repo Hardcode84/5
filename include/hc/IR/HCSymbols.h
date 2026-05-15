@@ -118,6 +118,11 @@ composeExprBinary(Store &store, ExprHandle lhs, ExprBinaryOp op, ExprHandle rhs,
                   std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprCeil(Store &store, ExprHandle value,
                                             std::string *diagnostic = nullptr);
+/// Floor function. Use `composeExprFloor(store, composeExprBinary(store, a,
+/// Div, b))` to get Python `//` semantics (floored integer division), since
+/// `composeExprBinary` with `Div` is *exact rational* division.
+mlir::FailureOr<ExprHandle> composeExprFloor(Store &store, ExprHandle value,
+                                             std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
                                            std::string *diagnostic = nullptr);
 

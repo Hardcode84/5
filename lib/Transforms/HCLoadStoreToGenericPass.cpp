@@ -347,6 +347,96 @@ static FailureOr<ArrayAttr> composeBroadcastSourceOffset(
   return ArrayAttr::get(ctx, {Attribute(*offset)});
 }
 
+// Divide `extent` by the slice's `step` when the step is a pinned
+// `!hc.idx<expr>` that isn't the integer literal 1. Unit steps leave
+// `extent` untouched — the hash-consed `/1` would print as a
+// redundant ride-along otherwise. Absent step (null `stepTy`) also
+// leaves `extent` alone since "no step" means unit by convention.
+static FailureOr<sym::ExprHandle>
+divideExtentByStep(sym::Store &store, sym::ExprHandle extent, Type stepTy) {
+  if (!stepTy)
+    return extent;
+  auto stepExpr = extractPinnedIdxExpr(stepTy);
+  if (failed(stepExpr))
+    return failure();
+  std::optional<int64_t> stepLit =
+      sym::getIntegerLiteralValue(stepExpr->getValue());
+  if (stepLit && *stepLit == 1)
+    return extent;
+  return sym::composeExprBinary(store, extent, sym::ExprBinaryOp::Div,
+                                stepExpr->getValue());
+}
+
+// Per-axis extent expression of one slice when the slice's `lower`
+// and `upper` are both pinned `!hc.idx<expr>`. Composes `upper -
+// lower` (and divides by `step` when the step is a non-unit pinned
+// literal). Used by the layout-driven gather decomposition to know
+// how many cells the slice covers along each axis.
+static FailureOr<ExprAttr>
+extractSliceExtent(MLIRContext *ctx, sym::Store &store, SliceType slice) {
+  Type lowerTy = slice.getLowerType();
+  Type upperTy = slice.getUpperType();
+  if (!lowerTy || !upperTy)
+    return failure();
+  auto lower = extractPinnedIdxExpr(lowerTy);
+  if (failed(lower))
+    return failure();
+  auto upper = extractPinnedIdxExpr(upperTy);
+  if (failed(upper))
+    return failure();
+  auto diff = sym::composeExprBinary(store, upper->getValue(),
+                                     sym::ExprBinaryOp::Sub, lower->getValue());
+  if (failed(diff))
+    return failure();
+  auto extent = divideExtentByStep(store, *diff, slice.getStepType());
+  if (failed(extent))
+    return failure();
+  return ExprAttr::get(ctx, *extent);
+}
+
+// Per-axis extents for an entire `indices` operand list. Returns
+// failure if any index isn't a slice with both pinned `lower` and
+// `upper` (the layout-driven gather decomposition needs both bounds
+// to compute the slice's flat capacity). Caller falls back to the
+// per-axis identity offsets on failure.
+static FailureOr<SmallVector<ExprAttr>>
+collectSliceExtents(MLIRContext *ctx, sym::Store &store, ValueRange indices) {
+  if (indices.empty())
+    return failure();
+  SmallVector<ExprAttr> extents;
+  extents.reserve(indices.size());
+  for (Value idx : indices) {
+    auto slice = dyn_cast<SliceType>(idx.getType());
+    if (!slice)
+      return failure();
+    auto extent = extractSliceExtent(ctx, store, slice);
+    if (failed(extent))
+      return failure();
+    extents.push_back(*extent);
+  }
+  return extents;
+}
+
+// Product of `extents`. Used to compare the slice's flat capacity
+// against the layout's `storage_size` before the gather
+// decomposition: hash-consing in the dialect store gives pointer
+// equality on the canonical handle when the two products
+// structurally agree.
+static FailureOr<sym::ExprHandle>
+composeProductOfExtents(sym::Store &store, ArrayRef<ExprAttr> extents) {
+  if (extents.empty())
+    return sym::composeExprInt(store, 1);
+  sym::ExprHandle prod = extents[0].getValue();
+  for (size_t k = 1; k < extents.size(); ++k) {
+    auto next = sym::composeExprBinary(store, prod, sym::ExprBinaryOp::Mul,
+                                       extents[k].getValue());
+    if (failed(next))
+      return failure();
+    prod = *next;
+  }
+  return prod;
+}
+
 // Validated preflight state for the load rewriter: source shape, the
 // per-axis indices, and whether the access is a non-injective rank-1
 // broadcast (source rank < tile rank, with the iter axes collapsing
@@ -356,6 +446,12 @@ struct LoadPreflight {
   SmallVector<ExprAttr> srcShape;
   LayoutAttr resultLayout;
   bool broadcastFromRank1;
+  // Per-axis slice extents when every index is a pinned slice. Empty
+  // when extracting extents failed for any axis or when the access
+  // doesn't use slices at every position. The layout-driven gather
+  // decomposition consumes this; the per-axis identity fallback
+  // doesn't need it.
+  SmallVector<ExprAttr> sliceExtents;
 };
 
 // Element-type match check between source and result: both must be
@@ -393,10 +489,155 @@ static LogicalResult classifyLoadAccess(Type resultTy, ValueRange indices,
   return success();
 }
 
+// Compose the layout's `offset` expression with iter syms
+// substituted for `index_syms` and `tileShape` for `shape_syms`.
+// The result is the per-iter-point flat position into the slice's
+// row-major flatten — the value the per-axis decomposition splits
+// back into source coordinates.
+static FailureOr<sym::ExprHandle>
+composeLayoutFlatOffset(MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+                        ArrayRef<ExprAttr> tileShape,
+                        ArrayRef<StringAttr> iterSyms) {
+  SmallVector<ExprAttr> iterExprs;
+  iterExprs.reserve(iterSyms.size());
+  for (StringAttr name : iterSyms) {
+    auto handle = sym::composeExprSym(store, name.getValue());
+    if (failed(handle))
+      return failure();
+    iterExprs.push_back(ExprAttr::get(ctx, *handle));
+  }
+  SmallVector<Attribute> dims(tileShape.begin(), tileShape.end());
+  auto tileShapeAttr = ShapeAttr::get(ctx, dims);
+  auto flatOr = composeAccessOffsetExpr(ctx, layout, tileShapeAttr, iterExprs);
+  if (failed(flatOr))
+    return failure();
+  return flatOr->getValue();
+}
+
+// Row-major inner products of `extents`: result[k] = product of
+// extents[k+1..N-1], with result[N-1] = 1. Used by the layout-driven
+// gather to split a flat row-major position back into per-axis
+// coordinates.
+static FailureOr<SmallVector<sym::ExprHandle>>
+composeInnerProducts(sym::Store &store, ArrayRef<ExprAttr> extents) {
+  size_t rank = extents.size();
+  SmallVector<sym::ExprHandle> innerProds(rank);
+  auto one = sym::composeExprInt(store, 1);
+  if (failed(one))
+    return failure();
+  innerProds[rank - 1] = *one;
+  for (size_t k = rank - 1; k > 0; --k) {
+    auto next = sym::composeExprBinary(store, extents[k].getValue(),
+                                       sym::ExprBinaryOp::Mul, innerProds[k]);
+    if (failed(next))
+      return failure();
+    innerProds[k - 1] = *next;
+  }
+  return innerProds;
+}
+
+// One axis of the layout-driven decomposition: `base + Mod(floor(flat
+// / inner_prod), extent)`. The last axis (`isLast=true`) skips the
+// `/inner_prod` since `inner_prod_{N-1} = 1` would print as a
+// redundant `/1`. The floor wrapper is mandatory on the non-last
+// axes — `composeExprBinary(Div)` is exact-rational; without the
+// floor we'd carry `1/16*X` through every later use and downstream
+// ixsimpl never recovers an integer index.
+static FailureOr<ExprAttr>
+composeDecomposedAxis(MLIRContext *ctx, sym::Store &store, sym::ExprHandle flat,
+                      sym::ExprHandle innerProd, ExprAttr extent, ExprAttr base,
+                      bool isLast) {
+  sym::ExprHandle divFlat = flat;
+  if (!isLast) {
+    auto d =
+        sym::composeExprBinary(store, flat, sym::ExprBinaryOp::Div, innerProd);
+    if (failed(d))
+      return failure();
+    auto floored = sym::composeExprFloor(store, *d);
+    if (failed(floored))
+      return failure();
+    divFlat = *floored;
+  }
+  auto m = sym::composeExprBinary(store, divFlat, sym::ExprBinaryOp::Mod,
+                                  extent.getValue());
+  if (failed(m))
+    return failure();
+  auto s = sym::composeExprBinary(store, base.getValue(),
+                                  sym::ExprBinaryOp::Add, *m);
+  if (failed(s))
+    return failure();
+  return ExprAttr::get(ctx, *s);
+}
+
+// Compose source-side per-axis offsets via the result type's layout
+// when the source is a multi-dim slice whose intent shape product
+// matches the layout's `storage_size`. The result type's layout maps
+// `index_syms` -> a single flat tile-storage offset; substituting
+// iter syms (`i_0`, `i_1`, ...) for `index_syms` and `tileShape` for
+// `shape_syms` produces an expression in iter syms that gives the
+// per-iter-point flat position into the slice's row-major flatten.
+// That flat position decomposes back into source-axis coordinates:
+//
+//   axis_k = base_k + (flat / inner_prod_k) % extent_k
+//
+// where `inner_prod_k = product(extent[k+1..N-1])` and
+// `inner_prod_{N-1} = 1`. The per-axis `% extent_k` keeps the
+// decomposition well-defined when ixsimpl can't prove the upper
+// bound; the simplifier folds it when bounds are statically tight.
+//
+// Bails when:
+//   * any iter sym fails to compose (rank/parity mismatch with the
+//     layout's `index_syms`),
+//   * the layout's `storage_size` doesn't structurally equal the
+//     slice extent product (with a wider layout, `% extent` would
+//     alias OOB lanes onto valid cells; with a narrower layout some
+//     positions stop short, both of which need explicit masking the
+//     generic surface doesn't carry on this slot).
+//
+// Caller has already confirmed every index is a pinned slice and
+// `pf.sliceExtents` rank-matches `pf.axes`.
+static FailureOr<ArrayAttr> composeLayoutGatherSourceOffsets(
+    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+    ArrayRef<ExprAttr> tileShape, ArrayRef<StringAttr> iterSyms,
+    ArrayRef<AxisIndex> axes, ArrayRef<ExprAttr> sliceExtents) {
+  size_t rank = axes.size();
+  if (rank == 0 || sliceExtents.size() != rank)
+    return failure();
+
+  auto productExtents = composeProductOfExtents(store, sliceExtents);
+  if (failed(productExtents))
+    return failure();
+  if (!(*productExtents == layout.getStorageSize().getValue()))
+    return failure();
+
+  auto flat = composeLayoutFlatOffset(ctx, store, layout, tileShape, iterSyms);
+  if (failed(flat))
+    return failure();
+  auto innerProds = composeInnerProducts(store, sliceExtents);
+  if (failed(innerProds))
+    return failure();
+
+  SmallVector<Attribute> axisOffsets;
+  axisOffsets.reserve(rank);
+  for (size_t k = 0; k < rank; ++k) {
+    auto axis = composeDecomposedAxis(ctx, store, *flat, (*innerProds)[k],
+                                      sliceExtents[k], axes[k].base,
+                                      /*isLast=*/k + 1 == rank);
+    if (failed(axis))
+      return failure();
+    axisOffsets.push_back(*axis);
+  }
+  return ArrayAttr::get(ctx, axisOffsets);
+}
+
 // All the bail-out checks a load rewrite needs before it starts
 // mutating IR. Validates rank parity, harvests the per-axis indices,
 // confirms the element types match, and computes the broadcast
-// classification.
+// classification. Also collects per-axis slice extents when the
+// result type carries a non-default layout and the indices are all
+// pinned slices — the layout-driven gather decomposition consumes
+// those to translate the layout's flat offset back into per-axis
+// source coords.
 static FailureOr<LoadPreflight>
 preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
                   Type resultTy, ValueRange indices,
@@ -425,13 +666,28 @@ preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
                                 broadcastFromRank1, resultLayout)))
     return failure();
 
+  SmallVector<ExprAttr> sliceExtents;
+  if (resultLayout && !broadcastFromRank1) {
+    auto extents = collectSliceExtents(ctx, store, indices);
+    if (succeeded(extents))
+      sliceExtents = std::move(*extents);
+    // Extraction failure is fine — `composeLoadInsOffsets` falls
+    // back to the per-axis identity offsets when the layout-driven
+    // gather doesn't fit the structural shape.
+  }
+
   return LoadPreflight{std::move(*axesOr), std::move(*srcShape), resultLayout,
-                       broadcastFromRank1};
+                       broadcastFromRank1, std::move(sliceExtents)};
 }
 
-// Pick the right ins_offsets[0] for a load: layout-driven on the
-// rank-1 broadcast path; per-axis `base + step*iter` for the
-// same-rank path.
+// Pick the right ins_offsets[0] for a load:
+//   * Rank-1 broadcast (source rank < tile rank, layout-driven
+//     collapse onto rank-1 storage): single flat offset.
+//   * Layout-driven gather (result has a non-default layout, all
+//     indices are pinned slices with extents flattening to the
+//     layout's `storage_size`): per-axis row-major decomposition of
+//     the layout's flat offset.
+//   * Otherwise: per-axis `base + step*iter` identity offsets.
 static FailureOr<ArrayAttr>
 composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
                       const LoadPreflight &pf, ArrayRef<ExprAttr> tileShape,
@@ -439,6 +695,18 @@ composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
   if (pf.broadcastFromRank1)
     return composeBroadcastSourceOffset(ctx, pf.resultLayout, tileShape,
                                         iterSyms, pf.srcShape);
+  if (pf.resultLayout && !pf.sliceExtents.empty()) {
+    auto layoutDriven =
+        composeLayoutGatherSourceOffsets(ctx, store, pf.resultLayout, tileShape,
+                                         iterSyms, pf.axes, pf.sliceExtents);
+    if (succeeded(layoutDriven))
+      return *layoutDriven;
+    // Fall through: the identity offsets are correct when the layout
+    // is structurally identity over the tile shape; when the layout
+    // is genuinely non-identity and we couldn't decompose, the
+    // identity fallback is wrong but matches the pre-fix behaviour
+    // and downstream verifiers diagnose the storage-size mismatch.
+  }
   return composeMemoryOffsetArray(ctx, store, pf.axes, iterSyms);
 }
 
@@ -664,6 +932,84 @@ static void populateMaskBody(HCGenericOp generic, MLIRContext *ctx,
   HCYieldOp::create(bodyBuilder, loc, ValueRange{predUnpinned});
 }
 
+// Compose the layout-driven mask conjunction: for every axis the
+// per-element bound is `decomposed_offset_k < srcDim_k`, where the
+// decomposed offset is the same row-major-flatten of the layout's
+// `composeAccessOffsetExpr` that the data-side gather uses. This
+// keeps the predicate's "in-bounds" notion structurally aligned with
+// the data access — without it, the mask says "in-bounds" for tile
+// positions whose layout-driven source coordinates actually run off
+// the slice (e.g. lanes 16..31 in a 16x16 WMMA tile under
+// `WAVE_ACC_FRAG_LAYOUT`).
+//
+// Caller has already confirmed slice extents flatten to the layout's
+// `storage_size` and built the per-axis `AxisIndex` carriers.
+static FailureOr<sym::PredHandle> composeLayoutGatherMaskConjunction(
+    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+    ArrayRef<ExprAttr> tileShape, ArrayRef<StringAttr> iterSyms,
+    ArrayRef<AxisIndex> axes, ArrayRef<ExprAttr> sliceExtents,
+    ArrayRef<ExprAttr> srcShape) {
+  auto offsetsOr = composeLayoutGatherSourceOffsets(
+      ctx, store, layout, tileShape, iterSyms, axes, sliceExtents);
+  if (failed(offsetsOr))
+    return failure();
+  ArrayAttr offsets = *offsetsOr;
+  if (offsets.size() != srcShape.size())
+    return failure();
+
+  std::optional<sym::PredHandle> conjunction;
+  for (auto [offsetAttr, srcDim] : llvm::zip_equal(offsets, srcShape)) {
+    auto offsetExpr = dyn_cast<ExprAttr>(offsetAttr);
+    if (!offsetExpr)
+      return failure();
+    auto cmp = sym::composePredCmp(store, offsetExpr.getValue(),
+                                   sym::PredCmpOp::Lt, srcDim.getValue());
+    if (failed(cmp))
+      return failure();
+    if (!conjunction) {
+      conjunction = *cmp;
+      continue;
+    }
+    auto andP = sym::composePredAnd(store, *conjunction, *cmp);
+    if (failed(andP))
+      return failure();
+    conjunction = *andP;
+  }
+  if (!conjunction)
+    return failure();
+  return *conjunction;
+}
+
+// Pick the right mask conjunction for an `hc.load_mask`. Result
+// type's layout governs whether the predicate is built per-axis
+// identity (`lo + step*iter < srcDim`) or via the layout-driven
+// decomposition. The data-side gather (`rewriteLoadLike`) already
+// bifurcates on the same condition — the predicate has to follow or
+// it will mask in/out lanes whose actual addressing the data path
+// remapped. Falls back to the identity form when the layout-driven
+// decomposition doesn't fit the structural shape.
+static FailureOr<sym::PredHandle> composeMaskConjunctionForResult(
+    MLIRContext *ctx, sym::Store &store, Type resultTy, ValueRange indices,
+    ArrayRef<ExprAttr> srcShape, ArrayRef<ExprAttr> tileShape,
+    ArrayRef<StringAttr> iterSyms, ArrayRef<SliceAxisInfo> sliceAxes) {
+  auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultTy);
+  LayoutAttr resultLayout =
+      resultShaped ? resultShaped.getSymbolicLayout() : LayoutAttr{};
+  if (resultLayout) {
+    auto extents = collectSliceExtents(ctx, store, indices);
+    auto axes = collectAxisIndices(ctx, store, indices);
+    if (succeeded(extents) && succeeded(axes) &&
+        axes->size() == extents->size()) {
+      auto conjunction = composeLayoutGatherMaskConjunction(
+          ctx, store, resultLayout, tileShape, iterSyms, *axes, *extents,
+          srcShape);
+      if (succeeded(conjunction))
+        return *conjunction;
+    }
+  }
+  return composeMaskConjunction(store, sliceAxes, iterSyms);
+}
+
 static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
   Type resultTy = op.getMask().getType();
   auto tileShape = getOperandShape(resultTy);
@@ -703,7 +1049,9 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
       /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  auto conjunction = composeMaskConjunction(store, sliceAxes, common.iterSyms);
+  auto conjunction =
+      composeMaskConjunctionForResult(ctx, store, resultTy, indices, *srcShape,
+                                      *tileShape, common.iterSyms, sliceAxes);
   if (failed(conjunction))
     return failure();
 

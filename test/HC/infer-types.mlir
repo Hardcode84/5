@@ -550,6 +550,25 @@ hc.func @mixed_idx_and_builtin_stays_unknown(%idx: !hc.idx<"M">, %n: i64) {
 
 // -----
 
+// `hc.pow` is the structural carrier for Python `**`; `-hc-lower-pow`
+// unfolds it before this pass in the canonical schedule, but the
+// inference still needs to be permissive for partial pipelines. Two
+// arms: a matching-scalar-type case folds to the scalar; an idx-vs-
+// idx case stays `!hc.undef` because there's no symbolic `Pow`
+// primitive in ixsimpl (the canonical pipeline relies on the unfold
+// to produce the mul chain the idx inference does handle).
+// CHECK-LABEL: hc.func @pow_inference
+// CHECK: hc.pow {{.*}} : (f32, f32) -> f32
+// CHECK: hc.pow {{.*}} : (!hc.idx<"M">, !hc.idx<"2">) -> !hc.undef
+hc.func @pow_inference(%x: f32, %e: f32, %m: !hc.idx<"M">) {
+  %a = hc.pow %x, %e : (f32, f32) -> !hc.undef
+  %two = hc.const<2 : i64> : !hc.undef
+  %b = hc.pow %m, %two : (!hc.idx<"M">, !hc.undef) -> !hc.undef
+  hc.return
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @untyped_string_const_stays_unknown
 // CHECK: hc.const<"gfx11"> : !hc.undef
 hc.func @untyped_string_const_stays_unknown {

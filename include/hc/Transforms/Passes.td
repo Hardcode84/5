@@ -104,6 +104,39 @@ def HCSpecializeLiterals : Pass<"hc-specialize-literals"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerPow : Pass<"hc-lower-pow"> {
+  let summary = "Rewrite hc.pow with positive integer-literal rhs to a mul chain.";
+  let description = [{
+    `hc.pow lhs, rhs` is the structural carrier for Python `**`. The
+    front-to-hc rewrite emits it for every `BinOp.op == Pow` it sees
+    and leaves the codegen choice for here, so we have a stable place
+    to:
+
+      * Unfold supported exponents into an `hc.mul` chain via binary
+        squaring (`K = 2,3 → 1,2 mults`; `K = 4..7 → 2,3,3,4 mults`);
+        the chain is what every downstream pass already understands
+        (type inference, generic funneling, launch-body lowering).
+      * Diagnose unsupported shapes with one obvious sender. Today
+        that's everything except positive-integer-literal rhs: a
+        non-constant rhs (would need a runtime loop or a `math.pow`
+        intrinsic that the dialect doesn't have yet), a non-integer
+        constant (likewise), zero (`x**0` needs a typed `1` we can't
+        synthesize pre-inference), and negative exponents (Python
+        promotes int**negative to float, which the dialect can't
+        encode without a reciprocal op either).
+
+    Runs after `hc-specialize-literals` so any literal-bound symbol
+    that appears as an exponent (e.g. `x ** K` with `K` literal-bound
+    to a constant) has already become a plain `hc.const<N>`, and
+    before `hc-infer-types` so the mul chain — not the carrier op —
+    is what gets type-refined.
+
+    No-op when no `hc.pow` survives; safe to leave wired even if a
+    user-supplied schedule drops the front-to-hc pass.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
 def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
   let summary = "Verify SSA shape operands have static HC shape metadata.";
   let description = [{

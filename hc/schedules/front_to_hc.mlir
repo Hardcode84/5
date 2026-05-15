@@ -92,7 +92,17 @@ module attributes {transform.with_named_sequence} {
     // unspecialized `hc.compile(kernel)` path stays byte-identical.
     %m3a = transform.apply_registered_pass "hc-specialize-literals" to %m3
         : (!transform.any_op) -> !transform.any_op
-    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3a
+    // `hc.pow` (the structural carrier the front-pass emits for Python
+    // `**`) doesn't have a runtime lowering yet, so unfold the
+    // positive-integer-literal cases into a mul chain here. Has to
+    // run after `hc-specialize-literals` (in case a `literal_bindings`
+    // sym ends up as the exponent) and before `hc-infer-types` so the
+    // produced muls — not the carrier op — are what the inference pass
+    // refines. Unsupported shapes (non-const, float, zero, negative
+    // exponents) fail this pass with a per-case diagnostic.
+    %m3b = transform.apply_registered_pass "hc-lower-pow" to %m3a
+        : (!transform.any_op) -> !transform.any_op
+    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3b
         : (!transform.any_op) -> !transform.any_op
     %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
         : (!transform.any_op) -> !transform.any_op

@@ -392,6 +392,22 @@ def HCModOp : HC_GenericBinaryOp<"mod",
   let summary = "Generic remainder (Python `%`).";
 }
 
+// `hc.pow lhs, rhs` covers Python's `**`. Carrier is mechanical — the
+// front-to-hc rewrite emits this for every `BinOp.op == Pow` it sees,
+// and the dedicated `-hc-lower-pow` pass (`include/hc/Transforms/Passes.td`)
+// rewrites supported shapes into the mul chain that the rest of the
+// pipeline actually understands. Non-supported shapes (non-constant or
+// non-integer-literal exponents) are diagnosed by `-hc-lower-pow`
+// because the dialect doesn't yet have a `math.pow`-style runtime op to
+// route them to; this op exists so the diagnostic fingers the original
+// `**` rather than some downstream lowering trying to read intent off
+// an opaque mul chain.
+def HCPowOp : HC_GenericBinaryOp<"pow",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
+    HC_NumericValueType, HC_NumericValueType> {
+  let summary = "Generic exponentiation (Python `**`).";
+}
+
 def HCNegOp : HC_GenericUnaryOp<"neg",
     [DeclareOpInterfaceMethods<HCInferTypeOpInterface>],
     HC_NumericValueType, HC_NumericValueType> {

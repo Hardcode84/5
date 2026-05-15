@@ -44,75 +44,12 @@ module {
 
 // -----
 
-// `Pow` with a non-constant rhs (here a param) can't be unrolled to a
-// fixed-length multiply chain, so the lowering rejects it. Constant
-// integer exponents are exercised in `basic.mlir`.
-module {
-  hc_front.kernel "bad_binop_pow_nonconst" attributes {
-    parameters = [{name = "a"}, {name = "b"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    // expected-error@+1 {{unsupported hc_front.binop kind 'Pow': only positive integer-literal exponents are supported, got a non-constant rhs}}
-    %c = hc_front.binop "Pow"(%a, %b)
-    hc_front.return
-  }
-}
-
-// -----
-
-// Float exponent literal — `**N` for fractional N would need a math.pow
-// op the dialect doesn't have yet. Reject with the same diagnostic
-// family as the non-constant case.
-module {
-  hc_front.kernel "bad_binop_pow_float" attributes {
-    parameters = [{name = "a"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %e = hc_front.constant<2.5 : f64>
-    // expected-error@+1 {{unsupported hc_front.binop kind 'Pow': only positive integer-literal exponents are supported, got rhs constant 2.500000e+00 : f64}}
-    %c = hc_front.binop "Pow"(%a, %e)
-    hc_front.return
-  }
-}
-
-// -----
-
-// Zero exponent — `x**0` is `1`, but the lowering can't synthesize a
-// well-typed `1` without inference (the result type matches `x`'s
-// type, which is still `!hc.undef` here). Diagnose so the user writes
-// the constant directly.
-module {
-  hc_front.kernel "bad_binop_pow_zero" attributes {
-    parameters = [{name = "a"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %e = hc_front.constant<0 : i64>
-    // expected-error@+1 {{unsupported hc_front.binop kind 'Pow': only positive integer-literal exponents are supported, got 0}}
-    %c = hc_front.binop "Pow"(%a, %e)
-    hc_front.return
-  }
-}
-
-// -----
-
-// Negative exponent — `x**-N` is `1/x**N`, also unsynthesizable
-// pre-inference (and Python `**-N` on ints returns a float anyway).
-module {
-  hc_front.kernel "bad_binop_pow_negative" attributes {
-    parameters = [{name = "a"}]
-  } {
-    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
-    %e = hc_front.constant<-3 : i64>
-    // expected-error@+1 {{unsupported hc_front.binop kind 'Pow': only positive integer-literal exponents are supported, got -3}}
-    %c = hc_front.binop "Pow"(%a, %e)
-    hc_front.return
-  }
-}
-
-// -----
-
-// Other unsupported binop kinds still hit the catch-all diagnostic.
+// `Pow` is the one binop kind that survives the front-pass as a
+// structural carrier (`hc.pow`); the unsupported-rhs diagnostics
+// (non-const, float, zero, negative) live on `-hc-lower-pow` and are
+// pinned in `test/HC/lower-pow-invalid.mlir`. The catch-all error here
+// covers everything `emitBinop` still can't map (`MatMult`, the
+// comparison family, bitwise ops, ...).
 module {
   hc_front.kernel "bad_binop_matmult" attributes {
     parameters = [{name = "a"}, {name = "b"}]

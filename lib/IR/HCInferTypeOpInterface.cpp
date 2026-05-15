@@ -1254,6 +1254,38 @@ LogicalResult HCModOp::inferHCTypes(ArrayRef<Type> operandTypes,
                           resultTypes);
 }
 
+// `hc.pow` is a carrier; the structural lowering (`-hc-lower-pow`)
+// rewrites it into a mul chain before infer-types runs in the canonical
+// schedule, so this only fires when a non-standard pipeline forces
+// inference on a surviving pow. ixsimpl has no `Pow` primitive, so the
+// idx arm bails to `{}` and lets the unfold pass produce the chain
+// whose mul ops `inferIndexBinary` will then type-refine. The scalar /
+// shaped arm mirrors `inferIndexBinary`'s fall-through (same-type
+// numeric in → same-type out) so a stray `hc.pow %x, %x` between
+// matching scalars still gets a result type during partial pipelines.
+LogicalResult HCPowOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                    SmallVectorImpl<Type> &resultTypes) {
+  if (failed(requireOperandCount(*this, operandTypes, 2)))
+    return failure();
+  Type lhs = operandTypes[0];
+  Type rhs = operandTypes[1];
+  if (!lhs || !rhs) {
+    resultTypes.push_back({});
+    return success();
+  }
+  if (isa<IdxType>(lhs) || isa<IdxType>(rhs)) {
+    resultTypes.push_back({});
+    return success();
+  }
+  if (lhs == rhs && (lhs.isIntOrIndexOrFloat() ||
+                     isa<mlir::hc::TensorType, mlir::hc::VectorType>(lhs))) {
+    resultTypes.push_back(lhs);
+    return success();
+  }
+  resultTypes.push_back({});
+  return success();
+}
+
 LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
   Type value = operandTypes.empty() ? Type{} : operandTypes.front();

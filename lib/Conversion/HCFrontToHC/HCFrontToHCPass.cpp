@@ -475,64 +475,11 @@ static Value peelBufferView(Value handle,
 // op and emits it against the two already-lowered operands. All results
 // use `!hc.undef`, consistent with the rest of the pipeline's progressive
 // typing.
+//
+// `Pow` is the structural-only entry — the front pass emits the carrier
+// `hc.pow` and `-hc-lower-pow` does the unfold + diagnostic; no shape
+// checking happens here so the diagnostic surface is single-sourced.
 //===----------------------------------------------------------------------===//
-
-// Lower `lhs ** exp` (positive integer exponent) to a chain of `hc.mul` via
-// binary exponentiation: walk the bits of `exp` from the highest set bit
-// downward, squaring the accumulator on each step and multiplying by `lhs`
-// on every set bit. `exp == 1` collapses to the no-op identity (the loop
-// runs zero times). Counts: K mults for K in {2,3} → 1,2; K in {4..7} →
-// 2,3,3,4. Cheaper than the naive K-1 chain for K >= 4.
-static Value emitIntegerPow(OpBuilder &builder, Location loc, Value lhs,
-                            int64_t exp, Type undef) {
-  assert(exp >= 1 && "emitIntegerPow expects a positive exponent");
-  int highBit = 0;
-  while ((int64_t(1) << (highBit + 1)) <= exp)
-    ++highBit;
-  Value result = lhs;
-  for (int bit = highBit - 1; bit >= 0; --bit) {
-    result = HCMulOp::create(builder, loc, undef, result, result);
-    if ((exp >> bit) & 1)
-      result = HCMulOp::create(builder, loc, undef, result, lhs);
-  }
-  return result;
-}
-
-// `Pow` covers Python's `**`. The only supported shape today is positive
-// integer-literal exponents — the rhs must lower to an `hc.const`
-// carrying an `IntegerAttr` with value >= 1. Everything else
-// (non-constant rhs, float / negative / zero literal) is rejected with a
-// precise diagnostic; the realistic in-pipeline use is `x**2` for squared
-// distances, and `emitIntegerPow` scales fine to any modest constant K.
-// Generic `pow` (fractional / non-constant) would need a new HC math op
-// and is intentionally out of scope here.
-static Value emitPowBinop(OpBuilder &builder, Location loc, Value lhs,
-                          Value rhs, Type undef, Operation *sourceOp) {
-  auto constOp = rhs.getDefiningOp<HCConstOp>();
-  if (!constOp) {
-    sourceOp->emitOpError(
-        "unsupported hc_front.binop kind 'Pow': only positive "
-        "integer-literal exponents are supported, got a non-constant rhs");
-    return nullptr;
-  }
-  auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
-  if (!intAttr) {
-    sourceOp->emitOpError(
-        "unsupported hc_front.binop kind 'Pow': only positive "
-        "integer-literal exponents are supported, got rhs constant ")
-        << constOp.getValue();
-    return nullptr;
-  }
-  int64_t exp = intAttr.getInt();
-  if (exp < 1) {
-    sourceOp->emitOpError(
-        "unsupported hc_front.binop kind 'Pow': only positive "
-        "integer-literal exponents are supported, got ")
-        << exp;
-    return nullptr;
-  }
-  return emitIntegerPow(builder, loc, lhs, exp, undef);
-}
 
 static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
                        Value lhs, Value rhs, Type undef, Operation *sourceOp) {
@@ -554,7 +501,7 @@ static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
   if (kind == "Mod")
     return HCModOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Pow")
-    return emitPowBinop(builder, loc, lhs, rhs, undef, sourceOp);
+    return HCPowOp::create(builder, loc, undef, lhs, rhs);
   sourceOp->emitOpError("unsupported hc_front.binop kind '") << kind << "'";
   return nullptr;
 }

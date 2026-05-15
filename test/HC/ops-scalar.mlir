@@ -23,6 +23,7 @@ func.func @scalar_producers() {
 // CHECK: hc.mul {{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.div {{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.mod {{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
+// CHECK: hc.pow {{.*}} : (!hc.undef, !hc.undef) -> !hc.undef
 // CHECK: hc.neg {{.*}} : !hc.undef -> !hc.undef
 func.func @arithmetic(
     %u0: !hc.undef, %u1: !hc.undef,
@@ -32,6 +33,7 @@ func.func @arithmetic(
   %c = hc.mul %u0, %u1 : (!hc.undef, !hc.undef) -> !hc.undef
   %d = hc.div %u0, %u1 : (!hc.undef, !hc.undef) -> !hc.undef
   %e = hc.mod %u0, %u1 : (!hc.undef, !hc.undef) -> !hc.undef
+  %p = hc.pow %u0, %u1 : (!hc.undef, !hc.undef) -> !hc.undef
   %f = hc.neg %u0 : !hc.undef -> !hc.undef
   return
 }

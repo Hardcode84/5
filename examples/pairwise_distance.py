@@ -64,14 +64,6 @@ def pairwise_distance_wg_kernel(
     # aligned with the `D[gid[0]:gid[0]+g0, gid[1]:gid[1]+g1]`
     # destination tile so `D[i, j] = sqrt(sum_k (X1[i, k] - X2[j,
     # k])**2)`.
-    #
-    # `doc/langref.md`'s WG-level form writes the broadcast as
-    # `(x1[None, :, :] - x2[:, None, :])` instead — that pattern
-    # produces `(g1, g0)` and stores the transpose of the intended
-    # distance matrix. The kernel here keeps the workitem-level
-    # contract from the same section (`D[i, j] = sqrt(sum_k (X1[i,
-    # k] - X2[j, k])**2)`) and corrects the broadcasting axes
-    # accordingly. The langref text is being tracked separately.
     diff = ((x1[:, None, :] - x2[None, :, :]) ** 2).sum(axis=2)
 
     # Explicit-stop slicing pins the destination tile to `(g0, g1)` so

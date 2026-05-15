@@ -82,8 +82,12 @@ def pairwise_distance_wg_kernel(group: CurrentGroup,
     x1 = group.load(X1[gid[0]:], shape=(group.shape[0], X1.shape[1]))
     x2 = group.load(X2[gid[1]:], shape=(group.shape[1], X2.shape[1]))
 
-    # calculating pairwise distance with NumPy-style broadcasting
-    diff = ((x1[None, :, :] - x2[:, None, :])**2).sum(axis=2)
+    # calculating pairwise distance with NumPy-style broadcasting:
+    # `x1[:, None, :]` shape `(group.shape[0], 1, H)`, `x2[None, :, :]`
+    # shape `(1, group.shape[1], H)`, broadcast difference shape
+    # `(group.shape[0], group.shape[1], H)`; `sum(axis=2)` collapses
+    # the feature axis to align with the `D[gid[0]:, gid[1]:]` tile.
+    diff = ((x1[:, None, :] - x2[None, :, :])**2).sum(axis=2)
 
     # store result to D, but with boundary checks
     group.store(D[gid[0]:, gid[1]:], np.sqrt(diff))

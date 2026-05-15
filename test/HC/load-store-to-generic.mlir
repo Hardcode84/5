@@ -587,3 +587,101 @@ func.func @load_mask_layout_gather(%buf: !hc.buffer<f32, ["M", "N"]>,
         -> !hc.bare_vector<!hc.pred, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
   return %m : !hc.bare_vector<!hc.pred, ["16", "16"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
 }
+
+// -----
+
+// Layout-bearing buffer source. `hc.as_layout` with a `shape=`
+// operand declares the buffer carries a `(32, 8)` view through
+// `WAVE_ACC_FRAG_LAYOUT`, and the access subscripts that view with a
+// pinned lane + slice. The rewriter peels the as_layout, binds
+// `index_syms[0] = lane` and `index_syms[1] = i_0`, composes
+// `LAY.offset(lane, i_0)` against the declared `(32, 8)` shape, and
+// decomposes the flat offset against the underlying tile's `(16,
+// 16)` shape (row-major). The generic's source operand becomes the
+// peeled buffer; the per-axis offsets re-route the layout-driven
+// gather through the underlying `c_tile` storage. No `% extent`
+// guard on the leading axis because the verifier already pins
+// `storage_size(LAY) == product(underlying.shape)` at the as_layout
+// boundary.
+// CHECK-LABEL: func.func @vload_layout_bearing_buffer_source
+// CHECK: %[[FILL:.+]] = hc.vzeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_vector<f32, ["8"]>
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"8">)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"Mod(2*i_0 + floor(1/16*lane), 16)">, #hc.expr<"Mod(lane, 16)">] : !hc.buffer<f32, ["16", "16"]>)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">] : !hc.bare_vector<f32, ["8"]>)
+// CHECK-NOT: hc.vload
+func.func @vload_layout_bearing_buffer_source(
+    %c_tile: !hc.buffer<f32, ["16", "16"]>,
+    %lane: !hc.idx<"lane">,
+    %hi: !hc.idx<"8">,
+    %zero_i: !hc.idx<"0">,
+    %one_i: !hc.idx<"1">)
+    -> !hc.bare_vector<f32, ["8"]> {
+  %d0 = hc.const<32 : i64> : !hc.idx<"32">
+  %d1 = hc.const<8 : i64> : !hc.idx<"8">
+  %lay_shape = hc.tuple(%d0, %d1)
+      : (!hc.idx<"32">, !hc.idx<"8">) -> tuple<!hc.idx<"32">, !hc.idx<"8">>
+  %c_lane = hc.as_layout %c_tile,
+      layout = (#hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>),
+      shape = %lay_shape : tuple<!hc.idx<"32">, !hc.idx<"8">>
+      : !hc.buffer<f32, ["16", "16"]>
+        -> !hc.buffer<f32, ["32", "8"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+  %tile_shape_a = hc.const<1 : i64> : !hc.idx<"8">
+  %tile_shape = hc.tuple(%tile_shape_a)
+      : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+  %s = hc.slice_expr(lower = %zero_i upper = %hi step = %one_i)
+      : (!hc.idx<"0">, !hc.idx<"8">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>
+  %v = hc.vload %c_lane[%lane, %s], shape %tile_shape
+      : (!hc.buffer<f32, ["32", "8"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>,
+         !hc.idx<"lane">,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>,
+         tuple<!hc.idx<"8">>)
+        -> !hc.bare_vector<f32, ["8"]>
+  return %v : !hc.bare_vector<f32, ["8"]>
+}
+
+// -----
+
+// Symmetric scatter through a layout-bearing buffer dest. Mirrors
+// `@vload_layout_bearing_buffer_source` on the store side: the dest
+// is `as_layout` with `shape=` declared `(32, 8)`, the access has a
+// pinned lane + slice, and the rewriter peels the as_layout so the
+// `outs` operand of the planted generic targets the underlying
+// `(16, 16)` tile. Same decomposition as the load side — the layout
+// composes `index_syms` to a flat offset and the row-major split
+// recovers `(row, col)`. This is the bd-npj3 path; the matching
+// init form in `@vload_layout_bearing_buffer_source` exercises the
+// load side.
+// CHECK-LABEL: func.func @store_layout_bearing_buffer_dest
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"8">)
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">] : !hc.bare_vector<f32, ["8"]>)
+// CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"Mod(2*i_0 + floor(1/16*lane), 16)">, #hc.expr<"Mod(lane, 16)">] : !hc.buffer<f32, ["16", "16"]>)
+// CHECK-NOT: hc.store
+func.func @store_layout_bearing_buffer_dest(
+    %c_tile: !hc.buffer<f32, ["16", "16"]>,
+    %frag: !hc.bare_vector<f32, ["8"]>,
+    %lane: !hc.idx<"lane">,
+    %hi: !hc.idx<"8">,
+    %zero_i: !hc.idx<"0">,
+    %one_i: !hc.idx<"1">) {
+  %d0 = hc.const<32 : i64> : !hc.idx<"32">
+  %d1 = hc.const<8 : i64> : !hc.idx<"8">
+  %lay_shape = hc.tuple(%d0, %d1)
+      : (!hc.idx<"32">, !hc.idx<"8">) -> tuple<!hc.idx<"32">, !hc.idx<"8">>
+  %c_lane = hc.as_layout %c_tile,
+      layout = (#hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>),
+      shape = %lay_shape : tuple<!hc.idx<"32">, !hc.idx<"8">>
+      : !hc.buffer<f32, ["16", "16"]>
+        -> !hc.buffer<f32, ["32", "8"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>
+  %s = hc.slice_expr(lower = %zero_i upper = %hi step = %one_i)
+      : (!hc.idx<"0">, !hc.idx<"8">, !hc.idx<"1">)
+        -> !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>
+  hc.store %c_lane[%lane, %s], %frag
+      : (!hc.buffer<f32, ["32", "8"], #hc.layout<shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*i1 + i0">>>,
+         !hc.idx<"lane">,
+         !hc.slice<lower = !hc.idx<"0">, upper = !hc.idx<"8">, step = !hc.idx<"1">>,
+         !hc.bare_vector<f32, ["8"]>) -> ()
+  return
+}

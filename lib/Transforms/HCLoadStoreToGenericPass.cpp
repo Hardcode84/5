@@ -452,7 +452,57 @@ struct LoadPreflight {
   // decomposition consumes this; the per-axis identity fallback
   // doesn't need it.
   SmallVector<ExprAttr> sliceExtents;
+  // Layout-bearing buffer source path: when the access op's source is
+  // defined by `hc.as_layout` with both a layout attribute and a
+  // `shape=` operand, peel it. `effectiveSource` is the underlying
+  // buffer (the as_layout's operand), `srcShape` reports that
+  // underlying's shape, and `sourceLayout` / `sourceDeclaredShape`
+  // drive the per-position gather decomposition. Empty
+  // `effectiveSource` means no peel happened and the original source
+  // routes through the layout-on-result paths above.
+  Value effectiveSource;
+  LayoutAttr sourceLayout;
+  ShapeAttr sourceDeclaredShape;
 };
+
+// `hc.as_layout` with a `shape=` operand is the symmetric layout-
+// driven load/store ergonomic on a pointer-rooted source: the result
+// type is `!hc.buffer<elem, [D0, ...], LAY>` carrying both the
+// declared shape and the layout that maps each access position to
+// the underlying buffer's row-major flatten. The access op itself
+// stays addressing-shape-agnostic — pinned + slice indices mix on
+// the as_layout result; the layout's `offset` formula reconstructs
+// the flat target.
+//
+// Peeling here lets the rewriter route the access through a gather
+// decomposition against the *underlying* buffer's shape, which is
+// what the per-axis offsets the post-flatten pipeline expects. The
+// alternative — leaving the `hc.as_layout` in place — would have
+// `hc-flatten-with-layouts` compose the source-side layout into the
+// access offsets, but that path also assumes the access op's
+// per-axis offsets are pre-layout coords and would double-apply LAY.
+struct LayoutBearingSource {
+  Value underlying;
+  LayoutAttr layout;
+  ShapeAttr declaredShape;
+};
+
+static std::optional<LayoutBearingSource>
+peelLayoutBearingBufferSource(Value source) {
+  auto op = source.getDefiningOp<HCAsLayoutOp>();
+  if (!op)
+    return std::nullopt;
+  LayoutAttr layout = op.getLayoutAttr();
+  if (!layout)
+    return std::nullopt;
+  Value shapeOperand = op.getShape();
+  if (!shapeOperand)
+    return std::nullopt;
+  ShapeAttr declared = getStaticShapeFromTupleType(shapeOperand.getType());
+  if (!declared)
+    return std::nullopt;
+  return LayoutBearingSource{op.getValue(), layout, declared};
+}
 
 // Element-type match check between source and result: both must be
 // shaped, with matching element types. Failure means the rewriter
@@ -630,18 +680,149 @@ static FailureOr<ArrayAttr> composeLayoutGatherSourceOffsets(
   return ArrayAttr::get(ctx, axisOffsets);
 }
 
-// All the bail-out checks a load rewrite needs before it starts
-// mutating IR. Validates rank parity, harvests the per-axis indices,
-// confirms the element types match, and computes the broadcast
-// classification. Also collects per-axis slice extents when the
-// result type carries a non-default layout and the indices are all
-// pinned slices — the layout-driven gather decomposition consumes
-// those to translate the layout's flat offset back into per-axis
-// source coords.
+// Build the per-position binding expression list for an access into a
+// layout-bearing buffer. Pinned `!hc.idx<expr>` positions bind their
+// idx's expression directly; slice positions bind `lo + step *
+// iter_sym`, consuming `iterSyms` in order (one per slice axis,
+// matching the result tile rank). The access is expected to carry
+// exactly `iterSyms.size()` slice positions — the preflight pinned-
+// vs-slice classification has already enforced that.
+static FailureOr<SmallVector<ExprAttr>>
+composeLayoutBearingAccessBindings(MLIRContext *ctx, sym::Store &store,
+                                   ValueRange indices, ArrayRef<AxisIndex> axes,
+                                   ArrayRef<StringAttr> iterSyms) {
+  SmallVector<ExprAttr> bindings;
+  bindings.reserve(indices.size());
+  size_t sliceSeen = 0;
+  for (auto [i, idx] : llvm::enumerate(indices)) {
+    Type ty = idx.getType();
+    if (llvm::isa<IdxType>(ty)) {
+      bindings.push_back(axes[i].base);
+      continue;
+    }
+    if (!llvm::isa<SliceType>(ty))
+      return failure();
+    if (sliceSeen >= iterSyms.size())
+      return failure();
+    auto binding =
+        composeBasePlusStepIter(ctx, store, axes[i], iterSyms[sliceSeen]);
+    if (failed(binding))
+      return failure();
+    bindings.push_back(*binding);
+    ++sliceSeen;
+  }
+  if (sliceSeen != iterSyms.size())
+    return failure();
+  return bindings;
+}
+
+// Compose the source-side per-axis offsets for an access whose source
+// is a layout-bearing buffer (the as_layout result peeled to its
+// underlying). The layout's `offset` is composed with the declared
+// shape (from the as_layout's `shape=` operand) and per-position
+// bindings; the resulting flat offset decomposes against the
+// underlying's shape via the same row-major split that the result-
+// layout gather uses, with per-axis base 0 (the buffer-view chain
+// downstream of the peeled source carries any tile origin).
+//
+// The structural invariant binding this to the verifier is:
+//
+//   storage_size(LAY) == product(underlying.shape)
+//
+// The `hc.as_layout` verifier already enforces this on the op (the
+// layout's storage_size matches the operand's flat capacity), so the
+// rewrite can rely on the row-major decomposition closing without a
+// secondary `% extent` guard.
+//
+// Caller has already validated:
+//   * iter syms count == result tile rank == slice axis count
+//   * layout.index_syms count == access indices count
+//   * layout.shape_syms count == declared shape rank
+static FailureOr<ArrayAttr> composeLayoutBearingBufferOffsets(
+    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+    ShapeAttr declaredShape, ValueRange indices, ArrayRef<AxisIndex> axes,
+    ArrayRef<StringAttr> iterSyms, ArrayRef<ExprAttr> underlyingShape) {
+  auto bindingsOr =
+      composeLayoutBearingAccessBindings(ctx, store, indices, axes, iterSyms);
+  if (failed(bindingsOr))
+    return failure();
+  auto flatOr =
+      composeAccessOffsetExpr(ctx, layout, declaredShape, *bindingsOr);
+  if (failed(flatOr))
+    return failure();
+  sym::ExprHandle flat = flatOr->getValue();
+
+  size_t rank = underlyingShape.size();
+  if (rank == 0)
+    return failure();
+  auto innerProds = composeInnerProducts(store, underlyingShape);
+  if (failed(innerProds))
+    return failure();
+  auto zero = sym::composeExprInt(store, 0);
+  if (failed(zero))
+    return failure();
+  ExprAttr base = ExprAttr::get(ctx, *zero);
+
+  SmallVector<Attribute> axisOffsets;
+  axisOffsets.reserve(rank);
+  for (size_t k = 0; k < rank; ++k) {
+    auto axis = composeDecomposedAxis(ctx, store, flat, (*innerProds)[k],
+                                      underlyingShape[k], base,
+                                      /*isLast=*/k + 1 == rank);
+    if (failed(axis))
+      return failure();
+    axisOffsets.push_back(*axis);
+  }
+  return ArrayAttr::get(ctx, axisOffsets);
+}
+
+// Layout-bearing buffer source preflight. Captures the peeled
+// underlying as `effectiveSource`, validates rank parity between
+// access indices and the layout's `index_syms`, between the declared
+// shape and `shape_syms`, and between slice positions and the result
+// tile rank.
+static FailureOr<LoadPreflight> preflightLoadLikeLayoutBearing(
+    MLIRContext *ctx, sym::Store &store, const LayoutBearingSource &peel,
+    Type resultTy, ValueRange indices, ArrayRef<ExprAttr> tileShape) {
+  if (indices.size() != peel.layout.getIndexSyms().size())
+    return failure();
+  if (peel.declaredShape.getDims().size() != peel.layout.getShapeSyms().size())
+    return failure();
+  auto axesOr = collectAxisIndices(ctx, store, indices);
+  if (failed(axesOr))
+    return failure();
+  size_t sliceCount = 0;
+  for (Value idx : indices)
+    if (llvm::isa<SliceType>(idx.getType()))
+      ++sliceCount;
+  if (sliceCount != tileShape.size())
+    return failure();
+  if (failed(checkLoadElementTypesMatch(peel.underlying.getType(), resultTy)))
+    return failure();
+  auto srcShape = getOperandShape(peel.underlying.getType());
+  if (failed(srcShape))
+    return failure();
+  LoadPreflight pf;
+  pf.axes = std::move(*axesOr);
+  pf.srcShape = std::move(*srcShape);
+  pf.effectiveSource = peel.underlying;
+  pf.sourceLayout = peel.layout;
+  pf.sourceDeclaredShape = peel.declaredShape;
+  return pf;
+}
+
+// Plain (non-layout-bearing) load preflight. Same shape as the
+// pre-as_layout path: rank-parity gate, per-axis index harvest,
+// element-type compatibility, source-shape extraction, then the
+// result-layout / broadcast classification that picks the gather
+// decomposition vs identity-offset path downstream. Result-layout
+// slice extents are harvested up front so the gather composer can
+// translate the layout's flat offset back into per-axis source
+// coords.
 static FailureOr<LoadPreflight>
-preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
-                  Type resultTy, ValueRange indices,
-                  ArrayRef<ExprAttr> tileShape) {
+preflightLoadLikePlain(MLIRContext *ctx, sym::Store &store, Value source,
+                       Type resultTy, ValueRange indices,
+                       ArrayRef<ExprAttr> tileShape) {
   // Empty index list is a legal shape (`hc.load %t[], shape ...`): the
   // access addresses the operand at the tile origin, which is just the
   // iter syms with no addressing addend. Non-empty lists must rank-
@@ -680,7 +861,29 @@ preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
                        broadcastFromRank1, std::move(sliceExtents)};
 }
 
+// Top-level load preflight. Layout-bearing buffer source
+// (`hc.as_layout` with `shape=` operand) gets its own path because
+// the access's index list rank-matches the layout's `index_syms`,
+// not the underlying buffer's shape — running it through the plain
+// path's rank-parity gate would reject the mixed pinned + slice
+// ergonomic form outright.
+static FailureOr<LoadPreflight>
+preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
+                  Type resultTy, ValueRange indices,
+                  ArrayRef<ExprAttr> tileShape) {
+  if (auto peel = peelLayoutBearingBufferSource(source))
+    return preflightLoadLikeLayoutBearing(ctx, store, *peel, resultTy, indices,
+                                          tileShape);
+  return preflightLoadLikePlain(ctx, store, source, resultTy, indices,
+                                tileShape);
+}
+
 // Pick the right ins_offsets[0] for a load:
+//   * Layout-bearing buffer source (source is `hc.as_layout` with
+//     `shape=` operand): per-position bindings (pinned-idx expr for
+//     pinned, `lo + step*iter` for slice) compose through the
+//     source's layout, then decompose against the peeled underlying's
+//     shape.
 //   * Rank-1 broadcast (source rank < tile rank, layout-driven
 //     collapse onto rank-1 storage): single flat offset.
 //   * Layout-driven gather (result has a non-default layout, all
@@ -690,8 +893,13 @@ preflightLoadLike(MLIRContext *ctx, sym::Store &store, Value source,
 //   * Otherwise: per-axis `base + step*iter` identity offsets.
 static FailureOr<ArrayAttr>
 composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
-                      const LoadPreflight &pf, ArrayRef<ExprAttr> tileShape,
+                      const LoadPreflight &pf, ValueRange indices,
+                      ArrayRef<ExprAttr> tileShape,
                       ArrayRef<StringAttr> iterSyms) {
+  if (pf.sourceLayout)
+    return composeLayoutBearingBufferOffsets(ctx, store, pf.sourceLayout,
+                                             pf.sourceDeclaredShape, indices,
+                                             pf.axes, iterSyms, pf.srcShape);
   if (pf.broadcastFromRank1)
     return composeBroadcastSourceOffset(ctx, pf.resultLayout, tileShape,
                                         iterSyms, pf.srcShape);
@@ -746,6 +954,10 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
                               *tileShape);
   if (failed(pf))
     return failure();
+  // Layout-bearing buffer source path peels `hc.as_layout` and routes
+  // through the underlying; everything downstream (body element type,
+  // generic op operand) keys off the effective source.
+  Value effSource = pf->effectiveSource ? pf->effectiveSource : source;
 
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -753,15 +965,15 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
   Value shapeTuple = buildShapeTuple(builder, loc, common.iterBounds);
   Value initOut = emitValueInit(builder, loc, resultTy, shapeTuple);
 
-  auto inOff =
-      composeLoadInsOffsets(ctx, store, *pf, *tileShape, common.iterSyms);
+  auto inOff = composeLoadInsOffsets(ctx, store, *pf, op.getIndices(),
+                                     *tileShape, common.iterSyms);
   if (failed(inOff))
     return failure();
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {*inOff});
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
 
-  SmallVector<Value> insArr{source};
+  SmallVector<Value> insArr{effSource};
   SmallVector<Value> outsArr{initOut};
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{resultTy}, common.iterSymsAttr,
@@ -769,7 +981,7 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
       ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  Type srcElem = bodyArgElementType(source.getType());
+  Type srcElem = bodyArgElementType(effSource.getType());
   Type resElem = bodyArgElementType(resultTy);
   populateLoadBody(generic, srcElem, resElem, loc);
 
@@ -888,10 +1100,15 @@ composeSliceAxisBound(sym::Store &store, StringAttr iterSym,
 // Hash-consing shares identical bounds expressions with any other
 // producer, so two load_masks reading the same buffer with the same
 // slice geometry emit one pred_apply each pointing at the same
-// canonical node.
+// canonical node. Empty `sliceAxes` returns failure rather than the
+// rank-0 conjunction — `hc-full-mask` is the right primitive for
+// that pathological shape, and an empty fold here would leave the
+// outer `composeMaskConjunctionForResult` deref-on-empty-optional.
 static FailureOr<sym::PredHandle>
 composeMaskConjunction(sym::Store &store, ArrayRef<SliceAxisInfo> sliceAxes,
                        ArrayRef<StringAttr> iterSyms) {
+  if (sliceAxes.empty())
+    return failure();
   std::optional<sym::PredHandle> conjunction;
   for (auto [k, info] : llvm::enumerate(sliceAxes)) {
     auto cmp = composeSliceAxisBound(store, iterSyms[k], info);
@@ -932,31 +1149,16 @@ static void populateMaskBody(HCGenericOp generic, MLIRContext *ctx,
   HCYieldOp::create(bodyBuilder, loc, ValueRange{predUnpinned});
 }
 
-// Compose the layout-driven mask conjunction: for every axis the
-// per-element bound is `decomposed_offset_k < srcDim_k`, where the
-// decomposed offset is the same row-major-flatten of the layout's
-// `composeAccessOffsetExpr` that the data-side gather uses. This
-// keeps the predicate's "in-bounds" notion structurally aligned with
-// the data access — without it, the mask says "in-bounds" for tile
-// positions whose layout-driven source coordinates actually run off
-// the slice (e.g. lanes 16..31 in a 16x16 WMMA tile under
-// `WAVE_ACC_FRAG_LAYOUT`).
-//
-// Caller has already confirmed slice extents flatten to the layout's
-// `storage_size` and built the per-axis `AxisIndex` carriers.
-static FailureOr<sym::PredHandle> composeLayoutGatherMaskConjunction(
-    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
-    ArrayRef<ExprAttr> tileShape, ArrayRef<StringAttr> iterSyms,
-    ArrayRef<AxisIndex> axes, ArrayRef<ExprAttr> sliceExtents,
-    ArrayRef<ExprAttr> srcShape) {
-  auto offsetsOr = composeLayoutGatherSourceOffsets(
-      ctx, store, layout, tileShape, iterSyms, axes, sliceExtents);
-  if (failed(offsetsOr))
-    return failure();
-  ArrayAttr offsets = *offsetsOr;
+// Turn a list of per-axis source offsets into the in-bounds
+// conjunction `offset_k < srcDim_k AND ...`. Shared between the
+// result-layout gather mask and the source-layout (layout-bearing
+// buffer) mask: both decompose the layout's flat offset into source
+// coords first, then ask the same per-axis bound.
+static FailureOr<sym::PredHandle>
+maskConjunctionFromOffsets(sym::Store &store, ArrayAttr offsets,
+                           ArrayRef<ExprAttr> srcShape) {
   if (offsets.size() != srcShape.size())
     return failure();
-
   std::optional<sym::PredHandle> conjunction;
   for (auto [offsetAttr, srcDim] : llvm::zip_equal(offsets, srcShape)) {
     auto offsetExpr = dyn_cast<ExprAttr>(offsetAttr);
@@ -980,34 +1182,132 @@ static FailureOr<sym::PredHandle> composeLayoutGatherMaskConjunction(
   return *conjunction;
 }
 
-// Pick the right mask conjunction for an `hc.load_mask`. Result
-// type's layout governs whether the predicate is built per-axis
-// identity (`lo + step*iter < srcDim`) or via the layout-driven
-// decomposition. The data-side gather (`rewriteLoadLike`) already
-// bifurcates on the same condition — the predicate has to follow or
-// it will mask in/out lanes whose actual addressing the data path
-// remapped. Falls back to the identity form when the layout-driven
-// decomposition doesn't fit the structural shape.
+// Compose the layout-driven mask conjunction: for every axis the
+// per-element bound is `decomposed_offset_k < srcDim_k`, where the
+// decomposed offset is the same row-major-flatten of the layout's
+// `composeAccessOffsetExpr` that the data-side gather uses. This
+// keeps the predicate's "in-bounds" notion structurally aligned with
+// the data access — without it, the mask says "in-bounds" for tile
+// positions whose layout-driven source coordinates actually run off
+// the slice (e.g. lanes 16..31 in a 16x16 WMMA tile under
+// `WAVE_ACC_FRAG_LAYOUT`).
+//
+// Caller has already confirmed slice extents flatten to the layout's
+// `storage_size` and built the per-axis `AxisIndex` carriers.
+static FailureOr<sym::PredHandle> composeLayoutGatherMaskConjunction(
+    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+    ArrayRef<ExprAttr> tileShape, ArrayRef<StringAttr> iterSyms,
+    ArrayRef<AxisIndex> axes, ArrayRef<ExprAttr> sliceExtents,
+    ArrayRef<ExprAttr> srcShape) {
+  auto offsetsOr = composeLayoutGatherSourceOffsets(
+      ctx, store, layout, tileShape, iterSyms, axes, sliceExtents);
+  if (failed(offsetsOr))
+    return failure();
+  return maskConjunctionFromOffsets(store, *offsetsOr, srcShape);
+}
+
+// Mask companion of the layout-bearing buffer load path. Same
+// decomposition (`LAY.offset` composed with per-position bindings,
+// then row-major split against the peeled underlying's shape) drives
+// both the data offsets and the mask's in-bounds bound; without the
+// per-axis bound the predicate would flag in-bounds lanes whose
+// decomposed source coords actually run past the underlying tile.
+static FailureOr<sym::PredHandle> composeLayoutBearingMaskConjunction(
+    MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
+    ShapeAttr declaredShape, ValueRange indices, ArrayRef<AxisIndex> axes,
+    ArrayRef<StringAttr> iterSyms, ArrayRef<ExprAttr> underlyingShape) {
+  auto offsetsOr = composeLayoutBearingBufferOffsets(
+      ctx, store, layout, declaredShape, indices, axes, iterSyms,
+      underlyingShape);
+  if (failed(offsetsOr))
+    return failure();
+  return maskConjunctionFromOffsets(store, *offsetsOr, underlyingShape);
+}
+
+// Pick the right mask conjunction for an `hc.load_mask`. Three
+// shapes, all driven by the same in-bounds-per-source-axis principle
+// the matching data-side load uses, so masked-in lanes line up with
+// the data path's actual addressing:
+//   * Layout-bearing buffer source (`hc.as_layout` source with
+//     `shape=` operand) — the per-position bindings compose through
+//     the source layout and decompose against the peeled underlying.
+//   * Result-layout gather (layout on the mask result type, all
+//     pinned slices) — same decomposition through the result layout
+//     and slice extents.
+//   * Plain per-axis bound — `lo + step*iter < srcDim`.
 static FailureOr<sym::PredHandle> composeMaskConjunctionForResult(
-    MLIRContext *ctx, sym::Store &store, Type resultTy, ValueRange indices,
-    ArrayRef<ExprAttr> srcShape, ArrayRef<ExprAttr> tileShape,
-    ArrayRef<StringAttr> iterSyms, ArrayRef<SliceAxisInfo> sliceAxes) {
+    MLIRContext *ctx, sym::Store &store, Value source, Type resultTy,
+    ValueRange indices, ArrayRef<ExprAttr> srcShape,
+    ArrayRef<ExprAttr> tileShape, ArrayRef<StringAttr> iterSyms,
+    ArrayRef<AxisIndex> axes, ArrayRef<SliceAxisInfo> sliceAxes) {
+  if (auto peel = peelLayoutBearingBufferSource(source)) {
+    auto conjunction = composeLayoutBearingMaskConjunction(
+        ctx, store, peel->layout, peel->declaredShape, indices, axes, iterSyms,
+        srcShape);
+    if (succeeded(conjunction))
+      return *conjunction;
+  }
   auto resultShaped = dyn_cast<SymbolicallyShapedTypeInterface>(resultTy);
   LayoutAttr resultLayout =
       resultShaped ? resultShaped.getSymbolicLayout() : LayoutAttr{};
   if (resultLayout) {
     auto extents = collectSliceExtents(ctx, store, indices);
-    auto axes = collectAxisIndices(ctx, store, indices);
-    if (succeeded(extents) && succeeded(axes) &&
-        axes->size() == extents->size()) {
+    if (succeeded(extents) && axes.size() == extents->size()) {
       auto conjunction = composeLayoutGatherMaskConjunction(
-          ctx, store, resultLayout, tileShape, iterSyms, *axes, *extents,
+          ctx, store, resultLayout, tileShape, iterSyms, axes, *extents,
           srcShape);
       if (succeeded(conjunction))
         return *conjunction;
     }
   }
   return composeMaskConjunction(store, sliceAxes, iterSyms);
+}
+
+// Bail-out checks for a `hc.load_mask` rewrite. Two flavours of source:
+//   * Layout-bearing buffer source (`hc.as_layout` with `shape=`) —
+//     `srcShape` is the peeled underlying's shape; indices rank-
+//     match the layout's `index_syms`, not the underlying source.
+//   * Plain shaped source — `srcShape` is the source's shape and
+//     indices must rank-match.
+struct MaskPreflight {
+  SmallVector<ExprAttr> srcShape;
+  SmallVector<AxisIndex> axes;
+  // Slice-only axes per `collectMaskSliceAxes`. Empty when the access
+  // doesn't fit the rank-matched assumption — only legal for the
+  // layout-bearing path, which uses `axes` and the captured layout
+  // instead.
+  SmallVector<SliceAxisInfo> sliceAxes;
+};
+
+static FailureOr<MaskPreflight>
+preflightLoadMask(MLIRContext *ctx, sym::Store &store, Value source,
+                  ValueRange indices, ArrayRef<ExprAttr> tileShape) {
+  MaskPreflight pf;
+  if (auto peel = peelLayoutBearingBufferSource(source)) {
+    auto shapeOr = getOperandShape(peel->underlying.getType());
+    if (failed(shapeOr))
+      return failure();
+    pf.srcShape = std::move(*shapeOr);
+  } else {
+    auto shapeOr = getOperandShape(source.getType());
+    if (failed(shapeOr))
+      return failure();
+    pf.srcShape = std::move(*shapeOr);
+    if (indices.size() != pf.srcShape.size())
+      return failure();
+  }
+  auto axesOr = collectAxisIndices(ctx, store, indices);
+  if (failed(axesOr))
+    return failure();
+  pf.axes = std::move(*axesOr);
+  // `collectMaskSliceAxes` is only well-defined on the rank-matched
+  // pure-slice form; let it fail silently when the layout-bearing
+  // path needs the per-position bindings instead.
+  auto sliceAxesOr =
+      collectMaskSliceAxes(ctx, store, indices, pf.srcShape, tileShape);
+  if (succeeded(sliceAxesOr))
+    pf.sliceAxes = std::move(*sliceAxesOr);
+  return pf;
 }
 
 static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
@@ -1017,20 +1317,33 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
     return failure();
 
   Value source = op.getSource();
-  auto srcShape = getOperandShape(source.getType());
-  if (failed(srcShape))
-    return failure();
-
   ValueRange indices = op.getIndices();
-  if (indices.size() != srcShape->size())
-    return failure();
   MLIRContext *ctx = op.getContext();
 
-  auto sliceAxesOr =
-      collectMaskSliceAxes(ctx, store, indices, *srcShape, *tileShape);
-  if (failed(sliceAxesOr))
+  auto pf = preflightLoadMask(ctx, store, source, indices, *tileShape);
+  if (failed(pf))
     return failure();
-  SmallVector<SliceAxisInfo> sliceAxes = std::move(*sliceAxesOr);
+
+  // Iter sym names ahead of `buildCommon` — the conjunction composer
+  // needs them, and `buildCommon` mints SSA `idx_apply` / `tuple`
+  // ops we don't want orphaned if the conjunction picker bails. The
+  // names depend only on `tileShape.size()` (canonical `i_0`,
+  // `i_1`, ...), so generating them out-of-band stays in lockstep
+  // with the names `buildCommon` would mint.
+  SmallVector<StringAttr> iterSymNames;
+  iterSymNames.reserve(tileShape->size());
+  for (size_t k = 0; k < tileShape->size(); ++k)
+    iterSymNames.push_back(StringAttr::get(ctx, ("i_" + Twine(k)).str()));
+
+  // Conjunction picker routes through the source-layout / result-
+  // layout / per-axis paths; failure here means none of the three
+  // could fit the access shape and the op stays for the legacy
+  // launch-body handler to pick up.
+  auto conjunction = composeMaskConjunctionForResult(
+      ctx, store, source, resultTy, indices, pf->srcShape, *tileShape,
+      iterSymNames, pf->axes, pf->sliceAxes);
+  if (failed(conjunction))
+    return failure();
 
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -1049,12 +1362,6 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
       /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  auto conjunction =
-      composeMaskConjunctionForResult(ctx, store, resultTy, indices, *srcShape,
-                                      *tileShape, common.iterSyms, sliceAxes);
-  if (failed(conjunction))
-    return failure();
-
   Type predElem = getUnpinnedPredType(ctx);
   populateMaskBody(generic, ctx, loc, predElem, *conjunction);
 
@@ -1072,17 +1379,27 @@ struct StorePreflight {
   Type srcElem;
   Type dstElem;
   Type maskElem; // null when there's no mask
+  // Layout-bearing buffer dest path: when `op.getDest()` is defined
+  // by `hc.as_layout` with both a layout attribute and a `shape=`
+  // operand, peel it. `effectiveDest` is the underlying buffer,
+  // `dstShape` is its shape, and `destLayout` / `destDeclaredShape`
+  // drive the per-position scatter decomposition. Empty
+  // `effectiveDest` means no peel happened.
+  Value effectiveDest;
+  SmallVector<ExprAttr> dstShape;
+  LayoutAttr destLayout;
+  ShapeAttr destDeclaredShape;
 };
 
 // Element-type match between src and dst, plus mask element type
 // extraction. Returns failure on mismatch or on a mask whose tile rank
 // doesn't match `tileShape`.
-static LogicalResult collectStoreElementTypes(HCStoreOp op,
+static LogicalResult collectStoreElementTypes(HCStoreOp op, Type dstType,
                                               ArrayRef<ExprAttr> tileShape,
                                               Type &srcElem, Type &dstElem,
                                               Type &maskElem) {
   srcElem = bodyArgElementType(op.getSource().getType());
-  dstElem = bodyArgElementType(op.getDest().getType());
+  dstElem = bodyArgElementType(dstType);
   if (!srcElem || !dstElem || srcElem != dstElem)
     return failure();
   if (Value mask = op.getMask()) {
@@ -1096,6 +1413,50 @@ static LogicalResult collectStoreElementTypes(HCStoreOp op,
   return success();
 }
 
+// Layout-bearing buffer dest preflight: mirrors
+// `preflightLoadLikeLayoutBearing` on the scatter side. The peeled underlying
+// becomes the generic op's `outs` operand; the captured layout / declared shape
+// drive the per-axis offset decomposition.
+static FailureOr<StorePreflight>
+preflightStoreLayoutBearing(MLIRContext *ctx, sym::Store &store, HCStoreOp op,
+                            const LayoutBearingSource &peel,
+                            ArrayRef<ExprAttr> tileShape) {
+  if (!isa<BufferType>(peel.underlying.getType()))
+    return failure();
+  ValueRange indices = op.getIndices();
+  if (indices.size() != peel.layout.getIndexSyms().size())
+    return failure();
+  if (peel.declaredShape.getDims().size() != peel.layout.getShapeSyms().size())
+    return failure();
+  size_t sliceCount = 0;
+  for (Value idx : indices)
+    if (llvm::isa<SliceType>(idx.getType()))
+      ++sliceCount;
+  if (sliceCount != tileShape.size())
+    return failure();
+  auto axes = collectAxisIndices(ctx, store, indices);
+  if (failed(axes))
+    return failure();
+  auto dstShape = getOperandShape(peel.underlying.getType());
+  if (failed(dstShape))
+    return failure();
+  Type srcElem, dstElem, maskElem;
+  if (failed(collectStoreElementTypes(op, peel.underlying.getType(), tileShape,
+                                      srcElem, dstElem, maskElem)))
+    return failure();
+  StorePreflight pf;
+  pf.tileShape.assign(tileShape.begin(), tileShape.end());
+  pf.axes = std::move(*axes);
+  pf.srcElem = srcElem;
+  pf.dstElem = dstElem;
+  pf.maskElem = maskElem;
+  pf.effectiveDest = peel.underlying;
+  pf.dstShape = std::move(*dstShape);
+  pf.destLayout = peel.layout;
+  pf.destDeclaredShape = peel.declaredShape;
+  return pf;
+}
+
 // Validates the store's operand shapes and element types. Tensor-dst
 // is rejected (separate slice); src and dst element types must match;
 // when present, mask must match `src`'s tile shape (the
@@ -1103,6 +1464,18 @@ static LogicalResult collectStoreElementTypes(HCStoreOp op,
 // the element type extracted up front).
 static FailureOr<StorePreflight>
 preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
+  auto tileShape = getOperandShape(op.getSource().getType());
+  if (failed(tileShape))
+    return failure();
+
+  // Layout-bearing buffer dest: dest is `hc.as_layout` with `shape=`
+  // operand whose underlying is the actual storage. Peel before the
+  // tensor-dst / rank-parity gates below so the mixed pinned+slice
+  // access form on the scatter side can route through the layout-
+  // driven decomposition (the load-side mirror).
+  if (auto peel = peelLayoutBearingBufferSource(op.getDest()))
+    return preflightStoreLayoutBearing(ctx, store, op, *peel, *tileShape);
+
   // Tensor / bare_tensor dst is workgroup-shared LDS storage; the IR
   // models it as a value-typed operand even though the runtime
   // semantic is in-place mutation. A clean rewrite would need to
@@ -1114,10 +1487,6 @@ preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
   if (!isa<BufferType>(op.getDest().getType()))
     return failure();
 
-  auto tileShape = getOperandShape(op.getSource().getType());
-  if (failed(tileShape))
-    return failure();
-
   ValueRange indices = op.getIndices();
   if (!indices.empty() && indices.size() != tileShape->size())
     return failure();
@@ -1126,12 +1495,17 @@ preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
     return failure();
 
   Type srcElem, dstElem, maskElem;
-  if (failed(
-          collectStoreElementTypes(op, *tileShape, srcElem, dstElem, maskElem)))
+  if (failed(collectStoreElementTypes(op, op.getDest().getType(), *tileShape,
+                                      srcElem, dstElem, maskElem)))
     return failure();
 
-  return StorePreflight{std::move(*tileShape), std::move(*axes), srcElem,
-                        dstElem, maskElem};
+  StorePreflight pf;
+  pf.tileShape = std::move(*tileShape);
+  pf.axes = std::move(*axes);
+  pf.srcElem = srcElem;
+  pf.dstElem = dstElem;
+  pf.maskElem = maskElem;
+  return pf;
 }
 
 // Build the body block of the store generic: src arg, optional mask
@@ -1156,6 +1530,21 @@ static void populateStoreBody(HCGenericOp generic, const StorePreflight &pf,
     HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
 }
 
+// Pick the right outs_offsets[0] for a store. Mirrors
+// `composeLoadInsOffsets` on the scatter side: layout-bearing buffer
+// dest routes through `composeLayoutBearingBufferOffsets`; the
+// plain path keeps the per-axis identity offsets.
+static FailureOr<ArrayAttr>
+composeStoreOutsOffsets(MLIRContext *ctx, sym::Store &store,
+                        const StorePreflight &pf, ValueRange indices,
+                        ArrayRef<StringAttr> iterSyms) {
+  if (pf.destLayout)
+    return composeLayoutBearingBufferOffsets(ctx, store, pf.destLayout,
+                                             pf.destDeclaredShape, indices,
+                                             pf.axes, iterSyms, pf.dstShape);
+  return composeMemoryOffsetArray(ctx, store, pf.axes, iterSyms);
+}
+
 static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   MLIRContext *ctx = op.getContext();
   auto pf = preflightStore(ctx, store, op);
@@ -1163,7 +1552,7 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
     return failure();
 
   Value src = op.getSource();
-  Value dst = op.getDest();
+  Value dst = pf->effectiveDest ? pf->effectiveDest : op.getDest();
   Value mask = op.getMask();
 
   Location loc = op.getLoc();
@@ -1171,8 +1560,8 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   CommonRewriteData common = buildCommon(builder, loc, pf->tileShape);
 
   ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, common.iterSyms);
-  auto outOffArr =
-      composeMemoryOffsetArray(ctx, store, pf->axes, common.iterSyms);
+  auto outOffArr = composeStoreOutsOffsets(ctx, store, *pf, op.getIndices(),
+                                           common.iterSyms);
   if (failed(outOffArr))
     return failure();
   // Masked path: mask rides as an extra ins slot with identity offsets

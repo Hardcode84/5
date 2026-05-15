@@ -649,4 +649,95 @@ module {
   } {
     hc_front.return
   }
+
+  // `x ** K` for positive integer-literal K lowers to a binary-squaring
+  // chain of `hc.mul`s. The exponent must be `hc_front.constant<K : i64>`
+  // with K >= 1; any other rhs is rejected (see `invalid.mlir`). Every
+  // other binop kind in `emitBinop` produces a single `hc` op; this is
+  // the only family that fans out.
+
+  // K = 2: just `x * x`, one mul.
+  // CHECK-LABEL: hc.func @binop_pow_squared
+  // CHECK: hc.mul %arg0, %arg0 : (!hc.undef, !hc.undef) -> !hc.undef
+  // CHECK-NOT: hc.mul
+  // CHECK: hc.return
+  hc_front.func "binop_pow_squared" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %e = hc_front.constant<2 : i64>
+    %r = hc_front.binop "Pow"(%x, %e)
+    hc_front.return %r
+  }
+
+  // K = 3: square then multiply by `x`, two muls.
+  // CHECK-LABEL: hc.func @binop_pow_cubed
+  // CHECK: %[[SQ:.*]] = hc.mul %arg0, %arg0
+  // CHECK: hc.mul %[[SQ]], %arg0
+  // CHECK-NOT: hc.mul
+  // CHECK: hc.return
+  hc_front.func "binop_pow_cubed" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %e = hc_front.constant<3 : i64>
+    %r = hc_front.binop "Pow"(%x, %e)
+    hc_front.return %r
+  }
+
+  // K = 4: square-then-square — still two muls, beats the naive K-1 = 3.
+  // CHECK-LABEL: hc.func @binop_pow_quartic
+  // CHECK: %[[SQ:.*]] = hc.mul %arg0, %arg0
+  // CHECK: hc.mul %[[SQ]], %[[SQ]]
+  // CHECK-NOT: hc.mul
+  // CHECK: hc.return
+  hc_front.func "binop_pow_quartic" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %e = hc_front.constant<4 : i64>
+    %r = hc_front.binop "Pow"(%x, %e)
+    hc_front.return %r
+  }
+
+  // K = 7 (0b111): exercises the full bit walk — square (^2), *x (^3),
+  // square (^6), *x (^7). Four muls instead of the naive six.
+  // CHECK-LABEL: hc.func @binop_pow_seventh
+  // CHECK: %[[K2:.*]] = hc.mul %arg0, %arg0
+  // CHECK: %[[K3:.*]] = hc.mul %[[K2]], %arg0
+  // CHECK: %[[K6:.*]] = hc.mul %[[K3]], %[[K3]]
+  // CHECK: hc.mul %[[K6]], %arg0
+  // CHECK-NOT: hc.mul
+  // CHECK: hc.return
+  hc_front.func "binop_pow_seventh" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %e = hc_front.constant<7 : i64>
+    %r = hc_front.binop "Pow"(%x, %e)
+    hc_front.return %r
+  }
+
+  // K = 1: trivial identity, no muls at all.
+  // CHECK-LABEL: hc.func @binop_pow_one
+  // CHECK-NOT: hc.mul
+  // CHECK: hc.return %arg0
+  hc_front.func "binop_pow_one" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %e = hc_front.constant<1 : i64>
+    %r = hc_front.binop "Pow"(%x, %e)
+    hc_front.return %r
+  }
 }

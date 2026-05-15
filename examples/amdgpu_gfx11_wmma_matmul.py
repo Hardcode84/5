@@ -49,21 +49,23 @@ The per-lane accumulator addressing is captured once as
 ``WAVE_ACC_FRAG_LAYOUT`` — an ``index_map`` whose offset
 ``(lane // 16 + fi * 2) * 16 + (lane % 16)`` maps each
 ``(lane, fragment_index)`` pair to a position inside the flat 16x16
-output tile. ``init_wmma_acc`` loads through it via the wave-
-cooperative ``group.vload(c_tile, shape=(WAVE_LANES,
-WMMA_ACC_FRAGMENT), layout=WAVE_ACC_FRAG_LAYOUT)`` form;
-``store_wmma_tile`` realises the same arithmetic as the inverse
-strided ``c[row_slice, col_slice]`` view because the substrate
-doesn't yet carry a symmetric ``group.store(c_tile, value,
-layout=...)`` (or equivalently a buffer-side ``as_layout`` with a
-shape-changing reinterpretation that ``hc.store`` would consume —
-the simulator's ``LayoutBufferView`` / ``LayoutBufferSlice`` is the
-runtime side of that future symmetric path).
+output tile. ``init_wmma_acc`` and ``store_wmma_tile`` both attach
+this layout to the C-tile buffer through ``as_layout(c_tile,
+WAVE_ACC_FRAG_LAYOUT, shape=(WAVE_LANES, WMMA_ACC_FRAGMENT))``,
+then read / write this lane's row off the layout-bearing view with
+``group.vload(c_lane[lane, :], shape=(WMMA_ACC_FRAGMENT,))`` and
+the matching ``group.store(c_lane[lane, :], frag)``. One layout
+declaration, two call sites that share its offset formula by
+construction.
 
-The direct layout-driven load form compiles end-to-end through the
-substrate via ``hc-distribute-wave-layouts``, which factors the lane
-axis out of the wave-cooperative carrier before ``hc.generic``
-lowering.
+The buffer-side ``as_layout`` with shape-changing reinterpretation
+threads end-to-end through the substrate: ``hc-load-store-to-
+generic`` peels the as_layout, composes the layout's offset with
+the declared ``(WAVE_LANES, WMMA_ACC_FRAGMENT)`` shape, and row-
+major-splits the flat offset against the underlying C-tile's
+``(16, 16)`` storage; ``hc-distribute-wave-layouts`` then factors
+the lane axis out of the wave-cooperative carrier before the
+``hc.generic`` decomposition.
 """
 
 from __future__ import annotations
@@ -142,11 +144,12 @@ def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:
 # logical shape satisfies `LayoutAttr`'s
 # `index_syms.size() == shape_syms.size()` contract.
 #
-# `init_wmma_acc` and `store_wmma_tile` realise the same arithmetic
-# as a strided `c[row_slice, col_slice]` view. Single declared
-# formula, two call sites that decode it by hand — see the module
-# docstring for the simulator gap the direct layout-driven form
-# still trips.
+# `init_wmma_acc` and `store_wmma_tile` attach this layout to the
+# C-tile buffer via `as_layout(..., shape=(WAVE_LANES,
+# WMMA_ACC_FRAGMENT))` and let the substrate peel the layout-driven
+# gather/scatter into the underlying tile's row-major storage. Single
+# declared formula, two call sites that share its decomposition by
+# construction.
 WAVE_ACC_FRAG_LAYOUT = index_map(
     storage_size=lambda lc, fc: WMMA_M * WMMA_N,
     offset=lambda lane, fi, lc, fc: (lane // WMMA_N + fi * WMMA_ACC_ROW_STRIDE) * WMMA_N
@@ -363,33 +366,38 @@ def init_wmma_acc(group, c, row0, col0):
     @group.workitems
     def init(wi):
         lane = wi.local_id()[0]
-        # Layout-driven load: hand the whole `16x16` C tile to a
-        # `vload` carrying `WAVE_ACC_FRAG_LAYOUT`, then subscript out
-        # this lane's `(WMMA_ACC_FRAGMENT,)` row and strip the layout
-        # back to plain so the result flows into the accumulator
-        # carrier shape WMMA's recipe expects. The layout's offset
-        # formula encodes the per-lane (row, col) addressing once;
-        # the strided `hc.buffer_view` form in `store_wmma_tile` keeps
-        # a redundant copy until a symmetric layout-aware scatter
-        # lands on `group.store`.
+        # Symmetric layout-driven init: attach the per-lane WMMA
+        # accumulator layout to the C-tile buffer once via `as_layout`
+        # with a declared `(WAVE_LANES, WMMA_ACC_FRAGMENT)` shape, then
+        # gather this lane's `(WMMA_ACC_FRAGMENT,)` row off the layout-
+        # bearing view. The matching scatter in `store_wmma_tile` reads
+        # the same view, so the lane addressing lives in one place —
+        # `WAVE_ACC_FRAG_LAYOUT` — and the two callers share its offset
+        # formula structurally instead of open-coding the inverse on
+        # the store side.
         #
-        # Two substrate guarantees keep this clean:
+        # Substrate guarantees:
+        #   - `hc-load-store-to-generic` peels the `hc.as_layout` and
+        #     routes the mixed pinned + slice access through the
+        #     layout-driven gather decomposition: `LAY.offset(lane,
+        #     i_0)` composed with the declared `(32, 8)` shape, then
+        #     row-major-split against the underlying `(16, 16)` tile.
         #   - `hc-distribute-wave-layouts` factors the leading `lane`
         #     axis out of the layout-bearing carriers before
         #     `hc.generic` decomposition, so per-lane peers see the
         #     `(WMMA_ACC_FRAGMENT,)` slice and not the wave-cooperative
         #     `(WAVE_LANES, WMMA_ACC_FRAGMENT)` tile.
         #   - The simulator's gather OOB-pads the clipped slice up to
-        #     the slice's intent shape, so partial-tile cases (M/N
-        #     not multiples of WMMA_M/WMMA_N) mask False at the right
-        #     per-element positions instead of aliasing in-bounds
-        #     cells from the clipped ravel.
-        wave_acc = group.vload(
+        #     the slice's intent shape, so partial-tile cases (M/N not
+        #     multiples of WMMA_M/WMMA_N) mask False at the right
+        #     per-element positions instead of aliasing in-bounds cells
+        #     from the clipped ravel.
+        c_lane = as_layout(
             c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N],
+            WAVE_ACC_FRAG_LAYOUT,
             shape=(WAVE_LANES, WMMA_ACC_FRAGMENT),
-            layout=WAVE_ACC_FRAG_LAYOUT,
         )
-        return as_layout(wave_acc[lane, :], None)
+        return group.vload(c_lane[lane, :], shape=(WMMA_ACC_FRAGMENT,))
 
     return init()
 
@@ -425,28 +433,22 @@ def store_wmma_tile(group, c, row0, col0, acc) -> None:
     @group.workitems
     def wave(wi):
         lane = wi.local_id()[0]
-        # `WAVE_ACC_FRAG_LAYOUT.offset` applied in the inverse
-        # direction: for each per-lane fragment index `fi`, the
-        # element lives at `(row0 + lane // WMMA_N + fi *
-        # WMMA_ACC_ROW_STRIDE, col0 + lane % WMMA_N)`. Expressed as a
-        # strided `c[row_slice, col_slice]` view — the form the
-        # simulator scatters via numpy strides and the gpu path lowers
-        # through `hc.generic`. A symmetric layout-aware scatter on
-        # `group.store` (or equivalently a buffer-side `as_layout`
-        # with a shape-changing reinterpretation that `hc.store`
-        # would consume) would let us shed the manual inverse; the
-        # simulator's `LayoutBufferView` / `LayoutBufferSlice` is the
-        # runtime side of that future symmetric path. Until the
-        # substrate carries it through compile, the formula here must
-        # stay in lockstep with the `WAVE_ACC_FRAG_LAYOUT`
-        # declaration above.
-        group.store(
-            c[
-                row0 + lane // WMMA_N : row0 + WMMA_M : WMMA_ACC_ROW_STRIDE,
-                col0 + lane % WMMA_N : col0 + lane % WMMA_N + 1,
-            ],
-            acc[:, lane, :],
+        # Symmetric layout-driven scatter: reuse the same layout-bearing
+        # view the matching `init_wmma_acc` reads from. The
+        # `as_layout(c_tile, LAY, shape=(WAVE_LANES,
+        # WMMA_ACC_FRAGMENT))` form puts the per-lane addressing on the
+        # buffer's type; `group.store(c_lane[lane, :], ...)` lets
+        # `hc-load-store-to-generic` peel the as_layout and run the
+        # scatter through the same layout-driven decomposition the load
+        # side uses. The accumulator carries a trailing singleton
+        # collective axis from `wmma_gfx11`, so `acc[:, lane, 0]` peels
+        # it off to match the destination's `(WMMA_ACC_FRAGMENT,)` row.
+        c_lane = as_layout(
+            c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N],
+            WAVE_ACC_FRAG_LAYOUT,
+            shape=(WAVE_LANES, WMMA_ACC_FRAGMENT),
         )
+        group.store(c_lane[lane, :], acc[:, lane, 0])
 
     wave()
 

@@ -28,8 +28,13 @@
 // CHECK-SAME: !hc.bare_vector<!hc.pred, ["8"]>
 // CHECK-SAME: !hc.idx<"$WI0">
 // CHECK-SAME: -> (!hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>)
+// Symmetric scatter through the layout-bearing C-tile view: same
+// `hc.as_layout` declaration `init_wmma_acc` planted on the load
+// side, so the store hits the same `(lc=32, fc=8)` view and
+// `hc-decompose-shaped-values` strips the trailing collective lane
+// axis. The store input rides as a `[8]` data/mask pair.
 // CHECK: hc.store {{.*}}, %{{[^,]+}}, mask %{{[^ ]+}}
-// CHECK-SAME: !hc.bare_vector<f32, ["8", "1"]>, !hc.bare_vector<!hc.pred, ["8", "1"]>
+// CHECK-SAME: !hc.bare_vector<f32, ["8"]>, !hc.bare_vector<!hc.pred, ["8"]>) -> ()
 // CHECK-LABEL: hc.intrinsic @wmma_gfx11
 // CHECK-SAME: %{{.*}}: !hc.bare_tensor<f16, ["16", "16"]>
 // CHECK-SAME: %{{.*}}: !hc.bare_tensor<!hc.pred, ["16", "16"]>

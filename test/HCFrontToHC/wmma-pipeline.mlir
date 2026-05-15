@@ -46,17 +46,20 @@
 // CHECK: hc.yield {{.*}} : !hc.undef, !hc.undef, !hc.undef
 // CHECK: hc.call @store_wmma_tile(%[[GROUP]], %[[C]], %[[ROW0]], %[[COL0]], %[[ACC_FINAL]]#2) : (!hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, !hc.buffer<f32, ["M", "N"], <shape_syms = ["d0", "d1"], index_syms = ["i0", "i1"], params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"$STRIDE_0_c*i0 + $STRIDE_1_c*i1">>>, !hc.undef, !hc.undef, !hc.undef) -> ()
 
-// `init_wmma_acc` reads the per-lane output slice of `c` (`hc.vload` on a
-// strided `hc.buffer_view`) so the accumulator seed inherits the
-// bounds-aware mask the vload's clip-and-pad rule produces. The mask
+// `init_wmma_acc` declares the per-lane WMMA accumulator layout on
+// the C-tile via `hc.as_layout` with a `shape=(WAVE_LANES,
+// WMMA_ACC_FRAGMENT)` operand, then `hc.vload`s this lane's row off
+// the layout-bearing view. Same arithmetic the matching scatter in
+// `store_wmma_tile` reads, so the per-element output-validity mask
 // rides through every k-tile iteration and gates the eventual
 // `group.store`, keeping right/bottom-edge tiles from writing OOB.
 // CHECK-LABEL: hc.func @init_wmma_acc
 // CHECK-SAME: (%{{.*}}: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*N)"]>, group_shape = #hc.shape<["32", "1"]>, subgroup_size = #hc.expr<"32">>, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef, %{{.*}}: !hc.undef) -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: %{{.*}} = hc.workitem_region captures = ["group", "c", "row0", "col0"] -> (!hc.undef)
-// CHECK: hc.vload {{.*}} : ({{.*}}) -> !hc.undef
+// CHECK: %{{.*}} = hc.workitem_region captures = ["c", "row0", "col0", "group"] -> (!hc.undef)
 // CHECK: hc.buffer_view
+// CHECK: hc.as_layout {{.*}} layout = (#hc.layout<shape_syms = ["lc", "fc"], index_syms = ["lane", "fi"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*fi + lane">>)
+// CHECK: hc.vload {{.*}} : ({{.*}}) -> !hc.undef
 // CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 
@@ -74,11 +77,18 @@
 // CHECK: hc.yield {{.*}} : !hc.undef
 // CHECK: hc.return {{.*}} : !hc.undef
 
+// `store_wmma_tile` mirrors `init_wmma_acc` on the scatter side: same
+// `hc.as_layout` declaration with `shape=(WAVE_LANES,
+// WMMA_ACC_FRAGMENT)`, then `hc.store` through the layout-bearing
+// view. The per-lane addressing lives in one place — the layout
+// attribute — so the load and store agree by construction.
 // CHECK-LABEL: hc.func @store_wmma_tile
 // CHECK-NOT: -> !hc.undef
 // CHECK-SAME: attributes {scope = #hc.scope<"WorkGroup">}
-// CHECK: hc.workitem_region captures =
+// CHECK: hc.workitem_region captures = ["c", "row0", "col0", "group", "acc"]
 // CHECK: hc.slice_expr(lower =
+// CHECK: hc.buffer_view
+// CHECK: hc.as_layout {{.*}} layout = (#hc.layout<shape_syms = ["lc", "fc"], index_syms = ["lane", "fi"], params = {}, storage_size = #hc.expr<"256">, offset = #hc.expr<"32*fi + lane">>)
 // CHECK: hc.store {{.*}} : (!hc.undef, !hc.undef, !hc.undef, !hc.undef) -> ()
 
 // CHECK-LABEL: hc.func @load_wmma_a_fragment

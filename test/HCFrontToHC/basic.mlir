@@ -424,6 +424,147 @@ module {
     hc_front.return
   }
 
+  // When the kernel's launch context carries no static shape and the
+  // launch-geo getter is bound to a local, the static-rank pre-walk
+  // must still trace the local through to its assignment so the emitted
+  // launch-geo op stays at the rank the subscripts actually demand —
+  // otherwise we fall back to the conservative `kMaxLaunchAxis` cap and
+  // emit a far wider op than needed.
+  // CHECK-LABEL: hc.kernel @launch_geo_local_no_static_shape
+  // CHECK: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CHECK: hc.tuple
+  // CHECK: hc.getitem
+  // CHECK: hc.getitem
+  // CSE-LABEL: hc.kernel @launch_geo_local_no_static_shape
+  // CSE: %{{.*}}:2 = hc.group_id %arg0 : (!hc.group) -> (!hc.idx<"$WG0">, !hc.idx<"$WG1">)
+  // CSE-NOT: hc.group_id
+  hc_front.kernel "launch_geo_local_no_static_shape" attributes {
+    parameters = [{name = "group"}, {name = "out"}],
+    returns = "None"
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %out = hc_front.name "out" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %v0 = hc_front.constant<0 : i64>
+    %v1 = hc_front.constant<1 : i64>
+    %gid_attr = hc_front.attr %grp, "group_id" {ref = {kind = "dsl_method", method = "group_id"}}
+    %gid_t = hc_front.target_name "gid"
+    hc_front.assign %gid_t = %gid_attr
+    %gid = hc_front.name "gid" {ctx = "load", ref = {kind = "local"}}
+    %gid0 = hc_front.subscript %gid[%ax0]
+    %slot0 = hc_front.target_subscript %out[%gid0]
+    hc_front.assign %slot0 = %v0
+    %gid_again = hc_front.name "gid" {ctx = "load", ref = {kind = "local"}}
+    %gid1 = hc_front.subscript %gid_again[%ax1]
+    %slot1 = hc_front.target_subscript %out[%gid1]
+    hc_front.assign %slot1 = %v1
+    hc_front.return
+  }
+
+  // Bare launch-geometry getters (no immediate subscript or call) must
+  // materialize the multi-axis tuple as an SSA value so a Python local
+  // can name them and downstream peeling still lowers:
+  //   ```
+  //   gid = group.work_offset
+  //   out[gid[0]] = 0
+  //   out[gid[1]] = 1
+  //   ```
+  // After `--hc-promote-names` the dead `hc.assign "gid"` is folded
+  // away — what stays is one `hc.work_offset`, one tuple wrap, and one
+  // `hc.getitem` per subscript. CSE then dedups the tuple wrap.
+  // CHECK-LABEL: hc.kernel @launch_geo_bound_to_local
+  // CHECK: %[[WO:.*]]:2 = hc.work_offset %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>>) -> (!hc.idx<"$WO0">, !hc.idx<"$WO1">)
+  // CHECK: %[[WOT:.*]] = hc.tuple(%[[WO]]#0, %[[WO]]#1) : (!hc.idx<"$WO0">, !hc.idx<"$WO1">) -> tuple<!hc.idx<"$WO0">, !hc.idx<"$WO1">>
+  // CHECK: hc.getitem %[[WOT]]
+  // CHECK: hc.getitem %[[WOT]]
+  // CSE-LABEL: hc.kernel @launch_geo_bound_to_local
+  // CSE: %{{.*}}:2 = hc.work_offset
+  // CSE-NOT: hc.work_offset
+  hc_front.kernel "launch_geo_bound_to_local" attributes {
+    parameters = [{name = "group"}, {name = "out"}],
+    returns = "None",
+    work_shape = ["M", "N"]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %out = hc_front.name "out" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %v0 = hc_front.constant<0 : i64>
+    %v1 = hc_front.constant<1 : i64>
+    %wo_attr = hc_front.attr %grp, "work_offset" {ref = {kind = "dsl_method", method = "work_offset"}}
+    %wo_t = hc_front.target_name "wo"
+    hc_front.assign %wo_t = %wo_attr
+    %wo = hc_front.name "wo" {ctx = "load", ref = {kind = "local"}}
+    %wo0 = hc_front.subscript %wo[%ax0]
+    %out_idx0 = hc_front.target_subscript %out[%wo0]
+    hc_front.assign %out_idx0 = %v0
+    %wo_again = hc_front.name "wo" {ctx = "load", ref = {kind = "local"}}
+    %wo1 = hc_front.subscript %wo_again[%ax1]
+    %out_idx1 = hc_front.target_subscript %out[%wo1]
+    hc_front.assign %out_idx1 = %v1
+    hc_front.return
+  }
+
+  // Scalar launch-geometry getter bound to a local. The bare attr
+  // materializes the scalar `hc.group_size` result directly (no tuple
+  // wrap); reading the local back as a store index keeps the def alive
+  // through `--hc-promote-names`.
+  // CHECK-LABEL: hc.kernel @launch_geo_scalar_bound_to_local
+  // CHECK: %[[GSZ:.*]] = hc.group_size %arg0 : (!hc.group) -> !hc.idx<"$GSZ0">
+  // CHECK: hc.store %arg1[%[[GSZ]]]
+  hc_front.kernel "launch_geo_scalar_bound_to_local" attributes {
+    parameters = [{name = "group"}, {name = "out"}]
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %out = hc_front.name "out" {ctx = "load", ref = {kind = "param"}}
+    %v0 = hc_front.constant<0 : i64>
+    %gsz_attr = hc_front.attr %grp, "group_size" {ref = {kind = "dsl_method", method = "group_size"}}
+    %gsz_t = hc_front.target_name "sz"
+    hc_front.assign %gsz_t = %gsz_attr
+    %sz = hc_front.name "sz" {ctx = "load", ref = {kind = "local"}}
+    %slot = hc_front.target_subscript %out[%sz]
+    hc_front.assign %slot = %v0
+    hc_front.return
+  }
+
+  // Call-style launch-geometry getter bound to a local. Mirrors the
+  // property-style case above: `group.local_id()` lowers to one
+  // launch-geo op whose tuple is shared by both subscripts on the
+  // local through the same `hc.getitem` peel. The kernel's
+  // `group_shape` attribute drives the static rank, so the launch-geo
+  // op is rank-2 (not the conservative cap).
+  // CHECK-LABEL: hc.kernel @launch_geo_call_bound_to_local
+  // CHECK: %[[LID:.*]]:2 = hc.local_id %arg0 : (!hc.group<group_shape = #hc.shape<["G0", "G1"]>>) -> (!hc.idx<"$WI0">, !hc.idx<"$WI1">)
+  // CHECK: %[[LIDT:.*]] = hc.tuple(%[[LID]]#0, %[[LID]]#1) : (!hc.idx<"$WI0">, !hc.idx<"$WI1">) -> tuple<!hc.idx<"$WI0">, !hc.idx<"$WI1">>
+  // CHECK: hc.getitem %[[LIDT]]
+  // CHECK: hc.getitem %[[LIDT]]
+  hc_front.kernel "launch_geo_call_bound_to_local" attributes {
+    group_shape = ["G0", "G1"],
+    parameters = [{name = "group"}, {name = "out"}],
+    returns = "None"
+  } {
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %out = hc_front.name "out" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %v0 = hc_front.constant<0 : i64>
+    %v1 = hc_front.constant<1 : i64>
+    %lid_attr = hc_front.attr %grp, "local_id" {ref = {kind = "dsl_method", method = "local_id"}}
+    %lid_call = hc_front.call %lid_attr()
+    %lid_t = hc_front.target_name "lid"
+    hc_front.assign %lid_t = %lid_call
+    %lid = hc_front.name "lid" {ctx = "load", ref = {kind = "local"}}
+    %lid0 = hc_front.subscript %lid[%ax0]
+    %slot0 = hc_front.target_subscript %out[%lid0]
+    hc_front.assign %slot0 = %v0
+    %lid_again = hc_front.name "lid" {ctx = "load", ref = {kind = "local"}}
+    %lid1 = hc_front.subscript %lid_again[%ax1]
+    %slot1 = hc_front.target_subscript %out[%lid1]
+    hc_front.assign %slot1 = %v1
+    hc_front.return
+  }
+
   // CHECK-LABEL: hc.kernel @zero_rank_buffer_param
   // Rank-0 buffers still get the layout slot: empty shape_syms /
   // index_syms, literal `0` offset and storage_size — the structural

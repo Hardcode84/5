@@ -1557,8 +1557,7 @@ private:
                                IntegerAttr ax);
   FailureOr<Value> tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
                                                   hc_front::AttrOp attr,
-                                                  Value baseVal, Value idxVal,
-                                                  IntegerAttr ax);
+                                                  Value idxVal, IntegerAttr ax);
 
   // Populates `entry`'s block arguments and returns the matching
   // `FunctionType`. Buffer parameters are seeded from their metadata;
@@ -1646,7 +1645,7 @@ private:
   // Wrap a freshly-emitted tensor/vector result in `hc.as_layout` when
   // the originating call carried a `layout=` kwarg. Returns the
   Value tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
-                              Value base, const CallArgs &args);
+                              const CallArgs &args);
 
   unsigned getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
                                  Type contextType,
@@ -2307,15 +2306,26 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
 }
 
 FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
-  // Attribute chains like `group.load` or `buf.shape` are folded into
-  // the parent call or subscript and don't produce a standalone SSA
-  // value at this layer. The one exception is `numpy_dtype_type`: the
-  // attr itself denotes a type, which both `x.astype(np.<dtype>)` (arg
-  // position) and `np.<dtype>(0)` (callee position) want to observe as
-  // an `hc.const` carrying a `TypeAttr`. Materializing it eagerly here
-  // keeps `collectCallArgs` honest (no null-arg rejection) and lets
-  // `lowerDslMethodCall` reuse the same value when a numpy dtype is
-  // used as a value constructor.
+  // Most attribute chains (`group.load`, `buf.shape`, ...) are folded
+  // into the parent call or subscript and don't produce a standalone
+  // SSA value at this layer. Two exceptions materialize eagerly here:
+  //
+  //  * `numpy_dtype_type` denotes a type. Both `x.astype(np.<dtype>)`
+  //    (arg position) and `np.<dtype>(0)` (callee position) need to
+  //    observe an `hc.const` carrying a `TypeAttr`. Emitting it here
+  //    keeps `collectCallArgs` honest (no null-arg rejection) and lets
+  //    `lowerDslMethodCall` reuse the same value when a numpy dtype is
+  //    used as a value constructor.
+  //
+  //  * Launch-geometry getters (`group.work_offset`, `wi.local_id`,
+  //    ...). The Python frontend can bind these to locals
+  //    (`gid = group.work_offset`) or thread them through helpers;
+  //    leaving the bare attr as a null Value used to crash assignment
+  //    lowering with "rhs did not lower to an hc value". Lowering
+  //    eagerly to the multi-axis tuple (or scalar) makes the value a
+  //    first-class SSA carrier, and the inline-subscript /
+  //    call-of-getter folds just retrieve it from the cache instead of
+  //    re-emitting their own launch-geo op.
   //
   // A present-but-malformed `ref` (dict without a string `kind`) is
   // diagnosed here so the error fingers the attr rather than the
@@ -2333,6 +2343,19 @@ FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
     return {
         HCConstOp::create(builder, op.getLoc(), undef, TypeAttr::get(*dtypeTy))
             .getResult()};
+  }
+  if (std::optional<LaunchGeoMethodInfo> info =
+          classifyLaunchGeoMethod(op.getName())) {
+    FailureOr<Value> baseOr =
+        lowerValueOperand(op.getBase(), op.getOperation(), "launch-geo base");
+    if (failed(baseOr))
+      return failure();
+    Value base = *baseOr;
+    if (!base)
+      return Value();
+    std::optional<unsigned> requiredRank =
+        getStaticLaunchGeometryRank(op.getBase(), op.getName());
+    return tryEmitLaunchGeo(*info, base, op.getLoc(), requiredRank);
   }
   return Value();
 }
@@ -3450,7 +3473,7 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return lowerUnaryBaseMethod(call, method, base, args);
   if (isMemOpMethod(method))
     return lowerMemOp(call, method, args);
-  if (Value lowered = tryLowerLaunchGeoCall(call, method, base, args))
+  if (Value lowered = tryLowerLaunchGeoCall(call, method, args))
     return {lowered};
 
   call.emitOpError("unsupported dsl_method '") << method << "'";
@@ -3897,27 +3920,23 @@ FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
 }
 
 Value Lowerer::tryLowerLaunchGeoCall(hc_front::CallOp call, StringRef method,
-                                     Value base, const CallArgs &args) {
+                                     const CallArgs &args) {
   // `group.{launch_geo}()` with no args is the call form (`wi.local_id()`).
-  // Emit one tuple-valued launch-geo query; an enclosing subscript lowers to
-  // `hc.getitem`. The property-style `group.launch_geo[N]` is handled in
-  // `lowerSubscript` — both go through `tryEmitLaunchGeo` so the supported
-  // method set stays in one place.
-  if (call.getArguments().empty() && args.kwvalues.empty() &&
-      args.kwattrs.empty()) {
-    if (base) {
-      std::optional<LaunchGeoMethodInfo> methodInfo =
-          classifyLaunchGeoMethod(method);
-      if (!methodInfo)
-        return {};
-      std::optional<unsigned> requiredRank =
-          getStaticLaunchGeometryRank(call.getResult(), method);
-      if (Value v =
-              tryEmitLaunchGeo(*methodInfo, base, call.getLoc(), requiredRank))
-        return v;
-    }
-  }
-  return {};
+  // The launch-geo op itself is emitted by `lowerAttr` on the call's
+  // attr callee; the call is semantically transparent for these
+  // getters, so we forward the cached tuple.
+  if (!call.getArguments().empty() || !args.kwvalues.empty() ||
+      !args.kwattrs.empty())
+    return {};
+  if (!classifyLaunchGeoMethod(method))
+    return {};
+  auto attr =
+      dyn_cast_if_present<hc_front::AttrOp>(call.getCallee().getDefiningOp());
+  if (!attr)
+    return {};
+  FailureOr<Value> attrValOr = lowerValueOperand(
+      attr.getResult(), call.getOperation(), "launch-geo attr");
+  return failed(attrValOr) ? Value{} : *attrValOr;
 }
 
 static std::optional<unsigned> staticLaunchGeoRequiredRank(Value axisValue) {
@@ -3975,7 +3994,11 @@ static std::optional<unsigned> allSubscriptUsesRank(Value result) {
 // `getitem` against a call result: only tighten when *every* use of the
 // call result is a structural-constant subscript. Any escape (passing the
 // tuple by value, dynamic index, etc.) keeps the conservative cap-sized
-// fallback intact.
+// fallback intact. The rank is recorded against `attr.getBase()` (the
+// launch context SSA value) — the same key used by the property-style
+// `noteAttrSubscriptLaunchGeoRank` — so the launch-geo op `lowerAttr`
+// emits sees the merged rank regardless of whether the user wrote the
+// property or call form.
 static void noteCallSubscriptLaunchGeoRank(
     hc_front::CallOp call,
     llvm::function_ref<void(Value, StringRef, unsigned)> record) {
@@ -3993,7 +4016,39 @@ static void noteCallSubscriptLaunchGeoRank(
   std::optional<unsigned> rank = allSubscriptUsesRank(call.getResult());
   if (!rank || *rank == 0)
     return;
-  record(call.getResult(), method, *rank);
+  record(attr.getBase(), method, *rank);
+}
+
+// Trace an `hc_front.name` (ref = "local") backwards through the most
+// recent prior `hc_front.assign` in the same block. Returns the defining
+// op of the rhs Value when found, or null otherwise. Reaching-definitions
+// across branches / loops is intentionally not modelled: this covers the
+// common "bind once, read many times" idiom that lets a launch-geo or
+// shape subscript fold through the local binding without us having to
+// touch the type of `hc.name_load`. Shared by the static-rank pre-walk
+// (`collectStaticLaunchGeometryRanks`) and the subscript fold dispatch
+// in `trySubscriptFolds` so both views of a local-bound launch-geo
+// tuple stay in sync.
+static Operation *traceLocalNameSourceOp(hc_front::NameOp name) {
+  RefInfo ref = RefInfo::get(name);
+  if (ref.getKind() != "local")
+    return nullptr;
+  StringRef target = name.getName();
+  Block *block = name.getOperation()->getBlock();
+  for (Operation *cur = name.getOperation()->getPrevNode(); cur;
+       cur = cur->getPrevNode()) {
+    if (cur->getBlock() != block)
+      break;
+    auto assign = dyn_cast<hc_front::AssignOp>(cur);
+    if (!assign)
+      continue;
+    auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(
+        assign.getTarget().getDefiningOp());
+    if (!tn || tn.getName() != target)
+      continue;
+    return assign.getValue().getDefiningOp();
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -4008,10 +4063,33 @@ void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
     if (op.getIndices().size() != 1)
       return;
     Operation *baseOp = op.getBase().getDefiningOp();
+    // Mirror `trySubscriptFolds`: trace local-name bindings to their
+    // source so a `gid = group.group_id; gid[0]; gid[1]` idiom still
+    // contributes a structural rank hint even though the subscripts
+    // sit on the local read rather than on the attr directly.
+    bool tracedFromLocal = false;
+    if (auto nameOp = dyn_cast_if_present<hc_front::NameOp>(baseOp))
+      if (Operation *src = traceLocalNameSourceOp(nameOp)) {
+        baseOp = src;
+        tracedFromLocal = true;
+      }
     if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(baseOp))
       return noteAttrSubscriptLaunchGeoRank(op, attr, record);
-    if (auto call = dyn_cast_if_present<hc_front::CallOp>(baseOp))
-      noteCallSubscriptLaunchGeoRank(call, record);
+    if (auto call = dyn_cast_if_present<hc_front::CallOp>(baseOp)) {
+      // Direct `group.method()[N]` keeps the all-uses tightening
+      // (a tuple-passed-by-value escape must keep the conservative
+      // cap). The local-traced form already used its assignment as a
+      // user, so `allSubscriptUsesRank` would refuse to tighten; treat
+      // it like the property form instead and record the per-subscript
+      // hint against the underlying attr's base.
+      if (!tracedFromLocal) {
+        noteCallSubscriptLaunchGeoRank(call, record);
+        return;
+      }
+      if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
+              call.getCallee().getDefiningOp()))
+        noteAttrSubscriptLaunchGeoRank(op, attr, record);
+    }
   });
 }
 
@@ -4170,26 +4248,32 @@ Value Lowerer::tryLowerShapeSubscript(hc_front::SubscriptOp op, Value baseVal,
 // Property-style launch-geo subscript fold:
 // `base.local_id[N]` -> `hc.getitem(launch-geo-tuple, N)`.
 //
-// Tri-state return: `failure()` means a diagnostic has already fired (the
-// caller must propagate, not fall through to the generic path);
-// `success(null Value)` means "didn't match, try the next pattern";
-// `success(non-null Value)` is the lowered result.
+// The launch-geo op itself is emitted by `lowerAttr` (a post-order walk
+// guarantees the attr has been lowered before this subscript runs); we
+// only need to peel the cached tuple here. Tri-state return:
+// `failure()` means a diagnostic has already fired (the caller must
+// propagate, not fall through to the generic path); `success(null
+// Value)` means "didn't match, try the next pattern"; `success(non-null
+// Value)` is the lowered result.
 FailureOr<Value>
 Lowerer::tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
-                                        hc_front::AttrOp attr, Value baseVal,
-                                        Value idxVal, IntegerAttr ax) {
+                                        hc_front::AttrOp attr, Value idxVal,
+                                        IntegerAttr ax) {
   std::optional<LaunchGeoMethodInfo> methodInfo =
       classifyLaunchGeoMethod(attr.getName());
-  if (!baseVal || !idxVal || !methodInfo)
+  if (!idxVal || !methodInfo)
     return Value();
   if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
     return failure();
-  std::optional<unsigned> requiredRank =
-      getStaticLaunchGeometryRank(attr.getBase(), attr.getName());
-  Value v = tryEmitLaunchGeo(*methodInfo, baseVal, op.getLoc(), requiredRank);
-  if (!v)
+  FailureOr<Value> attrValOr =
+      lowerValueOperand(attr.getResult(), op.getOperation(), "launch-geo attr");
+  if (failed(attrValOr))
+    return failure();
+  Value attrVal = *attrValOr;
+  if (!attrVal)
     return Value();
-  return Value(HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal));
+  return Value(
+      HCGetItemOp::create(builder, op.getLoc(), undef, attrVal, idxVal));
 }
 
 // Property-style `base.method[N]` folds. Tri-state: see
@@ -4202,16 +4286,22 @@ FailureOr<Value> Lowerer::tryLowerAttrSubscript(hc_front::SubscriptOp op,
       op.getIndices().front(), op.getOperation(), "subscript index");
   if (failed(idxValOr))
     return failure();
-  FailureOr<Value> baseValOr =
-      lowerValueOperand(attr.getBase(), op.getOperation(), "subscript base");
-  if (failed(baseValOr))
-    return failure();
   Value idxVal = *idxValOr;
-  Value baseVal = *baseValOr;
   IntegerAttr ax = indexConstantAxisAttr(idxVal);
-  if (attr.getName() == "shape")
-    return Value(tryLowerShapeSubscript(op, baseVal, ax));
-  return tryLowerLaunchGeoAttrSubscript(op, attr, baseVal, idxVal, ax);
+  if (attr.getName() == "shape") {
+    // `x.shape[N]` only makes sense for buffer/tensor/vector bases;
+    // the buffer-dim fold needs the base SSA value, not the cached
+    // attr value (which is null for `shape` today). Launch-context
+    // `shape` access (e.g. `group.shape[N]`) still falls through here
+    // and emits buffer_dim — resolving that correctly needs a
+    // type-aware dispatch on the base's launch-context vs buffer kind.
+    FailureOr<Value> baseValOr =
+        lowerValueOperand(attr.getBase(), op.getOperation(), "subscript base");
+    if (failed(baseValOr))
+      return failure();
+    return Value(tryLowerShapeSubscript(op, *baseValOr, ax));
+  }
+  return tryLowerLaunchGeoAttrSubscript(op, attr, idxVal, ax);
 }
 
 // Call-style `base.method()[N]` fold for launch-geo getters: lowers the
@@ -4254,6 +4344,14 @@ FailureOr<Value> Lowerer::tryLowerCallSubscript(hc_front::SubscriptOp op,
 Lowerer::SubscriptFoldResult
 Lowerer::trySubscriptFolds(hc_front::SubscriptOp op) {
   Operation *baseOp = op.getBase().getDefiningOp();
+  // Locally-bound aliases (e.g. `gid = group.work_offset; gid[0]`)
+  // route through the same fold path as the inline `group.work_offset[0]`
+  // form. The launch-geo / buffer-dim helpers only need the AttrOp or
+  // CallOp at the source of the binding, not the `hc.name_load` SSA
+  // value that the local read lowers to.
+  if (auto nameOp = dyn_cast_if_present<hc_front::NameOp>(baseOp))
+    if (Operation *src = traceLocalNameSourceOp(nameOp))
+      baseOp = src;
   if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(baseOp)) {
     FailureOr<Value> lowered = tryLowerAttrSubscript(op, attr);
     if (failed(lowered))

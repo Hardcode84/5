@@ -17,6 +17,13 @@ from examples.amdgpu_gfx11_wmma_matmul import (
     simulate_gfx11_wmma_matmul,
     tiled_gfx11_wmma_matmul,
 )
+from examples.pairwise_distance import (
+    make_demo_inputs as make_pairwise_inputs,
+)
+from examples.pairwise_distance import (
+    reference_pairwise_distance,
+    simulate_pairwise_distance,
+)
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
@@ -152,6 +159,30 @@ def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> 
 
     out = c_dev.cpu().numpy()
     np.testing.assert_allclose(out, expected, rtol=0.0, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    ("w1", "w2", "h"),
+    [(6, 5, 4), (8, 8, 3), (3, 7, 5)],
+)
+def test_pairwise_distance_simulator_matches_numpy(w1: int, w2: int, h: int) -> None:
+    """End-to-end simulator pass for the langref WG-level pairwise distance.
+
+    Pins the workgroup-level pairwise Euclidean distance kernel from
+    `doc/langref.md` against a plain NumPy reference. Broadcasting axes
+    are corrected from the langref text (which writes the result
+    transposed); the per-element contract matches the workitem-level
+    form in the same doc section. The frontend-to-hc pipeline doesn't
+    cover this kernel yet — see the open gaps tracker for the missing
+    pieces (Pow binop, tensor reductions, group.shape subscript,
+    None-axis broadcast, work-offset symbol binding downstream of the
+    elementwise pipeline).
+    """
+
+    x1, x2 = make_pairwise_inputs(w1=w1, w2=w2, h=h, seed=29)
+    out = simulate_pairwise_distance(x1, x2)
+    ref = reference_pairwise_distance(x1, x2)
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-6)
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

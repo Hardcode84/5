@@ -199,6 +199,51 @@ func.func @as_layout_buffer_noninjective(
                                      offset = #hc.expr<"j">>>
 }
 
+// `hc.as_layout` on a `!hc.buffer` operand can also change rank /
+// shape via the optional `shape=` SSA operand: a 2-D buffer whose
+// `(WMMA_M, WMMA_N)` extent is the source-side layout's allocation
+// proxy can be reinterpreted as a 2-D `(WAVE_LANES,
+// WMMA_ACC_FRAGMENT)` layout-bearing view whose flat storage_size
+// still resolves to `WMMA_M*WMMA_N`. The declared shape rides on the
+// shape= operand because the layout's `shape_syms` don't bind to the
+// operand's named dims — pointer storage and reinterpreted extent
+// are independent under buffer roots, and the verifier short-circuits
+// the storage_size structural check for the same reason.
+// CHECK-LABEL: func.func @as_layout_buffer_shape_change
+// CHECK: hc.as_layout %{{.*}}, layout = (#hc.layout<{{.*}}offset = #hc.expr<"32*fi + lane">>), shape = %{{.*}} : tuple<!hc.idx<"WAVE_LANES">, !hc.idx<"WMMA_ACC_FRAGMENT">>
+// CHECK-SAME: : !hc.buffer<f32, ["WMMA_M", "WMMA_N"]>
+// CHECK-SAME: -> !hc.buffer<f32, ["WAVE_LANES", "WMMA_ACC_FRAGMENT"]
+func.func @as_layout_buffer_shape_change(
+    %buf: !hc.buffer<f32, ["WMMA_M", "WMMA_N"]>,
+    %shape: tuple<!hc.idx<"WAVE_LANES">, !hc.idx<"WMMA_ACC_FRAGMENT">>)
+    -> !hc.buffer<f32, ["WAVE_LANES", "WMMA_ACC_FRAGMENT"],
+                  #hc.layout<shape_syms = ["wl", "waf"],
+                             index_syms = ["lane", "fi"],
+                             params = {},
+                             storage_size = #hc.expr<"WMMA_M*WMMA_N">,
+                             offset = #hc.expr<"lane + fi * 32">>> {
+  %v = hc.as_layout %buf,
+       layout = (#hc.layout<shape_syms = ["wl", "waf"],
+                            index_syms = ["lane", "fi"],
+                            params = {},
+                            storage_size = #hc.expr<"WMMA_M*WMMA_N">,
+                            offset = #hc.expr<"lane + fi * 32">>),
+       shape = %shape : tuple<!hc.idx<"WAVE_LANES">, !hc.idx<"WMMA_ACC_FRAGMENT">>
+       : !hc.buffer<f32, ["WMMA_M", "WMMA_N"]>
+         -> !hc.buffer<f32, ["WAVE_LANES", "WMMA_ACC_FRAGMENT"],
+                       #hc.layout<shape_syms = ["wl", "waf"],
+                                  index_syms = ["lane", "fi"],
+                                  params = {},
+                                  storage_size = #hc.expr<"WMMA_M*WMMA_N">,
+                                  offset = #hc.expr<"lane + fi * 32">>>
+  return %v : !hc.buffer<f32, ["WAVE_LANES", "WMMA_ACC_FRAGMENT"],
+                          #hc.layout<shape_syms = ["wl", "waf"],
+                                     index_syms = ["lane", "fi"],
+                                     params = {},
+                                     storage_size = #hc.expr<"WMMA_M*WMMA_N">,
+                                     offset = #hc.expr<"lane + fi * 32">>>
+}
+
 // CHECK-LABEL: func.func @allocators
 // CHECK: hc.vzeros shape %{{.*}} : (tuple<!hc.undef, !hc.undef>) -> !hc.vector<f32, ["16", "16"]>
 // CHECK: hc.vones shape %{{.*}} : (tuple<!hc.undef>) -> !hc.vector<i1, ["16"]>

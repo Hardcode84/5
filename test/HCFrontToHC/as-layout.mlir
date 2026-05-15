@@ -99,6 +99,55 @@ module {
 
 // -----
 
+// Buffer-rooted `as_layout(buf, LAY, shape=(...))` carries the
+// reinterpreted extent on the optional `shape=` operand. Pointer
+// storage and layout extent are independent under buffer roots, so
+// the user has to declare the new shape explicitly; the verifier
+// short-circuits the storage_size structural check (see
+// `HCAsLayoutOp::verify`'s buffer guard).
+
+// CHECK-LABEL: hc.kernel @uses_as_layout_shape
+// CHECK: %[[V:.*]] = hc.name_load "v"
+// CHECK: %[[T:.*]] = hc.tuple
+// CHECK: %[[R:.*]] = hc.as_layout %[[V]]
+// CHECK-SAME: layout = (#hc.layout<
+// CHECK-SAME: shape = %[[T]]
+
+module {
+  hc_front.kernel "uses_as_layout_shape" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %layout_fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %descriptor = hc_front.name "A_LAYOUT"
+        {ctx = "load",
+         ref = {
+           kind = "layout",
+           shape_syms = ["w", "h"],
+           index_syms = ["i", "j"],
+           params = {},
+           storage_size = #hc.expr<"0">,
+           offset = #hc.expr<"i + j">
+         }}
+    %w = hc_front.name "W" {ctx = "load", ref = {kind = "local"}}
+    %h = hc_front.name "H" {ctx = "load", ref = {kind = "local"}}
+    %shape_tup = hc_front.tuple(%w, %h)
+    %shape_kw = hc_front.keyword "shape" = %shape_tup
+    %relabeled = hc_front.call %layout_fn(%v, %descriptor, %shape_kw)
+    %tgt = hc_front.target_name "w_relabeled"
+    hc_front.assign %tgt = %relabeled
+    hc_front.return
+  }
+}
+
+// -----
+
 // `as_layout(value, None)` is the user-marked strip boundary: the
 // None literal arrives as an `hc_front.constant` carrying the
 // `python_kind = "NoneType"` stamp (see ``_constant_kind`` in

@@ -265,7 +265,10 @@ public:
 // `hc.as_layout(%v, L2)` by reaching past the inner op's source. The
 // conversion driver runs to fixpoint, so chains of any length collapse
 // without us hand-rolling a worklist; the inner op is dropped by DCE
-// once nothing references it.
+// once nothing references it. The outer op's `shape=` (when present)
+// stays the surviving shape — `shape=` declares the reinterpreted
+// extent at the outer relabel boundary, and the inner relabel's
+// reinterpretation is what's getting collapsed away.
 struct CollapseAsLayoutChain : public OpConversionPattern<HCAsLayoutOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -276,7 +279,7 @@ struct CollapseAsLayoutChain : public OpConversionPattern<HCAsLayoutOp> {
     if (!inner)
       return rewriter.notifyMatchFailure(op, "operand is not an as_layout");
     rewriter.replaceOpWithNewOp<HCAsLayoutOp>(
-        op, op.getType(), inner.getValue(), op.getLayoutAttr());
+        op, op.getType(), inner.getValue(), op.getShape(), op.getLayoutAttr());
     return success();
   }
 };

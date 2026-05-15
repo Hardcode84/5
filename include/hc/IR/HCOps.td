@@ -1016,15 +1016,26 @@ def HCAsLayoutOp : HC_Op<"as_layout",
     accepted on either side: the relabel is a pure type op and
     composes with the source decomposition that introduces the
     bare carriers.
+
+    Pointer-rooted (`!hc.buffer`) operands additionally accept the
+    optional `shape=` SSA operand to declare the reinterpreted
+    extent. The buffer's named dims are a proxy for its logical
+    extent — pointer storage and logical extent are independent
+    concepts — so the new shape rides on the op rather than being
+    derived from the operand's dims. Tensor/vector operands have
+    dims as part of their value semantics; `shape=` is meaningless
+    there and the frontend rejects it.
   }];
   let arguments = (ins
     HC_AnyShapedValueType:$value,
+    Optional<HC_TupleValueType>:$shape,
     HC_LayoutAttr:$layout
   );
   let results = (outs HC_AnyShapedValueType:$result);
   let assemblyFormat = [{
-    $value `,` `layout` `=` custom<HCAsLayoutAttr>($layout) attr-dict `:`
-    type($value) `->` type($result)
+    $value `,` `layout` `=` custom<HCAsLayoutAttr>($layout)
+    (`,` `shape` `=` $shape^ `:` type($shape))?
+    attr-dict `:` type($value) `->` type($result)
   }];
   let hasVerifier = 1;
 }

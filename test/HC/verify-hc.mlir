@@ -583,6 +583,37 @@ module {
 
 // -----
 
+// `hc.as_layout` with a `shape=` operand requires a pointer-rooted
+// (`!hc.buffer`) source. Tensor / vector operands carry their dims as
+// part of value semantics, so an external shape would create two
+// sources of truth (and the storage_size verifier would still trip).
+// Diagnose at the op so the user sees the misuse at the call site
+// rather than tracking it to a downstream type-mismatch.
+// CHECK: error: 'hc.as_layout' op `shape=` operand is only valid on a `!hc.buffer` operand; got '!hc.tensor<f32, ["M", "N"]>'
+module {
+  func.func @bad(
+      %src: !hc.tensor<f32, ["M", "N"]>,
+      %shape: tuple<!hc.idx<"A">, !hc.idx<"B">>) {
+    %v = hc.as_layout %src,
+         layout = (#hc.layout<shape_syms = ["a", "b"],
+                              index_syms = ["i", "j"],
+                              params = {},
+                              storage_size = #hc.expr<"a*b">,
+                              offset = #hc.expr<"j + b*i">>),
+         shape = %shape : tuple<!hc.idx<"A">, !hc.idx<"B">>
+         : !hc.tensor<f32, ["M", "N"]>
+           -> !hc.tensor<f32, ["A", "B"],
+                         #hc.layout<shape_syms = ["a", "b"],
+                                    index_syms = ["i", "j"],
+                                    params = {},
+                                    storage_size = #hc.expr<"a*b">,
+                                    offset = #hc.expr<"j + b*i">>>
+    return
+  }
+}
+
+// -----
+
 // `hc.strip_layout` result must have a null layout slot. The op
 // exists exactly to drop the layout at a user-marked boundary; a
 // layout-bearing result is a frontend bug — spell `hc.as_layout`

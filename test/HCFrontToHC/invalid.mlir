@@ -769,6 +769,66 @@ module {
 
 // -----
 
+// `as_layout` accepts only `shape=` as a kwarg; anything else is a
+// resolver bug. Diagnose at the call site so users follow the chain
+// back to the offending kwarg name.
+module {
+  hc_front.kernel "bad_as_layout_unknown_kwarg" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %d = hc_front.name "D" {ctx = "load", ref = {
+      kind = "layout", shape_syms = ["d0"], index_syms = ["i0"],
+      params = {}, storage_size = #hc.expr<"0">, offset = #hc.expr<"i0">}}
+    %junk = hc_front.constant <"junk">
+    %kw = hc_front.keyword "stride" = %junk
+    // expected-error@+1 {{as_layout accepts only `shape=` as a keyword argument; got `stride=`}}
+    %r = hc_front.call %fn(%v, %d, %kw)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}
+
+// -----
+
+// `as_layout(value, None, shape=...)` is the strip-layout boundary
+// with an attached extent — there's nothing to declare an extent on
+// after a strip, so diagnose against the call site rather than
+// silently dropping the `shape=` operand.
+module {
+  hc_front.kernel "bad_strip_with_shape" attributes {
+    decorators = ["kernel"],
+    group_shape = ["32"],
+    parameters = [{name = "group"}],
+    returns = "None",
+    subgroup_size = 32 : i32,
+    work_shape = ["M"]
+  } {
+    %v = hc_front.name "v" {ctx = "load", ref = {kind = "local"}}
+    %fn = hc_front.name "as_layout"
+        {ctx = "load", ref = {kind = "layout_op", op = "as_layout"}}
+    %none = hc_front.constant <"None"> {python_kind = "NoneType"}
+    %w = hc_front.name "W" {ctx = "load", ref = {kind = "local"}}
+    %tup = hc_front.tuple(%w)
+    %kw = hc_front.keyword "shape" = %tup
+    // expected-error@+1 {{as_layout(value, None) is the strip-layout boundary and does not accept `shape=`}}
+    %r = hc_front.call %fn(%v, %none, %kw)
+    %t = hc_front.target_name "r"
+    hc_front.assign %t = %r
+    hc_front.return
+  }
+}
+
+// -----
+
 // `store` doesn't produce a shaped result, so `layout=` is a no-op
 // (or a user-side bug). Diagnose at the call site instead of silently
 // dropping the kwarg.

@@ -1921,6 +1921,43 @@ verifyAsLayoutStorageSize(HCAsLayoutOp op, Type valueType, Type resultType,
   return success();
 }
 
+// `shape=` is only meaningful for pointer-rooted operands —
+// tensor / vector dims are part of value semantics and a separate-
+// shape SSA on top would create two sources of truth. Diagnose once
+// at op creation rather than letting the downstream storage_size
+// check (which would still trip) produce a less direct error.
+static LogicalResult verifyAsLayoutShapeOperand(HCAsLayoutOp op,
+                                                Type valueType) {
+  Value shape = op.getShape();
+  if (!shape)
+    return success();
+  if (valueType && !isHCUndefType(valueType) && !isa<BufferType>(valueType))
+    return op.emitOpError(
+               "`shape=` operand is only valid on a `!hc.buffer` operand; got ")
+           << valueType;
+  Type shapeT = shape.getType();
+  if (shapeT && !isHCUndefType(shapeT) && !isa<TupleType>(shapeT))
+    return op.emitOpError("`shape=` operand must be a tuple, got ") << shapeT;
+  return success();
+}
+
+// Both sides shaped: check element type, then (when shapes are
+// crystallized) the storage_size invariant. Pulled out so the outer
+// `HCAsLayoutOp::verify` stays a flat one-step-per-line driver.
+static LogicalResult
+verifyAsLayoutShapedSides(HCAsLayoutOp op, Type valueType, Type resultType,
+                          SymbolicallyShapedTypeInterface valueShaped,
+                          SymbolicallyShapedTypeInterface resultShaped) {
+  if (failed(verifyAsLayoutElementType(op, valueShaped, resultShaped)))
+    return failure();
+  ShapeAttr valueShape = valueShaped.getSymbolicShape();
+  ShapeAttr resultShape = resultShaped.getSymbolicShape();
+  if (!valueShape || !resultShape)
+    return success();
+  return verifyAsLayoutStorageSize(op, valueType, resultType, valueShaped,
+                                   valueShape, resultShape);
+}
+
 LogicalResult HCAsLayoutOp::verify() {
   // Progressive typing: any side still on `!hc.undef` (the v0
   // placeholder before inference fills in) can't be checked yet —
@@ -1932,6 +1969,9 @@ LogicalResult HCAsLayoutOp::verify() {
   // their dims.
   Type valueType = getValue().getType();
   Type resultType = getResult().getType();
+  if (failed(verifyAsLayoutShapeOperand(*this, valueType)))
+    return failure();
+
   if (!valueType || !resultType || isHCUndefType(valueType) ||
       isHCUndefType(resultType))
     return success();
@@ -1941,16 +1981,8 @@ LogicalResult HCAsLayoutOp::verify() {
   if (!valueShaped || !resultShaped)
     return success();
 
-  if (failed(verifyAsLayoutElementType(*this, valueShaped, resultShaped)))
-    return failure();
-
-  ShapeAttr valueShape = valueShaped.getSymbolicShape();
-  ShapeAttr resultShape = resultShaped.getSymbolicShape();
-  if (!valueShape || !resultShape)
-    return success();
-
-  return verifyAsLayoutStorageSize(*this, valueType, resultType, valueShaped,
-                                   valueShape, resultShape);
+  return verifyAsLayoutShapedSides(*this, valueType, resultType, valueShaped,
+                                   resultShaped);
 }
 
 LogicalResult HCLoadMaskOp::verify() {

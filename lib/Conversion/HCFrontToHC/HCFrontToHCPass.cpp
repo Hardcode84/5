@@ -1628,8 +1628,20 @@ private:
   FailureOr<Value> lowerLayoutOpCall(hc_front::CallOp op, const RefInfo &ref);
 
   // Validate that an `as_layout(...)` call has exactly two positional
-  // arguments and no kwargs.
+  // arguments and an optional `shape=` kwarg.
   LogicalResult validateAsLayoutCallShape(hc_front::CallOp op, ValueRange args);
+
+  // `as_layout(value, descriptor, *, shape=?)` carries kwargs alongside
+  // positionals on a single `hc_front.call` argument list. The descriptor
+  // arrives as an `hc_front.name` whose `valueMap` entry is null by
+  // design (its ref carries structured `LayoutAttr` pieces); separating
+  // positionals from kwargs lets `lowerLayoutOpCall` lower each piece
+  // through the right path.
+  struct AsLayoutCallSplit {
+    SmallVector<Value, 2> positional;
+    Value shapeKwValue;
+  };
+  AsLayoutCallSplit splitAsLayoutCallArgs(ValueRange args);
 
   // Wrap a freshly-emitted tensor/vector result in `hc.as_layout` when
   // the originating call carried a `layout=` kwarg. Returns the
@@ -3461,31 +3473,64 @@ static bool isAsLayoutNoneSentinel(Value descriptor) {
   return kind && kind.getValue() == "NoneType";
 }
 
-// Validate the call shape `as_layout(value, descriptor)` — exactly
-// two positional arguments and no kwargs.
+// Validate the call shape `as_layout(value, descriptor, *, shape=?)`
+// — exactly two positionals, optional `shape=` kwarg, nothing else.
+// Tensor / vector callers (the verifier rejects `shape=` on those
+// flavors) must leave `shape=` absent; pointer-rooted (`!hc.buffer`)
+// callers use it to declare the layout's reinterpreted extent.
 LogicalResult Lowerer::validateAsLayoutCallShape(hc_front::CallOp op,
                                                  ValueRange args) {
-  if (args.size() != 2) {
-    op.emitOpError("as_layout expects 2 positional arguments "
-                   "(value, layout descriptor); got ")
-        << args.size();
-    return failure();
-  }
+  // Drop kwargs before counting positionals — the same call may carry
+  // a `shape=` kwarg, and `args.size()` includes both kinds.
+  unsigned positional = 0;
+  bool seenShape = false;
   for (Value v : args) {
     if (keywordInfo.contains(v)) {
-      op.emitOpError("as_layout does not accept keyword arguments");
+      auto kw = v.getDefiningOp<hc_front::KeywordOp>();
+      if (kw && kw.getName() == "shape") {
+        if (seenShape) {
+          op.emitOpError("as_layout `shape=` kwarg appears more than once");
+          return failure();
+        }
+        seenShape = true;
+        continue;
+      }
+      op.emitOpError("as_layout accepts only `shape=` as a keyword "
+                     "argument; got `")
+          << (kw ? kw.getName() : StringRef{"<unknown>"}) << "=`";
       return failure();
     }
+    ++positional;
+  }
+  if (positional != 2) {
+    op.emitOpError("as_layout expects 2 positional arguments "
+                   "(value, layout descriptor); got ")
+        << positional;
+    return failure();
   }
   return success();
+}
+
+Lowerer::AsLayoutCallSplit Lowerer::splitAsLayoutCallArgs(ValueRange args) {
+  AsLayoutCallSplit out;
+  for (Value arg : args) {
+    auto kwIt = keywordInfo.find(arg);
+    if (kwIt == keywordInfo.end()) {
+      out.positional.push_back(arg);
+      continue;
+    }
+    if (kwIt->second.name == "shape")
+      out.shapeKwValue = kwIt->second.loweredValue;
+  }
+  return out;
 }
 
 FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
                                             const RefInfo &ref) {
   // Today the only ``layout_op`` primitive is ``as_layout(value,
-  // descriptor)``. The dispatch is keyed on the ref's `op` string so we
-  // can grow more primitives (`as_dense`, mask-rebinders, ...) without
-  // touching this switch's neighbors.
+  // descriptor, *, shape=?)``. The dispatch is keyed on the ref's `op`
+  // string so we can grow more primitives (`as_dense`, mask-rebinders,
+  // ...) without touching this switch's neighbors.
   StringRef opName = ref.getString("op");
   if (opName != "as_layout") {
     op.emitOpError("unsupported layout_op '") << opName << "'";
@@ -3496,8 +3541,10 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
   if (failed(validateAsLayoutCallShape(op, args)))
     return failure();
 
-  FailureOr<Value> valueOr =
-      lowerValueOperand(args[0], op.getOperation(), "as_layout value");
+  AsLayoutCallSplit split = splitAsLayoutCallArgs(args);
+
+  FailureOr<Value> valueOr = lowerValueOperand(
+      split.positional[0], op.getOperation(), "as_layout value");
   if (failed(valueOr))
     return failure();
   Value value = *valueOr;
@@ -3506,16 +3553,23 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
     return failure();
   }
 
-  if (isAsLayoutNoneSentinel(args[1]))
+  if (isAsLayoutNoneSentinel(split.positional[1])) {
+    if (split.shapeKwValue) {
+      op.emitOpError("as_layout(value, None) is the strip-layout "
+                     "boundary and does not accept `shape=`");
+      return failure();
+    }
     return {HCStripLayoutOp::create(builder, op.getLoc(), undef, value)
                 .getResult()};
+  }
 
-  FailureOr<LayoutAttr> layout =
-      readLayoutFromValue(args[1], op.getOperation(), "as_layout layout");
+  FailureOr<LayoutAttr> layout = readLayoutFromValue(
+      split.positional[1], op.getOperation(), "as_layout layout");
   if (failed(layout))
     return failure();
 
-  return {HCAsLayoutOp::create(builder, op.getLoc(), undef, value, *layout)
+  return {HCAsLayoutOp::create(builder, op.getLoc(), undef, value,
+                               split.shapeKwValue, *layout)
               .getResult()};
 }
 

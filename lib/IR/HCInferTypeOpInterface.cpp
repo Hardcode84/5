@@ -1461,9 +1461,85 @@ HCCallIntrinsicOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+// Apply the op's `layout` attribute to a (operand) shaped type's
+// flavor, preserving element type and shape. Returns null when the
+// flavor isn't one we know how to retype (buffer is handled by the
+// caller, which also has to pull the new shape off the optional shape
+// operand). Mirrors `stripLayoutForCarrier` on the strip side.
+static Type applyLayoutToCarrier(Type valueType, Type elementType,
+                                 ShapeAttr shape, LayoutAttr layout,
+                                 MLIRContext *ctx) {
+  if (isa<mlir::hc::VectorType>(valueType))
+    return mlir::hc::VectorType::get(ctx, elementType, shape, layout);
+  if (isa<mlir::hc::BareVectorType>(valueType))
+    return mlir::hc::BareVectorType::get(ctx, elementType, shape, layout);
+  if (isa<mlir::hc::TensorType>(valueType))
+    return mlir::hc::TensorType::get(ctx, elementType, shape, layout);
+  if (isa<mlir::hc::BareTensorType>(valueType))
+    return mlir::hc::BareTensorType::get(ctx, elementType, shape, layout);
+  return {};
+}
+
+// Buffer-rooted as_layout: result is a fresh `!hc.buffer` carrying
+// the op's layout. When the op has a `shape=` operand, the declared
+// shape from the tuple type drives the result; without it, the
+// operand's dims pass through so a no-op relabel stays well-typed.
+static Type inferAsLayoutBufferResult(BufferType buffer, Type shapeType,
+                                      LayoutAttr layout, MLIRContext *ctx) {
+  ShapeAttr resultShape = buffer.getShape();
+  if (shapeType && !isHCUndefType(shapeType))
+    if (ShapeAttr declared = getStaticShapeFromTupleType(shapeType))
+      resultShape = declared;
+  return mlir::hc::BufferType::get(ctx, buffer.getElementType(), resultShape,
+                                   layout);
+}
+
+// Value-semantic operand (tensor / vector, bare or not): bake the
+// op's layout onto the operand's existing element type and shape.
+// Returns the unchanged operand type when the shape couldn't be
+// recovered structurally — the verifier still pins the storage_size
+// invariant downstream.
+static Type inferAsLayoutShapedResult(Type valueType, LayoutAttr layout,
+                                      MLIRContext *ctx) {
+  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(valueType);
+  if (!shaped)
+    return valueType;
+  Type elementType = shaped.getSymbolicElementType();
+  ShapeAttr shape = shaped.getSymbolicShape();
+  if (!elementType || !shape)
+    return valueType;
+  Type relabelled =
+      applyLayoutToCarrier(valueType, elementType, shape, layout, ctx);
+  return relabelled ? relabelled : valueType;
+}
+
 LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                          SmallVectorImpl<Type> &resultTypes) {
-  resultTypes.push_back(operandTypes.empty() ? Type{} : operandTypes.front());
+  // operandTypes is [value, (shape?)]; the shape slot is only present
+  // when the op carries a `shape=` operand (buffer-rooted only — the
+  // verifier rejects shape= on tensor/vector).
+  Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
+  Type shapeType =
+      (getShape() && operandTypes.size() > 1) ? operandTypes[1] : Type{};
+
+  // Pre-inference operand → preserve any refined result type the
+  // frontend may have stamped (e.g. a buffer-rooted `as_layout` whose
+  // result was pre-typed from the shape kwarg + layout). Without this
+  // a subsequent inference round would clobber the refined slot with
+  // `!hc.undef`.
+  if (!valueType || isHCUndefType(valueType)) {
+    resultTypes.push_back(getResult().getType());
+    return success();
+  }
+
+  if (auto buffer = dyn_cast<mlir::hc::BufferType>(valueType)) {
+    resultTypes.push_back(inferAsLayoutBufferResult(buffer, shapeType,
+                                                    getLayout(), getContext()));
+    return success();
+  }
+
+  resultTypes.push_back(
+      inferAsLayoutShapedResult(valueType, getLayout(), getContext()));
   return success();
 }
 

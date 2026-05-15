@@ -408,4 +408,33 @@ module {
     }
     return
   }
+
+  // `group.work_offset[k]` lowers to a `hc.idx_apply` whose expression
+  // names `$WO[k]` — the upper-left corner of the workgroup's tile in
+  // the work grid. Launch-body materialises the binding as
+  // `arith.muli %block_id_k, %block_size_k`, mirroring what every
+  // other launch-geometry sym does (`$WG` / `$WI` / `$WGS` bind off
+  // the gpu.launch operands directly; `$WO` is the only one that
+  // needs an actual arithmetic op). Axes 0 and 1 in the same kernel
+  // pin that the binding is per-axis, not just axis 0.
+  // CHECK-LABEL: func.func @work_offset_binding
+  // CHECK-SAME: %[[GX:[^:]+]]: index,
+  // CHECK-SAME: %[[GY:[^:]+]]: index,
+  // CHECK-SAME: %[[SX:[^:]+]]: index,
+  // CHECK-SAME: %[[SY:[^:]+]]: index
+  // CHECK: gpu.launch blocks(%[[BX:[^,]+]], %[[BY:[^,]+]], %{{[^)]+}})
+  // CHECK-DAG: %[[WO0:.+]] = arith.muli %[[BX]], %[[SX]] : index
+  // CHECK-DAG: %[[WO1:.+]] = arith.muli %[[BY]], %[[SY]] : index
+  // CHECK-NOT: hc.idx_apply
+  func.func @work_offset_binding(%gx: index, %gy: index,
+                                 %sx: index, %sy: index) {
+    %c1 = arith.constant 1 : index
+    gpu.launch blocks(%bx, %by, %bz) in (%gxr = %gx, %gyr = %gy, %gzr = %c1)
+               threads(%tx, %ty, %tz) in (%sxr = %sx, %syr = %sy, %szr = %c1) {
+      %off0 = hc.idx_apply () : () -> !hc.idx<"$WO0">
+      %off1 = hc.idx_apply () : () -> !hc.idx<"$WO1">
+      gpu.terminator
+    }
+    return
+  }
 }

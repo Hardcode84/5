@@ -516,6 +516,30 @@ static void bindLaunchDim3(StringRef prefix, gpu::KernelDim3 values,
   }
 }
 
+// `$WO[k] = $WG[k] * $WGS[k]`: the upper-left corner of the
+// workgroup's tile in the work grid, on axis `k`. The launch
+// already carries both factors as `index`-typed operands, so the
+// binding is one `arith.muli` per axis, planted at the rewriter's
+// current insertion point. CSE collapses the per-apply duplicates
+// downstream — keeping the materialisation here (rather than
+// substituting `$WO` -> `$WG*$WGS` symbolically before lowering)
+// matches the bind-then-lookup shape of every other launch-geometry
+// sym and leaves the symbol equivalence intact for any future
+// consumer that cares about the name.
+static void bindWorkOffsets(gpu::LaunchOp launch, OpBuilder &builder,
+                            Location loc, BoundValues &boundValues) {
+  gpu::KernelDim3 blockIds = launch.getBlockIds();
+  gpu::KernelDim3 blockSizes = launch.getBlockSizeOperandValues();
+  Value bi[] = {blockIds.x, blockIds.y, blockIds.z};
+  Value bs[] = {blockSizes.x, blockSizes.y, blockSizes.z};
+  for (auto axis : llvm::seq<size_t>(0, std::size(bi))) {
+    SmallString<8> name("$WO");
+    name += Twine(axis).str();
+    Value product = arith::MulIOp::create(builder, loc, bi[axis], bs[axis]);
+    boundValues.bind(name, product);
+  }
+}
+
 // Pre-flatten kernel-arg UCC: single multi-input bundle → single
 // buffer output. The buffer carries shape syms (M, N, ...) and the
 // inputs give us per-axis dim values.
@@ -613,6 +637,7 @@ static BoundValues collectBoundValues(Operation *anchor,
   bindLaunchDim3("$WG", launch.getBlockIds(), boundValues);
   bindLaunchDim3("$WI", launch.getThreadIds(), boundValues);
   bindLaunchDim3("$WGS", launch.getBlockSizeOperandValues(), boundValues);
+  bindWorkOffsets(launch, rewriter, anchor->getLoc(), boundValues);
 
   launch.walk([&](UnrealizedConversionCastOp cast) {
     bindKernelArgCastSymbols(cast, rewriter, anchor->getLoc(), boundValues);

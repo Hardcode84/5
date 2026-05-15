@@ -1614,6 +1614,8 @@ private:
                                        const CallArgs &args);
   FailureOr<Value> lowerUnaryBaseMethod(hc_front::CallOp call, StringRef method,
                                         Value base, const CallArgs &args);
+  FailureOr<Value> lowerReduceMethod(hc_front::CallOp call, StringRef method,
+                                     Value base, const CallArgs &args);
   FailureOr<Value> lowerMemOp(hc_front::CallOp call, StringRef method,
                               const CallArgs &args);
   FailureOr<Value> lowerMemLoad(hc_front::CallOp call, StringRef method,
@@ -3521,6 +3523,15 @@ static bool isMemOpMethod(StringRef method) {
   return llvm::is_contained(kMemOps, method);
 }
 
+// Reductions live on every tensor-shaped value (the simulator surfaces
+// them on `_MaskedValue` and `np.<reducer>` on the carrier shape).
+// `prod` is listed here so the dispatcher can pin a clear "not yet
+// wired" diagnostic instead of leaking through as an unknown method.
+static bool isReduceMethod(StringRef method) {
+  return method == "sum" || method == "max" || method == "min" ||
+         method == "prod";
+}
+
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
                                              hc_front::AttrOp attr) {
   RefInfo ref = RefInfo::get(attr);
@@ -3556,6 +3567,13 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
 
   if (isUnaryBaseMethod(method))
     return lowerUnaryBaseMethod(call, method, base, args);
+  if (isReduceMethod(method)) {
+    if (!base) {
+      call.emitOpError(method) << ": base did not lower";
+      return failure();
+    }
+    return lowerReduceMethod(call, method, base, args);
+  }
   if (isMemOpMethod(method))
     return lowerMemOp(call, method, args);
   if (Value lowered = tryLowerLaunchGeoCall(call, method, args))
@@ -3771,6 +3789,186 @@ static FailureOr<Value> lowerAsTypeMethod(OpBuilder &builder, Type undef,
     return failure();
   }
   return {HCAsTypeOp::create(builder, call.getLoc(), undef, base, targetAttr)
+              .getResult()};
+}
+
+// `.sum` / `.max` / `.min` map onto the same `hc.reduce` op with three
+// different kinds. Naming the surface methods in one place keeps the
+// dispatcher mechanical and `lowerReduceMethod` decoupled from the
+// classifier's spelling list.
+static std::optional<ReduceKind> reduceMethodKind(StringRef method) {
+  if (method == "sum")
+    return ReduceKind::Sum;
+  if (method == "max")
+    return ReduceKind::Max;
+  if (method == "min")
+    return ReduceKind::Min;
+  return std::nullopt;
+}
+
+// Walk an SSA value back to the integer literal it represents, or
+// fail. Reductions live at the DSL boundary where `axis=N` arrives
+// as an `hc.const` over an `IntegerAttr` (the same shape the
+// classifier already emits for `np.<dtype>` literals, buffer-dim
+// indices, etc.). Anything else — a captured variable, a `range`
+// iteration variable, a `.shape[k]` query — leaks an SSA value that
+// won't fold here, and the dialect would reject the resulting
+// non-attr axis anyway.
+static FailureOr<int64_t> tryGetLiteralInt(Value v) {
+  auto constOp = v.getDefiningOp<HCConstOp>();
+  if (!constOp)
+    return failure();
+  auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+  if (!intAttr)
+    return failure();
+  return intAttr.getInt();
+}
+
+// Walk an SSA value back to the bool literal it represents, or
+// fail. Mirrors `tryGetLiteralInt` but tolerates the i1-or-i64
+// representation `hc.const` allows for boolean literals (the Python
+// emitter stamps `True`/`False` as i1 constants today).
+static FailureOr<bool> tryGetLiteralBool(Value v) {
+  auto constOp = v.getDefiningOp<HCConstOp>();
+  if (!constOp)
+    return failure();
+  if (auto boolAttr = dyn_cast<BoolAttr>(constOp.getValue()))
+    return boolAttr.getValue();
+  if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue()))
+    return intAttr.getInt() != 0;
+  return failure();
+}
+
+// Pick the axis SSA value out of `args`, accepting either a single
+// positional or an `axis=` kwarg but not both. Returns a null Value
+// (still wrapped in success) when no axis is supplied; the caller turns
+// that into the surface "axis required" diagnostic.
+static FailureOr<Value> pickReduceAxisOperand(hc_front::CallOp call,
+                                              StringRef method,
+                                              const CallArgs &args) {
+  Value axisVal;
+  bool fromPositional = false;
+  if (!args.positional.empty()) {
+    axisVal = args.positional.front();
+    fromPositional = true;
+    if (args.positional.size() > 1) {
+      call.emitOpError(method) << " takes at most one positional argument";
+      return failure();
+    }
+  }
+  auto axisKw = args.kwvalues.find("axis");
+  if (axisKw != args.kwvalues.end()) {
+    if (fromPositional) {
+      call.emitOpError(method) << " axis specified twice (positional + axis=)";
+      return failure();
+    }
+    axisVal = axisKw->second;
+  }
+  return axisVal;
+}
+
+// Decode the picked axis SSA value into a non-negative integer. Tuple
+// and `None` axis values get bespoke diagnostics — both would also
+// fail `tryGetLiteralInt`, but the specific messages tell the user
+// which surface form they wrote.
+static FailureOr<uint64_t> resolveReduceAxis(hc_front::CallOp call,
+                                             StringRef method, Value axisVal) {
+  if (axisVal.getDefiningOp<HCTupleOp>()) {
+    call.emitOpError(method)
+        << " tuple axis is not supported; use a single axis";
+    return failure();
+  }
+  if (auto axisConst = axisVal.getDefiningOp<HCConstOp>())
+    if (auto strAttr = dyn_cast<StringAttr>(axisConst.getValue());
+        strAttr && strAttr.getValue() == "None") {
+      call.emitOpError(method)
+          << " axis=None (full-tensor reduction) is not supported";
+      return failure();
+    }
+  FailureOr<int64_t> axisLit = tryGetLiteralInt(axisVal);
+  if (failed(axisLit)) {
+    call.emitOpError(method) << " axis must be a non-negative integer literal";
+    return failure();
+  }
+  if (*axisLit < 0) {
+    call.emitOpError(method) << " axis must be non-negative, got " << *axisLit;
+    return failure();
+  }
+  return static_cast<uint64_t>(*axisLit);
+}
+
+// Resolve the optional `keepdims=` kwarg. Absent => `false`; anything
+// not a bool literal => diagnose.
+static FailureOr<bool> resolveReduceKeepdims(hc_front::CallOp call,
+                                             StringRef method,
+                                             const CallArgs &args) {
+  auto kwIt = args.kwvalues.find("keepdims");
+  if (kwIt == args.kwvalues.end())
+    return false;
+  FailureOr<bool> kdLit = tryGetLiteralBool(kwIt->second);
+  if (failed(kdLit)) {
+    call.emitOpError(method) << " keepdims must be a bool literal";
+    return failure();
+  }
+  return *kdLit;
+}
+
+// Reject unknown kwargs after `axis` / `keepdims` have been consumed.
+// A misspelt `axes=` must not silently fall through as a no-axis
+// reduction and point the user at the wrong place.
+static LogicalResult rejectExtraReduceKwargs(hc_front::CallOp call,
+                                             StringRef method,
+                                             const CallArgs &args) {
+  for (auto &kv : args.kwvalues) {
+    StringRef name = kv.first();
+    if (name == "axis" || name == "keepdims")
+      continue;
+    call.emitOpError(method) << " unknown keyword argument '" << name << "'";
+    return failure();
+  }
+  return success();
+}
+
+// Lower `base.<sum|max|min>(axis=..., keepdims=?)` to `hc.reduce`. The
+// axis can arrive positionally (`.sum(2)`) or by keyword (`.sum(axis=2)`);
+// matches the numpy / simulator signature and is the only way to write a
+// reduction at the surface today. Keepdims defaults to false. Tuple axis
+// and `axis=None` are diagnosed via `resolveReduceAxis` rather than
+// silently folded — a full-tensor reduction needs a different lowering,
+// and the simulator doesn't accept a tuple form either. `prod` parses as
+// a reduction method so the dispatcher routes it here, but the dialect
+// doesn't carry the kind yet; reject it explicitly instead of crashing
+// on a missing enum case.
+FailureOr<Value> Lowerer::lowerReduceMethod(hc_front::CallOp call,
+                                            StringRef method, Value base,
+                                            const CallArgs &args) {
+  std::optional<ReduceKind> kindOpt = reduceMethodKind(method);
+  if (!kindOpt) {
+    call.emitOpError("reduction method '")
+        << method
+        << "' is not supported yet; only sum/max/min are wired through "
+           "`hc.reduce` today";
+    return failure();
+  }
+  FailureOr<Value> axisOr = pickReduceAxisOperand(call, method, args);
+  if (failed(axisOr))
+    return failure();
+  if (!*axisOr) {
+    call.emitOpError(method)
+        << " requires an `axis=` argument; full-tensor reductions are not "
+           "supported yet";
+    return failure();
+  }
+  FailureOr<uint64_t> axisLit = resolveReduceAxis(call, method, *axisOr);
+  if (failed(axisLit))
+    return failure();
+  FailureOr<bool> keepdims = resolveReduceKeepdims(call, method, args);
+  if (failed(keepdims))
+    return failure();
+  if (failed(rejectExtraReduceKwargs(call, method, args)))
+    return failure();
+  return {HCReduceOp::create(builder, call.getLoc(), undef, base, *kindOpt,
+                             *axisLit, *keepdims)
               .getResult()};
 }
 

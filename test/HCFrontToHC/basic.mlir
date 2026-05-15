@@ -688,4 +688,63 @@ module {
     %r = hc_front.binop "Pow"(%x, %y)
     hc_front.return %r
   }
+
+  // `t.sum(axis=2)` is the canonical surface for a reduction over one
+  // axis. The lowering reads the literal `axis=` kwarg into the typed
+  // `IntegerAttr` slot on `hc.reduce` and stamps the kind off the
+  // dsl_method name. Keepdims defaults to `false` — the printer
+  // suppresses the slot when it matches the default, so the CHECK
+  // line stops at `axis`.
+  // CHECK-LABEL: hc.func @reduce_sum_axis_kwarg
+  // CHECK: hc.reduce %arg0, kind = sum, axis = 2 : !hc.undef -> !hc.undef
+  // CHECK-NOT: hc.reduce
+  hc_front.func "reduce_sum_axis_kwarg" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<2 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    %r = hc_front.call %sum_attr(%ax_kw)
+    hc_front.return %r
+  }
+
+  // Positional axis (numpy's `np.sum(arr, 2)` surface) flows through
+  // the same path — `lowerReduceMethod` accepts the first positional
+  // as the axis when no `axis=` kwarg is present.
+  // CHECK-LABEL: hc.func @reduce_max_axis_positional
+  // CHECK: hc.reduce %arg0, kind = max, axis = 0 : !hc.undef -> !hc.undef
+  hc_front.func "reduce_max_axis_positional" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<0 : i64>
+    %max_attr = hc_front.attr %t, "max" {ref = {kind = "dsl_method", method = "max"}}
+    %r = hc_front.call %max_attr(%ax)
+    hc_front.return %r
+  }
+
+  // `keepdims=True` flips the optional bool slot on `hc.reduce` and
+  // the printer surfaces it. Boolean literals arrive as i1 `BoolAttr`
+  // on the const op; `tryGetLiteralBool` handles that spelling.
+  // CHECK-LABEL: hc.func @reduce_min_keepdims
+  // CHECK: hc.reduce %arg0, kind = min, axis = 1, keepdims = true : !hc.undef -> !hc.undef
+  hc_front.func "reduce_min_keepdims" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<1 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax
+    %kd = hc_front.constant<true>
+    %kd_kw = hc_front.keyword "keepdims" = %kd
+    %min_attr = hc_front.attr %t, "min" {ref = {kind = "dsl_method", method = "min"}}
+    %r = hc_front.call %min_attr(%ax_kw, %kd_kw)
+    hc_front.return %r
+  }
 }

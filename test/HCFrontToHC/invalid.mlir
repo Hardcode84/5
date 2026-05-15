@@ -892,3 +892,156 @@ module {
     hc_front.return
   }
 }
+
+// -----
+
+// `.sum()` without an axis is the full-tensor reduction surface. The
+// dialect's `hc.reduce` op carries a single int axis with no `None`
+// escape; surface the missing-axis form here rather than synthesise
+// an axis nobody wrote.
+module {
+  hc_front.func "sum_missing_axis" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum requires an `axis=` argument}}
+    %r = hc_front.call %sum_attr()
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// `.sum(axis=None)` is the explicit full-tensor form. Same gap as the
+// missing-axis case above, but the diagnostic names the literal
+// users actually typed so the message is obvious.
+module {
+  hc_front.func "sum_axis_none" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %none = hc_front.constant <"None"> {python_kind = "NoneType"}
+    %ax_kw = hc_front.keyword "axis" = %none
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum axis=None (full-tensor reduction) is not supported}}
+    %r = hc_front.call %sum_attr(%ax_kw)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// `.sum(axis=(0,1))` is the multi-axis reduction surface. `hc.reduce`
+// only carries one axis; reject tuples explicitly so the user gets
+// the "split into two reductions" cue instead of a verifier error
+// about a non-int axis attribute.
+module {
+  hc_front.func "sum_axis_tuple" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %a0 = hc_front.constant<0 : i64>
+    %a1 = hc_front.constant<1 : i64>
+    %tup = hc_front.tuple(%a0, %a1)
+    %ax_kw = hc_front.keyword "axis" = %tup
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum tuple axis is not supported}}
+    %r = hc_front.call %sum_attr(%ax_kw)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Negative axis is rejected at the front pass rather than letting it
+// reach `hc.reduce`'s own non-negative check — the message is then
+// attached to the call site users wrote, not the synthesized
+// reduce op.
+module {
+  hc_front.func "sum_axis_negative" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<-1 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum axis must be non-negative, got -1}}
+    %r = hc_front.call %sum_attr(%ax_kw)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Unknown kwargs (e.g. a typo'd `axes=`) are caught instead of
+// silently falling through and producing a missing-axis diagnostic
+// that points the user away from the actual mistake.
+module {
+  hc_front.func "sum_unknown_kwarg" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<0 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax
+    %typo = hc_front.constant<true>
+    %typo_kw = hc_front.keyword "keepdim" = %typo
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum unknown keyword argument 'keepdim'}}
+    %r = hc_front.call %sum_attr(%ax_kw, %typo_kw)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// Specifying axis twice (positional + kwarg) is ambiguous. Reject so
+// the user disambiguates rather than getting the silent kwarg-wins
+// behaviour that the simulator would also flag.
+module {
+  hc_front.func "sum_axis_twice" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax0 = hc_front.constant<0 : i64>
+    %ax1 = hc_front.constant<1 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax1
+    %sum_attr = hc_front.attr %t, "sum" {ref = {kind = "dsl_method", method = "sum"}}
+    // expected-error@+1 {{sum axis specified twice (positional + axis=)}}
+    %r = hc_front.call %sum_attr(%ax0, %ax_kw)
+    hc_front.return %r
+  }
+}
+
+// -----
+
+// `prod` lives on the bead's roadmap but `hc.reduce`'s kind enum
+// doesn't carry it yet. Surface the gap explicitly instead of
+// crashing on the missing case in the dispatcher's enum switch.
+module {
+  hc_front.func "prod_not_supported" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "t"}],
+    scope = "WorkGroup"
+  } {
+    %t = hc_front.name "t" {ctx = "load", ref = {kind = "param"}}
+    %ax = hc_front.constant<0 : i64>
+    %ax_kw = hc_front.keyword "axis" = %ax
+    %prod_attr = hc_front.attr %t, "prod" {ref = {kind = "dsl_method", method = "prod"}}
+    // expected-error@+1 {{reduction method 'prod' is not supported yet}}
+    %r = hc_front.call %prod_attr(%ax_kw)
+    hc_front.return %r
+  }
+}

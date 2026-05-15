@@ -128,6 +128,40 @@ static void printHCAsLayoutAttr(OpAsmPrinter &printer, Operation *op,
   printer << ")";
 }
 
+// Parse the `(%arg0: T, %arg1: T)` argument list — caller has already
+// consumed the leading `(`. Empty paren pair is allowed.
+static ParseResult
+parseSignatureArgList(OpAsmParser &parser,
+                      SmallVectorImpl<OpAsmParser::Argument> &arguments) {
+  if (succeeded(parser.parseOptionalRParen()))
+    return success();
+  if (failed(parser.parseArgumentList(arguments, AsmParser::Delimiter::None,
+                                      /*allowType=*/true,
+                                      /*allowAttrs=*/false)))
+    return failure();
+  return parser.parseRParen();
+}
+
+// Parse an optional `-> T`, `-> (T0, T1)`, or `-> ()` result clause.
+static ParseResult
+parseOptionalResultTypes(OpAsmParser &parser,
+                         SmallVectorImpl<Type> &resultTypes) {
+  if (failed(parser.parseOptionalArrow()))
+    return success();
+  if (failed(parser.parseOptionalLParen())) {
+    Type ty;
+    if (failed(parser.parseType(ty)))
+      return failure();
+    resultTypes.push_back(ty);
+    return success();
+  }
+  if (succeeded(parser.parseOptionalRParen()))
+    return success();
+  if (failed(parser.parseTypeList(resultTypes)))
+    return failure();
+  return parser.parseRParen();
+}
+
 // Parse an optional `(%arg0: T, %arg1: T) (-> T)?` signature. On success,
 // populates `arguments` with zero-or-more entry-block arguments and, when a
 // signature is present, stores the reconstructed `FunctionType` into
@@ -138,32 +172,11 @@ static ParseResult parseOptionalFunctionSignature(
     TypeAttr &functionTypeAttr) {
   if (!succeeded(parser.parseOptionalLParen()))
     return success();
-  if (failed(parser.parseOptionalRParen())) {
-    if (failed(parser.parseArgumentList(arguments, AsmParser::Delimiter::None,
-                                        /*allowType=*/true,
-                                        /*allowAttrs=*/false)))
-      return failure();
-    if (failed(parser.parseRParen()))
-      return failure();
-  }
+  if (failed(parseSignatureArgList(parser, arguments)))
+    return failure();
   SmallVector<Type> resultTypes;
-  if (succeeded(parser.parseOptionalArrow())) {
-    // `-> T`, `-> (T0, T1)`, or `-> ()` all round-trip; drop into the
-    // parenthesised branch on an opening paren, otherwise read a single
-    // type.
-    if (succeeded(parser.parseOptionalLParen())) {
-      if (failed(parser.parseOptionalRParen())) {
-        if (failed(parser.parseTypeList(resultTypes)) ||
-            failed(parser.parseRParen()))
-          return failure();
-      }
-    } else {
-      Type ty;
-      if (failed(parser.parseType(ty)))
-        return failure();
-      resultTypes.push_back(ty);
-    }
-  }
+  if (failed(parseOptionalResultTypes(parser, resultTypes)))
+    return failure();
   SmallVector<Type> inputTypes;
   inputTypes.reserve(arguments.size());
   for (auto &arg : arguments)
@@ -427,6 +440,76 @@ LogicalResult HCFuncOp::verify() {
 // `hc.intrinsic`.
 //===----------------------------------------------------------------------===//
 
+// Parse `<keyword> = <attr>` (where `<attr>` is the typed attribute
+// `T`) and add it under `attrName`. No-op when the keyword is absent.
+template <typename AttrT>
+static ParseResult
+parseOptionalKeywordCustomAttr(OpAsmParser &parser, StringRef keyword,
+                               StringAttr attrName, OperationState &result) {
+  if (failed(parser.parseOptionalKeyword(keyword)))
+    return success();
+  if (parser.parseEqual())
+    return failure();
+  AttrT attr;
+  if (parser.parseCustomAttributeWithFallback(attr, Type{}))
+    return failure();
+  result.addAttribute(attrName, attr);
+  return success();
+}
+
+// Same shape, but for builtin `ArrayAttr` values that are parsed via
+// generic `parseAttribute` rather than a dialect-specific custom hook.
+static ParseResult parseOptionalKeywordArrayAttr(OpAsmParser &parser,
+                                                 StringRef keyword,
+                                                 StringAttr attrName,
+                                                 OperationState &result) {
+  if (failed(parser.parseOptionalKeyword(keyword)))
+    return success();
+  if (parser.parseEqual())
+    return failure();
+  ArrayAttr attr;
+  if (parser.parseAttribute(attr))
+    return failure();
+  result.addAttribute(attrName, attr);
+  return success();
+}
+
+// Parse the required `scope = #hc.scope<...>` clause and stash the
+// attribute on `result`.
+static ParseResult parseIntrinsicScopeClause(OpAsmParser &parser,
+                                             OperationState &result) {
+  if (parser.parseKeyword("scope") || parser.parseEqual())
+    return failure();
+  ScopeAttr scope;
+  if (parser.parseCustomAttributeWithFallback(scope, Type{}))
+    return failure();
+  result.addAttribute(HCIntrinsicOp::getScopeAttrName(result.name), scope);
+  return success();
+}
+
+// Parse the four optional metadata keywords (`effects`,
+// `const_kwargs`, `parameters`, `keyword_only`) in declaration
+// order. Each is parsed as `<key> = <attr>` and absent keywords are a
+// no-op; the caller still gets a single failure short-circuit.
+static ParseResult parseIntrinsicMetadataKeywords(OpAsmParser &parser,
+                                                  OperationState &result) {
+  if (parseOptionalKeywordCustomAttr<EffectClassAttr>(
+          parser, "effects", HCIntrinsicOp::getEffectsAttrName(result.name),
+          result))
+    return failure();
+  if (parseOptionalKeywordArrayAttr(
+          parser, "const_kwargs",
+          HCIntrinsicOp::getConstKwargsAttrName(result.name), result))
+    return failure();
+  if (parseOptionalKeywordArrayAttr(
+          parser, "parameters",
+          HCIntrinsicOp::getParametersAttrName(result.name), result))
+    return failure();
+  return parseOptionalKeywordArrayAttr(
+      parser, "keyword_only",
+      HCIntrinsicOp::getKeywordOnlyAttrName(result.name), result);
+}
+
 ParseResult HCIntrinsicOp::parse(OpAsmParser &parser, OperationState &result) {
   StringAttr sym_nameAttr;
   if (parser.parseSymbolName(sym_nameAttr, SymbolTable::getSymbolAttrName(),
@@ -440,47 +523,9 @@ ParseResult HCIntrinsicOp::parse(OpAsmParser &parser, OperationState &result) {
   if (functionTypeAttr)
     result.addAttribute(getFunctionTypeAttrName(result.name), functionTypeAttr);
 
-  // `scope = #hc.scope<...>` is required on every intrinsic, so it is the
-  // one non-optional keyword here.
-  if (parser.parseKeyword("scope") || parser.parseEqual())
+  if (parseIntrinsicScopeClause(parser, result) ||
+      parseIntrinsicMetadataKeywords(parser, result))
     return failure();
-  ScopeAttr scope;
-  if (parser.parseCustomAttributeWithFallback(scope, Type{}))
-    return failure();
-  result.addAttribute(getScopeAttrName(result.name), scope);
-
-  if (succeeded(parser.parseOptionalKeyword("effects"))) {
-    if (parser.parseEqual())
-      return failure();
-    EffectClassAttr eff;
-    if (parser.parseCustomAttributeWithFallback(eff, Type{}))
-      return failure();
-    result.addAttribute(getEffectsAttrName(result.name), eff);
-  }
-  if (succeeded(parser.parseOptionalKeyword("const_kwargs"))) {
-    if (parser.parseEqual())
-      return failure();
-    ArrayAttr kwargs;
-    if (parser.parseAttribute(kwargs))
-      return failure();
-    result.addAttribute(getConstKwargsAttrName(result.name), kwargs);
-  }
-  if (succeeded(parser.parseOptionalKeyword("parameters"))) {
-    if (parser.parseEqual())
-      return failure();
-    ArrayAttr parameters;
-    if (parser.parseAttribute(parameters))
-      return failure();
-    result.addAttribute(getParametersAttrName(result.name), parameters);
-  }
-  if (succeeded(parser.parseOptionalKeyword("keyword_only"))) {
-    if (parser.parseEqual())
-      return failure();
-    ArrayAttr keywordOnly;
-    if (parser.parseAttribute(keywordOnly))
-      return failure();
-    result.addAttribute(getKeywordOnlyAttrName(result.name), keywordOnly);
-  }
 
   return parseSignatureTailAndBody(parser, result, arguments);
 }
@@ -520,60 +565,74 @@ void HCIntrinsicOp::print(OpAsmPrinter &p) {
   p.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
 
-LogicalResult HCIntrinsicOp::verify() {
-  if (failed(verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody())))
-    return failure();
-
-  ArrayAttr parameters = getParametersAttr();
-  TypeAttr fnTypeAttr = getFunctionTypeAttr();
-  if (!parameters) {
-    if (ArrayAttr constKwargs = getConstKwargsAttr())
-      return emitOpError("const_kwargs requires parameters to declare the "
-                         "full intrinsic parameter order");
-    if (ArrayAttr keywordOnly = getKeywordOnlyAttr())
-      return emitOpError("keyword_only requires parameters to declare the "
-                         "full intrinsic parameter order");
-    if (fnTypeAttr) {
-      auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
-      if (fnType.getNumInputs() != 0)
-        return emitOpError("function_type with inputs requires parameters to "
-                           "name the intrinsic operand order");
-    }
+// When `parameters` is missing, neither `const_kwargs` nor
+// `keyword_only` may be specified, and `function_type` must declare
+// zero inputs. The empty-parameter case is otherwise valid.
+static LogicalResult verifyIntrinsicWithoutParameters(HCIntrinsicOp op,
+                                                      TypeAttr fnTypeAttr) {
+  if (op.getConstKwargsAttr())
+    return op.emitOpError("const_kwargs requires parameters to declare the "
+                          "full intrinsic parameter order");
+  if (op.getKeywordOnlyAttr())
+    return op.emitOpError("keyword_only requires parameters to declare the "
+                          "full intrinsic parameter order");
+  if (!fnTypeAttr)
     return success();
-  }
+  auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
+  if (fnType.getNumInputs() != 0)
+    return op.emitOpError("function_type with inputs requires parameters to "
+                          "name the intrinsic operand order");
+  return success();
+}
 
-  llvm::SmallDenseSet<StringRef> declared;
+// Validate the `parameters` array and populate `declared` with the
+// declared name set. Each entry must be a unique non-empty StringAttr.
+static LogicalResult
+verifyIntrinsicParameterEntries(HCIntrinsicOp op, ArrayAttr parameters,
+                                llvm::SmallDenseSet<StringRef> &declared) {
   for (auto [idx, parameter] : llvm::enumerate(parameters)) {
     auto name = dyn_cast<StringAttr>(parameter);
     if (!name)
-      return emitOpError("parameters entry at index ")
+      return op.emitOpError("parameters entry at index ")
              << idx << " must be a StringAttr, got " << parameter;
     if (!declared.insert(name.getValue()).second)
-      return emitOpError("duplicate parameter name '")
+      return op.emitOpError("duplicate parameter name '")
              << name.getValue() << "'";
   }
+  return success();
+}
 
-  if (!fnTypeAttr)
-    return emitOpError(
-        "parameters requires function_type to define the runtime SSA "
-        "operand signature");
-
-  llvm::SmallDenseSet<StringRef> keywordOnlyNames;
-  if (ArrayAttr keywordOnly = getKeywordOnlyAttr()) {
-    for (Attribute kw : keywordOnly) {
-      auto kwName = dyn_cast<StringAttr>(kw);
-      if (!kwName)
-        return emitOpError("keyword_only entry must be a StringAttr, got ")
-               << kw;
-      StringRef name = kwName.getValue();
-      if (!keywordOnlyNames.insert(name).second)
-        return emitOpError("duplicate keyword_only entry '") << name << "'";
-      if (!declared.contains(name))
-        return emitOpError("keyword_only entry '")
-               << name << "' is not listed in parameters";
-    }
+// Validate the optional `keyword_only` array and populate
+// `keywordOnlyNames` with its entries. Every name must already appear
+// in `declared`.
+static LogicalResult
+verifyIntrinsicKeywordOnly(HCIntrinsicOp op,
+                           const llvm::SmallDenseSet<StringRef> &declared,
+                           llvm::SmallDenseSet<StringRef> &keywordOnlyNames) {
+  ArrayAttr keywordOnly = op.getKeywordOnlyAttr();
+  if (!keywordOnly)
+    return success();
+  for (Attribute kw : keywordOnly) {
+    auto kwName = dyn_cast<StringAttr>(kw);
+    if (!kwName)
+      return op.emitOpError("keyword_only entry must be a StringAttr, got ")
+             << kw;
+    StringRef name = kwName.getValue();
+    if (!keywordOnlyNames.insert(name).second)
+      return op.emitOpError("duplicate keyword_only entry '") << name << "'";
+    if (!declared.contains(name))
+      return op.emitOpError("keyword_only entry '")
+             << name << "' is not listed in parameters";
   }
+  return success();
+}
 
+// Once we know which parameter names are keyword-only, walk the
+// parameter list once more to ensure every positional name comes
+// before the first keyword-only name.
+static LogicalResult verifyIntrinsicPositionalOrder(
+    HCIntrinsicOp op, ArrayAttr parameters,
+    const llvm::SmallDenseSet<StringRef> &keywordOnlyNames) {
   bool seenKeywordOnly = false;
   for (Attribute parameter : parameters) {
     StringRef name = cast<StringAttr>(parameter).getValue();
@@ -582,28 +641,64 @@ LogicalResult HCIntrinsicOp::verify() {
       continue;
     }
     if (seenKeywordOnly)
-      return emitOpError("positional parameter '")
+      return op.emitOpError("positional parameter '")
              << name << "' cannot follow a keyword-only parameter";
   }
+  return success();
+}
 
-  if (ArrayAttr constKwargs = getConstKwargsAttr()) {
-    llvm::SmallDenseSet<StringRef> seenConstKwargs;
-    for (Attribute kw : constKwargs) {
-      auto kwName = dyn_cast<StringAttr>(kw);
-      if (!kwName)
-        return emitOpError("const_kwargs entry must be a StringAttr, got ")
-               << kw;
-      StringRef name = kwName.getValue();
-      if (!seenConstKwargs.insert(name).second)
-        return emitOpError("duplicate const_kwargs entry '") << name << "'";
-      if (!declared.contains(name))
-        return emitOpError("const_kwargs entry '")
-               << name << "' is not listed in parameters";
-      if (!keywordOnlyNames.contains(name))
-        return emitOpError("const_kwargs entry '")
-               << name << "' must be listed in keyword_only";
-    }
+// Validate the optional `const_kwargs` array. Each entry must appear
+// in `declared` and must also be `keyword_only` (since const-kwargs
+// are not part of the SSA operand signature).
+static LogicalResult verifyIntrinsicConstKwargs(
+    HCIntrinsicOp op, const llvm::SmallDenseSet<StringRef> &declared,
+    const llvm::SmallDenseSet<StringRef> &keywordOnlyNames) {
+  ArrayAttr constKwargs = op.getConstKwargsAttr();
+  if (!constKwargs)
+    return success();
+  llvm::SmallDenseSet<StringRef> seenConstKwargs;
+  for (Attribute kw : constKwargs) {
+    auto kwName = dyn_cast<StringAttr>(kw);
+    if (!kwName)
+      return op.emitOpError("const_kwargs entry must be a StringAttr, got ")
+             << kw;
+    StringRef name = kwName.getValue();
+    if (!seenConstKwargs.insert(name).second)
+      return op.emitOpError("duplicate const_kwargs entry '") << name << "'";
+    if (!declared.contains(name))
+      return op.emitOpError("const_kwargs entry '")
+             << name << "' is not listed in parameters";
+    if (!keywordOnlyNames.contains(name))
+      return op.emitOpError("const_kwargs entry '")
+             << name << "' must be listed in keyword_only";
   }
+  return success();
+}
+
+LogicalResult HCIntrinsicOp::verify() {
+  if (failed(verifyFunctionSignature(*this, getFunctionTypeAttr(), getBody())))
+    return failure();
+
+  ArrayAttr parameters = getParametersAttr();
+  TypeAttr fnTypeAttr = getFunctionTypeAttr();
+  if (!parameters)
+    return verifyIntrinsicWithoutParameters(*this, fnTypeAttr);
+
+  llvm::SmallDenseSet<StringRef> declared;
+  if (failed(verifyIntrinsicParameterEntries(*this, parameters, declared)))
+    return failure();
+
+  if (!fnTypeAttr)
+    return emitOpError(
+        "parameters requires function_type to define the runtime SSA "
+        "operand signature");
+
+  llvm::SmallDenseSet<StringRef> keywordOnlyNames;
+  if (failed(verifyIntrinsicKeywordOnly(*this, declared, keywordOnlyNames)) ||
+      failed(verifyIntrinsicPositionalOrder(*this, parameters,
+                                            keywordOnlyNames)) ||
+      failed(verifyIntrinsicConstKwargs(*this, declared, keywordOnlyNames)))
+    return failure();
 
   auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
   ArrayAttr operandParameters =
@@ -626,15 +721,39 @@ LogicalResult HCIntrinsicOp::verify() {
 // match the declared result types.
 //===----------------------------------------------------------------------===//
 
-LogicalResult HCReturnOp::verify() {
-  // Walk outward through control-flow / scope regions until we hit a
-  // callable parent. `hc.subgroup_region`, `hc.workitem_region`,
-  // `hc.for_range`, and `hc.if` are transparent to `hc.return`: the return
-  // terminates the enclosing kernel/func/intrinsic, not the structured
-  // region it textually sits in.
-  Operation *callee = (*this)->getParentOp();
+// Locate the nearest enclosing callable `hc.return` should agree with.
+// Walks outward through control-flow / scope regions until it hits a
+// callable parent. `hc.subgroup_region`, `hc.workitem_region`,
+// `hc.for_range`, and `hc.if` are transparent to `hc.return`.
+static Operation *findReturnEnclosingCallee(HCReturnOp op) {
+  Operation *callee = op->getParentOp();
   while (callee && !isa<HCKernelOp, HCFuncOp, HCIntrinsicOp>(callee))
     callee = callee->getParentOp();
+  return callee;
+}
+
+// Check that the returned-value types match the declared result-type
+// list of the enclosing callable.
+static LogicalResult verifyReturnAgainstFunctionType(HCReturnOp op,
+                                                     Operation *callee,
+                                                     FunctionType fnType) {
+  if (op.getValues().size() != fnType.getNumResults())
+    return op.emitOpError("returns ")
+           << op.getValues().size() << " value(s) but enclosing "
+           << callee->getName() << " declares " << fnType.getNumResults()
+           << " result(s)";
+  for (auto [i, returned, declared] :
+       llvm::enumerate(op.getValues().getTypes(), fnType.getResults())) {
+    if (!areHCProgressiveTypesCompatible(returned, declared))
+      return op.emitOpError("returned value #")
+             << i << " type " << returned << " does not match enclosing "
+             << callee->getName() << " result type " << declared;
+  }
+  return success();
+}
+
+LogicalResult HCReturnOp::verify() {
+  Operation *callee = findReturnEnclosingCallee(*this);
   if (!callee)
     return success();
 
@@ -656,19 +775,7 @@ LogicalResult HCReturnOp::verify() {
   if (!fnTypeAttr)
     return success();
   auto fnType = llvm::cast<FunctionType>(fnTypeAttr.getValue());
-  if (getValues().size() != fnType.getNumResults())
-    return emitOpError("returns ")
-           << getValues().size() << " value(s) but enclosing "
-           << callee->getName() << " declares " << fnType.getNumResults()
-           << " result(s)";
-  for (auto [i, returned, declared] :
-       llvm::enumerate(getValues().getTypes(), fnType.getResults())) {
-    if (!areHCProgressiveTypesCompatible(returned, declared))
-      return emitOpError("returned value #")
-             << i << " type " << returned << " does not match enclosing "
-             << callee->getName() << " result type " << declared;
-  }
-  return success();
+  return verifyReturnAgainstFunctionType(*this, callee, fnType);
 }
 
 LogicalResult HCSymbolOp::verify() {
@@ -1109,20 +1216,59 @@ static FailureOr<ExprAttr> postFlattenStorageExpr(Type type) {
 // collective vector with `dim[0] == product(suffix)`; carry the scalar
 // across as a synthesised `yield_storage = 1` so the same storage-product
 // check fires.
+// Tuple-vs-tuple structural recursion for the post-flatten lift check.
+// Element-wise lift; nested tuples are not modeled here.
+static bool postFlattenLiftMatchesTuple(TupleType yt, Type resultType,
+                                        ArrayRef<Attribute> suffix) {
+  auto rt = dyn_cast<TupleType>(resultType);
+  if (!rt || yt.size() != rt.size())
+    return false;
+  for (auto [yElem, rElem] : llvm::zip_equal(yt.getTypes(), rt.getTypes())) {
+    if (isa<TupleType>(yElem))
+      return false;
+    if (!mlir::hc::postFlattenLiftMatches(yElem, rElem, suffix))
+      return false;
+  }
+  return true;
+}
+
+// Compute the yield-side storage expression for the post-flatten
+// lift check. Returns nullptr `ExprAttr` (wrapped in failure) when
+// the yield kind is incompatible (e.g. tuple slipping in here, or an
+// unsupported scalar kind).
+static FailureOr<ExprAttr>
+postFlattenLiftYieldStorage(Type yieldedType, Type resultType,
+                            SymbolicallyShapedTypeInterface resultShaped,
+                            sym::Store &store) {
+  MLIRContext *ctx = yieldedType.getContext();
+  if (auto yieldShaped =
+          dyn_cast<SymbolicallyShapedTypeInterface>(yieldedType)) {
+    if (yieldedType.getTypeID() != resultType.getTypeID())
+      return failure();
+    if (resultShaped.getSymbolicElementType() !=
+        yieldShaped.getSymbolicElementType())
+      return failure();
+    return postFlattenStorageExpr(yieldedType);
+  }
+  if (!isCollectiveScalarType(yieldedType))
+    return failure();
+  // Collective-scalar lift wraps the scalar in `mlir::hc::VectorType`
+  // pre-flatten, which collapses to its 1D form post-flatten. The
+  // bare-vector form is not a legal target for the scalar lift, so
+  // demand the same kind here.
+  if (!isa<mlir::hc::VectorType>(resultType) ||
+      resultShaped.getSymbolicElementType() != yieldedType)
+    return failure();
+  auto one = sym::composeExprInt(store, 1);
+  if (failed(one))
+    return failure();
+  return ExprAttr::get(ctx, *one);
+}
+
 bool mlir::hc::postFlattenLiftMatches(Type yieldedType, Type resultType,
                                       ArrayRef<Attribute> suffix) {
-  if (auto yt = dyn_cast<TupleType>(yieldedType)) {
-    auto rt = dyn_cast<TupleType>(resultType);
-    if (!rt || yt.size() != rt.size())
-      return false;
-    for (auto [yElem, rElem] : llvm::zip_equal(yt.getTypes(), rt.getTypes())) {
-      if (isa<TupleType>(yElem))
-        return false;
-      if (!postFlattenLiftMatches(yElem, rElem, suffix))
-        return false;
-    }
-    return true;
-  }
+  if (auto yt = dyn_cast<TupleType>(yieldedType))
+    return postFlattenLiftMatchesTuple(yt, resultType, suffix);
 
   FailureOr<ExprAttr> resultStorage = postFlattenStorageExpr(resultType);
   if (failed(resultStorage))
@@ -1131,42 +1277,16 @@ bool mlir::hc::postFlattenLiftMatches(Type yieldedType, Type resultType,
 
   MLIRContext *ctx = yieldedType.getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
-
-  ExprAttr yieldStorage;
-  if (auto yieldShaped =
-          dyn_cast<SymbolicallyShapedTypeInterface>(yieldedType)) {
-    if (yieldedType.getTypeID() != resultType.getTypeID())
-      return false;
-    if (resultShaped.getSymbolicElementType() !=
-        yieldShaped.getSymbolicElementType())
-      return false;
-    FailureOr<ExprAttr> ys = postFlattenStorageExpr(yieldedType);
-    if (failed(ys))
-      return false;
-    yieldStorage = *ys;
-  } else if (isCollectiveScalarType(yieldedType)) {
-    // Collective-scalar lift wraps the scalar in `mlir::hc::VectorType`
-    // pre-flatten, which collapses to its 1D form post-flatten. The
-    // bare-vector form is not a legal target for the scalar lift
-    // (the pre-flatten `collectiveLiftedType` only produces
-    // `mlir::hc::VectorType` here), so demand the same kind here.
-    if (!isa<mlir::hc::VectorType>(resultType))
-      return false;
-    if (resultShaped.getSymbolicElementType() != yieldedType)
-      return false;
-    auto one = sym::composeExprInt(store, 1);
-    if (failed(one))
-      return false;
-    yieldStorage = ExprAttr::get(ctx, *one);
-  } else {
+  FailureOr<ExprAttr> yieldStorage =
+      postFlattenLiftYieldStorage(yieldedType, resultType, resultShaped, store);
+  if (failed(yieldStorage))
     return false;
-  }
 
   FailureOr<ExprAttr> suffixProduct = composeSuffixProduct(ctx, suffix);
   if (failed(suffixProduct))
     return false;
   auto lifted =
-      sym::composeExprBinary(store, yieldStorage.getValue(),
+      sym::composeExprBinary(store, yieldStorage->getValue(),
                              sym::ExprBinaryOp::Mul, suffixProduct->getValue());
   if (failed(lifted))
     return false;
@@ -1199,66 +1319,80 @@ static bool collectiveYieldMatchesRegionResult(Operation *op, Type yieldedType,
   return postFlattenLiftMatches(yieldedType, resultType, *suffix);
 }
 
-LogicalResult HCForRangeOp::verify() {
-  // The body block takes the induction variable plus one argument per
-  // iter_args entry; result types mirror iter_inits types one-to-one.
-  Block &body = getBody().front();
-  unsigned expectedArgs = 1 + getIterInits().size();
+// Verify the iter_inits count matches result count and pairwise types
+// agree, plus the body block is shaped `induction_var, iter_args...`.
+static LogicalResult verifyForRangeIterSignature(HCForRangeOp op) {
+  Block &body = op.getBody().front();
+  unsigned expectedArgs = 1 + op.getIterInits().size();
   if (body.getNumArguments() != expectedArgs)
-    return emitOpError("expected body block to take ")
+    return op.emitOpError("expected body block to take ")
            << expectedArgs << " arguments (induction variable + "
-           << getIterInits().size() << " iter_args), got "
+           << op.getIterInits().size() << " iter_args), got "
            << body.getNumArguments();
-  if (getIterResults().size() != getIterInits().size())
-    return emitOpError("iter_args (")
-           << getIterInits().size() << ") and result count ("
-           << getIterResults().size() << ") differ";
-  for (auto [idx, pair] :
-       llvm::enumerate(llvm::zip_equal(getIterInits(), getIterResults()))) {
+  if (op.getIterResults().size() != op.getIterInits().size())
+    return op.emitOpError("iter_args (")
+           << op.getIterInits().size() << ") and result count ("
+           << op.getIterResults().size() << ") differ";
+  for (auto [idx, pair] : llvm::enumerate(
+           llvm::zip_equal(op.getIterInits(), op.getIterResults()))) {
     auto [init, result] = pair;
     if (!areHCBranchTypesCompatible(init.getType(), result.getType()))
-      return emitOpError("iter_args[")
+      return op.emitOpError("iter_args[")
              << idx << "] type " << init.getType() << " does not match result["
              << idx << "] type " << result.getType();
   }
+  return success();
+}
 
-  // Block arguments must line up with iter_inits one-to-one past the
-  // induction variable. `!hc.undef` freely matches anything so pre-inference
-  // IR round-trips; once types refine, drift between iter args and block
-  // args fails verification.
+// Block arguments must line up with iter_inits one-to-one past the
+// induction variable. `!hc.undef` freely matches anything so
+// pre-inference IR round-trips cleanly.
+static LogicalResult verifyForRangeBlockArgTypes(HCForRangeOp op) {
+  Block &body = op.getBody().front();
   for (auto [idx, pair] : llvm::enumerate(llvm::zip_equal(
-           getIterInits(), body.getArguments().drop_front(1)))) {
+           op.getIterInits(), body.getArguments().drop_front(1)))) {
     auto [init, blockArg] = pair;
     Type initTy = init.getType();
     Type blockTy = blockArg.getType();
     if (areHCBranchTypesCompatible(initTy, blockTy))
       continue;
-    return emitOpError("iter_args[")
+    return op.emitOpError("iter_args[")
            << idx << "] type " << initTy
            << " does not match body block argument type " << blockTy;
   }
+  return success();
+}
 
-  // The body must terminate with `hc.yield`, and its operands must match
-  // the iter_results signature; mirrors `hc.if`. `!hc.undef` is accepted
-  // on either side so pre-inference IR round-trips cleanly.
+// The body must terminate with `hc.yield`, and its operands must match
+// the iter_results signature.
+static LogicalResult verifyForRangeYield(HCForRangeOp op) {
+  Block &body = op.getBody().front();
   auto yield = llvm::dyn_cast_or_null<HCYieldOp>(tryGetTerminator(body));
   if (!yield)
-    return emitOpError("body must terminate with an `hc.yield`");
-  if (yield.getValues().size() != getIterResults().size())
-    return emitOpError("body yield produces ")
+    return op.emitOpError("body must terminate with an `hc.yield`");
+  if (yield.getValues().size() != op.getIterResults().size())
+    return op.emitOpError("body yield produces ")
            << yield.getValues().size() << " values, expected "
-           << getIterResults().size();
-  for (auto [idx, pair] :
-       llvm::enumerate(llvm::zip_equal(yield.getValues(), getIterResults()))) {
+           << op.getIterResults().size();
+  for (auto [idx, pair] : llvm::enumerate(
+           llvm::zip_equal(yield.getValues(), op.getIterResults()))) {
     auto [yielded, result] = pair;
     Type yieldedTy = yielded.getType();
     Type resultTy = result.getType();
     if (areHCBranchTypesCompatible(yieldedTy, resultTy))
       continue;
-    return emitOpError("body yield[")
+    return op.emitOpError("body yield[")
            << idx << "] type " << yieldedTy << " does not match result[" << idx
            << "] type " << resultTy;
   }
+  return success();
+}
+
+LogicalResult HCForRangeOp::verify() {
+  if (failed(verifyForRangeIterSignature(*this)) ||
+      failed(verifyForRangeBlockArgTypes(*this)) ||
+      failed(verifyForRangeYield(*this)))
+    return failure();
   return success();
 }
 
@@ -1614,6 +1748,95 @@ static LogicalResult verifyBarePredicateMask(Operation *op, Type type) {
   return success();
 }
 
+// Bundles the per-side flavor flags (vector / bare_vector / tensor /
+// bare_tensor) so the strip-layout flavor-preservation check below
+// can compare both ends in a single sweep.
+namespace {
+struct StripLayoutFlavorFlags {
+  bool isVector;
+  bool isBareVector;
+  bool isTensor;
+  bool isBareTensor;
+
+  bool any() const {
+    return isVector || isBareVector || isTensor || isBareTensor;
+  }
+};
+} // namespace
+
+static StripLayoutFlavorFlags makeStripFlavorFlags(Type type) {
+  return {isa<mlir::hc::VectorType>(type), isa<mlir::hc::BareVectorType>(type),
+          isa<mlir::hc::TensorType>(type), isa<mlir::hc::BareTensorType>(type)};
+}
+
+// Flavor preservation: the strip drops the layout slot, it does not
+// change the carrier kind. `vector -> vector` (without layout),
+// `bare_vector -> bare_vector`, similarly for tensors. Switching
+// kinds here would clash with downstream inference at every site
+// where the post-strip value flows into a peer-typed op.
+static LogicalResult verifyStripFlavorPreservation(HCStripLayoutOp op,
+                                                   Type valueType,
+                                                   Type resultType) {
+  auto src = makeStripFlavorFlags(valueType);
+  auto dst = makeStripFlavorFlags(resultType);
+  if (src.isVector && !dst.isVector)
+    return op.emitOpError("vector operand requires vector result; got ")
+           << resultType;
+  if (src.isBareVector && !dst.isBareVector)
+    return op.emitOpError("bare_vector operand requires bare_vector "
+                          "result; got ")
+           << resultType;
+  if (src.isTensor && !dst.isTensor)
+    return op.emitOpError("tensor operand requires tensor result; got ")
+           << resultType;
+  if (src.isBareTensor && !dst.isBareTensor)
+    return op.emitOpError("bare_tensor operand requires bare_tensor "
+                          "result; got ")
+           << resultType;
+  if (!src.any())
+    return op.emitOpError("operand must be a vector / tensor (semantic or "
+                          "bare); got ")
+           << valueType;
+  return success();
+}
+
+// Element type and shape are preserved across the strip — it drops
+// the layout slot only.
+static LogicalResult
+verifyStripElementAndShape(HCStripLayoutOp op,
+                           SymbolicallyShapedTypeInterface valueShaped,
+                           SymbolicallyShapedTypeInterface resultShaped) {
+  Type valueElem = valueShaped.getSymbolicElementType();
+  Type resultElem = resultShaped.getSymbolicElementType();
+  if (valueElem && resultElem && valueElem != resultElem)
+    return op.emitOpError("operand element type ")
+           << valueElem << " differs from result element type " << resultElem;
+
+  ShapeAttr valueShape = valueShaped.getSymbolicShape();
+  ShapeAttr resultShape = resultShaped.getSymbolicShape();
+  if (valueShape && resultShape && valueShape != resultShape)
+    return op.emitOpError("operand shape ")
+           << valueShape << " differs from result shape " << resultShape
+           << "; hc.strip_layout drops the layout, it doesn't reshape";
+  return success();
+}
+
+// `strip_layout` requires the result to have a null layout slot and
+// neither side may be `!hc.buffer` (buffer storage lives host-side
+// and is reinterpreted via `hc.as_layout`).
+static LogicalResult
+verifyStripCarrierShape(HCStripLayoutOp op, Type valueType, Type resultType,
+                        SymbolicallyShapedTypeInterface resultShaped) {
+  if (resultShaped.getSymbolicLayout())
+    return op.emitOpError("result type must have no layout slot; "
+                          "use hc.as_layout to relabel a layout-bearing value");
+  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
+    return op.emitOpError("hc.strip_layout does not apply to !hc.buffer; "
+                          "buffer storage lives host-side, the bare/non-bare "
+                          "distinction is value-semantic only");
+  return success();
+}
+
 LogicalResult HCStripLayoutOp::verify() {
   // Progressive typing: `!hc.undef` on either side is the pre-inference
   // placeholder; the verifier runs at every fold boundary and rejecting
@@ -1630,69 +1853,71 @@ LogicalResult HCStripLayoutOp::verify() {
   if (!valueShaped || !resultShaped)
     return success();
 
-  // Result must have a null layout slot. The op exists exactly to
-  // drop the layout at a user-marked boundary — a layout-bearing
-  // result is a frontend bug; spell `hc.as_layout` instead for a
-  // relabel that preserves the layout slot.
-  if (resultShaped.getSymbolicLayout())
-    return emitOpError("result type must have no layout slot; "
-                       "use hc.as_layout to relabel a layout-bearing value");
+  if (failed(verifyStripCarrierShape(*this, valueType, resultType,
+                                     resultShaped)) ||
+      failed(verifyStripFlavorPreservation(*this, valueType, resultType)))
+    return failure();
+  return verifyStripElementAndShape(*this, valueShaped, resultShaped);
+}
 
-  // Buffers have no value-semantic counterpart in the v0 surface —
-  // their storage is host-side and `hc.as_layout` is the right
-  // primitive for buffer-level relabel. Routing a frontend mistake
-  // here to a clear diagnostic.
-  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
-    return emitOpError("hc.strip_layout does not apply to !hc.buffer; "
-                       "buffer storage lives host-side, the bare/non-bare "
-                       "distinction is value-semantic only");
-
-  // Flavor preservation: the strip drops the layout slot, it does
-  // not change the carrier kind. `vector -> vector` (without
-  // layout), `bare_vector -> bare_vector`, similarly for tensors.
-  // Switching kinds here would clash with downstream inference at
-  // every site where the post-strip value flows into a peer-typed
-  // op (the K-tile loop's iter init / result pair against the
-  // intrinsic's vector return is the motivating example).
-  bool sourceIsVector = isa<mlir::hc::VectorType>(valueType);
-  bool sourceIsBareVector = isa<mlir::hc::BareVectorType>(valueType);
-  bool sourceIsTensor = isa<mlir::hc::TensorType>(valueType);
-  bool sourceIsBareTensor = isa<mlir::hc::BareTensorType>(valueType);
-  bool resultIsVector = isa<mlir::hc::VectorType>(resultType);
-  bool resultIsBareVector = isa<mlir::hc::BareVectorType>(resultType);
-  bool resultIsTensor = isa<mlir::hc::TensorType>(resultType);
-  bool resultIsBareTensor = isa<mlir::hc::BareTensorType>(resultType);
-  if (sourceIsVector && !resultIsVector)
-    return emitOpError("vector operand requires vector result; got ")
-           << resultType;
-  if (sourceIsBareVector && !resultIsBareVector)
-    return emitOpError("bare_vector operand requires bare_vector result; got ")
-           << resultType;
-  if (sourceIsTensor && !resultIsTensor)
-    return emitOpError("tensor operand requires tensor result; got ")
-           << resultType;
-  if (sourceIsBareTensor && !resultIsBareTensor)
-    return emitOpError("bare_tensor operand requires bare_tensor result; got ")
-           << resultType;
-  if (!sourceIsVector && !sourceIsBareVector && !sourceIsTensor &&
-      !sourceIsBareTensor)
-    return emitOpError("operand must be a vector / tensor (semantic or "
-                       "bare); got ")
-           << valueType;
-
+// Compare element types and assert layout-reinterpretation invariant.
+// `as_layout` reinterprets the layout, not the underlying data type.
+static LogicalResult
+verifyAsLayoutElementType(HCAsLayoutOp op,
+                          SymbolicallyShapedTypeInterface valueShaped,
+                          SymbolicallyShapedTypeInterface resultShaped) {
   Type valueElem = valueShaped.getSymbolicElementType();
   Type resultElem = resultShaped.getSymbolicElementType();
   if (valueElem && resultElem && valueElem != resultElem)
-    return emitOpError("operand element type ")
-           << valueElem << " differs from result element type " << resultElem;
+    return op.emitOpError("operand element type ")
+           << valueElem << " differs from result element type " << resultElem
+           << "; hc.as_layout reinterprets the layout, not the data type";
+  return success();
+}
 
-  ShapeAttr valueShape = valueShaped.getSymbolicShape();
-  ShapeAttr resultShape = resultShaped.getSymbolicShape();
-  if (valueShape && resultShape && valueShape != resultShape)
-    return emitOpError("operand shape ")
-           << valueShape << " differs from result shape " << resultShape
-           << "; hc.strip_layout drops the layout, it doesn't reshape";
+// Storage-size sanity for `as_layout`. The check is conditional on
+// being able to compute both sides — pointer-rooted (`!hc.buffer`)
+// values short-circuit (their dims are a logical-extent proxy, not an
+// allocation declaration), and any non-`ExprAttr` dim placeholder
+// (intermediate `?` sentinels or builder stamps) skips the compose.
+static LogicalResult
+verifyAsLayoutStorageSize(HCAsLayoutOp op, Type valueType, Type resultType,
+                          SymbolicallyShapedTypeInterface valueShaped,
+                          ShapeAttr valueShape, ShapeAttr resultShape) {
+  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
+    return success();
 
+  auto allDimsAreExprs = [](ShapeAttr s) {
+    return llvm::all_of(s.getDims(), [](Attribute a) {
+      return llvm::isa_and_nonnull<ExprAttr>(a);
+    });
+  };
+  if (!allDimsAreExprs(valueShape) || !allDimsAreExprs(resultShape))
+    return success();
+
+  MLIRContext *ctx = op.getContext();
+  FailureOr<ExprAttr> valueStorage =
+      computeStorageSizeExpr(ctx, valueShaped.getSymbolicLayout(), valueShape);
+  if (failed(valueStorage))
+    return success();
+  FailureOr<ExprAttr> resultStorage =
+      computeStorageSizeExpr(ctx, op.getLayout(), resultShape);
+  if (failed(resultStorage))
+    return success();
+
+  // ixsimpl hash-cons gives canonical handles per (store, expr); the
+  // raw-pointer equality on the underlying nodes is structural
+  // equivalence under the same normalization both sides went
+  // through. Two textually different formulas that reduce to the
+  // same canonical form (`M*N*4` vs `4*N*M`) compare equal here.
+  if (*valueStorage != *resultStorage)
+    return op.emitOpError("storage size mismatch: operand addresses ")
+           << *valueStorage << " elements, result layout addresses "
+           << *resultStorage
+           << "; hc.as_layout reinterprets without resizing — the layouts'"
+              " effective storage_size (operand's dims bound into its layout"
+              " or the dim product when absent vs the explicit result"
+              " layout's storage_size bound to the result's dims) must agree";
   return success();
 }
 
@@ -1716,67 +1941,16 @@ LogicalResult HCAsLayoutOp::verify() {
   if (!valueShaped || !resultShaped)
     return success();
 
-  Type valueElem = valueShaped.getSymbolicElementType();
-  Type resultElem = resultShaped.getSymbolicElementType();
-  if (valueElem && resultElem && valueElem != resultElem)
-    return emitOpError("operand element type ")
-           << valueElem << " differs from result element type " << resultElem
-           << "; hc.as_layout reinterprets the layout, not the data type";
+  if (failed(verifyAsLayoutElementType(*this, valueShaped, resultShaped)))
+    return failure();
 
   ShapeAttr valueShape = valueShaped.getSymbolicShape();
   ShapeAttr resultShape = resultShaped.getSymbolicShape();
   if (!valueShape || !resultShape)
     return success();
 
-  // Pointer-rooted shaped values (`!hc.buffer`) hold whatever the
-  // user-supplied allocation contains; the named dims are a proxy for
-  // the addressable extent, not a declaration of the underlying byte
-  // size. A non-injective layout on a buffer (`storage_size <
-  // product(dims)`, e.g. broadcast / per-lane fragment views) is a
-  // legitimate reinterpretation — the gather/scatter path bounds-clips
-  // against the actual flat allocation at runtime, not against the
-  // layout's declared `storage_size`. Skip the structural check when
-  // either side is a buffer; the value-semantic (tensor / vector /
-  // bare) path stays strict because its dims *are* the allocation.
-  if (isa<BufferType>(valueType) || isa<BufferType>(resultType))
-    return success();
-
-  // `computeStorageSizeExpr` wants every dim entry to be an
-  // `ExprAttr`; a malformed builder could plant a non-Expr placeholder.
-  // Skip the check in that case; the cast-to-`ExprAttr` inside
-  // `computeStorageSizeExpr` would assert otherwise.
-  auto allDimsAreExprs = [](ShapeAttr s) {
-    return llvm::all_of(s.getDims(), [](Attribute a) {
-      return llvm::isa_and_nonnull<ExprAttr>(a);
-    });
-  };
-  if (!allDimsAreExprs(valueShape) || !allDimsAreExprs(resultShape))
-    return success();
-
-  MLIRContext *ctx = getContext();
-  FailureOr<ExprAttr> valueStorage =
-      computeStorageSizeExpr(ctx, valueShaped.getSymbolicLayout(), valueShape);
-  if (failed(valueStorage))
-    return success();
-  FailureOr<ExprAttr> resultStorage =
-      computeStorageSizeExpr(ctx, getLayout(), resultShape);
-  if (failed(resultStorage))
-    return success();
-
-  // ixsimpl hash-cons gives canonical handles per (store, expr); the
-  // raw-pointer equality on the underlying nodes is structural
-  // equivalence under the same normalization both sides went
-  // through. Two textually different formulas that reduce to the
-  // same canonical form (`M*N*4` vs `4*N*M`) compare equal here.
-  if (*valueStorage != *resultStorage)
-    return emitOpError("storage size mismatch: operand addresses ")
-           << *valueStorage << " elements, result layout addresses "
-           << *resultStorage
-           << "; hc.as_layout reinterprets without resizing — the layouts'"
-              " effective storage_size (operand's dims bound into its layout"
-              " or the dim product when absent vs the explicit result"
-              " layout's storage_size bound to the result's dims) must agree";
-  return success();
+  return verifyAsLayoutStorageSize(*this, valueType, resultType, valueShaped,
+                                   valueShape, resultShape);
 }
 
 LogicalResult HCLoadMaskOp::verify() {
@@ -2194,6 +2368,40 @@ static bool isMemoryCarrierOperand(Type type) {
   return llvm::isa<PtrType, BufferType>(type);
 }
 
+// Parse a single `<kind> <name> = %bound : type` entry of the iter
+// clause. The kind keyword must be `parallel` or `reduction`; an
+// empty name is rejected here for a localized diagnostic.
+static ParseResult parseGenericIterEntry(
+    OpAsmParser &parser, MLIRContext *ctx, SmallVectorImpl<Attribute> &iterSyms,
+    SmallVectorImpl<Attribute> &iterKinds,
+    SmallVectorImpl<OpAsmParser::UnresolvedOperand> &boundsOps,
+    SmallVectorImpl<Type> &boundsTypes) {
+  StringRef kindKw;
+  auto kindLoc = parser.getCurrentLocation();
+  if (parser.parseKeyword(&kindKw))
+    return failure();
+  auto kind = symbolizeIterKind(kindKw);
+  if (!kind)
+    return parser.emitError(kindLoc)
+           << "expected `parallel` or `reduction`, got '" << kindKw << "'";
+  iterKinds.push_back(IterKindAttr::get(ctx, *kind));
+  StringRef name;
+  auto nameLoc = parser.getCurrentLocation();
+  if (parser.parseKeyword(&name))
+    return failure();
+  if (name.empty())
+    return parser.emitError(nameLoc) << "iter sym name must be non-empty";
+  iterSyms.push_back(StringAttr::get(ctx, name));
+  OpAsmParser::UnresolvedOperand bound;
+  Type ty;
+  if (parser.parseEqual() || parser.parseOperand(bound) ||
+      parser.parseColonType(ty))
+    return failure();
+  boundsOps.push_back(bound);
+  boundsTypes.push_back(ty);
+  return success();
+}
+
 static ParseResult parseGenericIterClause(
     OpAsmParser &parser, SmallVectorImpl<Attribute> &iterSyms,
     SmallVectorImpl<Attribute> &iterKinds,
@@ -2204,38 +2412,72 @@ static ParseResult parseGenericIterClause(
   // Empty `iter ()` is rejected at parse — the verifier would catch it
   // anyway, but failing here gives a localized diagnostic.
   MLIRContext *ctx = parser.getContext();
-  auto parseOne = [&]() -> ParseResult {
-    StringRef kindKw;
-    auto kindLoc = parser.getCurrentLocation();
-    if (parser.parseKeyword(&kindKw))
-      return failure();
-    auto kind = symbolizeIterKind(kindKw);
-    if (!kind)
-      return parser.emitError(kindLoc)
-             << "expected `parallel` or `reduction`, got '" << kindKw << "'";
-    iterKinds.push_back(IterKindAttr::get(ctx, *kind));
-    StringRef name;
-    auto nameLoc = parser.getCurrentLocation();
-    if (parser.parseKeyword(&name))
-      return failure();
-    if (name.empty())
-      return parser.emitError(nameLoc) << "iter sym name must be non-empty";
-    iterSyms.push_back(StringAttr::get(ctx, name));
-    OpAsmParser::UnresolvedOperand bound;
-    Type ty;
-    if (parser.parseEqual() || parser.parseOperand(bound) ||
-        parser.parseColonType(ty))
-      return failure();
-    boundsOps.push_back(bound);
-    boundsTypes.push_back(ty);
-    return success();
-  };
-  if (parseOne())
+  if (parseGenericIterEntry(parser, ctx, iterSyms, iterKinds, boundsOps,
+                            boundsTypes))
     return failure();
   while (succeeded(parser.parseOptionalComma()))
-    if (parseOne())
+    if (parseGenericIterEntry(parser, ctx, iterSyms, iterKinds, boundsOps,
+                              boundsTypes))
       return failure();
   return parser.parseRParen();
+}
+
+// Parse a single `#hc.expr<...>` axis attribute and append it to
+// `axisOffsets`. Anything else gets an explicit diagnostic.
+static ParseResult
+parseGenericOperandAxisAttr(OpAsmParser &parser,
+                            SmallVectorImpl<Attribute> &axisOffsets) {
+  Attribute axisAttr;
+  auto attrLoc = parser.getCurrentLocation();
+  if (parser.parseAttribute(axisAttr))
+    return failure();
+  auto expr = llvm::dyn_cast<ExprAttr>(axisAttr);
+  if (!expr)
+    return parser.emitError(attrLoc) << "expected #hc.expr<...> attribute";
+  axisOffsets.push_back(expr);
+  return success();
+}
+
+// Parse the per-axis bracketed offset list `[a, b, c]` (possibly
+// empty). Caller has already consumed the leading `[`. The bracket
+// terminator shields the trailing `: type` from `parseExtendedAttr`,
+// which would otherwise consume the colon as part of the attribute.
+static ParseResult
+parseGenericOperandOffsetList(OpAsmParser &parser,
+                              SmallVectorImpl<Attribute> &axisOffsets) {
+  if (succeeded(parser.parseOptionalRSquare()))
+    return success();
+  if (parseGenericOperandAxisAttr(parser, axisOffsets))
+    return failure();
+  while (succeeded(parser.parseOptionalComma()))
+    if (parseGenericOperandAxisAttr(parser, axisOffsets))
+      return failure();
+  return parser.parseRSquare();
+}
+
+// Parse a single operand entry: `%val at [offsets] : type`.
+static ParseResult
+parseGenericOperandEntry(OpAsmParser &parser, MLIRContext *ctx,
+                         SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
+                         SmallVectorImpl<Type> &types,
+                         SmallVectorImpl<Attribute> &offsets) {
+  OpAsmParser::UnresolvedOperand op;
+  Type ty;
+  if (parser.parseOperand(op) || parser.parseKeyword("at") ||
+      parser.parseLSquare())
+    return failure();
+  // Empty arrays are permitted at parse — the verifier flags rank
+  // mismatch with a clearer message than a parser-level "missing
+  // entry" would.
+  SmallVector<Attribute> axisOffsets;
+  if (parseGenericOperandOffsetList(parser, axisOffsets))
+    return failure();
+  if (parser.parseColonType(ty))
+    return failure();
+  ops.push_back(op);
+  offsets.push_back(ArrayAttr::get(ctx, axisOffsets));
+  types.push_back(ty);
+  return success();
 }
 
 static ParseResult parseGenericOperandClause(
@@ -2251,49 +2493,10 @@ static ParseResult parseGenericOperandClause(
     return success();
   }
   MLIRContext *ctx = parser.getContext();
-  auto parseOne = [&]() -> ParseResult {
-    OpAsmParser::UnresolvedOperand op;
-    Type ty;
-    // Per-axis offsets ride inside `[...]`. The bracket terminator
-    // shields the trailing `: type` from `parseExtendedAttr`, which
-    // would otherwise consume the colon as part of the attribute. Empty
-    // arrays are permitted at parse — the verifier flags rank mismatch
-    // with a clearer message than a parser-level "missing entry" would.
-    SmallVector<Attribute> axisOffsets;
-    auto parseAxis = [&]() -> ParseResult {
-      Attribute axisAttr;
-      auto attrLoc = parser.getCurrentLocation();
-      if (parser.parseAttribute(axisAttr))
-        return failure();
-      auto expr = llvm::dyn_cast<ExprAttr>(axisAttr);
-      if (!expr)
-        return parser.emitError(attrLoc) << "expected #hc.expr<...> attribute";
-      axisOffsets.push_back(expr);
-      return success();
-    };
-    if (parser.parseOperand(op) || parser.parseKeyword("at") ||
-        parser.parseLSquare())
-      return failure();
-    if (failed(parser.parseOptionalRSquare())) {
-      if (parseAxis())
-        return failure();
-      while (succeeded(parser.parseOptionalComma()))
-        if (parseAxis())
-          return failure();
-      if (parser.parseRSquare())
-        return failure();
-    }
-    if (parser.parseColonType(ty))
-      return failure();
-    ops.push_back(op);
-    offsets.push_back(ArrayAttr::get(ctx, axisOffsets));
-    types.push_back(ty);
-    return success();
-  };
-  if (parseOne())
+  if (parseGenericOperandEntry(parser, ctx, ops, types, offsets))
     return failure();
   while (succeeded(parser.parseOptionalComma()))
-    if (parseOne())
+    if (parseGenericOperandEntry(parser, ctx, ops, types, offsets))
       return failure();
   return parser.parseRParen();
 }
@@ -2328,40 +2531,29 @@ static void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
 // from its sym-name attribute the same way `hc.idx_apply`'s textual
 // surface does — readers don't have to learn a second convention
 // for the same data shape.
-static ParseResult parseGenericAmbientClause(
+// Parse a single ambient clause entry: `%val as "name" : type`.
+// `parseString` is used (not `parseAttribute(StringAttr&)`) so the
+// trailing `: !hc.idx<...>` doesn't get swallowed as the attribute's
+// value type.
+static ParseResult parseGenericAmbientEntry(
     OpAsmParser &parser, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
     SmallVectorImpl<Type> &types, SmallVectorImpl<Attribute> &syms) {
-  if (failed(parser.parseOptionalKeyword("ambient")))
-    return success();
-  if (parser.parseLParen())
+  OpAsmParser::UnresolvedOperand op;
+  std::string symName;
+  Type ty;
+  if (parser.parseOperand(op) || parser.parseKeyword("as") ||
+      parser.parseString(&symName) || parser.parseColonType(ty))
     return failure();
-  if (succeeded(parser.parseOptionalRParen()))
-    return success();
-  auto parseOne = [&]() -> ParseResult {
-    OpAsmParser::UnresolvedOperand op;
-    std::string symName;
-    Type ty;
-    // `parseString` reads the bare quoted string without trying to
-    // attach a type suffix the way `parseAttribute(StringAttr&)` does
-    // (which would consume the trailing `: !hc.idx<...>` as the
-    // attribute's value type).
-    if (parser.parseOperand(op) || parser.parseKeyword("as") ||
-        parser.parseString(&symName) || parser.parseColonType(ty))
-      return failure();
-    ops.push_back(op);
-    types.push_back(ty);
-    syms.push_back(parser.getBuilder().getStringAttr(symName));
-    return success();
-  };
-  if (parseOne())
-    return failure();
-  while (succeeded(parser.parseOptionalComma()))
-    if (parseOne())
-      return failure();
-  if (parser.parseRParen())
-    return failure();
-  // Defensive duplicate check — the verifier catches this too, but a
-  // parser-time error gives a tighter location.
+  ops.push_back(op);
+  types.push_back(ty);
+  syms.push_back(parser.getBuilder().getStringAttr(symName));
+  return success();
+}
+
+// Defensive duplicate check — the verifier catches this too, but a
+// parser-time error gives a tighter location.
+static ParseResult validateAmbientSymUniqueness(OpAsmParser &parser,
+                                                ArrayRef<Attribute> syms) {
   llvm::StringSet<> seen;
   for (Attribute a : syms) {
     auto s = cast<StringAttr>(a).getValue();
@@ -2375,44 +2567,126 @@ static ParseResult parseGenericAmbientClause(
   return success();
 }
 
-ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
+static ParseResult parseGenericAmbientClause(
+    OpAsmParser &parser, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
+    SmallVectorImpl<Type> &types, SmallVectorImpl<Attribute> &syms) {
+  if (failed(parser.parseOptionalKeyword("ambient")))
+    return success();
+  if (parser.parseLParen())
+    return failure();
+  if (succeeded(parser.parseOptionalRParen()))
+    return success();
+  if (parseGenericAmbientEntry(parser, ops, types, syms))
+    return failure();
+  while (succeeded(parser.parseOptionalComma()))
+    if (parseGenericAmbientEntry(parser, ops, types, syms))
+      return failure();
+  if (parser.parseRParen())
+    return failure();
+  return validateAmbientSymUniqueness(parser, syms);
+}
+
+// All the per-clause parser state HCGenericOp::parse needs to thread
+// from the front-half (clause parsing) to the back-half (operand
+// resolution + attribute construction).
+namespace {
+struct HCGenericParseState {
   SmallVector<Attribute> iterSyms;
   SmallVector<Attribute> iterKinds;
   SmallVector<OpAsmParser::UnresolvedOperand> boundsOps;
   SmallVector<Type> boundsTypes;
-  if (parseGenericIterClause(parser, iterSyms, iterKinds, boundsOps,
-                             boundsTypes))
-    return failure();
-
   SmallVector<OpAsmParser::UnresolvedOperand> insOps;
   SmallVector<Type> insTypes;
   SmallVector<Attribute> insOffsets;
-  if (parseGenericOperandClause(parser, "ins", /*allowEmpty=*/true, insOps,
-                                insTypes, insOffsets))
-    return failure();
-
   SmallVector<OpAsmParser::UnresolvedOperand> outsOps;
   SmallVector<Type> outsTypes;
   SmallVector<Attribute> outsOffsets;
-  if (parseGenericOperandClause(parser, "outs", /*allowEmpty=*/false, outsOps,
-                                outsTypes, outsOffsets))
-    return failure();
-
   SmallVector<OpAsmParser::UnresolvedOperand> ambientOps;
   SmallVector<Type> ambientTypes;
   SmallVector<Attribute> ambientSyms;
-  if (parseGenericAmbientClause(parser, ambientOps, ambientTypes, ambientSyms))
-    return failure();
-
   SmallVector<Type> resultTypes;
+};
+} // namespace
+
+// Parse the four operand clauses (iter, ins, outs, ambient) into
+// `state`. Each clause has its own helper above with its own
+// localized diagnostics.
+static ParseResult parseHCGenericClauses(OpAsmParser &parser,
+                                         HCGenericParseState &state) {
+  if (parseGenericIterClause(parser, state.iterSyms, state.iterKinds,
+                             state.boundsOps, state.boundsTypes))
+    return failure();
+  if (parseGenericOperandClause(parser, "ins", /*allowEmpty=*/true,
+                                state.insOps, state.insTypes, state.insOffsets))
+    return failure();
+  if (parseGenericOperandClause(parser, "outs", /*allowEmpty=*/false,
+                                state.outsOps, state.outsTypes,
+                                state.outsOffsets))
+    return failure();
+  return parseGenericAmbientClause(parser, state.ambientOps, state.ambientTypes,
+                                   state.ambientSyms);
+}
+
+// Parse the trailing `-> (T0, T1, ...)` (or `-> ()`) result-type
+// clause. Empty result list is permitted.
+static ParseResult parseHCGenericResultArrow(OpAsmParser &parser,
+                                             SmallVectorImpl<Type> &outTypes) {
   if (parser.parseArrow() || parser.parseLParen())
     return failure();
-  if (failed(parser.parseOptionalRParen())) {
-    if (parser.parseTypeList(resultTypes) || parser.parseRParen())
-      return failure();
-  }
+  if (succeeded(parser.parseOptionalRParen()))
+    return success();
+  if (parser.parseTypeList(outTypes))
+    return failure();
+  return parser.parseRParen();
+}
 
-  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+// Resolve operand groups in the same order the ODS spec declares
+// them (iter_bounds, ins, outs, ambient_idxs) so the implicit
+// `operandSegmentSizes` index reads them back consistently.
+static ParseResult resolveHCGenericOperands(OpAsmParser &parser,
+                                            const HCGenericParseState &state,
+                                            OperationState &result) {
+  auto loc = parser.getCurrentLocation();
+  if (parser.resolveOperands(state.boundsOps, state.boundsTypes, loc,
+                             result.operands) ||
+      parser.resolveOperands(state.insOps, state.insTypes, loc,
+                             result.operands) ||
+      parser.resolveOperands(state.outsOps, state.outsTypes, loc,
+                             result.operands) ||
+      parser.resolveOperands(state.ambientOps, state.ambientTypes, loc,
+                             result.operands))
+    return failure();
+  return success();
+}
+
+static void populateHCGenericAttrs(OpAsmParser &parser,
+                                   const HCGenericParseState &state,
+                                   OperationState &result) {
+  MLIRContext *ctx = parser.getContext();
+  auto &builder = parser.getBuilder();
+  result.addAttribute(HCGenericOp::getIterSymsAttrName(result.name),
+                      ArrayAttr::get(ctx, state.iterSyms));
+  result.addAttribute(HCGenericOp::getIterKindsAttrName(result.name),
+                      ArrayAttr::get(ctx, state.iterKinds));
+  result.addAttribute(HCGenericOp::getAmbientIdxSymsAttrName(result.name),
+                      ArrayAttr::get(ctx, state.ambientSyms));
+  result.addAttribute(HCGenericOp::getInsOffsetsAttrName(result.name),
+                      ArrayAttr::get(ctx, state.insOffsets));
+  result.addAttribute(HCGenericOp::getOutsOffsetsAttrName(result.name),
+                      ArrayAttr::get(ctx, state.outsOffsets));
+  result.addAttribute(HCGenericOp::getOperandSegmentSizesAttrName(result.name),
+                      builder.getDenseI32ArrayAttr(
+                          {static_cast<int32_t>(state.boundsOps.size()),
+                           static_cast<int32_t>(state.insOps.size()),
+                           static_cast<int32_t>(state.outsOps.size()),
+                           static_cast<int32_t>(state.ambientOps.size())}));
+}
+
+ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
+  HCGenericParseState state;
+  if (parseHCGenericClauses(parser, state) ||
+      parseHCGenericResultArrow(parser, state.resultTypes) ||
+      parser.parseOptionalAttrDictWithKeyword(result.attributes))
     return failure();
 
   Region *body = result.addRegion();
@@ -2420,36 +2694,11 @@ ParseResult HCGenericOp::parse(OpAsmParser &parser, OperationState &result) {
                          /*enableNameShadowing=*/false))
     return failure();
 
-  // `resolveOperands` appends to `result.operands` in the call order; the
-  // ODS-declared operand groups (iter_bounds, ins, outs, ambient_idxs)
-  // must arrive in the same order so `operandSegmentSizes` reads them
-  // back consistently.
-  auto loc = parser.getCurrentLocation();
-  if (parser.resolveOperands(boundsOps, boundsTypes, loc, result.operands) ||
-      parser.resolveOperands(insOps, insTypes, loc, result.operands) ||
-      parser.resolveOperands(outsOps, outsTypes, loc, result.operands) ||
-      parser.resolveOperands(ambientOps, ambientTypes, loc, result.operands))
+  if (resolveHCGenericOperands(parser, state, result))
     return failure();
 
-  MLIRContext *ctx = parser.getContext();
-  auto &builder = parser.getBuilder();
-  result.addAttribute(getIterSymsAttrName(result.name),
-                      ArrayAttr::get(ctx, iterSyms));
-  result.addAttribute(getIterKindsAttrName(result.name),
-                      ArrayAttr::get(ctx, iterKinds));
-  result.addAttribute(getAmbientIdxSymsAttrName(result.name),
-                      ArrayAttr::get(ctx, ambientSyms));
-  result.addAttribute(getInsOffsetsAttrName(result.name),
-                      ArrayAttr::get(ctx, insOffsets));
-  result.addAttribute(getOutsOffsetsAttrName(result.name),
-                      ArrayAttr::get(ctx, outsOffsets));
-  result.addAttribute(
-      getOperandSegmentSizesAttrName(result.name),
-      builder.getDenseI32ArrayAttr({static_cast<int32_t>(boundsOps.size()),
-                                    static_cast<int32_t>(insOps.size()),
-                                    static_cast<int32_t>(outsOps.size()),
-                                    static_cast<int32_t>(ambientOps.size())}));
-  result.addTypes(resultTypes);
+  populateHCGenericAttrs(parser, state, result);
+  result.addTypes(state.resultTypes);
   return success();
 }
 
@@ -2498,154 +2747,175 @@ void HCGenericOp::print(OpAsmPrinter &p) {
   p.printRegion(getBody(), /*printEntryBlockArgs=*/true);
 }
 
-LogicalResult HCGenericOp::verify() {
-  ArrayAttr iterSyms = getIterSymsAttr();
-  ArrayAttr iterKinds = getIterKindsAttr();
-  OperandRange iterBounds = getIterBounds();
+// Verify the iter-clause invariants: triple-arity equality, non-empty,
+// and per-entry uniqueness / non-emptiness. Populates `reductionSyms`
+// with the names tagged `IterKind::Reduction` so the output-offset
+// pass can reject reductions on out-side addressing.
+static LogicalResult
+verifyHCGenericIterClause(HCGenericOp op,
+                          llvm::SmallDenseSet<StringRef> &reductionSyms) {
+  ArrayAttr iterSyms = op.getIterSymsAttr();
+  ArrayAttr iterKinds = op.getIterKindsAttr();
+  OperandRange iterBounds = op.getIterBounds();
   if (iterSyms.size() != iterBounds.size() ||
       iterSyms.size() != iterKinds.size())
-    return emitOpError("iter_syms, iter_bounds, and iter_kinds must agree on "
-                       "iter count, got ")
+    return op.emitOpError(
+               "iter_syms, iter_bounds, and iter_kinds must agree on "
+               "iter count, got ")
            << iterSyms.size() << ", " << iterBounds.size() << ", "
            << iterKinds.size();
   if (iterSyms.empty())
-    return emitOpError("must declare at least one iter");
+    return op.emitOpError("must declare at least one iter");
 
   llvm::StringSet<> seenSyms;
-  llvm::SmallDenseSet<StringRef> reductionSyms;
   for (auto [symAttr, kindAttr] :
        llvm::zip_equal(iterSyms.getAsRange<StringAttr>(),
                        iterKinds.getAsRange<IterKindAttr>())) {
     StringRef name = symAttr.getValue();
     if (name.empty())
-      return emitOpError("iter sym names must be non-empty");
+      return op.emitOpError("iter sym names must be non-empty");
     if (!seenSyms.insert(name).second)
-      return emitOpError("duplicate iter sym '") << name << "'";
+      return op.emitOpError("duplicate iter sym '") << name << "'";
     if (kindAttr.getValue() == IterKind::Reduction)
       reductionSyms.insert(name);
   }
+  return success();
+}
 
-  ArrayAttr insOffsets = getInsOffsetsAttr();
-  ArrayAttr outsOffsets = getOutsOffsetsAttr();
-  if (insOffsets.size() != getIns().size())
-    return emitOpError("ins_offsets count ")
-           << insOffsets.size() << " != ins count " << getIns().size();
-  if (outsOffsets.size() != getOuts().size())
-    return emitOpError("outs_offsets count ")
-           << outsOffsets.size() << " != outs count " << getOuts().size();
+// True iff `expr` is the bare leaf reference to the single symbol
+// `name` — used by the ambient-clause check to confirm the operand's
+// `!hc.idx<sym>` payload matches the declared sym name.
+static bool exprIsBareSymbol(sym::ExprHandle expr, StringRef name) {
+  StringRef onlyName;
+  bool unique = true;
+  sym::walkSymbolNames(expr, [&](StringRef n) {
+    if (onlyName.empty())
+      onlyName = n;
+    else if (onlyName != n)
+      unique = false;
+  });
+  return unique && !onlyName.empty() && onlyName == name;
+}
 
-  OperandRange ambientIdxs = getAmbientIdxs();
-  ArrayAttr ambientSyms = getAmbientIdxSymsAttr();
+// Verify a single ambient (operand, sym name) pair: name must be
+// non-empty / unique, and if the operand still carries an
+// `!hc.idx<sym>` payload, its expression must pin the same bare
+// symbol. After the launch-body converter strips to `index`, the
+// type-pin check trivially passes.
+static LogicalResult verifyHCGenericAmbientEntry(HCGenericOp op, Value val,
+                                                 StringRef name,
+                                                 llvm::StringSet<> &seen) {
+  if (name.empty())
+    return op.emitOpError("ambient sym name must be non-empty");
+  if (!seen.insert(name).second)
+    return op.emitOpError("duplicate ambient sym '") << name << "'";
+  auto idxTy = dyn_cast<IdxType>(val.getType());
+  if (!idxTy)
+    return success();
+  ExprAttr expr = idxTy.getExpr();
+  if (!expr)
+    return success();
+  if (!exprIsBareSymbol(expr.getValue(), name))
+    return op.emitOpError("ambient sym '")
+           << name << "' operand type does not pin the same bare symbol";
+  return success();
+}
+
+// Verify that ambient SSA edges and their sym-name attribute list
+// agree on count, and that each ambient operand pins the sym leaf
+// expression that matches its declared name. After the launch-body
+// type converter has stripped to `index`, the attr is the only sym
+// record and the type-pin check trivially passes.
+static LogicalResult verifyHCGenericAmbientClause(HCGenericOp op) {
+  OperandRange ambientIdxs = op.getAmbientIdxs();
+  ArrayAttr ambientSyms = op.getAmbientIdxSymsAttr();
   if (ambientIdxs.size() != ambientSyms.size())
-    return emitOpError("ambient_idxs count ")
+    return op.emitOpError("ambient_idxs count ")
            << ambientIdxs.size() << " != ambient_idx_syms count "
            << ambientSyms.size();
-  // Ambient names must be non-empty and unique; if the operand still
-  // carries its `!hc.idx<sym>` payload, its expression must be the bare
-  // sym leaf matching the attr entry. After the launch-body type
-  // converter has stripped to `index`, the attr is the only sym record.
-  {
-    llvm::StringSet<> seen;
-    for (auto [val, symAttr] :
-         llvm::zip_equal(ambientIdxs, ambientSyms.getAsRange<StringAttr>())) {
-      StringRef name = symAttr.getValue();
-      if (name.empty())
-        return emitOpError("ambient sym name must be non-empty");
-      if (!seen.insert(name).second)
-        return emitOpError("duplicate ambient sym '") << name << "'";
-      if (auto idxTy = dyn_cast<IdxType>(val.getType())) {
-        if (ExprAttr expr = idxTy.getExpr()) {
-          StringRef onlyName;
-          bool unique = true;
-          sym::walkSymbolNames(expr.getValue(), [&](StringRef n) {
-            if (onlyName.empty())
-              onlyName = n;
-            else if (onlyName != n)
-              unique = false;
-          });
-          if (!unique || onlyName.empty() || onlyName != name)
-            return emitOpError("ambient sym '")
-                   << name
-                   << "' operand type does not pin the same bare symbol";
-        }
-      }
-    }
-  }
+  llvm::StringSet<> seen;
+  for (auto [val, symAttr] :
+       llvm::zip_equal(ambientIdxs, ambientSyms.getAsRange<StringAttr>()))
+    if (failed(verifyHCGenericAmbientEntry(op, val, symAttr.getValue(), seen)))
+      return failure();
+  return success();
+}
 
-  if (getOuts().empty())
-    return emitOpError("must declare at least one output");
-
-  // SSA results track value-typed outs in declaration order. Ptr/buffer
-  // outs land their work in memory through the implicit ptr_store on the
-  // yield (op-level effects say so) and contribute no result. A pure-store
-  // generic produces zero results; mixed produces one per value-typed out.
+// Verify the SSA-result side: there must be one result per
+// value-typed out (ptr/buffer outs land in memory and contribute no
+// result), and the result types must match the outs types positionally.
+static LogicalResult verifyHCGenericResultsVsOuts(HCGenericOp op) {
+  if (op.getOuts().empty())
+    return op.emitOpError("must declare at least one output");
   SmallVector<Value> valueOuts;
-  for (Value out : getOuts())
+  for (Value out : op.getOuts())
     if (!isMemoryCarrierOperand(out.getType()))
       valueOuts.push_back(out);
-  if (getResults().size() != valueOuts.size())
-    return emitOpError("results count ")
-           << getResults().size() << " != value-typed outs count "
+  if (op.getResults().size() != valueOuts.size())
+    return op.emitOpError("results count ")
+           << op.getResults().size() << " != value-typed outs count "
            << valueOuts.size() << " (ptr/buffer outs contribute no SSA result)";
-  for (auto [i, resTy, outVal] : llvm::enumerate(getResultTypes(), valueOuts)) {
+  for (auto [i, resTy, outVal] :
+       llvm::enumerate(op.getResultTypes(), valueOuts))
     if (resTy != outVal.getType())
-      return emitOpError("result #")
+      return op.emitOpError("result #")
              << i << " type " << resTy << " does not match outs operand type "
              << outVal.getType();
-  }
+  return success();
+}
 
-  // Per-operand offset arrays must agree on length with the operand's
-  // rank. `!hc.undef` operands have no shape — skip them; the bounds
-  // pass / inference fills the rank in once a concrete type lands.
-  // `!hc.ptr<...>` carries a single linear address by op contract, so
-  // its offset array is always length 1.
-  //
-  // Pre-flatten the rule reads as logical-rank parity (rank N operand,
-  // N axis exprs); post-flatten the operand collapses to its 1D
-  // storage form and `hc-flatten-with-layouts` composes the per-axis
-  // exprs through the operand's layout into a single 1D offset, so
-  // the same equation holds with rank 1 on both sides. A richer
-  // post-flatten verifier that pins offset-vs-iter-sym usage lives
-  // in a follow-up.
-  auto operandRank = [](Type t) -> std::optional<size_t> {
-    if (isHCUndefType(t))
-      return std::nullopt;
-    if (llvm::isa<PtrType>(t))
-      return size_t{1};
-    if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
-      if (ShapeAttr shape = shaped.getSymbolicShape())
-        return shape.getDims().size();
+// `!hc.undef` operands have no shape; the bounds pass / inference
+// fills the rank in once a concrete type lands. `!hc.ptr<...>`
+// carries a single linear address by op contract, so its offset
+// array is always length 1.
+static std::optional<size_t> hcGenericOperandRank(Type t) {
+  if (isHCUndefType(t))
     return std::nullopt;
-  };
-  auto checkPerOperandShape = [&](ArrayAttr perOperandOffsets, Value operand,
-                                  StringRef role,
-                                  size_t roleIdx) -> LogicalResult {
+  if (llvm::isa<PtrType>(t))
+    return size_t{1};
+  if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
+    if (ShapeAttr shape = shaped.getSymbolicShape())
+      return shape.getDims().size();
+  return std::nullopt;
+}
+
+// Per-operand offset arrays must agree on length with the operand's
+// rank. Pre-flatten the rule reads as logical-rank parity (rank N
+// operand, N axis exprs); post-flatten the operand collapses to its
+// 1D storage form and the same equation holds with rank 1 on both
+// sides.
+static LogicalResult verifyHCGenericPerOperandOffsetShape(HCGenericOp op,
+                                                          ArrayAttr offsets,
+                                                          OperandRange operands,
+                                                          StringRef role) {
+  if (offsets.size() != operands.size())
+    return op.emitOpError(role)
+           << "_offsets count " << offsets.size() << " != " << role << " count "
+           << operands.size();
+  for (auto [i, perOperandOffsets, operand] :
+       llvm::enumerate(offsets.getAsRange<ArrayAttr>(), operands)) {
     auto entries = llvm::dyn_cast<ArrayAttr>(perOperandOffsets);
     if (!entries)
-      return emitOpError(role)
-             << "_offsets[" << roleIdx
+      return op.emitOpError(role)
+             << "_offsets[" << i
              << "] must be an array of #hc.expr<...> per axis";
-    if (auto rank = operandRank(operand.getType()))
+    if (auto rank = hcGenericOperandRank(operand.getType()))
       if (entries.size() != *rank)
-        return emitOpError(role)
-               << "_offsets[" << roleIdx << "] has " << entries.size()
+        return op.emitOpError(role)
+               << "_offsets[" << i << "] has " << entries.size()
                << " axis expression(s), expected " << *rank
                << " (one per operand axis)";
-    return success();
-  };
-  for (auto [i, off, in] :
-       llvm::enumerate(insOffsets.getAsRange<ArrayAttr>(), getIns()))
-    if (failed(checkPerOperandShape(off, in, "ins", i)))
-      return failure();
-  for (auto [i, off, out] :
-       llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>(), getOuts()))
-    if (failed(checkPerOperandShape(off, out, "outs", i)))
-      return failure();
+  }
+  return success();
+}
 
-  // Reduction iters on output offsets would mean writing the same slot
-  // twice along the reduction without specifying a combinator — the op
-  // doesn't model that; the reduction value rides on the outs-as-init
-  // body-arg/yield channel instead. Walk every per-axis entry.
+// Reduction iters on output offsets would mean writing the same slot
+// twice along the reduction without specifying a combinator — the op
+// doesn't model that; the reduction value rides on the outs-as-init
+// body-arg/yield channel instead.
+static LogicalResult verifyHCGenericReductionsNotInOutOffsets(
+    HCGenericOp op, ArrayAttr outsOffsets,
+    const llvm::SmallDenseSet<StringRef> &reductionSyms) {
   for (auto [i, perOperand] :
        llvm::enumerate(outsOffsets.getAsRange<ArrayAttr>())) {
     StringRef bad;
@@ -2664,22 +2934,24 @@ LogicalResult HCGenericOp::verify() {
       });
     }
     if (!bad.empty())
-      return emitOpError("output #")
+      return op.emitOpError("output #")
              << i << " axis " << badAxis
              << " offset references reduction iter '" << bad
              << "'; only parallel iters may appear in output addressing";
   }
+  return success();
+}
 
-  Region &body = getBody();
-  if (body.empty())
-    return emitOpError("expected a body region with an entry block");
-  Block &entry = body.front();
-  size_t expectedArgs = getIns().size() + getOuts().size();
+// Verify the body block exists, has the right arg arity (one per
+// in/out), and each block arg's type matches the corresponding
+// operand element type (skipping `!hc.undef` placeholders).
+static LogicalResult verifyHCGenericBodyBlockArgs(HCGenericOp op,
+                                                  Block &entry) {
+  size_t expectedArgs = op.getIns().size() + op.getOuts().size();
   if (entry.getNumArguments() != expectedArgs)
-    return emitOpError("body block takes ")
+    return op.emitOpError("body block takes ")
            << entry.getNumArguments() << " argument(s), expected "
            << expectedArgs << " (one per ins/outs)";
-
   auto checkArg = [&](size_t blockIdx, Value operand, StringRef role,
                       size_t roleIdx) -> LogicalResult {
     Type elem = genericOperandElement(operand.getType());
@@ -2688,22 +2960,26 @@ LogicalResult HCGenericOp::verify() {
     Type blockArgType = entry.getArgument(blockIdx).getType();
     if (isHCUndefType(blockArgType) || blockArgType == elem)
       return success();
-    return emitOpError("body argument #")
+    return op.emitOpError("body argument #")
            << blockIdx << " type " << blockArgType << " does not match " << role
            << " #" << roleIdx << " element type " << elem;
   };
-  for (auto [i, in] : llvm::enumerate(getIns()))
+  for (auto [i, in] : llvm::enumerate(op.getIns()))
     if (failed(checkArg(i, in, "ins", i)))
       return failure();
-  for (auto [i, out] : llvm::enumerate(getOuts()))
-    if (failed(checkArg(getIns().size() + i, out, "outs", i)))
+  for (auto [i, out] : llvm::enumerate(op.getOuts()))
+    if (failed(checkArg(op.getIns().size() + i, out, "outs", i)))
       return failure();
+  return success();
+}
 
+// Body terminates with either `hc.yield` (unconditional) or
+// `hc.yield_predicated` (per-value mask gate). Type-parity rules are
+// the same in both cases — only the predicated form additionally
+// carries masks, and the per-pair shape match is enforced on that op.
+static LogicalResult verifyHCGenericBodyTerminator(HCGenericOp op,
+                                                   Block &entry) {
   Operation *terminator = tryGetTerminator(entry);
-  // Body terminates with either `hc.yield` (unconditional) or
-  // `hc.yield_predicated` (per-value mask gate). Type-parity rules are the
-  // same in both cases — only the predicated form additionally carries
-  // masks, and the per-pair shape match is enforced on that op.
   ValueRange yieldValues;
   StringRef terminatorName;
   if (auto yield = llvm::dyn_cast_or_null<HCYieldOp>(terminator)) {
@@ -2714,22 +2990,51 @@ LogicalResult HCGenericOp::verify() {
     yieldValues = yieldPred.getValues();
     terminatorName = "hc.yield_predicated";
   } else {
-    return emitOpError(
+    return op.emitOpError(
         "body must terminate with `hc.yield` or `hc.yield_predicated`");
   }
-  if (yieldValues.size() != getOuts().size())
-    return emitOpError(terminatorName) << " arity " << yieldValues.size()
-                                       << " != outs count " << getOuts().size();
-  for (auto [i, yv, outVal] : llvm::enumerate(yieldValues, getOuts())) {
+  if (yieldValues.size() != op.getOuts().size())
+    return op.emitOpError(terminatorName)
+           << " arity " << yieldValues.size() << " != outs count "
+           << op.getOuts().size();
+  for (auto [i, yv, outVal] : llvm::enumerate(yieldValues, op.getOuts())) {
     Type yieldType = yv.getType();
     Type outElem = genericOperandElement(outVal.getType());
     if (!outElem || isHCUndefType(yieldType) || yieldType == outElem)
       continue;
-    return emitOpError(terminatorName)
+    return op.emitOpError(terminatorName)
            << " #" << i << " type " << yieldType << " does not match outs #"
            << i << " element type " << outElem;
   }
+  return success();
+}
 
+LogicalResult HCGenericOp::verify() {
+  llvm::SmallDenseSet<StringRef> reductionSyms;
+  if (failed(verifyHCGenericIterClause(*this, reductionSyms)))
+    return failure();
+
+  ArrayAttr insOffsets = getInsOffsetsAttr();
+  ArrayAttr outsOffsets = getOutsOffsetsAttr();
+  if (failed(verifyHCGenericPerOperandOffsetShape(*this, insOffsets, getIns(),
+                                                  "ins")) ||
+      failed(verifyHCGenericPerOperandOffsetShape(*this, outsOffsets, getOuts(),
+                                                  "outs")))
+    return failure();
+
+  if (failed(verifyHCGenericAmbientClause(*this)) ||
+      failed(verifyHCGenericResultsVsOuts(*this)) ||
+      failed(verifyHCGenericReductionsNotInOutOffsets(*this, outsOffsets,
+                                                      reductionSyms)))
+    return failure();
+
+  Region &body = getBody();
+  if (body.empty())
+    return emitOpError("expected a body region with an entry block");
+  Block &entry = body.front();
+  if (failed(verifyHCGenericBodyBlockArgs(*this, entry)) ||
+      failed(verifyHCGenericBodyTerminator(*this, entry)))
+    return failure();
   return success();
 }
 

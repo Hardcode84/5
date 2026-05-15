@@ -241,6 +241,8 @@ struct KernelArgSource {
   unsigned rank() const { return dims.size(); }
 };
 
+static std::optional<KernelArgSource> resolveKernelArg(Value source);
+
 // Pure query: walks defining ops to find the underlying kernel-arg
 // `(ptr, dims..., strides...)` UCC. Handles both the pre-flatten
 // direct kernel-arg shape (one UCC carrying the bundle) and the
@@ -249,47 +251,80 @@ struct KernelArgSource {
 // return the inner rank-N source — the consumer decides whether to
 // use it directly (e.g. `AdaptGenericOp` just needs `ptr`) or to
 // collapse to a rank-1 view (`flatKernelArgView`, IR-mutating).
+// `cast` is the multi-output bare-carrier UCC that the post-flatten
+// pipeline plants over a rank-1 `BufferType` view. Caller has
+// established `cast` is a UCC; we just check the shape and recurse
+// into the original kernel-arg input.
+static std::optional<KernelArgSource>
+resolveKernelArgViaBareCarrier(UnrealizedConversionCastOp cast, Value source) {
+  if (cast.getInputs().size() != 1 || cast.getOutputs().size() <= 1 ||
+      source != cast.getOutputs()[0])
+    return std::nullopt;
+  auto bufOut = dyn_cast<BufferType>(source.getType());
+  if (!bufOut || bufOut.getShape().getDims().size() != 1)
+    return std::nullopt;
+  return resolveKernelArg(cast.getInputs()[0]);
+}
+
+// Validate the canonical kernel-arg UCC shape: 1 output, and inputs
+// of the form `ptr<global, T>, dim_0..dim_{r-1}, stride_0..stride_{r-1}`.
+// Returns the `(ptr, rank)` pair on success.
+static std::optional<std::pair<Value, unsigned>>
+validateKernelArgCastShape(UnrealizedConversionCastOp cast) {
+  if (cast.getOutputs().size() != 1 || cast.getInputs().size() < 1 ||
+      (cast.getInputs().size() - 1) % 2 != 0)
+    return std::nullopt;
+  Value ptr = cast.getInputs().front();
+  auto ptrType = dyn_cast<PtrType>(ptr.getType());
+  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Global)
+    return std::nullopt;
+  unsigned rank = static_cast<unsigned>((cast.getInputs().size() - 1) / 2);
+  return std::make_pair(ptr, rank);
+}
+
+// Extract `rank` `index`-typed values from `cast.getInputs()`
+// starting at `start`. Returns `nullopt` if any value isn't `index`.
+static std::optional<SmallVector<Value>>
+extractKernelArgIndexInputs(UnrealizedConversionCastOp cast, unsigned start,
+                            unsigned rank) {
+  SmallVector<Value> out;
+  out.reserve(rank);
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    Value v = cast.getInputs()[start + axis];
+    if (!v.getType().isIndex())
+      return std::nullopt;
+    out.push_back(v);
+  }
+  return out;
+}
+
 static std::optional<KernelArgSource> resolveKernelArg(Value source) {
   auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
   if (!cast)
     return std::nullopt;
 
-  if (cast.getInputs().size() == 1 && cast.getOutputs().size() > 1 &&
-      source == cast.getOutputs()[0]) {
-    if (auto bufOut = dyn_cast<BufferType>(source.getType());
-        bufOut && bufOut.getShape().getDims().size() == 1)
-      return resolveKernelArg(cast.getInputs()[0]);
-  }
+  if (std::optional<KernelArgSource> via =
+          resolveKernelArgViaBareCarrier(cast, source))
+    return via;
 
-  if (cast.getOutputs().size() != 1)
+  std::optional<std::pair<Value, unsigned>> shape =
+      validateKernelArgCastShape(cast);
+  if (!shape)
     return std::nullopt;
-  if (cast.getInputs().size() < 1)
+  auto [ptr, rank] = *shape;
+  std::optional<SmallVector<Value>> dims =
+      extractKernelArgIndexInputs(cast, /*start=*/1, rank);
+  if (!dims)
     return std::nullopt;
-  if ((cast.getInputs().size() - 1) % 2 != 0)
+  std::optional<SmallVector<Value>> strides =
+      extractKernelArgIndexInputs(cast, /*start=*/1 + rank, rank);
+  if (!strides)
     return std::nullopt;
 
-  Value ptr = cast.getInputs().front();
-  auto ptrType = dyn_cast<PtrType>(ptr.getType());
-  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Global)
-    return std::nullopt;
-
-  unsigned rank = (cast.getInputs().size() - 1) / 2;
   KernelArgSource info;
   info.ptr = ptr;
-  info.dims.reserve(rank);
-  info.strides.reserve(rank);
-  for (unsigned axis = 0; axis < rank; ++axis) {
-    Value dim = cast.getInputs()[1 + axis];
-    if (!dim.getType().isIndex())
-      return std::nullopt;
-    info.dims.push_back(dim);
-  }
-  for (unsigned axis = 0; axis < rank; ++axis) {
-    Value stride = cast.getInputs()[1 + rank + axis];
-    if (!stride.getType().isIndex())
-      return std::nullopt;
-    info.strides.push_back(stride);
-  }
+  info.dims = std::move(*dims);
+  info.strides = std::move(*strides);
   return info;
 }
 
@@ -426,6 +461,21 @@ static Value resolveBundleStrideSym(const KernelArgSource &source,
 // fold through the `index → i64` block-arg materialization that
 // `convert-gpu-to-rocdl` plants, taking the offset arith all the way
 // back to the i64 kernel args.
+// Walk the bundle's per-axis shape syms looking for a dim that
+// matches `symbol`. Returns the bundle's `index`-typed dim value
+// when found.
+static std::optional<Value> lookupBundleDim(BufferType bundleType,
+                                            const KernelArgSource &info,
+                                            StringRef symbol) {
+  for (auto [axis, attr] : llvm::enumerate(bundleType.getShape().getDims())) {
+    auto expr = dyn_cast<ExprAttr>(attr);
+    std::optional<StringRef> dimSym = exactSymbolName(expr);
+    if (dimSym && *dimSym == symbol && axis < info.dims.size())
+      return info.dims[axis];
+  }
+  return std::nullopt;
+}
+
 static Value resolveToBundleIndex(Value value) {
   auto idxType = dyn_cast<IdxType>(value.getType());
   if (!idxType)
@@ -442,12 +492,8 @@ static Value resolveToBundleIndex(Value value) {
   std::optional<KernelArgSource> info = resolveKernelArg(cast.getInputs()[0]);
   if (!info)
     return Value{};
-  for (auto [axis, attr] : llvm::enumerate(bundleType.getShape().getDims())) {
-    auto expr = dyn_cast<ExprAttr>(attr);
-    std::optional<StringRef> dimSym = exactSymbolName(expr);
-    if (dimSym && *dimSym == *symbol && axis < info->dims.size())
-      return info->dims[axis];
-  }
+  if (std::optional<Value> dim = lookupBundleDim(bundleType, *info, *symbol))
+    return *dim;
   return resolveBundleStrideSym(*info, *symbol);
 }
 
@@ -470,75 +516,79 @@ static void bindLaunchDim3(StringRef prefix, gpu::KernelDim3 values,
   }
 }
 
-static BoundValues collectBoundValues(Operation *anchor,
-                                      ConversionPatternRewriter &rewriter) {
-  BoundValues boundValues;
-  auto launch = anchor->getParentOfType<gpu::LaunchOp>();
-  if (!launch)
-    return boundValues;
+// Pre-flatten kernel-arg UCC: single multi-input bundle → single
+// buffer output. The buffer carries shape syms (M, N, ...) and the
+// inputs give us per-axis dim values.
+static void bindPreFlattenKernelArgCast(UnrealizedConversionCastOp cast,
+                                        ConversionPatternRewriter &rewriter,
+                                        Location loc,
+                                        BoundValues &boundValues) {
+  Type outputType = cast.getOutputs().front().getType();
+  if (auto buffer = dyn_cast<BufferType>(outputType)) {
+    if (auto info = resolveKernelArg(cast.getResult(0)))
+      bindShapeSymbols(buffer, *info, boundValues);
+    return;
+  }
+  if (cast.getInputs().size() != 1)
+    return;
+  Value input = cast.getInputs().front();
+  if (std::optional<StringRef> symbol = exactSymbolName(outputType))
+    boundValues.bind(*symbol, indexCast(rewriter, loc, input));
+}
 
-  bindLaunchDim3("$WG", launch.getBlockIds(), boundValues);
-  bindLaunchDim3("$WI", launch.getThreadIds(), boundValues);
-  bindLaunchDim3("$WGS", launch.getBlockSizeOperandValues(), boundValues);
+// Post-flatten retype UCC: rank-N buffer input → (rank-1 buffer,
+// idx<sym>, idx<sym>, ...) outputs. Each idx-typed output exposes
+// an implicit-symbol value (kernel-arg shape dim, stride, layout
+// param, ...) that the access ops reference symbolically in their
+// composed offsets. Bind each one so the ambient lowering can
+// resolve the apply.
+//
+// `indexCastViaBundle` short-circuits to the underlying kernel-arg
+// bundle's `index`-typed input when one is reachable; otherwise it
+// emits an `idx<sym>→index` UCC on the retype output as before. See
+// `resolveToBundleIndex` for the rationale.
+static void bindPostFlattenRetypeCast(UnrealizedConversionCastOp cast,
+                                      ConversionPatternRewriter &rewriter,
+                                      Location loc, BoundValues &boundValues) {
+  if (cast.getInputs().size() != 1)
+    return;
+  for (Value output : cast.getOutputs().drop_front()) {
+    std::optional<StringRef> symbol = exactSymbolName(output.getType());
+    if (symbol)
+      boundValues.bind(*symbol, indexCastViaBundle(rewriter, loc, output));
+  }
+}
 
-  launch.walk([&](UnrealizedConversionCastOp cast) {
-    // Pre-flatten kernel-arg UCC: single multi-input bundle → single
-    // buffer output. The buffer carries shape syms (M, N, ...) and the
-    // inputs give us per-axis dim values.
-    if (cast.getOutputs().size() == 1) {
-      Type outputType = cast.getOutputs().front().getType();
-      if (auto buffer = dyn_cast<BufferType>(outputType)) {
-        if (auto info = resolveKernelArg(cast.getResult(0)))
-          bindShapeSymbols(buffer, *info, boundValues);
-        return;
-      }
+static void bindKernelArgCastSymbols(UnrealizedConversionCastOp cast,
+                                     ConversionPatternRewriter &rewriter,
+                                     Location loc, BoundValues &boundValues) {
+  if (cast.getOutputs().size() == 1) {
+    bindPreFlattenKernelArgCast(cast, rewriter, loc, boundValues);
+    return;
+  }
+  bindPostFlattenRetypeCast(cast, rewriter, loc, boundValues);
+}
 
-      if (cast.getInputs().size() != 1)
-        return;
-      Value input = cast.getInputs().front();
-      if (std::optional<StringRef> symbol = exactSymbolName(outputType))
-        boundValues.bind(*symbol, indexCast(rewriter, anchor->getLoc(), input));
-      return;
-    }
-
-    // Post-flatten retype UCC: rank-N buffer input → (rank-1 buffer,
-    // idx<sym>, idx<sym>, ...) outputs. Each idx-typed output exposes
-    // an implicit-symbol value (kernel-arg shape dim, stride, layout
-    // param, ...) that the access ops reference symbolically in their
-    // composed offsets. Bind each one so the ambient lowering can
-    // resolve the apply.
-    //
-    // `indexCastViaBundle` short-circuits to the underlying kernel-arg
-    // bundle's `index`-typed input when one is reachable; otherwise it
-    // emits an `idx<sym>→index` UCC on the retype output as before.
-    // See `resolveToBundleIndex` for the rationale.
-    if (cast.getInputs().size() == 1) {
-      for (Value output : cast.getOutputs().drop_front()) {
-        std::optional<StringRef> symbol = exactSymbolName(output.getType());
-        if (symbol)
-          boundValues.bind(
-              *symbol, indexCastViaBundle(rewriter, anchor->getLoc(), output));
-      }
-    }
-  });
-
-  // Structured loop/region block arguments that carry a bare-sym `!hc.idx`
-  // type (e.g. an `hc.for_range` induction variable typed
-  // `!hc.idx<"$join0">`) are their own binding for that symbol name. The
-  // pre-flatten access-offset apply leaves these as free symbols because
-  // the inner expression references the bare sym directly rather than
-  // taking the value as an explicit operand; we pick them up ambiently
-  // here. Only ancestor blocks of `anchor` qualify — a sibling for_range's
-  // induction var would shadow incorrectly and would also fail SSA
-  // dominance if a UCC against it ended up outside its defining block.
-  //
-  // Post-`hc-flatten-with-layouts`, `hc.generic` carries its ambient sym
-  // SSA edges in operand form (`ambient_idxs` / `ambient_idx_syms`) and
-  // `hc-lower-generic` plants per-lane applies that bind every ambient
-  // sym as an explicit operand. Those applies never reach this walker
-  // because their operand list is complete; the only consumers we see
-  // are pre-flatten applies whose free-sym set still rides on the
-  // ancestor `!hc.idx<sym>` types we collect below.
+// Structured loop/region block arguments that carry a bare-sym `!hc.idx`
+// type (e.g. an `hc.for_range` induction variable typed
+// `!hc.idx<"$join0">`) are their own binding for that symbol name. The
+// pre-flatten access-offset apply leaves these as free symbols because
+// the inner expression references the bare sym directly rather than
+// taking the value as an explicit operand; we pick them up ambiently
+// here. Only ancestor blocks of `anchor` qualify — a sibling for_range's
+// induction var would shadow incorrectly and would also fail SSA
+// dominance if a UCC against it ended up outside its defining block.
+//
+// Post-`hc-flatten-with-layouts`, `hc.generic` carries its ambient sym
+// SSA edges in operand form (`ambient_idxs` / `ambient_idx_syms`) and
+// `hc-lower-generic` plants per-lane applies that bind every ambient
+// sym as an explicit operand. Those applies never reach this walker
+// because their operand list is complete; the only consumers we see
+// are pre-flatten applies whose free-sym set still rides on the
+// ancestor `!hc.idx<sym>` types we collect below.
+static void bindAncestorBlockArgSymbols(Operation *anchor, gpu::LaunchOp launch,
+                                        ConversionPatternRewriter &rewriter,
+                                        BoundValues &boundValues) {
   for (Block *block = anchor->getBlock(); block;) {
     for (BlockArgument arg : block->getArguments()) {
       std::optional<StringRef> symbol = exactSymbolName(arg.getType());
@@ -551,6 +601,24 @@ static BoundValues collectBoundValues(Operation *anchor,
       break;
     block = parent->getBlock();
   }
+}
+
+static BoundValues collectBoundValues(Operation *anchor,
+                                      ConversionPatternRewriter &rewriter) {
+  BoundValues boundValues;
+  auto launch = anchor->getParentOfType<gpu::LaunchOp>();
+  if (!launch)
+    return boundValues;
+
+  bindLaunchDim3("$WG", launch.getBlockIds(), boundValues);
+  bindLaunchDim3("$WI", launch.getThreadIds(), boundValues);
+  bindLaunchDim3("$WGS", launch.getBlockSizeOperandValues(), boundValues);
+
+  launch.walk([&](UnrealizedConversionCastOp cast) {
+    bindKernelArgCastSymbols(cast, rewriter, anchor->getLoc(), boundValues);
+  });
+
+  bindAncestorBlockArgSymbols(anchor, launch, rewriter, boundValues);
 
   return boundValues;
 }
@@ -1244,6 +1312,94 @@ struct PtrViewSource {
   SmallVector<SliceAxis> axes;
 };
 
+// Pull the workgroup ptr out of a remapped source tile, checking the
+// address space matches the LDS contract (any other address space means
+// the caller has the wrong source and should fail the rewrite).
+static FailureOr<std::pair<Value, PtrType>>
+resolveWorkgroupPtr(Value remapped) {
+  Value srcPtr = sourcePtr(remapped);
+  if (!srcPtr)
+    return failure();
+  auto srcPtrType = dyn_cast<PtrType>(srcPtr.getType());
+  if (!srcPtrType || srcPtrType.getAddrSpace() != AddrSpace::Workgroup)
+    return failure();
+  return std::make_pair(srcPtr, srcPtrType);
+}
+
+// Resolve the view source for a buffer-view op: remap each per-axis
+// subscript through the conversion pattern, then materialize the
+// offset/stride axes the per-element loop walks.
+static FailureOr<PtrViewSource>
+resolveBufferViewSource(HCBufferViewOp bv,
+                        ConversionPatternRewriter &rewriter) {
+  Value sourceTile = bv.getBuffer();
+  auto bareSrc = dyn_cast<BareTensorType>(sourceTile.getType());
+  if (!bareSrc)
+    return failure();
+  FailureOr<SmallVector<int64_t>> sourceShape =
+      staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bareSrc));
+  if (failed(sourceShape))
+    return failure();
+  Value remappedSrc = rewriter.getRemappedValue(sourceTile);
+  if (!remappedSrc)
+    return failure();
+  FailureOr<std::pair<Value, PtrType>> ptr = resolveWorkgroupPtr(remappedSrc);
+  if (failed(ptr))
+    return failure();
+  // Walk through remapped index operands so the per-axis offset/stride
+  // values come out as `index`-typed SSA the per-element loop can plug
+  // into `arith.muli`/`arith.addi` directly. The pre-conversion form
+  // here is `!hc.idx<...>` / `!hc.slice<...>` from the buffer_view's
+  // original operands, so we have to remap each index value (the slice
+  // op's `lower`/`upper`/`step` are the slice op's own operands and get
+  // remapped on its lowering, which has already happened by the time
+  // any ptr-view consumer runs).
+  SmallVector<Value> remappedIndices;
+  remappedIndices.reserve(bv.getIndices().size());
+  for (Value idx : bv.getIndices()) {
+    Value remapped = rewriter.getRemappedValue(idx);
+    if (!remapped)
+      return failure();
+    remappedIndices.push_back(remapped);
+  }
+  // Non-unit strides are fine here. `loadVectorFromPtrView` /
+  // `writeVectorToWorkgroupPtr` walk the result-vector lanes through
+  // `axis.stride * iter + axis.offset` (one per-element scalar
+  // load/store), so any constant or symbolic stride lowers correctly
+  // — there's no SIMD-vs-gather decision pending on this site.
+  // The wider upgrade to `vector.gather` / strided `vector.transfer_*`
+  // for performance is the separate "SIMD/gather upgrade" task.
+  FailureOr<SmallVector<SliceAxis>> axes =
+      collectAxes(bv.getOperation(), remappedIndices, rewriter,
+                  /*requireUnitStride=*/false);
+  if (failed(axes))
+    return failure();
+  if (axes->size() != sourceShape->size())
+    return bv.emitOpError("expected one view subscript per source axis");
+  return PtrViewSource{ptr->first, ptr->second, *sourceShape, std::move(*axes)};
+}
+
+// Synthesize a trivial axis pattern for non-view sources: each axis is
+// a full slice (`offset = 0`, `stride = 1`) over the source's static
+// dim. The strided per-element loop with trivial axes degenerates to
+// the same flat `0..N` iteration the no-view path would emit.
+static SmallVector<SliceAxis>
+buildTrivialSliceAxes(ArrayRef<int64_t> shape,
+                      ConversionPatternRewriter &rewriter, Location loc) {
+  SmallVector<SliceAxis> trivialAxes;
+  trivialAxes.reserve(shape.size());
+  Value zero = zeroIndex(rewriter, loc);
+  Value one = oneIndex(rewriter, loc);
+  for (size_t i = 0; i < shape.size(); ++i) {
+    SliceAxis ax;
+    ax.offset = zero;
+    ax.stride = one;
+    ax.isSlice = true;
+    trivialAxes.push_back(ax);
+  }
+  return trivialAxes;
+}
+
 // Walk back through a single `hc.buffer_view` to find the underlying
 // workgroup ptr and the index pattern. The buffer_view ops sit in the
 // pre-conversion IR — `getRemappedValue` walks `replaceOp` records to
@@ -1259,65 +1415,14 @@ struct PtrViewSource {
 // `0..N` iteration the no-view path would emit.
 static FailureOr<PtrViewSource>
 resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
-  if (auto bv = original.getDefiningOp<HCBufferViewOp>()) {
-    Value sourceTile = bv.getBuffer();
-    auto bareSrc = dyn_cast<BareTensorType>(sourceTile.getType());
-    if (!bareSrc)
-      return failure();
-    FailureOr<SmallVector<int64_t>> sourceShape =
-        staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bareSrc));
-    if (failed(sourceShape))
-      return failure();
-    Value remappedSrc = rewriter.getRemappedValue(sourceTile);
-    if (!remappedSrc)
-      return failure();
-    Value srcPtr = sourcePtr(remappedSrc);
-    if (!srcPtr)
-      return failure();
-    auto srcPtrType = dyn_cast<PtrType>(srcPtr.getType());
-    if (!srcPtrType || srcPtrType.getAddrSpace() != AddrSpace::Workgroup)
-      return failure();
-    // Walk through remapped index operands so the per-axis offset/stride
-    // values come out as `index`-typed SSA the per-element loop can plug
-    // into `arith.muli`/`arith.addi` directly. The pre-conversion form
-    // here is `!hc.idx<...>` / `!hc.slice<...>` from the buffer_view's
-    // original operands, so we have to remap each index value (the slice
-    // op's `lower`/`upper`/`step` are the slice op's own operands and get
-    // remapped on its lowering, which has already happened by the time
-    // any ptr-view consumer runs).
-    SmallVector<Value> remappedIndices;
-    remappedIndices.reserve(bv.getIndices().size());
-    for (Value idx : bv.getIndices()) {
-      Value remapped = rewriter.getRemappedValue(idx);
-      if (!remapped)
-        return failure();
-      remappedIndices.push_back(remapped);
-    }
-    // Non-unit strides are fine here. `loadVectorFromPtrView` /
-    // `writeVectorToWorkgroupPtr` walk the result-vector lanes through
-    // `axis.stride * iter + axis.offset` (one per-element scalar
-    // load/store), so any constant or symbolic stride lowers correctly
-    // — there's no SIMD-vs-gather decision pending on this site.
-    // The wider upgrade to `vector.gather` / strided `vector.transfer_*`
-    // for performance is the separate "SIMD/gather upgrade" task.
-    FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(bv.getOperation(), remappedIndices, rewriter,
-                    /*requireUnitStride=*/false);
-    if (failed(axes))
-      return failure();
-    if (axes->size() != sourceShape->size())
-      return bv.emitOpError("expected one view subscript per source axis");
-    return PtrViewSource{srcPtr, srcPtrType, *sourceShape, std::move(*axes)};
-  }
+  if (auto bv = original.getDefiningOp<HCBufferViewOp>())
+    return resolveBufferViewSource(bv, rewriter);
 
   Value remapped = rewriter.getRemappedValue(original);
   if (!remapped)
     return failure();
-  Value srcPtr = sourcePtr(remapped);
-  if (!srcPtr)
-    return failure();
-  auto srcPtrType = dyn_cast<PtrType>(srcPtr.getType());
-  if (!srcPtrType || srcPtrType.getAddrSpace() != AddrSpace::Workgroup)
+  FailureOr<std::pair<Value, PtrType>> ptr = resolveWorkgroupPtr(remapped);
+  if (failed(ptr))
     return failure();
   auto bare = dyn_cast<BareTensorType>(original.getType());
   if (!bare)
@@ -1326,19 +1431,9 @@ resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
       staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bare));
   if (failed(shape))
     return failure();
-
-  SmallVector<SliceAxis> trivialAxes;
-  trivialAxes.reserve(shape->size());
-  Value zero = zeroIndex(rewriter, original.getLoc());
-  Value one = oneIndex(rewriter, original.getLoc());
-  for (size_t i = 0; i < shape->size(); ++i) {
-    SliceAxis ax;
-    ax.offset = zero;
-    ax.stride = one;
-    ax.isSlice = true;
-    trivialAxes.push_back(ax);
-  }
-  return PtrViewSource{srcPtr, srcPtrType, *shape, std::move(trivialAxes)};
+  SmallVector<SliceAxis> trivialAxes =
+      buildTrivialSliceAxes(*shape, rewriter, original.getLoc());
+  return PtrViewSource{ptr->first, ptr->second, *shape, std::move(trivialAxes)};
 }
 
 // Per-element load of a multi-dim `vector<...xT>` from a workgroup ptr,
@@ -1354,6 +1449,91 @@ resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
 // The per-element shape preserves the byte-per-element layout the
 // cooperative store and other consumers use, sidestepping the i1
 // packed/unpacked discrepancy LLVM has between scalar and vector i1 stores.
+// Row-major stride for each axis of a static shape (last axis = 1,
+// each preceding axis multiplied by the next axis's size).
+static SmallVector<int64_t> computeRowMajorStrides(ArrayRef<int64_t> shape) {
+  SmallVector<int64_t> strides(shape.size(), 1);
+  for (int64_t axis = static_cast<int64_t>(shape.size()) - 2; axis >= 0; --axis)
+    strides[axis] = strides[axis + 1] * shape[axis + 1];
+  return strides;
+}
+
+// Positions of slice (non-scalar) axes in `axes`, in source order.
+static SmallVector<int64_t>
+collectSliceAxisPositions(ArrayRef<SliceAxis> axes) {
+  SmallVector<int64_t> positions;
+  for (int64_t i = 0; i < static_cast<int64_t>(axes.size()); ++i)
+    if (axes[i].isSlice)
+      positions.push_back(i);
+  return positions;
+}
+
+// Scalar (non-slice) source axes contribute a fixed base offset: each
+// axis's `offset` value times its source-side row-major stride, summed
+// into an `index`-typed running offset that's reused across every lane
+// of the per-element load.
+static Value computeScalarAxesBaseOffset(OpBuilder &rewriter, Location loc,
+                                         ArrayRef<SliceAxis> axes,
+                                         ArrayRef<int64_t> sourceStrides) {
+  Value base = zeroIndex(rewriter, loc);
+  for (size_t i = 0; i < axes.size(); ++i) {
+    if (axes[i].isSlice)
+      continue;
+    Value strideVal =
+        arith::ConstantIndexOp::create(rewriter, loc, sourceStrides[i])
+            .getResult();
+    Value contrib =
+        arith::MulIOp::create(rewriter, loc, axes[i].offset, strideVal)
+            .getResult();
+    base = arith::AddIOp::create(rewriter, loc, base, contrib).getResult();
+  }
+  return base;
+}
+
+// Unflatten a linear lane index into per-axis view coords (row-major).
+static SmallVector<int64_t> unflattenLaneIndex(int64_t lin,
+                                               ArrayRef<int64_t> viewShape) {
+  SmallVector<int64_t> coords(viewShape.size());
+  int64_t remaining = lin;
+  for (int64_t axis = static_cast<int64_t>(viewShape.size()) - 1; axis >= 0;
+       --axis) {
+    coords[axis] = remaining % viewShape[axis];
+    remaining /= viewShape[axis];
+  }
+  return coords;
+}
+
+// Add per-lane slice-axis contributions to a running base offset. Each
+// view coord scales the slice's stride, gets the slice's offset added,
+// and then multiplies the source-side row-major stride at that axis.
+static Value applyLaneSliceOffset(OpBuilder &rewriter, Location loc, Value base,
+                                  ArrayRef<int64_t> coordInts,
+                                  ArrayRef<int64_t> sliceAxisPositions,
+                                  ArrayRef<SliceAxis> axes,
+                                  ArrayRef<int64_t> sourceStrides) {
+  Value flat = base;
+  for (size_t vi = 0; vi < sliceAxisPositions.size(); ++vi) {
+    int64_t srcAxisPos = sliceAxisPositions[vi];
+    const SliceAxis &ax = axes[srcAxisPos];
+    Value coordVal =
+        arith::ConstantIndexOp::create(rewriter, loc, coordInts[vi])
+            .getResult();
+    Value scaledStride =
+        arith::MulIOp::create(rewriter, loc, coordVal, ax.stride).getResult();
+    Value indexInSource =
+        arith::AddIOp::create(rewriter, loc, ax.offset, scaledStride)
+            .getResult();
+    Value srcStrideVal =
+        arith::ConstantIndexOp::create(rewriter, loc, sourceStrides[srcAxisPos])
+            .getResult();
+    Value contrib =
+        arith::MulIOp::create(rewriter, loc, indexInSource, srcStrideVal)
+            .getResult();
+    flat = arith::AddIOp::create(rewriter, loc, flat, contrib).getResult();
+  }
+  return flat;
+}
+
 static FailureOr<Value>
 loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
                       Value original, mlir::VectorType vectorType,
@@ -1364,31 +1544,14 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
   if (vectorType.getShape() != viewShape)
     return failure();
 
-  SmallVector<int64_t> sourceStrides(src->sourceShape.size(), 1);
-  for (int64_t axis = static_cast<int64_t>(src->sourceShape.size()) - 2;
-       axis >= 0; --axis)
-    sourceStrides[axis] = sourceStrides[axis + 1] * src->sourceShape[axis + 1];
-
-  SmallVector<int64_t> sliceAxisPositions;
-  for (int64_t i = 0; i < static_cast<int64_t>(src->axes.size()); ++i)
-    if (src->axes[i].isSlice)
-      sliceAxisPositions.push_back(i);
+  SmallVector<int64_t> sourceStrides = computeRowMajorStrides(src->sourceShape);
+  SmallVector<int64_t> sliceAxisPositions =
+      collectSliceAxisPositions(src->axes);
   if (sliceAxisPositions.size() != viewShape.size())
     return failure();
 
-  Value baseOffset = zeroIndex(rewriter, loc);
-  for (size_t i = 0; i < src->axes.size(); ++i) {
-    if (src->axes[i].isSlice)
-      continue;
-    Value strideVal =
-        arith::ConstantIndexOp::create(rewriter, loc, sourceStrides[i])
-            .getResult();
-    Value contrib =
-        arith::MulIOp::create(rewriter, loc, src->axes[i].offset, strideVal)
-            .getResult();
-    baseOffset =
-        arith::AddIOp::create(rewriter, loc, baseOffset, contrib).getResult();
-  }
+  Value baseOffset =
+      computeScalarAxesBaseOffset(rewriter, loc, src->axes, sourceStrides);
 
   int64_t total = 1;
   for (int64_t d : viewShape)
@@ -1398,33 +1561,10 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
                                            rewriter.getZeroAttr(vectorType))
                      .getResult();
   for (int64_t lin = 0; lin != total; ++lin) {
-    SmallVector<int64_t> coordInts(viewShape.size());
-    int64_t remaining = lin;
-    for (int64_t axis = static_cast<int64_t>(viewShape.size()) - 1; axis >= 0;
-         --axis) {
-      coordInts[axis] = remaining % viewShape[axis];
-      remaining /= viewShape[axis];
-    }
-    Value flat = baseOffset;
-    for (size_t vi = 0; vi < sliceAxisPositions.size(); ++vi) {
-      int64_t srcAxisPos = sliceAxisPositions[vi];
-      const SliceAxis &ax = src->axes[srcAxisPos];
-      Value coordVal =
-          arith::ConstantIndexOp::create(rewriter, loc, coordInts[vi])
-              .getResult();
-      Value scaledStride =
-          arith::MulIOp::create(rewriter, loc, coordVal, ax.stride).getResult();
-      Value indexInSource =
-          arith::AddIOp::create(rewriter, loc, ax.offset, scaledStride)
-              .getResult();
-      Value srcStrideVal = arith::ConstantIndexOp::create(
-                               rewriter, loc, sourceStrides[srcAxisPos])
-                               .getResult();
-      Value contrib =
-          arith::MulIOp::create(rewriter, loc, indexInSource, srcStrideVal)
-              .getResult();
-      flat = arith::AddIOp::create(rewriter, loc, flat, contrib).getResult();
-    }
+    SmallVector<int64_t> coordInts = unflattenLaneIndex(lin, viewShape);
+    Value flat =
+        applyLaneSliceOffset(rewriter, loc, baseOffset, coordInts,
+                             sliceAxisPositions, src->axes, sourceStrides);
     Value addr =
         HCPtrOffsetOp::create(rewriter, loc, src->ptrType, src->sourcePtr, flat)
             .getResult();
@@ -1574,6 +1714,79 @@ static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
   return indices;
 }
 
+// Result shape/type bundle for a load-like op: the converted vector
+// type, its static shape, and the element type.
+struct LoadLikeResultShape {
+  mlir::VectorType vectorType;
+  SmallVector<int64_t> shape;
+  Type elementType;
+};
+
+// Decode the load's bare-vector result into a static `(VectorType,
+// shape, elementType)` bundle. Returns failure when the converter
+// wouldn't produce a vector or the bare-vector source isn't statically
+// shaped — both indicate the pattern shouldn't fire.
+static FailureOr<LoadLikeResultShape>
+unpackLoadLikeResultShape(const TypeConverter &converter, Type bareResultType) {
+  Type converted = converter.convertType(bareResultType);
+  auto vectorType = dyn_cast_if_present<mlir::VectorType>(converted);
+  if (!vectorType)
+    return failure();
+  auto bareVector = dyn_cast<BareVectorType>(bareResultType);
+  if (!bareVector)
+    return failure();
+  FailureOr<SmallVector<int64_t>> dims =
+      staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bareVector));
+  if (failed(dims))
+    return failure();
+  return LoadLikeResultShape{vectorType, std::move(*dims),
+                             vectorType.getElementType()};
+}
+
+// Resolve the per-axis slice/scalar axes for a kernel-arg-backed
+// access (load or store). The post-flatten synthesizer handles the
+// rank-1 carrier case; pre-flatten ops fall back to the generic axis
+// collector.
+static FailureOr<SmallVector<SliceAxis>>
+resolveAccessAxes(Operation *op, ValueRange indices,
+                  ConversionPatternRewriter &rewriter,
+                  const KernelArgSource &kernelArg, ArrayRef<int64_t> shape) {
+  if (auto synthesized = synthesizePostFlattenAxes(rewriter, op->getLoc(),
+                                                   kernelArg, indices, shape))
+    return std::move(*synthesized);
+  return collectAxes(op, indices, rewriter, /*requireUnitStride=*/false);
+}
+
+// Emit the per-lane scalar load chain for a kernel-arg-backed load:
+// one `hc.ptr_offset` + `hc.ptr_load` + `vector.insert` per result
+// coord, threaded through a running vector accumulator initialized to
+// zero of the result vector type. LLVM's SLP recombines adjacent
+// scalar loads when the slice is unit-stride.
+static Value emitLoadLikeLanes(OpBuilder &rewriter, Location loc,
+                               const KernelArgSource &kernelArg,
+                               PtrType sourcePtrType,
+                               const LoadLikeResultShape &result,
+                               ArrayRef<SliceAxis> axes) {
+  Value laneVec =
+      arith::ConstantOp::create(rewriter, loc, result.vectorType,
+                                rewriter.getZeroAttr(result.vectorType))
+          .getResult();
+  for (ArrayRef<int64_t> resultCoord : staticVectorCoordinates(result.shape)) {
+    SmallVector<Value> indices =
+        kernelArgLaneIndices(rewriter, loc, axes, resultCoord);
+    Value flat = linearizeKernelArgOffset(rewriter, loc, kernelArg, indices);
+    Value addr =
+        HCPtrOffsetOp::create(rewriter, loc, sourcePtrType, kernelArg.ptr, flat)
+            .getResult();
+    Value elem = HCPtrLoadOp::create(rewriter, loc, result.elementType, addr)
+                     .getResult();
+    laneVec =
+        vector::InsertOp::create(rewriter, loc, elem, laneVec, resultCoord)
+            .getResult();
+  }
+  return laneVec;
+}
+
 // Per-lane vector load from a kernel-arg `!hc.ptr<global, T>`. Every lane
 // materializes its own fragment via per-element scalar `hc.ptr_offset` +
 // `hc.ptr_load` + `vector.insert`s; LLVM's SLP recombines adjacent
@@ -1593,20 +1806,10 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   LogicalResult
   matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Type converted = this->typeConverter->convertType(op.getResult().getType());
-    auto resultVectorType = dyn_cast_if_present<mlir::VectorType>(converted);
-    if (!resultVectorType)
+    FailureOr<LoadLikeResultShape> result = unpackLoadLikeResultShape(
+        *this->typeConverter, op.getResult().getType());
+    if (failed(result))
       return failure();
-
-    auto resultBareVector = dyn_cast<BareVectorType>(op.getResult().getType());
-    if (!resultBareVector)
-      return failure();
-    FailureOr<SmallVector<int64_t>> dims = staticIntegerShape(
-        cast<SymbolicallyShapedTypeInterface>(resultBareVector));
-    if (failed(dims))
-      return failure();
-    SmallVector<int64_t> resultShape = std::move(*dims);
-    Type elementType = resultVectorType.getElementType();
 
     Value source = [&]() -> Value {
       if constexpr (std::is_same_v<OpT, HCLoadOp>)
@@ -1624,43 +1827,18 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
           "expected kernel-arg source rank to match index rank");
     auto sourcePtrType = cast<PtrType>(kernelArg->ptr.getType());
 
-    SmallVector<SliceAxis> axes;
-    if (auto synthesized =
-            synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
-                                      adaptor.getIndices(), resultShape)) {
-      axes = std::move(*synthesized);
-    } else {
-      FailureOr<SmallVector<SliceAxis>> collected =
-          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                      /*requireUnitStride=*/false);
-      if (failed(collected))
-        return failure();
-      axes = std::move(*collected);
-    }
-    if (llvm::count_if(axes, [](const SliceAxis &axis) {
+    FailureOr<SmallVector<SliceAxis>> axes =
+        resolveAccessAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                          *kernelArg, result->shape);
+    if (failed(axes))
+      return failure();
+    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
           return axis.isSlice;
-        }) != static_cast<int64_t>(resultShape.size()))
+        }) != static_cast<int64_t>(result->shape.size()))
       return op.emitOpError("load result rank must match slice subscript rank");
 
-    Value zero =
-        arith::ConstantOp::create(rewriter, op.getLoc(), resultVectorType,
-                                  rewriter.getZeroAttr(resultVectorType))
-            .getResult();
-    Value laneVec = zero;
-    for (ArrayRef<int64_t> resultCoord : staticVectorCoordinates(resultShape)) {
-      SmallVector<Value> indices =
-          kernelArgLaneIndices(rewriter, op.getLoc(), axes, resultCoord);
-      Value flat =
-          linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
-      Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), sourcePtrType,
-                                         kernelArg->ptr, flat)
-                       .getResult();
-      Value elem = HCPtrLoadOp::create(rewriter, op.getLoc(), elementType, addr)
-                       .getResult();
-      laneVec = vector::InsertOp::create(rewriter, op.getLoc(), elem, laneVec,
-                                         resultCoord)
-                    .getResult();
-    }
+    Value laneVec = emitLoadLikeLanes(rewriter, op.getLoc(), *kernelArg,
+                                      sourcePtrType, *result, *axes);
     rewriter.replaceOp(op, laneVec);
     return success();
   }
@@ -1902,6 +2080,87 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
   }
 };
 
+// Lower the store source into a vector value plus its static shape,
+// running through the same `shapedValueAsVector` path that load
+// patterns use. Diagnoses both the static-shape failure and the
+// non-vector lowering on `op`.
+static FailureOr<std::pair<Value, mlir::VectorType>>
+lowerStoreSource(HCStoreOp op, HCStoreOp::Adaptor adaptor,
+                 ConversionPatternRewriter &rewriter,
+                 const TypeConverter &converter) {
+  Type convertedSource = converter.convertType(op.getSource().getType());
+  FailureOr<SmallVector<int64_t>> sourceShape =
+      shapedResultShape(op.getSource().getType());
+  if (failed(sourceShape))
+    return failure();
+  FailureOr<Value> source =
+      shapedValueAsVector(rewriter, op.getLoc(), op.getSource(),
+                          adaptor.getSource(), convertedSource, *sourceShape);
+  if (failed(source))
+    return op.emitOpError("expected store source to lower to a vector");
+  auto sourceType = dyn_cast<mlir::VectorType>(source->getType());
+  if (!sourceType)
+    return op.emitOpError("expected store source to be a vector");
+  return std::make_pair(*source, sourceType);
+}
+
+// Lower the optional store mask into an `i1` vector of the same shape
+// as `sourceType`. Returns a null Value when the op has no mask. Any
+// shape / type mismatch on the lowered mask is reported on `op`.
+static FailureOr<Value> lowerStoreMask(HCStoreOp op, HCStoreOp::Adaptor adaptor,
+                                       ConversionPatternRewriter &rewriter,
+                                       const TypeConverter &converter,
+                                       mlir::VectorType sourceType) {
+  Value originalMask = op.getMask();
+  if (!originalMask)
+    return Value{};
+  Type convertedMask = converter.convertType(originalMask.getType());
+  FailureOr<SmallVector<int64_t>> maskShape =
+      shapedResultShape(originalMask.getType());
+  if (failed(maskShape))
+    return failure();
+  FailureOr<Value> maskVector =
+      shapedValueAsVector(rewriter, op.getLoc(), originalMask,
+                          adaptor.getMask(), convertedMask, *maskShape);
+  if (failed(maskVector))
+    return op.emitOpError("expected store mask to lower to a vector");
+  auto maskType = dyn_cast<mlir::VectorType>(maskVector->getType());
+  auto expectedMaskType =
+      mlir::VectorType::get(sourceType.getShape(), rewriter.getI1Type());
+  if (maskType != expectedMaskType)
+    return op.emitOpError("store mask type ")
+           << maskVector->getType() << " must match " << expectedMaskType;
+  return *maskVector;
+}
+
+// Emit per-lane scalar stores for `source` into the kernel-arg buffer.
+// `mask` may be null (unconditional stores via `hc.ptr_store`); when
+// present, each lane's mask bit guards a `hc.ptr_store_pred` so the
+// mask rides as a first-class operand instead of via an `scf.if`,
+// matching the symmetric `hc.ptr_load_pred` emitted for masked loads.
+static void emitStoreLanes(OpBuilder &rewriter, Location loc,
+                           const KernelArgSource &kernelArg,
+                           PtrType destPtrType, Value source,
+                           mlir::VectorType sourceType, Value mask,
+                           ArrayRef<SliceAxis> axes) {
+  for (ArrayRef<int64_t> coordinate :
+       staticVectorCoordinates(sourceType.getShape())) {
+    Value element = extractVectorElement(rewriter, loc, source, coordinate);
+    SmallVector<Value> indices =
+        storeIndicesForCoordinate(rewriter, loc, axes, coordinate);
+    Value flat = linearizeKernelArgOffset(rewriter, loc, kernelArg, indices);
+    Value addr =
+        HCPtrOffsetOp::create(rewriter, loc, destPtrType, kernelArg.ptr, flat)
+            .getResult();
+    if (!mask) {
+      HCPtrStoreOp::create(rewriter, loc, element, addr);
+      continue;
+    }
+    Value guard = extractVectorElement(rewriter, loc, mask, coordinate);
+    HCPtrStorePredOp::create(rewriter, loc, element, addr, guard);
+  }
+}
+
 struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
   using Base::Base;
 
@@ -1918,85 +2177,32 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
           "expected kernel-arg destination rank to match index rank");
     auto destPtrType = cast<PtrType>(kernelArg->ptr.getType());
 
-    Type convertedSource = typeConverter->convertType(op.getSource().getType());
-    FailureOr<SmallVector<int64_t>> sourceShape =
-        shapedResultShape(op.getSource().getType());
-    if (failed(sourceShape))
-      return failure();
-    FailureOr<Value> source =
-        shapedValueAsVector(rewriter, op.getLoc(), op.getSource(),
-                            adaptor.getSource(), convertedSource, *sourceShape);
+    FailureOr<std::pair<Value, mlir::VectorType>> source =
+        lowerStoreSource(op, adaptor, rewriter, *typeConverter);
     if (failed(source))
-      return op.emitOpError("expected store source to lower to a vector");
-    auto sourceType = dyn_cast<mlir::VectorType>(source->getType());
-    if (!sourceType)
-      return op.emitOpError("expected store source to be a vector");
+      return failure();
+    auto [sourceValue, sourceType] = *source;
+    SmallVector<int64_t> sourceShape(sourceType.getShape().begin(),
+                                     sourceType.getShape().end());
 
-    SmallVector<SliceAxis> axes;
-    if (auto synthesized =
-            synthesizePostFlattenAxes(rewriter, op.getLoc(), *kernelArg,
-                                      adaptor.getIndices(), *sourceShape)) {
-      axes = std::move(*synthesized);
-    } else {
-      FailureOr<SmallVector<SliceAxis>> collected =
-          collectAxes(op.getOperation(), adaptor.getIndices(), rewriter,
-                      /*requireUnitStride=*/false);
-      if (failed(collected))
-        return failure();
-      axes = std::move(*collected);
-    }
-    if (llvm::count_if(axes, [](const SliceAxis &axis) {
+    FailureOr<SmallVector<SliceAxis>> axes =
+        resolveAccessAxes(op.getOperation(), adaptor.getIndices(), rewriter,
+                          *kernelArg, sourceShape);
+    if (failed(axes))
+      return failure();
+    if (llvm::count_if(*axes, [](const SliceAxis &axis) {
           return axis.isSlice;
         }) != sourceType.getRank())
       return op.emitOpError(
           "store source rank must match slice subscript rank");
 
-    Value mask;
-    if (Value originalMask = op.getMask()) {
-      Type convertedMask = typeConverter->convertType(originalMask.getType());
-      FailureOr<SmallVector<int64_t>> maskShape =
-          shapedResultShape(originalMask.getType());
-      if (failed(maskShape))
-        return failure();
-      FailureOr<Value> maskVector =
-          shapedValueAsVector(rewriter, op.getLoc(), originalMask,
-                              adaptor.getMask(), convertedMask, *maskShape);
-      if (failed(maskVector))
-        return op.emitOpError("expected store mask to lower to a vector");
-      auto maskType = dyn_cast<mlir::VectorType>(maskVector->getType());
-      auto expectedMaskType =
-          mlir::VectorType::get(sourceType.getShape(), rewriter.getI1Type());
-      if (maskType != expectedMaskType)
-        return op.emitOpError("store mask type ")
-               << maskVector->getType() << " must match " << expectedMaskType;
-      mask = *maskVector;
-    }
+    FailureOr<Value> mask =
+        lowerStoreMask(op, adaptor, rewriter, *typeConverter, sourceType);
+    if (failed(mask))
+      return failure();
 
-    for (ArrayRef<int64_t> coordinate :
-         staticVectorCoordinates(sourceType.getShape())) {
-      Value element =
-          extractVectorElement(rewriter, op.getLoc(), *source, coordinate);
-      SmallVector<Value> indices =
-          storeIndicesForCoordinate(rewriter, op.getLoc(), axes, coordinate);
-      Value flat =
-          linearizeKernelArgOffset(rewriter, op.getLoc(), *kernelArg, indices);
-      Value addr = HCPtrOffsetOp::create(rewriter, op.getLoc(), destPtrType,
-                                         kernelArg->ptr, flat)
-                       .getResult();
-      if (!mask) {
-        HCPtrStoreOp::create(rewriter, op.getLoc(), element, addr);
-        continue;
-      }
-
-      // Predicated store: emit `hc.ptr_store_pred` directly so the mask
-      // rides as a first-class operand instead of via an `scf.if` guard.
-      // Keeps masked stores legible for downstream patterns and matches
-      // the symmetric `hc.ptr_load_pred` we emit for masked loads.
-      Value guard =
-          extractVectorElement(rewriter, op.getLoc(), mask, coordinate);
-      HCPtrStorePredOp::create(rewriter, op.getLoc(), element, addr, guard);
-    }
-
+    emitStoreLanes(rewriter, op.getLoc(), *kernelArg, destPtrType, sourceValue,
+                   sourceType, *mask, *axes);
     rewriter.eraseOp(op);
     return success();
   }
@@ -2039,6 +2245,109 @@ struct ConvertCallIntrinsicOp : public OpConversionPattern<HCCallIntrinsicOp> {
   }
 };
 
+// bare_tensor → bare_tensor view: source is a workgroup ptr. The
+// strided per-element loader (`loadVectorFromPtrView`) walks back
+// through this op to reconstruct the source-axis pattern, so the
+// buffer_view itself just needs to type-resolve cleanly. We pass the
+// source ptr through unchanged; the op survives in the IR as a
+// metadata anchor for the consumer chain walk and gets DCE'd once
+// every consumer has lowered. (The result-ptr type matches the source
+// because both are workgroup-AS, same element type, rank-erased.)
+static LogicalResult
+lowerWorkgroupBufferView(HCBufferViewOp op, HCBufferViewOp::Adaptor adaptor,
+                         ConversionPatternRewriter &rewriter, Type converted,
+                         PtrType sourcePtrType) {
+  if (sourcePtrType.getAddrSpace() != AddrSpace::Workgroup)
+    return failure();
+  auto resultPtrType = dyn_cast_if_present<PtrType>(converted);
+  if (!resultPtrType || resultPtrType.getAddrSpace() != AddrSpace::Workgroup)
+    return failure();
+  if (resultPtrType.getElementType() != sourcePtrType.getElementType())
+    return failure();
+  rewriter.replaceOp(op, adaptor.getBuffer());
+  return success();
+}
+
+// Partition `localAxes` into (a) the permutation that pulls scalar
+// (non-slice) axes to the front (in original axis order) followed by
+// the slice axes in original order, and (b) the per-scalar `offset`
+// values that the downstream `vector.extract` uses as positions.
+static void
+buildVectorViewPermutation(ArrayRef<SliceAxis> localAxes,
+                           SmallVectorImpl<int64_t> &permutation,
+                           SmallVectorImpl<OpFoldResult> &positions) {
+  permutation.reserve(localAxes.size());
+  for (auto [axis, info] : llvm::enumerate(localAxes)) {
+    if (info.isSlice)
+      continue;
+    permutation.push_back(axis);
+    positions.push_back(info.offset);
+  }
+  for (auto [axis, info] : llvm::enumerate(localAxes)) {
+    if (info.isSlice)
+      permutation.push_back(axis);
+  }
+}
+
+// Reshape `result` to match `converted` exactly. Both sides must be
+// vectors; otherwise the conversion isn't expressible and we bail.
+static FailureOr<Value> reshapeToConvertedVector(OpBuilder &rewriter,
+                                                 Location loc, Value result,
+                                                 Type converted) {
+  if (result.getType() == converted)
+    return result;
+  if (!isa<mlir::VectorType>(result.getType()) ||
+      !isa<mlir::VectorType>(converted))
+    return failure();
+  return vector::ShapeCastOp::create(rewriter, loc, converted, result)
+      .getResult();
+}
+
+// Vector-shape view: lower an `hc.buffer_view` over a vector source
+// into `vector.transpose` (scalar axes to the front) + `vector.extract`
+// (drop the scalar prefix coordinates) + a final shape cast back to
+// the converter's expected result type.
+static LogicalResult lowerVectorBufferView(HCBufferViewOp op,
+                                           HCBufferViewOp::Adaptor adaptor,
+                                           ConversionPatternRewriter &rewriter,
+                                           Type converted) {
+  auto sourceType = dyn_cast<mlir::VectorType>(adaptor.getBuffer().getType());
+  if (!sourceType || !converted)
+    return failure();
+
+  FailureOr<SmallVector<SliceAxis>> axes =
+      collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
+  if (failed(axes))
+    return failure();
+  if (static_cast<int64_t>(axes->size()) < sourceType.getRank())
+    return op.emitOpError(
+        "expected at least one view subscript per vector axis");
+
+  ArrayRef<SliceAxis> localAxes(*axes);
+  localAxes = localAxes.take_front(sourceType.getRank());
+  SmallVector<int64_t> permutation;
+  SmallVector<OpFoldResult> positions;
+  buildVectorViewPermutation(localAxes, permutation, positions);
+
+  Value source = adaptor.getBuffer();
+  if (!llvm::equal(permutation, llvm::seq<int64_t>(0, localAxes.size())))
+    source =
+        vector::TransposeOp::create(rewriter, op.getLoc(), source, permutation)
+            .getResult();
+
+  Value result = source;
+  if (!positions.empty())
+    result = vector::ExtractOp::create(rewriter, op.getLoc(), source, positions)
+                 .getResult();
+
+  FailureOr<Value> reshaped =
+      reshapeToConvertedVector(rewriter, op.getLoc(), result, converted);
+  if (failed(reshaped))
+    return failure();
+  rewriter.replaceOp(op, *reshaped);
+  return success();
+}
+
 struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
   using Base::Base;
 
@@ -2046,77 +2355,9 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
   matchAndRewrite(HCBufferViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getResult().getType());
-    // bare_tensor → bare_tensor view: source is a workgroup ptr. The
-    // strided per-element loader (`loadVectorFromPtrView`) walks back
-    // through this op to reconstruct the source-axis pattern, so the
-    // buffer_view itself just needs to type-resolve cleanly. We pass the
-    // source ptr through unchanged; the op survives in the IR as a
-    // metadata anchor for the consumer chain walk and gets DCE'd once
-    // every consumer has lowered. (The result-ptr type matches the source
-    // because both are workgroup-AS, same element type, rank-erased.)
-    if (auto sourcePtrType = dyn_cast<PtrType>(adaptor.getBuffer().getType())) {
-      if (sourcePtrType.getAddrSpace() != AddrSpace::Workgroup)
-        return failure();
-      auto resultPtrType = dyn_cast_if_present<PtrType>(converted);
-      if (!resultPtrType ||
-          resultPtrType.getAddrSpace() != AddrSpace::Workgroup)
-        return failure();
-      if (resultPtrType.getElementType() != sourcePtrType.getElementType())
-        return failure();
-      rewriter.replaceOp(op, adaptor.getBuffer());
-      return success();
-    }
-
-    auto sourceType = dyn_cast<mlir::VectorType>(adaptor.getBuffer().getType());
-    if (!sourceType || !converted)
-      return failure();
-
-    FailureOr<SmallVector<SliceAxis>> axes =
-        collectAxes(op.getOperation(), adaptor.getIndices(), rewriter);
-    if (failed(axes))
-      return failure();
-    if (static_cast<int64_t>(axes->size()) < sourceType.getRank())
-      return op.emitOpError(
-          "expected at least one view subscript per vector axis");
-
-    ArrayRef<SliceAxis> localAxes(*axes);
-    localAxes = localAxes.take_front(sourceType.getRank());
-    SmallVector<int64_t> permutation;
-    SmallVector<OpFoldResult> positions;
-    permutation.reserve(localAxes.size());
-    for (auto [axis, info] : llvm::enumerate(localAxes)) {
-      if (info.isSlice)
-        continue;
-      permutation.push_back(axis);
-      positions.push_back(info.offset);
-    }
-    for (auto [axis, info] : llvm::enumerate(localAxes)) {
-      if (info.isSlice)
-        permutation.push_back(axis);
-    }
-
-    Value source = adaptor.getBuffer();
-    if (!llvm::equal(permutation, llvm::seq<int64_t>(0, localAxes.size())))
-      source = vector::TransposeOp::create(rewriter, op.getLoc(), source,
-                                           permutation)
-                   .getResult();
-
-    Value result = source;
-    if (!positions.empty())
-      result =
-          vector::ExtractOp::create(rewriter, op.getLoc(), source, positions)
-              .getResult();
-
-    if (result.getType() != converted) {
-      if (!isa<mlir::VectorType>(result.getType()) ||
-          !isa<mlir::VectorType>(converted))
-        return failure();
-      result =
-          vector::ShapeCastOp::create(rewriter, op.getLoc(), converted, result)
-              .getResult();
-    }
-    rewriter.replaceOp(op, result);
-    return success();
+    if (auto srcPtr = dyn_cast<PtrType>(adaptor.getBuffer().getType()))
+      return lowerWorkgroupBufferView(op, adaptor, rewriter, converted, srcPtr);
+    return lowerVectorBufferView(op, adaptor, rewriter, converted);
   }
 };
 
@@ -2310,6 +2551,61 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
   }
 };
 
+// Clone an `hc.yield`-terminated region into the (already-created)
+// matching `scf` region. Maps block arguments 1:1, clones each
+// non-terminator op through `rewriter.clone`, and emits an `scf.yield`
+// whose operands are the values from the original `hc.yield`, each
+// cast (if needed) to the corresponding `resultTypes` entry.
+//
+// Used for both `scf.for` (passing the loop's result types) and
+// `scf.if` (passing the converted result types) — the cloning pattern
+// is identical in both cases.
+//
+// For `hc.for_range` lowering specifically, the `$joinN` symbolic name
+// binding the original induction var carried (`!hc.idx<"$joinN">`) is
+// no longer needed past this point: `hc-flatten-with-layouts` captured
+// it into every consuming `hc.generic`'s `ambient_idxs` while the
+// typed IV was still in scope, so any downstream apply that references
+// `$joinN` has the SSA edge operand-bound and survives this conversion
+// verbatim.
+static LogicalResult cloneHCYieldRegion(Location loc, Region &srcRegion,
+                                        Region &dstRegion,
+                                        TypeRange resultTypes,
+                                        ConversionPatternRewriter &rewriter) {
+  Block &src = srcRegion.front();
+  Block &dst = dstRegion.front();
+  Operation *dstTerminator = dst.empty() ? nullptr : &dst.back();
+  if (dstTerminator)
+    rewriter.setInsertionPoint(dstTerminator);
+  else
+    rewriter.setInsertionPointToEnd(&dst);
+
+  IRMapping mapping;
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(src.getArguments(), dst.getArguments()))
+    mapping.map(oldArg, newArg);
+
+  auto yield = dyn_cast<HCYieldOp>(src.back());
+  if (!yield)
+    return failure();
+  for (Operation &nested : src) {
+    if (&nested == yield.getOperation())
+      break;
+    rewriter.clone(nested, mapping);
+  }
+
+  SmallVector<Value> yielded;
+  for (auto [index, value] : llvm::enumerate(yield.getValues())) {
+    Value mapped = mapping.lookupOrDefault(value);
+    yielded.push_back(castIfNeeded(rewriter, loc, mapped, resultTypes[index]));
+  }
+  if (dstTerminator)
+    rewriter.replaceOpWithNewOp<scf::YieldOp>(dstTerminator, yielded);
+  else
+    scf::YieldOp::create(rewriter, loc, yielded);
+  return success();
+}
+
 struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
   using Base::Base;
 
@@ -2324,48 +2620,9 @@ struct ConvertForRangeOp : public OpConversionPattern<HCForRangeOp> {
     auto loop = scf::ForOp::create(rewriter, op.getLoc(), adaptor.getLower(),
                                    adaptor.getUpper(), adaptor.getStep(),
                                    adaptor.getIterInits());
-
-    Block &src = op.getBody().front();
-    Block &dst = loop.getRegion().front();
-    Operation *dstTerminator = dst.empty() ? nullptr : &dst.back();
-    if (dstTerminator)
-      rewriter.setInsertionPoint(dstTerminator);
-    else
-      rewriter.setInsertionPointToEnd(&dst);
-
-    // The `$joinN` symbolic-name binding the original `hc.for_range`
-    // induction var carried (`!hc.idx<"$joinN">`) is no longer needed
-    // past this point: `hc-flatten-with-layouts` captured it into
-    // every consuming `hc.generic`'s `ambient_idxs` while the typed
-    // IV was still in scope, so any downstream apply that references
-    // `$joinN` has the SSA edge operand-bound and survives this
-    // conversion verbatim. The scf.for IV becomes a plain `index`
-    // and no longer needs a name marker.
-
-    IRMapping mapping;
-    for (auto [oldArg, newArg] :
-         llvm::zip_equal(src.getArguments(), dst.getArguments()))
-      mapping.map(oldArg, newArg);
-
-    auto yield = dyn_cast<HCYieldOp>(src.back());
-    if (!yield)
+    if (failed(cloneHCYieldRegion(op.getLoc(), op.getBody(), loop.getRegion(),
+                                  loop.getResultTypes(), rewriter)))
       return op.emitOpError("body must end with `hc.yield`");
-    for (Operation &nested : src) {
-      if (&nested == yield.getOperation())
-        break;
-      rewriter.clone(nested, mapping);
-    }
-
-    SmallVector<Value> yielded;
-    for (auto [index, value] : llvm::enumerate(yield.getValues())) {
-      Value mapped = mapping.lookupOrDefault(value);
-      yielded.push_back(castIfNeeded(rewriter, op.getLoc(), mapped,
-                                     loop.getResultTypes()[index]));
-    }
-    if (dstTerminator)
-      rewriter.replaceOpWithNewOp<scf::YieldOp>(dstTerminator, yielded);
-    else
-      scf::YieldOp::create(rewriter, op.getLoc(), yielded);
     rewriter.replaceOp(op, loop.getResults());
     return success();
   }
@@ -2383,40 +2640,12 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
     auto ifOp =
         scf::IfOp::create(rewriter, op.getLoc(), results, adaptor.getCond(),
                           /*withElseRegion=*/!op.getElseRegion().empty());
-    auto cloneRegion = [&](Region &srcRegion,
-                           Region &dstRegion) -> LogicalResult {
-      Block &src = srcRegion.front();
-      Block &dst = dstRegion.front();
-      Operation *dstTerminator = dst.empty() ? nullptr : &dst.back();
-      if (dstTerminator)
-        rewriter.setInsertionPoint(dstTerminator);
-      else
-        rewriter.setInsertionPointToEnd(&dst);
-      IRMapping mapping;
-      auto yield = dyn_cast<HCYieldOp>(src.back());
-      if (!yield)
-        return failure();
-      for (Operation &nested : src) {
-        if (&nested == yield.getOperation())
-          break;
-        rewriter.clone(nested, mapping);
-      }
-      SmallVector<Value> yielded;
-      for (auto [index, value] : llvm::enumerate(yield.getValues())) {
-        Value mapped = mapping.lookupOrDefault(value);
-        yielded.push_back(
-            castIfNeeded(rewriter, op.getLoc(), mapped, results[index]));
-      }
-      if (dstTerminator)
-        rewriter.replaceOpWithNewOp<scf::YieldOp>(dstTerminator, yielded);
-      else
-        scf::YieldOp::create(rewriter, op.getLoc(), yielded);
-      return success();
-    };
-    if (failed(cloneRegion(op.getThenRegion(), ifOp.getThenRegion())))
+    if (failed(cloneHCYieldRegion(op.getLoc(), op.getThenRegion(),
+                                  ifOp.getThenRegion(), results, rewriter)))
       return op.emitOpError("then region must end with `hc.yield`");
     if (!op.getElseRegion().empty() &&
-        failed(cloneRegion(op.getElseRegion(), ifOp.getElseRegion())))
+        failed(cloneHCYieldRegion(op.getLoc(), op.getElseRegion(),
+                                  ifOp.getElseRegion(), results, rewriter)))
       return op.emitOpError("else region must end with `hc.yield`");
     rewriter.replaceOp(op, ifOp.getResults());
     return success();
@@ -2455,15 +2684,62 @@ static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
   });
 }
 
-static ConversionTarget
-makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
-  ConversionTarget target(*ctx);
-  target
-      .addLegalDialect<arith::ArithDialect, func::FuncDialect, gpu::GPUDialect,
-                       scf::SCFDialect, vector::VectorDialect>();
-  // HC ptr-family ops are produced by this pass (workgroup tiles) and must
-  // pass through to the downstream `hc-lower-to-llvm` slot.
-  //
+// An `hc.generic` operand is legal at this pass's boundary unless it
+// still references a kernel-arg buffer that hasn't been resolved to a
+// `!hc.ptr<global, T>`. `AdaptGenericOp` is responsible for that
+// resolution; until it fires, the op stays illegal.
+static bool isHCGenericOperandLegal(Value v) {
+  return !isa<BufferType>(v.getType()) || !resolveKernelArg(v);
+}
+
+static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
+  return llvm::all_of(op.getIns(), isHCGenericOperandLegal) &&
+         llvm::all_of(op.getOuts(), isHCGenericOperandLegal);
+}
+
+// `hc.intrinsic` is legal iff its signature already matches the
+// converter's idea of its input / result types. A missing signature
+// (parse error / orphan IR) is legal so the verifier can flag it on
+// its own terms; this predicate only kicks in for well-typed
+// intrinsics whose function type is converter-stable.
+static bool isHCIntrinsicSignatureLegal(HCIntrinsicOp op,
+                                        const TypeConverter &converter) {
+  std::optional<FunctionType> fnType = op.getFunctionType();
+  if (!fnType)
+    return true;
+  SmallVector<Type> inputs;
+  SmallVector<Type> results;
+  if (failed(convertIntrinsicFunctionSignature(*fnType, converter, inputs,
+                                               results)))
+    return false;
+  return llvm::equal(fnType->getInputs(), inputs) &&
+         llvm::equal(fnType->getResults(), results);
+}
+
+// `hc.call_intrinsic` is legal iff every operand and result type
+// already equals the converter's intrinsic-boundary projection. If
+// any type can't be projected (boundary returns null) the call is
+// illegal — the conversion driver should rewrite it.
+static bool isHCCallIntrinsicLegal(HCCallIntrinsicOp op,
+                                   const TypeConverter &converter) {
+  for (Value arg : op.getArgs()) {
+    Type boundary = convertIntrinsicBoundaryType(arg.getType(), converter);
+    if (!boundary || arg.getType() != boundary)
+      return false;
+  }
+  for (Type result : op.getResultTypes()) {
+    Type boundary = convertIntrinsicBoundaryType(result, converter);
+    if (!boundary || result != boundary)
+      return false;
+  }
+  return true;
+}
+
+// HC ptr-family ops are produced by this pass (workgroup tiles) and must
+// pass through to the downstream `hc-lower-to-llvm` slot. The other
+// HC ops in the illegal set are the launch-body surface that lowers
+// here; anything from a non-`hc` dialect is unconditionally legal.
+static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   // `hc.generic` is dynamically legal: legal once `AdaptGenericOp` has
   // resolved every kernel-arg buffer operand back to its underlying
   // `!hc.ptr<global, T>` (the post-flatten access path expects a ptr
@@ -2478,13 +2754,7 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,
                     HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp, HCPtrLoadPredOp,
                     HCPtrStorePredOp, HCYieldPredicatedOp>();
-  target.addDynamicallyLegalOp<HCGenericOp>([](HCGenericOp op) {
-    auto operandIsLegal = [](Value v) {
-      return !isa<BufferType>(v.getType()) || !resolveKernelArg(v);
-    };
-    return llvm::all_of(op.getIns(), operandIsLegal) &&
-           llvm::all_of(op.getOuts(), operandIsLegal);
-  });
+  target.addDynamicallyLegalOp<HCGenericOp>(isHCGenericLegalAtLaunchBoundary);
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
@@ -2502,42 +2772,36 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
                       HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp,
                       HCOnesOp, HCFullOp, HCEmptyOp, HCSelectOp, HCStoreOp,
                       HCForRangeOp, HCIfOp>();
-  // `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are
-  // left alone for the second invocation of this pass to consume —
-  // their iter-sym free names get explicit per-lane bindings only after
-  // `hc-lower-generic` unrolls the generic. The two-pass dance matches
-  // `hc.yield` above: bodily resident, materialised later. Outside the
-  // body (kernel-scope offset emission, ambient-binding helpers from
-  // earlier passes) the ops are illegal and lower here.
+}
+
+// `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are
+// left alone for the second invocation of this pass to consume —
+// their iter-sym free names get explicit per-lane bindings only after
+// `hc-lower-generic` unrolls the generic. The two-pass dance matches
+// `hc.yield`: bodily resident, materialised later. Outside the body
+// (kernel-scope offset emission, ambient-binding helpers from earlier
+// passes) the ops are illegal and lower here.
+static void registerLaunchBodyApplyLegality(ConversionTarget &target) {
   auto applyLegalInsideGeneric = [](Operation *op) {
     return op->getParentOfType<HCGenericOp>() != nullptr;
   };
   target.addDynamicallyLegalOp<HCIdxApplyOp>(applyLegalInsideGeneric);
   target.addDynamicallyLegalOp<HCPredApplyOp>(applyLegalInsideGeneric);
+}
+
+static ConversionTarget
+makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
+  ConversionTarget target(*ctx);
+  target
+      .addLegalDialect<arith::ArithDialect, func::FuncDialect, gpu::GPUDialect,
+                       scf::SCFDialect, vector::VectorDialect>();
+  registerLaunchBodyHCLegality(target);
+  registerLaunchBodyApplyLegality(target);
   target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
-    std::optional<FunctionType> fnType = op.getFunctionType();
-    if (!fnType)
-      return true;
-    SmallVector<Type> inputs;
-    SmallVector<Type> results;
-    if (failed(convertIntrinsicFunctionSignature(*fnType, converter, inputs,
-                                                 results)))
-      return false;
-    return llvm::equal(fnType->getInputs(), inputs) &&
-           llvm::equal(fnType->getResults(), results);
+    return isHCIntrinsicSignatureLegal(op, converter);
   });
   target.addDynamicallyLegalOp<HCCallIntrinsicOp>([&](HCCallIntrinsicOp op) {
-    for (Value arg : op.getArgs()) {
-      Type boundary = convertIntrinsicBoundaryType(arg.getType(), converter);
-      if (!boundary || arg.getType() != boundary)
-        return false;
-    }
-    for (Type result : op.getResultTypes()) {
-      Type boundary = convertIntrinsicBoundaryType(result, converter);
-      if (!boundary || result != boundary)
-        return false;
-    }
-    return true;
+    return isHCCallIntrinsicLegal(op, converter);
   });
   target.addDynamicallyLegalOp<HCTupleOp, HCSliceExprOp, HCGetItemOp>(
       [&](Operation *op) {

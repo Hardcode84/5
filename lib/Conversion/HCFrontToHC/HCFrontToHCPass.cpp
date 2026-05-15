@@ -394,38 +394,51 @@ static std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx,
 // bracket the safe range, and treat i1 separately as NumPy's `bool_`
 // truthiness rather than bit-pattern truncation — `APInt(1, 2)` would
 // store 0 (low bit), flipping the user's boolean under our feet.
+// Coerce `src` to the target float type. Float -> Float keeps the
+// double precision, Int -> Float widens via `int64 -> double`.
+static Attribute coerceNumpyLiteralToFloat(FloatType ft, Attribute src) {
+  if (auto f = dyn_cast<FloatAttr>(src))
+    return FloatAttr::get(ft, f.getValueAsDouble());
+  if (auto i = dyn_cast<IntegerAttr>(src))
+    return FloatAttr::get(ft, static_cast<double>(i.getInt()));
+  return {};
+}
+
+// Float -> Integer for non-`i1` widths. Rejects non-finite or
+// out-of-range doubles (the user's literal is invalid in the target
+// width); otherwise sext/trunc-to-width via APInt.
+static Attribute coerceFloatToWideInteger(IntegerType it, double v) {
+  if (!std::isfinite(v) || v < -0x1.0p63 || v >= 0x1.0p63)
+    return {};
+  APInt bits(64, static_cast<uint64_t>(static_cast<int64_t>(v)),
+             /*isSigned=*/true);
+  return IntegerAttr::get(it, bits.sextOrTrunc(it.getWidth()));
+}
+
+// Coerce `src` to the target integer type. `i1` follows truthiness
+// semantics (any nonzero is `1`); wider widths sign-extend / truncate
+// the bit pattern.
+static Attribute coerceNumpyLiteralToInteger(IntegerType it, Attribute src) {
+  bool isI1 = it.getWidth() == 1;
+  if (auto i = dyn_cast<IntegerAttr>(src)) {
+    if (isI1)
+      return IntegerAttr::get(it, i.getValue().isZero() ? 0 : 1);
+    return IntegerAttr::get(it, i.getValue().sextOrTrunc(it.getWidth()));
+  }
+  if (auto f = dyn_cast<FloatAttr>(src)) {
+    double v = f.getValueAsDouble();
+    if (isI1)
+      return IntegerAttr::get(it, v != 0.0 ? 1 : 0);
+    return coerceFloatToWideInteger(it, v);
+  }
+  return {};
+}
+
 static Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
-  if (auto ft = dyn_cast<FloatType>(targetTy)) {
-    if (auto f = dyn_cast<FloatAttr>(src))
-      return FloatAttr::get(ft, f.getValueAsDouble());
-    if (auto i = dyn_cast<IntegerAttr>(src))
-      return FloatAttr::get(ft, static_cast<double>(i.getInt()));
-    return {};
-  }
-  if (auto it = dyn_cast<IntegerType>(targetTy)) {
-    bool isI1 = it.getWidth() == 1;
-    auto wrapInteger = [&](int64_t value) {
-      APInt bits(64, static_cast<uint64_t>(value), /*isSigned=*/true);
-      return IntegerAttr::get(it, bits.sextOrTrunc(it.getWidth()));
-    };
-    if (auto i = dyn_cast<IntegerAttr>(src)) {
-      if (isI1)
-        return IntegerAttr::get(it, i.getValue().isZero() ? 0 : 1);
-      APInt bits = i.getValue().sextOrTrunc(it.getWidth());
-      return IntegerAttr::get(it, bits);
-    }
-    if (auto f = dyn_cast<FloatAttr>(src)) {
-      double v = f.getValueAsDouble();
-      if (isI1)
-        return IntegerAttr::get(it, v != 0.0 ? 1 : 0);
-      if (!std::isfinite(v))
-        return {};
-      if (v < -0x1.0p63 || v >= 0x1.0p63)
-        return {};
-      return wrapInteger(static_cast<int64_t>(v));
-    }
-    return {};
-  }
+  if (auto ft = dyn_cast<FloatType>(targetTy))
+    return coerceNumpyLiteralToFloat(ft, src);
+  if (auto it = dyn_cast<IntegerType>(targetTy))
+    return coerceNumpyLiteralToInteger(it, src);
   return {};
 }
 
@@ -645,12 +658,11 @@ static void appendShapeBoundSymbols(MLIRContext *ctx, ShapeAttr shape,
 // wrapper / scope binder knows to materialize them at launch — for the
 // default fully-strided buffer layout that's exactly the per-axis
 // `$STRIDE_<N>_<argname>` symbols emitted in `parameterTypeFromDict`.
-static void appendLayoutBoundSymbols(MLIRContext *ctx, LayoutAttr layout,
-                                     llvm::StringSet<> &seen,
-                                     SmallVectorImpl<Attribute> &symbols) {
-  if (!layout)
-    return;
-  llvm::StringSet<> layoutLocals;
+// Collect the names that bind locally to a layout — `shape_syms`,
+// `index_syms`, and the `params` keys — into `layoutLocals`. These
+// don't get promoted to kernel-level bound symbols.
+static void collectLayoutLocalSymbolNames(LayoutAttr layout,
+                                          llvm::StringSet<> &layoutLocals) {
   for (Attribute name : layout.getShapeSyms())
     if (auto str = dyn_cast<StringAttr>(name))
       layoutLocals.insert(str.getValue());
@@ -659,6 +671,15 @@ static void appendLayoutBoundSymbols(MLIRContext *ctx, LayoutAttr layout,
       layoutLocals.insert(str.getValue());
   for (NamedAttribute kv : layout.getParams())
     layoutLocals.insert(kv.getName().getValue());
+}
+
+static void appendLayoutBoundSymbols(MLIRContext *ctx, LayoutAttr layout,
+                                     llvm::StringSet<> &seen,
+                                     SmallVectorImpl<Attribute> &symbols) {
+  if (!layout)
+    return;
+  llvm::StringSet<> layoutLocals;
+  collectLayoutLocalSymbolNames(layout, layoutLocals);
 
   auto walk = [&](ExprAttr expr) {
     if (!expr)
@@ -794,21 +815,12 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
 // hash-cons against any other producer that builds the same expression
 // — never via `parseExpr` / string templating per the symbolic-engine
 // rules in `AGENTS.md`.
-static FailureOr<LayoutAttr>
-buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
-                                ShapeAttr shape) {
-  MLIRContext *ctx = sourceOp->getContext();
-  sym::Store &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
-  unsigned rank = static_cast<unsigned>(shape.getDims().size());
-
-  auto composeFail = [&](StringRef what, StringRef diag) {
-    return sourceOp->emitOpError("buffer parameter '")
-           << argName << "': failed to compose " << what
-           << " for default strided layout: " << diag;
-  };
-
-  SmallVector<Attribute> shapeSyms;
-  SmallVector<Attribute> indexSyms;
+// Build the parallel `dN` (shape) and `iN` (index) symbol arrays for
+// the default strided layout.
+static void
+buildDefaultStridedShapeIndexSyms(MLIRContext *ctx, unsigned rank,
+                                  SmallVectorImpl<Attribute> &shapeSyms,
+                                  SmallVectorImpl<Attribute> &indexSyms) {
   shapeSyms.reserve(rank);
   indexSyms.reserve(rank);
   for (unsigned i = 0; i < rank; ++i) {
@@ -819,59 +831,90 @@ buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
     shapeSyms.push_back(StringAttr::get(ctx, shapeName));
     indexSyms.push_back(StringAttr::get(ctx, indexName));
   }
+}
+
+// Build a single per-axis `iN * $STRIDE_N_<arg>` term.
+static FailureOr<sym::ExprHandle> composeStridedAxisTerm(sym::Store &store,
+                                                         StringRef argName,
+                                                         unsigned axis,
+                                                         std::string &diag) {
+  SmallString<8> indexName("i");
+  indexName += Twine(axis).str();
+  FailureOr<sym::ExprHandle> idx = sym::composeExprSym(store, indexName, &diag);
+  if (failed(idx))
+    return failure();
+  SmallString<32> strideName("$STRIDE_");
+  strideName += Twine(axis).str();
+  strideName += "_";
+  strideName += argName;
+  FailureOr<sym::ExprHandle> stride =
+      sym::composeExprSym(store, strideName, &diag);
+  if (failed(stride))
+    return failure();
+  return sym::composeExprBinary(store, *idx, sym::ExprBinaryOp::Mul, *stride,
+                                &diag);
+}
+
+// Compose the per-axis terms into a single offset expression
+// `i0*$STRIDE_0_<arg> + i1*$STRIDE_1_<arg> + ...`. Rank 0 collapses
+// to the literal `0`.
+static FailureOr<sym::ExprHandle>
+composeDefaultStridedOffset(sym::Store &store, StringRef argName, unsigned rank,
+                            std::string &diag) {
+  if (rank == 0)
+    return sym::composeExprInt(store, 0, &diag);
+  SmallVector<sym::ExprHandle> terms;
+  terms.reserve(rank);
+  for (unsigned axis = 0; axis < rank; ++axis) {
+    FailureOr<sym::ExprHandle> term =
+        composeStridedAxisTerm(store, argName, axis, diag);
+    if (failed(term))
+      return failure();
+    terms.push_back(*term);
+  }
+  sym::ExprHandle acc = terms[0];
+  for (unsigned axis = 1; axis < rank; ++axis) {
+    FailureOr<sym::ExprHandle> sum = sym::composeExprBinary(
+        store, acc, sym::ExprBinaryOp::Add, terms[axis], &diag);
+    if (failed(sum))
+      return failure();
+    acc = *sum;
+  }
+  return acc;
+}
+
+static FailureOr<LayoutAttr>
+buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
+                                ShapeAttr shape) {
+  MLIRContext *ctx = sourceOp->getContext();
+  sym::Store &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  unsigned rank = static_cast<unsigned>(shape.getDims().size());
+
+  SmallVector<Attribute> shapeSyms;
+  SmallVector<Attribute> indexSyms;
+  buildDefaultStridedShapeIndexSyms(ctx, rank, shapeSyms, indexSyms);
+
+  auto composeFail = [&](StringRef what, StringRef diag) {
+    return sourceOp->emitOpError("buffer parameter '")
+           << argName << "': failed to compose " << what
+           << " for default strided layout: " << diag;
+  };
 
   std::string diag;
-  sym::ExprHandle offsetHandle;
-  if (rank == 0) {
-    FailureOr<sym::ExprHandle> zero = sym::composeExprInt(store, 0, &diag);
-    if (failed(zero))
-      return composeFail("rank-0 offset", diag);
-    offsetHandle = *zero;
-  } else {
-    SmallVector<sym::ExprHandle> terms;
-    terms.reserve(rank);
-    for (unsigned axis = 0; axis < rank; ++axis) {
-      SmallString<8> indexName("i");
-      indexName += Twine(axis).str();
-      FailureOr<sym::ExprHandle> idx =
-          sym::composeExprSym(store, indexName, &diag);
-      if (failed(idx))
-        return composeFail("index symbol", diag);
-
-      SmallString<32> strideName("$STRIDE_");
-      strideName += Twine(axis).str();
-      strideName += "_";
-      strideName += argName;
-      FailureOr<sym::ExprHandle> stride =
-          sym::composeExprSym(store, strideName, &diag);
-      if (failed(stride))
-        return composeFail("stride symbol", diag);
-
-      FailureOr<sym::ExprHandle> term = sym::composeExprBinary(
-          store, *idx, sym::ExprBinaryOp::Mul, *stride, &diag);
-      if (failed(term))
-        return composeFail("stride term", diag);
-      terms.push_back(*term);
-    }
-    sym::ExprHandle acc = terms[0];
-    for (unsigned axis = 1; axis < rank; ++axis) {
-      FailureOr<sym::ExprHandle> sum = sym::composeExprBinary(
-          store, acc, sym::ExprBinaryOp::Add, terms[axis], &diag);
-      if (failed(sum))
-        return composeFail("offset accumulator", diag);
-      acc = *sum;
-    }
-    offsetHandle = acc;
-  }
+  FailureOr<sym::ExprHandle> offsetHandle =
+      composeDefaultStridedOffset(store, argName, rank, diag);
+  if (failed(offsetHandle))
+    return composeFail("default strided offset", diag);
 
   FailureOr<sym::ExprHandle> storageSizeHandle =
       sym::composeExprInt(store, 0, &diag);
   if (failed(storageSizeHandle))
     return composeFail("storage_size literal", diag);
 
-  return LayoutAttr::get(
-      ctx, shapeSyms, indexSyms, DictionaryAttr::get(ctx, {}),
-      ExprAttr::get(ctx, *storageSizeHandle), ExprAttr::get(ctx, offsetHandle));
+  return LayoutAttr::get(ctx, shapeSyms, indexSyms,
+                         DictionaryAttr::get(ctx, {}),
+                         ExprAttr::get(ctx, *storageSizeHandle),
+                         ExprAttr::get(ctx, *offsetHandle));
 }
 
 // Read a Python-stamped ``layout`` ref dict and rebuild the structured
@@ -881,6 +924,35 @@ buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
 // `ExprAttr` for `storage_size` / `offset`); see the resolver-side
 // contract documented at `hc/_resolve.py::_index_map_ref`. No text is
 // parsed here — assemble straight from the typed payload.
+// Validate that every entry in `names` is a `StringAttr`. A bad entry
+// is a frontend / resolver bug — surface with a localized diagnostic
+// pointing at the offending index.
+static LogicalResult validateLayoutSymNameArray(Operation *sourceOp,
+                                                ArrayAttr names,
+                                                StringRef which) {
+  for (auto en : llvm::enumerate(names))
+    if (!isa<StringAttr>(en.value())) {
+      sourceOp->emitOpError("layout ref ")
+          << which << " entry #" << en.index() << " is not a StringAttr (got "
+          << en.value() << ")";
+      return failure();
+    }
+  return success();
+}
+
+// Validate that every value in `params` is an `ExprAttr`.
+static LogicalResult validateLayoutParamsDict(Operation *sourceOp,
+                                              DictionaryAttr params) {
+  for (NamedAttribute kv : params)
+    if (!isa<ExprAttr>(kv.getValue())) {
+      sourceOp->emitOpError("layout ref param '")
+          << kv.getName().getValue() << "' is not an ExprAttr (got "
+          << kv.getValue() << ")";
+      return failure();
+    }
+  return success();
+}
+
 static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
                                                const RefInfo &ref) {
   auto require = [&](StringRef key, auto attr) -> LogicalResult {
@@ -899,19 +971,9 @@ static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
       failed(require("offset", offset)))
     return failure();
 
-  auto validateNames = [&](ArrayAttr names, StringRef which) -> LogicalResult {
-    for (auto en : llvm::enumerate(names)) {
-      if (!isa<StringAttr>(en.value())) {
-        sourceOp->emitOpError("layout ref ")
-            << which << " entry #" << en.index() << " is not a StringAttr (got "
-            << en.value() << ")";
-        return failure();
-      }
-    }
-    return success();
-  };
-  if (failed(validateNames(shapeSymsAttr, "shape_syms")) ||
-      failed(validateNames(indexSymsAttr, "index_syms")))
+  if (failed(
+          validateLayoutSymNameArray(sourceOp, shapeSymsAttr, "shape_syms")) ||
+      failed(validateLayoutSymNameArray(sourceOp, indexSymsAttr, "index_syms")))
     return failure();
 
   // Params is optional only in the "I have no derived params" sense
@@ -921,14 +983,8 @@ static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
   DictionaryAttr paramsAttr = ref.getAs<DictionaryAttr>("params");
   if (!paramsAttr)
     return sourceOp->emitOpError("layout ref missing `params`");
-  for (NamedAttribute kv : paramsAttr) {
-    if (!isa<ExprAttr>(kv.getValue())) {
-      sourceOp->emitOpError("layout ref param '")
-          << kv.getName().getValue() << "' is not an ExprAttr (got "
-          << kv.getValue() << ")";
-      return failure();
-    }
-  }
+  if (failed(validateLayoutParamsDict(sourceOp, paramsAttr)))
+    return failure();
 
   return LayoutAttr::get(sourceOp->getContext(),
                          llvm::to_vector(shapeSymsAttr.getValue()),
@@ -998,57 +1054,113 @@ static FailureOr<LayoutAttr> consumeLayoutKwarg(hc_front::CallOp call) {
   return readLayoutFromValue(kw.getValue(), call.getOperation(), "layout=");
 }
 
+// Build the explicit launch-context type (`!hc.group`, `!hc.workitem`,
+// `!hc.subgroup`) from a `parameters` entry that carries a
+// `launch_context` kind hint. Validates ordering / scope expectations
+// before consulting the launch metadata.
 static FailureOr<Type>
-parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
-                      LaunchMetadataAttrs defaultLaunchMetadata,
-                      unsigned paramIndex) {
+buildLaunchContextParameterType(Operation *sourceOp, DictionaryAttr param,
+                                unsigned paramIndex, StringRef launchContext,
+                                LaunchMetadataAttrs metadataAttrs) {
   MLIRContext *ctx = sourceOp->getContext();
-  auto kind = param.getAs<StringAttr>("kind");
-  auto shapeAttr = param.getAs<ArrayAttr>("shape");
-  auto name = param.getAs<StringAttr>("name");
-  if (!name)
-    return sourceOp->emitOpError("`parameters` entry missing `name` key");
-  LaunchMetadataAttrs sourceMetadata = launchMetadataAttrsFrom(sourceOp);
-  LaunchMetadataAttrs metadataAttrs =
-      !sourceMetadata.empty() ? sourceMetadata : defaultLaunchMetadata;
-  if (std::optional<StringRef> launchContext =
-          getLaunchContextParameterKind(param)) {
-    StringRef expected = "";
-    if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp))
-      expected = *scopedExpected;
-    if (failed(validateLaunchContextParameter(sourceOp, param, paramIndex,
-                                              *launchContext, expected)))
-      return failure();
-    FailureOr<LaunchMetadata> metadata =
-        parseLaunchMetadata(sourceOp, metadataAttrs);
-    if (failed(metadata))
-      return failure();
-    if (*launchContext == "group")
-      return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
-                                 metadata->subgroupSize));
-    if (*launchContext == "workitem")
-      return Type(
-          WorkitemType::get(ctx, metadata->groupShape, metadata->subgroupSize));
-    if (*launchContext == "subgroup")
-      return Type(
-          SubgroupType::get(ctx, metadata->groupShape, metadata->subgroupSize));
-    return sourceOp->emitOpError("unknown launch-context parameter kind '")
-           << *launchContext << "'";
-  }
-  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp);
-      scopedExpected && paramIndex == 0)
-    return sourceOp->emitOpError("first scoped helper parameter must be "
-                                 "marked as a ")
-           << *scopedExpected << " launch context";
-  if (name.getValue() == "group" &&
-      !getScopedLaunchContextParameterKind(sourceOp)) {
-    FailureOr<LaunchMetadata> metadata =
-        parseLaunchMetadata(sourceOp, metadataAttrs);
-    if (failed(metadata))
-      return failure();
+  StringRef expected = "";
+  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp))
+    expected = *scopedExpected;
+  if (failed(validateLaunchContextParameter(sourceOp, param, paramIndex,
+                                            launchContext, expected)))
+    return failure();
+  FailureOr<LaunchMetadata> metadata =
+      parseLaunchMetadata(sourceOp, metadataAttrs);
+  if (failed(metadata))
+    return failure();
+  if (launchContext == "group")
     return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
                                metadata->subgroupSize));
+  if (launchContext == "workitem")
+    return Type(
+        WorkitemType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+  if (launchContext == "subgroup")
+    return Type(
+        SubgroupType::get(ctx, metadata->groupShape, metadata->subgroupSize));
+  return sourceOp->emitOpError("unknown launch-context parameter kind '")
+         << launchContext << "'";
+}
+
+// Resolve the layout attribute for a buffer parameter — either the
+// frontend-captured `IndexMap` ref dict or the default fully-strided
+// layout namespaced by the arg name.
+static FailureOr<LayoutAttr> resolveBufferParameterLayout(Operation *sourceOp,
+                                                          DictionaryAttr param,
+                                                          StringRef name,
+                                                          ShapeAttr shape) {
+  if (auto layoutDict = param.getAs<DictionaryAttr>("layout"))
+    return layoutAttrFromRef(sourceOp, RefInfo::fromDict(layoutDict));
+  return buildDefaultStridedBufferLayout(sourceOp, name, shape);
+}
+
+// Resolve a `kind = "buffer"` parameter dict to a `BufferType`. The
+// fallback element type is used when the entry lacks an explicit
+// `dtype` (e.g. dtype-polymorphic kernels).
+static FailureOr<Type>
+buildBufferParameterType(Operation *sourceOp, DictionaryAttr param,
+                         StringRef name, ArrayAttr shapeAttr, Type fallback) {
+  MLIRContext *ctx = sourceOp->getContext();
+  Type elementType = fallback;
+  if (auto dtype = param.getAs<StringAttr>("dtype")) {
+    std::optional<Type> resolved = resolveNumpyDtypeType(ctx, dtype.getValue());
+    if (!resolved)
+      return sourceOp->emitOpError("buffer parameter '")
+             << name << "' has unsupported dtype '" << dtype.getValue() << "'";
+    elementType = *resolved;
   }
+
+  FailureOr<ShapeAttr> shape = stringArrayToShape(sourceOp, shapeAttr);
+  if (failed(shape))
+    return failure();
+  // Buffer args carry the default fully-strided np/torch layout from
+  // the boundary on unless the Python frontend captured an explicit
+  // `IndexMap` on the annotation (e.g. `Buffer[M, N, dtype, A_LAYOUT]`).
+  // Per-axis stride symbols on the default-strided path are namespaced
+  // by the arg name so two buffers with the same shape don't share
+  // strides; the host wrapper binds them at launch.
+  // `appendLayoutBoundSymbols` (called further down) picks up either
+  // layout's free symbols and extends `kernel.bound_symbols` so
+  // downstream passes know to leave them unmaterialized.
+  FailureOr<LayoutAttr> layout =
+      resolveBufferParameterLayout(sourceOp, param, name, *shape);
+  if (failed(layout))
+    return failure();
+  return Type(BufferType::get(ctx, elementType, *shape, *layout));
+}
+
+// Implicit `group` parameter (legacy frontend-style top-level
+// kernels): when the parameter name is literally `group` and we're
+// not in a scoped helper, materialize the launch-context type from
+// the kernel's launch metadata.
+static FailureOr<Type>
+buildImplicitGroupParameterType(Operation *sourceOp, StringAttr name,
+                                LaunchMetadataAttrs metadataAttrs) {
+  MLIRContext *ctx = sourceOp->getContext();
+  if (name.getValue() != "group" ||
+      getScopedLaunchContextParameterKind(sourceOp))
+    return Type();
+  FailureOr<LaunchMetadata> metadata =
+      parseLaunchMetadata(sourceOp, metadataAttrs);
+  if (failed(metadata))
+    return failure();
+  return Type(GroupType::get(ctx, metadata->workShape, metadata->groupShape,
+                             metadata->subgroupSize));
+}
+
+// Validate the `kind` / `shape` keys for a non-launch-context, non-
+// implicit-group parameter, returning either the fallback element
+// type (no shape, plain scalar) or success() to indicate the buffer
+// branch should be taken.
+static FailureOr<Type> validateNonBufferParameterShape(Operation *sourceOp,
+                                                       StringAttr name,
+                                                       StringAttr kind,
+                                                       ArrayAttr shapeAttr,
+                                                       Type fallback) {
   if (!kind) {
     if (shapeAttr)
       return sourceOp->emitOpError("parameter '")
@@ -1063,91 +1175,111 @@ parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
              << kind.getValue() << "' is not `buffer`";
     return fallback;
   }
+  return Type();
+}
 
+// Once we've ruled out launch-context entries, the remaining parameter
+// shapes are: implicit `group`, non-buffer with `shape` metadata coercion,
+// or a buffer-with-layout. Walk those in the documented order so a
+// missing `shape` only fires after the bespoke kinds have a chance to claim
+// the parameter.
+static FailureOr<Type> buildBufferLikeParameterType(
+    Operation *sourceOp, DictionaryAttr param, StringAttr name, StringAttr kind,
+    ArrayAttr shapeAttr, Type fallback, LaunchMetadataAttrs metadataAttrs) {
+  FailureOr<Type> implicitGroup =
+      buildImplicitGroupParameterType(sourceOp, name, metadataAttrs);
+  if (failed(implicitGroup))
+    return failure();
+  if (*implicitGroup)
+    return *implicitGroup;
+  FailureOr<Type> nonBuffer = validateNonBufferParameterShape(
+      sourceOp, name, kind, shapeAttr, fallback);
+  if (failed(nonBuffer))
+    return failure();
+  if (*nonBuffer)
+    return *nonBuffer;
   if (!shapeAttr)
     return sourceOp->emitOpError("buffer parameter '")
            << name.getValue() << "' is missing `shape` metadata";
-
-  Type elementType = fallback;
-  if (auto dtype = param.getAs<StringAttr>("dtype")) {
-    std::optional<Type> resolved = resolveNumpyDtypeType(ctx, dtype.getValue());
-    if (!resolved)
-      return sourceOp->emitOpError("buffer parameter '")
-             << name.getValue() << "' has unsupported dtype '"
-             << dtype.getValue() << "'";
-    elementType = *resolved;
-  }
-
-  FailureOr<ShapeAttr> shape = stringArrayToShape(sourceOp, shapeAttr);
-  if (failed(shape))
-    return failure();
-  // Buffer args carry the default fully-strided np/torch layout from
-  // the boundary on unless the Python frontend captured an explicit
-  // `IndexMap` on the annotation (e.g. `Buffer[M, N, dtype, A_LAYOUT]`),
-  // in which case the parameter dict carries a `layout` sub-dict in the
-  // same shape as a body-level `kind = "layout"` ref. Per-axis stride
-  // symbols on the default-strided path are namespaced by the arg name
-  // so two buffers with the same shape don't share strides; the host
-  // wrapper binds them at launch. `appendLayoutBoundSymbols` (called
-  // further down) picks up either layout's free symbols and extends
-  // `kernel.bound_symbols` so downstream passes know to leave them
-  // unmaterialized.
-  FailureOr<LayoutAttr> layout;
-  if (auto layoutDict = param.getAs<DictionaryAttr>("layout")) {
-    layout = layoutAttrFromRef(sourceOp, RefInfo::fromDict(layoutDict));
-  } else {
-    layout = buildDefaultStridedBufferLayout(sourceOp, name.getValue(), *shape);
-  }
-  if (failed(layout))
-    return failure();
-  return Type(BufferType::get(ctx, elementType, *shape, *layout));
+  return buildBufferParameterType(sourceOp, param, name.getValue(), shapeAttr,
+                                  fallback);
 }
 
-static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
-                                            DictionaryAttr record,
-                                            StringRef attrName,
-                                            unsigned index) {
-  MLIRContext *ctx = sourceOp->getContext();
-  auto kind = record.getAs<StringAttr>("kind");
-  if (!kind)
-    return sourceOp->emitOpError("`")
-           << attrName << "` entry #" << index << " missing string `kind`";
-  auto verifyKeys = [&](ArrayRef<StringRef> allowedKeys) -> LogicalResult {
-    llvm::SmallDenseSet<StringRef, 4> allowed(allowedKeys.begin(),
-                                              allowedKeys.end());
-    for (NamedAttribute attr : record) {
-      StringRef key = attr.getName().getValue();
-      if (!allowed.contains(key))
-        return sourceOp->emitOpError("`")
-               << attrName << "` entry #" << index << " kind '"
-               << kind.getValue() << "' has unsupported key '" << key << "'";
-    }
-    return success();
-  };
-  if (kind.getValue() == "undef") {
-    if (failed(verifyKeys({"kind"})))
-      return failure();
-    return Type(UndefType::get(ctx));
-  }
-  if (kind.getValue() == "idx") {
-    if (failed(verifyKeys({"kind", "expr"})))
-      return failure();
-    if (auto expr = record.getAs<StringAttr>("expr")) {
-      FailureOr<ExprAttr> parsed = stringToExpr(sourceOp, expr, "idx expr");
-      if (failed(parsed))
-        return failure();
-      return Type(IdxType::get(ctx, *parsed));
-    }
-    return Type(IdxType::get(ctx, ExprAttr()));
-  }
+static FailureOr<Type>
+parameterTypeFromDict(Operation *sourceOp, DictionaryAttr param, Type fallback,
+                      LaunchMetadataAttrs defaultLaunchMetadata,
+                      unsigned paramIndex) {
+  auto kind = param.getAs<StringAttr>("kind");
+  auto shapeAttr = param.getAs<ArrayAttr>("shape");
+  auto name = param.getAs<StringAttr>("name");
+  if (!name)
+    return sourceOp->emitOpError("`parameters` entry missing `name` key");
+  LaunchMetadataAttrs sourceMetadata = launchMetadataAttrsFrom(sourceOp);
+  LaunchMetadataAttrs metadataAttrs =
+      !sourceMetadata.empty() ? sourceMetadata : defaultLaunchMetadata;
+  if (std::optional<StringRef> launchContext =
+          getLaunchContextParameterKind(param))
+    return buildLaunchContextParameterType(sourceOp, param, paramIndex,
+                                           *launchContext, metadataAttrs);
+  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp);
+      scopedExpected && paramIndex == 0)
+    return sourceOp->emitOpError("first scoped helper parameter must be "
+                                 "marked as a ")
+           << *scopedExpected << " launch context";
+  return buildBufferLikeParameterType(sourceOp, param, name, kind, shapeAttr,
+                                      fallback, metadataAttrs);
+}
 
-  bool isTensor = kind.getValue() == "tensor";
-  bool isVector = kind.getValue() == "vector";
-  if (!isTensor && !isVector)
-    return sourceOp->emitOpError("`")
-           << attrName << "` entry #" << index << " has unsupported kind '"
-           << kind.getValue() << "'";
-  if (failed(verifyKeys({"kind", "shape", "dtype"})))
+// Reject any `record` entry that is not in `allowedKeys`. Entries
+// outside the spelt-out vocabulary are typo-likely and silently
+// ignoring them would let the wrong shape pin a contract.
+static LogicalResult verifyContractDictKeys(Operation *sourceOp,
+                                            DictionaryAttr record,
+                                            StringRef attrName, unsigned index,
+                                            StringRef kind,
+                                            ArrayRef<StringRef> allowedKeys) {
+  llvm::SmallDenseSet<StringRef, 4> allowed(allowedKeys.begin(),
+                                            allowedKeys.end());
+  for (NamedAttribute attr : record) {
+    StringRef key = attr.getName().getValue();
+    if (!allowed.contains(key))
+      return sourceOp->emitOpError("`")
+             << attrName << "` entry #" << index << " kind '" << kind
+             << "' has unsupported key '" << key << "'";
+  }
+  return success();
+}
+
+// Build a `kind = "idx"` contract entry. Optional `expr` is parsed
+// once via the textual surface; absent expr means an unbound index.
+static FailureOr<Type> buildContractIdxType(Operation *sourceOp,
+                                            DictionaryAttr record,
+                                            StringRef attrName, unsigned index,
+                                            StringRef kind) {
+  MLIRContext *ctx = sourceOp->getContext();
+  if (failed(verifyContractDictKeys(sourceOp, record, attrName, index, kind,
+                                    {"kind", "expr"})))
+    return failure();
+  if (auto expr = record.getAs<StringAttr>("expr")) {
+    FailureOr<ExprAttr> parsed = stringToExpr(sourceOp, expr, "idx expr");
+    if (failed(parsed))
+      return failure();
+    return Type(IdxType::get(ctx, *parsed));
+  }
+  return Type(IdxType::get(ctx, ExprAttr()));
+}
+
+// Build a `kind = "tensor"` or `kind = "vector"` contract entry.
+// Both share the `{kind, shape, dtype}` vocabulary; the chosen
+// constructor differentiates between the two.
+static FailureOr<Type> buildContractShapedType(Operation *sourceOp,
+                                               DictionaryAttr record,
+                                               StringRef attrName,
+                                               unsigned index, StringRef kind,
+                                               bool isTensor) {
+  MLIRContext *ctx = sourceOp->getContext();
+  if (failed(verifyContractDictKeys(sourceOp, record, attrName, index, kind,
+                                    {"kind", "shape", "dtype"})))
     return failure();
 
   auto dtype = record.getAs<StringAttr>("dtype");
@@ -1170,6 +1302,35 @@ static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
   if (isTensor)
     return Type(::mlir::hc::TensorType::get(ctx, *elementType, *shape));
   return Type(::mlir::hc::VectorType::get(ctx, *elementType, *shape));
+}
+
+static FailureOr<Type> typeFromContractDict(Operation *sourceOp,
+                                            DictionaryAttr record,
+                                            StringRef attrName,
+                                            unsigned index) {
+  MLIRContext *ctx = sourceOp->getContext();
+  auto kind = record.getAs<StringAttr>("kind");
+  if (!kind)
+    return sourceOp->emitOpError("`")
+           << attrName << "` entry #" << index << " missing string `kind`";
+  StringRef kindStr = kind.getValue();
+  if (kindStr == "undef") {
+    if (failed(verifyContractDictKeys(sourceOp, record, attrName, index,
+                                      kindStr, {"kind"})))
+      return failure();
+    return Type(UndefType::get(ctx));
+  }
+  if (kindStr == "idx")
+    return buildContractIdxType(sourceOp, record, attrName, index, kindStr);
+  if (kindStr == "tensor")
+    return buildContractShapedType(sourceOp, record, attrName, index, kindStr,
+                                   /*isTensor=*/true);
+  if (kindStr == "vector")
+    return buildContractShapedType(sourceOp, record, attrName, index, kindStr,
+                                   /*isTensor=*/false);
+  return sourceOp->emitOpError("`")
+         << attrName << "` entry #" << index << " has unsupported kind '"
+         << kindStr << "'";
 }
 
 static FailureOr<SmallVector<Type>> typesFromContractArray(Operation *sourceOp,
@@ -1198,6 +1359,17 @@ static FailureOr<SmallVector<Type>> typesFromContractArray(Operation *sourceOp,
 // after each top-level op finishes lowering.
 //===----------------------------------------------------------------------===//
 
+// Call-site special-cased kwargs get picked out of the argument list
+// before operands are lowered to real `hc` ops, so the callee can see
+// a flat positional arg list plus a {name: attr} map. Lives at file
+// scope (rather than nested inside `Lowerer`) so static helpers
+// outside the class can take it by reference.
+struct CallArgs {
+  SmallVector<Value> positional;
+  llvm::StringMap<Attribute> kwattrs;
+  llvm::StringMap<Value> kwvalues;
+};
+
 class Lowerer {
 public:
   Lowerer(OpBuilder &builder, Type undef,
@@ -1206,6 +1378,22 @@ public:
         defaultLaunchMetadata(defaultLaunchMetadata) {}
 
   LogicalResult lowerCallable(Operation *frontOp);
+
+  using BodyBuilder =
+      llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)>;
+  LogicalResult runCallableBody(Operation *frontOp, ArrayAttr runParams,
+                                bool returnsValue, bool ensureReturn,
+                                BodyBuilder build);
+  LogicalResult lowerKernelCallable(hc_front::KernelOp kernel,
+                                    ArrayAttr params);
+  LogicalResult lowerFuncCallable(hc_front::FuncOp func, ArrayAttr params);
+  LogicalResult lowerIntrinsicCallable(hc_front::IntrinsicOp intr,
+                                       ArrayAttr params);
+  LogicalResult populateKernelMetadata(HCKernelOp hcKernel, Operation *frontOp,
+                                       FunctionType fnType);
+  FailureOr<FunctionType> buildIntrinsicFunctionType(Operation *frontOp,
+                                                     ArrayAttr parameterNames,
+                                                     ArrayAttr constKwargsAttr);
 
 private:
   OpBuilder &builder;
@@ -1274,8 +1462,23 @@ private:
   // route through one helper templated on the target `hc` op type.
   template <typename HCRegionOpT, typename FrontRegionOpT>
   LogicalResult lowerCapturingRegion(FrontRegionOpT op);
+  template <typename FrontRegionOpT>
+  LogicalResult populateCapturingRegionParams(
+      FrontRegionOpT op, Operation *newOp, ArrayAttr params, Block *body,
+      StringRef expectedLaunchContext, SmallVectorImpl<StringAttr> &paramNames);
+  template <typename FrontRegionOpT>
+  LogicalResult lowerCapturingRegionBody(FrontRegionOpT op, Operation *newOp,
+                                         bool isTailReturnRegion);
+  template <typename FrontRegionOpT>
+  FailureOr<SmallVector<Type>>
+  capturingRegionResultTypes(FrontRegionOpT op, bool isTailReturnRegion);
 
   LogicalResult lowerOp(Operation *op);
+  LogicalResult lowerProducingOp(Operation *op);
+  LogicalResult lowerScalarValueOp(Operation *op);
+  LogicalResult lowerStructuralOp(Operation *op);
+  LogicalResult lowerTupleOp(hc_front::TupleOp t);
+  LogicalResult lowerKeywordOp(hc_front::KeywordOp k);
 
   FailureOr<Value> lowerValueOperand(Value v, Operation *consumer,
                                      StringRef role = "operand");
@@ -1294,7 +1497,19 @@ private:
   Value lowerSlice(hc_front::SliceOp op);
   LogicalResult lowerReturn(hc_front::ReturnOp op);
   LogicalResult lowerAssign(hc_front::AssignOp op);
+  LogicalResult lowerAssignToName(hc_front::AssignOp op,
+                                  hc_front::TargetNameOp tn);
+  LogicalResult lowerAssignToTuple(hc_front::AssignOp op,
+                                   hc_front::TargetTupleOp tt);
+  LogicalResult lowerAssignToSubscript(hc_front::AssignOp op,
+                                       hc_front::TargetSubscriptOp ts);
+  FailureOr<SmallVector<Value>>
+  expandTupleAssignSources(hc_front::AssignOp op, Value value, size_t arity);
   LogicalResult lowerFor(hc_front::ForOp op);
+  FailureOr<hc_front::CallOp> lowerForIterRegion(hc_front::ForOp op,
+                                                 Region &iter);
+  FailureOr<std::array<Value, 3>> lowerForRangeArgs(hc_front::ForOp op,
+                                                    hc_front::CallOp iterCall);
   LogicalResult lowerWorkitemRegion(hc_front::WorkitemRegionOp op);
   LogicalResult lowerSubgroupRegion(hc_front::SubgroupRegionOp op);
   // Flattens a `hc_front.inlined_region` into the caller's current `hc`
@@ -1305,12 +1520,45 @@ private:
   // parameter binding, walks the body through `lowerOp`, and intercepts
   // `hc_front.return` to wire the region's results into `valueMap`.
   LogicalResult lowerInlinedRegion(hc_front::InlinedRegionOp op);
+  LogicalResult bindInlinedRegionParams(hc_front::InlinedRegionOp op,
+                                        ArrayAttr params, StringRef prefix);
+  FailureOr<SmallVector<Value>>
+  lowerInlinedRegionBody(hc_front::InlinedRegionOp op, Block &block);
+  LogicalResult publishInlinedRegionResults(hc_front::InlinedRegionOp op,
+                                            ArrayRef<Value> resultValues);
   // FailureOr so a `builtin` call that is cleanly consumed by its parent
   // (`range(...)` inside `hc_front.for`) can be distinguished from a real
   // error. `FailureOr<Value>` reads as: success+Value / success+null /
   // failure.
   FailureOr<Value> lowerCall(hc_front::CallOp op);
+  FailureOr<Value> lowerNamedCall(hc_front::CallOp op, RefInfo ref,
+                                  StringRef kind, const CallArgs &args);
+  FailureOr<Value> lowerCalleeCall(hc_front::CallOp op,
+                                   FlatSymbolRefAttr symRef, StringRef callee,
+                                   const CallArgs &args);
+  FailureOr<Value> lowerIntrinsicCall(hc_front::CallOp op,
+                                      FlatSymbolRefAttr symRef,
+                                      StringRef callee, const CallArgs &args);
+  SmallVector<Type> deduceCalleeResultTypes(hc_front::CallOp op,
+                                            FlatSymbolRefAttr symRef,
+                                            StringRef callee);
   Value lowerSubscript(hc_front::SubscriptOp op);
+  struct SubscriptFoldResult {
+    bool consumed;
+    Value value;
+  };
+  SubscriptFoldResult trySubscriptFolds(hc_front::SubscriptOp op);
+  Value lowerGenericSubscript(hc_front::SubscriptOp op);
+  FailureOr<Value> tryLowerAttrSubscript(hc_front::SubscriptOp op,
+                                         hc_front::AttrOp attr);
+  FailureOr<Value> tryLowerCallSubscript(hc_front::SubscriptOp op,
+                                         hc_front::CallOp call);
+  Value tryLowerShapeSubscript(hc_front::SubscriptOp op, Value baseVal,
+                               IntegerAttr ax);
+  FailureOr<Value> tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
+                                                  hc_front::AttrOp attr,
+                                                  Value baseVal, Value idxVal,
+                                                  IntegerAttr ax);
 
   // Populates `entry`'s block arguments and returns the matching
   // `FunctionType`. Buffer parameters are seeded from their metadata;
@@ -1320,6 +1568,16 @@ private:
   FailureOr<FunctionType> materializeParameters(ArrayAttr params, Block &entry,
                                                 Operation *sourceOp,
                                                 bool returnsValue);
+
+  // Helper used by `materializeParameters` to enforce the scoped-helper
+  // first-launch-context rule before any parameter types are computed.
+  LogicalResult validateScopedHelperLaunchContexts(Operation *sourceOp,
+                                                   ArrayAttr params);
+
+  // Helper used by `materializeParameters` to mirror launch geometry off
+  // the freshly-computed launch-context parameter type into the lowerer's
+  // own group/work/subgroup state.
+  void recordLaunchContextShape(Type paramType);
 
   // Emits `hc.assign "<pname>", %arg` at the start of `entry` for each
   // parameter in `params`. Must be called after the enclosing op has
@@ -1344,14 +1602,6 @@ private:
   FailureOr<Value> lowerDslMethodCall(hc_front::CallOp call,
                                       hc_front::AttrOp attr);
 
-  // Call-site special-cased kwargs get picked out of the argument list
-  // before operands are lowered to real `hc` ops, so the callee can see a
-  // flat positional arg list plus a {name: attr} map.
-  struct CallArgs {
-    SmallVector<Value> positional;
-    llvm::StringMap<Attribute> kwattrs;
-    llvm::StringMap<Value> kwvalues;
-  };
   FailureOr<CallArgs> collectCallArgs(hc_front::CallOp op);
 
   FailureOr<Value> lowerNumpyDtypeCall(hc_front::CallOp call,
@@ -1361,6 +1611,13 @@ private:
                                         Value base, const CallArgs &args);
   FailureOr<Value> lowerMemOp(hc_front::CallOp call, StringRef method,
                               const CallArgs &args);
+  FailureOr<Value> lowerMemLoad(hc_front::CallOp call, StringRef method,
+                                const CallArgs &args);
+  FailureOr<Value> lowerMemStore(hc_front::CallOp call, const CallArgs &args);
+  FailureOr<Value> lowerMemInit(hc_front::CallOp call, StringRef method,
+                                const CallArgs &args);
+  FailureOr<Value> lowerMemFull(hc_front::CallOp call, StringRef method,
+                                const CallArgs &args);
 
   // Consume a `hc_front.call` whose callee was classified as a layout
   // primitive (`ref.kind = "layout_op"`). Today the only such primitive
@@ -1369,6 +1626,10 @@ private:
   // `kind = "layout"` carrying typed `#hc.expr` / DictAttr pieces; this
   // path reassembles them into a `LayoutAttr` and emits `hc.as_layout`.
   FailureOr<Value> lowerLayoutOpCall(hc_front::CallOp op, const RefInfo &ref);
+
+  // Validate that an `as_layout(...)` call has exactly two positional
+  // arguments and no kwargs.
+  LogicalResult validateAsLayoutCallShape(hc_front::CallOp op, ValueRange args);
 
   // Wrap a freshly-emitted tensor/vector result in `hc.as_layout` when
   // the originating call carried a `layout=` kwarg. Returns the
@@ -1398,9 +1659,256 @@ private:
 // Top-level callable dispatch.
 //===----------------------------------------------------------------------===//
 
-LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
+// Common skeleton for kernel/func lowering: build a fresh entry block with
+// one block arg per param, hand (entry, fnType) to the per-kind `build`
+// lambda which creates the hc op + attaches the block, then (if `build`
+// asks for it) emit a leading `hc.assign` per param and lower the hc_front
+// body region into that entry block. `build` returning a null `Region *`
+// on success means "skip the walk".
+//
+// Block ownership: on `materializeParameters` failure we delete
+// `entry` here; on success `build` is contractually attach-then-erase
+// — attaches `entry` to the hc op first, so any later failure can
+// `hcOp->erase()` and take the block with it.
+LogicalResult Lowerer::runCallableBody(Operation *frontOp, ArrayAttr runParams,
+                                       bool returnsValue, bool ensureReturn,
+                                       BodyBuilder build) {
+  Block *entry = new Block();
+  auto fnType = materializeParameters(runParams, *entry, frontOp, returnsValue);
+  if (failed(fnType)) {
+    delete entry;
+    return failure();
+  }
+  FailureOr<Region *> bodyRegion = build(entry, *fnType);
+  if (failed(bodyRegion))
+    return failure();
+  if (!*bodyRegion)
+    return success();
+  OpBuilder::InsertionGuard bodyGuard(builder);
+  emitParameterAssigns(runParams, *entry, frontOp->getLoc());
+  if (failed(lowerRegion(**bodyRegion)))
+    return failure();
+  if (ensureReturn && (entry->empty() || !isa<HCReturnOp>(entry->back()))) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(entry);
+    HCReturnOp::create(builder, frontOp->getLoc(), ValueRange{});
+  }
+  return success();
+}
+
+// Stamp shape/layout metadata onto a freshly built `hc.kernel`. Returns
+// failure when a string-array `work_shape` / `group_shape` attribute can't
+// be promoted to a typed `#hc.shape<...>`.
+LogicalResult Lowerer::populateKernelMetadata(HCKernelOp hcKernel,
+                                              Operation *frontOp,
+                                              FunctionType fnType) {
+  MLIRContext *ctx = frontOp->getContext();
+  if (auto ws = frontOp->getAttrOfType<ArrayAttr>("work_shape")) {
+    auto shape = stringArrayToShape(frontOp, ws);
+    if (failed(shape)) {
+      hcKernel->erase();
+      return failure();
+    }
+    hcKernel.setWorkShapeAttr(*shape);
+    workRank = static_cast<unsigned>((*shape).getDims().size());
+  }
+  if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
+    auto shape = stringArrayToShape(frontOp, gs);
+    if (failed(shape)) {
+      hcKernel->erase();
+      return failure();
+    }
+    hcKernel.setGroupShapeAttr(*shape);
+    groupRank = static_cast<unsigned>((*shape).getDims().size());
+  }
+  if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
+    hcKernel.setSubgroupSizeAttr(sg);
+  hcKernel.setBoundSymbolsAttr(buildKernelBoundSymbols(
+      ctx, fnType.getInputs(), hcKernel.getWorkShapeAttr(),
+      hcKernel.getGroupShapeAttr()));
+  if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
+    hcKernel.setLiteralsAttr(lits);
+  // `literal_bindings` rides on `hc_front.kernel` when the launcher
+  // (`hc.compile(symbols={...})`) has pinned concrete integer values
+  // for the specialization point. Carry it over so the downstream
+  // `hc-specialize-literals` pass can fold them into the IR.
+  if (auto binds = frontOp->getAttrOfType<DictionaryAttr>("literal_bindings"))
+    hcKernel.setLiteralBindingsAttr(binds);
+  return success();
+}
+
+LogicalResult Lowerer::lowerKernelCallable(hc_front::KernelOp kernel,
+                                           ArrayAttr params) {
+  Operation *frontOp = kernel.getOperation();
   MLIRContext *ctx = frontOp->getContext();
   Location loc = frontOp->getLoc();
+  return runCallableBody(
+      frontOp, params, /*returnsValue=*/false, /*ensureReturn=*/false,
+      [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
+        auto hcKernel = HCKernelOp::create(
+            builder, loc, StringAttr::get(ctx, kernel.getName()),
+            TypeAttr::get(fnType), /*work_shape=*/ShapeAttr(),
+            /*group_shape=*/ShapeAttr(),
+            /*subgroup_size=*/IntegerAttr(), /*bound_symbols=*/ArrayAttr(),
+            /*literals=*/ArrayAttr(),
+            /*literal_bindings=*/DictionaryAttr(),
+            /*requirements=*/ConstraintSetAttr());
+        hcKernel.getBody().push_back(entry);
+        if (failed(populateKernelMetadata(hcKernel, frontOp, fnType)))
+          return failure();
+        return &kernel.getBody();
+      });
+}
+
+LogicalResult Lowerer::lowerFuncCallable(hc_front::FuncOp func,
+                                         ArrayAttr params) {
+  Operation *frontOp = func.getOperation();
+  MLIRContext *ctx = frontOp->getContext();
+  Location loc = frontOp->getLoc();
+  return runCallableBody(
+      frontOp, params, /*returnsValue=*/!declaresNoneReturn(frontOp),
+      /*ensureReturn=*/true,
+      [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
+        auto hcFunc = HCFuncOp::create(
+            builder, loc, StringAttr::get(ctx, func.getName()),
+            TypeAttr::get(fnType), /*requirements=*/ConstraintSetAttr(),
+            /*effects=*/EffectClassAttr());
+        hcFunc.getBody().push_back(entry);
+        if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
+          auto cls = parseEffectClass(effAttr.getValue());
+          if (!cls) {
+            hcFunc->emitOpError("unknown effects class '")
+                << effAttr.getValue() << "'";
+            hcFunc->erase();
+            return failure();
+          }
+          hcFunc.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
+        }
+        // `scope` travels as a generic discardable attr on hc.func,
+        // mirroring the existing use_scope_and_effects round-trip test.
+        if (auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope"))
+          hcFunc->setAttr("scope", ScopeAttr::get(ctx, scopeAttr.getValue()));
+        return &func.getBody();
+      });
+}
+
+// Validate the constraints between `keyword_only_parameters` and
+// `const_kwargs`: the former must be a flat string list and every entry of
+// the latter must appear in the former. The list itself isn't built here;
+// it's recovered from `params` via `parameterNamesFromDicts` etc.
+static LogicalResult
+validateIntrinsicConstKwargs(Operation *frontOp, ArrayAttr constKwargsAttr,
+                             ArrayAttr keywordOnlyParameters) {
+  if (!constKwargsAttr)
+    return success();
+  for (auto [idx, kw] : llvm::enumerate(constKwargsAttr))
+    if (!isa<StringAttr>(kw))
+      return frontOp->emitOpError("`const_kwargs` entry at index ")
+             << idx << " must be a StringAttr, got " << kw;
+  llvm::SmallDenseSet<StringRef> keywordOnlySet;
+  for (Attribute kw : keywordOnlyParameters)
+    keywordOnlySet.insert(cast<StringAttr>(kw).getValue());
+  for (Attribute kw : constKwargsAttr) {
+    StringRef name = cast<StringAttr>(kw).getValue();
+    if (!keywordOnlySet.contains(name))
+      return frontOp->emitOpError("const kwarg '")
+             << name << "' must be declared keyword-only";
+  }
+  return success();
+}
+
+// Build the runtime function-type for an intrinsic, applying the optional
+// `operand_types` / `result_types` typed contract from the frontend.
+FailureOr<FunctionType> Lowerer::buildIntrinsicFunctionType(
+    Operation *frontOp, ArrayAttr parameterNames, ArrayAttr constKwargsAttr) {
+  MLIRContext *ctx = frontOp->getContext();
+  FunctionType fnType = getIntrinsicOperandFunctionType(
+      parameterNames, constKwargsAttr, TypeRange{undef}, undef);
+  if (auto operandTypesAttr =
+          frontOp->getAttrOfType<ArrayAttr>("operand_types")) {
+    FailureOr<SmallVector<Type>> operandTypes =
+        typesFromContractArray(frontOp, operandTypesAttr, "operand_types");
+    if (failed(operandTypes))
+      return failure();
+    if (operandTypes->size() != fnType.getNumInputs())
+      return frontOp->emitOpError("`operand_types` declares ")
+             << operandTypes->size()
+             << " type(s) but intrinsic runtime signature has "
+             << fnType.getNumInputs() << " SSA operand(s)";
+    SmallVector<Type> resultTypes(fnType.getResults().begin(),
+                                  fnType.getResults().end());
+    fnType = FunctionType::get(ctx, *operandTypes, resultTypes);
+  }
+  if (auto resultTypesAttr =
+          frontOp->getAttrOfType<ArrayAttr>("result_types")) {
+    FailureOr<SmallVector<Type>> resultTypes =
+        typesFromContractArray(frontOp, resultTypesAttr, "result_types");
+    if (failed(resultTypes))
+      return failure();
+    fnType = FunctionType::get(ctx, fnType.getInputs(), *resultTypes);
+  }
+  return fnType;
+}
+
+LogicalResult Lowerer::lowerIntrinsicCallable(hc_front::IntrinsicOp intr,
+                                              ArrayAttr params) {
+  Operation *frontOp = intr.getOperation();
+  MLIRContext *ctx = frontOp->getContext();
+  Location loc = frontOp->getLoc();
+  auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope");
+  if (!scopeAttr)
+    return frontOp->emitOpError(
+        "hc_front.intrinsic must carry a `scope` string attribute");
+  FailureOr<ArrayAttr> parameterNames =
+      parameterNamesFromDicts(params, frontOp);
+  if (failed(parameterNames))
+    return failure();
+  FailureOr<ArrayAttr> keywordOnlyParameters =
+      keywordOnlyParametersFromDicts(params, frontOp);
+  if (failed(keywordOnlyParameters))
+    return failure();
+  auto constKwargsAttr = frontOp->getAttrOfType<ArrayAttr>("const_kwargs");
+  if (failed(validateIntrinsicConstKwargs(frontOp, constKwargsAttr,
+                                          *keywordOnlyParameters)))
+    return failure();
+
+  // `hc.intrinsic` owns the const-kwarg filtering rule: its
+  // `function_type` is the runtime operand signature, while
+  // `parameters` keeps the full declared order for call-site kwarg
+  // binding. Python metadata may publish a typed contract; otherwise
+  // operands/results stay erased for target-specific validation.
+  FailureOr<FunctionType> fnType =
+      buildIntrinsicFunctionType(frontOp, *parameterNames, constKwargsAttr);
+  if (failed(fnType))
+    return failure();
+
+  Block *entry = new Block();
+  for (Type input : fnType->getInputs())
+    entry->addArgument(input, loc);
+
+  auto hcIntr = HCIntrinsicOp::create(
+      builder, loc, StringAttr::get(ctx, intr.getName()),
+      TypeAttr::get(*fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
+      /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr(),
+      /*parameters=*/*parameterNames,
+      /*keyword_only=*/*keywordOnlyParameters);
+  hcIntr.getBody().push_back(entry);
+  if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
+    auto cls = parseEffectClass(effAttr.getValue());
+    if (!cls) {
+      hcIntr->emitOpError("unknown effects class '")
+          << effAttr.getValue() << "'";
+      hcIntr->erase();
+      return failure();
+    }
+    hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
+  }
+  if (constKwargsAttr)
+    hcIntr.setConstKwargsAttr(constKwargsAttr);
+  return success();
+}
+
+LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPoint(frontOp);
 
@@ -1409,229 +1917,71 @@ LogicalResult Lowerer::lowerCallable(Operation *frontOp) {
   // structural annotations). Downstream we rely on both the arity and the
   // name -> block-arg binding, so a missing attr is programmer error.
   auto params = frontOp->getAttrOfType<ArrayAttr>("parameters");
-  if (!params) {
+  if (!params)
     return frontOp->emitOpError(
         "missing `parameters` attribute; the hc_front driver must stamp one");
-  }
   collectStaticLaunchGeometryRanks(frontOp);
 
-  // All three callable kinds share the same skeleton: build a fresh
-  // entry block with one block arg per param, hand (entry, fnType) to
-  // the per-kind `build` lambda which creates the hc op + attaches the
-  // block, then (if `build` asks for it) emit a leading `hc.assign` per
-  // param and lower the hc_front body region into that entry block.
-  // `build` returning a null `Region *` on success means "skip the walk"
-  // — the intrinsic arm uses it to land a declaration-only op with an
-  // empty (no-assigns, no-body) entry block; see file banner.
-  //
-  // Block ownership: on `materializeParameters` failure we delete
-  // `entry` here; on success `build` is contractually attach-then-erase
-  // — attaches `entry` to the hc op first, so any later failure can
-  // `hcOp->erase()` and take the block with it.
-  auto runBody =
-      [&](ArrayAttr runParams, bool returnsValue, bool ensureReturn,
-          llvm::function_ref<FailureOr<Region *>(Block *, FunctionType)> build)
-      -> LogicalResult {
-    Block *entry = new Block();
-    auto fnType =
-        materializeParameters(runParams, *entry, frontOp, returnsValue);
-    if (failed(fnType)) {
-      delete entry;
-      return failure();
-    }
-    FailureOr<Region *> bodyRegion = build(entry, *fnType);
-    if (failed(bodyRegion))
-      return failure();
-    if (!*bodyRegion)
-      return success();
-    OpBuilder::InsertionGuard bodyGuard(builder);
-    emitParameterAssigns(runParams, *entry, frontOp->getLoc());
-    // `emitParameterAssigns` leaves the builder just past the last
-    // parameter `hc.assign`, which is where we want `lowerRegion` to
-    // start appending the body's converted ops.
-    if (failed(lowerRegion(**bodyRegion)))
-      return failure();
-    if (ensureReturn && (entry->empty() || !isa<HCReturnOp>(entry->back()))) {
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(entry);
-      HCReturnOp::create(builder, frontOp->getLoc(), ValueRange{});
-    }
-    return success();
-  };
-
-  if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp)) {
-    return runBody(
-        params, /*returnsValue=*/false, /*ensureReturn=*/false,
-        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
-          auto hcKernel = HCKernelOp::create(
-              builder, loc, StringAttr::get(ctx, kernel.getName()),
-              TypeAttr::get(fnType), /*work_shape=*/ShapeAttr(),
-              /*group_shape=*/ShapeAttr(),
-              /*subgroup_size=*/IntegerAttr(), /*bound_symbols=*/ArrayAttr(),
-              /*literals=*/ArrayAttr(),
-              /*literal_bindings=*/DictionaryAttr(),
-              /*requirements=*/ConstraintSetAttr());
-          hcKernel.getBody().push_back(entry);
-          // Shape-like metadata travels as string arrays in hc_front;
-          // convert to `#hc.shape<...>` for typed downstream consumers.
-          if (auto ws = frontOp->getAttrOfType<ArrayAttr>("work_shape")) {
-            auto shape = stringArrayToShape(frontOp, ws);
-            if (failed(shape)) {
-              hcKernel->erase();
-              return failure();
-            }
-            hcKernel.setWorkShapeAttr(*shape);
-            workRank = static_cast<unsigned>((*shape).getDims().size());
-          }
-          if (auto gs = frontOp->getAttrOfType<ArrayAttr>("group_shape")) {
-            auto shape = stringArrayToShape(frontOp, gs);
-            if (failed(shape)) {
-              hcKernel->erase();
-              return failure();
-            }
-            hcKernel.setGroupShapeAttr(*shape);
-            groupRank = static_cast<unsigned>((*shape).getDims().size());
-          }
-          if (auto sg = frontOp->getAttrOfType<IntegerAttr>("subgroup_size"))
-            hcKernel.setSubgroupSizeAttr(sg);
-          hcKernel.setBoundSymbolsAttr(buildKernelBoundSymbols(
-              ctx, fnType.getInputs(), hcKernel.getWorkShapeAttr(),
-              hcKernel.getGroupShapeAttr()));
-          if (auto lits = frontOp->getAttrOfType<ArrayAttr>("literals"))
-            hcKernel.setLiteralsAttr(lits);
-          // `literal_bindings` rides on `hc_front.kernel` when the launcher
-          // (`hc.compile(symbols={...})`) has pinned concrete integer values
-          // for the specialization point. Carry it over so the downstream
-          // `hc-specialize-literals` pass can fold them into the IR.
-          if (auto binds =
-                  frontOp->getAttrOfType<DictionaryAttr>("literal_bindings"))
-            hcKernel.setLiteralBindingsAttr(binds);
-          return &kernel.getBody();
-        });
-  }
-
-  if (auto func = dyn_cast<hc_front::FuncOp>(frontOp)) {
-    return runBody(
-        params, /*returnsValue=*/!declaresNoneReturn(frontOp),
-        /*ensureReturn=*/true,
-        [&](Block *entry, FunctionType fnType) -> FailureOr<Region *> {
-          auto hcFunc = HCFuncOp::create(
-              builder, loc, StringAttr::get(ctx, func.getName()),
-              TypeAttr::get(fnType), /*requirements=*/ConstraintSetAttr(),
-              /*effects=*/EffectClassAttr());
-          hcFunc.getBody().push_back(entry);
-          if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
-            auto cls = parseEffectClass(effAttr.getValue());
-            if (!cls) {
-              hcFunc->emitOpError("unknown effects class '")
-                  << effAttr.getValue() << "'";
-              hcFunc->erase();
-              return failure();
-            }
-            hcFunc.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
-          }
-          // `scope` travels as a generic discardable attr on hc.func,
-          // mirroring the existing use_scope_and_effects round-trip test.
-          if (auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope"))
-            hcFunc->setAttr("scope", ScopeAttr::get(ctx, scopeAttr.getValue()));
-          return &func.getBody();
-        });
-  }
-
-  if (auto intr = dyn_cast<hc_front::IntrinsicOp>(frontOp)) {
-    auto scopeAttr = frontOp->getAttrOfType<StringAttr>("scope");
-    if (!scopeAttr) {
-      return frontOp->emitOpError(
-          "hc_front.intrinsic must carry a `scope` string attribute");
-    }
-    auto constKwargsAttr = frontOp->getAttrOfType<ArrayAttr>("const_kwargs");
-    if (constKwargsAttr) {
-      for (auto [idx, kw] : llvm::enumerate(constKwargsAttr)) {
-        if (!isa<StringAttr>(kw))
-          return frontOp->emitOpError("`const_kwargs` entry at index ")
-                 << idx << " must be a StringAttr, got " << kw;
-      }
-    }
-
-    FailureOr<ArrayAttr> parameterNames =
-        parameterNamesFromDicts(params, frontOp);
-    if (failed(parameterNames))
-      return failure();
-    FailureOr<ArrayAttr> keywordOnlyParameters =
-        keywordOnlyParametersFromDicts(params, frontOp);
-    if (failed(keywordOnlyParameters))
-      return failure();
-    llvm::SmallDenseSet<StringRef> keywordOnlySet;
-    for (Attribute kw : *keywordOnlyParameters)
-      keywordOnlySet.insert(cast<StringAttr>(kw).getValue());
-    if (constKwargsAttr) {
-      for (Attribute kw : constKwargsAttr) {
-        StringRef name = cast<StringAttr>(kw).getValue();
-        if (!keywordOnlySet.contains(name))
-          return frontOp->emitOpError("const kwarg '")
-                 << name << "' must be declared keyword-only";
-      }
-    }
-
-    // `hc.intrinsic` owns the const-kwarg filtering rule: its
-    // `function_type` is the runtime operand signature, while
-    // `parameters` keeps the full declared order for call-site kwarg
-    // binding. Python metadata may publish a typed contract; otherwise
-    // operands/results stay erased for target-specific validation.
-    FunctionType fnType = getIntrinsicOperandFunctionType(
-        *parameterNames, constKwargsAttr, TypeRange{undef}, undef);
-    if (auto operandTypesAttr =
-            frontOp->getAttrOfType<ArrayAttr>("operand_types")) {
-      FailureOr<SmallVector<Type>> operandTypes =
-          typesFromContractArray(frontOp, operandTypesAttr, "operand_types");
-      if (failed(operandTypes))
-        return failure();
-      if (operandTypes->size() != fnType.getNumInputs())
-        return frontOp->emitOpError("`operand_types` declares ")
-               << operandTypes->size()
-               << " type(s) but intrinsic runtime signature has "
-               << fnType.getNumInputs() << " SSA operand(s)";
-      SmallVector<Type> resultTypes(fnType.getResults().begin(),
-                                    fnType.getResults().end());
-      fnType = FunctionType::get(ctx, *operandTypes, resultTypes);
-    }
-    if (auto resultTypesAttr =
-            frontOp->getAttrOfType<ArrayAttr>("result_types")) {
-      FailureOr<SmallVector<Type>> resultTypes =
-          typesFromContractArray(frontOp, resultTypesAttr, "result_types");
-      if (failed(resultTypes))
-        return failure();
-      fnType = FunctionType::get(ctx, fnType.getInputs(), *resultTypes);
-    }
-    ArrayAttr parameterNamesAttr = *parameterNames;
-    ArrayAttr keywordOnlyParametersAttr = *keywordOnlyParameters;
-    Block *entry = new Block();
-    for (Type input : fnType.getInputs())
-      entry->addArgument(input, loc);
-
-    auto hcIntr = HCIntrinsicOp::create(
-        builder, loc, StringAttr::get(ctx, intr.getName()),
-        TypeAttr::get(fnType), ScopeAttr::get(ctx, scopeAttr.getValue()),
-        /*effects=*/EffectClassAttr(), /*const_kwargs=*/ArrayAttr(),
-        /*parameters=*/parameterNamesAttr,
-        /*keyword_only=*/keywordOnlyParametersAttr);
-    hcIntr.getBody().push_back(entry);
-    if (auto effAttr = frontOp->getAttrOfType<StringAttr>("effects")) {
-      auto cls = parseEffectClass(effAttr.getValue());
-      if (!cls) {
-        hcIntr->emitOpError("unknown effects class '")
-            << effAttr.getValue() << "'";
-        hcIntr->erase();
-        return failure();
-      }
-      hcIntr.setEffectsAttr(EffectClassAttr::get(ctx, *cls));
-    }
-    if (constKwargsAttr)
-      hcIntr.setConstKwargsAttr(constKwargsAttr);
-    return success();
-  }
-
+  if (auto kernel = dyn_cast<hc_front::KernelOp>(frontOp))
+    return lowerKernelCallable(kernel, params);
+  if (auto func = dyn_cast<hc_front::FuncOp>(frontOp))
+    return lowerFuncCallable(func, params);
+  if (auto intr = dyn_cast<hc_front::IntrinsicOp>(frontOp))
+    return lowerIntrinsicCallable(intr, params);
   return frontOp->emitOpError("unexpected top-level hc_front op");
+}
+
+// Scoped helpers (`scope=workitem` / `scope=subgroup`) require the first
+// parameter that carries a launch-context kind to *match* the helper's
+// declared scope. Walk to the first such entry and validate it; any other
+// position diagnoses inside `validateLaunchContextParameter`.
+LogicalResult Lowerer::validateScopedHelperLaunchContexts(Operation *sourceOp,
+                                                          ArrayAttr params) {
+  auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp);
+  if (!scopedExpected)
+    return success();
+  for (auto [idx, param] : llvm::enumerate(params)) {
+    auto dict = dyn_cast<DictionaryAttr>(param);
+    if (!dict)
+      continue;
+    std::optional<StringRef> launchContext =
+        getLaunchContextParameterKind(dict);
+    if (!launchContext)
+      continue;
+    return validateLaunchContextParameter(sourceOp, dict, idx, *launchContext,
+                                          *scopedExpected);
+  }
+  return success();
+}
+
+// Capture launch geometry off whichever launch-context type just entered
+// the parameter list. The three context types share the same trio of
+// shape / size accessors but expose them under three distinct C++ types,
+// so the dispatch is a small chain rather than a single template.
+void Lowerer::recordLaunchContextShape(Type paramType) {
+  if (auto groupType = dyn_cast<GroupType>(paramType)) {
+    launchWorkShape = groupType.getWorkShape();
+    launchGroupShape = groupType.getGroupShape();
+    launchSubgroupSize = groupType.getSubgroupSize();
+    if (launchWorkShape)
+      workRank = static_cast<unsigned>(launchWorkShape.getDims().size());
+    if (launchGroupShape)
+      groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+    return;
+  }
+  if (auto workitemType = dyn_cast<WorkitemType>(paramType)) {
+    launchGroupShape = workitemType.getGroupShape();
+    launchSubgroupSize = workitemType.getSubgroupSize();
+    if (launchGroupShape)
+      groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+    return;
+  }
+  if (auto subgroupType = dyn_cast<SubgroupType>(paramType)) {
+    launchGroupShape = subgroupType.getGroupShape();
+    launchSubgroupSize = subgroupType.getSubgroupSize();
+    if (launchGroupShape)
+      groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
+  }
 }
 
 FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
@@ -1639,21 +1989,8 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
                                                        Operation *sourceOp,
                                                        bool returnsValue) {
   MLIRContext *ctx = sourceOp->getContext();
-  if (auto scopedExpected = getScopedLaunchContextParameterKind(sourceOp)) {
-    for (auto [idx, param] : llvm::enumerate(params)) {
-      auto dict = dyn_cast<DictionaryAttr>(param);
-      if (!dict)
-        continue;
-      std::optional<StringRef> launchContext =
-          getLaunchContextParameterKind(dict);
-      if (!launchContext)
-        continue;
-      if (failed(validateLaunchContextParameter(
-              sourceOp, dict, idx, *launchContext, *scopedExpected)))
-        return failure();
-      break;
-    }
-  }
+  if (failed(validateScopedHelperLaunchContexts(sourceOp, params)))
+    return failure();
   SmallVector<Type> inputs;
   inputs.reserve(params.size());
   for (Attribute param : params) {
@@ -1670,25 +2007,7 @@ FailureOr<FunctionType> Lowerer::materializeParameters(ArrayAttr params,
                               static_cast<unsigned>(inputs.size()));
     if (failed(paramType))
       return failure();
-    if (auto groupType = dyn_cast<GroupType>(*paramType)) {
-      launchWorkShape = groupType.getWorkShape();
-      launchGroupShape = groupType.getGroupShape();
-      launchSubgroupSize = groupType.getSubgroupSize();
-      if (launchWorkShape)
-        workRank = static_cast<unsigned>(launchWorkShape.getDims().size());
-      if (launchGroupShape)
-        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
-    } else if (auto workitemType = dyn_cast<WorkitemType>(*paramType)) {
-      launchGroupShape = workitemType.getGroupShape();
-      launchSubgroupSize = workitemType.getSubgroupSize();
-      if (launchGroupShape)
-        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
-    } else if (auto subgroupType = dyn_cast<SubgroupType>(*paramType)) {
-      launchGroupShape = subgroupType.getGroupShape();
-      launchSubgroupSize = subgroupType.getSubgroupSize();
-      if (launchGroupShape)
-        groupRank = static_cast<unsigned>(launchGroupShape.getDims().size());
-    }
+    recordLaunchContextShape(*paramType);
     inputs.push_back(*paramType);
     entry.addArgument(*paramType, sourceOp->getLoc());
   }
@@ -1750,52 +2069,88 @@ LogicalResult Lowerer::lowerRegion(Region &src) {
   return success();
 }
 
-LogicalResult Lowerer::lowerOp(Operation *op) {
-  // `target_name`, `target_tuple`, `target_subscript` don't emit `hc` ops
-  // in their own right — they only matter as the LHS of an `hc_front.assign`
-  // where the assign pattern walks their defining ops. Recording them here
-  // as null in the value map keeps operand lookups from tripping on the
-  // missing mapping.
-  if (isa<hc_front::TargetNameOp, hc_front::TargetTupleOp,
-          hc_front::TargetSubscriptOp>(op)) {
-    valueMap[op->getResult(0)] = Value();
-    return success();
-  }
+// Pure-syntax targets (LHS of an `hc_front.assign`): no `hc` op gets
+// emitted, but operand lookups still need a map entry so a downstream
+// pattern doesn't fault on the lookup.
+static bool isLoweredAsTargetSyntax(Operation *op) {
+  return isa<hc_front::TargetNameOp, hc_front::TargetTupleOp,
+             hc_front::TargetSubscriptOp>(op);
+}
 
-  // Name / attr ops are the classification surface of the `ref` metadata.
-  // Some classifications (callee/intrinsic/inline/builtin/module/numpy_*)
-  // are consumed at the call site; others (param/iv/local/constant/symbol)
-  // immediately resolve to a concrete `hc` value. `lowerName` returns
-  // success+null for the former (the call-site lookup inspects the
-  // defining op directly) and failure() for real errors.
-  if (auto name = dyn_cast<hc_front::NameOp>(op)) {
-    FailureOr<Value> v = lowerName(name);
-    if (failed(v))
-      return failure();
-    valueMap[name.getResult()] = *v;
-    return success();
-  }
-  if (auto attr = dyn_cast<hc_front::AttrOp>(op)) {
-    FailureOr<Value> v = lowerAttr(attr);
-    if (failed(v))
-      return failure();
-    valueMap[attr.getResult()] = *v;
-    return success();
-  }
+// Build an `hc.tuple` from the lowered elements of `t`. A null lowered
+// element is a hard error here: tuple elements are first-class SSA
+// values and have no "consumed by parent" interpretation.
+LogicalResult Lowerer::lowerTupleOp(hc_front::TupleOp t) {
+  FailureOr<SmallVector<Value>> elts =
+      lowerValueOperands(t.getElements(), t.getOperation(), "tuple element");
+  if (failed(elts))
+    return failure();
+  if (llvm::any_of(*elts, [](Value v) { return !v; }))
+    return t.emitOpError("tuple element did not lower to an hc value");
+  SmallVector<Type> elementTypes;
+  elementTypes.reserve(elts->size());
+  for (Value elt : *elts)
+    elementTypes.push_back(elt.getType());
+  Type tupleType = TupleType::get(t.getContext(), elementTypes);
+  valueMap[t.getResult()] =
+      HCTupleOp::create(builder, t.getLoc(), tupleType, *elts);
+  return success();
+}
 
+// `keyword(name, value)` is a passthrough for the lowered value paired
+// with its name; it isn't itself an SSA-bearing op on the `hc` side.
+LogicalResult Lowerer::lowerKeywordOp(hc_front::KeywordOp k) {
+  FailureOr<Value> v =
+      lowerValueOperand(k.getValue(), k.getOperation(), "keyword value");
+  if (failed(v))
+    return failure();
+  keywordInfo[k.getResult()] = {k.getName(), *v};
+  valueMap[k.getResult()] = Value();
+  return success();
+}
+
+// Bucket of producing ops whose lowering returns a `FailureOr<Value>` and
+// where a successful null lowering is meaningful (the parent op consumes
+// the result directly): name/attr/call.
+LogicalResult Lowerer::lowerProducingOp(Operation *op) {
+  auto record = [&](Value result, FailureOr<Value> lowered) {
+    if (failed(lowered))
+      return failure();
+    valueMap[result] = *lowered;
+    return success();
+  };
+  if (auto name = dyn_cast<hc_front::NameOp>(op))
+    return record(name.getResult(), lowerName(name));
+  if (auto attr = dyn_cast<hc_front::AttrOp>(op))
+    return record(attr.getResult(), lowerAttr(attr));
+  if (auto c = dyn_cast<hc_front::CallOp>(op))
+    return record(c.getResult(), lowerCall(c));
+  return failure();
+}
+
+// Bucket of value-or-null producers: a null lowering is a hard failure
+// (no "consumed by parent" sentinel for these).
+LogicalResult Lowerer::lowerScalarValueOp(Operation *op) {
+  auto record = [&](Value result, Value v) {
+    valueMap[result] = v;
+    return v ? success() : failure();
+  };
   if (auto c = dyn_cast<hc_front::ConstantOp>(op)) {
     valueMap[c.getResult()] = lowerConstant(c);
     return success();
   }
-  if (auto b = dyn_cast<hc_front::BinOp>(op)) {
-    valueMap[b.getResult()] = lowerBinop(b);
-    return valueMap[b.getResult()] ? success() : failure();
-  }
-  if (auto s = dyn_cast<hc_front::SliceOp>(op)) {
-    Value v = lowerSlice(s);
-    valueMap[s.getResult()] = v;
-    return v ? success() : failure();
-  }
+  if (auto b = dyn_cast<hc_front::BinOp>(op))
+    return record(b.getResult(), lowerBinop(b));
+  if (auto s = dyn_cast<hc_front::SliceOp>(op))
+    return record(s.getResult(), lowerSlice(s));
+  if (auto s = dyn_cast<hc_front::SubscriptOp>(op))
+    return record(s.getResult(), lowerSubscript(s));
+  return failure();
+}
+
+// Bucket of structural / control-flow ops whose lowering already returns
+// `LogicalResult` directly.
+LogicalResult Lowerer::lowerStructuralOp(Operation *op) {
   if (auto r = dyn_cast<hc_front::ReturnOp>(op))
     return lowerReturn(r);
   if (auto a = dyn_cast<hc_front::AssignOp>(op))
@@ -1808,44 +2163,28 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
     return lowerSubgroupRegion(sg);
   if (auto ir = dyn_cast<hc_front::InlinedRegionOp>(op))
     return lowerInlinedRegion(ir);
-  if (auto c = dyn_cast<hc_front::CallOp>(op)) {
-    FailureOr<Value> v = lowerCall(c);
-    if (failed(v))
-      return failure();
-    // `v` may be null for calls that the parent op consumes directly
-    // (e.g. `range(...)` inside `hc_front.for`). That's still a success.
-    valueMap[c.getResult()] = *v;
-    return success();
-  }
-  if (auto s = dyn_cast<hc_front::SubscriptOp>(op)) {
-    valueMap[s.getResult()] = lowerSubscript(s);
-    return valueMap[s.getResult()] ? success() : failure();
-  }
-  if (auto t = dyn_cast<hc_front::TupleOp>(op)) {
-    FailureOr<SmallVector<Value>> elts =
-        lowerValueOperands(t.getElements(), op, "tuple element");
-    if (failed(elts))
-      return failure();
-    if (llvm::any_of(*elts, [](Value v) { return !v; }))
-      return t.emitOpError("tuple element did not lower to an hc value");
-    SmallVector<Type> elementTypes;
-    elementTypes.reserve(elts->size());
-    for (Value elt : *elts)
-      elementTypes.push_back(elt.getType());
-    Type tupleType = TupleType::get(op->getContext(), elementTypes);
-    valueMap[t.getResult()] =
-        HCTupleOp::create(builder, op->getLoc(), tupleType, *elts);
-    return success();
-  }
-  if (auto k = dyn_cast<hc_front::KeywordOp>(op)) {
-    FailureOr<Value> v = lowerValueOperand(k.getValue(), op, "keyword value");
-    if (failed(v))
-      return failure();
-    keywordInfo[k.getResult()] = {k.getName(), *v};
-    valueMap[k.getResult()] = Value();
-    return success();
-  }
+  if (auto t = dyn_cast<hc_front::TupleOp>(op))
+    return lowerTupleOp(t);
+  if (auto k = dyn_cast<hc_front::KeywordOp>(op))
+    return lowerKeywordOp(k);
+  return failure();
+}
 
+LogicalResult Lowerer::lowerOp(Operation *op) {
+  if (isLoweredAsTargetSyntax(op)) {
+    valueMap[op->getResult(0)] = Value();
+    return success();
+  }
+  if (isa<hc_front::NameOp, hc_front::AttrOp, hc_front::CallOp>(op))
+    return lowerProducingOp(op);
+  if (isa<hc_front::ConstantOp, hc_front::BinOp, hc_front::SliceOp,
+          hc_front::SubscriptOp>(op))
+    return lowerScalarValueOp(op);
+  if (isa<hc_front::ReturnOp, hc_front::AssignOp, hc_front::ForOp,
+          hc_front::WorkitemRegionOp, hc_front::SubgroupRegionOp,
+          hc_front::InlinedRegionOp, hc_front::TupleOp, hc_front::KeywordOp>(
+          op))
+    return lowerStructuralOp(op);
   return op->emitOpError("unsupported hc_front op");
 }
 
@@ -2109,106 +2448,120 @@ LogicalResult Lowerer::lowerReturn(hc_front::ReturnOp op) {
   return success();
 }
 
-LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
-  Value rhs = op.getValue();
-  Operation *target = op.getTarget().getDefiningOp();
+LogicalResult Lowerer::lowerAssignToName(hc_front::AssignOp op,
+                                         hc_front::TargetNameOp tn) {
+  FailureOr<Value> valueOr =
+      lowerValueOperand(op.getValue(), op.getOperation(), "assignment rhs");
+  if (failed(valueOr))
+    return failure();
+  Value value = *valueOr;
+  if (!value)
+    return op.emitOpError("rhs for '") << tn.getName()
+                                       << "' did not lower to an hc value; "
+                                          "ref classification may be off";
+  HCAssignOp::create(builder, op.getLoc(),
+                     StringAttr::get(op.getContext(), tn.getName()), value);
+  return success();
+}
+
+// Multi-assign: `a, b = <rhs>`. First-class tuple SSA values are destructured
+// with `hc.getitem`; truly multi-result front ops can still distribute their
+// individual results. Arity-1 unpack also uses getitem so `a, = scalar` does
+// not silently become scalar assignment.
+FailureOr<SmallVector<Value>>
+Lowerer::expandTupleAssignSources(hc_front::AssignOp op, Value value,
+                                  size_t arity) {
+  SmallVector<Value> sources;
+  Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
+  if (rhsOp && rhsOp->getNumResults() == arity && arity != 1) {
+    sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
+    return sources;
+  }
+  if (!value)
+    return op.emitOpError("tuple-unpack rhs did not lower to an hc value");
   MLIRContext *ctx = op.getContext();
-  auto nameAttr = [&](StringRef n) { return StringAttr::get(ctx, n); };
-
-  if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target)) {
-    FailureOr<Value> valueOr =
-        lowerValueOperand(rhs, op.getOperation(), "assignment rhs");
-    if (failed(valueOr))
-      return failure();
-    Value value = *valueOr;
-    if (!value)
-      return op.emitOpError("rhs for '") << tn.getName()
-                                         << "' did not lower to an hc value; "
-                                            "ref classification may be off";
-    HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()), value);
-    return success();
+  for (size_t i = 0; i < arity; ++i) {
+    auto index = HCConstOp::create(
+        builder, op.getLoc(), undef,
+        IntegerAttr::get(IntegerType::get(ctx, 64), static_cast<int64_t>(i)));
+    sources.push_back(HCGetItemOp::create(builder, op.getLoc(), undef, value,
+                                          index.getResult()));
   }
+  return sources;
+}
 
-  if (auto tt = dyn_cast_if_present<hc_front::TargetTupleOp>(target)) {
-    // Multi-assign: `a, b = <rhs>`. First-class tuple SSA values are
-    // destructured with `hc.getitem`; truly multi-result front ops can still
-    // distribute their individual results. Arity-1 unpack also uses getitem so
-    // `a, = scalar` does not silently become scalar assignment.
-    size_t arity = tt.getElements().size();
-    SmallVector<Value> sources;
-    FailureOr<Value> valueOr =
-        lowerValueOperand(rhs, op.getOperation(), "tuple-unpack rhs");
-    if (failed(valueOr))
-      return failure();
-    Value value = *valueOr;
-    Operation *rhsOp = value ? value.getDefiningOp() : nullptr;
-    if (rhsOp && rhsOp->getNumResults() == arity && arity != 1) {
-      sources.assign(rhsOp->getResults().begin(), rhsOp->getResults().end());
-    } else if (value) {
-      for (size_t i = 0; i < arity; ++i) {
-        auto index =
-            HCConstOp::create(builder, op.getLoc(), undef,
-                              IntegerAttr::get(IntegerType::get(ctx, 64),
-                                               static_cast<int64_t>(i)));
-        sources.push_back(HCGetItemOp::create(builder, op.getLoc(), undef,
-                                              value, index.getResult()));
-      }
-    } else {
-      return op.emitOpError("tuple-unpack rhs did not lower to an hc value");
-    }
-    if (sources.size() != arity)
-      return op.emitOpError("tuple-unpack arity mismatch: rhs has ")
-             << sources.size() << ", target has " << arity;
-    for (auto [elem, src] : llvm::zip(tt.getElements(), sources)) {
-      auto tn =
-          dyn_cast_if_present<hc_front::TargetNameOp>(elem.getDefiningOp());
-      if (!tn)
-        return op.emitOpError("nested target kinds are not yet supported");
-      if (!src)
-        return op.emitOpError(
-            "tuple-unpack source element did not lower to an hc value");
-      HCAssignOp::create(builder, op.getLoc(), nameAttr(tn.getName()), src);
-    }
-    return success();
+LogicalResult Lowerer::lowerAssignToTuple(hc_front::AssignOp op,
+                                          hc_front::TargetTupleOp tt) {
+  size_t arity = tt.getElements().size();
+  FailureOr<Value> valueOr =
+      lowerValueOperand(op.getValue(), op.getOperation(), "tuple-unpack rhs");
+  if (failed(valueOr))
+    return failure();
+  FailureOr<SmallVector<Value>> sourcesOr =
+      expandTupleAssignSources(op, *valueOr, arity);
+  if (failed(sourcesOr))
+    return failure();
+  if (sourcesOr->size() != arity)
+    return op.emitOpError("tuple-unpack arity mismatch: rhs has ")
+           << sourcesOr->size() << ", target has " << arity;
+  MLIRContext *ctx = op.getContext();
+  for (auto [elem, src] : llvm::zip(tt.getElements(), *sourcesOr)) {
+    auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(elem.getDefiningOp());
+    if (!tn)
+      return op.emitOpError("nested target kinds are not yet supported");
+    if (!src)
+      return op.emitOpError(
+          "tuple-unpack source element did not lower to an hc value");
+    HCAssignOp::create(builder, op.getLoc(), StringAttr::get(ctx, tn.getName()),
+                       src);
   }
+  return success();
+}
 
-  if (auto ts = dyn_cast_if_present<hc_front::TargetSubscriptOp>(target)) {
-    FailureOr<Value> valueOr =
-        lowerValueOperand(rhs, op.getOperation(), "store source");
-    if (failed(valueOr))
-      return failure();
-    Value value = *valueOr;
-    if (!value)
-      return op.emitOpError("store source did not lower to an hc value");
-    FailureOr<Value> baseOr = lowerValueOperand(ts.getBase(), op.getOperation(),
-                                                "target_subscript base");
-    if (failed(baseOr))
-      return failure();
-    Value base = *baseOr;
-    if (!base)
-      return op.emitOpError("target_subscript base is unresolved");
-    SmallVector<Value> indices;
-    for (Value idx : ts.getIndices()) {
-      FailureOr<SmallVector<Value>> expanded =
-          expandTupleOperand(idx, op.getOperation(), "target_subscript index");
-      if (failed(expanded))
-        return op.emitOpError("target_subscript index did not lower");
-      indices.append(expanded->begin(), expanded->end());
-    }
-    HCStoreOp::create(builder, op.getLoc(), base, indices, value, Value{});
-    return success();
+LogicalResult Lowerer::lowerAssignToSubscript(hc_front::AssignOp op,
+                                              hc_front::TargetSubscriptOp ts) {
+  FailureOr<Value> valueOr =
+      lowerValueOperand(op.getValue(), op.getOperation(), "store source");
+  if (failed(valueOr))
+    return failure();
+  Value value = *valueOr;
+  if (!value)
+    return op.emitOpError("store source did not lower to an hc value");
+  FailureOr<Value> baseOr = lowerValueOperand(ts.getBase(), op.getOperation(),
+                                              "target_subscript base");
+  if (failed(baseOr))
+    return failure();
+  Value base = *baseOr;
+  if (!base)
+    return op.emitOpError("target_subscript base is unresolved");
+  SmallVector<Value> indices;
+  for (Value idx : ts.getIndices()) {
+    FailureOr<SmallVector<Value>> expanded =
+        expandTupleOperand(idx, op.getOperation(), "target_subscript index");
+    if (failed(expanded))
+      return op.emitOpError("target_subscript index did not lower");
+    indices.append(expanded->begin(), expanded->end());
   }
+  HCStoreOp::create(builder, op.getLoc(), base, indices, value, Value{});
+  return success();
+}
 
+LogicalResult Lowerer::lowerAssign(hc_front::AssignOp op) {
+  Operation *target = op.getTarget().getDefiningOp();
+  if (auto tn = dyn_cast_if_present<hc_front::TargetNameOp>(target))
+    return lowerAssignToName(op, tn);
+  if (auto tt = dyn_cast_if_present<hc_front::TargetTupleOp>(target))
+    return lowerAssignToTuple(op, tt);
+  if (auto ts = dyn_cast_if_present<hc_front::TargetSubscriptOp>(target))
+    return lowerAssignToSubscript(op, ts);
   return op.emitOpError("unsupported assign target");
 }
 
-LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
-  // The iter region must be a `hc_front.call` to the `range` builtin. We
-  // lower that region *eagerly* (before the main loop body) into the
-  // enclosing block, then harvest the lo/hi/step operands. This keeps the
-  // induction variable one consistent producer rather than a mix of
-  // pre-loop and loop-body ops.
-  Region &iter = op.getIter();
+// Lower the `iter` region of `for` (`hc_front.for_range`'s iterator clause)
+// in-place into the enclosing block and return the trailing call op, which
+// must be the `range(...)` builtin.
+FailureOr<hc_front::CallOp> Lowerer::lowerForIterRegion(hc_front::ForOp op,
+                                                        Region &iter) {
   if (iter.empty() || iter.front().empty())
     return op.emitOpError("for-iter region is empty");
   // `hc_front.for` declares all three sub-regions as `SizedRegion<1>`, so
@@ -2218,29 +2571,29 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   if (!iter.hasOneBlock())
     return op.emitOpError(
         "for-iter must be single-block (dialect verifier bypassed?)");
-
-  hc_front::CallOp iterCall;
   Operation *lastOp = nullptr;
   for (Operation &child : llvm::make_early_inc_range(iter.front())) {
     if (failed(lowerOp(&child)))
       return failure();
     lastOp = &child;
   }
-  iterCall = dyn_cast_if_present<hc_front::CallOp>(lastOp);
+  auto iterCall = dyn_cast_if_present<hc_front::CallOp>(lastOp);
   if (!iterCall)
     return op.emitOpError("for-iter must end in a call op");
-
   auto calleeName = dyn_cast_if_present<hc_front::NameOp>(
       iterCall.getCallee().getDefiningOp());
   RefInfo calleeRef = RefInfo::get(calleeName);
   if (!calleeName || calleeRef.getKind() != "builtin" ||
-      calleeRef.getString("builtin") != "range") {
+      calleeRef.getString("builtin") != "range")
     return op.emitOpError("for-iter must be `range(...)`");
-  }
+  return iterCall;
+}
 
-  // Python-style `range(stop)` / `range(start, stop)` / `range(start, stop,
-  // step)`: pad the missing parts with the canonical defaults so the
-  // `hc.for_range` op always sees three operands.
+// Python-style `range(stop)` / `range(start, stop)` / `range(start, stop,
+// step)`: pad the missing parts with the canonical defaults so the
+// `hc.for_range` op always sees three operands.
+FailureOr<std::array<Value, 3>>
+Lowerer::lowerForRangeArgs(hc_front::ForOp op, hc_front::CallOp iterCall) {
   FailureOr<SmallVector<Value>> rangeArgsOr = lowerValueOperands(
       iterCall.getArguments(), op.getOperation(), "range argument");
   if (failed(rangeArgsOr))
@@ -2248,28 +2601,28 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   SmallVector<Value> rangeArgs = std::move(*rangeArgsOr);
   if (llvm::any_of(rangeArgs, [](Value v) { return !v; }))
     return iterCall.emitOpError("range argument did not lower to an hc value");
-  Value lo, hi, step;
-  if (rangeArgs.size() == 1) {
-    lo = HCConstOp::create(
+  auto i64Const = [&](int64_t v) -> Value {
+    return HCConstOp::create(
         builder, op.getLoc(), undef,
-        IntegerAttr::get(IntegerType::get(op.getContext(), 64), 0));
-    hi = rangeArgs[0];
-    step = HCConstOp::create(
-        builder, op.getLoc(), undef,
-        IntegerAttr::get(IntegerType::get(op.getContext(), 64), 1));
-  } else if (rangeArgs.size() == 2) {
-    lo = rangeArgs[0];
-    hi = rangeArgs[1];
-    step = HCConstOp::create(
-        builder, op.getLoc(), undef,
-        IntegerAttr::get(IntegerType::get(op.getContext(), 64), 1));
-  } else if (rangeArgs.size() == 3) {
-    lo = rangeArgs[0];
-    hi = rangeArgs[1];
-    step = rangeArgs[2];
-  } else {
-    return op.emitOpError("range(...) must have 1, 2, or 3 args");
-  }
+        IntegerAttr::get(IntegerType::get(op.getContext(), 64), v));
+  };
+  if (rangeArgs.size() == 1)
+    return std::array<Value, 3>{i64Const(0), rangeArgs[0], i64Const(1)};
+  if (rangeArgs.size() == 2)
+    return std::array<Value, 3>{rangeArgs[0], rangeArgs[1], i64Const(1)};
+  if (rangeArgs.size() == 3)
+    return std::array<Value, 3>{rangeArgs[0], rangeArgs[1], rangeArgs[2]};
+  return op.emitOpError("range(...) must have 1, 2, or 3 args");
+}
+
+LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
+  FailureOr<hc_front::CallOp> iterCallOr = lowerForIterRegion(op, op.getIter());
+  if (failed(iterCallOr))
+    return failure();
+  FailureOr<std::array<Value, 3>> rangeOr = lowerForRangeArgs(op, *iterCallOr);
+  if (failed(rangeOr))
+    return failure();
+  Value lo = (*rangeOr)[0], hi = (*rangeOr)[1], step = (*rangeOr)[2];
 
   // Pull the IV name out of the target region. Same SizedRegion<1>
   // guarantee as above.
@@ -2318,20 +2671,34 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 // boundary and gets rewritten with its own prefix when it in turn is
 // flattened. Touching a nested inlined body here would double-prefix
 // its params and break the `parameters` -> body mapping.
+// True iff the `kind` field of an inline-rename `ref` dict is one of
+// the alpha-renameable categories (function parameters, locals, IVs).
+// Anything else (frontend names referencing module-level callables,
+// captured constants, etc.) keeps its identity across inlining.
+static bool isInlineRenameableNameKind(StringRef k) {
+  return k == "param" || k == "local" || k == "iv";
+}
+
+// Rename a single `hc_front.name` op when its `ref` kind is one of
+// the alpha-renameable categories.
+static void alphaRenameNameOp(hc_front::NameOp name, StringRef prefix) {
+  auto ref = name->getAttrOfType<DictionaryAttr>("ref");
+  if (!ref)
+    return;
+  auto kind = ref.getAs<StringAttr>("kind");
+  if (!kind || !isInlineRenameableNameKind(kind.getValue()))
+    return;
+  name.setName((prefix + name.getName()).str());
+}
+
 static void alphaRenameInlinedBody(Region &body, StringRef prefix) {
   SmallVector<Region *> worklist{&body};
   while (!worklist.empty()) {
     Region *region = worklist.pop_back_val();
-    for (Block &block : *region) {
+    for (Block &block : *region)
       for (Operation &op : block) {
         if (auto name = dyn_cast<hc_front::NameOp>(&op)) {
-          if (auto ref = name->getAttrOfType<DictionaryAttr>("ref")) {
-            if (auto kind = ref.getAs<StringAttr>("kind")) {
-              StringRef k = kind.getValue();
-              if (k == "param" || k == "local" || k == "iv")
-                name.setName((prefix + name.getName()).str());
-            }
-          }
+          alphaRenameNameOp(name, prefix);
           continue;
         }
         if (auto target = dyn_cast<hc_front::TargetNameOp>(&op)) {
@@ -2345,36 +2712,17 @@ static void alphaRenameInlinedBody(Region &body, StringRef prefix) {
         for (Region &nested : op.getRegions())
           worklist.push_back(&nested);
       }
-    }
   }
 }
 
-LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
+// Bind each parameter of an inlined region to its caller-side argument
+// via `hc.assign @<renamed_param> = <lowered_arg>`. The body's
+// `hc_front.name` references to the param now read the prefixed name,
+// which the promotion pass folds against these assigns.
+LogicalResult Lowerer::bindInlinedRegionParams(hc_front::InlinedRegionOp op,
+                                               ArrayAttr params,
+                                               StringRef prefix) {
   MLIRContext *ctx = op.getContext();
-  Region &body = op.getBody();
-  if (body.empty() || !body.hasOneBlock())
-    return op.emitOpError("inlined_region body must be single-block");
-
-  auto params = op->getAttrOfType<ArrayAttr>("parameters");
-  if (!params || params.size() != op.getArguments().size()) {
-    return op.emitOpError(
-               "inlined_region parameter/argument arity mismatch (params=")
-           << (params ? params.size() : 0)
-           << ", args=" << op.getArguments().size() << ")";
-  }
-
-  // Per-site prefix. `inlineSiteCounter` is module-wide, so two sites
-  // of the same helper in the same caller still get distinct prefixes.
-  std::string prefix =
-      ("__inl_" + op.getCallee() + "_" + Twine(inlineSiteCounter) + "_").str();
-  ++inlineSiteCounter;
-
-  alphaRenameInlinedBody(body, prefix);
-
-  // Bind params at the current caller insertion point: `hc.assign
-  // @<renamed_param> = <lowered_arg>`. The body's `hc_front.name`
-  // references to the param now read the prefixed name, which the
-  // promotion pass folds against these assigns.
   for (auto [paramAttr, arg] : llvm::zip_equal(params, op.getArguments())) {
     auto dict = dyn_cast<DictionaryAttr>(paramAttr);
     if (!dict)
@@ -2387,42 +2735,34 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
     if (failed(loweredArgOr))
       return failure();
     Value loweredArg = *loweredArgOr;
-    if (!loweredArg) {
+    if (!loweredArg)
       return op.emitOpError("inline argument for param `")
              << nameAttr.getValue() << "' did not lower to an hc value";
-    }
     std::string renamed = (prefix + nameAttr.getValue()).str();
     HCAssignOp::create(builder, op.getLoc(), StringAttr::get(ctx, renamed),
                        loweredArg);
   }
+  return success();
+}
 
-  // Walk the body ops. `hc_front.return` is the one we can't feed
-  // through `lowerOp`: the generic path would emit `hc.return` into
-  // the caller, which is wrong — the return's operands are instead
-  // the region's *result values* and must be funneled into `valueMap` so
-  // downstream consumers (`hc_front.assign`, etc.) resolve through the normal
-  // paths. Tuple returns are first-class values; only explicit multi-operand
-  // returns create multiple region results.
+// Walk the inlined body, lowering every op via the standard dispatch
+// except `hc_front.return`: that op's operands are the *region results*,
+// not a real `hc.return` to the enclosing function. Tuple returns are
+// first-class values; only explicit multi-operand returns create multiple
+// region results.
+FailureOr<SmallVector<Value>>
+Lowerer::lowerInlinedRegionBody(hc_front::InlinedRegionOp op, Block &block) {
   SmallVector<Value> resultValues;
   bool sawReturn = false;
-  for (Operation &child : llvm::make_early_inc_range(body.front())) {
+  for (Operation &child : llvm::make_early_inc_range(block)) {
     if (auto r = dyn_cast<hc_front::ReturnOp>(&child)) {
       if (sawReturn)
         return op.emitOpError("inlined_region body has multiple returns");
       sawReturn = true;
-      resultValues.clear();
-      resultValues.reserve(r.getValues().size());
-      for (Value v : r.getValues()) {
-        FailureOr<Value> loweredOr = lowerValueOperand(
-            v, r.getOperation(), "inlined_region return operand");
-        if (failed(loweredOr))
-          return failure();
-        Value lowered = *loweredOr;
-        if (!lowered) {
-          return r.emitOpError("inlined_region return operand did not lower");
-        }
-        resultValues.push_back(lowered);
-      }
+      FailureOr<SmallVector<Value>> loweredOr = lowerReturnValues(r);
+      if (failed(loweredOr))
+        return failure();
+      resultValues = std::move(*loweredOr);
       continue;
     }
     if (failed(lowerOp(&child)))
@@ -2430,24 +2770,28 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
   }
   if (!sawReturn)
     return op.emitOpError("inlined_region body has no return");
+  return resultValues;
+}
 
-  // Map region results. `hc_front.call` has one SSA result, so the canonical
-  // lowering for multiple explicit return operands is one tuple value at result
-  // #0. Additional region results keep hand-written direct uses well-defined;
-  // the front dialect verifier pins their arity to the body return.
+// Map the inlined region's results into `valueMap`. `hc_front.call` has
+// one SSA result, so the canonical lowering for multiple explicit return
+// operands is one tuple value at result #0; additional region results
+// keep hand-written direct uses well-defined, with arity pinned by the
+// front dialect verifier.
+LogicalResult
+Lowerer::publishInlinedRegionResults(hc_front::InlinedRegionOp op,
+                                     ArrayRef<Value> resultValues) {
   unsigned nResults = op.getNumResults();
   if (nResults == 0) {
-    if (!resultValues.empty()) {
+    if (!resultValues.empty())
       return op.emitOpError(
           "inlined_region declares no results but body returns values");
-    }
     return success();
   }
-  if (resultValues.size() != nResults) {
+  if (resultValues.size() != nResults)
     return op.emitOpError(
                "inlined_region result arity mismatch: region declares ")
            << nResults << ", body returns " << resultValues.size();
-  }
   if (nResults == 1) {
     valueMap[op.getResult(0)] = resultValues.front();
     return success();
@@ -2464,6 +2808,147 @@ LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
   return success();
 }
 
+LogicalResult Lowerer::lowerInlinedRegion(hc_front::InlinedRegionOp op) {
+  Region &body = op.getBody();
+  if (body.empty() || !body.hasOneBlock())
+    return op.emitOpError("inlined_region body must be single-block");
+
+  auto params = op->getAttrOfType<ArrayAttr>("parameters");
+  if (!params || params.size() != op.getArguments().size())
+    return op.emitOpError(
+               "inlined_region parameter/argument arity mismatch (params=")
+           << (params ? params.size() : 0)
+           << ", args=" << op.getArguments().size() << ")";
+
+  // Per-site prefix. `inlineSiteCounter` is module-wide, so two sites
+  // of the same helper in the same caller still get distinct prefixes.
+  std::string prefix =
+      ("__inl_" + op.getCallee() + "_" + Twine(inlineSiteCounter) + "_").str();
+  ++inlineSiteCounter;
+
+  alphaRenameInlinedBody(body, prefix);
+  if (failed(bindInlinedRegionParams(op, params, prefix)))
+    return failure();
+  FailureOr<SmallVector<Value>> resultValuesOr =
+      lowerInlinedRegionBody(op, body.front());
+  if (failed(resultValuesOr))
+    return failure();
+  return publishInlinedRegionResults(op, *resultValuesOr);
+}
+
+// Tail-return regions (`return inner()` already folded into a region with
+// `tail_return` set) must be the trailing op in their block and carry a
+// single return; the result arity is the return's value arity.
+template <typename FrontRegionOpT>
+static FailureOr<unsigned> captureRegionTailReturnArity(FrontRegionOpT op) {
+  if (op.getBody().empty())
+    return op.emitOpError("tail-return region has no body");
+  if (std::next(Block::iterator(op.getOperation())) != op->getBlock()->end())
+    return op.emitOpError("tail-return region must be the final operation "
+                          "in its enclosing block");
+  hc_front::ReturnOp soleReturn;
+  for (Operation &child : op.getBody().front()) {
+    auto candidate = dyn_cast<hc_front::ReturnOp>(&child);
+    if (!candidate)
+      continue;
+    if (soleReturn)
+      return op.emitOpError("tail-return region has multiple returns");
+    soleReturn = candidate;
+  }
+  if (!soleReturn)
+    return op.emitOpError("tail-return region has no return");
+  return static_cast<unsigned>(soleReturn.getValues().size());
+}
+
+// Materialize block arguments for the captured region's parameters and
+// collect their published names so we can emit `hc.assign "<p>", %arg` at
+// body entry. The first parameter must always carry an explicit launch-
+// context marker matching the region kind.
+template <typename FrontRegionOpT>
+LogicalResult Lowerer::populateCapturingRegionParams(
+    FrontRegionOpT op, Operation *newOp, ArrayAttr params, Block *body,
+    StringRef expectedLaunchContext, SmallVectorImpl<StringAttr> &paramNames) {
+  if (!params)
+    return success();
+  paramNames.reserve(params.size());
+  MLIRContext *ctx = op.getContext();
+  for (Attribute p : params) {
+    auto dict = dyn_cast<DictionaryAttr>(p);
+    if (!dict)
+      return op.emitOpError("invalid parameters entry");
+    auto name = dict.template getAs<StringAttr>("name");
+    if (!name)
+      return op.emitOpError("parameters entry missing `name`");
+    unsigned index = paramNames.size();
+    Type paramType = undef;
+    if (std::optional<StringRef> launchContext =
+            getLaunchContextParameterKind(dict)) {
+      if (failed(validateLaunchContextParameter(op.getOperation(), dict, index,
+                                                *launchContext,
+                                                expectedLaunchContext)))
+        return failure();
+      paramType = isa<HCWorkitemRegionOp>(newOp)
+                      ? Type(WorkitemType::get(ctx, launchGroupShape,
+                                               launchSubgroupSize))
+                  : isa<HCSubgroupRegionOp>(newOp)
+                      ? Type(SubgroupType::get(ctx, launchGroupShape,
+                                               launchSubgroupSize))
+                      : undef;
+    } else if (index == 0) {
+      return op.emitOpError(
+                 "first nested region parameter must be marked as a ")
+             << expectedLaunchContext << " launch context";
+    }
+    body->addArgument(paramType, op.getLoc());
+    paramNames.push_back(name);
+  }
+  return success();
+}
+
+// Walk the source body and lower it into the freshly built `newOp`'s body
+// block. For tail-return regions the trailing return is intercepted and
+// re-emitted as `hc.yield` to wire up the SSA result handoff; everything
+// else goes through the standard op dispatch.
+template <typename FrontRegionOpT>
+LogicalResult Lowerer::lowerCapturingRegionBody(FrontRegionOpT op,
+                                                Operation *newOp,
+                                                bool isTailReturnRegion) {
+  for (Operation &child : llvm::make_early_inc_range(op.getBody().front())) {
+    if (isTailReturnRegion) {
+      if (auto retOp = dyn_cast<hc_front::ReturnOp>(&child)) {
+        FailureOr<SmallVector<Value>> loweredValues = lowerReturnValues(retOp);
+        if (failed(loweredValues))
+          return failure();
+        if (loweredValues->size() != newOp->getNumResults())
+          return retOp.emitOpError(
+              "return arity mismatch for tail-return region");
+        HCYieldOp::create(builder, retOp.getLoc(), *loweredValues);
+        continue;
+      }
+    }
+    if (failed(lowerOp(&child)))
+      return failure();
+  }
+  return success();
+}
+
+// Compute the result-type vector for the freshly built region: tail-return
+// regions carry one result per source-return value (typed `undef`, refined
+// later); plain regions have no results.
+template <typename FrontRegionOpT>
+FailureOr<SmallVector<Type>>
+Lowerer::capturingRegionResultTypes(FrontRegionOpT op,
+                                    bool isTailReturnRegion) {
+  if (!isTailReturnRegion)
+    return SmallVector<Type>{};
+  FailureOr<unsigned> arityOr = captureRegionTailReturnArity(op);
+  if (failed(arityOr))
+    return failure();
+  SmallVector<Type> resultTypes;
+  resultTypes.assign(*arityOr, undef);
+  return resultTypes;
+}
+
 template <typename HCRegionOpT, typename FrontRegionOpT>
 LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.{workitem,subgroup}_region` match `hc_front` 1:1 (captures +
@@ -2472,7 +2957,6 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // `hc.assign "<p>", %arg` per param so the body's name lookups
   // resolve via the promotion pass. The `hc` op carries only a
   // captures list (no formal params), matching ODS.
-  //
   bool sourceEmpty = op.getBody().empty();
   if (!sourceEmpty && !op.getBody().hasOneBlock())
     return op.emitOpError("hc_front nested region must be single-block");
@@ -2480,77 +2964,23 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
   // Folded `return inner()` regions lower to ordinary SSA control flow:
   // yield from the nested scope, then return from the enclosing callable.
   bool isTailReturnRegion = op.getTailReturnAttr() != nullptr;
-  SmallVector<Type> resultTypes;
-  if (isTailReturnRegion) {
-    if (sourceEmpty)
-      return op.emitOpError("tail-return region has no body");
-    if (std::next(Block::iterator(op.getOperation())) != op->getBlock()->end())
-      return op.emitOpError("tail-return region must be the final operation "
-                            "in its enclosing block");
-    hc_front::ReturnOp soleReturn;
-    for (Operation &child : op.getBody().front()) {
-      auto candidate = dyn_cast<hc_front::ReturnOp>(&child);
-      if (!candidate)
-        continue;
-      if (soleReturn)
-        return op.emitOpError("tail-return region has multiple returns");
-      soleReturn = candidate;
-    }
-    if (!soleReturn)
-      return op.emitOpError("tail-return region has no return");
+  FailureOr<SmallVector<Type>> resultTypesOr =
+      capturingRegionResultTypes(op, isTailReturnRegion);
+  if (failed(resultTypesOr))
+    return failure();
 
-    resultTypes.assign(soleReturn.getValues().size(), undef);
-  }
-
-  auto newOp = HCRegionOpT::create(builder, op.getLoc(), resultTypes,
+  auto newOp = HCRegionOpT::create(builder, op.getLoc(), *resultTypesOr,
                                    op.getCapturesAttr());
   Block *body = new Block();
-  auto params = op->template getAttrOfType<ArrayAttr>("parameters");
   StringRef expectedLaunchContext =
       isa<HCWorkitemRegionOp>(newOp.getOperation()) ? StringRef("workitem")
                                                     : StringRef("subgroup");
-  // Region parameters must carry the same explicit launch-context marker as
-  // scoped helper functions; remaining source parameters start erased.
-  auto regionParamType = [&](DictionaryAttr dict,
-                             unsigned index) -> FailureOr<Type> {
-    if (std::optional<StringRef> launchContext =
-            getLaunchContextParameterKind(dict)) {
-      if (failed(validateLaunchContextParameter(op.getOperation(), dict, index,
-                                                *launchContext,
-                                                expectedLaunchContext)))
-        return failure();
-    } else if (index == 0) {
-      return op.emitOpError(
-                 "first nested region parameter must be marked as a ")
-             << expectedLaunchContext << " launch context";
-    } else {
-      return Type(undef);
-    }
-    if (isa<HCWorkitemRegionOp>(newOp.getOperation()))
-      return Type(WorkitemType::get(op->getContext(), launchGroupShape,
-                                    launchSubgroupSize));
-    if (isa<HCSubgroupRegionOp>(newOp.getOperation()))
-      return Type(SubgroupType::get(op->getContext(), launchGroupShape,
-                                    launchSubgroupSize));
-    return Type(undef);
-  };
   SmallVector<StringAttr> paramNames;
-  if (params) {
-    paramNames.reserve(params.size());
-    for (Attribute p : params) {
-      auto dict = dyn_cast<DictionaryAttr>(p);
-      if (!dict)
-        return op.emitOpError("invalid parameters entry");
-      auto name = dict.template getAs<StringAttr>("name");
-      if (!name)
-        return op.emitOpError("parameters entry missing `name`");
-      FailureOr<Type> paramType = regionParamType(dict, paramNames.size());
-      if (failed(paramType))
-        return failure();
-      body->addArgument(*paramType, op.getLoc());
-      paramNames.push_back(name);
-    }
-  }
+  if (failed(populateCapturingRegionParams(
+          op, newOp.getOperation(),
+          op->template getAttrOfType<ArrayAttr>("parameters"), body,
+          expectedLaunchContext, paramNames)))
+    return failure();
   newOp.getBody().push_back(body);
 
   {
@@ -2558,34 +2988,13 @@ LogicalResult Lowerer::lowerCapturingRegion(FrontRegionOpT op) {
     builder.setInsertionPointToStart(body);
     for (auto [idx, name] : llvm::enumerate(paramNames))
       HCAssignOp::create(builder, op.getLoc(), name, body->getArgument(idx));
-
-    if (!sourceEmpty) {
-      SmallVector<Value> returnValues;
-      for (Operation &child :
-           llvm::make_early_inc_range(op.getBody().front())) {
-        if (isTailReturnRegion) {
-          if (auto retOp = dyn_cast<hc_front::ReturnOp>(&child)) {
-            FailureOr<SmallVector<Value>> loweredValues =
-                lowerReturnValues(retOp);
-            if (failed(loweredValues))
-              return failure();
-            returnValues = std::move(*loweredValues);
-            if (returnValues.size() != newOp->getNumResults())
-              return retOp.emitOpError("return arity mismatch for tail-return "
-                                       "region");
-            HCYieldOp::create(builder, retOp.getLoc(), returnValues);
-            continue;
-          }
-        }
-        if (failed(lowerOp(&child)))
-          return failure();
-      }
-    }
+    if (!sourceEmpty && failed(lowerCapturingRegionBody(
+                            op, newOp.getOperation(), isTailReturnRegion)))
+      return failure();
   }
 
   if (!isTailReturnRegion)
     return success();
-
   // This is emitted in the enclosing block after the newly built region op.
   HCReturnOp::create(builder, op.getLoc(), newOp->getResults());
   return success();
@@ -2603,7 +3012,7 @@ LogicalResult Lowerer::lowerSubgroupRegion(hc_front::SubgroupRegionOp op) {
 // Call / subscript.
 //===----------------------------------------------------------------------===//
 
-FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
+FailureOr<CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
   CallArgs args;
   for (Value arg : op.getArguments()) {
     auto kwIt = keywordInfo.find(arg);
@@ -2626,6 +3035,315 @@ FailureOr<Lowerer::CallArgs> Lowerer::collectCallArgs(hc_front::CallOp op) {
     args.positional.push_back(lowered);
   }
   return args;
+}
+
+// Strip the leading "@" the Python driver stamps so we can hand a bare
+// symbol name to `FlatSymbolRefAttr::get` (which re-adds it).
+static StringRef stripLeadingAt(StringRef s) {
+  return s.starts_with("@") ? s.drop_front() : s;
+}
+
+// Compute the result-type vector for an `hc.call`. `hc` calls usually
+// carry one progressive-typing result. Helpers annotated `-> None` are
+// side-effect only, so their call sites carry no result.
+SmallVector<Type> Lowerer::deduceCalleeResultTypes(hc_front::CallOp op,
+                                                   FlatSymbolRefAttr symRef,
+                                                   StringRef callee) {
+  SmallVector<Type> resultTypes;
+  if (auto decl = SymbolTable::lookupNearestSymbolFrom<HCFuncOp>(
+          op.getOperation(), symRef)) {
+    if (std::optional<FunctionType> fnType = decl.getFunctionType())
+      resultTypes.assign(fnType->getResults().begin(),
+                         fnType->getResults().end());
+    else
+      resultTypes.push_back(undef);
+    return resultTypes;
+  }
+  if (!unresolvedFrontFuncDeclaresNoResults(op.getOperation(), callee))
+    resultTypes.push_back(undef);
+  return resultTypes;
+}
+
+// `hc_front.call` to a declared `hc.func`: the lowered op is a plain
+// `hc.call` against the symbol with the positional operands.
+FailureOr<Value> Lowerer::lowerCalleeCall(hc_front::CallOp op,
+                                          FlatSymbolRefAttr symRef,
+                                          StringRef callee,
+                                          const CallArgs &args) {
+  SmallVector<Type> resultTypes = deduceCalleeResultTypes(op, symRef, callee);
+  auto call = HCCallOp::create(builder, op.getLoc(), resultTypes, symRef,
+                               args.positional);
+  if (call->getNumResults() == 0)
+    return Value();
+  return call.getResult(0);
+}
+
+namespace {
+struct IntrinsicCallSets {
+  ArrayAttr declaredParameters;
+  ArrayAttr constKwargsAttr;
+  ArrayAttr keywordOnlyAttr;
+  llvm::SmallDenseSet<StringRef> constKwargSet;
+  llvm::SmallDenseSet<StringRef> keywordOnlySet;
+};
+
+static IntrinsicCallSets buildIntrinsicCallSets(HCIntrinsicOp intrDecl) {
+  IntrinsicCallSets s;
+  s.declaredParameters = intrDecl.getParametersAttr();
+  s.constKwargsAttr = intrDecl.getConstKwargsAttr();
+  s.keywordOnlyAttr = intrDecl.getKeywordOnlyAttr();
+  if (s.constKwargsAttr)
+    for (Attribute kw : s.constKwargsAttr)
+      if (auto str = dyn_cast<StringAttr>(kw))
+        s.constKwargSet.insert(str.getValue());
+  if (s.keywordOnlyAttr)
+    for (Attribute kw : s.keywordOnlyAttr)
+      if (auto str = dyn_cast<StringAttr>(kw))
+        s.keywordOnlySet.insert(str.getValue());
+  return s;
+}
+
+// Diagnose unknown kwargs / kwattrs at the call site once we've finished
+// matching declared parameters and the const-kwarg whitelist.
+static LogicalResult validateRemainingIntrinsicKwargs(
+    hc_front::CallOp op, StringRef callee, const CallArgs &args,
+    const llvm::SmallDenseSet<StringRef> &consumedKwargs,
+    const llvm::SmallDenseSet<StringRef> &constKwargSet) {
+  for (auto &kv : args.kwvalues) {
+    StringRef name = kv.first();
+    if (consumedKwargs.contains(name) || constKwargSet.contains(name))
+      continue;
+    op.emitOpError("intrinsic '@")
+        << callee << "' called with unknown keyword argument '" << name << "'";
+    return failure();
+  }
+  for (auto &kv : args.kwattrs) {
+    StringRef name = kv.first();
+    if (!constKwargSet.contains(name)) {
+      op.emitOpError("intrinsic '@")
+          << callee << "' called with unknown keyword attribute '" << name
+          << "'";
+      return failure();
+    }
+  }
+  return success();
+}
+} // namespace
+
+namespace {
+// Read the declared parameter name at `i`, surfacing a precise diagnostic
+// if the entry isn't a `StringAttr`.
+static FailureOr<StringRef> declaredParamName(hc_front::CallOp op,
+                                              StringRef callee,
+                                              ArrayAttr params, unsigned i) {
+  auto nameAttr = dyn_cast<StringAttr>(params[i]);
+  if (!nameAttr) {
+    op.emitOpError("intrinsic '@")
+        << callee << "' has malformed `parameters` entry at index " << i
+        << ": expected StringAttr, got " << params[i];
+    return failure();
+  }
+  return nameAttr.getValue();
+}
+
+// Verify that none of the positional operands binds a keyword-only
+// parameter slot.
+static LogicalResult validatePositionalSlots(hc_front::CallOp op,
+                                             StringRef callee, ArrayAttr params,
+                                             const IntrinsicCallSets &sets,
+                                             size_t positionalCount) {
+  for (unsigned i = 0; i < positionalCount; ++i) {
+    FailureOr<StringRef> nameOr = declaredParamName(op, callee, params, i);
+    if (failed(nameOr))
+      return failure();
+    if (sets.keywordOnlySet.contains(*nameOr)) {
+      op.emitOpError("intrinsic '@")
+          << callee << "' parameter '" << *nameOr
+          << "' is keyword-only and cannot be passed positionally";
+      return failure();
+    }
+  }
+  return success();
+}
+
+// Bind a single non-positional declared parameter against the call's
+// kwargs. Skips const_kwargs (handled elsewhere) and pushes the matching
+// SSA value into `operands` while recording consumption in
+// `consumedKwargs`.
+static LogicalResult
+bindOneIntrinsicKwarg(hc_front::CallOp op, StringRef callee,
+                      const CallArgs &args, const IntrinsicCallSets &sets,
+                      StringRef pname, SmallVectorImpl<Value> &operands,
+                      llvm::SmallDenseSet<StringRef> &consumedKwargs) {
+  if (sets.constKwargSet.contains(pname))
+    return success();
+  // Intrinsic IR reserves `hc_front.keyword` operands for Python
+  // keyword-only parameters. Positional-or-keyword spelling would make
+  // hand-authored IR depend on source argument order rather than the
+  // callee's declared ABI.
+  if (sets.keywordOnlyAttr && !sets.keywordOnlySet.contains(pname)) {
+    if (args.kwvalues.contains(pname)) {
+      op.emitOpError("intrinsic '@")
+          << callee << "' parameter '" << pname
+          << "' is positional and cannot be passed as a keyword";
+      return failure();
+    }
+    op.emitOpError("intrinsic '@")
+        << callee << "' missing required positional argument '" << pname << "'";
+    return failure();
+  }
+  auto valIt = args.kwvalues.find(pname);
+  if (valIt == args.kwvalues.end()) {
+    op.emitOpError("intrinsic '@")
+        << callee << "' missing required kwarg '" << pname << "'";
+    return failure();
+  }
+  operands.push_back(valIt->second);
+  consumedKwargs.insert(pname);
+  return success();
+}
+
+// Walk the callee's declared parameter list to anchor operand order:
+// positionals bind only the prefix before any keyword-only marker,
+// keyword operands bind only keyword-only slots, and const_kwargs are
+// skipped (they land as call-site attributes). Matching by declared-
+// parameter index rather than `kwvalues` iteration keeps the order
+// deterministic across hash layouts.
+static LogicalResult
+bindIntrinsicOperands(hc_front::CallOp op, StringRef callee,
+                      const CallArgs &args, const IntrinsicCallSets &sets,
+                      SmallVectorImpl<Value> &operands,
+                      llvm::SmallDenseSet<StringRef> &consumedKwargs) {
+  if (!sets.declaredParameters) {
+    if (args.kwvalues.empty())
+      return success();
+    // Keyword operands need the callee's full ordered parameter list to
+    // anchor their SSA slots. Declaration-only hand-written intrinsics
+    // without `parameters` can still accept positional calls, but there is
+    // no deterministic kwarg order to recover.
+    op.emitOpError("intrinsic '@")
+        << callee
+        << "' call has keyword arguments but callee declares no "
+           "`parameters` — the hc_front driver must stamp them";
+    return failure();
+  }
+  ArrayAttr params = sets.declaredParameters;
+  if (operands.size() > params.size()) {
+    op.emitOpError("intrinsic '@") << callee << "' declares " << params.size()
+                                   << " parameter(s), call site supplies "
+                                   << operands.size() << " positional";
+    return failure();
+  }
+  if (failed(
+          validatePositionalSlots(op, callee, params, sets, operands.size())))
+    return failure();
+  for (unsigned i = operands.size(), e = params.size(); i < e; ++i) {
+    FailureOr<StringRef> pnameOr = declaredParamName(op, callee, params, i);
+    if (failed(pnameOr))
+      return failure();
+    if (failed(bindOneIntrinsicKwarg(op, callee, args, sets, *pnameOr, operands,
+                                     consumedKwargs)))
+      return failure();
+  }
+  return success();
+}
+
+// Promote declared const kwargs to call-site attributes from the producing
+// `hc.const` payload. Const-kwargs must be constant, and hc.const is the
+// canonical producer; fish the payload attribute off the const op so the
+// kwarg lands as an attribute, not an SSA operand.
+static void applyConstKwargAttrs(Operation *call, ArrayAttr constKwargsAttr,
+                                 const CallArgs &args) {
+  if (!constKwargsAttr)
+    return;
+  for (Attribute kw : constKwargsAttr) {
+    auto kwStr = dyn_cast<StringAttr>(kw);
+    if (!kwStr)
+      continue;
+    StringRef kwName = kwStr.getValue();
+    auto attrIt = args.kwattrs.find(kwName);
+    if (attrIt != args.kwattrs.end()) {
+      call->setAttr(kwName, attrIt->second);
+      continue;
+    }
+    auto valIt = args.kwvalues.find(kwName);
+    if (valIt == args.kwvalues.end())
+      continue;
+    if (auto constOp = valIt->second.getDefiningOp<HCConstOp>())
+      call->setAttr(kwName, constOp.getValue());
+  }
+}
+} // namespace
+
+FailureOr<Value> Lowerer::lowerIntrinsicCall(hc_front::CallOp op,
+                                             FlatSymbolRefAttr symRef,
+                                             StringRef callee,
+                                             const CallArgs &args) {
+  // The lowered `hc.intrinsic` symbol carries both the full declared
+  // parameter order and the const-kwarg whitelist. Intrinsic
+  // declarations are materialized before caller bodies are lowered, so
+  // this lookup is independent of source order.
+  HCIntrinsicOp intrDecl = SymbolTable::lookupNearestSymbolFrom<HCIntrinsicOp>(
+      op.getOperation(), symRef);
+  if (!intrDecl) {
+    op.emitOpError("intrinsic '@")
+        << callee << "' does not resolve to a lowered hc.intrinsic";
+    return failure();
+  }
+  IntrinsicCallSets sets = buildIntrinsicCallSets(intrDecl);
+  SmallVector<Value> operands(args.positional.begin(), args.positional.end());
+  llvm::SmallDenseSet<StringRef> consumedKwargs;
+  if (failed(bindIntrinsicOperands(op, callee, args, sets, operands,
+                                   consumedKwargs)))
+    return failure();
+  if (failed(validateRemainingIntrinsicKwargs(op, callee, args, consumedKwargs,
+                                              sets.constKwargSet)))
+    return failure();
+  auto call = HCCallIntrinsicOp::create(builder, op.getLoc(), TypeRange{undef},
+                                        symRef, operands);
+  applyConstKwargAttrs(call.getOperation(), sets.constKwargsAttr, args);
+  return call.getResult(0);
+}
+
+FailureOr<Value> Lowerer::lowerNamedCall(hc_front::CallOp op, RefInfo ref,
+                                         StringRef kind, const CallArgs &args) {
+  StringRef callee = ref.getString("callee");
+  if (callee.empty()) {
+    op.emitOpError("`ref.callee` missing for ") << kind << " name ref";
+    return failure();
+  }
+  callee = stripLeadingAt(callee);
+  auto symRef = FlatSymbolRefAttr::get(op.getContext(), callee);
+  if (kind == "callee")
+    return lowerCalleeCall(op, symRef, callee, args);
+  return lowerIntrinsicCall(op, symRef, callee, args);
+}
+
+// Diagnose surviving `inline`/`local` calls — both should have been
+// consumed by upstream passes (`-hc-front-inline` and
+// `-hc-front-fold-region-defs` respectively). Surfacing them here as a
+// loud, located error catches pipeline misordering.
+static FailureOr<Value> diagnoseUnconsumedFrontCallKind(hc_front::CallOp op,
+                                                        StringRef kind) {
+  if (kind == "inline") {
+    op.emitOpError("`ref.kind = \"inline\"` call survived to conversion; "
+                   "run `-hc-front-inline` before `-convert-hc-front-to-hc`");
+    return failure();
+  }
+  if (kind == "local") {
+    // `-hc-front-fold-region-defs` owns the ghost
+    // `name{local}+call(+return)` trail Python emits for a
+    // `@group.workitems def inner(): ...; inner()` immediate-call
+    // shape. A surviving call to a local identifier means the folder
+    // didn't run — the region op itself is already the lowering, so
+    // there is no callable for us to dispatch against.
+    op.emitOpError(
+        "`ref.kind = \"local\"` call survived to conversion; run "
+        "`-hc-front-fold-region-defs` before `-convert-hc-front-to-hc`");
+    return failure();
+  }
+  op.emitOpError("unsupported callee ref.kind '") << kind << "'";
+  return failure();
 }
 
 FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
@@ -2660,230 +3378,27 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
     return failure();
   CallArgs &args = *argsOr;
 
-  if (kind == "callee" || kind == "intrinsic") {
-    StringRef callee = ref.getString("callee");
-    if (callee.empty()) {
-      op.emitOpError("`ref.callee` missing for ") << kind << " name ref";
-      return failure();
-    }
-    // Strip the leading "@" the Python driver stamps so we can hand a
-    // bare symbol name to `FlatSymbolRefAttr::get` (which re-adds it).
-    if (callee.starts_with("@"))
-      callee = callee.drop_front();
-    auto symRef = FlatSymbolRefAttr::get(op.getContext(), callee);
-
-    // `hc` calls usually carry one progressive-typing result. Helpers annotated
-    // `-> None` are side-effect only, so their call sites carry no result.
-    if (kind == "callee") {
-      SmallVector<Type> resultTypes;
-      if (auto decl = SymbolTable::lookupNearestSymbolFrom<HCFuncOp>(
-              op.getOperation(), symRef)) {
-        if (std::optional<FunctionType> fnType = decl.getFunctionType()) {
-          resultTypes.assign(fnType->getResults().begin(),
-                             fnType->getResults().end());
-        } else {
-          resultTypes.push_back(undef);
-        }
-      } else if (!unresolvedFrontFuncDeclaresNoResults(op.getOperation(),
-                                                       callee)) {
-        resultTypes.push_back(undef);
-      }
-      auto call = HCCallOp::create(builder, op.getLoc(), resultTypes, symRef,
-                                   args.positional);
-      if (call->getNumResults() == 0)
-        return Value();
-      return call.getResult(0);
-    }
-
-    // The lowered `hc.intrinsic` symbol carries both the full declared
-    // parameter order and the const-kwarg whitelist. Intrinsic
-    // declarations are materialized before caller bodies are lowered, so
-    // this lookup is independent of source order.
-    HCIntrinsicOp intrDecl =
-        SymbolTable::lookupNearestSymbolFrom<HCIntrinsicOp>(op.getOperation(),
-                                                            symRef);
-    if (!intrDecl) {
-      op.emitOpError("intrinsic '@")
-          << callee << "' does not resolve to a lowered hc.intrinsic";
-      return failure();
-    }
-    ArrayAttr declaredParameters = intrDecl.getParametersAttr();
-    ArrayAttr constKwargsAttr = intrDecl.getConstKwargsAttr();
-    ArrayAttr keywordOnlyAttr = intrDecl.getKeywordOnlyAttr();
-    llvm::SmallDenseSet<StringRef> constKwargSet;
-    if (constKwargsAttr) {
-      for (Attribute kw : constKwargsAttr)
-        if (auto s = dyn_cast<StringAttr>(kw))
-          constKwargSet.insert(s.getValue());
-    }
-    llvm::SmallDenseSet<StringRef> keywordOnlySet;
-    if (keywordOnlyAttr) {
-      for (Attribute kw : keywordOnlyAttr)
-        if (auto s = dyn_cast<StringAttr>(kw))
-          keywordOnlySet.insert(s.getValue());
-    }
-
-    // Walk the callee's declared parameter list to anchor operand order:
-    // positionals bind only the prefix before any keyword-only marker,
-    // keyword operands bind only keyword-only slots, and const_kwargs are
-    // skipped (they land as call-site attributes below). Matching by
-    // declared-parameter index rather than `kwvalues` iteration keeps the
-    // order deterministic across hash layouts.
-    SmallVector<Value> operands(args.positional.begin(), args.positional.end());
-    llvm::SmallDenseSet<StringRef> consumedKwargs;
-    if (declaredParameters) {
-      ArrayAttr params = declaredParameters;
-      if (operands.size() > params.size()) {
-        op.emitOpError("intrinsic '@")
-            << callee << "' declares " << params.size()
-            << " parameter(s), call site supplies " << operands.size()
-            << " positional";
-        return failure();
-      }
-      for (unsigned i = 0, e = operands.size(); i < e; ++i) {
-        auto nameAttr = dyn_cast<StringAttr>(params[i]);
-        if (!nameAttr) {
-          op.emitOpError("intrinsic '@")
-              << callee << "' has malformed `parameters` entry at index " << i
-              << ": expected StringAttr, got " << params[i];
-          return failure();
-        }
-        if (keywordOnlySet.contains(nameAttr.getValue())) {
-          op.emitOpError("intrinsic '@")
-              << callee << "' parameter '" << nameAttr.getValue()
-              << "' is keyword-only and cannot be passed positionally";
-          return failure();
-        }
-      }
-      for (unsigned i = operands.size(), e = params.size(); i < e; ++i) {
-        auto nameAttr = dyn_cast<StringAttr>(params[i]);
-        if (!nameAttr) {
-          op.emitOpError("intrinsic '@")
-              << callee << "' has malformed `parameters` entry at index " << i
-              << ": expected StringAttr, got " << params[i];
-          return failure();
-        }
-        StringRef pname = nameAttr.getValue();
-        if (constKwargSet.contains(pname))
-          continue;
-        // Intrinsic IR reserves `hc_front.keyword` operands for Python
-        // keyword-only parameters. Positional-or-keyword spelling would make
-        // hand-authored IR depend on source argument order rather than the
-        // callee's declared ABI.
-        if (keywordOnlyAttr && !keywordOnlySet.contains(pname)) {
-          if (args.kwvalues.contains(pname)) {
-            op.emitOpError("intrinsic '@")
-                << callee << "' parameter '" << pname
-                << "' is positional and cannot be passed as a keyword";
-            return failure();
-          }
-          op.emitOpError("intrinsic '@")
-              << callee << "' missing required positional argument '" << pname
-              << "'";
-          return failure();
-        }
-        auto valIt = args.kwvalues.find(pname);
-        if (valIt == args.kwvalues.end()) {
-          op.emitOpError("intrinsic '@")
-              << callee << "' missing required kwarg '" << pname << "'";
-          return failure();
-        }
-        operands.push_back(valIt->second);
-        consumedKwargs.insert(pname);
-      }
-    } else if (!args.kwvalues.empty()) {
-      // Keyword operands need the callee's full ordered parameter list to
-      // anchor their SSA slots. Declaration-only hand-written intrinsics
-      // without `parameters` can still accept positional calls, but there is
-      // no deterministic kwarg order to recover.
-      op.emitOpError("intrinsic '@")
-          << callee
-          << "' call has keyword arguments but callee declares no "
-             "`parameters` — the hc_front driver must stamp them";
-      return failure();
-    }
-
-    // Kwargs the declared walk didn't consume and that aren't on the
-    // const whitelist are unknown at this call site. Split the
-    // diagnostics along the axis they arrive on so triage doesn't have
-    // to cross-reference `collectCallArgs`.
-    for (auto &kv : args.kwvalues) {
-      StringRef name = kv.first();
-      if (consumedKwargs.contains(name) || constKwargSet.contains(name))
-        continue;
-      op.emitOpError("intrinsic '@")
-          << callee << "' called with unknown keyword argument '" << name
-          << "'";
-      return failure();
-    }
-    for (auto &kv : args.kwattrs) {
-      StringRef name = kv.first();
-      if (!constKwargSet.contains(name)) {
-        op.emitOpError("intrinsic '@")
-            << callee << "' called with unknown keyword attribute '" << name
-            << "'";
-        return failure();
-      }
-    }
-
-    auto call = HCCallIntrinsicOp::create(builder, op.getLoc(),
-                                          TypeRange{undef}, symRef, operands);
-    if (constKwargsAttr) {
-      // Promote declared const kwargs to call-site attributes from the
-      // producing `hc.const` payload.
-      for (Attribute kw : constKwargsAttr) {
-        auto kwStr = dyn_cast<StringAttr>(kw);
-        if (!kwStr)
-          continue;
-        StringRef kwName = kwStr.getValue();
-        auto attrIt = args.kwattrs.find(kwName);
-        if (attrIt != args.kwattrs.end()) {
-          call->setAttr(kwName, attrIt->second);
-          continue;
-        }
-        auto valIt = args.kwvalues.find(kwName);
-        if (valIt == args.kwvalues.end())
-          continue;
-        // Const-kwargs must be constant, and hc.const is the canonical
-        // producer; fish the payload attribute off the const op so the
-        // kwarg lands as an attribute, not an SSA operand.
-        if (auto constOp = valIt->second.getDefiningOp<HCConstOp>())
-          call->setAttr(kwName, constOp.getValue());
-      }
-    }
-    return call.getResult(0);
-  }
-  if (kind == "builtin") {
+  if (kind == "callee" || kind == "intrinsic")
+    return lowerNamedCall(op, ref, kind, args);
+  if (kind == "builtin")
     // Consumed-by-parent builtins (right now: `range`, always folded by the
     // for-loop lowering). No stand-alone hc op. Returning a null Value is
     // safe because the only consumers walk the original hc_front op.
     return Value();
-  }
-  if (kind == "inline") {
-    // `-hc-front-inline` is responsible for consuming every inline call
-    // before we run. If one survives to here, either the pipeline was
-    // ordered wrong or the pass missed a site — in both cases the
-    // operator wants a loud, located diagnostic, not a silent
-    // placeholder.
-    op.emitOpError("`ref.kind = \"inline\"` call survived to conversion; "
-                   "run `-hc-front-inline` before `-convert-hc-front-to-hc`");
-    return failure();
-  }
-  if (kind == "local") {
-    // `-hc-front-fold-region-defs` owns the ghost
-    // `name{local}+call(+return)` trail Python emits for a
-    // `@group.workitems def inner(): ...; inner()` immediate-call
-    // shape. A surviving call to a local identifier means the folder
-    // didn't run — the region op itself is already the lowering, so
-    // there is no callable for us to dispatch against. Parallel
-    // ordering diagnostic to the `inline` case above.
-    op.emitOpError(
-        "`ref.kind = \"local\"` call survived to conversion; run "
-        "`-hc-front-fold-region-defs` before `-convert-hc-front-to-hc`");
-    return failure();
-  }
-  op.emitOpError("unsupported callee ref.kind '") << kind << "'";
-  return failure();
+  return diagnoseUnconsumedFrontCallKind(op, kind);
+}
+
+// Method-name buckets for DSL-method dispatch. Keep these in one place
+// so adding a new builtin is a single-row edit.
+static bool isUnaryBaseMethod(StringRef method) {
+  return method == "vec" || method == "with_inactive" || method == "astype";
+}
+
+static bool isMemOpMethod(StringRef method) {
+  static constexpr StringRef kMemOps[] = {"load",  "vload", "store", "vzeros",
+                                          "vones", "vfull", "zeros", "ones",
+                                          "full",  "empty"};
+  return llvm::is_contained(kMemOps, method);
 }
 
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
@@ -2919,18 +3434,50 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return failure();
   Value base = *baseOr;
 
-  if (method == "vec" || method == "with_inactive" || method == "astype")
+  if (isUnaryBaseMethod(method))
     return lowerUnaryBaseMethod(call, method, base, args);
-  if (method == "load" || method == "vload" || method == "store" ||
-      method == "vzeros" || method == "vones" || method == "vfull" ||
-      method == "zeros" || method == "ones" || method == "full" ||
-      method == "empty")
+  if (isMemOpMethod(method))
     return lowerMemOp(call, method, args);
   if (Value lowered = tryLowerLaunchGeoCall(call, method, base, args))
     return {lowered};
 
   call.emitOpError("unsupported dsl_method '") << method << "'";
   return failure();
+}
+
+// Layout descriptor sentinel: ``as_layout(value, None)`` is the
+// user-marked boundary that drops the value's layout (the operand's
+// wave-wide / broadcast addressing convenience stops applying past
+// this point — the result is a standalone bare carrier whose
+// effective span is the dim product). Recognize the descriptor here
+// by chasing back to the ``hc_front.constant`` producer; the
+// emitter stamps ``python_kind = "NoneType"`` on the constant when
+// the Python literal was ``None``.
+static bool isAsLayoutNoneSentinel(Value descriptor) {
+  auto constOp = descriptor.getDefiningOp<hc_front::ConstantOp>();
+  if (!constOp)
+    return false;
+  auto kind = constOp->getAttrOfType<StringAttr>("python_kind");
+  return kind && kind.getValue() == "NoneType";
+}
+
+// Validate the call shape `as_layout(value, descriptor)` — exactly
+// two positional arguments and no kwargs.
+LogicalResult Lowerer::validateAsLayoutCallShape(hc_front::CallOp op,
+                                                 ValueRange args) {
+  if (args.size() != 2) {
+    op.emitOpError("as_layout expects 2 positional arguments "
+                   "(value, layout descriptor); got ")
+        << args.size();
+    return failure();
+  }
+  for (Value v : args) {
+    if (keywordInfo.contains(v)) {
+      op.emitOpError("as_layout does not accept keyword arguments");
+      return failure();
+    }
+  }
+  return success();
 }
 
 FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
@@ -2945,23 +3492,9 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
     return failure();
   }
 
-  // ``as_layout`` accepts exactly two positional arguments and no
-  // kwargs. Anything else is a frontend bug, not a "stretch the
-  // semantics" surface — diagnose loudly so the user fixes the call
-  // shape before the layout machinery quietly drops information.
   ValueRange args = op.getArguments();
-  if (args.size() != 2) {
-    op.emitOpError("as_layout expects 2 positional arguments "
-                   "(value, layout descriptor); got ")
-        << args.size();
+  if (failed(validateAsLayoutCallShape(op, args)))
     return failure();
-  }
-  for (Value v : args) {
-    if (keywordInfo.contains(v)) {
-      op.emitOpError("as_layout does not accept keyword arguments");
-      return failure();
-    }
-  }
 
   FailureOr<Value> valueOr =
       lowerValueOperand(args[0], op.getOperation(), "as_layout value");
@@ -2973,22 +3506,9 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
     return failure();
   }
 
-  // Layout descriptor sentinel: ``as_layout(value, None)`` is the
-  // user-marked boundary that drops the value's layout (the operand's
-  // wave-wide / broadcast addressing convenience stops applying past
-  // this point — the result is a standalone bare carrier whose
-  // effective span is the dim product). Recognize the descriptor here
-  // by chasing back to the ``hc_front.constant`` producer; the
-  // emitter stamps ``python_kind = "NoneType"`` on the constant when
-  // the Python literal was ``None`` (see ``_constant_kind`` in
-  // ``hc/_frontend_mlir.py``). Anything else routes through
-  // ``readLayoutFromValue`` and emits ``hc.as_layout`` as before.
-  if (auto constOp = args[1].getDefiningOp<hc_front::ConstantOp>()) {
-    auto kind = constOp->getAttrOfType<StringAttr>("python_kind");
-    if (kind && kind.getValue() == "NoneType")
-      return {HCStripLayoutOp::create(builder, op.getLoc(), undef, value)
-                  .getResult()};
-  }
+  if (isAsLayoutNoneSentinel(args[1]))
+    return {HCStripLayoutOp::create(builder, op.getLoc(), undef, value)
+                .getResult()};
 
   FailureOr<LayoutAttr> layout =
       readLayoutFromValue(args[1], op.getOperation(), "as_layout layout");
@@ -3038,6 +3558,60 @@ FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
                            "dtype callee");
 }
 
+// Lower `base.vec(layout=?)`. Optional `layout=` kwarg threads through
+// to the resulting `hc.vec`.
+static FailureOr<Value> lowerVecMethod(OpBuilder &builder, Type undef,
+                                       hc_front::CallOp call, Value base) {
+  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+  if (failed(layout))
+    return failure();
+  return {HCVecOp::create(builder, call.getLoc(), undef, base, *layout)
+              .getResult()};
+}
+
+// Lower `base.with_inactive(value=v)`. The `value=` kwarg is required.
+static FailureOr<Value> lowerWithInactiveMethod(OpBuilder &builder, Type undef,
+                                                hc_front::CallOp call,
+                                                Value base,
+                                                const CallArgs &args) {
+  auto valIt = args.kwvalues.find("value");
+  if (valIt == args.kwvalues.end()) {
+    call.emitOpError("with_inactive missing `value=` kwarg");
+    return failure();
+  }
+  Value inactive = valIt->second;
+  if (!inactive) {
+    call.emitOpError("with_inactive value did not lower to an hc value");
+    return failure();
+  }
+  return {
+      HCWithInactiveOp::create(builder, call.getLoc(), undef, base, inactive)
+          .getResult()};
+}
+
+// Lower `base.astype(target)`. The target must resolve to a TypeAttr
+// — either an `hc.const` carrying it directly, or a plain `TypeAttr`
+// stashed on the source name op.
+static FailureOr<Value> lowerAsTypeMethod(OpBuilder &builder, Type undef,
+                                          hc_front::CallOp call, Value base,
+                                          const CallArgs &args) {
+  if (args.positional.empty()) {
+    call.emitOpError("astype missing target type");
+    return failure();
+  }
+  Value target = args.positional.front();
+  TypeAttr targetAttr;
+  if (auto constOp = target.getDefiningOp<HCConstOp>())
+    if (auto t = dyn_cast<TypeAttr>(constOp.getValue()))
+      targetAttr = t;
+  if (!targetAttr) {
+    call.emitOpError("astype target must resolve to a TypeAttr");
+    return failure();
+  }
+  return {HCAsTypeOp::create(builder, call.getLoc(), undef, base, targetAttr)
+              .getResult()};
+}
+
 FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
                                                StringRef method, Value base,
                                                const CallArgs &args) {
@@ -3048,234 +3622,223 @@ FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
   // All unary-base DSL methods share the "base did not lower" guard; a
   // classification gap must not let us ship an hc op built on a null
   // operand — the later verifier error would be harder to attribute.
-  auto requireBase = [&](StringRef m) -> LogicalResult {
-    if (!base) {
-      call.emitOpError(m) << ": base did not lower";
-      return failure();
-    }
-    return success();
-  };
+  if (!base) {
+    call.emitOpError(method) << ": base did not lower";
+    return failure();
+  }
 
-  if (method == "vec") {
-    if (failed(requireBase(method)))
-      return failure();
-    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
-    if (failed(layout))
-      return failure();
-    return {HCVecOp::create(builder, call.getLoc(), undef, base, *layout)
-                .getResult()};
-  }
-  if (method == "with_inactive") {
-    if (failed(requireBase(method)))
-      return failure();
-    auto valIt = args.kwvalues.find("value");
-    if (valIt == args.kwvalues.end()) {
-      call.emitOpError("with_inactive missing `value=` kwarg");
-      return failure();
-    }
-    Value inactive = valIt->second;
-    if (!inactive) {
-      call.emitOpError("with_inactive value did not lower to an hc value");
-      return failure();
-    }
-    return {
-        HCWithInactiveOp::create(builder, call.getLoc(), undef, base, inactive)
-            .getResult()};
-  }
-  if (method == "astype") {
-    if (failed(requireBase(method)))
-      return failure();
-    if (args.positional.empty()) {
-      call.emitOpError("astype missing target type");
-      return failure();
-    }
-    // The frontend passes the target dtype as the first positional arg
-    // (a numpy_dtype_type name -> attr). We accept either an hc.const
-    // carrying a TypeAttr, or a plain TypeAttr stashed on the source name
-    // op. Both collapse to a TypeAttr here.
-    Value target = args.positional.front();
-    TypeAttr targetAttr;
-    if (auto constOp = target.getDefiningOp<HCConstOp>()) {
-      if (auto t = dyn_cast<TypeAttr>(constOp.getValue()))
-        targetAttr = t;
-    }
-    if (!targetAttr) {
-      call.emitOpError("astype target must resolve to a TypeAttr");
-      return failure();
-    }
-    return {HCAsTypeOp::create(builder, call.getLoc(), undef, base, targetAttr)
-                .getResult()};
-  }
+  if (method == "vec")
+    return lowerVecMethod(builder, undef, call, base);
+  if (method == "with_inactive")
+    return lowerWithInactiveMethod(builder, undef, call, base, args);
+  if (method == "astype")
+    return lowerAsTypeMethod(builder, undef, call, base, args);
   llvm_unreachable("unknown unary-base DSL method");
 }
 
+// Chained-subscript guard for `load`/`vload`/`store`: if after one peel the
+// handle is *still* a `hc.buffer_view`, the user wrote `a[i][j]`-style
+// nested subscripts. That lowers to two distinct buffer_views whose index
+// lists can't be safely spliced (the outer slice re-indexes the already-
+// reduced view, not the original buffer's next axis). Diagnose with the
+// rewrite suggestion rather than emit wrong IR or let the rank verifier
+// complain about an index count the user didn't write.
+static LogicalResult rejectNestedBufferView(hc_front::CallOp call,
+                                            StringRef method, Value handle) {
+  if (!handle.getDefiningOp<HCBufferViewOp>())
+    return success();
+  call.emitOpError("chained subscript into `")
+      << method
+      << "` is not supported; use a single tuple subscript instead "
+         "(e.g. `group."
+      << method << "(a[i, j], ...)` rather than `a[i][j]`)";
+  return failure();
+}
+
+// `shape=` is mandatory for the array-init mem ops; surface a precise
+// diagnostic when missing.
+static FailureOr<Value> requiredShapeKwarg(hc_front::CallOp call,
+                                           const CallArgs &args,
+                                           StringRef callee) {
+  auto shapeIt = args.kwvalues.find("shape");
+  if (shapeIt == args.kwvalues.end() || !shapeIt->second) {
+    call.emitOpError("`") << callee << "` missing or invalid `shape=` kwarg";
+    return failure();
+  }
+  return shapeIt->second;
+}
+
+// `dtype=` is optional. Absent => null `TypeAttr`; present must lower to an
+// `HCConstOp` carrying a `TypeAttr`.
+static FailureOr<TypeAttr> optionalDtypeKwarg(hc_front::CallOp call,
+                                              const CallArgs &args,
+                                              StringRef callee) {
+  auto dtypeIt = args.kwvalues.find("dtype");
+  if (dtypeIt == args.kwvalues.end())
+    return TypeAttr();
+  Value dtype = dtypeIt->second;
+  if (!dtype) {
+    call.emitOpError("`") << callee << "` dtype did not lower to an hc value";
+    return failure();
+  }
+  if (auto constOp = dtype.getDefiningOp<HCConstOp>())
+    if (auto type = dyn_cast<TypeAttr>(constOp.getValue()))
+      return type;
+  call.emitOpError("`") << callee << "` dtype must resolve to a TypeAttr";
+  return failure();
+}
+
+// `load` / `vload`: the frontend passes a (possibly pre-sliced) handle as
+// the first positional, remaining positionals go to the indices list, and
+// an optional `shape=` kwarg is passed through as a normal SSA operand.
+// `peelBufferView` folds the pre-subscripted `hc.buffer_view` into the op's
+// own index list; see its banner for the single-level rationale.
+FailureOr<Value> Lowerer::lowerMemLoad(hc_front::CallOp call, StringRef method,
+                                       const CallArgs &args) {
+  if (args.positional.empty()) {
+    call.emitOpError("`") << method << "` expects a buffer/tensor argument";
+    return failure();
+  }
+  Value src = args.positional.front();
+  SmallVector<Value> indices(args.positional.begin() + 1,
+                             args.positional.end());
+  src = peelBufferView(src, indices);
+  if (failed(rejectNestedBufferView(call, method, src)))
+    return failure();
+  auto shapeIt = args.kwvalues.find("shape");
+  Value shape =
+      shapeIt == args.kwvalues.end()
+          ? HCUndefValueOp::create(builder, call.getLoc(), undef).getResult()
+          : shapeIt->second;
+  if (!shape) {
+    call.emitOpError("`") << method << "` shape did not lower to an hc value";
+    return failure();
+  }
+  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+  if (failed(layout))
+    return failure();
+  Operation *op = method == "load"
+                      ? HCLoadOp::create(builder, call.getLoc(), undef, src,
+                                         indices, shape, *layout)
+                            .getOperation()
+                      : HCVLoadOp::create(builder, call.getLoc(), undef, src,
+                                          indices, shape, *layout)
+                            .getOperation();
+  return op->getResult(0);
+}
+
+// `store` is the one mem op without a shaped result — reinterpreting its
+// (absent) output via `layout=` is meaningless, so diagnose at the call
+// site instead of silently dropping the kwarg.
+FailureOr<Value> Lowerer::lowerMemStore(hc_front::CallOp call,
+                                        const CallArgs &args) {
+  if (args.positional.size() < 2) {
+    call.emitOpError("`store` expects at least (dest, source)");
+    return failure();
+  }
+  if (findKeywordArg(call, "layout")) {
+    call.emitOpError("`store` does not accept a `layout=` kwarg "
+                     "(stores have no shaped result to relabel)");
+    return failure();
+  }
+  Value dest = args.positional.front();
+  Value source = args.positional.back();
+  SmallVector<Value> indices(args.positional.begin() + 1,
+                             args.positional.end() - 1);
+  dest = peelBufferView(dest, indices);
+  if (failed(rejectNestedBufferView(call, "store", dest)))
+    return failure();
+  HCStoreOp::create(builder, call.getLoc(), dest, indices, source, Value{});
+  // `hc.store` is a no-result op; success+null signals "consumed, no
+  // SSA output" to `lowerCall`, distinct from the failure path below.
+  return Value();
+}
+
+// `vzeros` / `vones` / `zeros` / `ones` / `empty`: shape + optional dtype +
+// optional layout, no fill value.
+FailureOr<Value> Lowerer::lowerMemInit(hc_front::CallOp call, StringRef method,
+                                       const CallArgs &args) {
+  FailureOr<Value> shape = requiredShapeKwarg(call, args, method);
+  if (failed(shape))
+    return failure();
+  FailureOr<TypeAttr> dtype = optionalDtypeKwarg(call, args, method);
+  if (failed(dtype))
+    return failure();
+  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+  if (failed(layout))
+    return failure();
+  Operation *op = nullptr;
+  if (method == "vzeros")
+    op = HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                            *layout);
+  else if (method == "vones")
+    op = HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                           *layout);
+  else if (method == "zeros")
+    op = HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                           *layout);
+  else if (method == "ones")
+    op = HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                          *layout);
+  else
+    op = HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype,
+                           *layout);
+  return op->getResult(0);
+}
+
+// `vfull` / `full`: same shape/dtype/layout combo as init ops plus a
+// `fill_value` operand (sourced from `fill_value=` kwarg or first
+// positional).
+FailureOr<Value> Lowerer::lowerMemFull(hc_front::CallOp call, StringRef method,
+                                       const CallArgs &args) {
+  FailureOr<Value> shape = requiredShapeKwarg(call, args, method);
+  if (failed(shape))
+    return failure();
+  FailureOr<TypeAttr> dtype = optionalDtypeKwarg(call, args, method);
+  if (failed(dtype))
+    return failure();
+  Value fill;
+  if (auto fillIt = args.kwvalues.find("fill_value");
+      fillIt != args.kwvalues.end())
+    fill = fillIt->second;
+  else if (!args.positional.empty())
+    fill = args.positional.front();
+  if (!fill) {
+    call.emitOpError("`") << method << "` missing `fill_value=` operand";
+    return failure();
+  }
+  FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
+  if (failed(layout))
+    return failure();
+  Operation *op = method == "vfull"
+                      ? HCVFullOp::create(builder, call.getLoc(), undef, fill,
+                                          *shape, *dtype, *layout)
+                            .getOperation()
+                      : HCFullOp::create(builder, call.getLoc(), undef, fill,
+                                         *shape, *dtype, *layout)
+                            .getOperation();
+  return op->getResult(0);
+}
+
+// Bucket-membership predicates for the four mem-op families: keep adjacent
+// to `lowerMemOp` so adding a new builtin is a single-row edit.
+static bool isMemLoadMethod(StringRef m) { return m == "load" || m == "vload"; }
+static bool isMemInitMethod(StringRef m) {
+  return m == "vzeros" || m == "vones" || m == "zeros" || m == "ones" ||
+         m == "empty";
+}
+static bool isMemFullMethod(StringRef m) { return m == "vfull" || m == "full"; }
+
 FailureOr<Value> Lowerer::lowerMemOp(hc_front::CallOp call, StringRef method,
                                      const CallArgs &args) {
-  // Buffer/tensor load, vload, store: the frontend passes a (possibly
-  // pre-sliced) handle as the first positional, remaining positionals go
-  // to the indices list, and an optional `shape=` kwarg is passed through as
-  // a normal SSA operand. `peelBufferView` at file scope folds the
-  // pre-subscripted `hc.buffer_view` into the op's own index list; see its
-  // banner for the single-level rationale.
-  //
-  // Chained-subscript guard: if after one peel the handle is *still* a
-  // `hc.buffer_view`, the user wrote `a[i][j]`-style nested subscripts.
-  // That lowers to two distinct buffer_views whose index lists can't be
-  // safely spliced (the outer slice re-indexes the already-reduced view,
-  // not the original buffer's next axis). Diagnose with the rewrite
-  // suggestion rather than emit wrong IR or let the rank verifier
-  // complain about an index count the user didn't write.
-  auto rejectNestedView = [&](Value handle) -> LogicalResult {
-    if (!handle.getDefiningOp<HCBufferViewOp>())
-      return success();
-    call.emitOpError("chained subscript into `")
-        << method
-        << "` is not supported; use a single tuple subscript instead "
-           "(e.g. `group."
-        << method << "(a[i, j], ...)` rather than `a[i][j]`)";
-    return failure();
-  };
-
-  if (method == "load" || method == "vload") {
-    if (args.positional.empty()) {
-      call.emitOpError("`") << method << "` expects a buffer/tensor argument";
-      return failure();
-    }
-    Value src = args.positional.front();
-    SmallVector<Value> indices(args.positional.begin() + 1,
-                               args.positional.end());
-    src = peelBufferView(src, indices);
-    if (failed(rejectNestedView(src)))
-      return failure();
-    auto shapeIt = args.kwvalues.find("shape");
-    Value shape =
-        shapeIt == args.kwvalues.end()
-            ? HCUndefValueOp::create(builder, call.getLoc(), undef).getResult()
-            : shapeIt->second;
-    if (!shape) {
-      call.emitOpError("`") << method << "` shape did not lower to an hc value";
-      return failure();
-    }
-    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
-    if (failed(layout))
-      return failure();
-    Operation *op = method == "load"
-                        ? HCLoadOp::create(builder, call.getLoc(), undef, src,
-                                           indices, shape, *layout)
-                              .getOperation()
-                        : HCVLoadOp::create(builder, call.getLoc(), undef, src,
-                                            indices, shape, *layout)
-                              .getOperation();
-    return op->getResult(0);
-  }
-  if (method == "store") {
-    if (args.positional.size() < 2) {
-      call.emitOpError("`store` expects at least (dest, source)");
-      return failure();
-    }
-    // `store` is the one mem op without a shaped result — reinterpreting
-    // its (absent) output via `layout=` is meaningless, so diagnose at
-    // the call site instead of silently dropping the kwarg.
-    if (findKeywordArg(call, "layout")) {
-      call.emitOpError("`store` does not accept a `layout=` kwarg "
-                       "(stores have no shaped result to relabel)");
-      return failure();
-    }
-    Value dest = args.positional.front();
-    Value source = args.positional.back();
-    SmallVector<Value> indices(args.positional.begin() + 1,
-                               args.positional.end() - 1);
-    dest = peelBufferView(dest, indices);
-    if (failed(rejectNestedView(dest)))
-      return failure();
-    HCStoreOp::create(builder, call.getLoc(), dest, indices, source, Value{});
-    // `hc.store` is a no-result op; success+null signals "consumed, no
-    // SSA output" to `lowerCall`, distinct from the failure path below.
-    return Value();
-  }
-  auto requiredShape = [&](StringRef callee) -> FailureOr<Value> {
-    auto shapeIt = args.kwvalues.find("shape");
-    if (shapeIt == args.kwvalues.end() || !shapeIt->second) {
-      call.emitOpError("`") << callee << "` missing or invalid `shape=` kwarg";
-      return failure();
-    }
-    return shapeIt->second;
-  };
-  auto optionalDtype = [&](StringRef callee) -> FailureOr<TypeAttr> {
-    auto dtypeIt = args.kwvalues.find("dtype");
-    if (dtypeIt == args.kwvalues.end())
-      return TypeAttr();
-    Value dtype = dtypeIt->second;
-    if (!dtype) {
-      call.emitOpError("`") << callee << "` dtype did not lower to an hc value";
-      return failure();
-    }
-    if (auto constOp = dtype.getDefiningOp<HCConstOp>())
-      if (auto type = dyn_cast<TypeAttr>(constOp.getValue()))
-        return type;
-    call.emitOpError("`") << callee << "` dtype must resolve to a TypeAttr";
-    return failure();
-  };
-
-  if (method == "vzeros" || method == "vones" || method == "zeros" ||
-      method == "ones" || method == "empty") {
-    FailureOr<Value> shape = requiredShape(method);
-    if (failed(shape))
-      return failure();
-    FailureOr<TypeAttr> dtype = optionalDtype(method);
-    if (failed(dtype))
-      return failure();
-    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
-    if (failed(layout))
-      return failure();
-    Operation *op;
-    if (method == "vzeros")
-      op = HCVZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
-                              *layout);
-    else if (method == "vones")
-      op = HCVOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
-                             *layout);
-    else if (method == "zeros")
-      op = HCZerosOp::create(builder, call.getLoc(), undef, *shape, *dtype,
-                             *layout);
-    else if (method == "ones")
-      op = HCOnesOp::create(builder, call.getLoc(), undef, *shape, *dtype,
-                            *layout);
-    else
-      op = HCEmptyOp::create(builder, call.getLoc(), undef, *shape, *dtype,
-                             *layout);
-    return op->getResult(0);
-  }
-
-  if (method == "vfull" || method == "full") {
-    FailureOr<Value> shape = requiredShape(method);
-    if (failed(shape))
-      return failure();
-    FailureOr<TypeAttr> dtype = optionalDtype(method);
-    if (failed(dtype))
-      return failure();
-    Value fill;
-    if (auto fillIt = args.kwvalues.find("fill_value");
-        fillIt != args.kwvalues.end())
-      fill = fillIt->second;
-    else if (!args.positional.empty())
-      fill = args.positional.front();
-    if (!fill) {
-      call.emitOpError("`") << method << "` missing `fill_value=` operand";
-      return failure();
-    }
-    FailureOr<LayoutAttr> layout = consumeLayoutKwarg(call);
-    if (failed(layout))
-      return failure();
-    Operation *op = method == "vfull"
-                        ? HCVFullOp::create(builder, call.getLoc(), undef, fill,
-                                            *shape, *dtype, *layout)
-                              .getOperation()
-                        : HCFullOp::create(builder, call.getLoc(), undef, fill,
-                                           *shape, *dtype, *layout)
-                              .getOperation();
-    return op->getResult(0);
-  }
+  if (isMemLoadMethod(method))
+    return lowerMemLoad(call, method, args);
+  if (method == "store")
+    return lowerMemStore(call, args);
+  if (isMemInitMethod(method))
+    return lowerMemInit(call, method, args);
+  if (isMemFullMethod(method))
+    return lowerMemFull(call, method, args);
   llvm_unreachable("unknown memory DSL method");
 }
 
@@ -3316,6 +3879,71 @@ static std::optional<unsigned> staticLaunchGeoRequiredRank(Value axisValue) {
   return static_cast<unsigned>(value + 1);
 }
 
+namespace {
+
+// `getitem` against an `attr` directly: tighten the rank for that
+// (source, method) pair when the index is a structural constant.
+static void noteAttrSubscriptLaunchGeoRank(
+    hc_front::SubscriptOp op, hc_front::AttrOp attr,
+    llvm::function_ref<void(Value, StringRef, unsigned)> record) {
+  StringRef method = attr.getName();
+  std::optional<LaunchGeoMethodInfo> methodInfo =
+      classifyLaunchGeoMethod(method);
+  if (!methodInfo || methodInfo->isScalar())
+    return;
+  std::optional<unsigned> rank =
+      staticLaunchGeoRequiredRank(op.getIndices().front());
+  if (!rank)
+    return;
+  record(attr.getBase(), method, *rank);
+}
+
+// Walks every use of `result` and folds the structural rank of each
+// subscript index. Returns `nullopt` when any use isn't a single-index
+// constant subscript — i.e. the tuple escapes — so the caller leaves the
+// conservative cap-sized fallback in place.
+static std::optional<unsigned> allSubscriptUsesRank(Value result) {
+  unsigned rank = 0;
+  for (Operation *user : result.getUsers()) {
+    auto subscript = dyn_cast<hc_front::SubscriptOp>(user);
+    if (!subscript || subscript.getBase() != result ||
+        subscript.getIndices().size() != 1)
+      return std::nullopt;
+    std::optional<unsigned> required =
+        staticLaunchGeoRequiredRank(subscript.getIndices().front());
+    if (!required)
+      return std::nullopt;
+    rank = std::max(rank, *required);
+  }
+  return rank;
+}
+
+// `getitem` against a call result: only tighten when *every* use of the
+// call result is a structural-constant subscript. Any escape (passing the
+// tuple by value, dynamic index, etc.) keeps the conservative cap-sized
+// fallback intact.
+static void noteCallSubscriptLaunchGeoRank(
+    hc_front::CallOp call,
+    llvm::function_ref<void(Value, StringRef, unsigned)> record) {
+  if (!call.getArguments().empty())
+    return;
+  auto attr =
+      dyn_cast_if_present<hc_front::AttrOp>(call.getCallee().getDefiningOp());
+  if (!attr)
+    return;
+  StringRef method = attr.getName();
+  std::optional<LaunchGeoMethodInfo> methodInfo =
+      classifyLaunchGeoMethod(method);
+  if (!methodInfo || methodInfo->isScalar())
+    return;
+  std::optional<unsigned> rank = allSubscriptUsesRank(call.getResult());
+  if (!rank || *rank == 0)
+    return;
+  record(call.getResult(), method, *rank);
+}
+
+} // namespace
+
 void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
   auto record = [&](Value source, StringRef method, unsigned rank) {
     unsigned &current = staticLaunchGeoRanks[source][method];
@@ -3325,53 +3953,11 @@ void Lowerer::collectStaticLaunchGeometryRanks(Operation *frontOp) {
   frontOp->walk([&](hc_front::SubscriptOp op) {
     if (op.getIndices().size() != 1)
       return;
-    Value index = op.getIndices().front();
-
-    if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
-            op.getBase().getDefiningOp())) {
-      StringRef method = attr.getName();
-      std::optional<LaunchGeoMethodInfo> methodInfo =
-          classifyLaunchGeoMethod(method);
-      if (!methodInfo || methodInfo->isScalar())
-        return;
-      std::optional<unsigned> rank = staticLaunchGeoRequiredRank(index);
-      if (!rank)
-        return;
-      record(attr.getBase(), method, *rank);
-      return;
-    }
-
-    auto call =
-        dyn_cast_if_present<hc_front::CallOp>(op.getBase().getDefiningOp());
-    if (!call || !call.getArguments().empty())
-      return;
-    auto attr =
-        dyn_cast_if_present<hc_front::AttrOp>(call.getCallee().getDefiningOp());
-    if (!attr)
-      return;
-    StringRef method = attr.getName();
-    std::optional<LaunchGeoMethodInfo> methodInfo =
-        classifyLaunchGeoMethod(method);
-    if (!methodInfo || methodInfo->isScalar())
-      return;
-
-    // A call-style launch-geo tuple can also escape as a first-class value. In
-    // that case preserve the conservative cap-sized fallback; only pure static
-    // getitem use-sites get the tightened rank.
-    unsigned rank = 0;
-    for (Operation *user : call.getResult().getUsers()) {
-      auto subscript = dyn_cast<hc_front::SubscriptOp>(user);
-      if (!subscript || subscript.getBase() != call.getResult() ||
-          subscript.getIndices().size() != 1)
-        return;
-      std::optional<unsigned> required =
-          staticLaunchGeoRequiredRank(subscript.getIndices().front());
-      if (!required)
-        return;
-      rank = std::max(rank, *required);
-    }
-    if (rank != 0)
-      record(call.getResult(), method, rank);
+    Operation *baseOp = op.getBase().getDefiningOp();
+    if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(baseOp))
+      return noteAttrSubscriptLaunchGeoRank(op, attr, record);
+    if (auto call = dyn_cast_if_present<hc_front::CallOp>(baseOp))
+      noteCallSubscriptLaunchGeoRank(call, record);
   });
 }
 
@@ -3445,139 +4031,195 @@ Lowerer::getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
   llvm_unreachable("unhandled launch-geometry rank domain");
 }
 
+// Emit a per-axis launch-geometry op (group id, local id, etc.) and
+// pack its multi-result expansion into an `hc.tuple` so the caller
+// just has a single SSA carrier to subscript / store.
+template <typename OpT>
+static Value emitLaunchGeoMultiResult(OpBuilder &builder, StringRef prefix,
+                                      Value context, Location loc,
+                                      unsigned rank) {
+  FailureOr<SmallVector<Type>> resTypes =
+      launchGeometryIdxTypes(builder.getContext(), loc, prefix, rank);
+  if (failed(resTypes))
+    return {};
+  auto op = OpT::create(builder, loc, *resTypes, context);
+  auto tupleType = TupleType::get(builder.getContext(), op.getResultTypes());
+  return HCTupleOp::create(builder, loc, tupleType, op.getResults());
+}
+
+// Single-result launch-geometry op (group_size, wave_size).
+template <typename OpT>
+static Value emitLaunchGeoScalarResult(OpBuilder &builder, StringRef prefix,
+                                       Value context, Location loc) {
+  FailureOr<Type> resultType =
+      launchGeometryIdxType(builder.getContext(), loc, prefix, 0);
+  if (failed(resultType))
+    return {};
+  auto op = OpT::create(builder, loc, *resultType, context);
+  return op.getResult(0);
+}
+
 Value Lowerer::tryEmitLaunchGeo(const LaunchGeoMethodInfo &method,
                                 Value context, Location loc,
                                 std::optional<unsigned> requiredRank) {
-  auto emitMulti = [&](auto tag, StringRef prefix) -> Value {
-    using OpT = decltype(tag);
-    unsigned n = getLaunchGeometryRank(method, context.getType(), requiredRank);
-    FailureOr<SmallVector<Type>> resTypes =
-        launchGeometryIdxTypes(builder.getContext(), loc, prefix, n);
-    if (failed(resTypes))
-      return {};
-    auto op = OpT::create(builder, loc, *resTypes, context);
-    auto tupleType = TupleType::get(builder.getContext(), op.getResultTypes());
-    return HCTupleOp::create(builder, loc, tupleType, op.getResults());
-  };
-  auto emitScalar = [&](auto tag, StringRef prefix) -> Value {
-    using OpT = decltype(tag);
-    FailureOr<Type> resultType =
-        launchGeometryIdxType(builder.getContext(), loc, prefix, 0);
-    if (failed(resultType))
-      return {};
-    auto op = OpT::create(builder, loc, *resultType, context);
-    return op.getResult(0);
-  };
+  StringRef prefix = method.symbolPrefix;
+  unsigned rank =
+      getLaunchGeometryRank(method, context.getType(), requiredRank);
   switch (method.method) {
   case LaunchGeoMethod::GroupId:
-    return emitMulti(HCGroupIdOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCGroupIdOp>(builder, prefix, context, loc,
+                                                 rank);
   case LaunchGeoMethod::LocalId:
-    return emitMulti(HCLocalIdOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCLocalIdOp>(builder, prefix, context, loc,
+                                                 rank);
   case LaunchGeoMethod::SubgroupId:
-    return emitMulti(HCSubgroupIdOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCSubgroupIdOp>(builder, prefix, context,
+                                                    loc, rank);
   case LaunchGeoMethod::GroupShape:
-    return emitMulti(HCGroupShapeOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCGroupShapeOp>(builder, prefix, context,
+                                                    loc, rank);
   case LaunchGeoMethod::WorkOffset:
-    return emitMulti(HCWorkOffsetOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCWorkOffsetOp>(builder, prefix, context,
+                                                    loc, rank);
   case LaunchGeoMethod::WorkShape:
-    return emitMulti(HCWorkShapeOp{}, method.symbolPrefix);
+    return emitLaunchGeoMultiResult<HCWorkShapeOp>(builder, prefix, context,
+                                                   loc, rank);
   case LaunchGeoMethod::GroupSize:
-    return emitScalar(HCGroupSizeOp{}, method.symbolPrefix);
+    return emitLaunchGeoScalarResult<HCGroupSizeOp>(builder, prefix, context,
+                                                    loc);
   case LaunchGeoMethod::WaveSize:
-    return emitScalar(HCWaveSizeOp{}, method.symbolPrefix);
+    return emitLaunchGeoScalarResult<HCWaveSizeOp>(builder, prefix, context,
+                                                   loc);
   }
   llvm_unreachable("unhandled launch-geometry method");
 }
 
-Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
-  // DSL-method `[]` patterns fold into dedicated hc ops when the base is an
-  // `hc_front.attr`:
-  //   x.shape[N]      -> hc.buffer_dim
-  //   group.group_id[N] / local_id[N] / ... -> hc.getitem(hc.tuple(...), N)
-  // Property-style (no `()`) access to launch geometry lands here. The
-  // call-style form (`wi.local_id()[N]`) is handled by the sibling branch below
-  // so the default type-inference schedule never sees a launch-geo value as a
-  // fake buffer_view base.
-  if (auto attr =
-          dyn_cast_if_present<hc_front::AttrOp>(op.getBase().getDefiningOp())) {
-    // Read the method name off the attr op (`$name`) rather than
-    // `ref.method`: a `.shape[N]` or `.local_id[N]` chained off a
-    // subscript/call result reaches here without a `ref` dict on the
-    // attr, but the spelling on the op is enough — the branches below
-    // only fold on exact method strings (`"shape"` and the launch-geo
-    // set). Unknown spellings still fall through to the generic
-    // `hc.buffer_view` path.
-    StringRef method = attr.getName();
-    if (op.getIndices().size() == 1) {
-      FailureOr<Value> idxValOr = lowerValueOperand(
-          op.getIndices().front(), op.getOperation(), "subscript index");
-      if (failed(idxValOr))
-        return nullptr;
-      FailureOr<Value> baseValOr = lowerValueOperand(
-          attr.getBase(), op.getOperation(), "subscript base");
-      if (failed(baseValOr))
-        return nullptr;
-      Value idxVal = *idxValOr;
-      Value baseVal = *baseValOr;
-      auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
-      auto ax =
-          constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
-      if (baseVal && ax) {
-        int64_t axVal = ax.getInt();
-        if (method == "shape") {
-          // `hc.buffer_dim` axis is a buffer rank index, not a launch grid
-          // rank — no small-integer cap applies. Forward the driver value;
-          // bounds checking lives on the dialect verifier.
-          return HCBufferDimOp::create(
-              builder, op.getLoc(), undef, baseVal,
-              IntegerAttr::get(IntegerType::get(op.getContext(), 64), axVal));
-        }
-      }
-      std::optional<LaunchGeoMethodInfo> methodInfo =
-          classifyLaunchGeoMethod(method);
-      if (baseVal && idxVal && methodInfo) {
-        if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
-          return nullptr;
-        std::optional<unsigned> requiredRank =
-            getStaticLaunchGeometryRank(attr.getBase(), method);
-        if (Value v = tryEmitLaunchGeo(*methodInfo, baseVal, op.getLoc(),
-                                       requiredRank))
-          return HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal);
-      }
-    }
-  }
-  if (auto call =
-          dyn_cast_if_present<hc_front::CallOp>(op.getBase().getDefiningOp())) {
-    if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(
-            call.getCallee().getDefiningOp())) {
-      StringRef method = attr.getName();
-      std::optional<LaunchGeoMethodInfo> methodInfo =
-          classifyLaunchGeoMethod(method);
-      if (methodInfo && call.getArguments().empty() &&
-          op.getIndices().size() == 1) {
-        FailureOr<Value> idxValOr = lowerValueOperand(
-            op.getIndices().front(), op.getOperation(), "subscript index");
-        if (failed(idxValOr))
-          return nullptr;
-        FailureOr<Value> launchGeoOr = lowerValueOperand(
-            call.getResult(), op.getOperation(), "launch-geo call result");
-        if (failed(launchGeoOr))
-          return nullptr;
-        Value idxVal = *idxValOr;
-        Value launchGeo = *launchGeoOr;
-        auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
-        auto ax =
-            constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
-        if (launchGeo && idxVal) {
-          if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
-            return nullptr;
-          return HCGetItemOp::create(builder, op.getLoc(), undef, launchGeo,
-                                     idxVal);
-        }
-      }
-    }
-  }
+// Walk an `HCConstOp` index back to its `IntegerAttr` payload, which is
+// what the launch-geo / buffer-dim folds need to validate the axis.
+static IntegerAttr indexConstantAxisAttr(Value idxVal) {
+  auto constOp = idxVal ? idxVal.getDefiningOp<HCConstOp>() : nullptr;
+  return constOp ? dyn_cast<IntegerAttr>(constOp.getValue()) : IntegerAttr{};
+}
 
+// `base.shape[constant]` -> `hc.buffer_dim`. No cap applies (this is a
+// buffer rank, not launch geometry). Returns nullptr unless the static
+// shape pattern actually matched.
+Value Lowerer::tryLowerShapeSubscript(hc_front::SubscriptOp op, Value baseVal,
+                                      IntegerAttr ax) {
+  if (!baseVal || !ax)
+    return nullptr;
+  return HCBufferDimOp::create(
+      builder, op.getLoc(), undef, baseVal,
+      IntegerAttr::get(IntegerType::get(op.getContext(), 64), ax.getInt()));
+}
+
+// Property-style launch-geo subscript fold:
+// `base.local_id[N]` -> `hc.getitem(launch-geo-tuple, N)`.
+//
+// Tri-state return: `failure()` means a diagnostic has already fired (the
+// caller must propagate, not fall through to the generic path);
+// `success(null Value)` means "didn't match, try the next pattern";
+// `success(non-null Value)` is the lowered result.
+FailureOr<Value>
+Lowerer::tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
+                                        hc_front::AttrOp attr, Value baseVal,
+                                        Value idxVal, IntegerAttr ax) {
+  std::optional<LaunchGeoMethodInfo> methodInfo =
+      classifyLaunchGeoMethod(attr.getName());
+  if (!baseVal || !idxVal || !methodInfo)
+    return Value();
+  if (failed(checkLaunchGeoSubscript(op, *methodInfo, ax)))
+    return failure();
+  std::optional<unsigned> requiredRank =
+      getStaticLaunchGeometryRank(attr.getBase(), attr.getName());
+  Value v = tryEmitLaunchGeo(*methodInfo, baseVal, op.getLoc(), requiredRank);
+  if (!v)
+    return Value();
+  return Value(HCGetItemOp::create(builder, op.getLoc(), undef, v, idxVal));
+}
+
+// Property-style `base.method[N]` folds. Tri-state: see
+// `tryLowerLaunchGeoAttrSubscript`.
+FailureOr<Value> Lowerer::tryLowerAttrSubscript(hc_front::SubscriptOp op,
+                                                hc_front::AttrOp attr) {
+  if (op.getIndices().size() != 1)
+    return Value();
+  FailureOr<Value> idxValOr = lowerValueOperand(
+      op.getIndices().front(), op.getOperation(), "subscript index");
+  if (failed(idxValOr))
+    return failure();
+  FailureOr<Value> baseValOr =
+      lowerValueOperand(attr.getBase(), op.getOperation(), "subscript base");
+  if (failed(baseValOr))
+    return failure();
+  Value idxVal = *idxValOr;
+  Value baseVal = *baseValOr;
+  IntegerAttr ax = indexConstantAxisAttr(idxVal);
+  if (attr.getName() == "shape")
+    return Value(tryLowerShapeSubscript(op, baseVal, ax));
+  return tryLowerLaunchGeoAttrSubscript(op, attr, baseVal, idxVal, ax);
+}
+
+// Call-style `base.method()[N]` fold for launch-geo getters: lowers the
+// call's result and indexes into it via `hc.getitem`. Tri-state: see
+// `tryLowerLaunchGeoAttrSubscript`.
+FailureOr<Value> Lowerer::tryLowerCallSubscript(hc_front::SubscriptOp op,
+                                                hc_front::CallOp call) {
+  auto attr =
+      dyn_cast_if_present<hc_front::AttrOp>(call.getCallee().getDefiningOp());
+  if (!attr)
+    return Value();
+  std::optional<LaunchGeoMethodInfo> methodInfo =
+      classifyLaunchGeoMethod(attr.getName());
+  if (!methodInfo || !call.getArguments().empty() ||
+      op.getIndices().size() != 1)
+    return Value();
+  FailureOr<Value> idxValOr = lowerValueOperand(
+      op.getIndices().front(), op.getOperation(), "subscript index");
+  if (failed(idxValOr))
+    return failure();
+  FailureOr<Value> launchGeoOr = lowerValueOperand(
+      call.getResult(), op.getOperation(), "launch-geo call result");
+  if (failed(launchGeoOr))
+    return failure();
+  Value idxVal = *idxValOr;
+  Value launchGeo = *launchGeoOr;
+  if (!launchGeo || !idxVal)
+    return Value();
+  if (failed(checkLaunchGeoSubscript(op, *methodInfo,
+                                     indexConstantAxisAttr(idxVal))))
+    return failure();
+  return Value(
+      HCGetItemOp::create(builder, op.getLoc(), undef, launchGeo, idxVal));
+}
+
+// Run the property/call subscript folds, returning tri-state-flattened
+// against `lowerSubscript`'s own `Value`-or-null contract: the first
+// element says "stop and use this Value (possibly null on diagnosed
+// failure)", the second is the lowered Value when present.
+Lowerer::SubscriptFoldResult
+Lowerer::trySubscriptFolds(hc_front::SubscriptOp op) {
+  Operation *baseOp = op.getBase().getDefiningOp();
+  if (auto attr = dyn_cast_if_present<hc_front::AttrOp>(baseOp)) {
+    FailureOr<Value> lowered = tryLowerAttrSubscript(op, attr);
+    if (failed(lowered))
+      return {true, nullptr};
+    if (*lowered)
+      return {true, *lowered};
+  }
+  if (auto call = dyn_cast_if_present<hc_front::CallOp>(baseOp)) {
+    FailureOr<Value> lowered = tryLowerCallSubscript(op, call);
+    if (failed(lowered))
+      return {true, nullptr};
+    if (*lowered)
+      return {true, *lowered};
+  }
+  return {false, nullptr};
+}
+
+// Generic `hc.buffer_view` lowering for subscripts that didn't match any
+// of the dedicated DSL-method folds above.
+Value Lowerer::lowerGenericSubscript(hc_front::SubscriptOp op) {
   FailureOr<Value> baseOr =
       lowerValueOperand(op.getBase(), op.getOperation(), "subscript base");
   if (failed(baseOr))
@@ -3603,6 +4245,21 @@ Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
   return HCBufferViewOp::create(builder, op.getLoc(), undef, base, indices);
 }
 
+Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {
+  // DSL-method `[]` patterns fold into dedicated hc ops when the base is an
+  // `hc_front.attr`:
+  //   x.shape[N]      -> hc.buffer_dim
+  //   group.group_id[N] / local_id[N] / ... -> hc.getitem(hc.tuple(...), N)
+  // Property-style (no `()`) access to launch geometry lands here. The
+  // call-style form (`wi.local_id()[N]`) is handled by `trySubscriptFolds`
+  // so the default type-inference schedule never sees a launch-geo value as
+  // a fake buffer_view base.
+  SubscriptFoldResult folded = trySubscriptFolds(op);
+  if (folded.consumed)
+    return folded.value;
+  return lowerGenericSubscript(op);
+}
+
 //===----------------------------------------------------------------------===//
 // Pass scaffolding. The pass runs on the enclosing `builtin.module`, walks
 // every `hc_front` top-level callable, and erases it once the parallel
@@ -3613,13 +4270,12 @@ struct ConvertHCFrontToHCPass
     : public hc_front::impl::ConvertHCFrontToHCBase<ConvertHCFrontToHCPass> {
   using ConvertHCFrontToHCBase::ConvertHCFrontToHCBase;
 
-  void runOnOperation() override {
-    Operation *root = getOperation();
-    MLIRContext *ctx = &getContext();
-    UndefType undef = UndefType::get(ctx);
-
-    SmallVector<Operation *> intrinsicOps;
-    SmallVector<Operation *> frontOps;
+  // Walk the module once and partition the top-level callables into
+  // intrinsics (lowered first; their signatures may be referenced by
+  // user kernels/funcs) and user-visible kernel/func ops.
+  static void collectFrontCallables(Operation *root,
+                                    SmallVectorImpl<Operation *> &intrinsicOps,
+                                    SmallVectorImpl<Operation *> &frontOps) {
     for (Region &region : root->getRegions())
       for (Block &block : region)
         for (Operation &op : block) {
@@ -3628,37 +4284,61 @@ struct ConvertHCFrontToHCPass
           else if (isa<hc_front::IntrinsicOp>(op))
             intrinsicOps.push_back(&op);
         }
+  }
 
-    LaunchMetadataAttrs defaultLaunchMetadata;
+  // When the module declares exactly one `hc_front.kernel`, its launch
+  // metadata is the default for any helper that doesn't carry its own
+  // (intrinsics, func helpers compiled in the same module). With more
+  // than one kernel there's no unique default — pass back an empty
+  // attrs bundle.
+  static LaunchMetadataAttrs
+  pickDefaultLaunchMetadata(ArrayRef<Operation *> frontOps) {
     Operation *singleKernel = nullptr;
     for (Operation *op : frontOps) {
       if (!isa<hc_front::KernelOp>(op))
         continue;
-      if (singleKernel) {
-        singleKernel = nullptr;
-        break;
-      }
+      if (singleKernel)
+        return {};
       singleKernel = op;
     }
-    if (singleKernel)
-      defaultLaunchMetadata = launchMetadataAttrsFrom(singleKernel);
+    if (!singleKernel)
+      return {};
+    return launchMetadataAttrsFrom(singleKernel);
+  }
 
-    OpBuilder builder(ctx);
-    for (Operation *op : intrinsicOps) {
+  // Lower each callable in `ops` via a fresh `Lowerer`, erasing the
+  // source op on success and signalling pass failure on the first
+  // error. Used for both intrinsic and user-callable batches.
+  LogicalResult lowerCallableBatch(OpBuilder &builder, Type undef,
+                                   LaunchMetadataAttrs defaultLaunchMetadata,
+                                   ArrayRef<Operation *> ops) {
+    for (Operation *op : ops) {
       Lowerer lowerer(builder, undef, defaultLaunchMetadata);
-      if (failed(lowerer.lowerCallable(op))) {
-        signalPassFailure();
-        return;
-      }
+      if (failed(lowerer.lowerCallable(op)))
+        return failure();
       op->erase();
     }
-    for (Operation *op : frontOps) {
-      Lowerer lowerer(builder, undef, defaultLaunchMetadata);
-      if (failed(lowerer.lowerCallable(op))) {
-        signalPassFailure();
-        return;
-      }
-      op->erase();
+    return success();
+  }
+
+  void runOnOperation() override {
+    Operation *root = getOperation();
+    MLIRContext *ctx = &getContext();
+    UndefType undef = UndefType::get(ctx);
+
+    SmallVector<Operation *> intrinsicOps;
+    SmallVector<Operation *> frontOps;
+    collectFrontCallables(root, intrinsicOps, frontOps);
+    LaunchMetadataAttrs defaultLaunchMetadata =
+        pickDefaultLaunchMetadata(frontOps);
+
+    OpBuilder builder(ctx);
+    if (failed(lowerCallableBatch(builder, undef, defaultLaunchMetadata,
+                                  intrinsicOps)) ||
+        failed(lowerCallableBatch(builder, undef, defaultLaunchMetadata,
+                                  frontOps))) {
+      signalPassFailure();
+      return;
     }
   }
 };

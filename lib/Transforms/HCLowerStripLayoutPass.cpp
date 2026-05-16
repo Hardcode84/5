@@ -84,13 +84,17 @@ static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
 // Synthesise a zero-init of the strip's result type. The verifier
 // enforces `result.layout == null` (the whole point of the op is to
 // drop the layout), so the nullary allocator's optional layout attr
-// is left absent. Flavor preserved: `hc.vzeros` for vector /
-// bare_vector results, `hc.zeros` for tensor / bare_tensor.
+// is left absent. Flavor preserved: `hc.vzeros` for bare_vector
+// results, `hc.zeros` for bare_tensor. Semantic carriers are
+// rejected by the contract gate in `hc-decompose-shaped-values` and
+// never reach this pass.
 static Value emitBareInit(OpBuilder &builder, Location loc, Type resultTy,
                           Value shape) {
-  if (isa<mlir::hc::VectorType, mlir::hc::BareVectorType>(resultTy))
+  if (isa<mlir::hc::BareVectorType>(resultTy))
     return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                               /*layout=*/LayoutAttr{});
+  assert(isa<mlir::hc::BareTensorType>(resultTy) &&
+         "strip_layout result type must be a bare shaped carrier");
   return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                            /*layout=*/LayoutAttr{});
 }

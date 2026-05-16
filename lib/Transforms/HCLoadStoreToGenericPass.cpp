@@ -229,14 +229,17 @@ composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
 
 // Synthesise a fresh value-typed init of the given shape. The body
 // of an all-parallel `hc.generic` never reads its outs carry, so
-// any zero-cost initialisation is fine — `hc.zeros` for tensors,
-// `hc.vzeros` for vectors. Result type drives the choice; the verifier
-// only enforces workgroup scope on the tensor variants.
+// any zero-cost initialisation is fine — `hc.zeros` for bare tensors,
+// `hc.vzeros` for bare vectors. Result type drives the choice.
+// Semantic carriers are rejected by the contract gate in
+// `hc-decompose-shaped-values` and never reach this pass.
 static Value emitValueInit(OpBuilder &builder, Location loc, Type resultTy,
                            Value shape) {
-  if (isa<mlir::hc::VectorType, BareVectorType>(resultTy))
+  if (isa<BareVectorType>(resultTy))
     return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                               /*layout=*/LayoutAttr{});
+  assert(isa<BareTensorType>(resultTy) &&
+         "load/store-to-generic result must be a bare shaped carrier");
   return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                            /*layout=*/LayoutAttr{});
 }

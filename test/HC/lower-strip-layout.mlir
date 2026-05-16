@@ -10,22 +10,19 @@
 //
 // RUN: hc-opt --hc-lower-strip-layout %s --split-input-file | FileCheck %s
 
-// Non-injective source on a (semantic) vector — the canonical
-// per-lane WMMA-fragment shape the bead motivates: layout's
-// `storage_size > product(shape)`, post-projection vector still
-// has flavor `vector` so the K-tile loop's iter init / result pair
-// stays consistent against the intrinsic's `vector` return.
+// Non-injective source on a bare vector — the canonical per-lane
+// WMMA-fragment shape: layout's `storage_size > product(shape)`.
 // Rewrite emits an `hc.vzeros` sized to the layout-less result
-// (flavor preserved) + an `hc.generic` whose iter set spans the
-// result shape, ins/outs carry identity per-axis offsets, body
-// forwards the source element. Flatten's `composeAccessOffsetExpr`
-// later substitutes the iter syms into the source layout's
-// `offset` at `index_syms[k]`, producing the gather offset post-1D.
-// CHECK-LABEL: func.func @strip_non_injective_vector
+// + an `hc.generic` whose iter set spans the result shape, ins/outs
+// carry identity per-axis offsets, body forwards the source element.
+// Flatten's `composeAccessOffsetExpr` later substitutes the iter syms
+// into the source layout's `offset` at `index_syms[k]`, producing the
+// gather offset post-1D.
+// CHECK-LABEL: func.func @strip_non_injective
 // CHECK-DAG: %[[K:.+]] = hc.idx_apply () : () -> !hc.idx<"K">
 // CHECK: %[[SH:.+]] = hc.tuple(%[[K]])
 // CHECK: %[[FILL:.+]] = hc.vzeros shape %[[SH]]
-// CHECK-SAME: -> !hc.vector<f32, ["K"]>
+// CHECK-SAME: -> !hc.bare_vector<f32, ["K"]>
 // CHECK: %[[OUT:.+]] = hc.generic
 // CHECK-SAME: iter (parallel i_0 = %[[K]] : !hc.idx<"K">)
 // CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">]
@@ -33,32 +30,7 @@
 // CHECK: ^bb0(%[[BV:.+]]: f32, %{{.+}}: f32):
 // CHECK:   hc.yield %[[BV]] : f32
 // CHECK-NOT: hc.strip_layout
-func.func @strip_non_injective_vector(
-    %src: !hc.vector<f32, ["K"],
-      #hc.layout<shape_syms = ["d0"], index_syms = ["i0"],
-                 params = {}, storage_size = #hc.expr<"256">,
-                 offset = #hc.expr<"i0 * 16">>>)
-    -> !hc.vector<f32, ["K"]> {
-  %out = hc.strip_layout %src
-      : !hc.vector<f32, ["K"],
-          #hc.layout<shape_syms = ["d0"], index_syms = ["i0"],
-                     params = {}, storage_size = #hc.expr<"256">,
-                     offset = #hc.expr<"i0 * 16">>>
-      -> !hc.vector<f32, ["K"]>
-  return %out : !hc.vector<f32, ["K"]>
-}
-
-// -----
-
-// Same shape on a `bare_vector` — confirms the lowering preserves
-// the bare flavor too (the strip op is flavor-agnostic; only the
-// layout slot changes).
-// CHECK-LABEL: func.func @strip_non_injective_bare
-// CHECK: hc.vzeros shape
-// CHECK-SAME: -> !hc.bare_vector<f32, ["K"]>
-// CHECK: hc.generic
-// CHECK-NOT: hc.strip_layout
-func.func @strip_non_injective_bare(
+func.func @strip_non_injective(
     %src: !hc.bare_vector<f32, ["K"],
       #hc.layout<shape_syms = ["d0"], index_syms = ["i0"],
                  params = {}, storage_size = #hc.expr<"256">,

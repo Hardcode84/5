@@ -167,14 +167,16 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc,
   return HCTupleOp::create(builder, loc, tupleTy, dims);
 }
 
-// `hc.zeros` for tensor / bare_tensor results, `hc.vzeros` for
-// vector / bare_vector. Other shaped flavours don't appear at this
-// pre-flatten stage.
+// `hc.zeros` for bare_tensor results, `hc.vzeros` for bare_vector.
+// Semantic carriers are rejected by the contract gate in
+// `hc-decompose-shaped-values` and never reach this pass.
 static Value emitInit(OpBuilder &builder, Location loc, Type resultTy,
                       Value shape) {
-  if (isa<mlir::hc::VectorType, BareVectorType>(resultTy))
+  if (isa<BareVectorType>(resultTy))
     return HCVZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                               /*layout=*/LayoutAttr{});
+  assert(isa<BareTensorType>(resultTy) &&
+         "elementwise-to-generic result must be a bare shaped carrier");
   return HCZerosOp::create(builder, loc, resultTy, shape, TypeAttr(),
                            /*layout=*/LayoutAttr{});
 }

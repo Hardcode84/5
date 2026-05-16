@@ -2533,21 +2533,35 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
   LogicalResult
   matchAndRewrite(HCGenericOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Only the kernel-arg buffer operands transform here. Other HC
-    // operand slots (`!hc.bare_vector`, `!hc.bare_tensor`,
-    // `!hc.ptr<workgroup, T>`, `!hc.undef`) must stay in their HC form
-    // because `HCGenericOp`'s verifier rejects converted vector /
-    // memref types (`HC_GenericOperandType` is HC-only). We therefore
-    // start from the op's original operand values (which are guaranteed
-    // HC-typed) and only swap the buffer slots for their resolved ptr.
-    // bare_tensor operands backed by an LDS allocation (the
-    // `ptr<workgroup> -> bare_tensor` boundary UCC the shaped-constant
-    // lowering above plants) are NOT swapped here — that UCC only
-    // exists AFTER the producer's conversion has run, and the dialect
-    // conversion driver doesn't re-invoke dynamic legality on already-
-    // scanned ops when their operands change.
-    // `resolveWorkgroupPtrBareTensorIns` does the swap as a post-pass walk over
-    // the converted IR.
+    // Two HC-to-HC retypes happen here; the verifier on the other
+    // side stays happy because `HC_GenericOperandType` admits both
+    // `!hc.ptr` (global ABI ptr, workgroup LDS ptr) and `!hc.undef`.
+    // bare_vector deliberately doesn't appear in either retype — the
+    // global converter maps it to builtin `vector<NxT>`, which the
+    // generic-op verifier rejects, so we keep bare_vector operands at
+    // the original SSA and let `hc-lower-generic` consume them with
+    // its own value-carrier path.
+    //
+    //   * Kernel-arg buffers resolve to their `!hc.ptr<global, T>` via
+    //     the bundle UCC chain `hc-lower-kernels-to-gpu-launch`
+    //     planted. The adaptor doesn't help here because the bundle is
+    //     a multi-output UCC — `resolveKernelArg` walks it explicitly.
+    //
+    //   * bare_tensor ins swap to the `!hc.ptr<workgroup, T>` SSA the
+    //     adaptor hands back. This is the boundary `hc.zeros` (and
+    //     friends) emit when their bare_tensor result gets lowered to
+    //     an LDS allocation: the global converter remembers the
+    //     replacement, so `adaptor.getIns()[k]` is the ptr directly
+    //     (no UCC to peek through). The legality predicate keys this
+    //     off `converter.convertType(operandType)` — a pure type-
+    //     level check, no SSA chain inspection.
+    //
+    // Outs is left in `bare_tensor` form. Swapping outs would
+    // collapse the value-typed SSA result the op contracts to
+    // produce (`ptr` outs contribute no SSA result; the verifier
+    // matches result count against value-typed outs count). The
+    // outs-side LDS swap needs its own rewrite that also rewires the
+    // result chain — a separate change.
     //
     // Iter bounds, on the other hand, do accept the index conversion
     // because `HC_ValueType` covers both `!hc.idx<>` and `index`; pull
@@ -2555,8 +2569,9 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
     // chain in one shot.
     SmallVector<Value> newIns(op.getIns());
     SmallVector<Value> newOuts(op.getOuts());
+    ValueRange adaptedIns = adaptor.getIns();
     bool changed = false;
-    auto resolve = [&](Value &v) {
+    auto resolveBuffer = [&](Value &v) {
       if (!isa<BufferType>(v.getType()))
         return;
       auto info = resolveKernelArg(v);
@@ -2566,9 +2581,18 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
       changed = true;
     };
     for (Value &v : newIns)
-      resolve(v);
+      resolveBuffer(v);
     for (Value &v : newOuts)
-      resolve(v);
+      resolveBuffer(v);
+    for (auto [idx, v] : llvm::enumerate(newIns)) {
+      if (!isa<BareTensorType>(v.getType()))
+        continue;
+      Value adapted = adaptedIns[idx];
+      if (!isa<PtrType>(adapted.getType()))
+        continue;
+      newIns[idx] = adapted;
+      changed = true;
+    }
     if (!changed)
       return failure();
 
@@ -2727,8 +2751,20 @@ static bool isHCGenericOperandLegal(Value v) {
 }
 
 static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
-  return llvm::all_of(op.getIns(), isHCGenericOperandLegal) &&
-         llvm::all_of(op.getOuts(), isHCGenericOperandLegal);
+  if (!llvm::all_of(op.getIns(), isHCGenericOperandLegal))
+    return false;
+  if (!llvm::all_of(op.getOuts(), isHCGenericOperandLegal))
+    return false;
+  // bare_tensor ins lowers to `!hc.ptr<workgroup, T>` via
+  // `AdaptGenericOp`. Type-level check: the launch-body type converter
+  // maps bare_tensor unconditionally; the adaptor will hand back the
+  // matching ptr SSA the producer's conversion already planted. Outs
+  // intentionally not checked here — we don't swap outs (see the
+  // pattern comment).
+  for (Value v : op.getIns())
+    if (isa<BareTensorType>(v.getType()))
+      return false;
+  return true;
 }
 
 // `hc.intrinsic` is legal iff its signature already matches the
@@ -2846,58 +2882,6 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   return target;
 }
 
-// `!hc.bare_tensor` is a storage-class-free tile abstraction; the
-// launch-body type converter maps every bare_tensor to
-// `!hc.ptr<workgroup, T>` regardless of how downstream consumers use
-// the tile. That's a deliberate trade-off — analysing per-tile usage
-// (per-lane vs cross-lane) is its own pass — but it leaves a boundary
-// for the dialect-conversion driver: producers (`hc.zeros`, ...) get
-// rewritten to LDS, surviving consumers (`hc.generic`,
-// `hc.intrinsic`, ...) keep their `bare_tensor` slot type, and the
-// driver wallpapers the type mismatch with a `ptr<workgroup, T> ->
-// bare_tensor` UCC at each consumer edge.
-//
-// `hc.generic`'s operand slot is already polymorphic enough to take
-// `ptr<workgroup, T>` directly (see HC_GenericOperandType in the ODS
-// and the existing per-lane ptr-typed access path in
-// `hc-lower-generic`). Short-circuit the boundary UCC on `hc.generic`
-// ins here so that consumer reads through the ptr directly — saves
-// the per-lane downstream code from caring whether a `bare_tensor`
-// ins is a UCC-bridged ptr or a real value carrier. Other consumers
-// (intrinsic boundaries, where `convertIntrinsicBoundaryType` deliberately
-// keeps `bare_tensor` typed) are untouched: the UCC there is load-bearing
-// and the recipe code on the far side reads it as a `bare_tensor`.
-//
-// Two things are deliberately NOT done here:
-//
-// `outs` stays in `bare_tensor` form. Swapping outs would collapse
-// the value-typed SSA result the op contracts to produce — the
-// verifier matches result count against value-typed outs count, and
-// ptr/buffer outs contribute no SSA result. Result-chain rewiring on
-// the outs side is a separate problem (and a separate bead, see the
-// session reply).
-//
-// Pushing the swap *into* the dialect-conversion machinery (an
-// AdaptGenericOp-style pattern keyed on a per-pattern type converter)
-// doesn't compose: the dynamic-legality predicate sees the
-// pre-replacement operand SSA (the conversion driver tracks
-// remappings out of band), so the predicate can't observe "this
-// `bare_tensor` ins's producer just became a ptr" and there's no
-// signal to fire the pattern. Doing the swap post-conversion is the
-// honest place for this — same shape as
-// `reconcileUnrealizedCasts` in upstream MLIR, just on the operand
-// edge instead of the cast chain.
-static void reconcileWorkgroupTileBoundary(Operation *root) {
-  root->walk([](HCGenericOp op) {
-    for (OpOperand &use : op.getInsMutable()) {
-      if (!isa<BareTensorType>(use.get().getType()))
-        continue;
-      if (Value ptr = sourcePtr(use.get()))
-        use.set(ptr);
-    }
-  });
-}
-
 struct HCLowerLaunchBodyPass
     : public hc::impl::HCLowerLaunchBodyBase<HCLowerLaunchBodyPass> {
   using Base::Base;
@@ -2911,8 +2895,7 @@ struct HCLowerLaunchBodyPass
     ConversionTarget target = makeLaunchBodyLoweringTarget(ctx, converter);
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
-      return signalPassFailure();
-    reconcileWorkgroupTileBoundary(getOperation());
+      signalPassFailure();
   }
 };
 

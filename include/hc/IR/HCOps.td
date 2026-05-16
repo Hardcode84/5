@@ -1451,9 +1451,14 @@ def HCReduceOp : HC_Op<"reduce",
     wrong spellings fail at parse rather than verify. `$keepdims` matches the
     NumPy surface and is optional with default `false`. `$axis` must be
     non-negative and, when `$value` has a concrete rank, less than that rank.
+
+    Operand accepts the bare form too — `hc-decompose-shaped-values`
+    plants `hc.reduce` on the data half of a (data, mask) split, and
+    `hc-elementwise-to-generic` lowers either flavour through the
+    same `hc.generic` reduction nest.
   }];
   let arguments = (ins
-    HC_ShapedValueType:$value,
+    HC_DecomposableShapedValueType:$value,
     HC_ReduceKindAttr:$kind,
     I64Attr:$axis,
     DefaultValuedAttr<BoolAttr, "false">:$keepdims

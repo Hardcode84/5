@@ -297,12 +297,15 @@ Generic ops use an `HC_ValueType` constraint defined as an `AnyOf<[…]>` over
 every type listed above. Ops with clear semantic categories tighten further:
 
 * `HC_NumericValueType` — arithmetic operands (`hc.add`, `hc.sub`, `hc.mul`,
-  `hc.div`, `hc.mod`, `hc.neg`) and `hc.cmp.*` inputs; excludes `!hc.pred`,
-  `!hc.slice`, `!hc.buffer`
+  `hc.div`, `hc.mod`, `hc.neg`) and `hc.cmp.*` inputs; admits semantic and
+  bare shaped carriers so `hc-decompose-shaped-values` can plant arith on
+  the data half of a (data, mask) split; excludes `!hc.pred`, `!hc.slice`,
+  `!hc.buffer`
 * `HC_ShapedValueType` — ops that only make sense on semantic tensors/vectors
-  (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`)
+  (`hc.matmul`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`)
 * `HC_DecomposableShapedValueType` — semantic or bare shaped values at
-  decomposition-aware boundaries such as `hc.store`'s `$source`
+  decomposition-aware boundaries such as `hc.store`'s `$source` and
+  `hc.reduce`'s `$value`
 * `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.load`;
   excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either

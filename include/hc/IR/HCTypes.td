@@ -341,12 +341,17 @@ def HC_TupleValueType : AnyTypeOf<[
 
 // Numeric/symbolic subset. Excludes `!hc.pred`, `!hc.slice`, `!hc.buffer` —
 // types that have no business flowing through arithmetic ops. `!hc.undef`
-// is kept for pre-inference compatibility.
+// is kept for pre-inference compatibility. Bare carriers ride alongside
+// their semantic counterparts so `hc-decompose-shaped-values` can plant
+// arith on the data half of a (data, mask) split before the *to-generic
+// rewriters funnel the surface op into `hc.generic` form.
 def HC_NumericValueType : AnyTypeOf<[
   HC_UndefType,
   HC_IdxType,
   HC_TensorType,
   HC_VectorType,
+  HC_BareTensorType,
+  HC_BareVectorType,
   AnyInteger,
   AnyFloat,
   Index,

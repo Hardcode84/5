@@ -1930,6 +1930,14 @@ static Type rebuildReduceResultType(Type valueType, Type elem,
     return mlir::hc::TensorType::get(ctx, elem, outShape, LayoutAttr{});
   if (isa<mlir::hc::VectorType>(valueType))
     return mlir::hc::VectorType::get(ctx, elem, outShape, LayoutAttr{});
+  // Bare carriers reach `hc.reduce` post `hc-decompose-shaped-values`:
+  // the data half of a (data, mask) split rides the bare carrier and
+  // still needs a result type with the reduced shape so downstream
+  // `hc-elementwise-to-generic` sees a well-typed value.
+  if (isa<mlir::hc::BareTensorType>(valueType))
+    return mlir::hc::BareTensorType::get(ctx, elem, outShape, LayoutAttr{});
+  if (isa<mlir::hc::BareVectorType>(valueType))
+    return mlir::hc::BareVectorType::get(ctx, elem, outShape, LayoutAttr{});
   return {};
 }
 

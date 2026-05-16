@@ -988,6 +988,161 @@ struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
   }
 };
 
+// Elementwise binary arith (`hc.add` / `hc.sub` / `hc.mul` / `hc.div`
+// / `hc.mod`) on semantic shaped operands. Each side arrives as a
+// (data, mask) pair from the OneToN adaptor; the data half is the
+// op cloned on the data values, and validity is the per-operand
+// `hc.and`. Broadcasting on the data side is the op's standard
+// `inferShapedBinaryResult` outcome; we mirror it on the mask
+// channel by handing `hc.and` the matching `bareMaskType` of the
+// original op's broadcast result, so downstream
+// `hc-elementwise-to-generic` sees the same broadcast shape on
+// both halves.
+template <typename OpT>
+struct ConvertElementwiseBinaryShapedOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> lhs =
+        expectSplit(adaptor.getLhs(), op, "elementwise binary lhs");
+    FailureOr<std::pair<Value, Value>> rhs =
+        expectSplit(adaptor.getRhs(), op, "elementwise binary rhs");
+    if (failed(lhs) || failed(rhs))
+      return failure();
+
+    auto data =
+        OpT::create(rewriter, op.getLoc(), bareDataType(originalResultType),
+                    lhs->first, rhs->first);
+    auto mask =
+        HCAndOp::create(rewriter, op.getLoc(), bareMaskType(originalResultType),
+                        lhs->second, rhs->second);
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getResult());
+    return success();
+  }
+};
+
+// Elementwise unary arith (`hc.neg` / `hc.not`) on semantic shaped
+// operands. Data half clones the op on the data value; validity
+// passes through unchanged — unary arithmetic doesn't gate lanes
+// any further than its input already did.
+template <typename OpT>
+struct ConvertElementwiseUnaryShapedOp : public OpConversionPattern<OpT> {
+  using Base = OpConversionPattern<OpT>;
+  using Base::Base;
+  using OneToNOpAdaptor = typename Base::OneToNOpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpT op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getValue(), op, "elementwise unary value");
+    if (failed(source))
+      return failure();
+
+    auto data = OpT::create(rewriter, op.getLoc(),
+                            bareDataType(originalResultType), source->first);
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 source->second);
+    return success();
+  }
+};
+
+// `hc.builtin_call` (numpy ufunc surface) is elementwise homogeneous
+// by the dispatch invariant (see the op's td description). For the
+// single-arg case (numpy.sqrt / np.exp / ...) the input mask passes
+// through unchanged; for the multi-arg case we AND the per-operand
+// masks the way binary arithmetic does so downstream lowering sees
+// the same validity surface regardless of arity.
+struct ConvertBuiltinCallShapedOp
+    : public OpConversionPattern<HCBuiltinCallOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCBuiltinCallOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    SmallVector<Value> dataArgs;
+    SmallVector<Value> maskArgs;
+    dataArgs.reserve(adaptor.getArgs().size());
+    maskArgs.reserve(adaptor.getArgs().size());
+    for (auto [index, group] : llvm::enumerate(adaptor.getArgs())) {
+      FailureOr<std::pair<Value, Value>> split = expectSplit(
+          group, op, Twine("builtin_call arg #").concat(Twine(index)).str());
+      if (failed(split))
+        return failure();
+      dataArgs.push_back(split->first);
+      maskArgs.push_back(split->second);
+    }
+
+    auto data = HCBuiltinCallOp::create(rewriter, op.getLoc(),
+                                        bareDataType(originalResultType),
+                                        op.getNameAttr(), dataArgs);
+
+    Value maskValue = maskArgs.front();
+    for (Value m : ArrayRef<Value>(maskArgs).drop_front()) {
+      maskValue =
+          HCAndOp::create(rewriter, op.getLoc(),
+                          bareMaskType(originalResultType), maskValue, m)
+              .getResult();
+    }
+
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(), maskValue);
+    return success();
+  }
+};
+
+// `hc.reduce` on a semantic shaped operand. The data half clones the
+// reduction; the mask half is `hc.full_mask` of the reduced shape.
+// Reduction over invalid lanes is correct as long as the data path
+// keeps the neutral element in those lanes (`hc.zeros` initializer
+// + `inferShapedBinaryResult`'s broadcast invariant cover this),
+// which matches the broadcast / fill / load_mask story the upstream
+// decompose rewriters plant. Per-output-tile validity is a
+// store-side concern handled downstream; full_mask here is the
+// "result lanes are addressable" seed, not a claim that every
+// reduction summand was in bounds.
+struct ConvertReduceShapedOp : public OpConversionPattern<HCReduceOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCReduceOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> value =
+        expectSplit(adaptor.getValue(), op, "reduce value");
+    if (failed(value))
+      return failure();
+
+    auto data = HCReduceOp::create(
+        rewriter, op.getLoc(), bareDataType(originalResultType), value->first,
+        op.getKindAttr(), op.getAxisAttr(), op.getKeepdimsAttr());
+    auto mask = HCFullMaskOp::create(rewriter, op.getLoc(),
+                                     bareMaskType(originalResultType));
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
 static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 MLIRContext *ctx,
                                                 RewritePatternSet &patterns) {
@@ -1007,6 +1162,15 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
            ConvertNullaryAllocOp<HCZerosOp>, ConvertNullaryAllocOp<HCOnesOp>,
            ConvertNullaryAllocOp<HCEmptyOp>, ConvertFillAllocOp<HCVFullOp>,
            ConvertFillAllocOp<HCFullOp>>(converter, ctx);
+  patterns.add<ConvertElementwiseBinaryShapedOp<HCAddOp>,
+               ConvertElementwiseBinaryShapedOp<HCSubOp>,
+               ConvertElementwiseBinaryShapedOp<HCMulOp>,
+               ConvertElementwiseBinaryShapedOp<HCDivOp>,
+               ConvertElementwiseBinaryShapedOp<HCModOp>,
+               ConvertElementwiseUnaryShapedOp<HCNegOp>,
+               ConvertElementwiseUnaryShapedOp<HCNotOp>,
+               ConvertBuiltinCallShapedOp, ConvertReduceShapedOp>(converter,
+                                                                  ctx);
 }
 
 static ConversionTarget
@@ -1021,6 +1185,9 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
       });
   target.addDynamicallyLegalOp<HCCallOp, HCCallIntrinsicOp, HCStoreOp,
                                HCReturnOp>(
+      [&](Operation *op) { return converter.isLegal(op); });
+  target.addDynamicallyLegalOp<HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
+                               HCNegOp, HCNotOp, HCBuiltinCallOp, HCReduceOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {
@@ -1064,7 +1231,9 @@ makePartialShapedDecompositionTarget(MLIRContext *ctx,
       HCCallOp, HCCallIntrinsicOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp,
       HCBufferViewOp, HCGetItemOp, HCVecOp, HCStripLayoutOp, HCWithInactiveOp,
       HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp,
-      HCFullOp>([&](Operation *op) { return converter.isLegal(op); });
+      HCFullOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp, HCNegOp, HCNotOp,
+      HCBuiltinCallOp, HCReduceOp>(
+      [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {
     return converter.isLegal(op) && regionsAreLegal(op, converter);

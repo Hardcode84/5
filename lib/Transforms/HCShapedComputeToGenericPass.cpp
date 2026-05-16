@@ -115,17 +115,21 @@ static bool reduceComboSupported(ReduceKind kind, Type elem) {
 }
 
 // Identity fill matching the reduce kind. Sum -> 0 (`hc.zeros` for
-// floats, `hc.full <0>` for ints); max -> -inf; min -> +inf.
-// Caller pre-validates with `reduceComboSupported`. Result type is
-// the HC semantic tensor; `mlir::hc::TensorType` is spelled out
-// because the unqualified `TensorType` collides with builtin
-// `mlir::TensorType` under both `using namespace mlir` and
-// `using namespace mlir::hc`.
+// floats, `hc.full <0>` for ints); max -> -inf; min -> +inf. Caller
+// pre-validates with `reduceComboSupported`.
+//
+// `resultTy` is the reduce-generic outs type — either the semantic
+// `!hc.tensor` or its post-decompose bare counterpart. Both are
+// `SymbolicallyShapedTypeInterface` carriers exposing the same
+// element type accessor, and both flow through `HCZerosOp` /
+// `HCFullOp` which accept any `HC_ValueType` result. Threading
+// `Type` rather than a concrete tensor class keeps the rewrite valid
+// on the decomposed data half too.
 static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
-                                    ReduceKind kind,
-                                    mlir::hc::TensorType resultTy,
+                                    ReduceKind kind, Type resultTy,
                                     Value shape) {
-  Type elem = resultTy.getElementType();
+  Type elem =
+      cast<SymbolicallyShapedTypeInterface>(resultTy).getSymbolicElementType();
   if (kind == ReduceKind::Sum) {
     if (auto intTy = dyn_cast<IntegerType>(elem)) {
       auto zero = HCConstOp::create(builder, loc, elem,
@@ -376,15 +380,21 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   ArrayRef<ExprAttr> valShape = shape->valShape;
   uint64_t axis = shape->axis;
 
-  auto valTy = cast<mlir::hc::TensorType>(op.getValue().getType());
-  auto outTy = dyn_cast<mlir::hc::TensorType>(op.getResult().getType());
-  // Reduction-to-scalar (rank 0 result with non-tensor result type)
+  // Accept both the semantic `!hc.tensor` and the post-decompose
+  // `!hc.bare_tensor` carrier — the rewrite is structural over the
+  // reduce shape and doesn't care which flavour the producer planted,
+  // as long as both operand and result share it.
+  auto valTy =
+      dyn_cast<SymbolicallyShapedTypeInterface>(op.getValue().getType());
+  auto outTy =
+      dyn_cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
+  if (!valTy || !outTy)
+    return failure();
+  // Reduction-to-scalar (rank 0 result with non-shaped result type)
   // would need a different output carrier; leave it for now.
-  if (!outTy)
+  if (valTy.getSymbolicElementType() != outTy.getSymbolicElementType())
     return failure();
-  if (valTy.getElementType() != outTy.getElementType())
-    return failure();
-  Type elem = outTy.getElementType();
+  Type elem = outTy.getSymbolicElementType();
   if (!reduceComboSupported(op.getKind(), elem))
     return failure();
 

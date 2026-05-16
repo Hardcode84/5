@@ -2846,6 +2846,58 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   return target;
 }
 
+// `!hc.bare_tensor` is a storage-class-free tile abstraction; the
+// launch-body type converter maps every bare_tensor to
+// `!hc.ptr<workgroup, T>` regardless of how downstream consumers use
+// the tile. That's a deliberate trade-off — analysing per-tile usage
+// (per-lane vs cross-lane) is its own pass — but it leaves a boundary
+// for the dialect-conversion driver: producers (`hc.zeros`, ...) get
+// rewritten to LDS, surviving consumers (`hc.generic`,
+// `hc.intrinsic`, ...) keep their `bare_tensor` slot type, and the
+// driver wallpapers the type mismatch with a `ptr<workgroup, T> ->
+// bare_tensor` UCC at each consumer edge.
+//
+// `hc.generic`'s operand slot is already polymorphic enough to take
+// `ptr<workgroup, T>` directly (see HC_GenericOperandType in the ODS
+// and the existing per-lane ptr-typed access path in
+// `hc-lower-generic`). Short-circuit the boundary UCC on `hc.generic`
+// ins here so that consumer reads through the ptr directly — saves
+// the per-lane downstream code from caring whether a `bare_tensor`
+// ins is a UCC-bridged ptr or a real value carrier. Other consumers
+// (intrinsic boundaries, where `convertIntrinsicBoundaryType` deliberately
+// keeps `bare_tensor` typed) are untouched: the UCC there is load-bearing
+// and the recipe code on the far side reads it as a `bare_tensor`.
+//
+// Two things are deliberately NOT done here:
+//
+// `outs` stays in `bare_tensor` form. Swapping outs would collapse
+// the value-typed SSA result the op contracts to produce — the
+// verifier matches result count against value-typed outs count, and
+// ptr/buffer outs contribute no SSA result. Result-chain rewiring on
+// the outs side is a separate problem (and a separate bead, see the
+// session reply).
+//
+// Pushing the swap *into* the dialect-conversion machinery (an
+// AdaptGenericOp-style pattern keyed on a per-pattern type converter)
+// doesn't compose: the dynamic-legality predicate sees the
+// pre-replacement operand SSA (the conversion driver tracks
+// remappings out of band), so the predicate can't observe "this
+// `bare_tensor` ins's producer just became a ptr" and there's no
+// signal to fire the pattern. Doing the swap post-conversion is the
+// honest place for this — same shape as
+// `reconcileUnrealizedCasts` in upstream MLIR, just on the operand
+// edge instead of the cast chain.
+static void reconcileWorkgroupTileBoundary(Operation *root) {
+  root->walk([](HCGenericOp op) {
+    for (OpOperand &use : op.getInsMutable()) {
+      if (!isa<BareTensorType>(use.get().getType()))
+        continue;
+      if (Value ptr = sourcePtr(use.get()))
+        use.set(ptr);
+    }
+  });
+}
+
 struct HCLowerLaunchBodyPass
     : public hc::impl::HCLowerLaunchBodyBase<HCLowerLaunchBodyPass> {
   using Base::Base;
@@ -2860,32 +2912,7 @@ struct HCLowerLaunchBodyPass
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
       return signalPassFailure();
-
-    // `hc.zeros` (and friends) lowered to an LDS allocation upstream;
-    // the dialect-conversion driver bridged surviving bare_tensor
-    // consumers via a `ptr<workgroup, T> -> bare_tensor` UCC. The
-    // driver doesn't re-check dynamic legality after operands switch
-    // to UCC results, so AdaptGenericOp can't catch this from inside
-    // the conversion. Swap the boundary view on the `ins` side here
-    // so `hc-lower-generic` sees a real ptr-typed operand and takes
-    // its existing per-lane `hc.ptr_offset` + `hc.ptr_load` path —
-    // no use-def walk from the consumer side, no leftover
-    // `bare_tensor -> vector` UCC for LLVM translation to choke on.
-    //
-    // `outs` is left in `bare_tensor` form. Swapping outs would
-    // collapse the value-typed SSA result the op contracts to
-    // produce (ptr/buffer outs contribute no SSA result; the
-    // verifier matches result count against value-typed outs
-    // count). Outs-side LDS swaps need a separate rewrite that also
-    // rewires the result chain — out of scope here.
-    getOperation()->walk([](HCGenericOp op) {
-      for (OpOperand &use : op.getInsMutable()) {
-        if (!isa<BareTensorType>(use.get().getType()))
-          continue;
-        if (Value ptr = sourcePtr(use.get()))
-          use.set(ptr);
-      }
-    });
+    reconcileWorkgroupTileBoundary(getOperation());
   }
 };
 

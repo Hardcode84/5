@@ -2540,6 +2540,15 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
     // memref types (`HC_GenericOperandType` is HC-only). We therefore
     // start from the op's original operand values (which are guaranteed
     // HC-typed) and only swap the buffer slots for their resolved ptr.
+    // bare_tensor operands backed by an LDS allocation (the
+    // `ptr<workgroup> -> bare_tensor` boundary UCC the shaped-constant
+    // lowering above plants) are NOT swapped here — that UCC only
+    // exists AFTER the producer's conversion has run, and the dialect
+    // conversion driver doesn't re-invoke dynamic legality on already-
+    // scanned ops when their operands change.
+    // `resolveWorkgroupPtrBareTensorIns` does the swap as a post-pass walk over
+    // the converted IR.
+    //
     // Iter bounds, on the other hand, do accept the index conversion
     // because `HC_ValueType` covers both `!hc.idx<>` and `index`; pull
     // them from the adaptor to clean up the trailing idx-to-index cast
@@ -2850,7 +2859,33 @@ struct HCLowerLaunchBodyPass
     ConversionTarget target = makeLaunchBodyLoweringTarget(ctx, converter);
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
-      signalPassFailure();
+      return signalPassFailure();
+
+    // `hc.zeros` (and friends) lowered to an LDS allocation upstream;
+    // the dialect-conversion driver bridged surviving bare_tensor
+    // consumers via a `ptr<workgroup, T> -> bare_tensor` UCC. The
+    // driver doesn't re-check dynamic legality after operands switch
+    // to UCC results, so AdaptGenericOp can't catch this from inside
+    // the conversion. Swap the boundary view on the `ins` side here
+    // so `hc-lower-generic` sees a real ptr-typed operand and takes
+    // its existing per-lane `hc.ptr_offset` + `hc.ptr_load` path —
+    // no use-def walk from the consumer side, no leftover
+    // `bare_tensor -> vector` UCC for LLVM translation to choke on.
+    //
+    // `outs` is left in `bare_tensor` form. Swapping outs would
+    // collapse the value-typed SSA result the op contracts to
+    // produce (ptr/buffer outs contribute no SSA result; the
+    // verifier matches result count against value-typed outs
+    // count). Outs-side LDS swaps need a separate rewrite that also
+    // rewires the result chain — out of scope here.
+    getOperation()->walk([](HCGenericOp op) {
+      for (OpOperand &use : op.getInsMutable()) {
+        if (!isa<BareTensorType>(use.get().getType()))
+          continue;
+        if (Value ptr = sourcePtr(use.get()))
+          use.set(ptr);
+      }
+    });
   }
 };
 

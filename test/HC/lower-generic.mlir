@@ -817,38 +817,31 @@ func.func @value_out_body_iter_sym(%init: !hc.bare_vector<!hc.pred, ["4"]>)
 
 // -----
 
-// Value-typed ins backed by a workgroup LDS allocation through the
-// `ptr<workgroup> -> bare_tensor` UCC the launch-body shaped-
-// constant lowering plants. Without the workgroup-ptr-aware
-// materialization the per-lane extracts would route through a
-// dangling `bare_tensor -> vector<...>` UCC that nothing later
-// reconciles, tripping LLVM translation. The fix is to load each
-// lane through the underlying LDS ptr directly: per-element
-// `hc.ptr_offset` + `hc.ptr_load`, then a `vector.from_elements`
-// the per-lane `vector.extract` consumers fold against.
-// CHECK-LABEL: func.func @value_in_workgroup_bare_tensor
+// `ins` is a workgroup LDS ptr — the form `hc-lower-launch-body`
+// hands us when an `hc.zeros`-init shared tile feeds an `hc.generic`.
+// The existing ptr-typed access path discovers the per-lane offsets
+// are contig and emits a single vector-typed `hc.ptr_load`, then
+// per-lane `vector.extract` for the body clones. No bare-tensor
+// middleman and no UCC walk-back. The matching launch-body LIT
+// (`workgroup_bare_tensor_ins_swap`) checks the ins-side retype
+// that produces this shape.
+// CHECK-LABEL: func.func @value_in_workgroup_ptr_ins
 // CHECK-NOT: scf.parallel
 // CHECK: %[[ALLOC:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
-// CHECK: %[[TILE:.+]] = builtin.unrealized_conversion_cast %[[ALLOC]] : !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["8"]>
-// 8 per-slot loads off the LDS ptr — one per lane, slot k = const-k.
-// CHECK: hc.ptr_offset %[[ALLOC]]
-// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
-// CHECK: vector.from_elements {{.+}} : vector<8xf32>
-// No dangling bare_tensor -> vector cast that would survive to LLVM:
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> vector<8xf32>
+// CHECK: vector.extract
 // CHECK-NOT: builtin.unrealized_conversion_cast %{{.+}} : !hc.bare_tensor<f32, ["8"]> to vector<8xf32>
 // CHECK-NOT: hc.generic
-func.func @value_in_workgroup_bare_tensor(%dst: !hc.ptr<global, f32>) {
+func.func @value_in_workgroup_ptr_ins(%dst: !hc.ptr<global, f32>) {
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index
   gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
              threads(%tx, %ty, %tz) in (%sx = %c8, %sy = %c1, %sz = %c1) {
     %lds = hc.alloc count = %c8 : index -> !hc.ptr<workgroup, f32>
-    %tile = builtin.unrealized_conversion_cast %lds
-        : !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["8"]>
     %n = hc.idx_apply () : () -> !hc.idx<"8">
     hc.generic
         iter (parallel i = %n : !hc.idx<"8">)
-        ins (%tile at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["8"]>)
+        ins (%lds at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
         outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
         -> () {
     ^bb0(%v: f32, %init: f32):

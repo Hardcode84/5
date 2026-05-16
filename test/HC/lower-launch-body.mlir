@@ -437,4 +437,40 @@ module {
     }
     return
   }
+
+  // `hc.zeros` of a `!hc.bare_tensor` lowers to a workgroup LDS
+  // allocation; the resulting `ptr<workgroup, T> -> bare_tensor` UCC
+  // would otherwise leak past launch-body as the ins of a downstream
+  // `hc.generic`. `AdaptGenericOp` resolves the bare_tensor ins to
+  // the underlying ptr at the boundary so `hc-lower-generic` reads
+  // the LDS through the same ptr-typed access path the kernel-arg
+  // ptr / explicit `hc.alloc` ins already use — no UCC walk-back
+  // needed at consume time.
+  // CHECK-LABEL: func.func @workgroup_bare_tensor_ins_swap
+  // CHECK: gpu.launch
+  // CHECK: %[[LDS:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
+  // CHECK: hc.generic
+  // CHECK-SAME: ins (%[[LDS]] at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
+  // CHECK-NOT: !hc.bare_tensor<f32, ["8"]>
+  func.func @workgroup_bare_tensor_ins_swap(%dst: !hc.ptr<global, f32>) {
+    %c1 = arith.constant 1 : index
+    %c8 = arith.constant 8 : index
+    gpu.launch blocks(%bx, %by, %bz) in (%gxr = %c1, %gyr = %c1, %gzr = %c1)
+               threads(%tx, %ty, %tz) in (%sxr = %c8, %syr = %c1, %szr = %c1) {
+      %eight = hc.idx_apply () : () -> !hc.idx<"8">
+      %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
+      %tile = hc.zeros shape %shape
+          : (tuple<!hc.idx<"8">>) -> !hc.bare_tensor<f32, ["8"]>
+      hc.generic
+          iter (parallel i = %eight : !hc.idx<"8">)
+          ins (%tile at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["8"]>)
+          outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+          -> () {
+      ^bb0(%v: f32, %init: f32):
+        hc.yield %v : f32
+      }
+      gpu.terminator
+    }
+    return
+  }
 }

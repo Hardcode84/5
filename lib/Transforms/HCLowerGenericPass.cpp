@@ -2067,65 +2067,19 @@ static FailureOr<VectorCarrier> valueOperandVectorCarrier(HCGenericOp op,
                        mlir::VectorType::get({*count}, builtinElem)};
 }
 
-// Trace back through a one-input-one-output UCC to the underlying
-// `!hc.ptr<workgroup, T>` that backs a bare-tensor value, matching
-// the `ptr<workgroup> -> bare_tensor` source materialization the
-// launch-body shaped-constant lowering plants on `hc.zeros`. The
-// pair was designed to round-trip through canonicalize when the
-// consumer also wants a workgroup ptr; consumers that want a real
-// `vector<NxT>` carrier (the value-typed ins/outs path here) instead
-// need an actual load chain off the ptr, otherwise the unfoldable
-// `ptr -> bare_tensor -> vector` UCC chain survives all the way to
-// LLVM translation.
-static Value workgroupPtrBackingBareTensor(Value v) {
-  auto cast = v.getDefiningOp<UnrealizedConversionCastOp>();
-  if (!cast || cast.getInputs().size() != 1 || cast.getOutputs().size() != 1)
-    return Value();
-  Value src = cast.getInputs().front();
-  auto ptr = dyn_cast<PtrType>(src.getType());
-  if (!ptr || ptr.getAddrSpace() != AddrSpace::Workgroup)
-    return Value();
-  return src;
-}
-
-// Build a `vector<NxBuiltin>` from per-element loads off a workgroup
-// LDS ptr. The flat slot layout matches the launch-body
-// shaped-constant convention (row-major `ptr + slot` for slot in
-// `[0, count)`), so per-lane gathers via `vector.extract` line up
-// with the producing `hc.ptr_store` slots the partition lowering
-// emitted.
-static Value loadVectorFromWorkgroupPtr(OpBuilder &builder, Location loc,
-                                        Value ptr, mlir::VectorType vecTy) {
-  Type elemTy = vecTy.getElementType();
-  PtrType ptrTy = cast<PtrType>(ptr.getType());
-  int64_t count = vecTy.getNumElements();
-  SmallVector<Value> elems;
-  elems.reserve(count);
-  for (int64_t slot = 0; slot < count; ++slot) {
-    Value off = arith::ConstantIndexOp::create(builder, loc, slot).getResult();
-    Value addr =
-        HCPtrOffsetOp::create(builder, loc, ptrTy, ptr, off).getResult();
-    elems.push_back(
-        HCPtrLoadOp::create(builder, loc, elemTy, addr).getResult());
-  }
-  return vector::FromElementsOp::create(builder, loc, vecTy, elems).getResult();
-}
-
-// Materialise `v` as the value-typed lane carrier `vecTy`. The fast
-// path is a no-op when `v` is already a vector of the same shape;
-// the bare-tensor path threads through `workgroupPtrBackingBareTensor`
-// + `loadVectorFromWorkgroupPtr` so the per-lane consumers see real
-// `hc.ptr_load` values instead of an unresolved
-// `bare_tensor -> vector` UCC. The last-resort UCC remains for
-// non-workgroup carriers (e.g. value-typed outs threaded as-is by an
-// upstream op); per-lane extract on those folds elsewhere because
-// the bare carrier is itself a vector-shaped SSA.
+// Materialise `v` as the value-typed lane carrier `vecTy`. Fast path
+// when `v` is already a vector of the same shape; otherwise the last-
+// resort UCC lets per-lane consumers (`vector.extract`) downcast and
+// fold against whatever vector-shaped SSA is upstream. Bare-tensor
+// carriers backed by an LDS allocation are caught at the launch-body
+// boundary (`AdaptGenericOp` swaps the ins/outs SSA to the underlying
+// `ptr<workgroup>`); by the time `hc-lower-generic` looks the operand
+// type is a ptr, the ptr-typed access path fires, and this helper
+// only sees real value-carriers.
 static Value castToVectorCarrier(OpBuilder &builder, Location loc, Value v,
                                  mlir::VectorType vecTy) {
   if (v.getType() == Type(vecTy))
     return v;
-  if (Value ptr = workgroupPtrBackingBareTensor(v))
-    return loadVectorFromWorkgroupPtr(builder, loc, ptr, vecTy);
   return UnrealizedConversionCastOp::create(builder, loc, vecTy, v)
       .getResult(0);
 }

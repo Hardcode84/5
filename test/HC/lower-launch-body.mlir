@@ -478,22 +478,23 @@ module {
   // `hc-decompose-shaped-values --strict=false` leaves behind on
   // ops it doesn't rewrite — `hc.sub` / `hc.mul` / `hc.builtin_call`
   // / ... — and that `hc-elementwise-to-generic` then propagates as
-  // the outs init of a synthesised `hc.generic`) lowers to a vector
-  // `arith.constant dense<0>` plus a UCC back to the semantic
-  // carrier. `hc-lower-generic`'s value-outs path UCCs the carrier
-  // back to a builtin `vector<NxT>` on consume; the
-  // `vector -> tensor -> vector` round-trip folds at the next
-  // canonicalize. No LDS allocation: per-workitem tile.
-  // CHECK-LABEL: func.func @workitem_tensor_zeros_to_vector_const
+  // the outs init of a synthesised `hc.generic`) is workgroup-local
+  // storage per `doc/langref.md` §340-388, so the carrier rides the
+  // same `hc.alloc workgroup` + per-element splat-store path
+  // `!hc.bare_tensor` already uses. A trailing `ucc ptr -> tensor`
+  // keeps the SSA type stable for downstream consumers (the outs
+  // slot of an `hc.generic`); `hc-lower-generic`'s collective path
+  // UCC-traces the bridge back to the workgroup ptr.
+  // CHECK-LABEL: func.func @workitem_tensor_zeros_to_lds
   // CHECK: gpu.launch
-  // CHECK: %[[ZEROS:.+]] = arith.constant dense<0.000000e+00> : vector<8xf32>
-  // CHECK: %[[BRIDGE:.+]] = builtin.unrealized_conversion_cast %[[ZEROS]]
-  // CHECK-SAME: vector<8xf32> to !hc.tensor<f32, ["8"]>
+  // CHECK: %[[LDS:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
+  // CHECK: hc.ptr_store {{.*}}: f32, !hc.ptr<workgroup, f32>
+  // CHECK: %[[BRIDGE:.+]] = builtin.unrealized_conversion_cast %[[LDS]]
+  // CHECK-SAME: !hc.ptr<workgroup, f32> to !hc.tensor<f32, ["8"]>
   // CHECK: hc.generic
   // CHECK-SAME: outs (%[[BRIDGE]] at
-  // CHECK-NOT: hc.alloc
-  // CHECK-NOT: !hc.bare_tensor
-  func.func @workitem_tensor_zeros_to_vector_const(%src: !hc.ptr<global, f32>) {
+  // CHECK-NOT: arith.constant dense<0.000000e+00>
+  func.func @workitem_tensor_zeros_to_lds(%src: !hc.ptr<global, f32>) {
     %c1 = arith.constant 1 : index
     %c8 = arith.constant 8 : index
     gpu.launch blocks(%bx, %by, %bz) in (%gxr = %c1, %gyr = %c1, %gzr = %c1)

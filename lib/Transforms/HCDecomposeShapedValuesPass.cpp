@@ -835,13 +835,18 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
                                        "buffer_view index", indices)))
       return failure();
 
-    auto data = HCBufferViewOp::create(
-        rewriter, op.getLoc(), bareDataType(originalType), dataSource, indices);
+    // Pass the `unit_axes` set through so the result rank matches the
+    // residual-index count + unit-axis count — same contract the input
+    // op had, just on the decomposed data/mask pair.
+    DenseI64ArrayAttr unitAxes = op.getUnitAxesAttr();
+    auto data = HCBufferViewOp::create(rewriter, op.getLoc(),
+                                       bareDataType(originalType), dataSource,
+                                       indices, unitAxes);
     Value maskValue;
     if (maskSource) {
       maskValue = HCBufferViewOp::create(rewriter, op.getLoc(),
                                          bareMaskType(originalType), maskSource,
-                                         indices)
+                                         indices, unitAxes)
                       .getResult();
     } else {
       maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),

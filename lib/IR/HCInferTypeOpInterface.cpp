@@ -838,8 +838,99 @@ static Type buildBufferViewResultType(Type sourceType, bool vectorRoot,
   return mlir::hc::TensorType::get(ctx, elementType, resultShape, resultLayout);
 }
 
+// Interleave unit-size dims into `keptDims` at the output positions
+// listed by `unitAxes`. Output rank = `keptDims.size() + unitAxes.size()`.
+// Positions are pre-verified unique, sorted is NOT assumed; we sort a
+// local copy so the merge runs in one pass. Returns failure only on
+// internal one-expr lookup, which should not happen for well-formed
+// inputs.
+static FailureOr<SmallVector<Attribute>>
+interleaveUnitAxes(ArrayRef<Attribute> keptDims, ArrayRef<int64_t> unitAxes,
+                   Operation *op) {
+  if (unitAxes.empty())
+    return SmallVector<Attribute>(keptDims.begin(), keptDims.end());
+  FailureOr<ExprAttr> one = defaultOneExpr(op);
+  if (failed(one))
+    return failure();
+  SmallVector<int64_t> sortedUnits(unitAxes.begin(), unitAxes.end());
+  llvm::sort(sortedUnits);
+  size_t outputRank = keptDims.size() + sortedUnits.size();
+  SmallVector<Attribute> result;
+  result.reserve(outputRank);
+  size_t unitIdx = 0;
+  size_t keptIdx = 0;
+  for (size_t pos = 0; pos < outputRank; ++pos) {
+    if (unitIdx < sortedUnits.size() &&
+        static_cast<size_t>(sortedUnits[unitIdx]) == pos) {
+      result.push_back(*one);
+      ++unitIdx;
+      continue;
+    }
+    result.push_back(keptDims[keptIdx++]);
+  }
+  return result;
+}
+
+// Vector-root collective-suffix indices (beyond `baseDims.size()`) were
+// dropped during classification, so by the time we reach the layout
+// compose `keepAxis` covers exactly the source rank. If composition
+// fails (non-`IdxType` scalar against a layout, malformed shape entry,
+// ...) leave the result type un-refined and let a later inference pass
+// try again — encoded by returning the input `currentResultType`. A
+// null `sourceLayout` short-circuits with an empty result layout.
+static FailureOr<LayoutAttr> maybeComposeBufferViewLayout(
+    LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
+    const BufferViewAxisArrays &arrays, Type currentResultType, Operation *op) {
+  if (!sourceLayout)
+    return LayoutAttr{};
+  FailureOr<LayoutAttr> composed = composeBufferViewLayout(
+      sourceLayout, baseDims, arrays.keepAxis, arrays.scalarValueExpr,
+      arrays.sliceLowerExpr, arrays.sliceStepExpr, arrays.sliceShapeChanged,
+      op);
+  if (failed(composed))
+    return LayoutAttr{};
+  return *composed;
+}
+
+// Post-classification merge: compose the residual layout, splice the
+// `unit_axes` size-1 dims into the kept shape, and build the final
+// result type. Pulled out of `inferBufferViewResult` to keep that
+// function's branch-count under the lizard threshold.
+static FailureOr<Type>
+finalizeBufferViewResult(Type sourceType, const BufferViewAxisArrays &arrays,
+                         ArrayRef<Attribute> baseDims,
+                         ArrayRef<int64_t> unitAxes, bool vectorRoot,
+                         Type elementType, LayoutAttr sourceLayout,
+                         Type currentResultType, Operation *op) {
+  FailureOr<LayoutAttr> resultLayoutOr = maybeComposeBufferViewLayout(
+      sourceLayout, baseDims, arrays, currentResultType, op);
+  if (failed(resultLayoutOr))
+    return currentResultType;
+  LayoutAttr resultLayout = *resultLayoutOr;
+
+  // `unit_axes` interleave size-1 dims into the kept shape. Layout
+  // composition above only walks consuming subscripts; the unit dims
+  // exist only on the result side and don't enter the layout offset,
+  // so it's safe to splice them in afterwards. Bail conservatively if
+  // a layout-bearing source ever needs unit-axis insertion — the
+  // current frontend never plants `unit_axes` on layout-bearing
+  // tensors, so this branch is unreachable from real input; if it ever
+  // does, we'd need to extend the layout to carry zero-stride dims at
+  // the inserted positions.
+  if (!unitAxes.empty() && resultLayout)
+    return currentResultType;
+  FailureOr<SmallVector<Attribute>> finalDims =
+      interleaveUnitAxes(arrays.resultDims, unitAxes, op);
+  if (failed(finalDims))
+    return failure();
+
+  return buildBufferViewResultType(sourceType, vectorRoot, elementType,
+                                   *finalDims, resultLayout, op->getContext());
+}
+
 static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                              ArrayRef<Type> indexTypes,
+                                             ArrayRef<int64_t> unitAxes,
                                              Type currentResultType,
                                              Operation *op) {
   if (!sourceType || isHCUndefType(sourceType))
@@ -864,28 +955,9 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
     return failure();
   if (!*classification)
     return currentResultType;
-  const BufferViewAxisArrays &arrays = **classification;
-
-  LayoutAttr resultLayout;
-  if (sourceLayout) {
-    // Vector-root collective-suffix indices (beyond `baseDims.size()`)
-    // were dropped during classification, so by the time we reach the
-    // layout compose `keepAxis` covers exactly the source rank. If
-    // composition fails (non-`IdxType` scalar against a layout,
-    // malformed shape entry, ...) leave the result type un-refined
-    // and let a later inference pass try again.
-    FailureOr<LayoutAttr> composed = composeBufferViewLayout(
-        sourceLayout, baseDims, arrays.keepAxis, arrays.scalarValueExpr,
-        arrays.sliceLowerExpr, arrays.sliceStepExpr, arrays.sliceShapeChanged,
-        op);
-    if (failed(composed))
-      return currentResultType;
-    resultLayout = *composed;
-  }
-
-  return buildBufferViewResultType(sourceType, vectorRoot, elementType,
-                                   arrays.resultDims, resultLayout,
-                                   op->getContext());
+  return finalizeBufferViewResult(sourceType, **classification, baseDims,
+                                  unitAxes, vectorRoot, elementType,
+                                  sourceLayout, currentResultType, op);
 }
 
 // Optional `layout` attribute on load/alloc/`hc.vec` producer ops: when
@@ -995,7 +1067,8 @@ inferGetItemResult(Type sourceType, ArrayRef<Type> indexTypes, Operation *op) {
   if (!sourceType)
     return Type{};
   if (isa<mlir::hc::VectorType>(sourceType))
-    return inferBufferViewResult(sourceType, indexTypes, Type{}, op);
+    return inferBufferViewResult(sourceType, indexTypes, /*unitAxes=*/{},
+                                 Type{}, op);
   auto tuple = dyn_cast<TupleType>(sourceType);
   if (!tuple) {
     if (isa<UndefType, mlir::hc::BufferType, mlir::hc::TensorType,
@@ -1386,8 +1459,11 @@ LogicalResult HCBufferViewOp::inferHCTypes(ArrayRef<Type> operandTypes,
   Type sourceType = operandTypes.empty() ? Type{} : operandTypes.front();
   ArrayRef<Type> indexTypes =
       operandTypes.empty() ? ArrayRef<Type>{} : operandTypes.drop_front();
+  ArrayRef<int64_t> unitAxes;
+  if (auto attr = getUnitAxesAttr())
+    unitAxes = attr.asArrayRef();
   return pushInferred(resultTypes,
-                      inferBufferViewResult(sourceType, indexTypes,
+                      inferBufferViewResult(sourceType, indexTypes, unitAxes,
                                             getResult().getType(), *this));
 }
 

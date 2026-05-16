@@ -1493,6 +1493,11 @@ private:
                                                    StringRef role = "operand");
   FailureOr<SmallVector<Value>> expandTupleOperand(Value v, Operation *consumer,
                                                    StringRef role);
+  LogicalResult
+  classifyFrontSubscriptIndex(Value frontIdx, hc_front::SubscriptOp op,
+                              SmallVectorImpl<Value> &residualIndices,
+                              SmallVectorImpl<int64_t> &unitAxes,
+                              size_t &outputPos);
   FailureOr<SmallVector<Value>> lowerReturnValues(hc_front::ReturnOp op);
 
   // Per-op lowering entry points. `Value`-returning variants write into
@@ -4674,6 +4679,56 @@ Lowerer::trySubscriptFolds(hc_front::SubscriptOp op) {
   return {false, nullptr};
 }
 
+// NumPy `None` / `np.newaxis` subscript sentinel. The frontend emits
+// `hc_front.constant<"None"> {python_kind = "NoneType"}` for every
+// `x[..., None, ...]` slot; recognize it here so the buffer_view never
+// receives the resulting `!hc.undef` value as an index. Same shape as
+// `isAsLayoutNoneSentinel`, but kept separate because the surrounding
+// validation differs.
+static bool isFrontNoneSubscript(Value frontIdx) {
+  auto constOp = frontIdx.getDefiningOp<hc_front::ConstantOp>();
+  if (!constOp)
+    return false;
+  auto kind = constOp->getAttrOfType<StringAttr>("python_kind");
+  return kind && kind.getValue() == "NoneType";
+}
+
+// Walk one front-level subscript slot and record each leaf as either a
+// unit-axis insertion (`None`) or a consuming subscript. Front-side
+// `hc_front.tuple` slots are unpacked here so the `None` check lands on
+// the original constant, not the lowered `hc.const : !hc.undef`. The
+// HC values are produced via `lowerValueOperand` so the same value-map
+// path used elsewhere applies.
+LogicalResult
+Lowerer::classifyFrontSubscriptIndex(Value frontIdx, hc_front::SubscriptOp op,
+                                     SmallVectorImpl<Value> &residualIndices,
+                                     SmallVectorImpl<int64_t> &unitAxes,
+                                     size_t &outputPos) {
+  if (auto tuple = frontIdx.getDefiningOp<hc_front::TupleOp>()) {
+    for (Value element : tuple.getElements()) {
+      if (failed(classifyFrontSubscriptIndex(element, op, residualIndices,
+                                             unitAxes, outputPos)))
+        return failure();
+    }
+    return success();
+  }
+  if (isFrontNoneSubscript(frontIdx)) {
+    unitAxes.push_back(static_cast<int64_t>(outputPos++));
+    return success();
+  }
+  FailureOr<Value> lowered =
+      lowerValueOperand(frontIdx, op.getOperation(), "subscript index");
+  if (failed(lowered))
+    return failure();
+  if (!*lowered) {
+    op.emitOpError("subscript index did not lower");
+    return failure();
+  }
+  residualIndices.push_back(*lowered);
+  ++outputPos;
+  return success();
+}
+
 // Generic `hc.buffer_view` lowering for subscripts that didn't match any
 // of the dedicated DSL-method folds above.
 Value Lowerer::lowerGenericSubscript(hc_front::SubscriptOp op) {
@@ -4686,20 +4741,25 @@ Value Lowerer::lowerGenericSubscript(hc_front::SubscriptOp op) {
     op.emitOpError("subscript base did not lower");
     return nullptr;
   }
-  SmallVector<Value> indices;
+  SmallVector<Value> residualIndices;
+  SmallVector<int64_t> unitAxes;
+  size_t outputPos = 0;
   for (Value idx : op.getIndices()) {
-    FailureOr<SmallVector<Value>> expanded =
-        expandTupleOperand(idx, op.getOperation(), "subscript index");
-    if (failed(expanded)) {
-      op.emitOpError("subscript index did not lower");
+    if (failed(classifyFrontSubscriptIndex(idx, op, residualIndices, unitAxes,
+                                           outputPos)))
       return nullptr;
-    }
-    indices.append(expanded->begin(), expanded->end());
   }
   // `hc.buffer_view` accepts `!hc.undef`, buffer, tensor, and vector roots.
   // Type inference later specializes vector roots to element or fragment
-  // projections once the index types are known.
-  return HCBufferViewOp::create(builder, op.getLoc(), undef, base, indices);
+  // projections once the index types are known. A non-empty `unit_axes`
+  // is the encoded `np.newaxis` set: positions in the OUTPUT rank where
+  // size-1 dims are interleaved into the result shape.
+  DenseI64ArrayAttr unitAxesAttr = unitAxes.empty()
+                                       ? DenseI64ArrayAttr{}
+                                       : builder.getDenseI64ArrayAttr(unitAxes);
+  return HCBufferViewOp::create(builder, op.getLoc(), undef, base,
+                                residualIndices, unitAxesAttr)
+      .getResult();
 }
 
 Value Lowerer::lowerSubscript(hc_front::SubscriptOp op) {

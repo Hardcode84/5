@@ -782,10 +782,21 @@ def HCBufferViewOp : HC_Op<"buffer_view",
     matching Python-style multi-axis subscripts. Vector roots use the same
     shape-reduction rules: scalar indices consume axes, slices produce vector
     fragments, and indexing every vector axis yields the element type.
+
+    `$unit_axes` carries the output positions where NumPy `None` / `np.newaxis`
+    inserts a unit-size dim — `x[:, None, :]` becomes
+    `hc.buffer_view %x[%full, %full] {unit_axes = [1]}`. Positions are in the
+    output rank's coordinates (so two `None`s in the original subscript yield
+    two `unit_axes` entries). The variadic `$indices` list never contains a
+    `None` placeholder; the residual indices consume source axes one-for-one,
+    and the unit dims are interleaved into the result shape on the
+    type-inference side.
   }];
   let arguments = (ins HC_ViewRootValueType:$buffer,
-                       Variadic<HC_ValueType>:$indices);
+                       Variadic<HC_ValueType>:$indices,
+                       OptionalAttr<DenseI64ArrayAttr>:$unit_axes);
   let results = (outs HC_ValueType:$result);
+  let hasVerifier = 1;
   let assemblyFormat = [{
     $buffer `[` $indices `]` attr-dict `:`
     functional-type(operands, results)

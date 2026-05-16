@@ -319,6 +319,32 @@ hc.func @buffer_views(%buf: !hc.buffer<f32, ["M", "N"]>,
 
 // -----
 
+// `unit_axes` interleaves size-1 dims into the result shape at the
+// listed output positions. `np.newaxis` lowering plants these from
+// the frontend; the type-inference side here pins down the resulting
+// rank-bump for the three canonical placements: middle, leading, and
+// trailing.
+
+// CHECK-LABEL: hc.func @buffer_view_unit_axes
+// CHECK: hc.buffer_view {{.*}} {unit_axes = array<i64: 1>} {{.*}} -> !hc.tensor<f16, ["16", "1", "16"]>
+// CHECK: hc.buffer_view {{.*}} {unit_axes = array<i64: 0, 3>} {{.*}} -> !hc.tensor<f16, ["1", "16", "16", "1"]>
+// CHECK: hc.buffer_view {{.*}} {unit_axes = array<i64: 2>} {{.*}} -> !hc.tensor<f16, ["16", "16", "1"]>
+hc.func @buffer_view_unit_axes(%tensor: !hc.tensor<f16, ["16", "16"]>)
+    -> (!hc.undef, !hc.undef, !hc.undef) {
+  %full = hc.slice_expr() : () -> !hc.undef
+  %middle = hc.buffer_view %tensor[%full, %full] {unit_axes = array<i64: 1>}
+      : (!hc.tensor<f16, ["16", "16"]>, !hc.undef, !hc.undef) -> !hc.undef
+  %leading_pair = hc.buffer_view %tensor[%full, %full]
+      {unit_axes = array<i64: 0, 3>}
+      : (!hc.tensor<f16, ["16", "16"]>, !hc.undef, !hc.undef) -> !hc.undef
+  %trailing = hc.buffer_view %tensor[%full, %full] {unit_axes = array<i64: 2>}
+      : (!hc.tensor<f16, ["16", "16"]>, !hc.undef, !hc.undef) -> !hc.undef
+  hc.return %middle, %leading_pair, %trailing
+      : !hc.undef, !hc.undef, !hc.undef
+}
+
+// -----
+
 // CHECK-LABEL: hc.func @buffer_view_layout_multibuf
 // Slicing axis 0 of a 4-D layout-bearing tensor with a scalar
 // `!hc.idx<"buf_idx">` drops the `b` shape sym and the `ib` index

@@ -1388,7 +1388,8 @@ static Value emitFlatBufferViewSlice(HCBufferViewOp op, Type flatResultType,
                                          newLower, newUpper, newStep)
                        .getResult();
   return HCBufferViewOp::create(rewriter, op.getLoc(), flatResultType,
-                                flatSource, ValueRange{newSlice})
+                                flatSource, ValueRange{newSlice},
+                                /*unit_axes=*/DenseI64ArrayAttr())
       .getResult();
 }
 

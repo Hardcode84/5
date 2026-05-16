@@ -1622,6 +1622,36 @@ LogicalResult HCGetItemOp::verify() {
   return success();
 }
 
+LogicalResult HCBufferViewOp::verify() {
+  // `unit_axes` lists OUTPUT positions where NumPy `None` inserts a
+  // unit-size dim. The expected output rank is the residual index
+  // count (consuming subscripts) plus the unit-axis count; checking
+  // both that positions are unique and that none exceeds the output
+  // rank is enough to keep the merge in `inferBufferViewResult`
+  // well-formed.
+  auto unitAxes = getUnitAxesAttr();
+  if (!unitAxes)
+    return success();
+  ArrayRef<int64_t> positions = unitAxes.asArrayRef();
+  if (positions.empty())
+    return success();
+  size_t outputRank = getIndices().size() + positions.size();
+  llvm::SmallDenseSet<int64_t> seen;
+  for (int64_t pos : positions) {
+    if (pos < 0)
+      return emitOpError("unit_axes entries must be non-negative, got ") << pos;
+    if (static_cast<size_t>(pos) >= outputRank)
+      return emitOpError("unit_axes entry ")
+             << pos << " is out of range for output rank " << outputRank
+             << " (= " << getIndices().size() << " residual indices + "
+             << positions.size() << " unit axes)";
+    if (!seen.insert(pos).second)
+      return emitOpError("unit_axes entries must be unique; ")
+             << pos << " repeats";
+  }
+  return success();
+}
+
 LogicalResult HCReduceOp::verify() {
   // Kind is a typed enum now; wrong spellings never reach the verifier.
   if (getAxisAttr().getValue().isNegative())

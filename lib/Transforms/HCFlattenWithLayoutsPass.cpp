@@ -1963,6 +1963,144 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
   }
 };
 
+// Convert one shaped-allocator op's result type to its post-flatten
+// 1D form. Returns the (non-original) flat type when a rebuild is
+// warranted; failure on a no-op (the type-converter declines, the
+// result didn't actually change, or the converted type doesn't carry
+// a usable symbolic shape).
+static FailureOr<Type> flatAllocOpResultType(const TypeConverter &converter,
+                                             Type origResultType) {
+  SmallVector<Type> convertedResults;
+  if (failed(converter.convertType(origResultType, convertedResults)) ||
+      convertedResults.empty())
+    return failure();
+  Type flatResult = convertedResults.front();
+  if (flatResult == origResultType)
+    return failure();
+  auto flatShaped = dyn_cast<SymbolicallyShapedTypeInterface>(flatResult);
+  if (!flatShaped)
+    return failure();
+  ShapeAttr flatShape = flatShaped.getSymbolicShape();
+  if (!flatShape || flatShape.getDims().empty())
+    return failure();
+  return flatResult;
+}
+
+// Materialise a rank-matching shape tuple from the converted result's
+// symbolic shape. Each dim becomes an empty-binding `hc.idx_apply`
+// pinned to the dim expression — same severance form
+// `resolveResultAuxValues` uses for ambient syms the launch-body
+// walker rebinds at lower time. Returns failure if any dim isn't an
+// `ExprAttr` (no symbolic content to pin).
+static FailureOr<Value>
+buildFlatAllocShapeTuple(ConversionPatternRewriter &rewriter, Location loc,
+                         ShapeAttr flatShape) {
+  MLIRContext *ctx = rewriter.getContext();
+  ArrayAttr emptySymbols = rewriter.getArrayAttr({});
+  SmallVector<Value> dimValues;
+  SmallVector<Type> dimTypes;
+  dimValues.reserve(flatShape.getDims().size());
+  dimTypes.reserve(flatShape.getDims().size());
+  for (Attribute dim : flatShape.getDims()) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      return failure();
+    Type idxTy = IdxType::get(ctx, expr);
+    Value v =
+        HCIdxApplyOp::create(rewriter, loc, idxTy, ValueRange{}, emptySymbols)
+            .getResult();
+    dimValues.push_back(v);
+    dimTypes.push_back(idxTy);
+  }
+  return HCTupleOp::create(rewriter, loc, TupleType::get(ctx, dimTypes),
+                           dimValues)
+      .getResult();
+}
+
+// Splice a freshly-built shape tuple into the flat operand vector at
+// the position the interface advertised the shape lives at.
+static LogicalResult
+spliceFlatAllocShapeOperand(SmallVectorImpl<Value> &flatOperands,
+                            HCStaticShapeOpInterface shapeOp, Value newShape) {
+  Operation *op = shapeOp.getOperation();
+  Value shapeOperand = shapeOp.getStaticShapeOperand();
+  auto opOperands = op->getOperands();
+  auto shapeIt = llvm::find(opOperands, shapeOperand);
+  if (shapeIt == opOperands.end())
+    return failure();
+  unsigned shapeIdx = std::distance(opOperands.begin(), shapeIt);
+  if (shapeIdx >= flatOperands.size())
+    return failure();
+  flatOperands[shapeIdx] = newShape;
+  return success();
+}
+
+// Rebuild the shape tuple on nullary/fill shaped-allocator ops
+// (`hc.zeros` / `hc.ones` / `hc.empty` / `hc.full` and their `v*`
+// vector twins) after the result type collapses to a 1D bare carrier.
+// `RetypeAnyHCOp` would copy the original shape operand verbatim,
+// leaving an nD tuple paired with a 1D result — the `HCStaticShapeOp`
+// rule wants the tuple arity to match the result rank, and the
+// post-flatten launch-body lowering reads dim count off the operand.
+//
+// Source operands threaded by `hc.load` / friends are handled by the
+// per-access patterns and never hit this branch (the
+// `getStaticShapeSourceOperand` gate excludes anything but the
+// nullary/fill allocators).
+struct RebuildShapedAllocOpShape
+    : public OpInterfaceConversionPattern<HCStaticShapeOpInterface> {
+  using Base = OpInterfaceConversionPattern<HCStaticShapeOpInterface>;
+  RebuildShapedAllocOpShape(const TypeConverter &converter, MLIRContext *ctx)
+      : Base(converter, ctx, /*benefit=*/2) {}
+
+  LogicalResult
+  matchAndRewrite(HCStaticShapeOpInterface shapeOp,
+                  ArrayRef<ValueRange> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    Operation *op = shapeOp.getOperation();
+    if (shapeOp.getStaticShapeSourceOperand() || op->getNumResults() != 1)
+      return failure();
+
+    Type origResultType = op->getResult(0).getType();
+    FailureOr<Type> flatResult =
+        flatAllocOpResultType(*getTypeConverter(), origResultType);
+    if (failed(flatResult))
+      return failure();
+
+    Location loc = op->getLoc();
+    auto flatShape =
+        cast<SymbolicallyShapedTypeInterface>(*flatResult).getSymbolicShape();
+    FailureOr<Value> newShape =
+        buildFlatAllocShapeTuple(rewriter, loc, flatShape);
+    if (failed(newShape))
+      return failure();
+
+    SmallVector<Value> flatOperands = flatOperandsOnly(operands);
+    if (failed(spliceFlatAllocShapeOperand(flatOperands, shapeOp, *newShape)))
+      return failure();
+
+    OperationState state(loc, op->getName());
+    state.addOperands(flatOperands);
+    state.addTypes(*flatResult);
+    state.addAttributes(op->getAttrs());
+    Operation *newOp = rewriter.create(state);
+
+    llvm::StringMap<Value> bindings;
+    for (auto [origOperand, range] :
+         llvm::zip_equal(op->getOperands(), operands))
+      noteOperandBindings(origOperand.getType(), range, bindings);
+    auto auxValues =
+        resolveResultAuxValues(rewriter, loc, origResultType, bindings);
+    if (failed(auxValues))
+      return failure();
+    SmallVector<Value> replacement = {newOp->getResult(0)};
+    llvm::append_range(replacement, *auxValues);
+    SmallVector<ValueRange> replacements = {replacement};
+    rewriter.replaceOpWithMultiple(op, replacements);
+    return success();
+  }
+};
+
 // Generic op-rebuild pattern for HC dialect ops. The function/SCF
 // populators retype signatures and structural ops, but ops in the
 // middle of the IR (`hc.generic`, `hc.load`, `hc.cast`, ...) need to
@@ -2432,7 +2570,8 @@ struct HCFlattenWithLayoutsPass final
     // retype's 1), but having them grouped reads as the design.
     patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeStoreOffsets,
                  ComposeGenericOffsets, ComposeBufferViewOffsets, DropAsLayout,
-                 RetypeAnyHCOp, ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
+                 RebuildShapedAllocOpShape, RetypeAnyHCOp,
+                 ConvertHCSymbolSignatureOp<HCIntrinsicOp>,
                  ConvertHCSymbolSignatureOp<HCFuncOp>,
                  ConvertHCSymbolSignatureOp<HCKernelOp>>(converter, ctx);
 

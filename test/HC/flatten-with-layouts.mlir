@@ -1000,3 +1000,63 @@ func.func @buffer_view_strided_slice_then_vload(
       -> !hc.bare_vector<f32, ["8"]>
   return
 }
+
+// -----
+
+// Nullary tensor allocator with a multi-axis shape tuple: flatten
+// retypes the result to its 1D form but the original shape operand
+// keeps the pre-flatten arity verbatim. The rebuild pattern detects
+// the rank gap and synthesises a fresh single-axis tuple from the
+// converted result's symbolic shape (each dim materialised via an
+// empty-binding `hc.idx_apply` that the launch-body walker resolves
+// against the ambient sym map).
+// CHECK-LABEL: @zeros_rebuild_shape
+// CHECK-SAME: %[[A:[^:]+]]: !hc.idx<"A">, %[[B:[^:]+]]: !hc.idx<"B">
+// CHECK: %[[AB:.*]] = hc.idx_apply () : () -> !hc.idx<"A*B">
+// CHECK: %[[S:.*]] = hc.tuple(%[[AB]]) : (!hc.idx<"A*B">) -> tuple<!hc.idx<"A*B">>
+// CHECK: hc.zeros shape %[[S]] : (tuple<!hc.idx<"A*B">>) -> !hc.bare_tensor<f32, ["A*B"]>
+func.func @zeros_rebuild_shape(%a: !hc.idx<"A">, %b: !hc.idx<"B">) {
+  %s = hc.tuple(%a, %b) : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %z = hc.zeros shape %s
+      : (tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.bare_tensor<f32, ["A", "B"]>
+  return
+}
+
+// -----
+
+// Same rebuild path on a fill-style allocator (`hc.full`): the value
+// operand survives verbatim (carried through `flatOperandsOnly`) and
+// only the shape operand is rebuilt to the converted 1D rank.
+// CHECK-LABEL: @full_rebuild_shape
+// CHECK-SAME: %[[V:[^:]+]]: f32
+// CHECK-SAME: %[[A:[^:]+]]: !hc.idx<"A">, %[[B:[^:]+]]: !hc.idx<"B">
+// CHECK: %[[AB:.*]] = hc.idx_apply () : () -> !hc.idx<"A*B">
+// CHECK: %[[S:.*]] = hc.tuple(%[[AB]]) : (!hc.idx<"A*B">) -> tuple<!hc.idx<"A*B">>
+// CHECK: hc.full %[[V]], shape %[[S]] : (f32, tuple<!hc.idx<"A*B">>) -> !hc.bare_tensor<f32, ["A*B"]>
+func.func @full_rebuild_shape(%v: f32, %a: !hc.idx<"A">, %b: !hc.idx<"B">) {
+  %s = hc.tuple(%a, %b) : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %t = hc.full %v, shape %s
+      : (f32, tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.bare_tensor<f32, ["A", "B"]>
+  return
+}
+
+// -----
+
+// The undef-shape entry point: the elementwise-to-generic emitter
+// builds the broadcast init tile with `hc.undef_value`-typed shape
+// operands and lets bound inference patch the result type later.
+// Flatten's rebuild keys off the converted result alone (the shape
+// operand only contributes a rank), so an undef-typed tuple still
+// yields a valid post-flatten op.
+// CHECK-LABEL: @zeros_rebuild_from_undef_shape
+// CHECK-SAME: %[[A:[^:]+]]: !hc.idx<"A">, %[[B:[^:]+]]: !hc.idx<"B">
+// CHECK: %[[AB:.*]] = hc.idx_apply () : () -> !hc.idx<"A*B">
+// CHECK: %[[S:.*]] = hc.tuple(%[[AB]]) : (!hc.idx<"A*B">) -> tuple<!hc.idx<"A*B">>
+// CHECK: hc.zeros shape %[[S]] : (tuple<!hc.idx<"A*B">>) -> !hc.bare_tensor<f32, ["A*B"]>
+func.func @zeros_rebuild_from_undef_shape(%a: !hc.idx<"A">, %b: !hc.idx<"B">) {
+  %u = hc.undef_value : !hc.undef
+  %s = hc.tuple(%u, %u) : (!hc.undef, !hc.undef) -> tuple<!hc.undef, !hc.undef>
+  %z = hc.zeros shape %s
+      : (tuple<!hc.undef, !hc.undef>) -> !hc.bare_tensor<f32, ["A", "B"]>
+  return
+}

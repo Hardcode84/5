@@ -474,48 +474,6 @@ module {
     return
   }
 
-  // `hc.zeros` of a `!hc.tensor` (the semantic carrier that
-  // `hc-decompose-shaped-values --strict=false` leaves behind on
-  // ops it doesn't rewrite — `hc.sub` / `hc.mul` / `hc.builtin_call`
-  // / ... — and that `hc-elementwise-to-generic` then propagates as
-  // the outs init of a synthesised `hc.generic`) is workgroup-local
-  // storage per `doc/langref.md` §340-388, so the carrier rides the
-  // same `hc.alloc workgroup` + per-element splat-store path
-  // `!hc.bare_tensor` already uses. A trailing `ucc ptr -> tensor`
-  // keeps the SSA type stable for downstream consumers (the outs
-  // slot of an `hc.generic`); `hc-lower-generic`'s collective path
-  // UCC-traces the bridge back to the workgroup ptr.
-  // CHECK-LABEL: func.func @workitem_tensor_zeros_to_lds
-  // CHECK: gpu.launch
-  // CHECK: %[[LDS:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
-  // CHECK: hc.ptr_store {{.*}}: f32, !hc.ptr<workgroup, f32>
-  // CHECK: %[[BRIDGE:.+]] = builtin.unrealized_conversion_cast %[[LDS]]
-  // CHECK-SAME: !hc.ptr<workgroup, f32> to !hc.tensor<f32, ["8"]>
-  // CHECK: hc.generic
-  // CHECK-SAME: outs (%[[BRIDGE]] at
-  // CHECK-NOT: arith.constant dense<0.000000e+00>
-  func.func @workitem_tensor_zeros_to_lds(%src: !hc.ptr<global, f32>) {
-    %c1 = arith.constant 1 : index
-    %c8 = arith.constant 8 : index
-    gpu.launch blocks(%bx, %by, %bz) in (%gxr = %c1, %gyr = %c1, %gzr = %c1)
-               threads(%tx, %ty, %tz) in (%sxr = %c8, %syr = %c1, %szr = %c1) {
-      %eight = hc.idx_apply () : () -> !hc.idx<"8">
-      %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
-      %tile = hc.zeros shape %shape
-          : (tuple<!hc.idx<"8">>) -> !hc.tensor<f32, ["8"]>
-      %tile2 = hc.generic
-          iter (parallel i = %eight : !hc.idx<"8">)
-          ins (%src at [#hc.expr<"i">] : !hc.ptr<global, f32>)
-          outs (%tile at [#hc.expr<"i">] : !hc.tensor<f32, ["8"]>)
-          -> (!hc.tensor<f32, ["8"]>) {
-      ^bb0(%v: f32, %init: f32):
-        hc.yield %v : f32
-      }
-      gpu.terminator
-    }
-    return
-  }
-
   // Float-typed `hc.add` / `hc.sub` / `hc.mul` inside an `hc.generic`
   // body lower to `arith.addf` / `arith.subf` / `arith.mulf` — the
   // mirror of the existing int-typed pattern. Pre-pairwise the int
@@ -538,11 +496,11 @@ module {
       %eight = hc.idx_apply () : () -> !hc.idx<"8">
       %shape = hc.tuple(%eight) : (!hc.idx<"8">) -> tuple<!hc.idx<"8">>
       %tile = hc.zeros shape %shape
-          : (tuple<!hc.idx<"8">>) -> !hc.tensor<f32, ["8"]>
+          : (tuple<!hc.idx<"8">>) -> !hc.bare_tensor<f32, ["8"]>
       hc.generic
           iter (parallel i = %eight : !hc.idx<"8">)
-          ins (%tile at [#hc.expr<"i">] : !hc.tensor<f32, ["8"]>,
-               %tile at [#hc.expr<"i">] : !hc.tensor<f32, ["8"]>)
+          ins (%tile at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["8"]>,
+               %tile at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["8"]>)
           outs (%dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
           -> () {
       ^bb0(%a: f32, %b: f32, %init: f32):

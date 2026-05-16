@@ -1539,32 +1539,16 @@ static PtrType workgroupPtrFor(BareTensorType bt) {
   return PtrType::get(bt.getContext(), AddrSpace::Workgroup, elem);
 }
 
-// Symmetric helper for `!hc.tensor`. `doc/langref.md` §340-388 pins
-// the semantic carrier to workgroup storage; `hc-lower-launch-body`
-// plants the `hc.alloc workgroup` + `ucc ptr -> tensor` bridge in
-// `materializeShapedResult`. Reconstructing the ptr type here lets
-// `collectiveOutsPtrs` emit the matching reverse cast — the
-// back-to-back UCC pair folds at canonicalize.
-static PtrType workgroupPtrFor(hc::TensorType t) {
-  auto shaped = cast<SymbolicallyShapedTypeInterface>(t);
-  Type elem = convertBareTensorElement(shaped.getSymbolicElementType());
-  if (!elem)
-    return PtrType();
-  return PtrType::get(t.getContext(), AddrSpace::Workgroup, elem);
-}
-
 // Collective dispatch detector: at least one outs operand is
-// `!hc.ptr<workgroup, T>` (workgroup-staged tile) or a `bare_tensor` /
-// `!hc.tensor` view backed by one. Every `bare_tensor` SSA inside
-// `gpu.launch` is workgroup-backed by the launch-body type-converter
-// convention (`hc.zeros : bare_tensor` collapsed to `hc.alloc
-// workgroup` + a UCC bridge to the still-bare_tensor consumer slot);
-// `!hc.tensor` carries the same LDS storage by langref contract
-// (`doc/langref.md` §340-388) — `hc-lower-launch-body`'s
-// `materializeShapedResult` plants the `hc.alloc workgroup` +
-// `ucc ptr -> tensor` bridge for it. The op must sit inside a
-// `gpu.launch` (we need the dim3 thread/block layout to chunk the
-// iter space across the wave).
+// `!hc.ptr<workgroup, T>` (workgroup-staged tile) or a `bare_tensor`
+// view backed by one. Every `bare_tensor` SSA inside `gpu.launch` is
+// workgroup-backed by the launch-body type-converter convention
+// (`hc.zeros : bare_tensor` collapsed to `hc.alloc workgroup` + a
+// UCC bridge to the still-bare_tensor consumer slot). Semantic
+// `!hc.tensor` doesn't appear at this point — `hc-decompose-shaped-
+// values` splits it into bare (data, mask) pairs upstream. The op
+// must sit inside a `gpu.launch` (we need the dim3 thread/block
+// layout to chunk the iter space across the wave).
 //
 // The workgroup-ptr signal is the dispositive one: a workgroup tile
 // is shared state, so emitting "every lane runs every iteration"
@@ -1590,12 +1574,6 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> /*axes*/) {
       hasWorkgroupOut = true;
       continue;
     }
-    if (auto t = dyn_cast<hc::TensorType>(v.getType())) {
-      if (!workgroupPtrFor(t))
-        return false;
-      hasWorkgroupOut = true;
-      continue;
-    }
     return false;
   }
   if (!hasWorkgroupOut)
@@ -1604,17 +1582,17 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> /*axes*/) {
 }
 
 // Pin every outs to a workgroup ptr we can ptr_offset/load/store
-// against. Direct ptr outs are themselves; bare-tensor / tensor outs
-// UCC through to their backing ptr<workgroup> type once, hoisted
-// above the chunk loop so the cast doesn't re-emit per chunk. The
-// upstream UCC `ptr<workgroup> → bare_tensor` (planted by
-// `hc-lower-launch-body`'s shaped-constant lowering on the producing
-// side) and this fresh `bare_tensor → ptr<workgroup>` form a
-// foldable pair: canonicalize collapses the chain back to the
-// original `hc.alloc workgroup` so per-thread stores hit the real
-// LDS storage without a UCC dead-end at LLVM translation. The
-// `!hc.tensor` shape is symmetric — the bridge is
-// `ptr<workgroup> → tensor` from `materializeShapedResult`.
+// against. Direct ptr outs are themselves; bare_tensor outs UCC
+// through to their backing ptr<workgroup> type once, hoisted above
+// the chunk loop so the cast doesn't re-emit per chunk. The upstream
+// UCC `ptr<workgroup> → bare_tensor` (planted by `hc-lower-launch-
+// body`'s shaped-constant lowering on the producing side) and this
+// fresh `bare_tensor → ptr<workgroup>` form a foldable pair:
+// canonicalize collapses the chain back to the original
+// `hc.alloc workgroup` so per-thread stores hit the real LDS storage
+// without a UCC dead-end at LLVM translation. Semantic `!hc.tensor`
+// doesn't appear at this boundary — decompose splits it into bare
+// (data, mask) pairs upstream.
 static SmallVector<Value> collectiveOutsPtrs(OpBuilder &builder, Location loc,
                                              HCGenericOp op) {
   SmallVector<Value> outsPtrs(op.getOuts().size());
@@ -1623,11 +1601,9 @@ static SmallVector<Value> collectiveOutsPtrs(OpBuilder &builder, Location loc,
       outsPtrs[i] = out;
       continue;
     }
-    PtrType ptrTy;
-    if (auto bt = dyn_cast<BareTensorType>(out.getType()))
-      ptrTy = workgroupPtrFor(bt);
-    else if (auto t = dyn_cast<hc::TensorType>(out.getType()))
-      ptrTy = workgroupPtrFor(t);
+    auto bt = dyn_cast<BareTensorType>(out.getType());
+    assert(bt && "isCollectiveCandidate accepted non-bare_tensor outs");
+    PtrType ptrTy = workgroupPtrFor(bt);
     assert(ptrTy && "isCollectiveCandidate accepted unconvertible outs");
     outsPtrs[i] = UnrealizedConversionCastOp::create(builder, loc, ptrTy, out)
                       .getResult(0);

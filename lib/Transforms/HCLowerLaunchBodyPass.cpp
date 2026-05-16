@@ -1627,22 +1627,15 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
 //   * `vector<...xT>` is the per-workitem register path — pass through.
 //   * `!hc.ptr<workgroup, T>` is the LDS-staged path — allocate the tile
 //     and write the lanes per-element.
-//   * `!hc.tensor` is the semantic LDS carrier that
-//     `hc-decompose-shaped-values --strict=false` leaves on ops it
-//     doesn't rewrite (`hc.sub` / `hc.mul` / `hc.builtin_call` / ...);
-//     `doc/langref.md` §340-388 pins tensors to workgroup-local storage,
-//     so the carrier rides the same LDS-alloc + per-element store path
-//     bare_tensor uses, plus a UCC bridge back to the semantic type so
-//     downstream consumers (typically the outs slot of an `hc.generic`)
-//     keep their original type signature. `hc-lower-generic`'s
-//     collective-candidate path UCC-traces the bridge back to the
-//     workgroup ptr to drive `hc.ptr_load` / `hc.ptr_store`.
+//
+// Semantic `!hc.tensor` doesn't appear here by contract:
+// `hc-decompose-shaped-values` splits every tensor producer/consumer
+// into bare (data, mask) pairs upstream so launch-body only sees the
+// bare carrier. Anything else surviving to this point is a contract
+// bug in decompose.
+//
 // Allocate an LDS tile sized for `shape`'s element count and write
-// the per-lane `vector` into it. Common helper for both the
-// `ptr<workgroup>` and `!hc.tensor` branches of
-// `materializeShapedResult` — the only difference between them is
-// whether the caller returns the ptr directly or UCC-bridges it back
-// to the semantic carrier.
+// the per-lane `vector` into it.
 static FailureOr<Value> writeVectorToFreshLDS(OpBuilder &builder, Location loc,
                                               PtrType ptrType, Value vector,
                                               ArrayRef<int64_t> shape) {
@@ -1653,29 +1646,6 @@ static FailureOr<Value> writeVectorToFreshLDS(OpBuilder &builder, Location loc,
   if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
     return failure();
   return lds;
-}
-
-// Materialize `vector` against a tensor-typed carrier per the LDS
-// contract (`doc/langref.md` §340-388): allocate `hc.alloc workgroup`
-// + per-element splat write, then UCC the workgroup ptr back to the
-// semantic carrier so downstream consumers keep the original type.
-static FailureOr<Value> materializeTensorViaLDS(OpBuilder &builder,
-                                                Location loc,
-                                                hc::TensorType tensorTy,
-                                                Value vector,
-                                                ArrayRef<int64_t> shape) {
-  auto shaped = cast<SymbolicallyShapedTypeInterface>(tensorTy);
-  Type elementType = convertElementType(shaped.getSymbolicElementType());
-  if (!elementType)
-    return failure();
-  PtrType ptrType =
-      PtrType::get(builder.getContext(), AddrSpace::Workgroup, elementType);
-  FailureOr<Value> lds =
-      writeVectorToFreshLDS(builder, loc, ptrType, vector, shape);
-  if (failed(lds))
-    return failure();
-  return UnrealizedConversionCastOp::create(builder, loc, tensorTy, *lds)
-      .getResult(0);
 }
 
 static FailureOr<Value>
@@ -1691,8 +1661,6 @@ materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
       return failure();
     return writeVectorToFreshLDS(builder, loc, ptrType, vector, shape);
   }
-  if (auto tensorTy = dyn_cast_if_present<hc::TensorType>(convertedType))
-    return materializeTensorViaLDS(builder, loc, tensorTy, vector, shape);
   return failure();
 }
 
@@ -2622,35 +2590,22 @@ static void resolveBuffersInPlace(MutableArrayRef<Value> operands,
 }
 
 // Swap LDS-backed ins of an `hc.generic` to the underlying
-// `!hc.ptr<workgroup, T>`. Two LDS carrier shapes show up:
-//   * `!hc.bare_tensor`: the launch-body converter maps it to
-//     `!hc.ptr<workgroup, T>`, so the adaptor hands back the ptr
-//     directly — same SSA the producer's conversion planted.
-//   * `!hc.tensor`: identity through the converter, but the producer
-//     (`materializeShapedResult`) plants a `ucc ptr -> tensor`
-//     bridge. `sourcePtr` walks one step back through the UCC to
-//     recover the workgroup ptr; tensor ins without that bridge stay
-//     in place (they'll lower elsewhere).
+// `!hc.ptr<workgroup, T>`. The launch-body converter maps
+// `!hc.bare_tensor` directly to `!hc.ptr<workgroup, T>`, so the
+// adaptor hands back the ptr SSA the producer's conversion planted.
+// Semantic `!hc.tensor` doesn't appear here by contract —
+// `hc-decompose-shaped-values` splits it into bare (data, mask)
+// pairs upstream so launch-body only sees the bare carrier.
 static void swapInsLDSCarriersToPtrs(MutableArrayRef<Value> newIns,
                                      ValueRange adaptedIns, bool &changed) {
   for (auto [idx, v] : llvm::enumerate(newIns)) {
-    if (isa<BareTensorType>(v.getType())) {
-      Value adapted = adaptedIns[idx];
-      if (!isa<PtrType>(adapted.getType()))
-        continue;
-      newIns[idx] = adapted;
-      changed = true;
+    if (!isa<BareTensorType>(v.getType()))
       continue;
-    }
-    if (isa<hc::TensorType>(v.getType())) {
-      Value adapted = adaptedIns[idx];
-      Value ptr = sourcePtr(adapted);
-      if (!ptr)
-        continue;
-      newIns[idx] = ptr;
-      changed = true;
+    Value adapted = adaptedIns[idx];
+    if (!isa<PtrType>(adapted.getType()))
       continue;
-    }
+    newIns[idx] = adapted;
+    changed = true;
   }
 }
 
@@ -2696,17 +2651,11 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
     //     off `converter.convertType(operandType)` — a pure type-
     //     level check, no SSA chain inspection.
     //
-    //   * `!hc.tensor` ins (the semantic LDS carrier, produced by ops
-    //     `hc-decompose-shaped-values --strict=false` didn't decompose
-    //     and now lowered to `hc.alloc workgroup` + `ucc ptr -> tensor`
-    //     by `materializeShapedResult`) walk one step back through the
-    //     producer UCC via `sourcePtr` and swap to the workgroup ptr
-    //     directly. Symmetric with the bare_tensor case but the chain
-    //     goes through an explicit UCC because the converter leaves
-    //     `!hc.tensor` identity (downstream consumers that expect the
-    //     semantic carrier still see it on outs and reads).
+    // Semantic `!hc.tensor` doesn't appear at this boundary —
+    // `hc-decompose-shaped-values` splits it into bare (data, mask)
+    // pairs upstream, so launch-body only sees the bare carrier.
     //
-    // Outs is left in `bare_tensor` / `!hc.tensor` form. Swapping outs
+    // Outs is left in `bare_tensor` form. Swapping outs
     // would collapse the value-typed SSA result the op contracts to
     // produce (`ptr` outs contribute no SSA result; the verifier
     // matches result count against value-typed outs count). The
@@ -2894,18 +2843,8 @@ static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
   // matching ptr SSA the producer's conversion already planted. Outs
   // intentionally not checked here — we don't swap outs (see the
   // pattern comment).
-  //
-  // `!hc.tensor` ins is illegal iff the SSA's defining op is the
-  // `ucc ptr<workgroup> -> tensor` bridge `materializeShapedResult`
-  // plants on `hc.zeros` / `hc.full` of `!hc.tensor`. `AdaptGenericOp`
-  // walks one step through `sourcePtr` and swaps to the workgroup ptr.
-  // Tensor ins without a UCC bridge stay legal here so `hc-lower-
-  // generic` (which has its own collective-candidate UCC trace) can
-  // pick them up.
   for (Value v : op.getIns()) {
     if (isa<BareTensorType>(v.getType()))
-      return false;
-    if (isa<hc::TensorType>(v.getType()) && sourcePtr(v))
       return false;
   }
   return true;
@@ -3026,11 +2965,48 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   return target;
 }
 
+// Contract gate for the launch-body lowering: `hc-decompose-shaped-
+// values` runs upstream and splits every semantic `!hc.tensor` /
+// `!hc.vector` producer into bare (data, mask) pairs, so by the time
+// this pass runs there's no semantic carrier left to lower. If one
+// survives — either decompose missed a producer pattern, or someone
+// re-introduced the semantic carrier downstream — fail loud with the
+// offending op rather than silently identity-converting the type and
+// having `applyPartialConversion` produce a vague "failed to legalize"
+// error two stages later. Catching it here points the finger at the
+// upstream gap, not at this pass.
+static bool isSemanticShapedType(Type type) {
+  return isa<hc::TensorType, hc::VectorType>(type);
+}
+
+static LogicalResult assertNoSemanticShapedSurvives(Operation *rootOp) {
+  WalkResult walk = rootOp->walk([&](Operation *op) {
+    auto bail = [&](Type type, StringRef role) -> WalkResult {
+      op->emitOpError("semantic shaped type ")
+          << type << " survived past hc-decompose-shaped-values on " << role
+          << "; decompose must split !hc.tensor / !hc.vector into bare "
+             "(data, mask) pairs before hc-lower-launch-body runs";
+      return WalkResult::interrupt();
+    };
+    for (Value v : op->getOperands())
+      if (isSemanticShapedType(v.getType()))
+        return bail(v.getType(), "operand");
+    for (Type t : op->getResultTypes())
+      if (isSemanticShapedType(t))
+        return bail(t, "result");
+    return WalkResult::advance();
+  });
+  return success(!walk.wasInterrupted());
+}
+
 struct HCLowerLaunchBodyPass
     : public hc::impl::HCLowerLaunchBodyBase<HCLowerLaunchBodyPass> {
   using Base::Base;
 
   void runOnOperation() override {
+    if (failed(assertNoSemanticShapedSurvives(getOperation())))
+      return signalPassFailure();
+
     MLIRContext *ctx = &getContext();
     HCLaunchBodyTypeConverter converter;
     RewritePatternSet patterns(ctx);

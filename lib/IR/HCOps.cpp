@@ -3004,6 +3004,19 @@ static LogicalResult verifyHCGenericReductionsNotInOutOffsets(
   return success();
 }
 
+// `!hc.pred` is the dialect's single-bit boolean carrier; `i1` is its
+// post-launch-body substrate (`convertElementType` in `HCLowerLaunchBodyPass`).
+// The body block arg type often outlives an operand's `bare_tensor<!hc.pred>`
+// -> `ptr<workgroup, i1>` swap because `AdaptGenericOp` rewires the operand
+// SSA without touching the body region. Treating the two as
+// interchangeable in the body-arg parity check keeps the verifier honest
+// across that lowering boundary; `hc-lower-generic` UCC-bridges the loaded
+// `i1` to the body's `!hc.pred` block arg uses on the consume side.
+static bool isPredAndI1(Type a, Type b) {
+  return (isa<PredType>(a) && b.isInteger(1)) ||
+         (isa<PredType>(b) && a.isInteger(1));
+}
+
 // Verify the body block exists, has the right arg arity (one per
 // in/out), and each block arg's type matches the corresponding
 // operand element type (skipping `!hc.undef` placeholders).
@@ -3020,7 +3033,8 @@ static LogicalResult verifyHCGenericBodyBlockArgs(HCGenericOp op,
     if (!elem)
       return success();
     Type blockArgType = entry.getArgument(blockIdx).getType();
-    if (isHCUndefType(blockArgType) || blockArgType == elem)
+    if (isHCUndefType(blockArgType) || blockArgType == elem ||
+        isPredAndI1(blockArgType, elem))
       return success();
     return op.emitOpError("body argument #")
            << blockIdx << " type " << blockArgType << " does not match " << role

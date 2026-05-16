@@ -1139,6 +1139,28 @@ struct ConvertIntBinaryOp : public OpConversionPattern<OpT> {
   }
 };
 
+// Float counterpart to `ConvertIntBinaryOp`. The per-element scalar body
+// `hc-elementwise-to-generic` plants inside `hc.generic` carries the source
+// op kind (`hc.add` / `hc.sub` / ...) regardless of element type — the int
+// pattern above bails on float-typed bodies and this one picks them up.
+// The two together cover the numeric surface; pred/index/cast handlers
+// elsewhere cover the rest.
+template <typename OpT, typename ArithOpT>
+struct ConvertFloatBinaryOp : public OpConversionPattern<OpT> {
+  using OpConversionPattern<OpT>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OpT op, typename OpT::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type converted = this->typeConverter->convertType(op.getResult().getType());
+    if (!converted || !isa<FloatType>(converted))
+      return failure();
+    rewriter.template replaceOpWithNewOp<ArithOpT>(
+        op, converted, adaptor.getLhs(), adaptor.getRhs());
+    return success();
+  }
+};
+
 struct SliceAxis {
   Value offset;
   Value stride;
@@ -1601,10 +1623,15 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
   return result;
 }
 
-// Materialize a vector value as a workgroup-AS LDS tile of the given shape.
-// Allocates a flat `!hc.ptr<workgroup, T>` and writes the vector lanes
-// per-element. For the per-lane vector path the converted type is already
-// a `vector<...xT>` and we just pass the value through.
+// Materialize a vector value as the converter's chosen carrier:
+//   * `vector<...xT>` is the per-workitem register path — pass through.
+//   * `!hc.ptr<workgroup, T>` is the LDS-staged path — allocate the tile
+//     and write the lanes per-element.
+//   * Any other `SymbolicallyShapedTypeInterface` (e.g. `!hc.tensor` /
+//     `!hc.vector` that the converter left identity because decompose
+//     didn't rewrite the op-of-interest) bridges via UCC. `hc-lower-generic`
+//     UCCs the carrier back to a builtin vector on the value-outs path and
+//     canonicalize folds the round-trip.
 static FailureOr<Value>
 materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
                         Value vector, ArrayRef<int64_t> shape) {
@@ -1614,16 +1641,23 @@ materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
     return vector;
   }
 
-  auto ptrType = dyn_cast_if_present<PtrType>(convertedType);
-  if (!ptrType || ptrType.getAddrSpace() != AddrSpace::Workgroup)
-    return failure();
-  int64_t total = 1;
-  for (int64_t d : shape)
-    total *= d;
-  Value lds = allocateWorkgroupPtr(builder, loc, ptrType, total);
-  if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
-    return failure();
-  return lds;
+  if (auto ptrType = dyn_cast_if_present<PtrType>(convertedType)) {
+    if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
+      return failure();
+    int64_t total = 1;
+    for (int64_t d : shape)
+      total *= d;
+    Value lds = allocateWorkgroupPtr(builder, loc, ptrType, total);
+    if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
+      return failure();
+    return lds;
+  }
+
+  if (isa<SymbolicallyShapedTypeInterface>(convertedType))
+    return UnrealizedConversionCastOp::create(builder, loc, convertedType,
+                                              vector)
+        .getResult(0);
+  return failure();
 }
 
 // Read a converted shaped value as a multi-dim vector. The per-lane path
@@ -1869,15 +1903,16 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Static shape from the original BareTensor or BareVector result type — used
-// to drive per-element materialization for the LDS path. Returns failure
-// for any type the converter wouldn't have produced a vector or workgroup
-// ptr from.
+// Static shape from any symbolically shaped result type. Drives per-element
+// materialization on every flavour the launch-body lowering sees: BareTensor
+// (LDS-staged), BareVector (per-workitem vector register), and the semantic
+// Tensor / Vector carriers that `hc-decompose-shaped-values --strict=false`
+// leaves behind on ops it doesn't decompose. The semantic types ride through
+// the converter as identity; the rewrite still needs a literal int shape to
+// build the vector init `arith.constant` carrier off of.
 static FailureOr<SmallVector<int64_t>> shapedResultShape(Type type) {
-  if (auto bt = dyn_cast<BareTensorType>(type))
-    return staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bt));
-  if (auto bv = dyn_cast<BareVectorType>(type))
-    return staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(bv));
+  if (auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type))
+    return staticIntegerShape(shaped);
   return failure();
 }
 
@@ -1930,10 +1965,12 @@ struct ConvertNullaryShapedConstantOp : public OpConversionPattern<OpT> {
     FailureOr<SmallVector<int64_t>> shape =
         shapedResultShape(op.getResult().getType());
     if (succeeded(shape)) {
+      auto origShaped =
+          cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
       Type elementType =
-          isa<mlir::VectorType>(converted)
-              ? cast<mlir::VectorType>(converted).getElementType()
-              : cast<PtrType>(converted).getElementType();
+          convertElementType(origShaped.getSymbolicElementType());
+      if (!elementType)
+        return failure();
       mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
       FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
       if (failed(attr))
@@ -1970,9 +2007,11 @@ struct ConvertFillShapedConstantOp : public OpConversionPattern<OpT> {
         shapedResultShape(op.getResult().getType());
     if (failed(shape))
       return failure();
-    Type elementType = isa<mlir::VectorType>(converted)
-                           ? cast<mlir::VectorType>(converted).getElementType()
-                           : cast<PtrType>(converted).getElementType();
+    auto origShaped =
+        cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
+    Type elementType = convertElementType(origShaped.getSymbolicElementType());
+    if (!elementType)
+      return failure();
     mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
     Value vector = vector::BroadcastOp::create(rewriter, op.getLoc(),
                                                vectorType, adaptor.getValue());
@@ -2393,11 +2432,19 @@ struct ConvertDivOp : public OpConversionPattern<HCDivOp> {
   matchAndRewrite(HCDivOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getResult().getType());
-    if (!converted || !converted.isIntOrIndex())
+    if (!converted)
       return failure();
-    rewriter.replaceOpWithNewOp<arith::DivUIOp>(op, converted, adaptor.getLhs(),
-                                                adaptor.getRhs());
-    return success();
+    if (converted.isIntOrIndex()) {
+      rewriter.replaceOpWithNewOp<arith::DivUIOp>(
+          op, converted, adaptor.getLhs(), adaptor.getRhs());
+      return success();
+    }
+    if (isa<FloatType>(converted)) {
+      rewriter.replaceOpWithNewOp<arith::DivFOp>(
+          op, converted, adaptor.getLhs(), adaptor.getRhs());
+      return success();
+    }
+    return failure();
   }
 };
 
@@ -2408,17 +2455,25 @@ struct ConvertNegOp : public OpConversionPattern<HCNegOp> {
   matchAndRewrite(HCNegOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type converted = typeConverter->convertType(op.getResult().getType());
-    if (!converted || !converted.isIntOrIndex())
+    if (!converted)
       return failure();
-    Value zero =
-        converted.isIndex()
-            ? arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0)
-                  .getResult()
-            : arith::ConstantOp::create(rewriter, op.getLoc(), converted,
-                                        rewriter.getZeroAttr(converted));
-    rewriter.replaceOpWithNewOp<arith::SubIOp>(op, converted, zero,
-                                               adaptor.getValue());
-    return success();
+    if (converted.isIntOrIndex()) {
+      Value zero =
+          converted.isIndex()
+              ? arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0)
+                    .getResult()
+              : arith::ConstantOp::create(rewriter, op.getLoc(), converted,
+                                          rewriter.getZeroAttr(converted));
+      rewriter.replaceOpWithNewOp<arith::SubIOp>(op, converted, zero,
+                                                 adaptor.getValue());
+      return success();
+    }
+    if (isa<FloatType>(converted)) {
+      rewriter.replaceOpWithNewOp<arith::NegFOp>(op, converted,
+                                                 adaptor.getValue());
+      return success();
+    }
+    return failure();
   }
 };
 
@@ -2717,7 +2772,10 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertIdxApplyOp, ConvertPredApplyOp, ConvertConstOp,
       ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
       ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
-      ConvertIntBinaryOp<HCMulOp, arith::MulIOp>, ConvertDivOp,
+      ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
+      ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
+      ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
+      ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
       ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
       ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>, ConvertCmpOp<HCCmpGtOp>,
       ConvertCmpOp<HCCmpGeOp>, ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>,

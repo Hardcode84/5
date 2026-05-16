@@ -42,9 +42,9 @@ H = sym.H
 @kernel(work_shape=(W1, W2))
 def pairwise_distance_wg_kernel(
     group,
-    X1: Buffer[W1, H],
-    X2: Buffer[W2, H],
-    D: Buffer[W1, W2],
+    X1: Buffer[W1, H, np.float32],
+    X2: Buffer[W2, H, np.float32],
+    D: Buffer[W1, W2, np.float32],
 ) -> None:
     # `group.work_offset` is `(group_id[0] * group.shape[0],
     # group_id[1] * group.shape[1])` — the upper-left corner of the

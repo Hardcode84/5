@@ -523,6 +523,43 @@ func.func @load_mask_basic(%buf: !hc.buffer<f32, ["M", "N"]>) -> !hc.bare_vector
 
 // -----
 
+// `hc.load_mask` with a partial index list (the `X[gid[0]:]` form
+// against a rank-2 source) gets the same trailing-full-slice
+// padding the data-side `hc.load` rewriter uses: the trailing axis
+// contributes a structurally trivial bound (`0 + 1*iter < N`),
+// completing the rank-matched slice-axis form `composeMaskConjunction`
+// needs. The conjunction carries the user-pinned `i + i_0 < M`
+// alongside the synthesized `i_1 < N`. The decomposed-load broadcast
+// shape `(A,B)` flattened against the rank-1 mask carrier post-flatten
+// rides on the same pre-flatten rewrite: by the time launch-body
+// looks, the op is already an `hc.generic` and the rank-1-vs-tuple
+// mismatch never happens.
+// CHECK-LABEL: func.func @load_mask_partial_indices
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply () : () -> !hc.idx<"A">
+// CHECK-DAG: %[[B:.+]] = hc.idx_apply () : () -> !hc.idx<"B">
+// CHECK: hc.generic iter (parallel i_0 = %[[A]] : !hc.idx<"A">, parallel i_1 = %[[B]] : !hc.idx<"B">)
+// CHECK: ^bb0(%{{[^:]+}}: !hc.pred):
+// CHECK:   %[[P:.+]] = hc.pred_apply () : () -> !hc.pred<"-N + i_1 < 0 & -M + i + i_0 < 0">
+// CHECK:   %[[U:.+]] = builtin.unrealized_conversion_cast %[[P]] : !hc.pred<"-N + i_1 < 0 & -M + i + i_0 < 0"> to !hc.pred
+// CHECK:   hc.yield %[[U]] : !hc.pred
+// CHECK-NOT: hc.load_mask
+func.func @load_mask_partial_indices(%buf: !hc.buffer<f32, ["M", "N"]>,
+                                       %i: !hc.idx<"i">)
+    -> !hc.bare_tensor<!hc.pred, ["A", "B"]> {
+  %slice = hc.slice_expr(lower = %i)
+      : (!hc.idx<"i">) -> !hc.slice<lower = !hc.idx<"i">>
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %b = hc.const<1 : i64> : !hc.idx<"B">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %m = hc.load_mask %buf[%slice], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.slice<lower = !hc.idx<"i">>,
+         tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.bare_tensor<!hc.pred, ["A", "B"]>
+  return %m : !hc.bare_tensor<!hc.pred, ["A", "B"]>
+}
+
+// -----
+
 // Layout-driven gather load. The result type carries a layout whose
 // `storage_size` matches the rank-2 slice's flat capacity (`16 * 16
 // = 256`), so the rewriter inverts the layout's `offset` to

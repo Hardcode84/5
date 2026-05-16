@@ -1082,25 +1082,24 @@ struct SliceAxisInfo {
   ExprAttr srcDim;
 };
 
-// Collect the slice-only axes from `hc.load_mask`'s indices. Returns
-// failure when an index isn't a recognized pinned slice (raw `index`,
-// untyped `!hc.idx`, slice with non-pinned lower/step), or when the
-// resulting slice-axis count doesn't equal the result tile rank, or
-// when there are no slice axes at all (rank-0 mask is a pathological
+// Collect the slice-only axes from `hc.load_mask`'s parallel
+// (axis, isSlice) arrays. Caller is responsible for shape-padding
+// partial indices into the rank-matched form (synthetic full-slice
+// axes have `isSlice=true`). Returns failure when the resulting
+// slice-axis count doesn't equal the result tile rank, or when
+// there are no slice axes at all (rank-0 mask is a pathological
 // shape — `hc-full-mask` is the right primitive).
 static FailureOr<SmallVector<SliceAxisInfo>>
-collectMaskSliceAxes(MLIRContext *ctx, sym::Store &store, ValueRange indices,
-                     ArrayRef<ExprAttr> srcShape,
+collectMaskSliceAxes(sym::Store &store, ArrayRef<AxisIndex> axes,
+                     ArrayRef<bool> isSliceAxis, ArrayRef<ExprAttr> srcShape,
                      ArrayRef<ExprAttr> tileShape) {
+  if (axes.size() != srcShape.size() || axes.size() != isSliceAxis.size())
+    return failure();
   SmallVector<SliceAxisInfo> sliceAxes;
-  for (auto [idx, srcDim] : llvm::zip_equal(indices, srcShape)) {
-    Type indexTy = idx.getType();
-    if (!isa<SliceType>(indexTy))
+  for (auto [k, axis] : llvm::enumerate(axes)) {
+    if (!isSliceAxis[k])
       continue;
-    auto axis = extractAxisIndex(ctx, store, indexTy);
-    if (failed(axis))
-      return failure();
-    sliceAxes.push_back({axis->base, axis->step, srcDim});
+    sliceAxes.push_back({axis.base, axis.step, srcShape[k]});
   }
   if (sliceAxes.size() != tileShape.size() || sliceAxes.empty())
     return failure();
@@ -1317,34 +1316,78 @@ struct MaskPreflight {
   SmallVector<SliceAxisInfo> sliceAxes;
 };
 
-static FailureOr<MaskPreflight>
-preflightLoadMask(MLIRContext *ctx, sym::Store &store, Value source,
-                  ValueRange indices, ArrayRef<ExprAttr> tileShape) {
-  MaskPreflight pf;
+// Resolve the mask source's effective shape and whether it's
+// layout-bearing. `srcShape` is the peeled underlying's shape for
+// layout-bearing sources (`hc.as_layout` with `shape=`) and the
+// source's own shape otherwise. Over-indexing the plain shape
+// remains inconsistent IR.
+static FailureOr<bool>
+resolveMaskSourceShape(Value source, ValueRange indices,
+                       SmallVectorImpl<ExprAttr> &srcShape) {
   if (auto peel = peelLayoutBearingBufferSource(source)) {
     auto shapeOr = getOperandShape(peel->underlying.getType());
     if (failed(shapeOr))
       return failure();
-    pf.srcShape = std::move(*shapeOr);
-  } else {
-    auto shapeOr = getOperandShape(source.getType());
-    if (failed(shapeOr))
-      return failure();
-    pf.srcShape = std::move(*shapeOr);
-    if (indices.size() != pf.srcShape.size())
-      return failure();
+    srcShape = std::move(*shapeOr);
+    return true;
   }
+  auto shapeOr = getOperandShape(source.getType());
+  if (failed(shapeOr))
+    return failure();
+  srcShape = std::move(*shapeOr);
+  if (indices.size() > srcShape.size())
+    return failure();
+  return false;
+}
+
+// Build the parallel (axis, isSlice) arrays for `hc.load_mask`'s
+// indices, padding trailing axes with synthetic full-slice entries
+// when the index list is rank-short. Partial-index form
+// (`X[gid[0]:]` against rank-2 X): the trailing axes are implicit-
+// full slices, contributing a structurally trivial `0 + 1*iter <
+// srcDim` bound. Layout-bearing path skips padding — the layout's
+// own `index_syms` drive that flow.
+static LogicalResult buildMaskAxes(MLIRContext *ctx, sym::Store &store,
+                                   ValueRange indices, size_t srcRank,
+                                   bool layoutBearing,
+                                   SmallVectorImpl<AxisIndex> &axes,
+                                   SmallVectorImpl<bool> &isSliceAxis) {
   auto axesOr = collectAxisIndices(ctx, store, indices);
   if (failed(axesOr))
     return failure();
-  pf.axes = std::move(*axesOr);
+  axes = std::move(*axesOr);
+  isSliceAxis.reserve(srcRank);
+  for (Value idx : indices)
+    isSliceAxis.push_back(isa<SliceType>(idx.getType()));
+  if (layoutBearing)
+    return success();
+  if (failed(padTrailingFullSliceAxes(ctx, store, srcRank, srcRank, axes)))
+    return failure();
+  while (isSliceAxis.size() < axes.size())
+    isSliceAxis.push_back(true);
+  return success();
+}
+
+static FailureOr<MaskPreflight>
+preflightLoadMask(MLIRContext *ctx, sym::Store &store, Value source,
+                  ValueRange indices, ArrayRef<ExprAttr> tileShape) {
+  MaskPreflight pf;
+  auto layoutBearing = resolveMaskSourceShape(source, indices, pf.srcShape);
+  if (failed(layoutBearing))
+    return failure();
+  SmallVector<bool> isSliceAxis;
+  if (failed(buildMaskAxes(ctx, store, indices, pf.srcShape.size(),
+                           *layoutBearing, pf.axes, isSliceAxis)))
+    return failure();
   // `collectMaskSliceAxes` is only well-defined on the rank-matched
   // pure-slice form; let it fail silently when the layout-bearing
   // path needs the per-position bindings instead.
-  auto sliceAxesOr =
-      collectMaskSliceAxes(ctx, store, indices, pf.srcShape, tileShape);
-  if (succeeded(sliceAxesOr))
-    pf.sliceAxes = std::move(*sliceAxesOr);
+  if (pf.axes.size() == pf.srcShape.size()) {
+    auto sliceAxesOr = collectMaskSliceAxes(store, pf.axes, isSliceAxis,
+                                            pf.srcShape, tileShape);
+    if (succeeded(sliceAxesOr))
+      pf.sliceAxes = std::move(*sliceAxesOr);
+  }
   return pf;
 }
 

@@ -851,3 +851,87 @@ func.func @value_in_workgroup_ptr_ins(%dst: !hc.ptr<global, f32>) {
   }
   return
 }
+
+// -----
+
+// Value-typed outs with a mixed parallel + reduction iter set: the
+// pairwise-distance `diff.sum(axis=2)` shape. Outer parallel iters
+// (i_0 = 2, i_1 = 2) compile-time-unroll into 4 parLanes; the
+// reduction iter (r = 4) becomes a single `scf.for` per parLane with
+// the outs init as the loop's iter_arg. Each iteration cloning the
+// body once with the ins `vector.extract` at the runtime slot the
+// `16*i_0 + 4*i_1 + r` offset evaluates to (with the parallel iter
+// syms already pinned to per-parLane constants and `r` bound to the
+// IV). The four final scf.for results compose into
+// `vector.from_elements` sized to the outs lane count (4 = prodPar).
+// CHECK-LABEL: func.func @value_outs_mixed_reduction
+// CHECK-NOT: scf.parallel
+// CHECK: %[[OUTVEC:.+]] = builtin.unrealized_conversion_cast %{{.+}} : !hc.tensor<f32, ["4"]> to vector<4xf32>
+// CHECK: vector.extract %[[OUTVEC]][0]
+// CHECK: vector.extract %[[OUTVEC]][3]
+// CHECK: %[[INVEC:.+]] = builtin.unrealized_conversion_cast %{{.+}} : !hc.tensor<f32, ["16"]> to vector<16xf32>
+// CHECK-COUNT-4: scf.for %{{.+}} = %{{.+}} to %{{.+}} step %{{.+}} iter_args(%{{.+}} = %{{.+}}) -> (f32) {
+// CHECK: vector.extract %[[INVEC]][%{{.+}}] : f32 from vector<16xf32>
+// CHECK: arith.addf
+// CHECK: scf.yield %{{.+}} : f32
+// CHECK: vector.from_elements
+// CHECK-SAME: vector<4xf32>
+// CHECK: builtin.unrealized_conversion_cast %{{.+}} : vector<4xf32> to !hc.tensor<f32, ["4"]>
+// CHECK-NOT: hc.generic
+func.func @value_outs_mixed_reduction(%ins: !hc.tensor<f32, ["16"]>,
+                                      %outs_init: !hc.tensor<f32, ["4"]>)
+    -> !hc.tensor<f32, ["4"]> {
+  %i0 = hc.idx_apply () : () -> !hc.idx<"2">
+  %i1 = hc.idx_apply () : () -> !hc.idx<"2">
+  %r = hc.idx_apply () : () -> !hc.idx<"4">
+  %res = hc.generic
+      iter (parallel i_0 = %i0 : !hc.idx<"2">,
+            parallel i_1 = %i1 : !hc.idx<"2">,
+            reduction r = %r : !hc.idx<"4">)
+      ins (%ins at [#hc.expr<"8*i_0 + 4*i_1 + r">] : !hc.tensor<f32, ["16"]>)
+      outs (%outs_init at [#hc.expr<"2*i_0 + i_1">] : !hc.tensor<f32, ["4"]>)
+      -> (!hc.tensor<f32, ["4"]>) {
+  ^bb0(%a: f32, %acc: f32):
+    %s = arith.addf %acc, %a : f32
+    hc.yield %s : f32
+  }
+  return %res : !hc.tensor<f32, ["4"]>
+}
+
+// -----
+
+// Multi-axis reduction: two reduction iters nest as two `scf.for`s.
+// Single parallel iter unrolls compile-time (2 parLanes); the inner
+// nest carries the per-parLane accumulator through both for ops, and
+// the inner body's `vector.extract` runs once per (parLane, r0, r1)
+// combo at the offset-evaluated slot. The outer scf.for's result is
+// the parLane's final; per-lane finals compose into the outs vector.
+// CHECK-LABEL: func.func @value_outs_mixed_two_reduction
+// CHECK-NOT: scf.parallel
+// CHECK-COUNT-2: scf.for %{{.+}} iter_args(%{{.+}} = %{{.+}}) -> (f32) {
+// CHECK:   scf.for %{{.+}} iter_args(%{{.+}} = %{{.+}}) -> (f32) {
+// CHECK:     vector.extract
+// CHECK:     scf.yield %{{.+}} : f32
+// CHECK:   scf.yield %{{.+}} : f32
+// CHECK: vector.from_elements
+// CHECK-SAME: vector<2xf32>
+// CHECK-NOT: hc.generic
+func.func @value_outs_mixed_two_reduction(%ins: !hc.tensor<f32, ["8"]>,
+                                          %outs_init: !hc.tensor<f32, ["2"]>)
+    -> !hc.tensor<f32, ["2"]> {
+  %p = hc.idx_apply () : () -> !hc.idx<"2">
+  %r0 = hc.idx_apply () : () -> !hc.idx<"2">
+  %r1 = hc.idx_apply () : () -> !hc.idx<"2">
+  %res = hc.generic
+      iter (parallel i = %p : !hc.idx<"2">,
+            reduction k0 = %r0 : !hc.idx<"2">,
+            reduction k1 = %r1 : !hc.idx<"2">)
+      ins (%ins at [#hc.expr<"4*i + 2*k0 + k1">] : !hc.tensor<f32, ["8"]>)
+      outs (%outs_init at [#hc.expr<"i">] : !hc.tensor<f32, ["2"]>)
+      -> (!hc.tensor<f32, ["2"]>) {
+  ^bb0(%a: f32, %acc: f32):
+    %s = arith.addf %acc, %a : f32
+    hc.yield %s : f32
+  }
+  return %res : !hc.tensor<f32, ["2"]>
+}

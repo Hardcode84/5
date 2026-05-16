@@ -1174,8 +1174,8 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
 }
 
 static ConversionTarget
-makeStrictShapedDecompositionTarget(MLIRContext *ctx,
-                                    const TypeConverter &converter) {
+makeShapedDecompositionTarget(MLIRContext *ctx,
+                              const TypeConverter &converter) {
   ConversionTarget target(*ctx);
   target.addLegalOp<UnrealizedConversionCastOp>();
   target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp, HCIntrinsicOp>(
@@ -1206,45 +1206,43 @@ makeStrictShapedDecompositionTarget(MLIRContext *ctx,
   return target;
 }
 
-// Partial conversion target. Asymmetric on purpose: unknown ops are
-// legal (preserved with `unrealized_conversion_cast` boundaries when
-// their operands/results get decomposed), but every op in the enumerated
-// list below is a registered rewrite-pattern target — if one of them
-// carries a semantic shaped operand or result we still want it
-// decomposed, even when the surrounding IR isn't. Extending the rewrite
-// pattern set means extending this list in lockstep; the strict target
-// avoids this drift by treating every op uniformly. See the
-// `hc-decompose-shaped-values` description in `Passes.td` for the
-// invariant the two targets are encoding.
-static ConversionTarget
-makePartialShapedDecompositionTarget(MLIRContext *ctx,
-                                     const TypeConverter &converter) {
-  ConversionTarget target(*ctx);
-  target.addLegalOp<UnrealizedConversionCastOp>();
-  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
-  target.addDynamicallyLegalOp<HCKernelOp, HCFuncOp, HCIntrinsicOp>(
-      [&](Operation *op) {
-        return regionsAreLegal(op, converter) &&
-               callableSignatureIsLegal(op, converter);
-      });
-  target.addDynamicallyLegalOp<
-      HCCallOp, HCCallIntrinsicOp, HCStoreOp, HCReturnOp, HCLoadOp, HCVLoadOp,
-      HCBufferViewOp, HCGetItemOp, HCVecOp, HCStripLayoutOp, HCWithInactiveOp,
-      HCVZerosOp, HCVOnesOp, HCZerosOp, HCOnesOp, HCEmptyOp, HCVFullOp,
-      HCFullOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp, HCNegOp, HCNotOp,
-      HCBuiltinCallOp, HCReduceOp>(
-      [&](Operation *op) { return converter.isLegal(op); });
-  target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
-                               HCSubgroupRegionOp>([&](Operation *op) {
-    return converter.isLegal(op) && regionsAreLegal(op, converter);
+// Post-conversion belt-and-suspenders: walk the IR and assert no
+// `!hc.tensor` / `!hc.vector` survived. The conversion driver returns
+// success iff the target's legality predicates accept the result, so
+// in principle this walk is redundant with `applyFullConversion`. In
+// practice the target is built from explicit op lists and an unknown-
+// op legality lambda; if either set ever drifts (forgets a new HC op,
+// loses a converter check), a semantic carrier could slip through and
+// trip every downstream pass. The walk is cheap and the diagnostic
+// names the offending op directly, instead of letting the failure
+// surface several passes later as a vague type mismatch.
+static bool isSemanticShapedType(Type type) {
+  return isa<mlir::hc::TensorType, mlir::hc::VectorType>(type);
+}
+
+static LogicalResult assertNoSemanticShapedSurvives(Operation *rootOp) {
+  WalkResult walk = rootOp->walk([&](Operation *op) {
+    auto bail = [&](Type type, StringRef role) -> WalkResult {
+      op->emitOpError("semantic shaped type ")
+          << type << " survived hc-decompose-shaped-values on " << role
+          << "; every !hc.tensor / !hc.vector must split into bare "
+             "(data, mask) pairs before the pass returns";
+      return WalkResult::interrupt();
+    };
+    for (Value v : op->getOperands())
+      if (isSemanticShapedType(v.getType()))
+        return bail(v.getType(), "operand");
+    for (Type t : op->getResultTypes())
+      if (isSemanticShapedType(t))
+        return bail(t, "result");
+    for (Region &region : op->getRegions())
+      for (Block &block : region.getBlocks())
+        for (BlockArgument arg : block.getArguments())
+          if (isSemanticShapedType(arg.getType()))
+            return bail(arg.getType(), "block argument");
+    return WalkResult::advance();
   });
-  target.addDynamicallyLegalOp<HCYieldOp>([&](Operation *op) {
-    if (!isa<HCForRangeOp, HCIfOp, HCWorkitemRegionOp, HCSubgroupRegionOp>(
-            op->getParentOp()))
-      return true;
-    return converter.isLegal(op);
-  });
-  return target;
+  return success(!walk.wasInterrupted());
 }
 
 struct HCDecomposeShapedValuesPass
@@ -1260,15 +1258,11 @@ struct HCDecomposeShapedValuesPass
     populateShapedDecompositionPatterns(converter, ctx, patterns);
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-    ConversionTarget target =
-        strictMode ? makeStrictShapedDecompositionTarget(ctx, converter)
-                   : makePartialShapedDecompositionTarget(ctx, converter);
-    LogicalResult result =
-        strictMode
-            ? applyFullConversion(getOperation(), target, frozenPatterns)
-            : applyPartialConversion(getOperation(), target, frozenPatterns);
-    if (failed(result))
-      signalPassFailure();
+    ConversionTarget target = makeShapedDecompositionTarget(ctx, converter);
+    if (failed(applyFullConversion(getOperation(), target, frozenPatterns)))
+      return signalPassFailure();
+    if (failed(assertNoSemanticShapedSurvives(getOperation())))
+      return signalPassFailure();
   }
 };
 

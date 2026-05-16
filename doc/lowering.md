@@ -929,7 +929,7 @@ resolver may have stamped folding / inline markers on, in the order
     hc-infer-types
     hc-materialize-bound-exprs                      (#1)
     hc-verify-static-shapes
-    hc-decompose-shaped-values(strict=false)
+    hc-decompose-shaped-values
     hc-inline-helpers
     hc-materialize-bound-exprs                      (#2)
     apply_dce
@@ -989,14 +989,16 @@ format and override API.
 Postcondition: semantic `hc` operations and explicit region structure exist,
 name-based bindings have been promoted into SSA, inferable HC types have been
 refined, bound symbolic expressions declared by kernel `bound_symbols` have
-been materialized as SSA, static tensor/vector shape operands have been verified,
-and supported semantic shaped values have been split into bare data/masks.
-The scheduled decomposition is non-strict: helper-call signatures, call sites,
-stores, and structured/collective region boundaries are decomposed, while
-intrinsic boundaries that are not decomposed yet are preserved with
-`builtin.unrealized_conversion_cast`. Symbolic launch parameters may still
-remain. Supported helper calls and workitem scope regions are then normalized
-away so the executable HC body is closer to per-workitem SPMD form before
+been materialized as SSA, static tensor/vector shape operands have been
+verified, and every semantic `!hc.tensor` / `!hc.vector` has been split into
+bare `(data, mask)` pairs. The decomposition is the contract boundary between
+the semantic shaped surface and every downstream lowering pass: if any op in
+the IR still carries `!hc.tensor` / `!hc.vector` when decompose finishes, the
+pass fails with the offending op named — first by full-conversion failure on
+the surviving op, then by a post-conversion walk as belt-and-suspenders.
+Symbolic launch parameters may still remain. Supported helper calls and
+workitem scope regions are then normalized away so the executable HC body is
+closer to per-workitem SPMD form before
 upstream lowering. Bound-expression materialization runs a second time after
 helper inlining because inlined helper bodies can expose fresh launch-geometry
 producer chains rooted in kernel scope; the following `apply_dce` removes

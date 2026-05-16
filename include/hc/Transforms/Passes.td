@@ -715,33 +715,24 @@ def HCDecomposeShapedValues
     : Pass<"hc-decompose-shaped-values"> {
   let summary = "Split semantic tensor/vector values into bare data and masks.";
   let description = [{
-    Rewrites supported semantic `!hc.tensor` / `!hc.vector` producers and users
-    into compiler-internal `!hc.bare_tensor` / `!hc.bare_vector` data plus
-    matching bare `!hc.pred` masks. This is an HC-to-HC normalization boundary
-    for upstream lowering; semantic shaped values that cross unsupported ops are
-    diagnosed instead of being silently dropped.
+    Rewrites every semantic `!hc.tensor` / `!hc.vector` producer and user into
+    compiler-internal `!hc.bare_tensor` / `!hc.bare_vector` data plus matching
+    bare `!hc.pred` masks. This is the contract boundary between the semantic
+    shaped surface and every downstream lowering pass: no `!hc.tensor` /
+    `!hc.vector` may survive into `hc-shaped-compute-to-generic`,
+    `hc-flatten-with-layouts`, `hc-lower-launch-body`, or any other pass below
+    `hc-decompose-shaped-values` in `hc/schedules/front_to_hc.mlir`. Surviving
+    semantic carriers are a producer bug and are diagnosed loudly — first by
+    full-conversion failure on whichever op carries the surviving type, then
+    by a post-conversion walk that fails the pass if the driver somehow
+    returned success with leftover semantic carriers.
 
     Ordering: scheduled after `hc-infer-types`, `hc-materialize-bound-exprs`,
     and `hc-verify-static-shapes`. The decomposition reads concrete shaped
     types (so the mask-type derivation can build matching `!hc.pred` carriers)
     and assumes bound symbolic expressions have already been severed from
     their producer chains, so it only sees the post-inference shape surface.
-
-    Legality in `strict=false` mode is asymmetric: unknown ops are legal
-    (passed through unchanged), but the explicit HC op list in
-    `makePartialShapedDecompositionTarget` is still converter-legal-checked
-    because every op in that list is a registered rewrite target — if one of
-    them carries a semantic shaped operand or result, the partial conversion
-    decomposes it even though the rest of the IR may keep its semantic shape
-    via `builtin.unrealized_conversion_cast` boundaries. Strict mode collapses
-    the asymmetry: every op must converter-legalize before the pass succeeds.
   }];
-  let options = [
-    Option<"strictMode", "strict", "bool", "true",
-           "Fail unless every semantic shaped boundary is decomposed. Disable "
-           "this to run a partial conversion that preserves unsupported "
-           "boundaries with unrealized conversion casts.">
-  ];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // RUN: %python -m examples.amdgpu_gfx11_wmma_matmul --dump-front-ir \
-// RUN:   | hc-opt --hc-front-fold-region-defs --hc-front-inline --convert-hc-front-to-hc --hc-promote-names --hc-infer-types --hc-materialize-bound-exprs --hc-verify-static-shapes --hc-decompose-shaped-values=strict=false --hc-inline-helpers --hc-materialize-bound-exprs --canonicalize --hc-normalize-scope-regions --canonicalize --cse \
+// RUN:   | hc-opt --hc-front-fold-region-defs --hc-front-inline --convert-hc-front-to-hc --hc-promote-names --hc-infer-types --hc-materialize-bound-exprs --hc-verify-static-shapes --hc-decompose-shaped-values --hc-inline-helpers --hc-materialize-bound-exprs --canonicalize --hc-normalize-scope-regions --canonicalize --cse \
 // RUN:   | FileCheck %s --implicit-check-not='!hc.tensor<' --implicit-check-not='!hc.vector<' --implicit-check-not='hc.workitem_region' --implicit-check-not='hc.call @'
 
 // CHECK-LABEL: hc.kernel @tiled_gfx11_wmma_matmul

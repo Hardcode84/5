@@ -40,8 +40,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m7 = transform.apply_registered_pass "hc-verify-static-shapes" to %m6
         : (!transform.any_op) -> !transform.any_op
-    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
-        with options = { "strict" = false } to %m7
+    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values" to %m7
         : (!transform.any_op) -> !transform.any_op
     %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
         : (!transform.any_op) -> !transform.any_op
@@ -134,12 +133,12 @@ see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope
 normalization needs launch-context-independent SSA values. The static shape
 verifier then validates SSA shape operands through their inferred tuple element
 types before canonicalization and CSE can obscure the producer that carried a
-bad shape. Shaped-value decomposition runs next in non-strict mode: supported
-producers and users, including helper-call signatures, `hc.call` sites, stores,
-and structured/collective region boundaries, are split into bare data/masks,
-while remaining intrinsic boundaries are preserved with
-`builtin.unrealized_conversion_cast` until those consumers grow decomposition
-rules. Helper inlining can clone fresh launch-geometry producer chains from
+bad shape. Shaped-value decomposition runs next as the contract boundary
+between the semantic shaped surface and every downstream lowering pass: every
+semantic `!hc.tensor` / `!hc.vector` producer and user is split into bare
+data/mask pairs, and any survivor — including intrinsic boundaries that have
+no decomposition rule yet — fails the pass with the offending op named.
+Helper inlining can clone fresh launch-geometry producer chains from
 callee bodies, so bound-expression materialization runs again before
 scope-region normalization. DCE then removes now-dead scope-token geometry
 producers; live workitem/subgroup token uses still diagnose in the normalization

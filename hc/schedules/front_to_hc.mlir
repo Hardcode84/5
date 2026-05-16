@@ -110,8 +110,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m7 = transform.apply_registered_pass "hc-verify-static-shapes" to %m6
         : (!transform.any_op) -> !transform.any_op
-    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values"
-        with options = { "strict" = false } to %m7
+    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values" to %m7
         : (!transform.any_op) -> !transform.any_op
     %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
         : (!transform.any_op) -> !transform.any_op

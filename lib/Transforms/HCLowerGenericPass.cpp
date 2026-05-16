@@ -685,21 +685,13 @@ static std::optional<std::string> diagnoseConstantIterBounds(HCGenericOp op) {
   return std::nullopt;
 }
 
-// The all-parallel unroll emitter threads every parLane through the
-// result vector / store sequence and has no cross-lane carry for a
-// reduction iter. Value-typed ins reuse the same constraint: the
+// All iters must be parallel — the unrolled emitter threads every
+// parLane through the result vector / store sequence, and a
+// reduction iter would need cross-lane carry that the boundary form
+// doesn't model. Value-typed ins reuse the same constraint: the
 // gather slot is a function of iter syms alone, and a reduction iter
 // would mean the same value-in lane gets read at different reduction
 // steps with no scf-loop carry to express it.
-//
-// `lowerValueOutsMixed` lifts the constraint for the case where every
-// outs is value-typed (so no per-iter ptr_store boundary to choose
-// between unrolled and scf): the parallel iters stay compile-time
-// unrolled (one SSA register slot per parLane) and the reduction
-// iters wrap in an `scf.for` nest with the outs init as the loop's
-// iter_arg. Ptr-typed outs alongside reductions still hit this
-// diagnose because they need a per-iter store path the mixed
-// emitter doesn't model.
 static std::optional<std::string> diagnoseAllParallelIters(HCGenericOp op) {
   for (auto [i, k] : llvm::enumerate(op.getIterKindsAttr()))
     if (cast<IterKindAttr>(k).getValue() != IterKind::Parallel)
@@ -708,21 +700,6 @@ static std::optional<std::string> diagnoseAllParallelIters(HCGenericOp op) {
               "iters)")
           .str();
   return std::nullopt;
-}
-
-// True iff `lowerValueOutsMixed` can handle this op. Mirror of the
-// dispatcher predicate in `lowerOne`; `diagnoseUnsupported` uses it
-// to skip the all-parallel gate when the mixed path applies, so a
-// reduction iter alongside all-value-typed outs surfaces a clean
-// lowering instead of a diagnose-and-fail.
-static bool canLowerValueOutsMixed(HCGenericOp op) {
-  for (Value v : op.getOuts())
-    if (isa<PtrType>(v.getType()))
-      return false;
-  for (Attribute k : op.getIterKindsAttr())
-    if (cast<IterKindAttr>(k).getValue() == IterKind::Reduction)
-      return true;
-  return false;
 }
 
 // Body terminator: `hc.yield` (unconditional publish) or
@@ -794,9 +771,8 @@ static std::optional<std::string> diagnoseUnsupported(HCGenericOp op) {
     return std::nullopt;
   if (auto r = diagnoseConstantIterBounds(op))
     return r;
-  if (!canLowerValueOutsMixed(op))
-    if (auto r = diagnoseAllParallelIters(op))
-      return r;
+  if (auto r = diagnoseAllParallelIters(op))
+    return r;
   if (auto r = diagnoseGenericTerminator(op))
     return r;
   return diagnoseAmbientOffsetSyms(op);
@@ -2419,286 +2395,6 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
   return success();
 }
 
-// Build a nested `scf.for` over the reduction iters listed in `redIdx`
-// with `initCarriers` as the iter_args (one per value-typed outs). Each
-// level binds its reduction iter sym to the loop's induction var in
-// `laneScope` and recurses. At the innermost level the body is cloned
-// once with:
-//   * ins values: per-operand `hc.ptr_load` (ptr-typed in) or
-//     `vector.extract` at the runtime slot (value-typed in) under the
-//     current laneScope;
-//   * outs values: the current iter_args (per-parLane reduction
-//     accumulators).
-// The body's yielded values flow into `scf.yield`; the for op's
-// results bubble up as the next level's carries and eventually as the
-// per-parLane finals composed by `emitValueOutResult`.
-static FailureOr<SmallVector<Value>> buildReductionForNestValueOuts(
-    OpBuilder &builder, Location loc, HCGenericOp op, ArrayRef<size_t> redIdx,
-    ArrayRef<int64_t> redBounds, ArrayRef<StringRef> redNames,
-    ValueRange initCarriers, ArrayRef<Value> insAsVec,
-    ArrayRef<Type> insBodyElemTy, llvm::StringMap<Value> &laneScope) {
-  ArrayAttr insOff = op.getInsOffsetsAttr();
-  Block &body = op.getBody().front();
-
-  std::function<FailureOr<SmallVector<Value>>(size_t, ValueRange,
-                                              llvm::StringMap<Value> &)>
-      build = [&](size_t depth, ValueRange carries,
-                  llvm::StringMap<Value> &localScope)
-      -> FailureOr<SmallVector<Value>> {
-    if (depth == redIdx.size()) {
-      SmallVector<Value> insVals(op.getIns().size());
-      for (auto [ii, in] : llvm::enumerate(op.getIns())) {
-        ExprAttr off = getOperandOffset(insOff, ii);
-        Value offVal = emitOffset(builder, loc, off, localScope);
-        if (isa<PtrType>(in.getType())) {
-          Type bodyArgTy = body.getArgument(ii).getType();
-          insVals[ii] =
-              loadCollectiveOperandElement(builder, loc, in, offVal, bodyArgTy);
-          continue;
-        }
-        // Value-typed in: dynamic `vector.extract` at the offset-evaluated
-        // slot. Compile-time-constant offsets fold to a static position
-        // during canonicalize; reduction-iter-dependent offsets stay
-        // dynamic and ride the per-loop-iter SSA index.
-        SmallVector<OpFoldResult> positions = {OpFoldResult(offVal)};
-        Value lane =
-            vector::ExtractOp::create(builder, loc, insAsVec[ii], positions)
-                .getResult();
-        if (lane.getType() != insBodyElemTy[ii])
-          lane = UnrealizedConversionCastOp::create(builder, loc,
-                                                    insBodyElemTy[ii], lane)
-                     .getResult(0);
-        insVals[ii] = lane;
-      }
-      SmallVector<Value> outsVals(carries.begin(), carries.end());
-      SmallVector<Value> yielded;
-      if (failed(
-              cloneBody(builder, op, insVals, outsVals, localScope, yielded)))
-        return failure();
-      if (yielded.size() != op.getOuts().size())
-        return op.emitOpError("body yielded wrong arity");
-      return yielded;
-    }
-    Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-    Value ub = arith::ConstantIndexOp::create(builder, loc, redBounds[depth])
-                   .getResult();
-    Value step = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
-    auto forOp = scf::ForOp::create(builder, loc, c0, ub, step, carries);
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToStart(forOp.getBody());
-    StringRef name = redNames[depth];
-    Value saved = localScope.lookup(name);
-    localScope[name] = forOp.getInductionVar();
-    FailureOr<SmallVector<Value>> inner =
-        build(depth + 1, forOp.getRegionIterArgs(), localScope);
-    if (saved)
-      localScope[name] = saved;
-    else
-      localScope.erase(name);
-    if (failed(inner))
-      return failure();
-    scf::YieldOp::create(builder, loc, *inner);
-    return SmallVector<Value>(forOp.getResults().begin(),
-                              forOp.getResults().end());
-  };
-  return build(0, initCarriers, laneScope);
-}
-
-// Value-typed outs with mixed parallel + reduction iters. Compile-time
-// unroll over the parallel iter space (one SSA register slot per
-// parLane), inner `scf.for` nest over the reduction iters with the
-// outs init as the loop's iter_arg; the body clones once per
-// (parLane, redLane) combo via `cloneBody`. Per-parLane scf.for
-// result becomes the parLane's final; `vector.from_elements` composes
-// them into the outs carrier the same shape `lowerValueOuts` uses for
-// the all-parallel case.
-//
-// Preconditions (checked by `diagnoseUnsupported` / the dispatcher in
-// `lowerOne`):
-//   * At least one reduction iter (otherwise the all-parallel
-//     `lowerValueOuts` is the right path).
-//   * No ptr-typed outs (those need a per-iter ptr_store boundary the
-//     mixed path doesn't model).
-//   * All iter bounds compile-time non-negative integer literals.
-//   * Value-typed outs lane count equals the parallel iter product.
-//   * Value-typed operand offsets reference only iter syms.
-namespace {
-// Iter-axis split for the mixed value-outs path. Constant bounds and
-// iter-sym names are cached per kind so the per-parLane scope build
-// and the inner scf.for nest both pull from the same SoA.
-struct MixedIterSplit {
-  SmallVector<size_t> parIdx;
-  SmallVector<size_t> redIdx;
-  SmallVector<int64_t> parBounds;
-  SmallVector<StringRef> parNames;
-  SmallVector<int64_t> redBounds;
-  SmallVector<StringRef> redNames;
-  int64_t prodPar = 1;
-};
-} // namespace
-
-// Split iter axes into parallel + reduction, collect compile-time
-// bounds + names for each, and compute the parallel iter-space
-// product. Caller validates non-negativity; this function only
-// assembles the SoA. `diagnoseConstantIterBounds` (called from
-// `diagnoseUnsupported`) guarantees every bound is non-negative
-// before we ever reach `lowerValueOutsMixed`, so the assemble-only
-// shape matches the precondition.
-static MixedIterSplit splitMixedIters(ArrayRef<IterAxis> axes) {
-  MixedIterSplit out;
-  for (size_t i = 0; i < axes.size(); ++i)
-    (axes[i].kind == IterKind::Parallel ? out.parIdx : out.redIdx).push_back(i);
-  out.parBounds.reserve(out.parIdx.size());
-  out.parNames.reserve(out.parIdx.size());
-  for (size_t pi : out.parIdx) {
-    out.parBounds.push_back(constIterBound(axes[pi].bound));
-    out.parNames.push_back(axes[pi].name);
-  }
-  out.redBounds.reserve(out.redIdx.size());
-  out.redNames.reserve(out.redIdx.size());
-  for (size_t ri : out.redIdx) {
-    out.redBounds.push_back(constIterBound(axes[ri].bound));
-    out.redNames.push_back(axes[ri].name);
-  }
-  out.prodPar = 1;
-  for (int64_t b : out.parBounds)
-    out.prodPar *= b;
-  return out;
-}
-
-// Per-parLane outs init. Each value-typed outs gets
-// `vector.extract` + UCC at its compile-time slot.
-static LogicalResult
-emitMixedOutsInit(OpBuilder &builder, Location loc, HCGenericOp op,
-                  ArrayRef<SmallVector<int64_t>> slotPerOut, int64_t prodPar,
-                  MutableArrayRef<SmallVector<Value>> outsInit) {
-  for (auto [oi, v] : llvm::enumerate(op.getOuts()))
-    if (failed(emitValueOutInit(builder, loc, op, oi, v, slotPerOut[oi],
-                                prodPar, outsInit)))
-      return failure();
-  return success();
-}
-
-// Compose per-parLane scf.for results into the outs vector carriers
-// (one `vector.from_elements` per outs, UCC'd back to the operand's
-// declared type) and RAUW the original generic.
-static LogicalResult
-composeAndReplaceMixedResults(OpBuilder &builder, Location loc, HCGenericOp op,
-                              ArrayRef<SmallVector<int64_t>> slotPerOut,
-                              int64_t prodPar,
-                              ArrayRef<SmallVector<Value>> finals) {
-  SmallVector<Value, 2> opResults(op.getNumResults());
-  for (auto [oi, v] : llvm::enumerate(op.getOuts())) {
-    FailureOr<Value> result = emitValueOutResult(
-        builder, loc, op, oi, v, slotPerOut[oi], prodPar, finals);
-    if (failed(result))
-      return failure();
-    opResults[oi] = *result;
-  }
-  op->replaceAllUsesWith(opResults);
-  return success();
-}
-
-// UCC each value-typed in once to its builtin `vector<NxBuiltin>` carrier
-// so the per-loop-iter dynamic `vector.extract` can reuse the same SSA.
-// Ptr-typed ins flow through `loadCollectiveOperandElement` and don't
-// need a hoisted carrier; their slots in `insAsVec` / `insBodyElemTy`
-// stay default-initialized.
-static LogicalResult
-prepValueInsCarriers(OpBuilder &builder, Location loc, HCGenericOp op,
-                     SmallVectorImpl<Value> &insAsVec,
-                     SmallVectorImpl<Type> &insBodyElemTy) {
-  insAsVec.assign(op.getIns().size(), Value());
-  insBodyElemTy.assign(op.getIns().size(), Type());
-  for (auto [ii, in] : llvm::enumerate(op.getIns())) {
-    if (isa<PtrType>(in.getType()))
-      continue;
-    FailureOr<VectorCarrier> carrier = valueOperandVectorCarrier(
-        op, in, "value-outs mixed lowering: ins #", ii);
-    if (failed(carrier))
-      return failure();
-    insAsVec[ii] = castToVectorCarrier(builder, loc, in, carrier->vecTy);
-    insBodyElemTy[ii] = carrier->elemTy;
-  }
-  return success();
-}
-
-// Per-parLane scf.for nest emission. Pins each parallel iter sym to a
-// per-parLane compile-time constant in `laneScope`, then hands off to
-// `buildReductionForNestValueOuts` for the reduction loop nest with
-// the parLane's outs init as iter_args.
-static LogicalResult emitParLaneReductionNests(
-    OpBuilder &builder, Location loc, HCGenericOp op, ArrayRef<IterAxis> axes,
-    const MixedIterSplit &split, ArrayRef<SmallVector<Value>> outsInit,
-    ArrayRef<Value> insAsVec, ArrayRef<Type> insBodyElemTy,
-    const llvm::StringMap<Value> &ambientScope,
-    MutableArrayRef<SmallVector<Value>> finals) {
-  for (int64_t parLane = 0; parLane < split.prodPar; ++parLane) {
-    SmallVector<int, 4> parCoords =
-        decomposeLaneIndex(static_cast<int>(parLane), split.parBounds);
-    llvm::StringMap<Value> laneScope = ambientScope;
-    for (auto [pi, c] : llvm::zip_equal(split.parIdx, parCoords))
-      laneScope[axes[pi].name] =
-          arith::ConstantIndexOp::create(builder, loc, c).getResult();
-    FailureOr<SmallVector<Value>> nested = buildReductionForNestValueOuts(
-        builder, loc, op, split.redIdx, split.redBounds, split.redNames,
-        ValueRange(outsInit[parLane]), insAsVec, insBodyElemTy, laneScope);
-    if (failed(nested))
-      return failure();
-    finals[parLane] = std::move(*nested);
-  }
-  return success();
-}
-
-static LogicalResult lowerValueOutsMixed(HCGenericOp op,
-                                         ArrayRef<IterAxis> axes) {
-  Location loc = op.getLoc();
-  OpBuilder builder(op);
-  MLIRContext *ctx = op.getContext();
-  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
-
-  MixedIterSplit split = splitMixedIters(axes);
-  assert(!split.redIdx.empty() && "lowerValueOutsMixed needs a reduction iter");
-  if (failed(validateValueOutsLaneCount(op, split.prodPar)))
-    return failure();
-
-  ValueOutsLanes parLanes;
-  parLanes.bounds = split.parBounds;
-  parLanes.iterNames = split.parNames;
-  parLanes.prodPar = split.prodPar;
-
-  ArrayAttr outsOff = op.getOutsOffsetsAttr();
-  FailureOr<SmallVector<SmallVector<int64_t>>> slotPerOut =
-      resolveValueOutsSlots(op, store, outsOff, parLanes);
-  if (failed(slotPerOut))
-    return failure();
-
-  llvm::StringMap<Value> ambientScope = buildZeroIterScope(builder, loc, axes);
-  seedAmbientScope(op, ambientScope);
-
-  size_t numOuts = op.getOuts().size();
-  SmallVector<SmallVector<Value>> outsInit(split.prodPar,
-                                           SmallVector<Value>(numOuts));
-  if (failed(emitMixedOutsInit(builder, loc, op, *slotPerOut, split.prodPar,
-                               outsInit)))
-    return failure();
-
-  SmallVector<Value> insAsVec;
-  SmallVector<Type> insBodyElemTy;
-  if (failed(prepValueInsCarriers(builder, loc, op, insAsVec, insBodyElemTy)))
-    return failure();
-
-  SmallVector<SmallVector<Value>> finals(split.prodPar,
-                                         SmallVector<Value>(numOuts));
-  if (failed(emitParLaneReductionNests(builder, loc, op, axes, split, outsInit,
-                                       insAsVec, insBodyElemTy, ambientScope,
-                                       finals)))
-    return failure();
-
-  return composeAndReplaceMixedResults(builder, loc, op, *slotPerOut,
-                                       split.prodPar, finals);
-}
-
 // Top-level: pick `(order, partition)` via the divisibility-pruned
 // merge-score search, then dispatch to the partition-aware emitter.
 // The trivial `(1, ..., 1)` partition collapses through the same
@@ -2715,16 +2411,13 @@ static LogicalResult lowerValueOutsMixed(HCGenericOp op,
 //     even though the carrier type would otherwise admit the value-
 //     outs path. `lowerCollective` RAUWs its result(s) to the
 //     original outs SSA (the bare_tensor view of the same storage).
-//   * Value-typed operands next — split on iter-kind mix:
-//       - all-parallel iters use `lowerValueOuts` (compile-time
-//         unroll over the full iter space; a single SSA register
-//         holds the result; value-typed ins use per-lane
-//         `vector.extract`);
-//       - mixed parallel + reduction iters use `lowerValueOutsMixed`
-//         (compile-time unroll over parallel iters, inner `scf.for`
-//         nest over reduction iters with outs init as iter_arg).
-//     Stand-alone `bare_tensor` outs (no `gpu.launch` ancestor) reach
-//     these paths and ride the same compose-and-UCC-back shape.
+//   * Value-typed operands next — `lowerValueOuts` compile-time-
+//     unrolls the parallel sweep so a single SSA register can hold
+//     the result; value-typed ins have only a per-lane
+//     `vector.extract` materialization. Stand-alone `bare_tensor`
+//     outs (no `gpu.launch` ancestor, so no backing LDS) reach this
+//     path and ride the same compose-and-UCC-back shape as
+//     `bare_vector` outs.
 //   * Otherwise — the partition-aware emitter handles all-ptr
 //     generics with no workgroup-shared outs.
 static LogicalResult lowerOne(HCGenericOp op) {
@@ -2740,10 +2433,7 @@ static LogicalResult lowerOne(HCGenericOp op) {
   }
 
   if (hasValueOuts(op) || hasValueIns(op)) {
-    LogicalResult res = canLowerValueOutsMixed(op)
-                            ? lowerValueOutsMixed(op, axes)
-                            : lowerValueOuts(op, axes);
-    if (failed(res))
+    if (failed(lowerValueOuts(op, axes)))
       return failure();
     op.erase();
     return success();

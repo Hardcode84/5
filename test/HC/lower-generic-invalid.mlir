@@ -79,16 +79,12 @@ func.func @bail_value_out_dynamic_bound(%n: index,
 
 // -----
 
-// Mixed-out generic (value-typed bare_vector alongside a ptr-typed
-// out) with a reduction iter. `lowerValueOutsMixed` only kicks in
-// when every outs is value-typed (no per-iter store boundary to
-// model); the ptr-typed out routes the dispatch to `lowerValueOuts`
-// instead, where the all-parallel-iter gate still applies and
-// surfaces the reduction iter as unsupported.
-func.func @bail_mixed_outs_with_reduction(
-    %src: !hc.ptr<global, f32>,
-    %init: !hc.bare_vector<f32, ["4"]>,
-    %dst: !hc.ptr<global, f32>) -> !hc.bare_vector<f32, ["4"]> {
+// Value-typed out with a reduction iter. The unrolled compose
+// threads every parLane through one result vector; a reduction axis
+// would need cross-lane carry the boundary form doesn't model.
+func.func @bail_value_out_with_reduction(%src: !hc.ptr<global, f32>,
+                                         %init: !hc.bare_vector<f32, ["4"]>)
+    -> !hc.bare_vector<f32, ["4"]> {
   %m = hc.idx_apply () : () -> !hc.idx<"4">
   %k = hc.idx_apply () : () -> !hc.idx<"8">
   // expected-error @below {{cannot lower hc.generic; iter #1 kind is reduction (value-typed operand needs all-parallel iters)}}
@@ -96,12 +92,11 @@ func.func @bail_mixed_outs_with_reduction(
       iter (parallel i = %m : !hc.idx<"4">,
             reduction j = %k : !hc.idx<"8">)
       ins (%src at [#hc.expr<"8*i + j">] : !hc.ptr<global, f32>)
-      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["4"]>,
-            %dst at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      outs (%init at [#hc.expr<"i">] : !hc.bare_vector<f32, ["4"]>)
       -> (!hc.bare_vector<f32, ["4"]>) {
-  ^bb0(%sv: f32, %iv: f32, %dv: f32):
+  ^bb0(%sv: f32, %iv: f32):
     %s = hc.add %iv, %sv : (f32, f32) -> f32
-    hc.yield %s, %s : f32, f32
+    hc.yield %s : f32
   }
   return %r : !hc.bare_vector<f32, ["4"]>
 }

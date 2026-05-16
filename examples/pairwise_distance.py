@@ -22,6 +22,14 @@ The point of the example here is twofold:
     gaps still stand between the literal langref text and the existing
     substrate.
 
+The decorator pins `group_shape=(2, 2)` to a concrete integer-literal pair.
+The langref RFC text leaves `group_shape` implicit (the dispatcher picks it),
+but the native amdgpu lowering currently needs `group_shape` to be
+integer-literal at frontend-resolve time so the `$WGS0`/`$WGS1` system
+symbols seed `literal_bindings` for downstream LDS-tile static-shape checks.
+Symbolic `group_shape` with a user-supplied binding is the eventual surface
+- see the followup task in the issue tracker.
+
 Run from the repository root with:
 
     python -m examples.pairwise_distance
@@ -39,7 +47,7 @@ W2 = sym.W2
 H = sym.H
 
 
-@kernel(work_shape=(W1, W2))
+@kernel(work_shape=(W1, W2), group_shape=(2, 2))
 def pairwise_distance_wg_kernel(
     group,
     X1: Buffer[W1, H, np.float32],

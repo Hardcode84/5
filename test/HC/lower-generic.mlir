@@ -529,19 +529,30 @@ func.func @global_outs_in_launch_falls_through(%src: !hc.ptr<global, f32>,
 // -----
 
 // Workgroup-shared outs with a reduction iter: collective dispatch
-// requires every iter to be parallel — cross-iter accumulation
-// across threads is a cross-thread reduction the chunk-and-publish
-// shape doesn't model. Reduction generics fall through to the
-// partition-aware emitter even when the outs is in workgroup AS;
-// the per-thread accumulator path runs locally and the user's
-// upstream code is responsible for the cross-thread synchronization.
-// CHECK-LABEL: func.func @workgroup_outs_with_reduction_falls_through
+// partitions the parallel iter space across the wave (chunk loop
+// over the 8 parallel slots), and inside each in-range chunk-thread
+// an `scf.for` over the 16-element reduction iter accumulates into
+// the slot's register-resident `iter_args` carrier seeded from the
+// LDS outs init. The final carrier value stores back to LDS at the
+// parallel-only outs offset; a closing `gpu.barrier` publishes the
+// per-slot results before the downstream readers run. This is the
+// langref contract: workgroup storage is shared (`doc/langref.md`
+// §340-388), so the reduction accumulator stays per-thread on its
+// own slot and the LDS sees one read + one write per slot per
+// thread.
+// CHECK-LABEL: func.func @collective_workgroup_outs_with_reduction
 // CHECK: gpu.launch
-// CHECK: scf.for
-// CHECK: scf.reduce
-// CHECK-NOT: gpu.barrier
+// CHECK: scf.for {{.*}} = %c0{{.*}} to %{{.*}} step %c1
+// CHECK: scf.if
+// CHECK: %[[INIT:.+]] = hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
+// CHECK: scf.for %{{.+}} = %c0{{.*}} to %{{.*}} step %c1{{.*}} iter_args(%[[ACC:.+]] = %[[INIT]]) -> (f32)
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<global, f32> -> f32
+// CHECK: %[[SUM:.+]] = hc.add %[[ACC]], %{{.+}}
+// CHECK: scf.yield %[[SUM]] : f32
+// CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
+// CHECK: gpu.barrier
 // CHECK-NOT: hc.generic
-func.func @workgroup_outs_with_reduction_falls_through(
+func.func @collective_workgroup_outs_with_reduction(
     %src: !hc.ptr<global, f32>, %lds: !hc.ptr<workgroup, f32>) {
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index

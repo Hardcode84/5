@@ -1539,26 +1539,44 @@ static PtrType workgroupPtrFor(BareTensorType bt) {
   return PtrType::get(bt.getContext(), AddrSpace::Workgroup, elem);
 }
 
+// Symmetric helper for `!hc.tensor`. `doc/langref.md` §340-388 pins
+// the semantic carrier to workgroup storage; `hc-lower-launch-body`
+// plants the `hc.alloc workgroup` + `ucc ptr -> tensor` bridge in
+// `materializeShapedResult`. Reconstructing the ptr type here lets
+// `collectiveOutsPtrs` emit the matching reverse cast — the
+// back-to-back UCC pair folds at canonicalize.
+static PtrType workgroupPtrFor(hc::TensorType t) {
+  auto shaped = cast<SymbolicallyShapedTypeInterface>(t);
+  Type elem = convertBareTensorElement(shaped.getSymbolicElementType());
+  if (!elem)
+    return PtrType();
+  return PtrType::get(t.getContext(), AddrSpace::Workgroup, elem);
+}
+
 // Collective dispatch detector: at least one outs operand is
-// `!hc.ptr<workgroup, T>` (workgroup-staged tile) or a `bare_tensor` view
-// (every bare-tensor SSA inside `gpu.launch` is workgroup-backed by
-// the launch-body type-converter convention — `hc.zeros : bare_tensor`
-// collapsed to `hc.alloc workgroup` + a UCC bridge to the still-
-// bare_tensor consumer slot). Every iter is parallel (no cross-
-// thread accumulation) and the op sits inside a `gpu.launch` (we
-// need the dim3 thread/block layout to chunk the iter space across
-// the wave). Per-lane outs falls through to the existing partition-
-// aware path — running scf.parallel without partitioning is the
-// correct shape for lane-local results.
+// `!hc.ptr<workgroup, T>` (workgroup-staged tile) or a `bare_tensor` /
+// `!hc.tensor` view backed by one. Every `bare_tensor` SSA inside
+// `gpu.launch` is workgroup-backed by the launch-body type-converter
+// convention (`hc.zeros : bare_tensor` collapsed to `hc.alloc
+// workgroup` + a UCC bridge to the still-bare_tensor consumer slot);
+// `!hc.tensor` carries the same LDS storage by langref contract
+// (`doc/langref.md` §340-388) — `hc-lower-launch-body`'s
+// `materializeShapedResult` plants the `hc.alloc workgroup` +
+// `ucc ptr -> tensor` bridge for it. The op must sit inside a
+// `gpu.launch` (we need the dim3 thread/block layout to chunk the
+// iter space across the wave).
 //
 // The workgroup-ptr signal is the dispositive one: a workgroup tile
 // is shared state, so emitting "every lane runs every iteration"
 // against it would have the wave fight itself for every element.
-// All-parallel + launch-enclosed are necessary follow-ups: cross-iter
-// reduction needs cross-thread synchronization the collective shape
-// doesn't model, and the chunk loop's `lin_tid` source disappears
-// outside a launch.
-static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
+// A reduction iter on a workgroup-staged outs is fine and stays here:
+// each thread takes its slot from the parallel-iter partition and
+// runs an scf.for over the reduction iter against the LDS slot
+// (`emitCollectiveChunkReductionNest`). Per-thread reduction over a
+// per-thread register would be the value-outs path; the LDS contract
+// is "every thread shares the tile", so the per-slot accumulator
+// lives in LDS and the reduction is per-thread over its own slot.
+static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> /*axes*/) {
   bool hasWorkgroupOut = false;
   for (Value v : op.getOuts()) {
     if (auto ptr = dyn_cast<PtrType>(v.getType())) {
@@ -1572,26 +1590,31 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes) {
       hasWorkgroupOut = true;
       continue;
     }
+    if (auto t = dyn_cast<hc::TensorType>(v.getType())) {
+      if (!workgroupPtrFor(t))
+        return false;
+      hasWorkgroupOut = true;
+      continue;
+    }
     return false;
   }
   if (!hasWorkgroupOut)
     return false;
-  for (const IterAxis &ax : axes)
-    if (ax.kind != IterKind::Parallel)
-      return false;
   return op->getParentOfType<gpu::LaunchOp>() != nullptr;
 }
 
 // Pin every outs to a workgroup ptr we can ptr_offset/load/store
-// against. Direct ptr outs are themselves; bare-tensor outs UCC
-// through to their backing ptr<workgroup> type once, hoisted above
-// the chunk loop so the cast doesn't re-emit per chunk. The upstream
-// UCC `ptr<workgroup> → bare_tensor` (planted by
+// against. Direct ptr outs are themselves; bare-tensor / tensor outs
+// UCC through to their backing ptr<workgroup> type once, hoisted
+// above the chunk loop so the cast doesn't re-emit per chunk. The
+// upstream UCC `ptr<workgroup> → bare_tensor` (planted by
 // `hc-lower-launch-body`'s shaped-constant lowering on the producing
 // side) and this fresh `bare_tensor → ptr<workgroup>` form a
 // foldable pair: canonicalize collapses the chain back to the
 // original `hc.alloc workgroup` so per-thread stores hit the real
-// LDS storage without a UCC dead-end at LLVM translation.
+// LDS storage without a UCC dead-end at LLVM translation. The
+// `!hc.tensor` shape is symmetric — the bridge is
+// `ptr<workgroup> → tensor` from `materializeShapedResult`.
 static SmallVector<Value> collectiveOutsPtrs(OpBuilder &builder, Location loc,
                                              HCGenericOp op) {
   SmallVector<Value> outsPtrs(op.getOuts().size());
@@ -1600,9 +1623,12 @@ static SmallVector<Value> collectiveOutsPtrs(OpBuilder &builder, Location loc,
       outsPtrs[i] = out;
       continue;
     }
-    auto bt = cast<BareTensorType>(out.getType());
-    PtrType ptrTy = workgroupPtrFor(bt);
-    assert(ptrTy && "isCollectiveCandidate accepted unconvertible bare_tensor");
+    PtrType ptrTy;
+    if (auto bt = dyn_cast<BareTensorType>(out.getType()))
+      ptrTy = workgroupPtrFor(bt);
+    else if (auto t = dyn_cast<hc::TensorType>(out.getType()))
+      ptrTy = workgroupPtrFor(t);
+    assert(ptrTy && "isCollectiveCandidate accepted unconvertible outs");
     outsPtrs[i] = UnrealizedConversionCastOp::create(builder, loc, ptrTy, out)
                       .getResult(0);
   }
@@ -1728,44 +1754,172 @@ emitCollectiveChunkInRange(OpBuilder &builder, Location loc, HCGenericOp op,
   return success();
 }
 
+namespace {
+// Bundle of per-axis-kind metadata for the collective sweep. The
+// chunk loop partitions the parallel iter space across the wave;
+// reduction iters (when present) become an scf.for nest inside each
+// chunk-thread with the outs init load as the iter_args. Caching the
+// SSA bounds + names per kind keeps the chunk-body emission a
+// straight read instead of re-scanning `axes` per use.
+struct CollectiveIterSplit {
+  SmallVector<size_t> parIdx;
+  SmallVector<size_t> redIdx;
+  SmallVector<Value> parBounds;
+  SmallVector<Value> redBounds;
+};
+} // namespace
+
+static CollectiveIterSplit splitCollectiveIters(HCGenericOp op,
+                                                ArrayRef<IterAxis> axes) {
+  CollectiveIterSplit out;
+  ValueRange bounds = op.getIterBounds();
+  for (size_t i = 0; i < axes.size(); ++i) {
+    if (axes[i].kind == IterKind::Parallel) {
+      out.parIdx.push_back(i);
+      out.parBounds.push_back(bounds[i]);
+    } else {
+      out.redIdx.push_back(i);
+      out.redBounds.push_back(bounds[i]);
+    }
+  }
+  return out;
+}
+
+// Reduction-iter shape for the chunk body: load each outs init at the
+// parallel-only offset (the slot every thread owns post-partition),
+// build a nested `scf.for` over reduction iters with the inits as
+// `iter_args`, clone the body once per innermost iteration, propagate
+// yielded values as carries through the nest, and store the outer
+// loop's results back at the same outs offset. Reduction iter syms
+// bind to the loop induction vars in `localScope` while the nest
+// recurses and restore on the way out so siblings of the nest don't
+// see the temporary binding.
+static LogicalResult emitCollectiveChunkReductionNest(
+    OpBuilder &builder, Location loc, HCGenericOp op, ArrayRef<IterAxis> axes,
+    const CollectiveIterSplit &split, ArrayRef<Value> outsPtrs,
+    const llvm::StringMap<Value> &parScope) {
+  ArrayAttr outsOff = op.getOutsOffsetsAttr();
+  ArrayAttr insOff = op.getInsOffsetsAttr();
+  Block &body = op.getBody().front();
+  size_t numIns = op.getIns().size();
+
+  SmallVector<Value> outsInit(op.getOuts().size());
+  for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
+    Value off =
+        emitOffset(builder, loc, getOperandOffset(outsOff, oi), parScope);
+    Type bodyArgTy = body.getArgument(numIns + oi).getType();
+    outsInit[oi] = loadCollectiveOperandElement(builder, loc, outsPtrs[oi], off,
+                                                bodyArgTy);
+  }
+
+  std::function<FailureOr<SmallVector<Value>>(size_t, ValueRange,
+                                              llvm::StringMap<Value> &)>
+      build = [&](size_t depth, ValueRange carries,
+                  llvm::StringMap<Value> &localScope)
+      -> FailureOr<SmallVector<Value>> {
+    if (depth == split.redIdx.size()) {
+      SmallVector<Value> insVals(numIns);
+      for (size_t ii = 0; ii < numIns; ++ii) {
+        Value off =
+            emitOffset(builder, loc, getOperandOffset(insOff, ii), localScope);
+        Type bodyArgTy = body.getArgument(ii).getType();
+        insVals[ii] = loadCollectiveOperandElement(
+            builder, loc, op.getIns()[ii], off, bodyArgTy);
+      }
+      SmallVector<Value> outsVals(carries.begin(), carries.end());
+      SmallVector<Value> yielded;
+      if (failed(
+              cloneBody(builder, op, insVals, outsVals, localScope, yielded)))
+        return failure();
+      if (yielded.size() != op.getOuts().size())
+        return op.emitOpError("body yielded wrong arity");
+      return yielded;
+    }
+    size_t ri = split.redIdx[depth];
+    Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+    Value ub = castIdxToIndex(builder, loc, split.redBounds[depth]);
+    Value step = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+    auto forOp = scf::ForOp::create(builder, loc, c0, ub, step, carries);
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(forOp.getBody());
+    StringRef name = axes[ri].name;
+    Value saved = localScope.lookup(name);
+    localScope[name] = forOp.getInductionVar();
+    auto inner = build(depth + 1, forOp.getRegionIterArgs(), localScope);
+    if (saved)
+      localScope[name] = saved;
+    else
+      localScope.erase(name);
+    if (failed(inner))
+      return failure();
+    scf::YieldOp::create(builder, loc, *inner);
+    return SmallVector<Value>(forOp.getResults().begin(),
+                              forOp.getResults().end());
+  };
+
+  llvm::StringMap<Value> nestScope = parScope;
+  auto finals = build(0, ValueRange(outsInit), nestScope);
+  if (failed(finals))
+    return failure();
+  for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
+    Value off =
+        emitOffset(builder, loc, getOperandOffset(outsOff, oi), parScope);
+    storeCollectiveYielded(builder, loc, outsPtrs[oi], off, (*finals)[oi]);
+  }
+  return success();
+}
+
 // One chunk-thread's body inside the `lin < total` guard. Builds the
-// iter-sym scope from the unlinearised coords, loads every operand at
-// its composed offset, runs the body, and stores yielded values back.
-static LogicalResult emitCollectiveChunkBody(OpBuilder &builder, Location loc,
-                                             HCGenericOp op,
-                                             ArrayRef<IterAxis> axes,
-                                             ValueRange bounds, Value lin,
-                                             ArrayRef<Value> outsPtrs) {
-  SmallVector<Value> coords =
-      unlinearizeCollectiveCoords(builder, loc, lin, bounds);
+// iter-sym scope from the unlinearised parallel coords, then dispatches:
+//   * all-parallel — load every operand at its composed offset, run
+//     the body once, store the yielded scalars back at the same
+//     offset (each thread owns its element of the workgroup tile so
+//     the load+store pair never sees a write from another thread
+//     between them);
+//   * mixed parallel + reduction — load the outs init at the
+//     parallel-only offset, build a per-thread `scf.for` nest over
+//     reduction iters with the inits as `iter_args`, store the nest's
+//     final result back at the same outs offset. The reduction
+//     accumulator lives in registers for the duration of the nest;
+//     LDS gets one store per slot at the end.
+static LogicalResult emitCollectiveChunkBody(
+    OpBuilder &builder, Location loc, HCGenericOp op, ArrayRef<IterAxis> axes,
+    const CollectiveIterSplit &split, Value lin, ArrayRef<Value> outsPtrs) {
+  SmallVector<Value> parCoords = unlinearizeCollectiveCoords(
+      builder, loc, lin, ValueRange(split.parBounds));
   llvm::StringMap<Value> scope;
   seedAmbientScope(op, scope);
-  for (auto [ax, coord] : llvm::zip(axes, coords))
-    scope[ax.name] = coord;
+  for (auto [pi, c] : llvm::zip(split.parIdx, parCoords))
+    scope[axes[pi].name] = c;
 
-  SmallVector<Value> insVals, outsVals;
-  loadCollectiveOperands(builder, loc, op, outsPtrs, scope, insVals, outsVals);
-  return emitCollectiveChunkInRange(builder, loc, op, outsPtrs, insVals,
-                                    outsVals, scope);
+  if (split.redIdx.empty()) {
+    SmallVector<Value> insVals, outsVals;
+    loadCollectiveOperands(builder, loc, op, outsPtrs, scope, insVals,
+                           outsVals);
+    return emitCollectiveChunkInRange(builder, loc, op, outsPtrs, insVals,
+                                      outsVals, scope);
+  }
+  return emitCollectiveChunkReductionNest(builder, loc, op, axes, split,
+                                          outsPtrs, scope);
 }
 
 // Collective dispatch emit. Each thread of the enclosing wave
-// processes a strided subset of the iter space: chunk `c` lands lane
-// `lane * c + lin_tid`, an `scf.if lin < total` guards the trailing
-// partial chunk, and the body runs once per in-range iteration with
-// the unlinearized per-axis coords bound to the iter syms in scope.
-// A closing `gpu.barrier` makes the cooperative writes visible to
-// every thread before the per-lane readers downstream pick the
-// finished tile back up.
+// processes a strided subset of the parallel iter space: chunk `c`
+// lands lane `lane * c + lin_tid`, an `scf.if lin < total` guards the
+// trailing partial chunk, and the body runs once per in-range
+// iteration with the unlinearized per-axis parallel coords bound to
+// the iter syms in scope. A closing `gpu.barrier` makes the
+// cooperative writes visible to every thread before the per-lane
+// readers downstream pick the finished tile back up.
 //
-// Body emission reuses the trivial-partition single-clone path: each
-// in-range iteration loads one element per input operand, runs the
-// body once with the loaded ins + a per-element outs init load, and
-// stores the yielded scalars back at the same composed offset. Each
-// thread owns its element of the workgroup tile for the duration of
-// the body, so the load+store pair never sees a write from another
-// thread between them; the closing `gpu.barrier` makes the chunk's
-// writes visible before the per-lane readers run.
+// Body emission delegates to `emitCollectiveChunkBody`, which picks
+// between the all-parallel single-clone shape (load operands, run
+// body, store yields) and the reduction-iter nest shape (per-thread
+// `scf.for` over reduction iters with the outs init as iter_args).
+// Either way each thread owns its element of the workgroup tile for
+// the duration of the body, so the load+store pair never sees a
+// write from another thread between them; the closing `gpu.barrier`
+// makes the chunk's writes visible before the per-lane readers run.
 static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -1775,10 +1929,11 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
     return op.emitOpError("collective dispatch requires a gpu.launch parent");
   auto [linTid, wgSize] = *tidAndSize;
 
-  ValueRange bounds = op.getIterBounds();
+  CollectiveIterSplit split = splitCollectiveIters(op, axes);
   Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   Value c1 = arith::ConstantIndexOp::create(builder, loc, 1).getResult();
-  auto [total, chunks] = collectiveTotalAndChunks(builder, loc, bounds, wgSize);
+  auto [total, chunks] = collectiveTotalAndChunks(
+      builder, loc, ValueRange(split.parBounds), wgSize);
   SmallVector<Value> outsPtrs = collectiveOutsPtrs(builder, loc, op);
 
   scf::ForOp loop =
@@ -1800,7 +1955,7 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
     OpBuilder::InsertionGuard rangeGuard(builder);
     builder.setInsertionPointToStart(&rangeIf.getThenRegion().front());
     bodyStatus =
-        emitCollectiveChunkBody(builder, loc, op, axes, bounds, lin, outsPtrs);
+        emitCollectiveChunkBody(builder, loc, op, axes, split, lin, outsPtrs);
   }
   if (failed(bodyStatus))
     return failure();

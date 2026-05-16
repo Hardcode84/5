@@ -371,6 +371,37 @@ static LogicalResult rewriteUnaryHomogeneous(OpT op, sym::Store &store) {
   return emitElementwise(op, store, spec);
 }
 
+// `hc.builtin_call` for the elementwise-homogeneous family (`np.sqrt`,
+// `np.exp`, future `np.maximum`, ...). Variadic operands; result shape
+// matches the first operand; per-element body re-emits the same call
+// on the scalar block args. Same broadcast handling as the per-op
+// helpers above — every operand must either share the result shape or
+// project unit dims through `matchBroadcastShapes`.
+static LogicalResult rewriteBuiltinCall(HCBuiltinCallOp op, sym::Store &store) {
+  OperandRange args = op.getArgs();
+  if (args.empty())
+    return failure();
+  Type resultTy = op.getResult().getType();
+  auto shape = getOperandShape(resultTy);
+  if (failed(shape))
+    return failure();
+  auto operandShapes =
+      matchBroadcastShapes(op.getContext(), store, *shape, args);
+  if (failed(operandShapes))
+    return failure();
+  ElementwiseSpec spec;
+  spec.shapedIns.assign(args.begin(), args.end());
+  spec.resultTy = resultTy;
+  spec.resultShape = std::move(*shape);
+  spec.operandShapes = std::move(*operandShapes);
+  StringAttr name = op.getNameAttr();
+  spec.bodyBuilder = [name](OpBuilder &b, Location loc, ValueRange callArgs,
+                            Value /*out*/, Type elem) -> Value {
+    return HCBuiltinCallOp::create(b, loc, elem, name, callArgs).getResult();
+  };
+  return emitElementwise(op, store, spec);
+}
+
 // Comparisons. Result element type differs from input element type
 // (`i1` / `!hc.pred`), so the body returns a separate scalar; the
 // shape-gating helper (`matchBroadcastShapes`) only checks dims —
@@ -452,8 +483,8 @@ struct HCElementwiseToGenericPass
     SmallVector<Operation *> toRewrite;
     root->walk([&](Operation *op) {
       if (isa<HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp, HCAndOp, HCOrOp,
-              HCNegOp, HCNotOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
-              HCCmpEqOp, HCCmpNeOp, HCAsTypeOp>(op))
+              HCNegOp, HCNotOp, HCBuiltinCallOp, HCCmpLtOp, HCCmpLeOp,
+              HCCmpGtOp, HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCAsTypeOp>(op))
         toRewrite.push_back(op);
     });
 
@@ -487,6 +518,8 @@ struct HCElementwiseToGenericPass
               .Case<HCNotOp>([&](auto o) {
                 return rewriteUnaryHomogeneous<HCNotOp>(o, store);
               })
+              .Case<HCBuiltinCallOp>(
+                  [&](auto o) { return rewriteBuiltinCall(o, store); })
               .Case<HCCmpLtOp>(
                   [&](auto o) { return rewriteCmp<HCCmpLtOp>(o, store); })
               .Case<HCCmpLeOp>(

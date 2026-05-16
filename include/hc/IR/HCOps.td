@@ -414,6 +414,38 @@ def HCNegOp : HC_GenericUnaryOp<"neg",
   let summary = "Generic unary minus.";
 }
 
+// Carrier for "the Python source called a named function". Dedicated
+// ops (`hc.add`, `hc.neg`, `hc.pow`, `hc.cmp.lt`, ...) exist for the
+// Python operators — `BinOp`, `UnaryOp`, `Compare` get their own AST
+// nodes and the lowering wants to canonicalize on those at parse time.
+// Everything else with a name (`np.sqrt`, future `np.maximum`, ...) is
+// an ordinary function call from the language's point of view; giving
+// each one its own op buys nothing and would scale linearly with the
+// NumPy surface. This op keeps that family open-ended:
+//
+//   * `name` is the qualified Python name (`numpy.sqrt`, future
+//     `math.tanh`, ...). Dotted so the lowering can dispatch on the
+//     full path without re-classifying by base separately.
+//   * `args` is variadic — covers unary (`np.sqrt(x)`), binary (future
+//     `np.maximum(a, b)`), and n-ary uniformly.
+//   * Single result. Multi-result builtins (e.g. `np.divmod`) would
+//     need a separate op; none of them are in the supported surface.
+//
+// Invariant the front-to-hc dispatch upholds: only names recognised by
+// `isElementwiseBuiltinCall` reach this op, so every reader can assume
+// elementwise homogeneous semantics (`hc-elementwise-to-generic`
+// decomposes, scalar math lowering pattern-matches by name). Anything
+// else (reshape, where, advanced indexing) needs its own mechanism;
+// don't widen this op's contract.
+def HCBuiltinCallOp : HC_Op<"builtin_call", [Pure,
+    DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
+  let summary = "Call to a named library function (e.g. `numpy.sqrt`).";
+  let arguments = (ins StrAttr:$name, Variadic<HC_NumericValueType>:$args);
+  let results = (outs HC_NumericValueType:$result);
+  let assemblyFormat =
+      "$name `(` $args `)` attr-dict `:` functional-type(operands, results)";
+}
+
 // Boolean ops stay on `HC_ValueType` for now: `i1` is an `AnyInteger`, and a
 // cleanly-scoped `HC_BooleanValueType` would require structural support for
 // "integer width == 1" / "tensor element is i1". File as follow-up.

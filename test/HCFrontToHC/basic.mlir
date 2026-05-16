@@ -710,6 +710,41 @@ module {
     hc_front.return %r
   }
 
+  // `np.<func>(...)` lowers structurally to `hc.builtin_call
+  // "numpy.<func>"`. Two cases pin the contract: a one-positional ufunc
+  // (`np.sqrt(x)`) and a no-positional probe (`np.sqrt()` — invalid
+  // shape, but the carrier itself accepts variadic operands so it
+  // still emits; arity / semantic policing is downstream).
+  // CHECK-LABEL: hc.func @numpy_sqrt_unary
+  // CHECK: hc.builtin_call "numpy.sqrt"(%arg0)
+  // CHECK-SAME: (!hc.undef) -> !hc.undef
+  hc_front.func "numpy_sqrt_unary" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %np = hc_front.name "numpy" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %fn = hc_front.attr %np, "sqrt" {ref = {kind = "numpy_attr", attr = "sqrt"}}
+    %r = hc_front.call %fn(%x)
+    hc_front.return %r
+  }
+
+  // CHECK-LABEL: hc.func @numpy_exp_unary
+  // CHECK: hc.builtin_call "numpy.exp"(%arg0)
+  // CHECK-SAME: (!hc.undef) -> !hc.undef
+  hc_front.func "numpy_exp_unary" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %np = hc_front.name "numpy" {ctx = "load", ref = {kind = "module", module = "numpy"}}
+    %fn = hc_front.attr %np, "exp" {ref = {kind = "numpy_attr", attr = "exp"}}
+    %r = hc_front.call %fn(%x)
+    hc_front.return %r
+  }
+
   // `t.sum(axis=2)` is the canonical surface for a reduction over one
   // axis. The lowering reads the literal `axis=` kwarg into the typed
   // `IntegerAttr` slot on `hc.reduce` and stamps the kind off the

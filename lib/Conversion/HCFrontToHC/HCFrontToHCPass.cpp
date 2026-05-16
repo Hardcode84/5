@@ -1725,6 +1725,25 @@ private:
                                         Value base, const CallArgs &args);
   FailureOr<Value> lowerReduceMethod(hc_front::CallOp call, StringRef method,
                                      Value base, const CallArgs &args);
+  // `np.<func>(...)` for the bench of NumPy ufuncs the front pass
+  // forwards to `hc.builtin_call`. Called from `lowerDslMethodCall`
+  // when the attr base is `numpy_attr` and the method passes
+  // `isNumpyBuiltinCallMethod`. The returned value is a
+  // `hc.builtin_call` with `name = "numpy.<method>"`; downstream
+  // lowering pattern-matches on the name to emit `math.*` (or a
+  // runtime call where needed).
+  FailureOr<Value> lowerNumpyBuiltinCall(hc_front::CallOp call,
+                                         StringRef method,
+                                         const CallArgs &args);
+  // Method-bucket dispatch for the value-base case (`x.vec()`,
+  // `x.sum()`, `group.load(...)`, `group.shape`, ...). Split out of
+  // `lowerDslMethodCall` so the outer routine stays a flat list of
+  // ref-kind early returns and the per-bucket fan-out lives in one
+  // place.
+  FailureOr<Value> lowerValueBaseMethodCall(hc_front::CallOp call,
+                                            hc_front::AttrOp attr,
+                                            StringRef method,
+                                            const CallArgs &args);
   FailureOr<Value> lowerMemOp(hc_front::CallOp call, StringRef method,
                               const CallArgs &args);
   FailureOr<Value> lowerMemLoad(hc_front::CallOp call, StringRef method,
@@ -3650,6 +3669,22 @@ static bool isReduceMethod(StringRef method) {
          method == "prod";
 }
 
+// `np.<func>(...)` calls the front-to-hc rewrite forwards to a
+// `hc.builtin_call "numpy.<func>"` carrier. Dispatch is name-based —
+// every entry here is an opaque-from-the-dialect's-POV NumPy ufunc that
+// downstream lowering must recognise. We don't restrict to unary because
+// `np.maximum(a, b)` etc. share the same shape; arity is enforced
+// downstream (or by the lowering pattern that consumes the call).
+//
+// Why a per-bead allow-list and not "any numpy attr": a typo
+// (`np.srqt`) would otherwise silently lower to a builtin_call with a
+// bogus name that only fails at the lowering pass, far from the
+// source. Failing here keeps the diagnostic pointed at the user-visible
+// call. New entries cost one row plus a downstream lowering pattern.
+static bool isNumpyBuiltinCallMethod(StringRef method) {
+  return method == "sqrt" || method == "exp";
+}
+
 FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
                                              hc_front::AttrOp attr) {
   RefInfo ref = RefInfo::get(attr);
@@ -3674,9 +3709,21 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return failure();
   CallArgs &args = *argsOr;
 
+  // Module-namespace attr bases — numpy as a module isn't a lowerable
+  // value, so these branches dispatch without lowering `attr.getBase()`
+  // (which would null-fail). Every other attr base goes through the
+  // value-base bucket dispatch.
   if (ref.getKind() == "numpy_dtype_type")
     return lowerNumpyDtypeCall(call, ref, args);
+  if (ref.getKind() == "numpy_attr" && isNumpyBuiltinCallMethod(method))
+    return lowerNumpyBuiltinCall(call, method, args);
+  return lowerValueBaseMethodCall(call, attr, method, args);
+}
 
+FailureOr<Value> Lowerer::lowerValueBaseMethodCall(hc_front::CallOp call,
+                                                   hc_front::AttrOp attr,
+                                                   StringRef method,
+                                                   const CallArgs &args) {
   FailureOr<Value> baseOr =
       lowerValueOperand(attr.getBase(), call.getOperation(), "method base");
   if (failed(baseOr))
@@ -3854,6 +3901,36 @@ FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
         HCConstOp::create(builder, call.getLoc(), undef, typed).getResult()};
   return lowerValueOperand(call.getCallee(), call.getOperation(),
                            "dtype callee");
+}
+
+// `np.<func>(...)` forwarded to `hc.builtin_call`. Caller has gated on
+// `isNumpyBuiltinCallMethod`. Arity / kwarg policing happens
+// downstream where the lowering pattern knows what `numpy.<method>`
+// expects; here we just refuse keyword arguments (no ufunc in our
+// surface uses them) and confirm every positional lowered.
+FailureOr<Value> Lowerer::lowerNumpyBuiltinCall(hc_front::CallOp call,
+                                                StringRef method,
+                                                const CallArgs &args) {
+  if (!args.kwattrs.empty() || !args.kwvalues.empty()) {
+    call.emitOpError("`np.") << method << "(...)` takes no keyword arguments";
+    return failure();
+  }
+  SmallVector<Value> operands;
+  operands.reserve(args.positional.size());
+  for (auto [index, operand] : llvm::enumerate(args.positional)) {
+    if (!operand) {
+      call.emitOpError("`np.")
+          << method << "(...)`: argument " << index << " did not lower";
+      return failure();
+    }
+    operands.push_back(operand);
+  }
+  // `numpy.<method>` — dotted so the lowering can dispatch on the full
+  // path. New library namespaces (`math.*`, ...) compose the same way.
+  std::string qualified = ("numpy." + method).str();
+  StringAttr name = builder.getStringAttr(qualified);
+  return HCBuiltinCallOp::create(builder, call.getLoc(), undef, name, operands)
+      .getResult();
 }
 
 // Lower `base.vec(layout=?)`. Optional `layout=` kwarg threads through

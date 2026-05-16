@@ -1485,6 +1485,24 @@ LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+// `hc.builtin_call` is elementwise homogeneous by the dispatch
+// invariant (see the op definition): result type matches the first
+// operand's type. Pre-inference `!hc.undef` arms propagate as `{}` so
+// the type-inference pass keeps probing; once any operand has a
+// concrete shaped HC type we plant it. Symbolic `!hc.idx` operands
+// don't have a sensible math.* lowering so they fall through as `{}`.
+LogicalResult
+HCBuiltinCallOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                              SmallVectorImpl<Type> &resultTypes) {
+  Type first = operandTypes.empty() ? Type{} : operandTypes.front();
+  if (!first || isa<IdxType>(first)) {
+    resultTypes.push_back({});
+    return success();
+  }
+  resultTypes.push_back(first);
+  return success();
+}
+
 LogicalResult HCCmpLtOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   return inferIndexCmp(operandTypes, sym::PredCmpOp::Lt, *this, resultTypes);

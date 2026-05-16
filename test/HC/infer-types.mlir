@@ -595,6 +595,26 @@ hc.func @pow_inference(%x: f32, %e: f32, %m: !hc.idx<"M">) {
 
 // -----
 
+// `hc.builtin_call` inference plants the operand's type on the result
+// (elementwise homogeneous by the dispatch invariant). Two arms: a
+// shaped float input refines the result tensor; a symbolic idx input
+// falls through as `!hc.undef` — `numpy.sqrt` on a symbolic dim has
+// no sensible math.* lowering and `hc-lower-math` would diagnose it
+// later, so we don't pin a type early.
+// CHECK-LABEL: hc.func @builtin_call_inference
+// CHECK: hc.builtin_call "numpy.sqrt"({{.*}}) : (!hc.tensor<f32, ["M"]>) -> !hc.tensor<f32, ["M"]>
+// CHECK: hc.builtin_call "numpy.exp"({{.*}}) : (!hc.idx<"M">) -> !hc.undef
+hc.func @builtin_call_inference(%t: !hc.tensor<f32, ["M"]>,
+                                 %m: !hc.idx<"M">) {
+  %a = hc.builtin_call "numpy.sqrt"(%t)
+      : (!hc.tensor<f32, ["M"]>) -> !hc.undef
+  %b = hc.builtin_call "numpy.exp"(%m)
+      : (!hc.idx<"M">) -> !hc.undef
+  hc.return
+}
+
+// -----
+
 // `hc.reduce` inference drops the `axis` dim from the input shape so
 // the post-inference IR carries a concrete result type for
 // `hc-shaped-compute-to-generic`'s shape validation. Without this

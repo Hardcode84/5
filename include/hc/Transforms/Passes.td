@@ -137,6 +137,34 @@ def HCLowerPow : Pass<"hc-lower-pow"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCLowerMath : Pass<"hc-lower-math"> {
+  let summary = "Rewrite hc.builtin_call to the matching upstream math op.";
+  let description = [{
+    Walks every `hc.builtin_call` and lowers by name:
+
+      * `"numpy.sqrt"` -> `math.sqrt`
+      * `"numpy.exp"`  -> `math.exp`
+
+    Today only float scalar / vector / shaped operands compatible with
+    the upstream `math` dialect are supported — HC's own shaped types
+    (`!hc.tensor`, `!hc.vector`) have to ride `hc-elementwise-to-generic`
+    first so the carrier shows up scalar inside a `hc.generic` body
+    before this pass fires. The body op accepts any
+    `math`-compatible operand type uniformly; the path that exercises
+    that is `hc-lower-generic` cloning the body — math.sqrt comes
+    along unchanged.
+
+    No-op when no `hc.builtin_call` survives, so safe to leave wired
+    against user schedules that don't use the NumPy ufunc surface. An
+    unrecognised name surfaces a single-spot diagnostic here rather
+    than leaking through to LLVM lowering as an unknown op.
+  }];
+  let dependentDialects = [
+    "::mlir::hc::HCDialect",
+    "::mlir::math::MathDialect",
+  ];
+}
+
 def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
   let summary = "Verify SSA shape operands have static HC shape metadata.";
   let description = [{

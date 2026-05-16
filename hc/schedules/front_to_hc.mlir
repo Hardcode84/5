@@ -155,7 +155,15 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m10c = transform.apply_registered_pass "hc-elementwise-to-generic" to %m10b
         : (!transform.any_op) -> !transform.any_op
-    %m10d = transform.apply_registered_pass "hc-load-store-to-generic" to %m10c
+    // Rewrite `hc.builtin_call` (NumPy ufuncs forwarded by the front
+    // pass) to upstream `math.<op>`. Runs after
+    // `hc-elementwise-to-generic` so the carrier is in scalar form
+    // inside a `hc.generic` body (HC's shaped types aren't compatible
+    // with the `math.*` dialect, but its scalar / vector form is).
+    // No-op when the kernel uses no NumPy ufuncs.
+    %m10cm = transform.apply_registered_pass "hc-lower-math" to %m10c
+        : (!transform.any_op) -> !transform.any_op
+    %m10d = transform.apply_registered_pass "hc-load-store-to-generic" to %m10cm
         : (!transform.any_op) -> !transform.any_op
     // Distribute wave-cooperative layout-bearing carriers (e.g. the AMD
     // gfx11 WMMA accumulator's `<offset = 32*fi + lane>` accumulator)

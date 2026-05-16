@@ -93,6 +93,36 @@ func.func @logic_family(%a: !hc.tensor<i1, ["M"]>,
 
 // -----
 
+// `hc.builtin_call` decomposes the same way as the per-op unary helpers:
+// one shaped operand becomes one `ins`, the body re-emits the same
+// builtin_call by name on the scalar block arg, and the result fills
+// a shape-matching init. Two cases — `numpy.sqrt` for one operand and
+// `numpy.exp` for a second name — confirm the name attribute threads
+// through unchanged and the dispatch table doesn't depend on it.
+// CHECK-LABEL: func.func @builtin_call_sqrt_exp
+// CHECK: %[[FILLS:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.tensor<f32, ["M"]>
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">] : !hc.tensor<f32, ["M"]>)
+// CHECK-SAME: outs (%[[FILLS]] at [#hc.expr<"i_0">] : !hc.tensor<f32, ["M"]>)
+// CHECK: ^bb0(%[[A:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[S:.+]] = hc.builtin_call "numpy.sqrt"(%[[A]]) : (f32) -> f32
+// CHECK:   hc.yield %[[S]] : f32
+// CHECK: %[[FILLE:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.tensor<f32, ["M"]>
+// CHECK: hc.generic
+// CHECK: ^bb0(%[[B:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[E:.+]] = hc.builtin_call "numpy.exp"(%[[B]]) : (f32) -> f32
+// CHECK:   hc.yield %[[E]] : f32
+func.func @builtin_call_sqrt_exp(%a: !hc.tensor<f32, ["M"]>)
+    -> (!hc.tensor<f32, ["M"]>, !hc.tensor<f32, ["M"]>) {
+  %s = hc.builtin_call "numpy.sqrt"(%a)
+      : (!hc.tensor<f32, ["M"]>) -> !hc.tensor<f32, ["M"]>
+  %e = hc.builtin_call "numpy.exp"(%a)
+      : (!hc.tensor<f32, ["M"]>) -> !hc.tensor<f32, ["M"]>
+  return %s, %e : !hc.tensor<f32, ["M"]>, !hc.tensor<f32, ["M"]>
+}
+
+// -----
+
 // Comparisons: result element type is `i1`, distinct from the input
 // element type. Block args follow each operand's element type, so
 // the body emits `hc.cmp.lt %f32, %f32 -> i1`.

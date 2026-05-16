@@ -1915,14 +1915,14 @@ collapseReduceShape(ArrayRef<Attribute> dims, uint64_t axis, bool keepdims,
   return outDims;
 }
 
-// `hc.reduce`'s ODS pins the operand to `HC_ShapedValueType`
-// (`!hc.undef` / `!hc.tensor` / `!hc.vector`); bare carriers can't
-// surface (`hc-decompose-shaped-values` either rewrites the reduce
-// up-front or fails legality), so the dispatcher only mirrors the two
-// semantic flavors. Layout is intentionally dropped — the reduced
-// axis was part of the operand's index space, and carrying the
-// operand layout's name list past the collapse would dangle a stale
-// dim sym.
+// `hc.reduce`'s ODS pins the operand to `HC_DecomposableShapedValueType`
+// (`!hc.undef` / `!hc.tensor` / `!hc.vector` / `!hc.bare_tensor` /
+// `!hc.bare_vector`). Mirror the operand flavour on the result. Semantic
+// carriers arrive pre `hc-decompose-shaped-values`; bare ones arrive after,
+// when the decompose pass has planted the reduce on the data half of a
+// (data, mask) split. Layout is intentionally dropped — the reduced
+// axis was part of the operand's index space, and carrying the operand
+// layout's name list past the collapse would dangle a stale dim sym.
 static Type rebuildReduceResultType(Type valueType, Type elem,
                                     ShapeAttr outShape) {
   MLIRContext *ctx = elem.getContext();
@@ -1930,10 +1930,6 @@ static Type rebuildReduceResultType(Type valueType, Type elem,
     return mlir::hc::TensorType::get(ctx, elem, outShape, LayoutAttr{});
   if (isa<mlir::hc::VectorType>(valueType))
     return mlir::hc::VectorType::get(ctx, elem, outShape, LayoutAttr{});
-  // Bare carriers reach `hc.reduce` post `hc-decompose-shaped-values`:
-  // the data half of a (data, mask) split rides the bare carrier and
-  // still needs a result type with the reduced shape so downstream
-  // `hc-elementwise-to-generic` sees a well-typed value.
   if (isa<mlir::hc::BareTensorType>(valueType))
     return mlir::hc::BareTensorType::get(ctx, elem, outShape, LayoutAttr{});
   if (isa<mlir::hc::BareVectorType>(valueType))

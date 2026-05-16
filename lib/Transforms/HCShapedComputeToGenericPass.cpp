@@ -118,13 +118,13 @@ static bool reduceComboSupported(ReduceKind kind, Type elem) {
 // floats, `hc.full <0>` for ints); max -> -inf; min -> +inf. Caller
 // pre-validates with `reduceComboSupported`.
 //
-// `resultTy` is the reduce-generic outs type — either the semantic
-// `!hc.tensor` or its post-decompose bare counterpart. Both are
-// `SymbolicallyShapedTypeInterface` carriers exposing the same
-// element type accessor, and both flow through `HCZerosOp` /
-// `HCFullOp` which accept any `HC_ValueType` result. Threading
-// `Type` rather than a concrete tensor class keeps the rewrite valid
-// on the decomposed data half too.
+// `resultTy` is the reduce-generic outs type — a
+// `SymbolicallyShapedTypeInterface` carrier (post `hc-decompose-shaped-values`
+// the data half of a split is a bare `!hc.bare_tensor`; isolated unit-test
+// pipelines that skip decompose still pin semantic `!hc.tensor` here).
+// Threading the interface keeps the helper flavour-agnostic; element type comes
+// from the interface accessor and feeds straight into `HCZerosOp` / `HCFullOp`,
+// which accept any `HC_ValueType` result.
 static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
                                     ReduceKind kind, Type resultTy,
                                     Value shape) {
@@ -380,10 +380,11 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   ArrayRef<ExprAttr> valShape = shape->valShape;
   uint64_t axis = shape->axis;
 
-  // Accept both the semantic `!hc.tensor` and the post-decompose
-  // `!hc.bare_tensor` carrier — the rewrite is structural over the
-  // reduce shape and doesn't care which flavour the producer planted,
-  // as long as both operand and result share it.
+  // Operand and result are `SymbolicallyShapedTypeInterface` carriers.
+  // In the production schedule they're bare post `hc-decompose-shaped-values`;
+  // unit-test pipelines that skip decompose still pin semantic forms here.
+  // The rewrite is structural over the reduce shape so the interface
+  // dispatch covers both without branching.
   auto valTy =
       dyn_cast<SymbolicallyShapedTypeInterface>(op.getValue().getType());
   auto outTy =

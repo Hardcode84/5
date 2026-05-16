@@ -83,19 +83,22 @@ static Type dropWorkitemSuffix(Type type, ArrayRef<Attribute> suffix) {
     return changed ? TupleType::get(type.getContext(), elements) : type;
   }
 
-  auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
-  if (!shaped || !isa<mlir::hc::VectorType, BareVectorType>(type))
+  // Only bare vectors carry workitem-suffix dims at this point: the
+  // pass runs downstream of `hc-decompose-shaped-values`, which has
+  // already split every semantic `!hc.vector` into bare data and mask
+  // halves. Semantic `!hc.tensor` / `!hc.vector` reaching here is a
+  // contract violation caught by the post-conversion gate in decompose
+  // and by the `assertNoSemanticShapedSurvives` gate fronting
+  // `hc-lower-launch-body`.
+  auto bareVector = dyn_cast<BareVectorType>(type);
+  if (!bareVector)
     return type;
-  ArrayRef<Attribute> dims = shaped.getSymbolicShape().getDims();
+  ArrayRef<Attribute> dims = bareVector.getShape().getDims();
   if (!hasSuffix(dims, suffix))
     return type;
 
   SmallVector<Attribute> localDims(dims.drop_back(suffix.size()));
   ShapeAttr localShape = ShapeAttr::get(type.getContext(), localDims);
-  if (auto vector = dyn_cast<mlir::hc::VectorType>(type))
-    return mlir::hc::VectorType::get(type.getContext(), vector.getElementType(),
-                                     localShape);
-  auto bareVector = cast<BareVectorType>(type);
   return BareVectorType::get(type.getContext(), bareVector.getElementType(),
                              localShape);
 }

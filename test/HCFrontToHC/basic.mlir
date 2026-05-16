@@ -364,6 +364,27 @@ module {
     hc_front.return
   }
 
+  // Target-tuple unpack: `g0, g1 = group.shape` carries no per-axis
+  // subscript on the attr, so the static-rank tracker has nothing
+  // to latch onto. The Workgroup-domain fallback chains through the
+  // kernel's `work_shape` rank instead of dropping to the 32-axis cap
+  // — `group_shape`'s rank matches `work_shape`'s by spec.
+  // CHECK-LABEL: hc.kernel @group_shape_tuple_unpack
+  // CHECK: %[[GSV:.*]]:2 = hc.group_shape %arg0 : (!hc.group<work_shape = #hc.shape<["M", "N"]>>) -> (!hc.idx<"$WGS0">, !hc.idx<"$WGS1">)
+  // CHECK-NOT: $WGS2
+  hc_front.kernel "group_shape_tuple_unpack" attributes {
+    work_shape = ["M", "N"],
+    parameters = [{name = "group"}]
+  } {
+    %g0 = hc_front.target_name "g0"
+    %g1 = hc_front.target_name "g1"
+    %pair = hc_front.target_tuple(%g0, %g1)
+    %grp = hc_front.name "group" {ctx = "load", ref = {kind = "param"}}
+    %sh_attr = hc_front.attr %grp, "shape" {ref = {kind = "dsl_method", method = "shape"}}
+    hc_front.assign %pair = %sh_attr
+    hc_front.return
+  }
+
   // Local-bound alias: `g = group.shape; g[N]` should hit the same
   // launch-geo tuple + getitem path as the inline `group.shape[N]`
   // form — `trySubscriptFolds` traces the local name back to the

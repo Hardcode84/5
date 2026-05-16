@@ -741,15 +741,23 @@ static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, TypeRange inputTypes,
   unsigned groupRank =
       groupShape ? static_cast<unsigned>(groupShape.getDims().size()) : 0;
   unsigned groupIdRank = workRank ? workRank : groupRank;
+  // `group_shape` aligns 1:1 with `work_shape` (`doc/langref.md`
+  // "logical launch domain"). When the user only declares `work_shape`
+  // and lets the runtime pick a default group_shape, the per-workgroup
+  // launch-geo prefixes (`$WGS`, `$WI`, `$SGI`) still need to appear in
+  // the kernel's bound-symbol table so `hc-materialize-bound-exprs`
+  // recognises them as ambient. Mirror the rank fall-through in
+  // `Lowerer::getLaunchGeometryRank` for the Workgroup domain.
+  unsigned workgroupRank = groupRank ? groupRank : workRank;
 
   auto appendMethod = [&](LaunchGeoMethod method, unsigned rank) {
     appendLaunchBoundSymbols(ctx, getLaunchGeoMethodInfo(method).symbolPrefix,
                              rank, seen, symbols);
   };
   appendMethod(LaunchGeoMethod::GroupId, groupIdRank);
-  appendMethod(LaunchGeoMethod::LocalId, groupRank);
-  appendMethod(LaunchGeoMethod::SubgroupId, groupRank);
-  appendMethod(LaunchGeoMethod::GroupShape, groupRank);
+  appendMethod(LaunchGeoMethod::LocalId, workgroupRank);
+  appendMethod(LaunchGeoMethod::SubgroupId, workgroupRank);
+  appendMethod(LaunchGeoMethod::GroupShape, workgroupRank);
   appendMethod(LaunchGeoMethod::WorkOffset, workRank);
   appendMethod(LaunchGeoMethod::WorkShape, workRank);
   appendMethod(LaunchGeoMethod::GroupSize, 1);
@@ -4453,9 +4461,17 @@ Lowerer::getLaunchGeometryRank(const LaunchGeoMethodInfo &method,
                ? shapeRankOrZero(contextWorkShape)
                : workRank.value_or(fallbackRank());
   case LaunchGeoRankDomain::Workgroup:
+    // `group_shape` and `work_shape` share a rank by spec --- each
+    // workgroup dim aligns one-for-one with a work-grid dim
+    // (`doc/langref.md` "logical launch domain"). When the user only
+    // declares `work_shape=`, the runtime picks a target-specific
+    // default `group_shape` of the same rank; route the per-workgroup
+    // queries (`group.shape`, `wi.local_id`, `wi.subgroup_id`) through
+    // `workRank` instead of falling all the way to the 32-axis cap so
+    // the synthesized op carries the right result count.
     return shapeRankOrZero(contextGroupShape)
                ? shapeRankOrZero(contextGroupShape)
-               : groupRank.value_or(fallbackRank());
+               : groupRank.value_or(workRank.value_or(fallbackRank()));
   case LaunchGeoRankDomain::Scalar:
     return fallbackRank();
   }

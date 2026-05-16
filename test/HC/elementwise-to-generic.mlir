@@ -173,6 +173,25 @@ func.func @cmp_family(%a: !hc.bare_tensor<f32, ["M"]>,
 
 // -----
 
+// `hc.astype`: rank stays, element type changes. Body emits a
+// scalar `hc.astype` to the result element type.
+// CHECK-LABEL: func.func @astype_f16_to_f32
+// CHECK: %[[FILL:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_tensor<f32, ["M"]>
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<f16, ["M"]>)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">] : !hc.bare_tensor<f32, ["M"]>)
+// CHECK: ^bb0(%[[V:.+]]: f16, %{{.+}}: f32):
+// CHECK:   %[[C:.+]] = hc.astype %[[V]], target = f32 : f16 -> f32
+// CHECK:   hc.yield %[[C]] : f32
+func.func @astype_f16_to_f32(%v: !hc.bare_tensor<f16, ["M"]>)
+    -> !hc.bare_tensor<f32, ["M"]> {
+  %r = hc.astype %v, target = f32
+      : !hc.bare_tensor<f16, ["M"]> -> !hc.bare_tensor<f32, ["M"]>
+  return %r : !hc.bare_tensor<f32, ["M"]>
+}
+
+// -----
+
 // `hc.neg`: unary, no element type change.
 // CHECK-LABEL: func.func @neg_f32
 // CHECK: hc.generic

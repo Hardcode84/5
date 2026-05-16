@@ -1692,8 +1692,14 @@ LogicalResult HCAsTypeOp::verify() {
              << result << " does not match target type " << target;
     return success();
   }
+  // Both the semantic carriers (`!hc.tensor` / `!hc.vector`) and the
+  // post-decompose bare carriers (`!hc.bare_tensor` / `!hc.bare_vector`)
+  // are accepted; `hc-decompose-shaped-values` splits semantic astype
+  // into a bare data astype + mask pass-through, and the verifier has
+  // to admit the rewritten op for the conversion driver to accept it.
   auto elementOf = [](Type t) -> Type {
-    if (!llvm::isa<mlir::hc::TensorType, mlir::hc::VectorType>(t))
+    if (!llvm::isa<mlir::hc::TensorType, mlir::hc::VectorType,
+                   mlir::hc::BareTensorType, mlir::hc::BareVectorType>(t))
       return {};
     if (auto shaped = llvm::dyn_cast<SymbolicallyShapedTypeInterface>(t))
       return shaped.getSymbolicElementType();
@@ -1707,8 +1713,9 @@ LogicalResult HCAsTypeOp::verify() {
   }
   return emitOpError("result type ")
          << result
-         << " must be `!hc.undef`, a builtin numeric scalar, or an "
-            "`!hc.tensor`/`!hc.vector` whose element type matches target";
+         << " must be `!hc.undef`, a builtin numeric scalar, or a shaped "
+            "`!hc.tensor` / `!hc.vector` / `!hc.bare_tensor` / "
+            "`!hc.bare_vector` whose element type matches target";
 }
 
 LogicalResult HCWithInactiveOp::verify() {

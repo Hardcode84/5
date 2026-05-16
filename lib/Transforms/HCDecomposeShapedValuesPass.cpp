@@ -1060,6 +1060,36 @@ struct ConvertElementwiseUnaryShapedOp : public OpConversionPattern<OpT> {
   }
 };
 
+// `hc.astype` is the user-visible numeric conversion surface — same
+// shape as the unary template, but the op carries a `target` type
+// attribute that has to be threaded through manually. Element type on
+// the data half changes from the source element to the target; the
+// mask half passes through unchanged because element-cast doesn't
+// gate lanes.
+struct ConvertAsTypeShapedOp : public OpConversionPattern<HCAsTypeOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCAsTypeOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> source =
+        expectSplit(adaptor.getValue(), op, "astype value");
+    if (failed(source))
+      return failure();
+
+    auto data = HCAsTypeOp::create(rewriter, op.getLoc(),
+                                   bareDataType(originalResultType),
+                                   source->first, op.getTargetAttr());
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 source->second);
+    return success();
+  }
+};
+
 // `hc.builtin_call` (numpy ufunc surface) is elementwise homogeneous
 // by the dispatch invariant (see the op's td description). For the
 // single-arg case (numpy.sqrt / np.exp / ...) the input mask passes
@@ -1168,7 +1198,7 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                ConvertElementwiseBinaryShapedOp<HCDivOp>,
                ConvertElementwiseBinaryShapedOp<HCModOp>,
                ConvertElementwiseUnaryShapedOp<HCNegOp>,
-               ConvertElementwiseUnaryShapedOp<HCNotOp>,
+               ConvertElementwiseUnaryShapedOp<HCNotOp>, ConvertAsTypeShapedOp,
                ConvertBuiltinCallShapedOp, ConvertReduceShapedOp>(converter,
                                                                   ctx);
 }
@@ -1187,7 +1217,8 @@ makeShapedDecompositionTarget(MLIRContext *ctx,
                                HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
-                               HCNegOp, HCNotOp, HCBuiltinCallOp, HCReduceOp>(
+                               HCNegOp, HCNotOp, HCAsTypeOp, HCBuiltinCallOp,
+                               HCReduceOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {

@@ -373,3 +373,29 @@ func.func @noninjective_load_empty_indices(%buf: !hc.buffer<si64, ["K"]>) {
                                  offset = #hc.expr<"j">>>
   return
 }
+
+// -----
+
+// `hc.astype` on a semantic tensor splits into a bare data astype +
+// mask pass-through. Element type on the data half tracks `target`;
+// the mask half rides unchanged because element-cast doesn't gate
+// lanes. The `target` attribute threads through the pattern; the
+// generic unary template can't reuse-build the op because the
+// constructor signature carries the type attribute.
+// CHECK-LABEL: func.func @astype_decomposes
+// CHECK: %[[LOAD:.+]] = hc.load {{.*}} -> !hc.bare_tensor<f16, ["4"]>
+// CHECK: %[[MASK:.+]] = hc.load_mask {{.*}} -> !hc.bare_tensor<!hc.pred, ["4"]>
+// CHECK: %[[CAST:.+]] = hc.astype %[[LOAD]], target = f32 : !hc.bare_tensor<f16, ["4"]> -> !hc.bare_tensor<f32, ["4"]>
+// CHECK-NOT: !hc.tensor<
+// CHECK-NOT: !hc.vector<
+func.func @astype_decomposes(%buf: !hc.buffer<f16, ["M"]>,
+                              %i: !hc.idx<"0">) {
+  %four = hc.const<4 : i64> : !hc.idx<"4">
+  %shape = hc.tuple(%four) : (!hc.idx<"4">) -> tuple<!hc.idx<"4">>
+  %tile = hc.load %buf[%i], shape %shape
+      : (!hc.buffer<f16, ["M"]>, !hc.idx<"0">, tuple<!hc.idx<"4">>)
+        -> !hc.tensor<f16, ["4"]>
+  %cast = hc.astype %tile, target = f32
+      : !hc.tensor<f16, ["4"]> -> !hc.tensor<f32, ["4"]>
+  return
+}

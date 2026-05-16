@@ -404,6 +404,35 @@ module {
 
 // -----
 
+// Bare tensor result element must equal target — same rule as the
+// semantic tensor variant; `hc-decompose-shaped-values` rewrites
+// `hc.astype` to its bare data half and the result carrier still
+// has to match `target`.
+// CHECK: error: 'hc.astype' op result element type 'i32' does not match target type 'f32'
+module {
+  func.func @bad(%v: !hc.bare_tensor<i64, ["M"]>)
+      -> !hc.bare_tensor<i32, ["M"]> {
+    %r = hc.astype %v, target = f32
+        : !hc.bare_tensor<i64, ["M"]> -> !hc.bare_tensor<i32, ["M"]>
+    return %r : !hc.bare_tensor<i32, ["M"]>
+  }
+}
+
+// -----
+
+// Bare vector mirror — same rule.
+// CHECK: error: 'hc.astype' op result element type 'i32' does not match target type 'f32'
+module {
+  func.func @bad(%v: !hc.bare_vector<i64, ["M"]>)
+      -> !hc.bare_vector<i32, ["M"]> {
+    %r = hc.astype %v, target = f32
+        : !hc.bare_vector<i64, ["M"]> -> !hc.bare_vector<i32, ["M"]>
+    return %r : !hc.bare_vector<i32, ["M"]>
+  }
+}
+
+// -----
+
 // CHECK: error: 'hc.buffer_dim' op axis 3 is out of bounds for rank-2 buffer
 module {
   func.func @bad(%buf: !hc.buffer<f32, ["M", "N"]>) -> !hc.undef {

@@ -823,3 +823,19 @@ hc.func @call_result_iter_arg_keeps_loop_body_live(%group: !hc.undef) {
   }
   hc.return
 }
+
+// -----
+
+// Broadcast-aware binary shaped inference: `[A, 1, C]` op `[1, B, C]`
+// resolves to `[A, B, C]` so `hc-elementwise-to-generic` sees a
+// concrete shape to drive the per-operand offset projection. Same-
+// rank only — front pass normalises ranks via unit-axis insertion.
+// CHECK-LABEL: hc.func @binary_broadcasts_shape
+// CHECK: hc.sub {{.*}} -> !hc.tensor<f32, ["A", "B", "C"]>
+hc.func @binary_broadcasts_shape(%a: !hc.tensor<f32, ["A", "1", "C"]>,
+                                  %b: !hc.tensor<f32, ["1", "B", "C"]>) {
+  %r = hc.sub %a, %b
+      : (!hc.tensor<f32, ["A", "1", "C"]>, !hc.tensor<f32, ["1", "B", "C"]>)
+        -> !hc.undef
+  hc.return
+}

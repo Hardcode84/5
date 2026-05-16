@@ -173,6 +173,34 @@ func.func @load_untyped_index_falls_through(%buf: !hc.buffer<f32, ["M"]>, %i: in
 
 // -----
 
+// Partial indices: `X[gid[0]:]` against a rank-2 `X` lowers to a
+// single slice for the leading axis with the trailing axis
+// implicit-full. The funnel pads the missing axis with a default
+// `base=0, step=1` slot so the per-axis offset list rank-matches the
+// tile and the leading axis carries the slice's `i + i_0` offset.
+// CHECK-LABEL: func.func @load_partial_indices
+// CHECK-DAG: %[[A:.+]] = hc.idx_apply () : () -> !hc.idx<"A">
+// CHECK-DAG: %[[B:.+]] = hc.idx_apply () : () -> !hc.idx<"B">
+// CHECK: hc.generic iter (parallel i_0 = %[[A]] : !hc.idx<"A">, parallel i_1 = %[[B]] : !hc.idx<"B">)
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i + i_0">, #hc.expr<"i_1">] : !hc.buffer<f32, ["M", "N"]>)
+// CHECK-NOT: hc.load
+func.func @load_partial_indices(%buf: !hc.buffer<f32, ["M", "N"]>,
+                                  %i: !hc.idx<"i">)
+    -> !hc.tensor<f32, ["A", "B"]> {
+  %slice = hc.slice_expr(lower = %i)
+      : (!hc.idx<"i">) -> !hc.slice<lower = !hc.idx<"i">>
+  %a = hc.const<1 : i64> : !hc.idx<"A">
+  %b = hc.const<1 : i64> : !hc.idx<"B">
+  %shape = hc.tuple(%a, %b)
+      : (!hc.idx<"A">, !hc.idx<"B">) -> tuple<!hc.idx<"A">, !hc.idx<"B">>
+  %r = hc.load %buf[%slice], shape %shape
+      : (!hc.buffer<f32, ["M", "N"]>, !hc.slice<lower = !hc.idx<"i">>,
+         tuple<!hc.idx<"A">, !hc.idx<"B">>) -> !hc.tensor<f32, ["A", "B"]>
+  return %r : !hc.tensor<f32, ["A", "B"]>
+}
+
+// -----
+
 // Masked store: the mask rides as a second `ins` slot with identity
 // offsets (same shape as `%src`, both tile-local). The body now has
 // three block args (`src`, `mask`, `dst`) and terminates with

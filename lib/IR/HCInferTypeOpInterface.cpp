@@ -178,6 +178,109 @@ inferIndexBinaryIdxArm(Type lhs, Type rhs, bool lhsIdx, bool rhsIdx,
   return success();
 }
 
+// Same-rank NumPy-style broadcast on `#hc.shape<>` dim arrays. Returns
+// the broadcasted dim list, or failure when ranks differ or a pair of
+// non-`1` non-equal dims meet. Literal `1` is the broadcast neutral
+// element — the canonical `composeExprInt(1)` handle gives pointer
+// equality on the hash-consed `ExprAttr` so the per-axis test is one
+// comparison, no parser involved. Different-rank inputs aren't
+// supported yet: the front pass already aligns ranks via
+// `unit_axes` so they don't reach this helper, and NumPy's
+// left-padding rule needs more careful element-typing.
+static FailureOr<SmallVector<Attribute>>
+broadcastShapeDims(ArrayRef<Attribute> lhs, ArrayRef<Attribute> rhs,
+                   Operation *diagOp) {
+  if (lhs.size() != rhs.size())
+    return failure();
+  FailureOr<ExprAttr> one = composeIntExprAttr(1, diagOp);
+  if (failed(one))
+    return failure();
+  SmallVector<Attribute> out;
+  out.reserve(lhs.size());
+  for (auto [l, r] : llvm::zip_equal(lhs, rhs)) {
+    auto lExpr = dyn_cast<ExprAttr>(l);
+    auto rExpr = dyn_cast<ExprAttr>(r);
+    if (!lExpr || !rExpr)
+      return failure();
+    if (lExpr == *one) {
+      out.push_back(rExpr);
+      continue;
+    }
+    if (rExpr == *one) {
+      out.push_back(lExpr);
+      continue;
+    }
+    if (lExpr.getValue() == rExpr.getValue()) {
+      out.push_back(lExpr);
+      continue;
+    }
+    return failure();
+  }
+  return out;
+}
+
+// True iff `lhs` and `rhs` are the same HC shaped flavor (both
+// tensor / both bare-tensor / both vector / both bare-vector). The
+// elementwise rewriter only emits a result whose flavor matches the
+// operands, so cross-flavor binaries land on the diagnostic surface
+// instead of silently casting.
+static bool sameShapedFlavor(Type lhs, Type rhs) {
+  if (isa<mlir::hc::TensorType>(lhs))
+    return isa<mlir::hc::TensorType>(rhs);
+  if (isa<mlir::hc::BareTensorType>(lhs))
+    return isa<mlir::hc::BareTensorType>(rhs);
+  if (isa<mlir::hc::VectorType>(lhs))
+    return isa<mlir::hc::VectorType>(rhs);
+  if (isa<mlir::hc::BareVectorType>(lhs))
+    return isa<mlir::hc::BareVectorType>(rhs);
+  return false;
+}
+
+// Rebuild a shaped HC type with a fresh shape and element. Layout is
+// always null — broadcasting on a non-identity layout has no obvious
+// result-side layout to carry and the elementwise rewriter doesn't
+// read layouts off the result. Caller has already verified that
+// `flavor` is one of the four shaped HC kinds.
+static Type rebuildShapedType(Type flavor, Type elementType, ShapeAttr shape) {
+  MLIRContext *ctx = flavor.getContext();
+  if (isa<mlir::hc::TensorType>(flavor))
+    return mlir::hc::TensorType::get(ctx, elementType, shape, LayoutAttr{});
+  if (isa<mlir::hc::BareTensorType>(flavor))
+    return mlir::hc::BareTensorType::get(ctx, elementType, shape, LayoutAttr{});
+  if (isa<mlir::hc::VectorType>(flavor))
+    return mlir::hc::VectorType::get(ctx, elementType, shape, LayoutAttr{});
+  return mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{});
+}
+
+// Shaped binary inference: tensors / vectors of the same flavor.
+// Broadcast-aware — `[A, 1, C] op [1, B, C]` yields `[A, B, C]`.
+// Element type joins through `joinHCTypes` so a partly-inferred
+// `!hc.undef` element on one side picks up the concrete element from
+// the other.
+static FailureOr<Type> inferShapedBinaryResult(Type lhs, Type rhs,
+                                               Operation *op) {
+  if (!sameShapedFlavor(lhs, rhs))
+    return failure();
+
+  auto lhsShaped = cast<SymbolicallyShapedTypeInterface>(lhs);
+  auto rhsShaped = cast<SymbolicallyShapedTypeInterface>(rhs);
+  ShapeAttr lhsShape = lhsShaped.getSymbolicShape();
+  ShapeAttr rhsShape = rhsShaped.getSymbolicShape();
+  if (!lhsShape || !rhsShape)
+    return failure();
+  FailureOr<SmallVector<Attribute>> dims =
+      broadcastShapeDims(lhsShape.getDims(), rhsShape.getDims(), op);
+  if (failed(dims))
+    return failure();
+
+  Type elementType = joinHCTypes(lhsShaped.getSymbolicElementType(),
+                                 rhsShaped.getSymbolicElementType());
+  if (!elementType)
+    return failure();
+  ShapeAttr shape = ShapeAttr::get(op->getContext(), *dims);
+  return rebuildShapedType(lhs, elementType, shape);
+}
+
 static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
                                       sym::ExprBinaryOp opKind, Operation *op,
                                       SmallVectorImpl<Type> &resultTypes) {
@@ -199,6 +302,11 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
   if (lhs == rhs && (lhs.isIntOrIndexOrFloat() ||
                      isa<mlir::hc::TensorType, mlir::hc::VectorType>(lhs))) {
     resultTypes.push_back(lhs);
+    return success();
+  }
+  FailureOr<Type> broadcasted = inferShapedBinaryResult(lhs, rhs, op);
+  if (succeeded(broadcasted)) {
+    resultTypes.push_back(*broadcasted);
     return success();
   }
   resultTypes.push_back({});

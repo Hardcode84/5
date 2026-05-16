@@ -200,6 +200,53 @@ func.func @broadcast_falls_through(%a: f32, %b: !hc.tensor<f32, ["M"]>)
 
 // -----
 
+// Broadcast subtraction with leading / trailing unit-axes — the
+// pairwise-distance idiom `x1[:, None, :] - x2[None, :, :]`. Each
+// operand projects its `1`-dim axis to the literal-`0` offset and
+// the matching iter sym fills the broadcast axis on the result.
+// `hc-infer-generic-bounds` still binds the iter syms because the
+// init operand carries identity offsets on every axis.
+// CHECK-LABEL: func.func @broadcast_sub_pairwise
+// CHECK: %[[FILL:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.tensor<f32, ["A", "B", "C"]>
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"0">, #hc.expr<"i_2">] : !hc.tensor<f32, ["A", "1", "C"]>,
+// CHECK-SAME:      %{{[^ ]+}} at [#hc.expr<"0">, #hc.expr<"i_1">, #hc.expr<"i_2">] : !hc.tensor<f32, ["1", "B", "C"]>)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">, #hc.expr<"i_1">, #hc.expr<"i_2">] : !hc.tensor<f32, ["A", "B", "C"]>)
+// CHECK: ^bb0(%[[A:.+]]: f32, %[[B:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[S:.+]] = hc.sub %[[A]], %[[B]] : (f32, f32) -> f32
+// CHECK:   hc.yield %[[S]] : f32
+func.func @broadcast_sub_pairwise(%a: !hc.tensor<f32, ["A", "1", "C"]>,
+                                   %b: !hc.tensor<f32, ["1", "B", "C"]>)
+    -> !hc.tensor<f32, ["A", "B", "C"]> {
+  %r = hc.sub %a, %b
+      : (!hc.tensor<f32, ["A", "1", "C"]>, !hc.tensor<f32, ["1", "B", "C"]>)
+        -> !hc.tensor<f32, ["A", "B", "C"]>
+  return %r : !hc.tensor<f32, ["A", "B", "C"]>
+}
+
+// -----
+
+// Broadcast on rank-2 — operand's leading `1` projects to literal-`0`
+// while its trailing matching axis stays identity. Cmp variant
+// confirms the broadcast path threads through the comparison
+// rewriter too.
+// CHECK-LABEL: func.func @broadcast_cmp_rank2
+// CHECK: hc.generic
+// CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["1", "M"]>,
+// CHECK-SAME:      %{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.tensor<f32, ["N", "M"]>)
+// CHECK: ^bb0(%[[X:.+]]: f32, %[[Y:.+]]: f32, %{{.+}}: i1):
+// CHECK:   %[[C:.+]] = hc.cmp.lt %[[X]], %[[Y]] : (f32, f32) -> i1
+func.func @broadcast_cmp_rank2(%a: !hc.tensor<f32, ["1", "M"]>,
+                                %b: !hc.tensor<f32, ["N", "M"]>)
+    -> !hc.tensor<i1, ["N", "M"]> {
+  %r = hc.cmp.lt %a, %b
+      : (!hc.tensor<f32, ["1", "M"]>, !hc.tensor<f32, ["N", "M"]>)
+        -> !hc.tensor<i1, ["N", "M"]>
+  return %r : !hc.tensor<i1, ["N", "M"]>
+}
+
+// -----
+
 // Pre-inference IR: operand and result are `!hc.undef`. The
 // rewriter has no shape to source iter syms from and leaves the op
 // alone for later inference / downstream diagnostics.

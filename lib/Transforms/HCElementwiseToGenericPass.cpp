@@ -59,19 +59,6 @@ static FailureOr<SmallVector<ExprAttr>> getOperandShape(Type t) {
   return dims;
 }
 
-// Rank + shape parity: every input must agree with the output on
-// rank and per-axis dim expression. Hash-consing through ixsimpl
-// lets us compare via `ExprHandle::operator==`. Mismatched shapes
-// would mean a broadcast the v0 rewrite doesn't model.
-static bool sameShape(ArrayRef<ExprAttr> a, ArrayRef<ExprAttr> b) {
-  if (a.size() != b.size())
-    return false;
-  for (auto [x, y] : llvm::zip_equal(a, b))
-    if (!(x.getValue() == y.getValue()))
-      return false;
-  return true;
-}
-
 // Body block-arg element type for a shaped operand. Mirrors the
 // helper in `lib/IR/HCOps.cpp` (`genericOperandElement`) for the
 // shaped cases this rewriter actually emits.
@@ -130,6 +117,43 @@ static ArrayAttr identityOffsetArray(MLIRContext *ctx, sym::Store &store,
   return ArrayAttr::get(ctx, exprs);
 }
 
+// Per-operand offsets that project broadcast-unit axes to literal 0.
+// `operandShape` and `resultShape` are rank-aligned; the axes where
+// `operandShape` carries a literal `1` (and the result doesn't) read
+// the same element on every iteration, so the offset is `0`; the
+// other axes carry the matching iter sym in identity form. The
+// existing bounds-inference (`-hc-infer-generic-bounds`) keys off
+// identity offsets only, so the `0` projection is transparent to it.
+static FailureOr<ArrayAttr> broadcastOperandOffsetArray(
+    MLIRContext *ctx, sym::Store &store, ArrayRef<StringAttr> iterSyms,
+    ArrayRef<ExprAttr> operandShape, ArrayRef<ExprAttr> resultShape) {
+  assert(operandShape.size() == iterSyms.size() &&
+         resultShape.size() == iterSyms.size() &&
+         "operand and iter sym ranks must match the result");
+  auto oneHandle = sym::composeExprInt(store, 1);
+  if (failed(oneHandle))
+    return failure();
+  auto zeroHandle = sym::composeExprInt(store, 0);
+  if (failed(zeroHandle))
+    return failure();
+  ExprAttr oneAttr = ExprAttr::get(ctx, *oneHandle);
+  ExprAttr zeroAttr = ExprAttr::get(ctx, *zeroHandle);
+  SmallVector<Attribute> exprs;
+  exprs.reserve(iterSyms.size());
+  for (auto [iterSym, opDim, resDim] :
+       llvm::zip_equal(iterSyms, operandShape, resultShape)) {
+    if (opDim == oneAttr && resDim != oneAttr) {
+      exprs.push_back(zeroAttr);
+      continue;
+    }
+    auto handle = sym::composeExprSym(store, iterSym.getValue());
+    if (failed(handle))
+      return failure();
+    exprs.push_back(ExprAttr::get(ctx, *handle));
+  }
+  return ArrayAttr::get(ctx, exprs);
+}
+
 // Build the tuple<idx, ...> shape SSA the value-init op (`hc.zeros`
 // / `hc.vzeros`) requires. The init is overwritten by the body on
 // every iteration, so the dim values are just placeholders shaped
@@ -167,6 +191,12 @@ struct ElementwiseSpec {
   // Per-axis dim expressions of the result; the rewriter emits one
   // iter sym per entry.
   SmallVector<ExprAttr> resultShape;
+  // Per-operand symbolic shape, rank-aligned with `resultShape`. Used
+  // to project broadcast-unit axes (operand dim `1` against a
+  // non-`1` result dim) to a literal-`0` offset in the offset array.
+  // Same-shape operands get identity offsets out of this projection
+  // — broadcast and non-broadcast share one path.
+  SmallVector<SmallVector<ExprAttr>> operandShapes;
   // Body builder. `insArgs` is one block arg per entry of
   // `shapedIns`, in the same order; `outArg` is the carry block arg
   // (unused for all-parallel iters but still part of the block); the
@@ -185,7 +215,11 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
   OpBuilder builder(op);
 
   // Iter bounds use undef placeholders; bound inference resolves
-  // them from the operand shapes via identity-offset matching.
+  // them from the operand shapes via identity-offset matching. A
+  // broadcast operand only contributes identity bindings for the
+  // axes it doesn't project — for the unit-broadcast axes the init's
+  // identity offsets carry the inference, which is why the spec
+  // requires every result dim to appear somewhere.
   size_t rank = spec.resultShape.size();
   SmallVector<Value> iterBounds;
   iterBounds.reserve(rank);
@@ -193,7 +227,7 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
     iterBounds.push_back(emitUndefBound(builder, loc));
 
   IterMeta iter = buildIterMeta(ctx, rank);
-  ArrayAttr offsets = identityOffsetArray(ctx, store, iter.syms);
+  ArrayAttr identity = identityOffsetArray(ctx, store, iter.syms);
 
   // The init's shape tuple needs SSA dim values. Reuse the iter
   // bounds — they're undef-typed today; bound inference replaces
@@ -202,9 +236,20 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
   Value shapeTuple = buildShapeTuple(builder, loc, iterBounds);
   Value initOut = emitInit(builder, loc, spec.resultTy, shapeTuple);
 
-  SmallVector<Attribute> insOffArr(spec.shapedIns.size(), offsets);
+  assert(spec.operandShapes.size() == spec.shapedIns.size() &&
+         "spec.operandShapes must be aligned with shapedIns");
+  SmallVector<Attribute> insOffArr;
+  insOffArr.reserve(spec.shapedIns.size());
+  for (auto [opShape, _operand] :
+       llvm::zip_equal(spec.operandShapes, spec.shapedIns)) {
+    FailureOr<ArrayAttr> off = broadcastOperandOffsetArray(
+        ctx, store, iter.syms, opShape, spec.resultShape);
+    if (failed(off))
+      return failure();
+    insOffArr.push_back(*off);
+  }
   ArrayAttr insOffsets = ArrayAttr::get(ctx, insOffArr);
-  ArrayAttr outsOffsets = ArrayAttr::get(ctx, {offsets});
+  ArrayAttr outsOffsets = ArrayAttr::get(ctx, {identity});
 
   SmallVector<Value> insVals(spec.shapedIns);
   SmallVector<Value> outsVals{initOut};
@@ -234,22 +279,37 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
   return success();
 }
 
-// Common gating: pull the result shape, then verify each operand is
-// shaped with the same rank + dim expressions. Bails on `!hc.undef`
-// or any rank/dim mismatch (broadcast cases).
-static FailureOr<SmallVector<ExprAttr>> matchAllShapedSame(Type resultTy,
-                                                           ValueRange ins) {
-  auto resultShape = getOperandShape(resultTy);
-  if (failed(resultShape))
+// Broadcast-aware operand-shape collector. Result and operand ranks
+// must agree; per-axis the operand may either match the result dim
+// or carry a literal `1` (broadcast). Mismatched non-`1` dims fall
+// through to a downstream diagnostic. Returns the per-operand shape
+// list rank-aligned with the result so the emitter can build per-
+// operand offset arrays.
+static FailureOr<SmallVector<SmallVector<ExprAttr>>>
+matchBroadcastShapes(MLIRContext *ctx, sym::Store &store,
+                     ArrayRef<ExprAttr> resultShape, ValueRange ins) {
+  auto oneHandle = sym::composeExprInt(store, 1);
+  if (failed(oneHandle))
     return failure();
+  ExprAttr oneAttr = ExprAttr::get(ctx, *oneHandle);
+  SmallVector<SmallVector<ExprAttr>> operandShapes;
+  operandShapes.reserve(ins.size());
   for (Value in : ins) {
     auto inShape = getOperandShape(in.getType());
     if (failed(inShape))
       return failure();
-    if (!sameShape(*resultShape, *inShape))
+    if (inShape->size() != resultShape.size())
       return failure();
+    for (auto [opDim, resDim] : llvm::zip_equal(*inShape, resultShape)) {
+      if (opDim == resDim)
+        continue;
+      if (opDim == oneAttr)
+        continue;
+      return failure();
+    }
+    operandShapes.push_back(std::move(*inShape));
   }
-  return resultShape;
+  return operandShapes;
 }
 
 // ----- per-op visitors --------------------------------------------------
@@ -257,19 +317,28 @@ static FailureOr<SmallVector<ExprAttr>> matchAllShapedSame(Type resultTy,
 // Binary arith / boolean: `hc.add`, `hc.sub`, `hc.mul`, `hc.div`,
 // `hc.mod`, `hc.and`, `hc.or`. The body op is the same op kind as
 // the source — these are element-type-generic at the dialect level
-// and lower to the matching `arith` later.
+// and lower to the matching `arith` later. Operands may broadcast
+// against the result via unit-size axes; `matchBroadcastShapes`
+// gates on that and threads the per-operand shape through to the
+// emitter so the resulting `hc.generic` carries per-operand offset
+// arrays that fold the unit dims to a literal `0`.
 template <typename OpT>
 static LogicalResult rewriteBinaryHomogeneous(OpT op, sym::Store &store) {
   Value lhs = op.getLhs();
   Value rhs = op.getRhs();
   Type resultTy = op.getResult().getType();
-  auto shape = matchAllShapedSame(resultTy, {lhs, rhs});
+  auto shape = getOperandShape(resultTy);
   if (failed(shape))
+    return failure();
+  auto operandShapes =
+      matchBroadcastShapes(op.getContext(), store, *shape, {lhs, rhs});
+  if (failed(operandShapes))
     return failure();
   ElementwiseSpec spec;
   spec.shapedIns = {lhs, rhs};
   spec.resultTy = resultTy;
   spec.resultShape = std::move(*shape);
+  spec.operandShapes = std::move(*operandShapes);
   spec.bodyBuilder = [](OpBuilder &b, Location loc, ValueRange args,
                         Value /*out*/, Type elem) -> Value {
     return OpT::create(b, loc, elem, args[0], args[1]).getResult();
@@ -283,13 +352,18 @@ template <typename OpT>
 static LogicalResult rewriteUnaryHomogeneous(OpT op, sym::Store &store) {
   Value v = op.getValue();
   Type resultTy = op.getResult().getType();
-  auto shape = matchAllShapedSame(resultTy, {v});
+  auto shape = getOperandShape(resultTy);
   if (failed(shape))
+    return failure();
+  auto operandShapes =
+      matchBroadcastShapes(op.getContext(), store, *shape, {v});
+  if (failed(operandShapes))
     return failure();
   ElementwiseSpec spec;
   spec.shapedIns = {v};
   spec.resultTy = resultTy;
   spec.resultShape = std::move(*shape);
+  spec.operandShapes = std::move(*operandShapes);
   spec.bodyBuilder = [](OpBuilder &b, Location loc, ValueRange args,
                         Value /*out*/, Type elem) -> Value {
     return OpT::create(b, loc, elem, args[0]).getResult();
@@ -298,21 +372,21 @@ static LogicalResult rewriteUnaryHomogeneous(OpT op, sym::Store &store) {
 }
 
 // Comparisons. Result element type differs from input element type
-// (`i1` / `!hc.pred`), so we can't reuse `matchAllShapedSame` with
-// the result type — gate on the input shapes alone and trust the op
-// verifier that the result rank matches.
+// (`i1` / `!hc.pred`), so the body returns a separate scalar; the
+// shape-gating helper (`matchBroadcastShapes`) only checks dims —
+// element types stay independent and the body builder spells the
+// result element out.
 template <typename OpT>
 static LogicalResult rewriteCmp(OpT op, sym::Store &store) {
   Value lhs = op.getLhs();
   Value rhs = op.getRhs();
   Type resultTy = op.getResult().getType();
   auto resultShape = getOperandShape(resultTy);
-  auto lhsShape = getOperandShape(lhs.getType());
-  auto rhsShape = getOperandShape(rhs.getType());
-  if (failed(resultShape) || failed(lhsShape) || failed(rhsShape))
+  if (failed(resultShape))
     return failure();
-  if (!sameShape(*resultShape, *lhsShape) ||
-      !sameShape(*resultShape, *rhsShape))
+  auto operandShapes =
+      matchBroadcastShapes(op.getContext(), store, *resultShape, {lhs, rhs});
+  if (failed(operandShapes))
     return failure();
   Type lhsElem = elementType(lhs.getType());
   Type rhsElem = elementType(rhs.getType());
@@ -323,6 +397,7 @@ static LogicalResult rewriteCmp(OpT op, sym::Store &store) {
   spec.shapedIns = {lhs, rhs};
   spec.resultTy = resultTy;
   spec.resultShape = std::move(*resultShape);
+  spec.operandShapes = std::move(*operandShapes);
   spec.bodyBuilder = [resElem](OpBuilder &b, Location loc, ValueRange args,
                                Value /*out*/, Type /*ignored*/) -> Value {
     return OpT::create(b, loc, resElem, args[0], args[1]).getResult();
@@ -338,10 +413,11 @@ static LogicalResult rewriteAsType(HCAsTypeOp op, sym::Store &store) {
   Value v = op.getValue();
   Type resultTy = op.getResult().getType();
   auto resultShape = getOperandShape(resultTy);
-  auto vShape = getOperandShape(v.getType());
-  if (failed(resultShape) || failed(vShape))
+  if (failed(resultShape))
     return failure();
-  if (!sameShape(*resultShape, *vShape))
+  auto operandShapes =
+      matchBroadcastShapes(op.getContext(), store, *resultShape, {v});
+  if (failed(operandShapes))
     return failure();
   Type resElem = elementType(resultTy);
   if (!resElem)
@@ -350,6 +426,7 @@ static LogicalResult rewriteAsType(HCAsTypeOp op, sym::Store &store) {
   spec.shapedIns = {v};
   spec.resultTy = resultTy;
   spec.resultShape = std::move(*resultShape);
+  spec.operandShapes = std::move(*operandShapes);
   spec.bodyBuilder = [resElem](OpBuilder &b, Location loc, ValueRange args,
                                Value /*out*/, Type /*ignored*/) -> Value {
     return HCAsTypeOp::create(b, loc, resElem, args[0], TypeAttr::get(resElem))

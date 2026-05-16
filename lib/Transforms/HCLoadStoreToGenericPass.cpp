@@ -819,16 +819,57 @@ static FailureOr<LoadPreflight> preflightLoadLikeLayoutBearing(
 // slice extents are harvested up front so the gather composer can
 // translate the layout's flat offset back into per-axis source
 // coords.
+// Pad partial indices with default full-slice axes (`base=0,
+// step=1`) so the per-axis offset composer sees one axis per tile
+// dim. Only pads when the source's rank matches the tile rank — the
+// rank-1 broadcast path keeps the empty-axes form for the layout-
+// driven gather to pick up. A no-op for empty or already-rank-equal
+// axis lists.
+static LogicalResult
+padTrailingFullSliceAxes(MLIRContext *ctx, sym::Store &store, size_t targetRank,
+                         size_t srcRank, SmallVectorImpl<AxisIndex> &axes) {
+  if (axes.empty() || axes.size() >= targetRank || srcRank != targetRank)
+    return success();
+  auto zero = sym::composeExprInt(store, 0);
+  auto one = sym::composeExprInt(store, 1);
+  if (failed(zero) || failed(one))
+    return failure();
+  ExprAttr zeroAttr = ExprAttr::get(ctx, *zero);
+  ExprAttr oneAttr = ExprAttr::get(ctx, *one);
+  while (axes.size() < targetRank)
+    axes.push_back(AxisIndex{zeroAttr, oneAttr});
+  return success();
+}
+
+// Slice-extents are only meaningful on the layout-driven gather path
+// (`resultLayout != null && !broadcastFromRank1`); other paths return
+// an empty list. Extraction failure on the gather path is fine —
+// `composeLoadInsOffsets` falls back to the per-axis identity offsets
+// when the layout-driven gather doesn't fit the structural shape.
+static SmallVector<ExprAttr> harvestLayoutSliceExtents(MLIRContext *ctx,
+                                                       sym::Store &store,
+                                                       LayoutAttr resultLayout,
+                                                       bool broadcastFromRank1,
+                                                       ValueRange indices) {
+  if (!resultLayout || broadcastFromRank1)
+    return {};
+  auto extents = collectSliceExtents(ctx, store, indices);
+  if (failed(extents))
+    return {};
+  return std::move(*extents);
+}
+
 static FailureOr<LoadPreflight>
 preflightLoadLikePlain(MLIRContext *ctx, sym::Store &store, Value source,
                        Type resultTy, ValueRange indices,
                        ArrayRef<ExprAttr> tileShape) {
   // Empty index list is a legal shape (`hc.load %t[], shape ...`): the
   // access addresses the operand at the tile origin, which is just the
-  // iter syms with no addressing addend. Non-empty lists must rank-
-  // match the tile shape — anything else is inconsistent IR the access
-  // op's own checks would have caught.
-  if (!indices.empty() && indices.size() != tileShape.size())
+  // iter syms with no addressing addend. Non-empty lists may match
+  // the tile rank exactly (the canonical fully-indexed form) or fall
+  // short of it (NumPy `X[gid[0]:]` against a rank-2 `X` — trailing
+  // axes are implicit-full slices). Over-indexing is inconsistent IR.
+  if (!indices.empty() && indices.size() > tileShape.size())
     return failure();
   auto axesOr = collectAxisIndices(ctx, store, indices);
   if (failed(axesOr))
@@ -841,21 +882,18 @@ preflightLoadLikePlain(MLIRContext *ctx, sym::Store &store, Value source,
   if (failed(srcShape))
     return failure();
 
+  if (failed(padTrailingFullSliceAxes(ctx, store, tileShape.size(),
+                                      srcShape->size(), *axesOr)))
+    return failure();
+
   bool broadcastFromRank1 = false;
   LayoutAttr resultLayout;
   if (failed(classifyLoadAccess(resultTy, indices, *srcShape, tileShape,
                                 broadcastFromRank1, resultLayout)))
     return failure();
 
-  SmallVector<ExprAttr> sliceExtents;
-  if (resultLayout && !broadcastFromRank1) {
-    auto extents = collectSliceExtents(ctx, store, indices);
-    if (succeeded(extents))
-      sliceExtents = std::move(*extents);
-    // Extraction failure is fine — `composeLoadInsOffsets` falls
-    // back to the per-axis identity offsets when the layout-driven
-    // gather doesn't fit the structural shape.
-  }
+  SmallVector<ExprAttr> sliceExtents = harvestLayoutSliceExtents(
+      ctx, store, resultLayout, broadcastFromRank1, indices);
 
   return LoadPreflight{std::move(*axesOr), std::move(*srcShape), resultLayout,
                        broadcastFromRank1, std::move(sliceExtents)};

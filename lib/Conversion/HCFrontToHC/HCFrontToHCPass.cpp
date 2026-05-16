@@ -731,6 +731,102 @@ static void appendLaunchBoundSymbols(MLIRContext *ctx, StringRef prefix,
   }
 }
 
+// Per-axis launch-geo literal bindings derived from a shape attr whose
+// dims are integer-literal `#hc.expr`. Emits one `$<prefix><axis> ->
+// IntegerAttr` entry per axis when the dim resolves to a literal; non-
+// literal dims (symbolic kernel-arg names like `"W1"`) are skipped so
+// the user-named symbols carry their own bindings from
+// `hc.compile(symbols={...})`.
+static void appendShapeLiteralBindings(MLIRContext *ctx, StringRef prefix,
+                                       ShapeAttr shape,
+                                       SmallVectorImpl<NamedAttribute> &out) {
+  if (!shape)
+    return;
+  auto i64 = IntegerType::get(ctx, 64);
+  for (auto [axis, dim] : llvm::enumerate(shape.getDims())) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      continue;
+    std::optional<int64_t> value =
+        sym::getIntegerLiteralValue(sym::ExprHandle(expr.getNode()));
+    if (!value)
+      continue;
+    SmallString<16> name(prefix);
+    name += Twine(axis).str();
+    out.emplace_back(StringAttr::get(ctx, name), IntegerAttr::get(i64, *value));
+  }
+}
+
+// Augment the launcher-supplied `literal_bindings` dict with bindings
+// derived from integer-literal launch-geo attrs on the front kernel:
+// `group_shape` -> `$WGS<axis>`, `work_shape` -> `$WS<axis>`,
+// `subgroup_size` -> `$WV0`, and the static product of `group_shape`
+// -> `$GSZ0`. These are the launch-context symbols downstream passes
+// (`hc-materialize-bound-exprs`, `hc-lower-launch-body`'s static-
+// shape checks) expect to find substituted; user-supplied bindings
+// (`hc.compile(symbols={...})`) carry the work-shape symbol names but
+// can't reach the `$`-prefixed launch context, so the front-to-hc
+// hand-off has to plant them eagerly. Duplicate user-supplied keys
+// win to keep the launcher-provided values authoritative.
+// Product of a shape's dims when every axis is an integer-literal
+// `#hc.expr`. `std::nullopt` for the symbolic-mix case;
+// `literal_bindings` carries IntegerAttr values only, so a symbolic
+// product can't ride along as a binding regardless.
+static std::optional<int64_t> staticShapeProduct(ShapeAttr shape) {
+  if (!shape || shape.getDims().empty())
+    return std::nullopt;
+  int64_t product = 1;
+  for (Attribute dim : shape.getDims()) {
+    auto expr = dyn_cast<ExprAttr>(dim);
+    if (!expr)
+      return std::nullopt;
+    std::optional<int64_t> value =
+        sym::getIntegerLiteralValue(sym::ExprHandle(expr.getNode()));
+    if (!value)
+      return std::nullopt;
+    product *= *value;
+  }
+  return product;
+}
+
+// Merge `launcherBindings` with `derived`; user-supplied keys win
+// (insertion order: launcher first, then derived entries whose names
+// haven't been claimed yet). Returns the launcher dict unchanged
+// when `derived` is empty.
+static DictionaryAttr mergeLiteralBindings(MLIRContext *ctx,
+                                           DictionaryAttr launcherBindings,
+                                           ArrayRef<NamedAttribute> derived) {
+  if (derived.empty())
+    return launcherBindings;
+  SmallVector<NamedAttribute> merged;
+  llvm::StringSet<> seen;
+  if (launcherBindings)
+    for (NamedAttribute kv : launcherBindings) {
+      seen.insert(kv.getName().getValue());
+      merged.push_back(kv);
+    }
+  for (NamedAttribute kv : derived)
+    if (seen.insert(kv.getName().getValue()).second)
+      merged.push_back(kv);
+  return DictionaryAttr::get(ctx, merged);
+}
+
+static DictionaryAttr augmentLiteralBindingsFromLaunchGeo(
+    MLIRContext *ctx, DictionaryAttr launcherBindings, ShapeAttr workShape,
+    ShapeAttr groupShape, IntegerAttr subgroupSize) {
+  auto i64 = IntegerType::get(ctx, 64);
+  SmallVector<NamedAttribute> derived;
+  appendShapeLiteralBindings(ctx, "$WGS", groupShape, derived);
+  appendShapeLiteralBindings(ctx, "$WS", workShape, derived);
+  if (subgroupSize)
+    derived.emplace_back(StringAttr::get(ctx, "$WV0"),
+                         IntegerAttr::get(i64, subgroupSize.getInt()));
+  if (auto product = staticShapeProduct(groupShape))
+    derived.emplace_back(StringAttr::get(ctx, "$GSZ0"),
+                         IntegerAttr::get(i64, *product));
+  return mergeLiteralBindings(ctx, launcherBindings, derived);
+}
+
 static ArrayAttr buildKernelBoundSymbols(MLIRContext *ctx, TypeRange inputTypes,
                                          ShapeAttr workShape,
                                          ShapeAttr groupShape) {
@@ -1763,9 +1859,18 @@ LogicalResult Lowerer::populateKernelMetadata(HCKernelOp hcKernel,
   // `literal_bindings` rides on `hc_front.kernel` when the launcher
   // (`hc.compile(symbols={...})`) has pinned concrete integer values
   // for the specialization point. Carry it over so the downstream
-  // `hc-specialize-literals` pass can fold them into the IR.
-  if (auto binds = frontOp->getAttrOfType<DictionaryAttr>("literal_bindings"))
-    hcKernel.setLiteralBindingsAttr(binds);
+  // `hc-specialize-literals` pass can fold them into the IR, and
+  // augment it with the launch-geo `$`-prefixed bindings the
+  // launcher can't see — `group_shape` / `work_shape` literal dims,
+  // `subgroup_size`, static `group_size` — so symbolic launch-context
+  // syms get folded the same way as user-named ones.
+  DictionaryAttr launcherBindings =
+      frontOp->getAttrOfType<DictionaryAttr>("literal_bindings");
+  DictionaryAttr merged = augmentLiteralBindingsFromLaunchGeo(
+      ctx, launcherBindings, hcKernel.getWorkShapeAttr(),
+      hcKernel.getGroupShapeAttr(), hcKernel.getSubgroupSizeAttr());
+  if (merged && !merged.empty())
+    hcKernel.setLiteralBindingsAttr(merged);
   return success();
 }
 

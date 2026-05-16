@@ -66,3 +66,24 @@ hc.kernel @noop(%buf: !hc.buffer<f32, ["M"]>)
   %m = hc.const<0 : i64> : !hc.idx<"M">
   hc.return
 }
+
+// -----
+
+// Launch-context `$`-prefixed bindings (here `$WGS0 = 8`) are seeded
+// by the front-to-hc handshake from integer-literal `group_shape`
+// dims and don't need to appear in the user-facing `literals`
+// whitelist. The cross-check exempts them so a kernel that declared
+// only user-named literals still legally folds the system-managed
+// launch-context syms.
+// CHECK-LABEL: hc.kernel @wgs_bound
+// CHECK-SAME:    !hc.bare_tensor<f32, ["8"]>
+// CHECK-NOT:     literal_bindings
+// CHECK:         hc.const<0 : i64> : !hc.idx<"8">
+hc.kernel @wgs_bound(%t: !hc.bare_tensor<f32, ["$WGS0"]>)
+    attributes {literals = ["TILE"],
+                literal_bindings = {"$WGS0" = 8 : i64},
+                work_shape = #hc.shape<["M"]>,
+                group_shape = #hc.shape<["8"]>} {
+  %k = hc.const<0 : i64> : !hc.idx<"$WGS0">
+  hc.return
+}

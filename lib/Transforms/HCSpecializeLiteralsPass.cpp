@@ -70,6 +70,17 @@ static LogicalResult validateBindings(HCKernelOp kernel,
     StringRef name = entry.getName().getValue();
     if (declared.count(name))
       continue;
+    // Launch-context symbols (`$WGS<axis>`, `$WS<axis>`, `$WV0`,
+    // `$GSZ0`, `$STRIDE_<axis>_<arg>`, ...) are seeded by the front-
+    // to-hc handshake from `group_shape` / `work_shape` /
+    // `subgroup_size`, not by `hc.compile(symbols={...})`; the
+    // `literals` whitelist is the user-facing specialization
+    // contract and doesn't speak for system-managed names. Skip the
+    // cross-check for them so a kernel that declared a user literal
+    // (e.g. `literals = ["TILE"]`) still legally carries
+    // launch-context bindings.
+    if (name.starts_with("$"))
+      continue;
     return kernel->emitOpError("literal_bindings key '")
            << name << "' is not declared in `literals`";
   }

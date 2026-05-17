@@ -532,6 +532,64 @@ def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCInsertWorkgroupBarriers : Pass<"hc-insert-workgroup-barriers"> {
+  let summary = "Insert gpu.barrier between hc.generic ops on shared "
+                "workgroup-AS storage.";
+  let description = [{
+    Single owner for cross-generic synchronization on workgroup-AS
+    storage (LDS). Runs after the first `hc-lower-launch-body`
+    invocation (so every fill / load of a workgroup tile is already
+    rooted at `hc.alloc workgroup` + an `hc.generic` operand on
+    `!hc.ptr<workgroup, T>`) and before `hc-lower-generic` (so the
+    structured per-axis offsets / iter syms a future precise-elision
+    pass needs are still on the op).
+
+    Conservative rule:
+
+      1. For every `gpu.launch` body, walk regions block by block.
+      2. Within a block, scan top-level ops in order. Track a per-block
+         `pending` set of workgroup-AS storage roots written by an
+         earlier `hc.generic` in this block since the last barrier.
+      3. At each `hc.generic`:
+           - Collect the storage roots its `ins` / `outs` resolve to
+             (workgroup-AS pointers, or bare carriers UCC-bridged to
+             one). The root is the SSA Value reached by walking back
+             through single-input `unrealized_conversion_cast` and
+             `hc.ptr_offset` chains.
+           - If any read or write root intersects `pending`, insert
+             `gpu.barrier` immediately before the op and clear
+             `pending`. The read-side intersect catches the
+             writer→reader race, the write-side one the
+             writer→writer race on the same slot family.
+           - Add every workgroup-AS write root to `pending`.
+      4. `gpu.barrier` in the scan path clears `pending` — an already
+         present barrier doesn't get a sibling.
+
+    Stray non-generic loads / stores on workgroup-AS storage are out
+    of scope by design: the contract this pass enforces is
+    "workgroup-AS writes live inside `hc.generic`". A stray writer is
+    a bug in the emitter, not something to be papered over here.
+
+    Nested regions (`scf.for`, `scf.if`) get a fresh per-block scan
+    — the conservative v0 doesn't thread `pending` across the
+    structural-control-flow boundary, so a write inside one branch
+    of an `scf.if` doesn't seed a barrier in the sibling branch (it
+    can't, by construction) and a write before an `scf.for` does
+    barrier ahead of any read inside the loop (the loop op opaquely
+    consumes the read root). Precise affine elision and tighter
+    cross-region tracking are the follow-up axes.
+
+    Pass is a no-op on payloads with no `gpu.launch` and a no-op when
+    no `hc.generic` touches workgroup-AS storage; safe to leave wired
+    even on schedules that don't reach the workgroup-staged tile
+    surface.
+  }];
+  let dependentDialects = [
+    "::mlir::gpu::GPUDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCLowerGeneric : Pass<"hc-lower-generic"> {
   let summary = "Lower hc.generic to scf.parallel / scf.for + hc.ptr_offset / "
                 "hc.ptr_load / hc.ptr_store.";

@@ -412,11 +412,14 @@ func.func @scalar_fallback_index_bound(%n: index,
 // The pass picks the chunk-and-publish shape instead of `scf.parallel`
 // — every thread of the wave processes a strided subset of the
 // linearised iter space, with an in-range gate at the trailing
-// partial chunk and a closing `gpu.barrier` so the populated tile is
-// visible to downstream readers. The body still runs once per
-// in-range iteration (no partition unroll on this path: collective
-// dispatch is inherently per-element, the merge analyzer can't claim
-// anything useful when every lane owns a different element).
+// partial chunk. The body still runs once per in-range iteration (no
+// partition unroll on this path: collective dispatch is inherently
+// per-element, the merge analyzer can't claim anything useful when
+// every lane owns a different element). No `gpu.barrier` lands here
+// — `hc-insert-workgroup-barriers` runs upstream in the pipeline and
+// is the single owner of cross-`hc.generic` synchronization on LDS;
+// this LIT only exercises `hc-lower-generic` and so checks the
+// barrier is *not* emitted by this pass.
 // CHECK-LABEL: func.func @collective_lds_population
 // CHECK: gpu.launch blocks
 // CHECK-SAME: threads({{[^,]+}}, %[[TY:[^,]+]], %[[TZ:[^)]+]])
@@ -441,7 +444,7 @@ func.func @scalar_fallback_index_bound(%n: index,
 // CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
 // CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
 // CHECK: }
-// CHECK: gpu.barrier
+// CHECK-NOT: gpu.barrier
 // CHECK-NOT: hc.generic
 // CHECK-NOT: scf.parallel
 func.func @collective_lds_population(%src: !hc.ptr<global, f32>,
@@ -534,12 +537,12 @@ func.func @global_outs_in_launch_falls_through(%src: !hc.ptr<global, f32>,
 // an `scf.for` over the 16-element reduction iter accumulates into
 // the slot's register-resident `iter_args` carrier seeded from the
 // LDS outs init. The final carrier value stores back to LDS at the
-// parallel-only outs offset; a closing `gpu.barrier` publishes the
-// per-slot results before the downstream readers run. This is the
-// langref contract: workgroup storage is shared (`doc/langref.md`
-// §340-388), so the reduction accumulator stays per-thread on its
-// own slot and the LDS sees one read + one write per slot per
-// thread.
+// parallel-only outs offset. This is the langref contract: workgroup
+// storage is shared (`doc/langref.md` §340-388), so the reduction
+// accumulator stays per-thread on its own slot and the LDS sees one
+// read + one write per slot per thread. Cross-`hc.generic` LDS
+// synchronization rides on `hc-insert-workgroup-barriers` (not this
+// pass), so no `gpu.barrier` here.
 // CHECK-LABEL: func.func @collective_workgroup_outs_with_reduction
 // CHECK: gpu.launch
 // CHECK: scf.for {{.*}} = %c0{{.*}} to %{{.*}} step %c1
@@ -550,7 +553,7 @@ func.func @global_outs_in_launch_falls_through(%src: !hc.ptr<global, f32>,
 // CHECK: %[[SUM:.+]] = hc.add %[[ACC]], %{{.+}}
 // CHECK: scf.yield %[[SUM]] : f32
 // CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
-// CHECK: gpu.barrier
+// CHECK-NOT: gpu.barrier
 // CHECK-NOT: hc.generic
 func.func @collective_workgroup_outs_with_reduction(
     %src: !hc.ptr<global, f32>, %lds: !hc.ptr<workgroup, f32>) {
@@ -601,7 +604,7 @@ func.func @collective_workgroup_outs_with_reduction(
 // CHECK: hc.ptr_load %{{.+}} : !hc.ptr<global, f32> -> f32
 // CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
 // CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
-// CHECK: gpu.barrier
+// CHECK-NOT: gpu.barrier
 // CHECK: builtin.unrealized_conversion_cast %[[TILE]]
 // CHECK-SAME: !hc.bare_tensor<f32, ["256"]> to !hc.ptr<workgroup, f32>
 // CHECK: hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
@@ -662,7 +665,7 @@ func.func @collective_bare_tensor_ucc_lds(%src: !hc.ptr<global, f32>) {
 // CHECK: %[[SUM:.+]] = hc.add %[[ACC]], %{{.+}}
 // CHECK: scf.yield %[[SUM]] : f32
 // CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
-// CHECK: gpu.barrier
+// CHECK-NOT: gpu.barrier
 // CHECK-NOT: hc.generic
 func.func @collective_bare_tensor_outs_with_reduction(
     %src: !hc.ptr<global, f32>) {

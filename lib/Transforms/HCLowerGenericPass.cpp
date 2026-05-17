@@ -1904,9 +1904,7 @@ static LogicalResult emitCollectiveChunkBody(
 // lands lane `lane * c + lin_tid`, an `scf.if lin < total` guards the
 // trailing partial chunk, and the body runs once per in-range
 // iteration with the unlinearized per-axis parallel coords bound to
-// the iter syms in scope. A closing `gpu.barrier` makes the
-// cooperative writes visible to every thread before the per-lane
-// readers downstream pick the finished tile back up.
+// the iter syms in scope.
 //
 // Body emission delegates to `emitCollectiveChunkBody`, which picks
 // between the all-parallel single-clone shape (load operands, run
@@ -1914,8 +1912,16 @@ static LogicalResult emitCollectiveChunkBody(
 // `scf.for` over reduction iters with the outs init as iter_args).
 // Either way each thread owns its element of the workgroup tile for
 // the duration of the body, so the load+store pair never sees a
-// write from another thread between them; the closing `gpu.barrier`
-// makes the chunk's writes visible before the per-lane readers run.
+// write from another thread between them.
+//
+// Cross-`hc.generic` synchronization on the populated tile is owned
+// by the dedicated barrier-insertion pass that runs upstream of this
+// one (see `hc-insert-workgroup-barriers`). The pass plants a
+// `gpu.barrier` immediately before any consumer generic that touches
+// a workgroup-AS storage root an earlier generic in the same block
+// has written. Emitting one here too would double up on the common
+// case (two collective generics back-to-back on the same LDS), and
+// the canonicalizer cannot drop redundant `gpu.barrier`s on its own.
 static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
@@ -1955,13 +1961,6 @@ static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   }
   if (failed(bodyStatus))
     return failure();
-
-  // Make the cooperative writes visible to every thread of the
-  // workgroup before any downstream per-lane read picks the
-  // populated tile back up. Single-wave workgroups don't strictly
-  // need it; the cost is trivial and the canonicalizer leaves it
-  // alone deliberately.
-  gpu::BarrierOp::create(builder, loc);
 
   // The generic's result (`bare_tensor` value, when present) is the
   // post-write logical view of the same storage the cooperative

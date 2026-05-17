@@ -1658,14 +1658,14 @@ static Value extractSplatScalar(OpBuilder &builder, Location loc,
 // Emit a workgroup-cooperative fill of a freshly allocated LDS tile as a
 // single `hc.generic` with one parallel iter per slot. `hc-lower-generic`
 // then routes this through `lowerCollective`, which dispatches one slot
-// per thread and closes with a trailing `gpu.barrier`. Net effect:
+// per thread. Net effect:
 //
 //   * fill cost drops from `wgSize * total` per-thread stores to one
 //     pass over the slot range divided across the workgroup;
 //   * every workgroup-AS write lives inside a structured `hc.generic`,
-//     which keeps the surface uniform for the dedicated barrier-insertion
-//     pass that will eventually own cross-generic synchronization (see
-//     the `hc-insert-workgroup-barriers` bead).
+//     which keeps the surface uniform for `hc-insert-workgroup-barriers`
+//     — the dedicated pass that owns cross-generic synchronization on
+//     workgroup-AS storage.
 //
 // `lin` is the canonical name for the flat slot iter sym; ixsimpl
 // hash-conses the `#hc.expr<"lin">` payload across uses so the canonical

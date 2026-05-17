@@ -945,6 +945,7 @@ resolver may have stamped folding / inline markers on, in the order
     canonicalize / cse
     hc-lower-launch-body                            (#1)
     canonicalize / cse
+    hc-insert-workgroup-barriers
     hc-lower-generic
     hc-fold-predicates
     hc-lower-launch-body                            (#2)
@@ -1018,12 +1019,24 @@ consumes, and the post-flatten collective-lift verifier keeps
 yield/result shape. Flatten collapses every shaped value to its 1D bare
 carrier and composes per-access offsets and `hc.generic` per-axis offset
 arrays into a single 1D `#hc.expr` per operand, so `hc-lower-launch-body`
-then sees the 1D form uniformly. `hc-lower-generic` (after the first
-launch-body invocation) picks up generic candidates with the single
-composed offset per operand and lowers them to an outer `scf.parallel` over
-the parallel iters and an inner `scf.for` nest over reduction iters; the
-WMMA path goes through `hc-interpret-intrinsic-recipes` instead, so
-generic lowering is a no-op for that workload. `hc-fold-predicates`
+then sees the 1D form uniformly. `hc-insert-workgroup-barriers` runs
+between the first launch-body and `hc-lower-generic` and is the single
+owner of cross-`hc.generic` synchronization on workgroup-AS storage
+(LDS): a conservative per-block scan plants `gpu.barrier` immediately
+before any generic that touches a workgroup-AS storage root an earlier
+generic in the same block has written. By the time it runs every
+workgroup-staged write lives inside a structured `hc.generic` rooted at
+`hc.alloc workgroup` (`writeVectorToFreshLDS` lifts the splat init
+through the same surface), so one audit point owns the contract. Stray
+non-generic loads / stores on workgroup storage are out of scope by
+design — the contract is "workgroup writes live in `hc.generic`", and a
+stray writer is a bug in the emitter, not something the synchronization
+pass papers over. `hc-lower-generic` (after the barrier pass) picks up
+generic candidates with the single composed offset per operand and
+lowers them to an outer `scf.parallel` over the parallel iters and an
+inner `scf.for` nest over reduction iters; the WMMA path goes through
+`hc-interpret-intrinsic-recipes` instead, so generic lowering is a
+no-op for that workload. `hc-fold-predicates`
 collapses `hc.predicate` chains adjacent to their loads/stores, and the
 second `hc-lower-launch-body` invocation rewrites the fresh `hc.idx_apply`
 ops the generic lowering planted into plain `arith.*` / `index_cast`.

@@ -13,6 +13,7 @@ add_mlir_library(MLIRHCTransforms
   HCInferGenericBoundsPass.cpp
   HCInferTypesPass.cpp
   HCInlineHelpersPass.cpp
+  HCInsertWorkgroupBarriersPass.cpp
   HCInterpretIntrinsicRecipesPass.cpp
   HCLoadStoreToGenericPass.cpp
   HCLowerBarePredicatesPass.cpp

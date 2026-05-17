@@ -16,14 +16,16 @@
 // cleanup pair, wrap kernels in upstream GPU launches, flatten every
 // shaped carrier to its 1D storage form and compose every offset to a
 // single 1D `#hc.expr`, lower launch-body scalar/control flow on the
-// now-flat IR, clean up, lower `hc.generic` whose operands resolved
-// to `!hc.ptr` to the `scf.parallel` / `scf.for` loop nest, fold
-// `hc.predicate` through to its producer, run `hc-lower-launch-body`
-// a second time to convert the fresh per-lane `hc.idx_apply` ops the
-// generic lowering planted, then interpret target lowering recipes
-// (which rewrites every `hc.call_intrinsic` and erases the sibling
-// `__hc_intrinsic_lowerings__` module), then a canonicalize/cse pair
-// to fold the recipe's bridging UCCs into identity.
+// now-flat IR, clean up, plant `gpu.barrier` between `hc.generic` ops
+// that share a workgroup-AS storage root, lower `hc.generic` whose
+// operands resolved to `!hc.ptr` to the `scf.parallel` / `scf.for`
+// loop nest, fold `hc.predicate` through to its producer, run
+// `hc-lower-launch-body` a second time to convert the fresh per-lane
+// `hc.idx_apply` ops the generic lowering planted, then interpret
+// target lowering recipes (which rewrites every `hc.call_intrinsic`
+// and erases the sibling `__hc_intrinsic_lowerings__` module), then a
+// canonicalize/cse pair to fold the recipe's bridging UCCs into
+// identity.
 //
 // The generic-pipeline rewriters (`hc-shaped-compute-to-generic`,
 // `hc-elementwise-to-generic`, `hc-load-store-to-generic`,
@@ -215,6 +217,21 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m13b : !transform.any_op
+    // Centralise cross-`hc.generic` synchronization on workgroup-AS
+    // storage (LDS). Runs after the first `hc-lower-launch-body` so
+    // every workgroup-staged fill / load / store already lives inside
+    // a structured `hc.generic` rooted at `hc.alloc workgroup`, and
+    // before `hc-lower-generic` so the per-axis offsets / iter syms a
+    // future precise-elision pass needs are still on the op.
+    // Conservative rule: a `gpu.barrier` lands before an `hc.generic`
+    // iff some earlier generic in the same block has already written
+    // (or is about to overwrite) a workgroup-AS storage root this
+    // generic touches. Empty pending after each barrier; stray
+    // non-generic loads / stores on workgroup storage are out of
+    // scope by design (the contract is "workgroup writes live in
+    // `hc.generic`"). No-op on payloads with no workgroup tiles.
+    %m13bs = transform.apply_registered_pass "hc-insert-workgroup-barriers" to %m13b
+        : (!transform.any_op) -> !transform.any_op
     // Lower every `hc.generic` whose operands are `!hc.ptr<...>`
     // (resolved by the launch-body pass above off the kernel-arg
     // UCCs) with rank-1 composed offsets (built by the flatten
@@ -230,7 +247,7 @@ module attributes {transform.with_named_sequence} {
     // ride on `hc.generic`'s `ambient_idxs` slot, captured by
     // `hc-flatten-with-layouts` while the kernel-arg bundle UCC
     // chain and structured-loop induction vars were still HC-typed).
-    %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13b
+    %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13bs
         : (!transform.any_op) -> !transform.any_op
     // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as
     // ordinary body ops — the pass doesn't touch them, the predicate

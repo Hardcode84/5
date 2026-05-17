@@ -14,7 +14,7 @@
 // the binding surface (`hc.compile(symbols={...})` /
 // kernel-decorator `literals=`).
 //
-// RUN: hc-opt %s --hc-lower-launch-body --verify-diagnostics --split-input-file
+// RUN: hc-opt %s --hc-verify-bare-carriers --verify-diagnostics --split-input-file
 
 module {
   func.func @bare_tensor_symbolic_dim(%a: f32) -> f32 {

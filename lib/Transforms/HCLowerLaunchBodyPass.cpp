@@ -2694,79 +2694,14 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   return target;
 }
 
-// Contract gate: `hc-decompose-shaped-values` upstream should have
-// split every semantic `!hc.tensor` / `!hc.vector` into bare pairs.
-// Surviving semantic carrier -> producer-side fail-loud diagnostic.
-static bool isSemanticShapedType(Type type) {
-  return isa<hc::TensorType, hc::VectorType>(type);
-}
-
-static LogicalResult assertNoSemanticShapedSurvives(Operation *rootOp) {
-  WalkResult walk = rootOp->walk([&](Operation *op) {
-    auto bail = [&](Type type, StringRef role) -> WalkResult {
-      op->emitOpError("semantic shaped type ")
-          << type << " survived past hc-decompose-shaped-values on " << role
-          << "; decompose must split !hc.tensor / !hc.vector into bare "
-             "(data, mask) pairs before hc-lower-launch-body runs";
-      return WalkResult::interrupt();
-    };
-    for (Value v : op->getOperands())
-      if (isSemanticShapedType(v.getType()))
-        return bail(v.getType(), "operand");
-    for (Type t : op->getResultTypes())
-      if (isSemanticShapedType(t))
-        return bail(t, "result");
-    return WalkResult::advance();
-  });
-  return success(!walk.wasInterrupted());
-}
-
-// Bare carriers need static shapes (workgroup LDS / vector type are
-// compile-time sized). Free-sym carrier surfaces vague post-
-// conversion error; catch it here and name the op + sym.
-static bool isStaticShape(ShapeAttr shape) {
-  if (!shape)
-    return true;
-  return succeeded(staticIntegerShape(shape, nullptr));
-}
-
-static LogicalResult assertBareCarriersAreStaticShape(Operation *rootOp) {
-  WalkResult walk = rootOp->walk([&](Operation *op) {
-    auto checkType = [&](Type type, StringRef role) -> WalkResult {
-      auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
-      if (!shaped || !isa<BareTensorType, BareVectorType>(type))
-        return WalkResult::advance();
-      if (isStaticShape(shaped.getSymbolicShape()))
-        return WalkResult::advance();
-      op->emitOpError("bare carrier ")
-          << type << " has a non-literal shape on " << role
-          << "; hc-lower-launch-body needs every dim resolved to an integer "
-             "literal to allocate the workgroup tile, so bind the free "
-             "symbol(s) via hc.compile(symbols={...}) (add the symbol to the "
-             "kernel decorator's `literals=` set if it isn't already)";
-      return WalkResult::interrupt();
-    };
-    for (Value v : op->getOperands())
-      if (WalkResult r = checkType(v.getType(), "operand"); r.wasInterrupted())
-        return r;
-    for (Type t : op->getResultTypes())
-      if (WalkResult r = checkType(t, "result"); r.wasInterrupted())
-        return r;
-    return WalkResult::advance();
-  });
-  return success(!walk.wasInterrupted());
-}
-
 struct HCLowerLaunchBodyPass
     : public hc::impl::HCLowerLaunchBodyBase<HCLowerLaunchBodyPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    if (failed(assertNoSemanticShapedSurvives(getOperation())))
-      return signalPassFailure();
-    if (failed(assertBareCarriersAreStaticShape(getOperation())))
-      return signalPassFailure();
-
+    // Bare-carrier + semantic-shape preflights moved to
+    // `hc-verify-bare-carriers`. Runs once before the first
+    // launch-body invocation instead of per invocation.
     MLIRContext *ctx = &getContext();
     HCLaunchBodyTypeConverter converter;
     RewritePatternSet patterns(ctx);
@@ -2780,3 +2715,25 @@ struct HCLowerLaunchBodyPass
 };
 
 } // namespace
+
+namespace mlir::hc {
+std::unique_ptr<TypeConverter> makeLaunchBodyTypeConverter() {
+  return std::make_unique<HCLaunchBodyTypeConverter>();
+}
+
+// Populator exposed for `hc-lower-apply` so the post-`hc-lower-generic`
+// pass reuses the same `ExprLowerer` plumbing without duplicating the
+// patterns. See `HCLowerApplyPass.cpp`.
+void populateLaunchBodyApplyPatterns(TypeConverter &converter,
+                                     RewritePatternSet &patterns,
+                                     MLIRContext *ctx) {
+  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp>(converter, ctx);
+}
+
+// `hc.idx_apply` / `hc.pred_apply` / `hc.predicate` are dyn-legal
+// inside an `hc.generic` body (lowered when the body is cloned out
+// by `hc-lower-generic`); illegal everywhere else.
+void registerLaunchBodyApplyDynamicLegality(ConversionTarget &target) {
+  registerLaunchBodyApplyLegality(target);
+}
+} // namespace mlir::hc

@@ -860,6 +860,46 @@ def HCEmitBenchWrapper
   let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
 }
 
+def HCVerifyBareCarriers
+    : Pass<"hc-verify-bare-carriers"> {
+  let summary = "Gate the launch-body entry: no semantic shaped types "
+                "and bare carriers are static-shape.";
+  let description = [{
+    Pre-flight invariants the launch-body pipeline assumes:
+
+      * No `!hc.tensor` / `!hc.vector` operand or result survives past
+        `hc-decompose-shaped-values` -- semantic shaped types must be
+        split into bare `(data, mask)` pairs before launch-body.
+      * Every bare carrier (`!hc.bare_tensor`, `!hc.bare_vector`) has a
+        static shape -- LDS / vector allocation needs compile-time
+        dims; free symbols must bind via `hc.compile(symbols={...})`.
+
+    Fires once before `hc-lower-launch-body` instead of paying the
+    walk per launch-body invocation. Diagnoses on the offending op so
+    the producer is named, not the pass that tripped.
+  }];
+  let dependentDialects = ["::mlir::hc::HCDialect"];
+}
+
+def HCLowerApply : Pass<"hc-lower-apply"> {
+  let summary = "Lower `hc.idx_apply` / `hc.pred_apply` to arith / cmp.";
+  let description = [{
+    Per-lane apply rewriter: walks every `hc.idx_apply` /
+    `hc.pred_apply` outside `hc.generic` body and lowers via the same
+    `ExprLowerer` that `hc-lower-launch-body` uses. Runs after
+    `hc-lower-generic` to consume the fresh applies it plants, so the
+    second `hc-lower-launch-body` invocation isn't needed just for
+    apply lowering. Inside-generic-body applies stay legal (the body
+    hasn't been cloned yet).
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::func::FuncDialect",
+    "::mlir::gpu::GPUDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";

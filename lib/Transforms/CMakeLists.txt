@@ -15,6 +15,7 @@ add_mlir_library(MLIRHCTransforms
   HCInsertWorkgroupBarriersPass.cpp
   HCInterpretIntrinsicRecipesPass.cpp
   HCLoadStoreToGenericPass.cpp
+  HCLowerApplyPass.cpp
   HCLowerGenericPass.cpp
   HCLowerGPUToBinaryPass.cpp
   HCLowerKernelsToGPULaunchPass.cpp
@@ -29,6 +30,7 @@ add_mlir_library(MLIRHCTransforms
   HCPromoteNamesPass.cpp
   HCShapedComputeToGenericPass.cpp
   HCSpecializeLiteralsPass.cpp
+  HCVerifyBareCarriersPass.cpp
   HCVerifyStaticShapesPass.cpp
   LaunchUtils.cpp
 

@@ -204,7 +204,13 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
     transform.apply_cse to %m12b : !transform.any_op
-    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12b
+    // Preflight gate: bail if any semantic `!hc.tensor` / `!hc.vector`
+    // slipped past decompose, or any bare carrier has a non-literal
+    // shape. Hoisted out of launch-body so the walk fires once
+    // instead of per launch-body invocation.
+    %m12v = transform.apply_registered_pass "hc-verify-bare-carriers" to %m12b
+        : (!transform.any_op) -> !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12v
         : (!transform.any_op) -> !transform.any_op
     // Launch-body emitted fresh upstream `arith.constant` /
     // `index_cast` / `arith.muli` chains via ExprLowerer for every
@@ -259,18 +265,13 @@ module attributes {transform.with_named_sequence} {
     // not just on `hc-lower-generic`'s output.
     %m13af = transform.apply_registered_pass "hc-fold-predicates" to %m13a
         : (!transform.any_op) -> !transform.any_op
-    // Second `hc-lower-launch-body` invocation: the per-lane offsets
-    // emitted by `hc-lower-generic` surface as fresh `hc.idx_apply`
-    // ops that still need to be rewritten to plain `arith.*` /
-    // `index_cast` arithmetic before LLVM translation. Re-running
-    // launch-body picks them up via `ConvertIdxApplyOp` -- the only
-    // `hc.idx_apply -> arith` path in the pipeline. Any sym the
-    // per-lane emitter couldn't pre-bind (free in the planted apply)
-    // still falls through to the ambient-context resolver inside
-    // launch-body. The first invocation's body conversion target is
-    // idempotent on the IR shape it produced; only the surviving
-    // applies match here.
-    %m13ar = transform.apply_registered_pass "hc-lower-launch-body" to %m13af
+    // Pick up the per-lane `hc.idx_apply` / `hc.pred_apply` ops
+    // `hc-lower-generic` minted on its way out of the body and lower
+    // them to `arith.*` / `index_cast` via the same `ExprLowerer`
+    // launch-body uses. `hc-lower-apply` carries only the apply
+    // patterns -- no need to re-spin the full launch-body target on
+    // IR that's already past the launch-body legality bar.
+    %m13ar = transform.apply_registered_pass "hc-lower-apply" to %m13af
         : (!transform.any_op) -> !transform.any_op
     // Same rationale as the post-first-launch-body pair: ExprLowerer
     // planted fresh arith / index_cast chains for every per-lane

@@ -11,7 +11,7 @@
 // instead of identity-converting the type and producing a vague
 // "failed to legalize" error two stages later.
 //
-// RUN: hc-opt %s --hc-lower-launch-body --verify-diagnostics --split-input-file
+// RUN: hc-opt %s --hc-verify-bare-carriers --verify-diagnostics --split-input-file
 
 module {
   func.func @semantic_tensor_survives(%a: f32) -> f32 {

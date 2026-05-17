@@ -105,32 +105,6 @@ collectImplicitSyms(SymbolicallyShapedTypeInterface shaped) {
   return result;
 }
 
-// Bare sym name of a single-symbol dim, else empty. Drives the
-// host-wrapper aux-arg `axis -> sym name` map.
-static StringRef bareDimSymbolName(Attribute dimAttr) {
-  auto expr = dyn_cast<ExprAttr>(dimAttr);
-  if (!expr)
-    return {};
-  ixs_node *node = const_cast<ixs_node *>(expr.getNode());
-  if (ixs_node_tag(node) != IXS_SYM)
-    return {};
-  return StringRef(ixs_node_sym_name(node));
-}
-
-// Parse axis out of `$STRIDE_<axis>_<bufname>` (frontend stride sym
-// shape). nullopt for non-strides.
-static std::optional<unsigned> parseStrideAxis(StringRef name) {
-  static constexpr StringLiteral kStridePrefix = "$STRIDE_";
-  if (!name.starts_with(kStridePrefix))
-    return std::nullopt;
-  StringRef rest = name.drop_front(kStridePrefix.size());
-  auto [axisStr, bufName] = rest.split('_');
-  unsigned axis = 0;
-  if (axisStr.consumeInteger(10, axis) || !axisStr.empty() || bufName.empty())
-    return std::nullopt;
-  return axis;
-}
-
 // Build `!hc.idx<sym>` per implicit name.
 static LogicalResult buildAuxIdxTypes(MLIRContext *ctx,
                                       ArrayRef<std::string> names,
@@ -1808,102 +1782,11 @@ struct RetypeAnyHCOp : public ConversionPattern {
   }
 };
 
-// Classify implicit aux sym: stride (from `$Sx<axis>`) or dim (matches
-// a buffer axis). Non-shape-sourced names (storage_size, layout
-// params) can't bind from `hc_get_dim` and get dropped.
-struct FlattenAuxKindAxis {
-  StringRef kind;
-  int64_t axis;
-};
-static std::optional<FlattenAuxKindAxis>
-classifyImplicitAuxSym(StringRef name, ArrayRef<StringRef> axisSyms) {
-  if (std::optional<unsigned> strideAxis = parseStrideAxis(name))
-    return FlattenAuxKindAxis{"stride", static_cast<int64_t>(*strideAxis)};
-  for (auto [a, axisSym] : llvm::enumerate(axisSyms))
-    if (axisSym == name)
-      return FlattenAuxKindAxis{"dim", static_cast<int64_t>(a)};
-  return std::nullopt;
-}
-
-// One `(aux_of, axis, kind)` entry keyed by post-flatten arg index.
-static NamedAttribute
-buildFlattenAuxArgEntry(MLIRContext *ctx, IntegerType i64Type,
-                        unsigned auxPostIdx, unsigned flatCarrierIdx,
-                        const FlattenAuxKindAxis &kindAxis) {
-  SmallVector<NamedAttribute> auxEntries;
-  auxEntries.emplace_back(StringAttr::get(ctx, "aux_of"),
-                          IntegerAttr::get(i64Type, flatCarrierIdx));
-  auxEntries.emplace_back(StringAttr::get(ctx, "axis"),
-                          IntegerAttr::get(i64Type, kindAxis.axis));
-  auxEntries.emplace_back(StringAttr::get(ctx, "kind"),
-                          StringAttr::get(ctx, kindAxis.kind));
-
-  SmallString<8> key;
-  Twine(auxPostIdx).toVector(key);
-  return NamedAttribute(StringAttr::get(ctx, key),
-                        DictionaryAttr::get(ctx, auxEntries));
-}
-
-// Append one entry per recognized aux slot for a buffer arg; drops
-// non-shape-sourced names per `classifyImplicitAuxSym`.
-static void
-noteFlattenAuxArgsForBuffer(MLIRContext *ctx, IntegerType i64Type,
-                            unsigned flatCarrierIdx,
-                            SymbolicallyShapedTypeInterface shaped,
-                            SmallVectorImpl<NamedAttribute> &entries) {
-  SmallVector<StringRef> axisSyms;
-  if (ShapeAttr shape = shaped.getSymbolicShape())
-    for (Attribute dim : shape.getDims())
-      axisSyms.push_back(bareDimSymbolName(dim));
-
-  SmallVector<std::string> implicitSyms = collectImplicitSyms(shaped);
-  for (auto [i, sym] : llvm::enumerate(implicitSyms)) {
-    unsigned auxPostIdx = flatCarrierIdx + 1 + i;
-    std::optional<FlattenAuxKindAxis> kindAxis =
-        classifyImplicitAuxSym(StringRef(sym), axisSyms);
-    if (!kindAxis)
-      continue;
-    entries.push_back(buildFlattenAuxArgEntry(ctx, i64Type, auxPostIdx,
-                                              flatCarrierIdx, *kindAxis));
-  }
-}
-
-// Build `hc.flatten_aux_args` meta: DictionaryAttr keyed by
-// post-flatten arg index, value `(aux_of, axis, kind)` per aux slot.
-// Lets the host-wrapper lowering pair each aux back to its parent
-// buffer arg without re-deriving from the signature. Null on funcs
-// without expanded buffer args.
-static DictionaryAttr buildFlattenAuxArgsMeta(MLIRContext *ctx,
-                                              FunctionType origType,
-                                              const TypeConverter &converter) {
-  SmallVector<NamedAttribute> entries;
-  auto i64Type = IntegerType::get(ctx, 64);
-  unsigned newIdx = 0;
-  for (Type origInput : origType.getInputs()) {
-    SmallVector<Type> converted;
-    if (failed(converter.convertType(origInput, converted))) {
-      ++newIdx;
-      continue;
-    }
-    auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(origInput);
-    auto buffer = dyn_cast<BufferType>(origInput);
-    if (!buffer || !shaped || isAlreadyFlat(shaped)) {
-      newIdx += converted.size();
-      continue;
-    }
-    noteFlattenAuxArgsForBuffer(ctx, i64Type, newIdx, shaped, entries);
-    newIdx += converted.size();
-  }
-
-  if (entries.empty())
-    return {};
-  return DictionaryAttr::get(ctx, entries);
-}
-
 // Retype `hc.intrinsic` / `hc.func` / `hc.kernel` signatures + body
 // block args. These don't implement `FunctionOpInterface` so upstream
-// populator misses them. Attaches `hc.flatten_aux_args` for the
-// host-wrapper lowering to find aux slots.
+// populator misses them. In production only `hc.intrinsic` reaches
+// here -- `hc.kernel` / `hc.func` are consumed by earlier passes
+// (`hc-lower-kernels-to-gpu-launch`, `hc-inline-helpers`).
 template <typename SymbolOp>
 struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
   using OpConversionPattern<SymbolOp>::OpConversionPattern;
@@ -1928,14 +1811,9 @@ struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
     if (newType == *fnType)
       return failure();
 
-    DictionaryAttr auxMeta = buildFlattenAuxArgsMeta(
-        rewriter.getContext(), *fnType, *this->getTypeConverter());
-
     Region &body = op.getBody();
     rewriter.modifyOpInPlace(op, [&] {
       op.setFunctionType(newType);
-      if (auxMeta)
-        op->setAttr("hc.flatten_aux_args", auxMeta);
       if (body.empty())
         return;
       TypeConverter::SignatureConversion conversion(fnType->getNumInputs());

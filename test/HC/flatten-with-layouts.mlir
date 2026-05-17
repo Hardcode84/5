@@ -76,16 +76,10 @@ func.func @strided_buffer_arg(
 
 // Same signature on an `hc.kernel` instead of a `func.func` so the
 // kernel-specific signature populator (`ConvertHCSymbolSignatureOp`)
-// fires alongside the buffer's 1-to-N expansion. Aux idx slots get
-// pinned back to their parent buffer's post-flatten arg index via
-// the `hc.flatten_aux_args` attribute the populator attaches; the
-// host-wrapper lowering (`hc-lower-kernels-to-gpu-launch`) reads
-// it to skip allocating Python ABI slots for the auxes and to
-// resolve each aux through `_get_dim` / `_get_stride` on the parent
-// buffer's PyObject. `kind` distinguishes the accessor; `axis`
-// picks the axis in the parent's pre-flatten shape (stride symbols
-// encode the axis in their name, dim symbols by position in the
-// pre-flatten shape).
+// fires alongside the buffer's 1-to-N expansion. Production never
+// reaches the kernel-signature path -- hc-lower-kernels-to-gpu-launch
+// has already consumed hc.kernel before flatten runs -- but the
+// pattern stays for hc.intrinsic and out-of-pipeline hand-written IR.
 // CHECK-LABEL: hc.kernel @strided_buffer_kernel
 // CHECK-SAME: %arg0: !hc.group
 // CHECK-SAME: %arg1: !hc.buffer<f16, ["?"]>
@@ -93,11 +87,6 @@ func.func @strided_buffer_arg(
 // CHECK-SAME: %arg3: !hc.idx<"$STRIDE_1_a">
 // CHECK-SAME: %arg4: !hc.idx<"K">
 // CHECK-SAME: %arg5: !hc.idx<"M">
-// CHECK-SAME: hc.flatten_aux_args
-// CHECK-SAME: "2" = {aux_of = 1 : i64, axis = 0 : i64, kind = "stride"}
-// CHECK-SAME: "3" = {aux_of = 1 : i64, axis = 1 : i64, kind = "stride"}
-// CHECK-SAME: "4" = {aux_of = 1 : i64, axis = 1 : i64, kind = "dim"}
-// CHECK-SAME: "5" = {aux_of = 1 : i64, axis = 0 : i64, kind = "dim"}
 hc.kernel @strided_buffer_kernel(
     %group: !hc.group<work_shape = #hc.shape<["32*ceiling(1/16*M)", "ceiling(1/16*K)"]>, group_shape = #hc.shape<["32", "1"]>>,
     %a: !hc.buffer<f16, ["M", "K"],

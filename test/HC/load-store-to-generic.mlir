@@ -344,11 +344,22 @@ func.func @load_mask_untouched(%buf: !hc.buffer<f32, ["M"]>, %i: !hc.idx<"i">)
 // `lo + i_0` — step = const 1 folds out, matching the scalar-idx
 // printed form. This is the case the WMMA cooperative-load path emits
 // when both fragment dims are walked as `range(0, k)`-style slices.
+// Slice-typed indices opt the load body into the predicated shape:
+// `pred_apply` over the per-axis bound, UCC to i1, zero passthrough,
+// `hc.predicate` wrapping the ins block-arg. `hc-fold-predicates`
+// downstream folds that into `hc.ptr_load_pred` at the materialised
+// load site.
 // CHECK-LABEL: func.func @load_slice_unit_step
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %{{.+}} : !hc.idx<"A">)
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0 + lo">] : !hc.buffer<f32, ["M"]>)
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<f32, ["A"]>)
+// CHECK: ^bb0(%[[BV:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i_0 + lo < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]] : !hc.pred<"-M + i_0 + lo < 0"> to i1
+// CHECK:   %[[Z:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:   %[[G:.+]] = hc.predicate %[[BV]] mask %[[BPU]] passthrough %[[Z]] : f32, i1
+// CHECK:   hc.yield %[[G]] : f32
 // CHECK-NOT: hc.load
 func.func @load_slice_unit_step(%buf: !hc.buffer<f32, ["M"]>,
                                 %lo: !hc.idx<"lo">, %hi: !hc.idx<"hi">,

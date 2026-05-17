@@ -50,8 +50,30 @@ static bool tryFoldTrivialMask(HCPredicateOp op) {
   return false;
 }
 
+// `target` must reach `before` after a sequence of in-block hoists.
+// Already-dominating SSA: nothing to do. Same-block + after + pure:
+// recursively hoist operands then move. Cross-block non-dominating
+// or side-effecting: bail. Dominance is re-queried per call to
+// account for moves performed during recursion.
+static bool hoistChainBefore(Value target, Operation *before,
+                             DominanceInfo &dom) {
+  if (dom.properlyDominates(target, before))
+    return true;
+  Operation *def = target.getDefiningOp();
+  if (!def || def->getBlock() != before->getBlock())
+    return false;
+  if (!isMemoryEffectFree(def))
+    return false;
+  for (Value operand : def->getOperands())
+    if (!hoistChainBefore(operand, before, dom))
+      return false;
+  def->moveBefore(before);
+  dom.invalidate(def->getBlock()->getParent());
+  return true;
+}
+
 // Allow-list -- unknown producer is a diagnostic, not passthrough.
-static LogicalResult foldPredicate(HCPredicateOp op, const DominanceInfo &dom) {
+static LogicalResult foldPredicate(HCPredicateOp op, DominanceInfo &dom) {
   if (tryFoldTrivialMask(op))
     return success();
 
@@ -65,11 +87,14 @@ static LogicalResult foldPredicate(HCPredicateOp op, const DominanceInfo &dom) {
   if (auto load = dyn_cast<HCPtrLoadOp>(producer)) {
     // Mask / passthrough must dominate the load -- predicated clone
     // replaces the load in place, not at the predicate use site.
+    // Same-block, after-load chains hoist when pure (the planted
+    // body has `pred_apply` / UCC / constant past the materialised
+    // load).
     Value mask = op.getMask();
     Value pass = op.getPassthrough();
-    if (!dom.dominates(mask, load))
+    if (!hoistChainBefore(mask, load, dom))
       return op.emitOpError("mask does not dominate the hc.ptr_load producer");
-    if (!dom.dominates(pass, load))
+    if (!hoistChainBefore(pass, load, dom))
       return op.emitOpError(
           "passthrough does not dominate the hc.ptr_load producer");
 

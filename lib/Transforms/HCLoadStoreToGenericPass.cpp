@@ -14,6 +14,7 @@
 #include "hc/IR/HCTypes.h"
 #include "hc/IR/HCTypesInterfaces.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -945,6 +946,18 @@ composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
   return composeMemoryOffsetArray(ctx, store, pf.axes, iterSyms);
 }
 
+// Forward decls: full bodies live past `preflightLoadMask` so the
+// helpers can deref `MaskPreflight`. Template `rewriteLoadLike`
+// only needs declarations to satisfy non-ADL lookup at definition.
+static void populateLoadBodyPredicated(HCGenericOp generic, MLIRContext *ctx,
+                                       Type srcElem, Type resElem, Location loc,
+                                       sym::PredHandle conjunction);
+static std::optional<sym::PredHandle>
+tryComposeLoadBoundsConjunction(MLIRContext *ctx, sym::Store &store,
+                                Value source, Type resultTy, ValueRange indices,
+                                ArrayRef<ExprAttr> tileShape,
+                                ArrayRef<StringAttr> iterSyms);
+
 // Emit a fresh block carrying one src arg and one dst arg, terminated
 // with `hc.yield %src` -- the trivial "copy element through" body the
 // load rewrites all share.
@@ -1010,7 +1023,20 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 
   Type srcElem = bodyArgElementType(effSource.getType());
   Type resElem = bodyArgElementType(resultTy);
-  populateLoadBody(generic, srcElem, resElem, loc);
+
+  // Plant `hc.predicate` when we can compose the per-axis bounds and
+  // srcElem is arith-able (no zero attr for `!hc.undef` / `!hc.pred`).
+  // Falls back to the trivial passthrough body otherwise.
+  std::optional<sym::PredHandle> conjunction;
+  if (srcElem.isIntOrIndexOrFloat())
+    conjunction = tryComposeLoadBoundsConjunction(ctx, store, source, resultTy,
+                                                  op.getIndices(), *tileShape,
+                                                  common.iterSyms);
+  if (conjunction)
+    populateLoadBodyPredicated(generic, ctx, srcElem, resElem, loc,
+                               *conjunction);
+  else
+    populateLoadBody(generic, srcElem, resElem, loc);
 
   op->replaceAllUsesWith(generic.getResults());
   op->erase();
@@ -1378,6 +1404,59 @@ preflightLoadMask(MLIRContext *ctx, sym::Store &store, Value source,
       pf.sliceAxes = std::move(*sliceAxesOr);
   }
   return pf;
+}
+
+// Predicated load body: same shape as `populateLoadBody`, but the ins
+// block-arg is wrapped in `hc.predicate` so `hc-fold-predicates`
+// (after `hc-lower-generic` materialises the implicit load) can hoist
+// the mask into `hc.ptr_load_pred`. Passthrough is a zero constant.
+static void populateLoadBodyPredicated(HCGenericOp generic, MLIRContext *ctx,
+                                       Type srcElem, Type resElem, Location loc,
+                                       sym::PredHandle conjunction) {
+  Block *body = new Block();
+  BlockArgument bv = body->addArgument(srcElem, loc);
+  body->addArgument(resElem, loc);
+  generic.getBody().push_back(body);
+  OpBuilder b(body, body->begin());
+
+  PredAttr predAttr = PredAttr::get(ctx, conjunction);
+  Type pinnedTy = PredType::get(ctx, predAttr);
+  Value predPinned =
+      HCPredApplyOp::create(b, loc, pinnedTy,
+                            /*operands=*/ValueRange{}, b.getStrArrayAttr({}))
+          .getResult();
+  Type i1Ty = IntegerType::get(ctx, 1);
+  Value predUnpinned =
+      UnrealizedConversionCastOp::create(b, loc, i1Ty, predPinned).getResult(0);
+
+  auto zeroAttr = cast<TypedAttr>(b.getZeroAttr(srcElem));
+  Value zero = arith::ConstantOp::create(b, loc, zeroAttr);
+
+  Value guarded = HCPredicateOp::create(b, loc, srcElem, bv, predUnpinned, zero)
+                      .getResult();
+  HCYieldOp::create(b, loc, ValueRange{guarded});
+}
+
+// Try to compose the per-axis bounds conjunction for a load's source,
+// matching the `hc.load_mask` rewriter. Empty indices, missing source
+// shape, or any compositional failure -> std::nullopt; caller falls
+// back to the trivial passthrough body.
+static std::optional<sym::PredHandle>
+tryComposeLoadBoundsConjunction(MLIRContext *ctx, sym::Store &store,
+                                Value source, Type resultTy, ValueRange indices,
+                                ArrayRef<ExprAttr> tileShape,
+                                ArrayRef<StringAttr> iterSyms) {
+  if (indices.empty())
+    return std::nullopt;
+  auto pf = preflightLoadMask(ctx, store, source, indices, tileShape);
+  if (failed(pf))
+    return std::nullopt;
+  auto conjunction = composeMaskConjunctionForResult(
+      ctx, store, source, resultTy, indices, pf->srcShape, tileShape, iterSyms,
+      pf->axes, pf->sliceAxes);
+  if (failed(conjunction))
+    return std::nullopt;
+  return *conjunction;
 }
 
 static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {

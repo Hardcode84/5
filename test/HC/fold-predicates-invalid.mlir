@@ -42,27 +42,14 @@ func.func @double_predicate(%p: !hc.ptr<global, f32>,
 
 // -----
 
-// Mask SSA computed AFTER the load: hoisting the mask to the load's
-// site would break SSA. The fold pass refuses; the user has to
-// schedule the mask before the load.
-func.func @mask_after_load(%p: !hc.ptr<global, f32>, %f: f32,
-                           %lhs: i32, %rhs: i32) -> f32 {
+// Mask producer with memory effects: pure-only hoist refuses to move
+// a `hc.ptr_load`-produced mask back across the data load.
+func.func @mask_after_load_with_side_effect(%p: !hc.ptr<global, f32>,
+                                            %mp: !hc.ptr<global, i1>,
+                                            %f: f32) -> f32 {
   %v = hc.ptr_load %p : !hc.ptr<global, f32> -> f32
-  %m = arith.cmpi slt, %lhs, %rhs : i32
+  %m = hc.ptr_load %mp : !hc.ptr<global, i1> -> i1
   // expected-error @+1 {{'hc.predicate' op mask does not dominate the hc.ptr_load producer}}
-  %r = hc.predicate %v mask %m passthrough %f : f32, i1
-  return %r : f32
-}
-
-// -----
-
-// Passthrough computed AFTER the load: same hoisting constraint as the
-// mask. Fold refuses, user fixes the source.
-func.func @passthrough_after_load(%p: !hc.ptr<global, f32>, %m: i1,
-                                  %src: f32) -> f32 {
-  %v = hc.ptr_load %p : !hc.ptr<global, f32> -> f32
-  %f = arith.negf %src : f32
-  // expected-error @+1 {{'hc.predicate' op passthrough does not dominate the hc.ptr_load producer}}
   %r = hc.predicate %v mask %m passthrough %f : f32, i1
   return %r : f32
 }

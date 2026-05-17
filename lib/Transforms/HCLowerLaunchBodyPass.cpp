@@ -2658,14 +2658,17 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
                       HCStoreOp, HCForRangeOp, HCIfOp>();
 }
 
-// `hc.idx_apply` / `hc.pred_apply` inside `hc.generic` body deferred
-// to the post-unroll pass invocation; outside, illegal here.
+// `hc.idx_apply` / `hc.pred_apply` / `hc.predicate` inside `hc.generic`
+// body deferred to the post-unroll pass invocation (hc-lower-generic
+// materialises the producer, hc-fold-predicates folds the predicate);
+// outside, illegal here.
 static void registerLaunchBodyApplyLegality(ConversionTarget &target) {
   auto applyLegalInsideGeneric = [](Operation *op) {
     return op->getParentOfType<HCGenericOp>() != nullptr;
   };
   target.addDynamicallyLegalOp<HCIdxApplyOp>(applyLegalInsideGeneric);
   target.addDynamicallyLegalOp<HCPredApplyOp>(applyLegalInsideGeneric);
+  target.addDynamicallyLegalOp<HCPredicateOp>(applyLegalInsideGeneric);
 }
 
 static ConversionTarget

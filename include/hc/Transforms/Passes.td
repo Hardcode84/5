@@ -291,8 +291,18 @@ def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
     single `hc.pred_apply` carrying per-axis bounds conjunction. Slice
     axes without pinned `!hc.idx` lower / step and source dims that
     aren't `#hc.expr` leaves fall through unchanged.
+
+    Non-empty-index `hc.load` / `hc.vload` bodies wrap the ins block-arg
+    with `hc.predicate` whose mask is the same per-axis bounds
+    conjunction (passthrough = zero constant). `hc-lower-generic` then
+    materialises the block-arg as `hc.ptr_load`; `hc-fold-predicates`
+    rewrites the predicate into `hc.ptr_load_pred` so OOB lanes don't
+    speculate. Empty-index loads keep the trivial passthrough body.
   }];
-  let dependentDialects = ["::mlir::hc::HCDialect"];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect"
+  ];
 }
 
 def HCDistributeWaveLayouts : Pass<"hc-distribute-wave-layouts"> {

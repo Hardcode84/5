@@ -158,3 +158,50 @@ func.func @fold_const_true_vector(%p: !hc.ptr<global, f32>,
   %r = hc.predicate %v mask %t passthrough %f : vector<4xf32>, vector<4xi1>
   return %r : vector<4xf32>
 }
+
+// -----
+
+// Mask defined AFTER the load in the same block: the fold pass
+// hoists the pure mask chain back across the load so dominance
+// holds, then collapses into `hc.ptr_load_pred`. Mirrors the
+// pattern `hc-load-store-to-generic` plants in its load body
+// (`pred_apply` + UCC + `predicate`) — after `hc-lower-generic`
+// materialises the load, the chain lands past it and needs the
+// hoist to fold.
+// CHECK-LABEL: func.func @hoist_mask_chain
+// CHECK-SAME: %[[P:[^:]+]]: !hc.ptr<global, f32>
+// CHECK-SAME: %[[LHS:[^:]+]]: i32
+// CHECK-SAME: %[[RHS:[^:]+]]: i32
+// CHECK-SAME: %[[F:[^)]+]]: f32
+// CHECK: %[[M:.*]] = arith.cmpi slt, %[[LHS]], %[[RHS]] : i32
+// CHECK: %[[R:.*]] = hc.ptr_load_pred %[[P]], %[[M]] passthrough %[[F]]
+// CHECK-NOT: hc.predicate
+// CHECK-NOT: hc.ptr_load %
+// CHECK: return %[[R]]
+func.func @hoist_mask_chain(%p: !hc.ptr<global, f32>,
+                            %lhs: i32, %rhs: i32, %f: f32) -> f32 {
+  %v = hc.ptr_load %p : !hc.ptr<global, f32> -> f32
+  %m = arith.cmpi slt, %lhs, %rhs : i32
+  %r = hc.predicate %v mask %m passthrough %f : f32, i1
+  return %r : f32
+}
+
+// -----
+
+// Same shape for passthrough: pure compute defined after the load
+// hoists too. `arith.negf` rides along with the cmpi.
+// CHECK-LABEL: func.func @hoist_passthrough_chain
+// CHECK-SAME: %[[P:[^:]+]]: !hc.ptr<global, f32>
+// CHECK-SAME: %[[M:[^:]+]]: i1
+// CHECK-SAME: %[[SRC:[^)]+]]: f32
+// CHECK: %[[F:.*]] = arith.negf %[[SRC]] : f32
+// CHECK: %[[R:.*]] = hc.ptr_load_pred %[[P]], %[[M]] passthrough %[[F]]
+// CHECK-NOT: hc.predicate
+// CHECK: return %[[R]]
+func.func @hoist_passthrough_chain(%p: !hc.ptr<global, f32>,
+                                   %m: i1, %src: f32) -> f32 {
+  %v = hc.ptr_load %p : !hc.ptr<global, f32> -> f32
+  %f = arith.negf %src : f32
+  %r = hc.predicate %v mask %m passthrough %f : f32, i1
+  return %r : f32
+}

@@ -1277,7 +1277,8 @@ def HCPredicateOp : HC_Op<"predicate",
 // Reductions, matmul, astype.
 //===----------------------------------------------------------------------===//
 
-def HCMatmulOp : HC_Op<"matmul", [Pure]> {
+def HCMatmulOp : HC_Op<"matmul",
+    [Pure, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Generic matmul over tensors or vectors.";
   // Bare carriers accepted: `hc-decompose-shaped-values` splits semantic
   // operands into (data, mask) and re-plants matmul on the data half

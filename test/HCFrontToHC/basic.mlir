@@ -710,6 +710,21 @@ module {
     hc_front.return %r
   }
 
+  // Python `a @ b` arrives as `ast.MatMult` and routes to `hc.matmul`.
+  // CHECK-LABEL: hc.func @binop_matmul
+  // CHECK: hc.matmul %arg0, %arg1 : (!hc.undef, !hc.undef) -> !hc.undef
+  // CHECK: hc.return
+  hc_front.func "binop_matmul" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.binop "MatMult"(%a, %b)
+    hc_front.return %r
+  }
+
   // `np.<func>(...)` lowers structurally to `hc.builtin_call
   // "numpy.<func>"`. Two cases pin the contract: a one-positional ufunc
   // (`np.sqrt(x)`) and a no-positional probe (`np.sqrt()` — invalid

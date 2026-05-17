@@ -48,16 +48,16 @@ module {
 // structural carrier (`hc.pow`); the unsupported-rhs diagnostics
 // (non-const, float, zero, negative) live on `-hc-lower-pow` and are
 // pinned in `test/HC/lower-pow-invalid.mlir`. The catch-all error here
-// covers everything `emitBinop` still can't map (`MatMult`, the
-// comparison family, bitwise ops, ...).
+// covers everything `emitBinop` still can't map (bitwise / shift
+// family, ...).
 module {
-  hc_front.kernel "bad_binop_matmult" attributes {
+  hc_front.kernel "bad_binop_bitand" attributes {
     parameters = [{name = "a"}, {name = "b"}]
   } {
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    // expected-error@+1 {{unsupported hc_front.binop kind 'MatMult'}}
-    %c = hc_front.binop "MatMult"(%a, %b)
+    // expected-error@+1 {{unsupported hc_front.binop kind 'BitAnd'}}
+    %c = hc_front.binop "BitAnd"(%a, %b)
     hc_front.return
   }
 }

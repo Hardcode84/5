@@ -1287,6 +1287,46 @@ LogicalResult HCMulOp::inferHCTypes(ArrayRef<Type> operandTypes,
                           resultTypes);
 }
 
+// Rank-2 + K parity. Returns {M, N} pair on success, {} on failure.
+static std::optional<std::pair<Attribute, Attribute>>
+matmulMNDims(ShapeAttr lhs, ShapeAttr rhs) {
+  if (!lhs || !rhs)
+    return std::nullopt;
+  ArrayRef<Attribute> lhsDims = lhs.getDims();
+  ArrayRef<Attribute> rhsDims = rhs.getDims();
+  if (lhsDims.size() != 2 || rhsDims.size() != 2 || lhsDims[1] != rhsDims[0])
+    return std::nullopt;
+  return std::make_pair(lhsDims[0], rhsDims[1]);
+}
+
+// Same flavor + K parity. Layout dropped on result.
+static Type inferMatmulResultType(Type lhs, Type rhs, Operation *op) {
+  auto lhsShaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(lhs);
+  auto rhsShaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(rhs);
+  if (!lhsShaped || !rhsShaped || !sameShapedFlavor(lhs, rhs))
+    return {};
+  auto mn =
+      matmulMNDims(lhsShaped.getSymbolicShape(), rhsShaped.getSymbolicShape());
+  if (!mn)
+    return {};
+  Type elementType = joinHCTypes(lhsShaped.getSymbolicElementType(),
+                                 rhsShaped.getSymbolicElementType());
+  if (!elementType)
+    return {};
+  ShapeAttr resultShape =
+      ShapeAttr::get(op->getContext(), {mn->first, mn->second});
+  return rebuildShapedType(lhs, elementType, resultShape);
+}
+
+LogicalResult HCMatmulOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                       SmallVectorImpl<Type> &resultTypes) {
+  if (failed(requireOperandCount(*this, operandTypes, 2)))
+    return failure();
+  resultTypes.push_back(
+      inferMatmulResultType(operandTypes[0], operandTypes[1], *this));
+  return success();
+}
+
 LogicalResult HCDivOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
   return inferIndexBinary(operandTypes, sym::ExprBinaryOp::Div, *this,

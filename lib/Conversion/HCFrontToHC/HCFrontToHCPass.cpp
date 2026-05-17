@@ -502,6 +502,8 @@ static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
     return HCModOp::create(builder, loc, undef, lhs, rhs);
   if (kind == "Pow")
     return HCPowOp::create(builder, loc, undef, lhs, rhs);
+  if (kind == "MatMult")
+    return HCMatmulOp::create(builder, loc, undef, lhs, rhs);
   sourceOp->emitOpError("unsupported hc_front.binop kind '") << kind << "'";
   return nullptr;
 }

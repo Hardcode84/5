@@ -150,6 +150,64 @@ def compile_pairwise_distance(
     )
 
 
+def _require_torch_cuda(surface: str):
+    """Import torch and confirm a HIP/ROCm device is visible.
+
+    Returns the torch module so the caller can `.from_numpy(...).cuda()`
+    on it. Raises a `RuntimeError` (not `ImportError`) when torch or
+    `torch.cuda` is missing so the message points at the missing piece
+    instead of a generic stack trace. `surface` is the user-facing name
+    of the calling entry point so the diagnostic stays actionable.
+    """
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{surface} needs the `torch` package to allocate device "
+            "buffers; `pip install torch` (with a ROCm-enabled wheel) and "
+            "retry."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{surface} needs a HIP/ROCm device visible to torch.cuda; "
+            "torch.cuda.is_available() returned False."
+        )
+    return torch
+
+
+def run_on_hardware(
+    x1: np.ndarray,
+    x2: np.ndarray,
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-6,
+) -> np.ndarray:
+    """Compile for gfx11 and invoke through the bundled HIP shim.
+
+    Mirrors `examples/amdgpu_gfx11_wmma_matmul.run_on_hardware`. We use
+    `torch.cuda` tensors for the device buffers because `.data_ptr()`
+    returns a HIP-allocated pointer that `_mlir_ciface_hc_get_ptr` hands
+    straight to `gpu.launch_func`. The compile binds `H` to `x1.shape[1]`
+    via `compile_pairwise_distance` and asserts the readback against the
+    NumPy reference at the same `(rtol, atol)` floor the simulator uses.
+    """
+
+    torch = _require_torch_cuda("run_on_hardware")
+
+    x1_dev = torch.from_numpy(x1).cuda()
+    x2_dev = torch.from_numpy(x2).cuda()
+    d_dev = torch.zeros(x1.shape[0], x2.shape[0], dtype=torch.float32, device="cuda")
+
+    compiled = compile_pairwise_distance(x1, x2)
+    compiled.invoke(x1_dev, x2_dev, d_dev)
+
+    out = d_dev.cpu().numpy()
+    reference = reference_pairwise_distance(x1, x2)
+    np.testing.assert_allclose(out, reference, rtol=rtol, atol=atol)
+    return out
+
+
 def make_demo_inputs(
     *,
     w1: int = 6,

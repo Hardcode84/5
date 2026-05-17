@@ -25,6 +25,9 @@ from examples.pairwise_distance import (
 from examples.pairwise_distance import (
     make_demo_inputs as make_pairwise_inputs,
 )
+from examples.pairwise_distance import (
+    run_on_hardware as run_pairwise_on_hardware,
+)
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
@@ -202,6 +205,22 @@ def test_pairwise_distance_native_compile(h: int) -> None:
         compiled.pipeline_diagnostics
     )
     assert compiled.hc_ir_text
+
+
+# Real-hardware end-to-end gate for pairwise. Default-skipped — see the
+# `_RUN_HIP_INVOKE_TESTS` comment block above. The matching shape is
+# the smallest one whose work_shape stays strictly inside one
+# `group_shape=(8, 8)` workgroup; larger shapes (those that hit the
+# tile boundary at `W1==8` or `W2==8`) currently miscompare against
+# the numpy reference — see the open bead on the workgroup-collective
+# boundary race so the test surface tracks where the GPU output is
+# actually trusted.
+@_RUN_HIP_INVOKE_TESTS
+def test_pairwise_distance_invokes_on_real_hardware() -> None:
+    x1, x2 = make_pairwise_inputs(w1=6, w2=5, h=4, seed=29)
+    out = run_pairwise_on_hardware(x1, x2)
+    ref = reference_pairwise_distance(x1, x2)
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-6)
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

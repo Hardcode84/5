@@ -12,23 +12,27 @@ broadcasting them into a rank-3 difference, squaring, summing over `H`,
 and writing `sqrt(...)` back to `D` with the boundary mask carried by the
 `group.load` / `group.store` boundary checks.
 
-The point of the example here is twofold:
+The example exists as a small end-to-end pass through the workgroup-level
+API that exercises broadcasting + reduction + sqrt — useful both against
+the simulator and as the smallest non-WMMA native-compile target.
 
-  * pin a small end-to-end pass through the workgroup-level API that
-    exercises broadcasting + reduction + sqrt against the simulator,
-    independently of the gfx11-specific WMMA pipeline; and
+`H` (the inner reduction dim) is in the decorator's `literals=` set: the
+workgroup LDS tile of shape `(g0, H)` / `(g1, H)` has to materialize with
+all dims resolved to integer literals at `hc-lower-launch-body` time
+(runtime-sized LDS for symbolic carriers is the open feature in the
+tracker). The frontend-resolve step substitutes the literal binding into
+the kernel IR, so a different `H` per call means a recompile — the
+`compile_pairwise_distance` helper wires that up via `hc.compile(symbols=
+{H: x1.shape[1]})`. The simulator path doesn't care about literal
+binding and runs against arbitrary `H` directly.
 
-  * surface, as a single failing artifact, whichever frontend / lowering
-    gaps still stand between the literal langref text and the existing
-    substrate.
-
-The decorator pins `group_shape=(8, 8)` to a concrete integer-literal pair.
-The langref RFC text leaves `group_shape` implicit (the dispatcher picks it),
-but the native amdgpu lowering currently needs `group_shape` to be
+The decorator also pins `group_shape=(8, 8)` to a concrete integer-literal
+pair. The langref RFC text leaves `group_shape` implicit (the dispatcher
+picks it), but the native amdgpu lowering currently needs `group_shape`
 integer-literal at frontend-resolve time so the `$WGS0`/`$WGS1` system
-symbols seed `literal_bindings` for downstream LDS-tile static-shape checks.
-Symbolic `group_shape` with a user-supplied binding is the eventual surface
-- see the followup task in the issue tracker.
+symbols seed `literal_bindings` for downstream LDS-tile static-shape
+checks. Symbolic `group_shape` with a user-supplied binding is the
+eventual surface — same tracker, separate axis.
 
 `(8, 8)` is a 64-thread square tile - one full wave on wave64 (gfx9-),
 two waves on wave32 (gfx10+). The 2D shape matches the `(g0, g1, H)`
@@ -56,7 +60,7 @@ W2 = sym.W2
 H = sym.H
 
 
-@kernel(work_shape=(W1, W2), group_shape=(8, 8))
+@kernel(work_shape=(W1, W2), group_shape=(8, 8), literals=[H])
 def pairwise_distance_wg_kernel(
     group,
     X1: Buffer[W1, H, np.float32],
@@ -118,6 +122,32 @@ def simulate_pairwise_distance(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
     d = np.zeros((x1.shape[0], x2.shape[0]), dtype=x1.dtype)
     sim.launch(pairwise_distance_wg_kernel, x1, x2, d)
     return d
+
+
+def compile_pairwise_distance(
+    x1: np.ndarray, x2: np.ndarray, *, target: str = "amdgpu-gfx11"
+):
+    """Native compile the kernel with `H` bound to `x1.shape[1]`.
+
+    The LDS tile dim has to be a compile-time literal (see module
+    docstring for why), so the binding has to be supplied per-input
+    and a fresh shape means a fresh `hc.compile` call. Returns the
+    compiled handle; invoke it with device buffers (`handle.invoke
+    (x1_dev, x2_dev, d_dev)`) on a HIP-visible build.
+    """
+
+    if x1.ndim != 2 or x2.ndim != 2:
+        raise ValueError("X1 and X2 must be rank-2 matrices")
+    if x1.shape[1] != x2.shape[1]:
+        raise ValueError("X1.shape[1] must match X2.shape[1]")
+
+    import hc
+
+    return hc.compile(
+        pairwise_distance_wg_kernel,
+        symbols={H: x1.shape[1]},
+        target=target,
+    )
 
 
 def make_demo_inputs(

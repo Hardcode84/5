@@ -18,11 +18,12 @@ from examples.amdgpu_gfx11_wmma_matmul import (
     tiled_gfx11_wmma_matmul,
 )
 from examples.pairwise_distance import (
-    make_demo_inputs as make_pairwise_inputs,
-)
-from examples.pairwise_distance import (
+    compile_pairwise_distance,
     reference_pairwise_distance,
     simulate_pairwise_distance,
+)
+from examples.pairwise_distance import (
+    make_demo_inputs as make_pairwise_inputs,
 )
 
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
@@ -172,17 +173,35 @@ def test_pairwise_distance_simulator_matches_numpy(w1: int, w2: int, h: int) -> 
     `doc/langref.md` against a plain NumPy reference. Broadcasting axes
     are corrected from the langref text (which writes the result
     transposed); the per-element contract matches the workitem-level
-    form in the same doc section. The frontend-to-hc pipeline doesn't
-    cover this kernel yet — see the open gaps tracker for the missing
-    pieces (Pow binop, tensor reductions, group.shape subscript,
-    None-axis broadcast, work-offset symbol binding downstream of the
-    elementwise pipeline).
+    form in the same doc section.
     """
 
     x1, x2 = make_pairwise_inputs(w1=w1, w2=w2, h=h, seed=29)
     out = simulate_pairwise_distance(x1, x2)
     ref = reference_pairwise_distance(x1, x2)
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("h", [3, 4, 8])
+def test_pairwise_distance_native_compile(h: int) -> None:
+    """Native compile pass for the langref WG-level pairwise distance.
+
+    Drives `hc.compile` through the full hc pipeline with `H` bound via
+    `symbols={H: h}`; asserts the handle exposes a non-empty hc_ir
+    artifact (= every pass succeeded) and surfaces any pipeline
+    diagnostics if it doesn't. This is the compile-only gate — the
+    `invoke` path needs a HIP-visible build and is covered by the
+    matmul example's `_RUN_HIP_INVOKE_TESTS` surface.
+    """
+
+    x1, x2 = make_pairwise_inputs(w1=6, w2=5, h=h, seed=29)
+    compiled = compile_pairwise_distance(x1, x2)
+    assert (
+        compiled.hc_ir_text is not None
+    ), "compile produced no hc_ir; pipeline diagnostics:\n  " + "\n  ".join(
+        compiled.pipeline_diagnostics
+    )
+    assert compiled.hc_ir_text
 
 
 @_SKIP_HC_FRONT_DIALECT_TESTS

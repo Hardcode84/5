@@ -139,7 +139,7 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
 
     Simulator keeps dense NumPy payloads; the layout is logical-placement
     metadata. Non-injective offsets are legal (per-lane fragments,
-    broadcasts) — bounds checked, injectivity not enforced.
+    broadcasts) -- bounds checked, injectivity not enforced.
     """
     resolved_shape = tuple(int(dim) for dim in shape)
     if layout is None:
@@ -425,7 +425,7 @@ class BufferSlice:
         """Reinterpret this slice through `layout`.
 
         Mirrors `hc.as_layout` on a buffer source: storage-size check
-        is skipped (`HCAsLayoutOp::verify`) — pointer storage and
+        is skipped (`HCAsLayoutOp::verify`) -- pointer storage and
         layout extent are independent. `shape=` is required: layout
         `shape_syms` aren't bound by the underlying buffer shape.
         """
@@ -438,7 +438,7 @@ class LayoutBufferView:
     `view[lane, :]` -> `(...)`-shape `LayoutBufferSlice` rooted at the
     lane's per-element flat positions in the underlying tile. Natural
     target for both load (`group.vload`) and store (`group.store`)
-    against the same layout — kills manual per-lane stride arithmetic.
+    against the same layout -- kills manual per-lane stride arithmetic.
 
     Mirrors `hc.as_layout` on a buffer source: layout shape need not
     equal the underlying intent's flat extent.
@@ -535,7 +535,7 @@ def _make_layout_buffer_view(
         raise SimulatorError("as_layout layout must be an IndexMap")
     if shape is None:
         raise SimulatorError(
-            "as_layout on a buffer requires shape=(...) — the layout's "
+            "as_layout on a buffer requires shape=(...) -- the layout's "
             "reinterpreted extent isn't carried by the underlying "
             "pointer storage"
         )
@@ -653,7 +653,7 @@ def _slice_with_intent(
     """`BufferSlice` from an ndarray + slice index; `None` to fall through.
 
     Falls through for advanced indexing, Ellipsis, `np.newaxis`,
-    rank-dropping scalars, mixed shapes — none of which drive layout
+    rank-dropping scalars, mixed shapes -- none of which drive layout
     loads today.
     """
     index_tuple = index if isinstance(index, tuple) else (index,)

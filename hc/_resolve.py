@@ -10,22 +10,22 @@ attr on each `hc_front.name` / `hc_front.attr`. The `hc_front -> hc` pass
 dispatches on the refs, never on Python state.
 
 `hc_front.name` kinds:
-    param / iv / local   — stamped by the frontend from scope state.
-    constant             — captured int/float/bool/str.
-    symbol               — captured `hc.symbols.Symbol`.
-    callee               — `@kernel.func` helper.
-    intrinsic            — `@kernel.intrinsic` helper.
-    inline               — undecorated Python helper.
-    builtin              — `range`, `len`, etc.
-    module               — whole-module alias (numpy only).
+    param / iv / local   -- stamped by the frontend from scope state.
+    constant             -- captured int/float/bool/str.
+    symbol               -- captured `hc.symbols.Symbol`.
+    callee               -- `@kernel.func` helper.
+    intrinsic            -- `@kernel.intrinsic` helper.
+    inline               -- undecorated Python helper.
+    builtin              -- `range`, `len`, etc.
+    module               -- whole-module alias (numpy only).
 
 `hc_front.attr` kinds:
-    dsl_method           — attr on a param/iv/local-rooted value.
-    numpy_dtype_type     — `np.<scalar>`; pass decides call-vs-descriptor per
+    dsl_method           -- attr on a param/iv/local-rooted value.
+    numpy_dtype_type     -- `np.<scalar>`; pass decides call-vs-descriptor per
                            use.
-    numpy_attr           — other `np.*`; opaque, treated as inline call.
+    numpy_attr           -- other `np.*`; opaque, treated as inline call.
 
-Other bases (constant, callee, dtype chains, ...) stay unstamped — the pass
+Other bases (constant, callee, dtype chains, ...) stay unstamped -- the pass
 uses the base's own ref. Unresolvable name loads raise `FrontendError`.
 """
 
@@ -141,7 +141,7 @@ def _walk_dep_set(kernel_fn: Any) -> tuple[tuple[Any, ...], set[str]]:
     `ordered` starts with `kernel_fn`, then interleaves decorated
     callees and inline helpers in first-seen order. Dedup on `id(fn)`
     (handles aliases); inline `__name__` collisions are loud by
-    design — `hc_front -> hc` keys lookups on the name.
+    design -- `hc_front -> hc` keys lookups on the name.
     """
 
     seen_ids: set[int] = set()
@@ -209,7 +209,7 @@ def _referenced_names(fn: Any) -> tuple[str, ...]:
 
     `inspect.getclosurevars` only sees the top-level code; walk
     `co_consts` transitively to catch nested `@group.workitems` etc.
-    Conservative over-approximation — false matches add harmless deps,
+    Conservative over-approximation -- false matches add harmless deps,
     missing a real dep would break compilation.
     """
 
@@ -263,7 +263,7 @@ def _classify_module(module: Any, fns: tuple[Any, ...]) -> None:
 
     # `lower_functions_to_front_ir` emits one classifiable top-level
     # per `fn` plus optional support modules (e.g.
-    # `__hc_intrinsic_lowerings__`) as siblings. Drop the latter — no
+    # `__hc_intrinsic_lowerings__`) as siblings. Drop the latter -- no
     # Python fn behind them.
     ctx = module.context
     toplevels = [op for op in module.body.operations if _classifiable_toplevel(op)]
@@ -522,7 +522,7 @@ def _classify_inline(name: str, value: Any) -> Mapping[str, object] | None:
 
 
 def _classify_as_layout(name: str, value: Any) -> Mapping[str, object] | None:
-    """`hc.core.as_layout` recognized by identity — DSL primitive, not inlinable.
+    """`hc.core.as_layout` recognized by identity -- DSL primitive, not inlinable.
 
     Catches imports / aliases before `_classify_inline` tries to re-parse
     the dispatcher's body. Lowering keys on `kind = "layout_op"`.
@@ -554,10 +554,10 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     syms from `offset`'s leading positionals. Bind through a fresh
     `SymbolNamespace`. Params feed back as symbol-valued (not
     expr-valued) so offset prints `i * row_stride + j` instead of
-    fully-substituted — matches `doc/layouts.md` and keeps diagnostics
+    fully-substituted -- matches `doc/layouts.md` and keeps diagnostics
     readable.
 
-    Returns parallel arrays for the params table — encoder only handles
+    Returns parallel arrays for the params table -- encoder only handles
     flat scalar/tuple values. Pairing: `params_names[i] -> params_exprs[i]`.
     """
     from .symbols import Context, SymbolNamespace
@@ -716,7 +716,7 @@ def _layout_positional_names(
 
     Layout lambdas must be straight positional shape -> ... -> params.
     Keyword-only names in `allowed_kwonly` (the layout's `free_syms`)
-    are permitted but not returned — caller binds separately.
+    are permitted but not returned -- caller binds separately.
     """
     try:
         sig = inspect.signature(fn)
@@ -756,7 +756,7 @@ def _layout_positional_names(
 def _layout_shape_param_names(layout: IndexMap) -> tuple[str, ...]:
     """Shape-sym names: from `params` if present, else `storage_size`.
 
-    `params` takes shape syms only — full signature is the shape list.
+    `params` takes shape syms only -- full signature is the shape list.
     Without it, `storage_size`'s signature is the list (offset must match).
     """
     free = frozenset(layout.free_syms)

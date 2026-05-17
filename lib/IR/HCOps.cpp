@@ -213,8 +213,8 @@ parseSignatureTailAndBody(OpAsmParser &parser, OperationState &result,
   return success();
 }
 
-// Signature-carrying verify: function_type → entry block args 1:1 with inputs;
-// absent → no args.
+// Signature-carrying verify: function_type -> entry block args 1:1 with inputs;
+// absent -> no args.
 static LogicalResult verifyFunctionSignature(Operation *op,
                                              TypeAttr functionTypeAttr,
                                              Region &body) {
@@ -585,7 +585,7 @@ static LogicalResult verifyIntrinsicPositionalOrder(
   return success();
 }
 
-// const_kwargs: each in declared ∧ keyword_only (not SSA operands).
+// const_kwargs: each in declared and keyword_only (not SSA operands).
 static LogicalResult verifyIntrinsicConstKwargs(
     HCIntrinsicOp op, const llvm::SmallDenseSet<StringRef> &declared,
     const llvm::SmallDenseSet<StringRef> &keywordOnlyNames) {
@@ -1065,7 +1065,7 @@ static Type collectiveLiftedType(Type yieldedType, ArrayRef<Attribute> suffix) {
   return {};
 }
 
-// Per-axis suffix dims → single #hc.expr product via ixsimpl. Empty = 1.
+// Per-axis suffix dims -> single #hc.expr product via ixsimpl. Empty = 1.
 // Each entry must be ExprAttr; collectiveSuffix enforces upstream.
 static FailureOr<ExprAttr> composeSuffixProduct(MLIRContext *ctx,
                                                 ArrayRef<Attribute> suffix) {
@@ -1094,7 +1094,7 @@ static FailureOr<ExprAttr> composeSuffixProduct(MLIRContext *ctx,
 }
 
 // Storage #hc.expr from 1D shaped type (post-flatten: no layout, single dim).
-// Failure → not post-flatten.
+// Failure -> not post-flatten.
 static FailureOr<ExprAttr> postFlattenStorageExpr(Type type) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
   if (!shaped)
@@ -1915,7 +1915,7 @@ static LogicalResult checkLoadStoreValueMatchesPointer(Operation *op,
          << " must match pointer element type " << ptrElem;
 }
 
-// Predicated ptr access shape parity. scalar↔i1, vector<NxT>↔vector<Nxi1>.
+// Predicated ptr access shape parity. scalar<->i1, vector<NxT><->vector<Nxi1>.
 static LogicalResult checkPredicateShapeMatchesValue(Operation *op,
                                                      Type valueType,
                                                      Type predicateType) {
@@ -1951,7 +1951,7 @@ LogicalResult HCPtrOffsetOp::verify() {
   if (sourceElem && resultElem && sourceElem != resultElem)
     return emitOpError("element type mismatch: source ")
            << sourceElem << " vs result " << resultElem;
-  // No piecemeal typed↔opaque drop; typed→opaque only at LLVM-lowering
+  // No piecemeal typed<->opaque drop; typed->opaque only at LLVM-lowering
   // boundary.
   if (static_cast<bool>(sourceElem) != static_cast<bool>(resultElem))
     return emitOpError(
@@ -1989,7 +1989,7 @@ LogicalResult HCPtrStorePredOp::verify() {
                                          getPredicate().getType());
 }
 
-// AllTypesMatch ties $value/$passthrough/$result; only value↔mask shape here.
+// AllTypesMatch ties $value/$passthrough/$result; only value<->mask shape here.
 LogicalResult HCPredicateOp::verify() {
   return checkPredicateShapeMatchesValue(getOperation(), getValue().getType(),
                                          getMask().getType());
@@ -2072,7 +2072,8 @@ MutableOperandRange HCCallOp::getArgOperandsMutable() {
   return getArgsMutable();
 }
 
-// EffectClass → MemoryEffects on default resource. Pure=∅; absent→Read+Write.
+// EffectClass -> MemoryEffects on default resource. Pure=none;
+// absent->Read+Write.
 static void emitEffectsForClass(
     std::optional<EffectClass> cls,
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
@@ -2139,7 +2140,7 @@ void HCCallIntrinsicOp::getEffects(
 //       ins  (%a at #hc.expr<"i*K+k"> : !hc.bare_tensor<...>, ...)
 //       outs (%c at #hc.expr<"i*N+j"> : !hc.bare_tensor<...>)
 //       -> (!hc.bare_tensor<...>, ...) { ^bb0(%av: f16, ...): ... }
-// iter and outs ≥1; ins may be empty.
+// iter and outs >=1; ins may be empty.
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -2165,7 +2166,7 @@ static bool isMemoryCarrierOperand(Type type) {
   return llvm::isa<PtrType, BufferType>(type);
 }
 
-// `<kind> <name> = %bound : type` iter entry; kind ∈ {parallel, reduction}.
+// `<kind> <name> = %bound : type` iter entry; kind in {parallel, reduction}.
 static ParseResult parseGenericIterEntry(
     OpAsmParser &parser, MLIRContext *ctx, SmallVectorImpl<Attribute> &iterSyms,
     SmallVectorImpl<Attribute> &iterKinds,
@@ -2309,7 +2310,7 @@ static void printGenericOperandClause(OpAsmPrinter &p, StringRef keyword,
 
 } // namespace
 
-// `ambient (%a as "name" : type, ...)`. Operand !hc.idx or index. Empty →
+// `ambient (%a as "name" : type, ...)`. Operand !hc.idx or index. Empty ->
 // ambient-context resolution. parseString preserves trailing `: !hc.idx<...>`.
 static ParseResult parseGenericAmbientEntry(
     OpAsmParser &parser, SmallVectorImpl<OpAsmParser::UnresolvedOperand> &ops,
@@ -2561,7 +2562,7 @@ static bool exprIsBareSymbol(sym::ExprHandle expr, StringRef name) {
 }
 
 // Single ambient pair: non-empty unique name; if operand is !hc.idx<sym>
-// the expression must pin the same bare sym. Post strip to index → vacuous.
+// the expression must pin the same bare sym. Post strip to index -> vacuous.
 static LogicalResult verifyHCGenericAmbientEntry(HCGenericOp op, Value val,
                                                  StringRef name,
                                                  llvm::StringSet<> &seen) {

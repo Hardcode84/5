@@ -89,14 +89,14 @@ def test_splicer_inserts_one_print_per_payload_mutator() -> None:
 
 def test_splicer_uses_result_handle_for_apply_registered_pass() -> None:
     out, _ = _spliced(_MINI_SCHEDULE)
-    # Probe latches onto result (%0), not input (%arg0) — device-PM
+    # Probe latches onto result (%0), not input (%arg0) -- device-PM
     # "IR Dump Before" covers pre-pass.
     assert 'transform.print %0 {name = "after-canonicalize"}' in out
 
 
 def test_splicer_uses_operand_handle_for_in_place_ops() -> None:
     out, _ = _spliced(_MINI_SCHEDULE)
-    # In-place ops produce no new handle — probe reuses %0.
+    # In-place ops produce no new handle -- probe reuses %0.
     assert 'transform.print %0 {name = "after-apply_patterns"}' in out
     assert 'transform.print %0 {name = "after-apply_cse"}' in out
     assert 'transform.print %0 {name = "after-apply_dce"}' in out
@@ -140,7 +140,7 @@ def test_resolve_dump_dir_rejects_forbidden_chars(
     monkeypatch: pytest.MonkeyPatch, ch: str
 ) -> None:
     # Reject chars that close the MLIR option string or split on
-    # whitespace — clean ValueError beats a downstream parse failure.
+    # whitespace -- clean ValueError beats a downstream parse failure.
     monkeypatch.setenv(_DUMP_DIR_ENV, f"/tmp/with{ch}bad")
     with pytest.raises(ValueError, match=_DUMP_DIR_ENV):
         _resolve_dump_dir()
@@ -159,7 +159,7 @@ def test_substitute_dump_dir_empty_when_unset(
 ) -> None:
     monkeypatch.delenv(_DUMP_DIR_ENV, raising=False)
     text = f"x={_DUMP_DIR_PLACEHOLDER},"
-    # Pass reads empty as "dump disabled" — substitute to empty, not raw placeholder.
+    # Pass reads empty as "dump disabled" -- substitute to empty, not raw placeholder.
     assert _substitute_dump_dir(text) == "x=,"
 
 
@@ -180,7 +180,7 @@ def test_default_schedule_round_trips_through_splicer(
     text = _substitute_chip(text, None)
     text = _substitute_features(text, None)
     out = _maybe_splice_dump_passes(text, context=None)
-    # Schedule grows — assert >=, don't pin exact count.
+    # Schedule grows -- assert >=, don't pin exact count.
     n_passes = text.count("transform.apply_registered_pass")
     n_prints = out.count("transform.print")
     assert n_prints >= n_passes

@@ -15,7 +15,7 @@
 // callee because a local identifier has no target op. The folder
 // runs before `-convert-hc-front-to-hc` (see pass description /
 // `doc/lowering.md`); a surviving `ref.kind = "local"` call past the
-// folder is still an error — the converter's diagnostic is the
+// folder is still an error -- the converter's diagnostic is the
 // operator-facing signal that the pipeline ordering is wrong.
 //
 // Match shape (all siblings of a `hc_front.func`/`hc_front.kernel`/
@@ -53,7 +53,7 @@ namespace {
 
 // Check that `%call`'s result is dead or used by exactly one
 // same-block `hc_front.return`. "Bound to a local" (`x = inner()`)
-// falls through — the folder is structural, not semantic, so it
+// falls through -- the folder is structural, not semantic, so it
 // leaves that case to the converter (which will report the stale
 // `ref.kind = "local"`). `dead` is an out-param set on every success;
 // it is initialized here so a future caller that forgets to seed it
@@ -180,7 +180,7 @@ template <typename RegionOpT> static void foldAfterRegion(RegionOpT regionOp) {
   // Python frontend emits the `hc_front.name` immediately after the
   // region, but bare unused calls may appear after unrelated sibling
   // ops, so we scan forward. Tail-return folds are stricter (see
-  // `tailTrailAlignedForReturn` — conversion emits the callable return
+  // `tailTrailAlignedForReturn` -- conversion emits the callable return
   // at the region site, so no intervening siblings can be skipped).
   // The pattern is selected by full predicate, not by uniqueness: even
   // if several `hc_front.name` ops share the region's string name, the
@@ -226,5 +226,5 @@ struct HCFrontFoldRegionDefsPass
 } // namespace
 
 // `createHCFrontFoldRegionDefsPass()` is emitted by tablegen (friend of
-// the impl::HCFrontFoldRegionDefsBase CRTP). See `Passes.td` — no
+// the impl::HCFrontFoldRegionDefsBase CRTP). See `Passes.td` -- no
 // `let constructor`, so the generated factory is the only one.

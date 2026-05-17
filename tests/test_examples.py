@@ -34,7 +34,7 @@ _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     reason="native hc_front dialect smoke tests disabled by env",
 )
 
-# Real-hardware gate. Default-skipped — dlopens `libamdhip64.so` and
+# Real-hardware gate. Default-skipped -- dlopens `libamdhip64.so` and
 # dispatches on the GPU bound by `HIP_VISIBLE_DEVICES`.
 _RUN_HIP_INVOKE_TESTS = pytest.mark.skipif(
     os.environ.get("HC_RT_RUN_HIP_INVOKE_TEST") != "1",
@@ -177,11 +177,11 @@ def test_pairwise_distance_native_compile(h: int) -> None:
 #
 # Shape coverage:
 #   * Sub-tile (6, 5, h): single `group_shape=(8, 8)` workgroup with a
-#     partial chunk — exercises the boundary-mask path.
+#     partial chunk -- exercises the boundary-mask path.
 #   * Tile-aligned (multiples of (8, 8)): full workgroups + cross-wave
 #     LDS pre-fill against collective reductions.
 #   * (16, 12, 8): partial-last-tile across multiple workgroups,
-#     clipped in W2. Pins dst-bounds mask on store — without it stride
+#     clipped in W2. Pins dst-bounds mask on store -- without it stride
 #     aliasing turns OOB column writes into next-row hits via
 #     `hc.ptr_store_pred`.
 @_RUN_HIP_INVOKE_TESTS
@@ -212,7 +212,7 @@ def test_gfx11_wmma_example_writes_dump_intermediates(
     """`HC_DUMP_DIR` makes hc-lower-gpu-to-binary emit per-stage artifacts.
 
     Four files per `gpu.module`: pre-opt LLVM IR, post-opt LLVM IR,
-    ISA, HSACO blob. Runs at compile time — no GPU needed.
+    ISA, HSACO blob. Runs at compile time -- no GPU needed.
     """
 
     monkeypatch.setenv("HC_DUMP_DIR", str(tmp_path))
@@ -254,9 +254,9 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
 
     captured = capsys.readouterr()
     # Default schedule lowers to self-contained LLVM:
-    # `hc-lower-gpu-to-binary` → HSACO `gpu.binary`,
+    # `hc-lower-gpu-to-binary` -> HSACO `gpu.binary`,
     # `hc-lower-launch-func-to-runtime` embeds it as LLVM global +
-    # rewrites `gpu.launch_func` → `hc_rt_load_kernel` +
+    # rewrites `gpu.launch_func` -> `hc_rt_load_kernel` +
     # `hc_rt_launch_kernel`. Host wrapper takes one `!llvm.ptr` per
     # kernel arg, calls `_mlir_ciface_hc_get_*` (via
     # `llvm.emit_c_interface` mangling onto `libhc_rt_helpers.so`)

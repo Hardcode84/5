@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Hand-coded subset of the HIP ABI touched by the launcher shim. Drops
-// the build-time ROCm dependency — host needs only a C++17 toolchain.
+// the build-time ROCm dependency -- host needs only a C++17 toolchain.
 // Entry points are dlsym'd from `libamdhip64.so` by `hc_rt_init`.
 
 #ifndef HC_RUNTIME_HIPTYPES_H
@@ -34,7 +34,7 @@ enum hipLaunchAttributeID {
   hipLaunchAttributeMax,
 };
 
-// 64 bytes — fits any upstream attribute value struct. Cluster dim is the
+// 64 bytes -- fits any upstream attribute value struct. Cluster dim is the
 // only attribute we set today; written via `int*` reinterpret.
 union hipLaunchAttributeValue {
   char pad[64];

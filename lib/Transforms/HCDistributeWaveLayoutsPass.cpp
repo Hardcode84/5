@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implements `-hc-distribute-wave-layouts`: wave-cooperative layout carriers
-// → per-lane peers. Recognition: first index sym `lane` enters `offset` as an
+// -> per-lane peers. Recognition: first index sym `lane` enters `offset` as an
 // affine `lane * stride` term; `lane := $WI0` gives per-lane offset, `lane :=
 // 0` gives the iter-only residue. Leading shape dim must equal `subgroup_size`.
 // Scope is `hc.workitem_region` bodies only. See `doc/layouts.md`.
@@ -825,7 +825,7 @@ static LogicalResult rewriteGenericOp(HCGenericOp op, int64_t waveSize,
 // the recogniser later (e.g. accepting other full-range forms) is
 // additive.
 // True iff `firstTy` is a pinned `!hc.idx<expr>` whose expression
-// references `waveSym` — i.e. an index materialized from the
+// references `waveSym` -- i.e. an index materialized from the
 // workitem region's lane scalar.
 static bool isLaneScalarIdx(IdxType firstTy, StringRef waveSym) {
   if (!firstTy)
@@ -880,7 +880,7 @@ static LogicalResult rewriteBufferView(HCBufferViewOp op, StringRef waveSym) {
   // root whose remaining shape matches the view's result; the layout
   // slot may differ (root is typically layout-less after the
   // identity-fold; the view's result still carries the lane-pinned
-  // layout from inference time). Drop the view and forward the root —
+  // layout from inference time). Drop the view and forward the root --
   // consumers pick up the new type via SSA tracking, and the verifier
   // on `hc.generic` is permissive on the layout slot.
   auto resShaped =

@@ -36,7 +36,7 @@ static ParseResult parseShapeDim(AsmParser &parser,
   if (failed(*parsedString))
     return failure();
 
-  // `"?"` → #hc.dyn sentinel: host-owned size, not symbol-derivable.
+  // `"?"` -> #hc.dyn sentinel: host-owned size, not symbol-derivable.
   if (text == "?") {
     dims.push_back(DynSizeAttr::get(parser.getContext()));
     return success();
@@ -234,7 +234,7 @@ static ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
   return success();
 }
 
-// Flags checked at end → single "requires ..." diagnostic for any missing
+// Flags checked at end -> single "requires ..." diagnostic for any missing
 // field.
 struct LayoutFields {
   SmallVector<Attribute> shapeSyms;
@@ -447,7 +447,7 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 
 namespace {
 
-// Row-major contiguous: prod(dims), empty → 1 (matches layout-driven scalar
+// Row-major contiguous: prod(dims), empty -> 1 (matches layout-driven scalar
 // case).
 static FailureOr<sym::ExprHandle>
 identityShapeProduct(sym::Store &store, ArrayRef<Attribute> dims) {
@@ -545,7 +545,7 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
 
 namespace {
 
-// Row-major: sum_i (i * prod(dims[i+1:])). Rank-0 → 0. Caller checks rank
+// Row-major: sum_i (i * prod(dims[i+1:])). Rank-0 -> 0. Caller checks rank
 // parity.
 static FailureOr<sym::ExprHandle>
 identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
@@ -594,7 +594,7 @@ appendSubstitutionPair(sym::Store &store, StringRef name,
   return success();
 }
 
-// shape_syms[k] → dims[k]; index_syms[k] → indexExprs[k]. Caller checks rank
+// shape_syms[k] -> dims[k]; index_syms[k] -> indexExprs[k]. Caller checks rank
 // parity.
 static LogicalResult stageLayoutSubstitutions(
     sym::Store &store, ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> dims,

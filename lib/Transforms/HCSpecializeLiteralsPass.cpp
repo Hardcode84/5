@@ -9,7 +9,7 @@
 // layout / shaped-type stack via `AttrTypeReplacer`.
 //
 // Bindings live in IR (not a pass option) so a `hc_ir_text` snapshot
-// is self-contained — re-running on the snapshot reproduces the
+// is self-contained -- re-running on the snapshot reproduces the
 // specialized IR. `literals` declares what may be bound;
 // `literal_bindings` carries the bound values.
 
@@ -53,7 +53,7 @@ static LogicalResult validateBindings(HCKernelOp kernel,
     if (declared.count(name))
       continue;
     // `$`-prefixed names are launch-context (seeded by the front-to-hc
-    // handshake), not user literals — skip the whitelist check.
+    // handshake), not user literals -- skip the whitelist check.
     if (name.starts_with("$"))
       continue;
     return kernel->emitOpError("literal_bindings key '")
@@ -63,7 +63,7 @@ static LogicalResult validateBindings(HCKernelOp kernel,
 }
 
 // Build `ixs_subs_multi` inputs from `name -> IntegerAttr`. Fail-fast on
-// the first invalid entry — specialization is all-or-nothing per kernel.
+// the first invalid entry -- specialization is all-or-nothing per kernel.
 static LogicalResult
 composeSubstitutionPairs(HCKernelOp kernel, DictionaryAttr bindings,
                          sym::Store &store,
@@ -89,7 +89,7 @@ composeSubstitutionPairs(HCKernelOp kernel, DictionaryAttr bindings,
   return success();
 }
 
-// Shared between `ExprHandle` / `PredHandle` — identical substitution
+// Shared between `ExprHandle` / `PredHandle` -- identical substitution
 // semantics.
 template <typename Handle>
 static Handle substituteHandle(sym::Session &session, Handle handle,
@@ -105,7 +105,7 @@ static Handle substituteHandle(sym::Session &session, Handle handle,
 }
 
 // `AttrTypeReplacer::recursivelyReplaceElementsIn` doesn't visit block
-// argument types — walk regions explicitly after the op tree.
+// argument types -- walk regions explicitly after the op tree.
 static void retypeBlockArguments(Operation *op, AttrTypeReplacer &replacer) {
   for (Region &region : op->getRegions())
     for (Block &block : region)
@@ -130,7 +130,7 @@ static void specializeKernel(HCKernelOp kernel, sym::Store &store,
             substituteHandle(session, attr.getValue(), targets, replacements);
         if (replaced == attr.getValue())
           return {attr, WalkResult::skip()};
-        // `ExprAttr` is a leaf — opaque `ixs_node *`, not an MLIR sub-element.
+        // `ExprAttr` is a leaf -- opaque `ixs_node *`, not an MLIR sub-element.
         return {ExprAttr::get(attr.getContext(), replaced), WalkResult::skip()};
       });
   replacer.addReplacement(
@@ -143,14 +143,14 @@ static void specializeKernel(HCKernelOp kernel, sym::Store &store,
       });
 
   // Walk the kernel op so `function_type` stays parity with block args
-  // (verifier enforces). `literal_bindings` holds only `IntegerAttr` —
+  // (verifier enforces). `literal_bindings` holds only `IntegerAttr` --
   // no Expr/Pred matches, safe to recurse through.
   replacer.recursivelyReplaceElementsIn(kernel, /*replaceAttrs=*/true,
                                         /*replaceLocs=*/false,
                                         /*replaceTypes=*/true);
   retypeBlockArguments(kernel, replacer);
 
-  // Drop consumed bindings (re-run = no-op). `literals` stays — declaration.
+  // Drop consumed bindings (re-run = no-op). `literals` stays -- declaration.
   kernel.removeLiteralBindingsAttr();
 }
 
@@ -167,7 +167,7 @@ struct HCSpecializeLiteralsPass
           DictionaryAttr bindings = kernel.getLiteralBindingsAttr();
           if (!bindings)
             return WalkResult::advance();
-          // Empty bindings — drop attribute, skip substitution.
+          // Empty bindings -- drop attribute, skip substitution.
           if (bindings.empty()) {
             kernel.removeLiteralBindingsAttr();
             return WalkResult::advance();

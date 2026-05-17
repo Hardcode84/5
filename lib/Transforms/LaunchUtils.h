@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Pass-internal helpers shared between the launch-body lowering passes.
-// Anchored at `gpu.launch` boundary work — anything that maps the dim3
+// Anchored at `gpu.launch` boundary work -- anything that maps the dim3
 // thread / block layout to a linearised single-dim view of the wave
 // belongs here.
 

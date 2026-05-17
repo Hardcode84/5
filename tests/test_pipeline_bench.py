@@ -4,7 +4,7 @@
 
 """Unit tests for `bench=` placeholder plumbing in `hc._pipeline`.
 
-Pins Python-side substitution: `bench=False` → byte-identical to
+Pins Python-side substitution: `bench=False` -> byte-identical to
 pre-bench shape (modulo the empty placeholder); `bench=True` splices
 the pass into the right slot; placeholder appears exactly once in
 `_GPU_LOWERING_PIPELINE`. End-to-end `-hc-emit-bench-wrapper` lives in
@@ -38,7 +38,7 @@ def test_bench_placeholder_sits_between_runtime_lowering_and_symbol_dce() -> Non
 
 
 def test_substitute_bench_false_drops_placeholder() -> None:
-    # Default: byte-identical to pre-bench shape — no stray comma,
+    # Default: byte-identical to pre-bench shape -- no stray comma,
     # no empty pass slot, no leftover placeholder.
     out = _substitute_bench(_GPU_LOWERING_PIPELINE, bench=False)
     assert _BENCH_PLACEHOLDER not in out
@@ -62,7 +62,7 @@ def test_substitute_bench_is_idempotent_on_text_without_placeholder() -> None:
 
 
 def test_bench_pass_fragment_ends_with_comma() -> None:
-    # Fragment carries its own trailing comma → placeholder lands in
+    # Fragment carries its own trailing comma -> placeholder lands in
     # `prev_pass,__HC_BENCH__next_pass` without a surrounding-comma
     # rewrite.
     assert _BENCH_PASS_FRAGMENT.endswith(",")

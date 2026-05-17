@@ -16,7 +16,7 @@ The simulator runs symbolic `H` directly.
 
 `group_shape=(8, 8)` is a literal pair. Native amdgpu lowering needs
 `group_shape` int-literal so `$WGS0` / `$WGS1` seed `literal_bindings`
-for LDS static-shape checks. `(8, 8) = 64` threads — one wave64 / two
+for LDS static-shape checks. `(8, 8) = 64` threads -- one wave64 / two
 wave32. Smaller leaves wave idle; larger raises LDS without payoff.
 
 Run from the repository root with:
@@ -88,7 +88,7 @@ def compile_pairwise_distance(
 ):
     """Native compile with `H` bound to `x1.shape[1]`.
 
-    LDS needs compile-time literal — fresh shape, fresh compile.
+    LDS needs compile-time literal -- fresh shape, fresh compile.
     Invoke the returned handle with device buffers on a HIP-visible build.
     """
 
@@ -138,7 +138,7 @@ def run_on_hardware(
 ) -> np.ndarray:
     """Compile for gfx11 and invoke through the bundled HIP shim.
 
-    `torch.cuda` tensors back device buffers — `.data_ptr()` returns
+    `torch.cuda` tensors back device buffers -- `.data_ptr()` returns
     a HIP pointer for `_mlir_ciface_hc_get_ptr`. Binds `H` to
     `x1.shape[1]` and checks against the NumPy reference.
     """

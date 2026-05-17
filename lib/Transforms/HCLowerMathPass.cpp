@@ -27,7 +27,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// Single dispatch table for the NumPy ufunc family. Float-only —
+// Single dispatch table for the NumPy ufunc family. Float-only --
 // upstream `math.*` rejects non-float element types.
 static LogicalResult lowerBuiltinCall(HCBuiltinCallOp op) {
   StringRef name = op.getName();

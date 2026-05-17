@@ -79,10 +79,10 @@ static Operation *nearestSymbolTable(Operation *op) {
   return cursor;
 }
 
-// workgroup → private-linkage `llvm.mlir.global` in addrspace 3 + addressof
+// workgroup -> private-linkage `llvm.mlir.global` in addrspace 3 + addressof
 // (AMDGPU LDS is module-scope; no in-kernel alloca for workgroup).
-// private → `llvm.alloca` in addrspace 5 (runtime count fine).
-// global → diagnose (host owns global allocations).
+// private -> `llvm.alloca` in addrspace 5 (runtime count fine).
+// global -> diagnose (host owns global allocations).
 struct ConvertAllocOp : public OpConversionPattern<HCAllocOp> {
   using Base::Base;
 
@@ -144,8 +144,8 @@ struct ConvertAllocOp : public OpConversionPattern<HCAllocOp> {
     }
 
     if (hcPtr.getAddrSpace() == AddrSpace::Private) {
-      // `arith.index_cast` (not UCC) so standard arith→LLVM completes the
-      // i64 conversion — UCCs strand when reconcile runs late.
+      // `arith.index_cast` (not UCC) so standard arith->LLVM completes the
+      // i64 conversion -- UCCs strand when reconcile runs late.
       Value countI64 = arith::IndexCastUIOp::create(
                            rewriter, loc, rewriter.getI64Type(), count)
                            .getResult();
@@ -177,8 +177,8 @@ struct ConvertPtrOffsetOp : public OpConversionPattern<HCPtrOffsetOp> {
     if (!llvmElem)
       return op.emitOpError("failed to convert hc.ptr_offset element type");
 
-    // `arith.index_cast` (not UCC) so standard arith→LLVM completes the
-    // i64 conversion — UCCs strand pre-reconcile.
+    // `arith.index_cast` (not UCC) so standard arith->LLVM completes the
+    // i64 conversion -- UCCs strand pre-reconcile.
     Value indexVal =
         arith::IndexCastUIOp::create(rewriter, op.getLoc(),
                                      rewriter.getI64Type(), adaptor.getIndex())
@@ -217,7 +217,7 @@ struct ConvertPtrStoreOp : public OpConversionPattern<HCPtrStoreOp> {
   }
 };
 
-// Vector mask → `llvm.intr.masked.load`. Scalar `i1` → `scf.if`
+// Vector mask -> `llvm.intr.masked.load`. Scalar `i1` -> `scf.if`
 // (`llvm.intr.masked.load` rejects scalar masks).
 struct ConvertPtrLoadPredOp : public OpConversionPattern<HCPtrLoadPredOp> {
   using Base::Base;
@@ -358,7 +358,7 @@ struct ConvertGPULaunchFuncOp : public OpConversionPattern<gpu::LaunchFuncOp> {
 
 // UCC bridging host `!llvm.ptr` to `!hc.ptr<global, T>` spans addrspaces
 // after HC-ptr conversion. Rewrite to `llvm.addrspacecast` (or no-op
-// when addrspaces agree) — AMDGPU expects the real cast.
+// when addrspaces agree) -- AMDGPU expects the real cast.
 struct ConvertPtrUCCToAddrSpaceCast
     : public OpConversionPattern<UnrealizedConversionCastOp> {
   using Base::Base;
@@ -413,9 +413,9 @@ struct HCLowerToLLVMPass
     ConversionTarget target(*ctx);
     target.addLegalDialect<LLVM::LLVMDialect, arith::ArithDialect,
                            scf::SCFDialect>();
-    // UCCs bridging `!llvm.ptr` → `!hc.ptr` must become real
-    // `llvm.addrspacecast` — `reconcile-unrealized-casts` only collapses
-    // exact A→B→A chains.
+    // UCCs bridging `!llvm.ptr` -> `!hc.ptr` must become real
+    // `llvm.addrspacecast` -- `reconcile-unrealized-casts` only collapses
+    // exact A->B->A chains.
     target.addDynamicallyLegalOp<UnrealizedConversionCastOp>(
         [](UnrealizedConversionCastOp op) {
           if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)

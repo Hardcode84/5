@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implements `-hc-lower-strip-layout`: rewrite `hc.strip_layout` into
-// `hc.generic` — one parallel iter per result axis, source on `ins`
+// `hc.generic` -- one parallel iter per result axis, source on `ins`
 // with identity per-axis offsets, bare init on `outs`, body yields
 // the loaded element.
 
@@ -154,7 +154,7 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   if (!srcShaped || !resShaped)
     return failure();
 
-  // src matches result — forward, no allocator/generic.
+  // src matches result -- forward, no allocator/generic.
   if (srcTy == resTy) {
     op.getResult().replaceAllUsesWith(src);
     op.erase();

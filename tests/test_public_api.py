@@ -177,7 +177,7 @@ def test_wmma_lowering_records_transform_recipe() -> None:
     ]
     _assert_wmma_require_steps(require_steps)
     # f16 fragment for `a`/`b`, f32 accumulator for the third operand
-    # + result. Builder dedupes by literal text → each appears once.
+    # + result. Builder dedupes by literal text -> each appears once.
     literals = {step.type_literal for step in const_type_steps}
     assert literals == {"vector<16xf16>", "vector<8xf32>"}
     _assert_wmma_create_step(create_steps[0], cast_steps)

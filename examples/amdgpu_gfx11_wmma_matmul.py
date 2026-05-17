@@ -10,12 +10,12 @@ Run from the repository root with:
 
 Flags:
 
-* ``--dump-front-ir`` — print combined ``hc_front`` MLIR.
-* ``--dump-hc-ir`` — print result of front-to-``hc`` pipeline.
-* ``--run-on-hw`` — compile for ``amdgpu-gfx11``, dispatch through
+* ``--dump-front-ir`` -- print combined ``hc_front`` MLIR.
+* ``--dump-hc-ir`` -- print result of front-to-``hc`` pipeline.
+* ``--run-on-hw`` -- compile for ``amdgpu-gfx11``, dispatch through
   ``hc.compile().invoke()`` on ``torch.cuda`` tensors. Needs ROCm +
   gfx11 + torch.
-* ``--bench`` — same plus ``compiled.bench(...)`` stats. Untimed
+* ``--bench`` -- same plus ``compiled.bench(...)`` stats. Untimed
   correctness check runs first; mismatch warns, doesn't abort
   (bench measures dispatch latency, valid even on miscompile).
 
@@ -188,7 +188,7 @@ def wmma_gfx11(
     col = _lane_column(lane)
     values = np.empty((len(rows),), dtype=np.float32)
     # `acc_frag.mask` carries output-validity from `init_wmma_acc`. Skip
-    # multiply-add for masked-off slots — fallback never touches poison.
+    # multiply-add for masked-off slots -- fallback never touches poison.
     acc_mask = acc_frag.mask
     for index in range(len(rows)):
         accum = np.float32(0)
@@ -199,7 +199,7 @@ def wmma_gfx11(
                     b_tile[k_idx, col]
                 )
         values[index] = accum
-    # WMMA preserves accumulator validity — forward the mask unchanged.
+    # WMMA preserves accumulator validity -- forward the mask unchanged.
     return group.vload(values, mask=acc_frag.mask)
 
 
@@ -235,7 +235,7 @@ def _lower_wmma(t, call):
     # into the rewrite. `wave_size` is `i64` from the frontend.
     t.require_attr(call, "arch", GFX_ARCH)
     t.require_attr(call, "wave_size", t.i64(WAVE_LANES))
-    # `amdgpu.wmma` rejects HC bare types — bridge via UCC. Pre-existing
+    # `amdgpu.wmma` rejects HC bare types -- bridge via UCC. Pre-existing
     # paired UCCs from `hc-lower-launch-body` collapse on canonicalize.
     op = t.create(
         "amdgpu.wmma",
@@ -245,7 +245,7 @@ def _lower_wmma(t, call):
             call.operand("b_frag.data", expected_type=_FRAG_AB_TYPE),
             call.operand("acc_frag.data", expected_type=_FRAG_ACC_TYPE),
         ],
-        # `m`/`n`/`k` are `i32` with confined value sets — wrong width
+        # `m`/`n`/`k` are `i32` with confined value sets -- wrong width
         # is a verifier reject.
         attrs={
             "m": t.i32(WMMA_M),
@@ -253,7 +253,7 @@ def _lower_wmma(t, call):
             "k": t.i32(WMMA_K),
         },
     )
-    # WMMA preserves accumulator validity — forward mask unchanged.
+    # WMMA preserves accumulator validity -- forward mask unchanged.
     return (
         t.cast(op.result(0), to=call.result_type(0)),
         call.operand("acc_frag.mask"),
@@ -337,7 +337,7 @@ def store_wmma_tile(group, c, row0, col0, acc) -> None:
     @group.workitems
     def wave(wi):
         lane = wi.local_id()[0]
-        # Same view as `init_wmma_acc` — single addressing source.
+        # Same view as `init_wmma_acc` -- single addressing source.
         # `acc[:, lane, 0]` peels the singleton collective axis to match
         # the destination's `(WMMA_ACC_FRAGMENT,)` row.
         c_lane = as_layout(
@@ -443,7 +443,7 @@ def run_on_hardware(
 ) -> np.ndarray:
     """Compile for gfx11 and invoke through the bundled HIP shim.
 
-    `torch.cuda` tensors back device buffers — `Tensor.data_ptr()`
+    `torch.cuda` tensors back device buffers -- `Tensor.data_ptr()`
     returns a HIP pointer that `_mlir_ciface_hc_get_ptr` hands to
     `gpu.launch_func`.
     """
@@ -480,7 +480,7 @@ def bench_on_hardware(
     """Compile with bench=True, smoke-check, then bench.
 
     Untimed invoke checks numerics against numpy at the simulator's
-    `(atol, rtol)` floor — timing a miscompile is worse than failing loud.
+    `(atol, rtol)` floor -- timing a miscompile is worse than failing loud.
     """
     torch = _require_torch_cuda("--bench")
 
@@ -494,7 +494,7 @@ def bench_on_hardware(
 
     compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11", bench=True)
     # Untimed invoke fills `c_dev`; bench loop overwrites with the same
-    # value across samples — readback reflects the checked output.
+    # value across samples -- readback reflects the checked output.
     compiled.invoke(a_dev, b_dev, c_dev)
     out = c_dev.cpu().numpy()
     reference = reference_blocked_matmul(a, b)
@@ -512,7 +512,7 @@ def bench_on_hardware(
 def dump_front_ir() -> None:
     """Lower the kernel + transitive deps to ``hc_front`` and print.
 
-    Same resolver as `hc.compile` — dumped module matches what
+    Same resolver as `hc.compile` -- dumped module matches what
     downstream lowering sees.
     """
 

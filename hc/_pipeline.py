@@ -12,7 +12,7 @@ module to `hc`. Schedule is MLIR: a `transform.named_sequence
 Pass order lives in IR, swappable without Python.
 
 After the schedule, a fixed `_GPU_LOWERING_PIPELINE` (raw pass string,
-not transform ops — `convert-gpu-to-rocdl` is anchored on `GPUModuleOp`
+not transform ops -- `convert-gpu-to-rocdl` is anchored on `GPUModuleOp`
 and needs `gpu.module(...)` nesting) takes `#rocdl.target`-stamped
 `gpu.module` ops to `gpu.binary` HSACO blobs via
 `hc-lower-gpu-to-binary`. Custom schedules get the chain appended too.
@@ -70,7 +70,7 @@ _DUMP_DIR_FORBIDDEN_CHARS = _LLD_FORBIDDEN_CHARS
 _DUMP_DIR_ENV = "HC_DUMP_DIR"
 
 # AMDGPU LLVM `target-features`. gfx10+ MUST set `+wavefrontsize32`
-# for WMMA correctness — LLVM defaults to wave64, which silently
+# for WMMA correctness -- LLVM defaults to wave64, which silently
 # produces garbage WMMA results. gfx9 and below: empty, only ran wave64.
 _FEATURES_PLACEHOLDER = "__HC_FEATURES__"
 _FEATURES_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
@@ -90,7 +90,7 @@ _BENCH_PASS_FRAGMENT = "hc-emit-bench-wrapper,"
 # Raw pipeline string (not transform-dialect ops) because
 # `transform.apply_registered_pass` can't express nested pass managers.
 _GPU_LOWERING_PIPELINE = (
-    # `!hc.ptr` family must be lowered before `convert-scf-to-cf` — the
+    # `!hc.ptr` family must be lowered before `convert-scf-to-cf` -- the
     # convert-*-to-llvm passes nested below don't know `hc.alloc`/`hc.ptr_*`.
     "hc-lower-to-llvm,"
     "convert-scf-to-cf,"
@@ -153,7 +153,7 @@ def run_front_to_hc(
 ) -> PipelineResult:
     """Run the hc_front -> hc transform schedule on a parsed front module.
 
-    `front_module` must come from `prepared_context()` — context with
+    `front_module` must come from `prepared_context()` -- context with
     `hc_front` + `hc` dialects and hc's passes registered. Module is
     mutated in place on success. Clone first to preserve the original.
 
@@ -168,7 +168,7 @@ def run_front_to_hc(
     `_DEFAULT_CHIP` covers `target=None` and trivial kernels that
     never grow `gpu.module`.
 
-    `__HC_LLD__`: `hc._native_paths.lld_path` — bundled binary or
+    `__HC_LLD__`: `hc._native_paths.lld_path` -- bundled binary or
     `$HC_LLD` for source-tree work. Pipeline is self-contained.
 
     `bench=True`: splice `-hc-emit-bench-wrapper`. `False` leaves the
@@ -197,7 +197,7 @@ def run_front_to_hc(
             pm.run(front_module.operation)
         except ir.MLIRError as exc:
             # Narrow: `MLIRError` is the only contracted raise from
-            # `PassManager.parse`/`.run`. Anything else propagates —
+            # `PassManager.parse`/`.run`. Anything else propagates --
             # swallowing would turn real bugs into "hc_ir came back None".
             _capture_exception(diagnostics, exc)
             return PipelineResult(None, None, tuple(diagnostics))
@@ -294,7 +294,7 @@ def _schedule_file(
     """Yield a filesystem path to the schedule (always materialized).
 
     `transform-preload-library` takes file paths. Always tempfile so
-    the driver controls the path — sidesteps option-parser-delimiter
+    the driver controls the path -- sidesteps option-parser-delimiter
     chars in user-supplied paths and gives us a substitution slot for
     `__HC_TARGET__`.
     """
@@ -370,7 +370,7 @@ def _substitute_chip(text: str, target: str | None) -> str:
 
 def _substitute_lld(text: str) -> str:
     # Eager resolve: pipeline is self-contained. Existence not validated
-    # here — C++ pass surfaces a clear "ld.lld not found" naming the
+    # here -- C++ pass surfaces a clear "ld.lld not found" naming the
     # missing path.
     return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
 

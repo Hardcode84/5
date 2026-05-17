@@ -488,8 +488,8 @@ HCTransformRequireIntrinsicAttrOp::apply(xform::TransformRewriter &rewriter,
 void HCTransformRequireIntrinsicAttrOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   xform::onlyReadsHandle(getCallMutable(), effects);
-  // Conceptually this op only reads the payload — failure isn't a memory
-  // effect — but `onlyReadsPayload` lets the canonicalizer treat the op as
+  // Conceptually this op only reads the payload -- failure isn't a memory
+  // effect -- but `onlyReadsPayload` lets the canonicalizer treat the op as
   // dead when it has no SSA users (and a require op never does). Declaring
   // payload as written keeps the op alive past `--canonicalize`/`--cse`,
   // which the recipe IR has to survive so the interpreter can still see

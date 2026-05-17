@@ -8,7 +8,7 @@
 // to `[?]` (host-owned allocation).
 //
 // 1-to-N converter: each shaped operand expands to `(flat_value,
-// idx_aux_0, ..., idx_aux_{k-1})` — one `!hc.idx<sym>` per implicit
+// idx_aux_0, ..., idx_aux_{k-1})` -- one `!hc.idx<sym>` per implicit
 // free symbol (shape syms + layout's free syms minus `index_syms`).
 // Names sorted lex for determinism.
 //
@@ -173,7 +173,7 @@ extractAccessIndexExpr(MLIRContext *ctx, sym::Store &store, Type indexType) {
   return failure();
 }
 
-// `composeAccessOffsetExpr` lives in `lib/IR/HCAttrs.cpp` — shared with
+// `composeAccessOffsetExpr` lives in `lib/IR/HCAttrs.cpp` -- shared with
 // `hc-load-store-to-generic` for hash-cons alignment.
 
 // Materialize composed offset as `!hc.idx<offset_expr>` via
@@ -207,7 +207,7 @@ static Value materializeOffsetSSA(ConversionPatternRewriter &rewriter,
 }
 
 // Buffer with missing layout is a frontend bug (default strided
-// layout always attached) — fail rather than emit `0` over wrong dims.
+// layout always attached) -- fail rather than emit `0` over wrong dims.
 struct ShapedAccessOperandInfo {
   SymbolicallyShapedTypeInterface shaped;
   LayoutAttr layout;
@@ -298,7 +298,7 @@ static void bindBareSymbolIndexOperands(OperandRange indices, sym::Store &store,
 }
 
 // Bind ancestor bare-sym block args (e.g. `hc.for_range` IV typed
-// `!hc.idx<"$join0">`). Must bind here: for_range→scf.for rewrite
+// `!hc.idx<"$join0">`). Must bind here: for_range->scf.for rewrite
 // strips the sym type before the inner apply lowers.
 static void bindAncestorBareSymbolBlockArgs(Operation *op, sym::Store &store,
                                             llvm::StringMap<Value> &bindings) {
@@ -978,7 +978,7 @@ struct SliceTripleExprs {
   sym::ExprHandle step;
 };
 
-// Slice triple with Python defaults: lower→0, upper→axis size, step→1.
+// Slice triple with Python defaults: lower->0, upper->axis size, step->1.
 static FailureOr<SliceTripleExprs>
 extractSliceTripleExprs(HCSliceExprOp sliceProducer, sym::ExprHandle zero,
                         sym::ExprHandle axisDim, sym::ExprHandle one) {
@@ -1170,7 +1170,7 @@ struct ComposeBufferViewOffsets
 // shared sym-name bindings. Bail on rank mismatch / missing layout.
 // Layout-less operands fall back to identity layout.
 //
-// `composed` flips only when the folded offset differs from input —
+// `composed` flips only when the folded offset differs from input --
 // rank-1 layout-less operand identity-folds to itself.
 static FailureOr<ArrayAttr> composeGenericOperandOffsets(MLIRContext *ctx,
                                                          Value origOperand,
@@ -1465,7 +1465,7 @@ composeAndSliceGenericOperands(HCGenericOp op, HCGenericOpOneToNAdaptor adaptor,
   return out;
 }
 
-// Sym→SSA map + ambient operand list for the new op: operand
+// Sym->SSA map + ambient operand list for the new op: operand
 // expansions, ancestor block-arg bindings, ambient syms transitively
 // needed by offsets and body applies, pre-existing ambient bindings.
 static void buildGenericBindingsAndAmbient(
@@ -1479,7 +1479,7 @@ static void buildGenericBindingsAndAmbient(
   for (auto [orig, range] : llvm::zip_equal(op.getOuts(), adaptor.getOuts()))
     noteOperandBindings(orig.getType(), range, bindings);
 
-  // Capture ambient sym→SSA now: for_range→scf.for later strips the
+  // Capture ambient sym->SSA now: for_range->scf.for later strips the
   // `!hc.idx<sym>` payload off the IV but `ambient_idxs` already
   // holds the SSA edge by then.
   MLIRContext *ctx = op.getContext();
@@ -2019,7 +2019,7 @@ static bool isFlattenLegalAtPassBoundary(Operation *op,
       return converter.isSignatureLegal(fnType);
   if (isa<func::ReturnOp, func::CallOp>(op))
     return converter.isLegal(op);
-  // `hc.as_layout` always illegal — rewriter drops unconditionally.
+  // `hc.as_layout` always illegal -- rewriter drops unconditionally.
   if (isa<HCAsLayoutOp>(op))
     return false;
   if (std::optional<bool> sigLegal = hcSymbolSignatureLegality(op, converter))

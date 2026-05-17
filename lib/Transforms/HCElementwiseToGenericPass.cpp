@@ -58,7 +58,7 @@ static Type elementType(Type t) {
   return {};
 }
 
-// Undef placeholder — bounds inference resolves via identity-offset matching.
+// Undef placeholder -- bounds inference resolves via identity-offset matching.
 static Value emitUndefBound(OpBuilder &builder, Location loc) {
   return HCUndefValueOp::create(builder, loc,
                                 UndefType::get(builder.getContext()));
@@ -102,7 +102,7 @@ static ArrayAttr identityOffsetArray(MLIRContext *ctx, sym::Store &store,
   return ArrayAttr::get(ctx, exprs);
 }
 
-// Broadcast-unit axes → `0` offset; identity elsewhere. Bounds inference
+// Broadcast-unit axes -> `0` offset; identity elsewhere. Bounds inference
 // keys off identity only, so the `0` projection is transparent.
 static FailureOr<ArrayAttr> broadcastOperandOffsetArray(
     MLIRContext *ctx, sym::Store &store, ArrayRef<StringAttr> iterSyms,
@@ -134,7 +134,7 @@ static FailureOr<ArrayAttr> broadcastOperandOffsetArray(
   return ArrayAttr::get(ctx, exprs);
 }
 
-// Init shape placeholders — init is overwritten every iter; DCE drops dupes.
+// Init shape placeholders -- init is overwritten every iter; DCE drops dupes.
 static Value buildShapeTuple(OpBuilder &builder, Location loc,
                              ValueRange dims) {
   SmallVector<Type> elemTypes(

@@ -13,7 +13,7 @@ runnable from Python:
 
 * Spin up our `hc_execution_engine` extension, register the runtime
   helper + HIP shim symbols by ctypes-resolving them out of the bundled
-  `.so` files and handing them to `set_symbol_map` — explicit and
+  `.so` files and handing them to `set_symbol_map` -- explicit and
   process-local, no `LoadLibraryPermanently` side effects.
 * `engine.load_mlir(text)` parses the post-pipeline LLVM-dialect text,
   translates to LLVM IR, and JITs it. The engine returns the raw
@@ -23,7 +23,7 @@ runnable from Python:
 
 Engine + cfunc creation is cached on the `CompiledKernel` via a tiny
 mutable side-channel; the dataclass itself stays frozen. The cache is
-process-local — no global engine pool — so two compiled kernels keep
+process-local -- no global engine pool -- so two compiled kernels keep
 their JIT'd code separate and a refcount drop releases the engine
 immediately.
 """
@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 # Symbols the host wrapper calls. The lists are short enough to enumerate
-# explicitly — wave does the same — and listing them here doubles as
+# explicitly -- wave does the same -- and listing them here doubles as
 # documentation of the runtime ABI surface.
 _RUNTIME_HELPER_SYMBOLS: tuple[str, ...] = (
     "_mlir_ciface_hc_get_ptr",
@@ -77,7 +77,7 @@ def runtime_symbol_map() -> dict[str, int]:
     plumbed into the JIT's symbol table so unresolved externals in the
     host wrapper (`@_mlir_ciface_hc_get_*`, `@hc_rt_*`) bind to the
     real implementations. Loading the libraries via `ctypes.CDLL` keeps
-    them alive for the lifetime of the process — `RTLD_LOCAL` is fine
+    them alive for the lifetime of the process -- `RTLD_LOCAL` is fine
     because the JIT only needs the addresses, not visibility against
     `dlsym(NULL, ...)`.
     """
@@ -88,7 +88,7 @@ def runtime_symbol_map() -> dict[str, int]:
     # bound, otherwise the first launch dereferences a null function
     # pointer and the process segfaults with no useful diagnostic. The
     # shim's `hc_rt_init` is mutex-serialized and double-checked, so
-    # calling it eagerly here is safe and idempotent — once per process
+    # calling it eagerly here is safe and idempotent -- once per process
     # is enough, but once per invoker construction is also harmless and
     # keeps the bootstrap close to the symbol resolution that needs it.
     hip.hc_rt_init.argtypes = []
@@ -108,7 +108,7 @@ def _symbol_address(lib: ctypes.CDLL, name: str) -> int:
         raise RuntimeError(
             f"hc.invoke: symbol '{name}' resolved to a null address inside "
             f"{lib._name!r}; the shared library is built but the symbol is "
-            "missing — rebuild the runtime libs."
+            "missing -- rebuild the runtime libs."
         )
     return int(raw)
 
@@ -127,10 +127,10 @@ def kernel_arg_count(module: Any, kernel_name: str) -> int:
     so callers don't need to know about the stream slot at the
     arg-validation level. Reading the IR (rather than re-deriving from
     `kernel_fn.__hc_kernel__` + Python signature) keeps Python and C++
-    decoupled — the lowering pass owns the ABI, this just observes it.
+    decoupled -- the lowering pass owns the ABI, this just observes it.
 
     The bench surface (`hc.compile(bench=True).bench(...)`) shares the
-    same user-arg arity contract — `-hc-emit-bench-wrapper` clones the
+    same user-arg arity contract -- `-hc-emit-bench-wrapper` clones the
     regular wrapper and only appends an `i64 n_inner` after the user
     args, so reading off the regular wrapper is the right count for
     either path.
@@ -150,11 +150,11 @@ def kernel_arg_count(module: Any, kernel_name: str) -> int:
             args_close = header.rindex(")")
             args_text = header[args_open + 1 : args_close].strip()
             if not args_text:
-                # Should be impossible — every host wrapper has at least
-                # the stream slot — but treat it as "0 user args" rather
+                # Should be impossible -- every host wrapper has at least
+                # the stream slot -- but treat it as "0 user args" rather
                 # than crashing here; the call will surface the mismatch.
                 return 0
-            # Split on top-level commas (no nested parens at this level —
+            # Split on top-level commas (no nested parens at this level --
             # arg types are all `!llvm.ptr`, attribute lists never use
             # `,` outside a `{...}` group which is also flat here).
             total = args_text.count(",") + 1
@@ -211,7 +211,7 @@ def _require_runtime_libs() -> None:
 def ensure_engine(cache: InvokerCache, module: Any) -> tuple[Any, Any]:
     """Lazy-build an `ExecutionEngine` + load the module text once per cache.
 
-    `bench()` and `invoke()` share the same JIT'd module — JIT-compiling
+    `bench()` and `invoke()` share the same JIT'd module -- JIT-compiling
     twice would double the per-CompiledKernel warmup cost on every
     sample-driven benchmark, so we hand both call sites the same
     `(engine, handle)` pair through the cache. Idempotent: a second
@@ -249,7 +249,7 @@ def make_invoker(
     Shares the cache's `ExecutionEngine` (via `ensure_engine`) with any
     bench invoker that the same CompiledKernel materializes later.
     Raises `RuntimeError` (not `ImportError`) when either runtime
-    shared library is missing — the package install is broken in a way
+    shared library is missing -- the package install is broken in a way
     that's not the caller's fault, and downgrading to a plain import
     error would invite "wrap with try/ImportError" patterns that mask
     the real cause.
@@ -261,11 +261,11 @@ def make_invoker(
         raise RuntimeError(
             f"hc.invoke: lookup of host wrapper '@{kernel_name}' returned "
             "a null address (the JIT loaded the module but the symbol is "
-            "not visible — check that the lowering pipeline did not "
+            "not visible -- check that the lowering pipeline did not "
             "rename or DCE the wrapper)"
         )
 
-    # `void (void* stream, PyObject* arg0, PyObject* arg1, ...)` — the
+    # `void (void* stream, PyObject* arg0, PyObject* arg1, ...)` -- the
     # leading `c_void_p` is the HIP stream pointer (null = default
     # stream); the rest are per-arg PyObject* slots, each passed by
     # reference (a `py_object` _is_ a borrowed `PyObject *`).
@@ -286,7 +286,7 @@ def make_invoker(
                 f"hc.invoke: kernel '{kernel_name}' takes {num_args} "
                 f"argument(s), got {len(args)}"
             )
-        # `None` → null pointer → HIP default stream. An explicit `int`
+        # `None` -> null pointer -> HIP default stream. An explicit `int`
         # is the raw stream-handle address (for PyTorch users this is
         # `torch.cuda.current_stream().cuda_stream`).
         cfunc(stream, *(ctypes.py_object(arg) for arg in args))

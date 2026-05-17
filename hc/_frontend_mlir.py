@@ -830,7 +830,7 @@ class HCFrontEmitter:
     def _emit_intrinsic_lowering_recipes(self, value: object) -> None:
         # Recipes land as real `transform.named_sequence` ops in a
         # sibling `builtin.module @__hc_intrinsic_lowerings__`. Symbol
-        # names encode `<intrinsic>_<target>` — no DictAttr needed.
+        # names encode `<intrinsic>_<target>` -- no DictAttr needed.
         if value is None:
             return
         if isinstance(value, str | bytes) or not isinstance(value, Sequence):
@@ -915,7 +915,7 @@ class HCFrontEmitter:
         if isinstance(value, str):
             return self._string_attr(value)
         if isinstance(value, bool | int):
-            # bool ⊂ int; both serialize as i64 for stable payloads.
+            # bool subset of int; both serialize as i64 for stable payloads.
             return ir.IntegerAttr.get(
                 ir.IntegerType.get_signless(64, context=self._context),
                 int(value),

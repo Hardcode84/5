@@ -23,7 +23,7 @@ bool mlir::hc::isHCUndefType(Type type) { return isa<UndefType>(type); }
 
 namespace {
 
-// Pinned `!hc.idx<expr>` only. diagOp non-null → emit error; null → silent.
+// Pinned `!hc.idx<expr>` only. diagOp non-null -> emit error; null -> silent.
 static LogicalResult collectTupleDim(Type dimType, size_t idx,
                                      Operation *diagOp,
                                      SmallVectorImpl<Attribute> &dims) {
@@ -392,7 +392,7 @@ Type mlir::hc::BufferType::cloneWithSymbolicShape(ShapeAttr shape) const {
 
 namespace {
 
-// Same flavor/element/shape. Bare ∪ layout → layout. Two distinct layouts →
+// Same flavor/element/shape. Bare U layout -> layout. Two distinct layouts ->
 // fail.
 template <typename ShapedT>
 static Type joinShapedSameFlavor(ShapedT lhs, Type rhsRaw) {
@@ -620,7 +620,7 @@ void IdxType::print(AsmPrinter &printer) const {
 }
 
 Type IdxType::joinHCType(Type other) const {
-  // Distinct symbolic facts widen to unpinned — concretizing guesses a
+  // Distinct symbolic facts widen to unpinned -- concretizing guesses a
   // predecessor.
   if (isa<IdxType>(other))
     return getUnpinnedIdxType(getContext());
@@ -822,7 +822,7 @@ void GroupType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
-// group_shape / subgroup_size only — no work_shape on nested contexts.
+// group_shape / subgroup_size only -- no work_shape on nested contexts.
 static LogicalResult parseLaunchContextField(AsmParser &parser, StringRef key,
                                              ShapeAttr &groupShape,
                                              ExprAttr &subgroupSize) {

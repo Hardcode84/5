@@ -9,7 +9,7 @@
 // i64 elapsed-ns the repeat entry produces.
 //
 // Cloning preserves `llvm.addressof` SymbolRefAttrs verbatim, so both
-// wrappers share `<kernel>_handle` cache slots — warm-up on either
+// wrappers share `<kernel>_handle` cache slots -- warm-up on either
 // side primes the other.
 
 #include "hc/Transforms/Passes.h"
@@ -39,7 +39,7 @@ static constexpr llvm::StringLiteral kLaunchRepeatSymbol =
     "hc_rt_launch_kernel_repeat";
 static constexpr llvm::StringLiteral kBenchSuffix = "_bench";
 
-// Null if zero or >1 callsites — ambiguous shape, skip cleanly.
+// Null if zero or >1 callsites -- ambiguous shape, skip cleanly.
 static LLVM::CallOp findLaunchCall(LLVM::LLVMFuncOp func) {
   LLVM::CallOp found;
   bool ambiguous = false;
@@ -82,7 +82,7 @@ static LLVM::LLVMFuncOp getOrInsertRepeatDecl(ModuleOp mod,
                                   repeatType);
 }
 
-// Clone preserves SymbolRefAttrs verbatim — wrappers share cache slots.
+// Clone preserves SymbolRefAttrs verbatim -- wrappers share cache slots.
 static void emitBenchClone(LLVM::LLVMFuncOp host, ModuleOp mod) {
   MLIRContext *ctx = host.getContext();
   Type i64Type = IntegerType::get(ctx, 64);
@@ -110,7 +110,7 @@ static void emitBenchClone(LLVM::LLVMFuncOp host, ModuleOp mod) {
 
   LLVM::LLVMFuncOp repeatDecl = getOrInsertRepeatDecl(mod, builder);
 
-  // kernelParams alloca/insertvalue chain cloned with body — same `void**`.
+  // kernelParams alloca/insertvalue chain cloned with body -- same `void**`.
   builder.setInsertionPoint(clonedLaunch);
   SmallVector<Value> repeatArgs(clonedLaunch.getArgOperands());
   repeatArgs.push_back(nInner);

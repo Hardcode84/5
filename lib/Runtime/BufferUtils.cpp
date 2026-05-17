@@ -7,7 +7,7 @@
 // GIL because the host wrapper itself runs from a thread that already
 // holds the interpreter (it was entered through ctypes from Python). We
 // still call `PyGILState_Ensure` defensively in case the wrapper is ever
-// invoked from a non-Python-managed thread — `Ensure` is a no-op in that
+// invoked from a non-Python-managed thread -- `Ensure` is a no-op in that
 // common case and a real acquire otherwise.
 
 #include "hc/Runtime/BufferUtils.h"
@@ -33,7 +33,7 @@ private:
 };
 
 // Stealing-style smart pointer for owned PyObject references. Treats
-// nullptr as "an exception was raised" — caller must check before use.
+// nullptr as "an exception was raised" -- caller must check before use.
 class PyRef {
 public:
   PyRef() = default;
@@ -82,7 +82,7 @@ private:
 }
 
 // Call `obj.<method>(int_arg)` and convert the result via PyLong_AsLongLong.
-// Used by both `get_dim` and `get_stride` — they share the entire flow
+// Used by both `get_dim` and `get_stride` -- they share the entire flow
 // modulo the method name.
 static int64_t callIntegerAccessor(PyObject *obj, const char *method,
                                    int32_t index) {
@@ -109,13 +109,13 @@ static int64_t callIntegerAccessor(PyObject *obj, const char *method,
 } // namespace
 
 // Returned pointer is passed verbatim to `hipModuleLaunchKernel` by the
-// JIT'd host wrapper — so `obj.data_ptr()` MUST be a device-allocated
+// JIT'd host wrapper -- so `obj.data_ptr()` MUST be a device-allocated
 // address. `torch.Tensor.cuda().data_ptr()` works; bare `numpy.ndarray`
 // (whose `ctypes.data` is a host pointer) does not. Auto-wrapping numpy
 // here would silently produce launches that either segfault on the
 // first device dereference or, on a unified-memory system, return
 // nondeterministic garbage. The cure for "I want to invoke from numpy"
-// is an explicit host→device alloc/copy surface (hc.to_device or
+// is an explicit host->device alloc/copy surface (hc.to_device or
 // equivalent), not relaxing this contract.
 extern "C" void *_mlir_ciface_hc_get_ptr(PyObject *obj) {
   GilGuard gil;

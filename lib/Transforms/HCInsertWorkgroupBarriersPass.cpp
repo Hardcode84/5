@@ -29,7 +29,7 @@ using namespace mlir::hc;
 namespace {
 
 // Walk back to the workgroup-AS storage root through single-input
-// `unrealized_conversion_cast` (the `ptr<workgroup>` ↔ `bare_tensor`
+// `unrealized_conversion_cast` (the `ptr<workgroup>` <-> `bare_tensor`
 // sandwich the launch-body type converter plants and that surrounding
 // canonicalize/cse has not necessarily folded by this schedule slot)
 // and `hc.ptr_offset`. Pointer equality on the returned Value is the
@@ -60,8 +60,8 @@ static Value resolveWorkgroupRoot(Value v) {
   return current;
 }
 
-// `ins` → reads, `outs` → writes. `outs` is outs-as-init (read at the
-// same instant as write — same conservative answer either way).
+// `ins` -> reads, `outs` -> writes. `outs` is outs-as-init (read at the
+// same instant as write -- same conservative answer either way).
 // Writes kept separate so a precise pass can elide barriers between
 // read-only generics on the same root.
 struct WorkgroupRoots {

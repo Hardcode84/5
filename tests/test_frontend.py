@@ -423,7 +423,7 @@ def test_lower_function_records_wmma_intrinsic_contract_metadata() -> None:
         "keyword_only",
         "keyword_only",
     )
-    # No typed annotations → omit the key, not emit an empty mapping.
+    # No typed annotations -> omit the key, not emit an empty mapping.
     assert "parameter_annotations" not in intrinsic_payload
 
 
@@ -441,7 +441,7 @@ def test_lower_source_does_not_fabricate_toplevel_metadata() -> None:
     lower_source(_CONTROL_FLOW_SOURCE, emitter, filename="control.py")
 
     func_payload = _payloads(emitter, "func_begin")[0]
-    # Source-only lowering: no live function object → no decorator
+    # Source-only lowering: no live function object -> no decorator
     # kwargs or resolved annotations. Keys stay absent.
     assert "metadata" not in func_payload
     assert "parameter_annotations" not in func_payload
@@ -544,7 +544,7 @@ def demo(group, x):
     assert kinds_by_name["x"] == {"param"}
     assert kinds_by_name["k"] == {"iv"}
     assert kinds_by_name["tmp"] == {"local"}
-    # Unresolved captures — driver fills `builtin` / `constant` later.
+    # Unresolved captures -- driver fills `builtin` / `constant` later.
     assert kinds_by_name["range"] == {None}
     assert kinds_by_name["CONST"] == {None}
 

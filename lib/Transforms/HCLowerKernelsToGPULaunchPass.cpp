@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// `-hc-lower-kernels-to-gpu-launch`: first wrapper slice of HC →
+// `-hc-lower-kernels-to-gpu-launch`: first wrapper slice of HC ->
 // upstream GPU lowering.
 
 #include "hc/Transforms/Passes.h"
@@ -276,7 +276,7 @@ static void bindScalarSymbol(Type originalType, Value hostArg,
 
 // Idempotent extern "C" helper decl. `llvm.emit_c_interface` makes
 // convert-func-to-llvm emit the `_mlir_ciface_<name>` decl + a private
-// `<name>` forwarder. No sret — call sites use the unmangled `@<name>`.
+// `<name>` forwarder. No sret -- call sites use the unmangled `@<name>`.
 static func::FuncOp ensureRuntimeHelper(ModuleOp module, StringRef name,
                                         ArrayRef<Type> inputs,
                                         ArrayRef<Type> results) {
@@ -307,7 +307,7 @@ static void ensureRuntimeHelpers(ModuleOp module) {
   ensureRuntimeHelper(module, "hc_get_float64", {ptr}, {f64});
 }
 
-// `_mlir_ciface_hc_get_*(pyobj, axis)` → i64 element units, cast to
+// `_mlir_ciface_hc_get_*(pyobj, axis)` -> i64 element units, cast to
 // `index`. Shared so dim and stride don't drift.
 static Value callIndexAccessor(OpBuilder &builder, Location loc,
                                ModuleOp module, StringRef name, Value pyArg,
@@ -336,7 +336,7 @@ static Value callGetStride(OpBuilder &builder, Location loc, ModuleOp module,
 // Kernel-boundary expansion of `!hc.buffer<T, [dims]>`:
 //   1. `!hc.ptr<global, T?>` from `data_ptr()`.
 //   2. per-axis dim (`_mlir_ciface_hc_get_dim` or ExprLowerer).
-//   3. per-axis stride (`_mlir_ciface_hc_get_stride`) — without this
+//   3. per-axis stride (`_mlir_ciface_hc_get_stride`) -- without this
 //      transposed / sliced inputs silently fall back to contiguous.
 // Stitched through a 1-to-N UCC back to the original buffer type so
 // the kernel body is unchanged; launch-body unwinds the UCC at lower-
@@ -380,7 +380,7 @@ static Value buildBufferUCC(OpBuilder &builder, Location loc, BufferType target,
       .getResult(0);
 }
 
-// PyObject → scalar of `targetType`. Wire is i64/f64; narrow in-IR.
+// PyObject -> scalar of `targetType`. Wire is i64/f64; narrow in-IR.
 static FailureOr<Value> buildScalar(OpBuilder &builder, Location loc,
                                     ModuleOp module, Value pyArg,
                                     Type targetType) {
@@ -456,7 +456,7 @@ static LogicalResult lowerLaunchGeometry(OpBuilder &builder, Location loc,
   return success();
 }
 
-// Trailing `hc.return` or null. Non-empty return is a hard error —
+// Trailing `hc.return` or null. Non-empty return is a hard error --
 // `gpu.launch` terminator has no operands.
 static FailureOr<Operation *> findTrailingReturn(Block &kernelBlock) {
   if (kernelBlock.empty())
@@ -675,7 +675,7 @@ buildPostFlattenBufferPack(OpBuilder &builder, Location loc, ModuleOp module,
                            Value pyArg, PtrType ptrType,
                            SmallVectorImpl<Value> &shapeValues,
                            ArrayRef<Value> strideValues) {
-  // Constant-dim axes carry no aux — probe at runtime.
+  // Constant-dim axes carry no aux -- probe at runtime.
   unsigned rank = std::max(shapeValues.size(), strideValues.size());
   shapeValues.resize(rank);
   for (auto [axis, slot] : llvm::enumerate(shapeValues))

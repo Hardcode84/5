@@ -32,7 +32,7 @@ def package_native_lib_dir() -> Path:
 
 
 def runtime_helpers_lib_path() -> Path:
-    """libhc_rt_helpers.so — provides `_mlir_ciface_hc_get_*`.
+    """libhc_rt_helpers.so -- provides `_mlir_ciface_hc_get_*`.
 
     ctypes-loaded; addresses fed to the JIT. `HC_RT_HELPERS_PATH`
     overrides for source-tree dev.
@@ -44,7 +44,7 @@ def runtime_helpers_lib_path() -> Path:
 
 
 def hip_runtime_lib_path() -> Path:
-    """libhc_hip_runtime.so — `hc_rt_init / load_kernel / launch_kernel`.
+    """libhc_hip_runtime.so -- `hc_rt_init / load_kernel / launch_kernel`.
 
     No build-time ROCm dep; `hc_rt_init` dlopens `libamdhip64.so`
     lazily.
@@ -56,7 +56,7 @@ def hip_runtime_lib_path() -> Path:
 
 
 def lld_path() -> Path:
-    """ld.lld — used by `hc-lower-gpu-to-binary` to link HSACO.
+    """ld.lld -- used by `hc-lower-gpu-to-binary` to link HSACO.
 
     Bundled at `hc/_native/bin/ld.lld`. `HC_LLD` overrides.
     """

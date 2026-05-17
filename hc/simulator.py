@@ -1324,7 +1324,7 @@ def _iterate_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
 
 
 def _iter_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
-    # Dimension 0 varies fastest — documented launch order.
+    # Dimension 0 varies fastest -- documented launch order.
     for reversed_index in np.ndindex(tuple(reversed(shape))):
         yield tuple(reversed(reversed_index))
 
@@ -1393,7 +1393,7 @@ def _copy_loaded_value(
             layout=layout,
             source_intent=source_intent,
         )
-    # No layout: dense logical-shape overlap copy. Rank must match —
+    # No layout: dense logical-shape overlap copy. Rank must match --
     # surface the mismatch here rather than inside NumPy.
     if source_data.ndim != len(shape):
         raise SimulatorError("load rank does not match the requested shape")

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Thin C++ wrapper over `llvm::orc::LLJIT`. Avoids `mlir::ExecutionEngine`
-// because it rewrites every public function with a packed-args wrapper —
+// because it rewrites every public function with a packed-args wrapper --
 // we want one ctypes thunk per launch with no `void**` repacking.
 // Per-module `LLVMContext` lives inside `ThreadSafeModule`, so releasing
 // a module also disposes of its context.

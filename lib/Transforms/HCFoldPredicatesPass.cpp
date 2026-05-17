@@ -37,7 +37,7 @@ static bool tryFoldTrivialMask(HCPredicateOp op) {
     return true;
   }
   if (matchPattern(mask, m_Zero())) {
-    // Always-false → load elided; drop producer if `isOpTriviallyDead`
+    // Always-false -> load elided; drop producer if `isOpTriviallyDead`
     // (accepts MemRead-only loads with no remaining uses).
     Value value = op.getValue();
     op.replaceAllUsesWith(op.getPassthrough());
@@ -50,7 +50,7 @@ static bool tryFoldTrivialMask(HCPredicateOp op) {
   return false;
 }
 
-// Allow-list — unknown producer is a diagnostic, not passthrough.
+// Allow-list -- unknown producer is a diagnostic, not passthrough.
 static LogicalResult foldPredicate(HCPredicateOp op, const DominanceInfo &dom) {
   if (tryFoldTrivialMask(op))
     return success();
@@ -63,7 +63,7 @@ static LogicalResult foldPredicate(HCPredicateOp op, const DominanceInfo &dom) {
         "hc.ptr_load and vector.extract");
 
   if (auto load = dyn_cast<HCPtrLoadOp>(producer)) {
-    // Mask / passthrough must dominate the load — predicated clone
+    // Mask / passthrough must dominate the load -- predicated clone
     // replaces the load in place, not at the predicate use site.
     Value mask = op.getMask();
     Value pass = op.getPassthrough();

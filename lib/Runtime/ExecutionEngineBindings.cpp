@@ -5,7 +5,7 @@
 // Nanobind module exposing `hc::ExecutionEngine` to Python. The whole
 // module is one translation unit because we want a single "C++ surface"
 // the linker can hide everything-but-`PyInit_*` from via the version
-// script — keeping LLVM internals from leaking into other extensions
+// script -- keeping LLVM internals from leaking into other extensions
 // loaded in the same process.
 
 #include "hc/Runtime/ExecutionEngine.h"
@@ -47,7 +47,7 @@ static T unwrapExpected(llvm::Expected<T> expected, const char *context) {
 
 NB_MODULE(hc_execution_engine, m) {
   m.doc() =
-      "LLVM ORC LLJIT bindings for hc — JITs LLVM IR text emitted by the "
+      "LLVM ORC LLJIT bindings for hc -- JITs LLVM IR text emitted by the "
       "compiler pipeline and resolves caller-supplied symbols against the "
       "loaded modules.";
 

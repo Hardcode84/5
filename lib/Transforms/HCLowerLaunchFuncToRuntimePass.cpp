@@ -5,7 +5,7 @@
 // Implements `-hc-lower-launch-func-to-runtime`. Each `gpu.launch_func`
 // becomes `hc_rt_load_kernel` + `hc_rt_launch_kernel` calls into the HIP
 // shim; the matching `gpu.binary`'s HSACO blob is inlined as an LLVM
-// global so the JIT'd module is self-contained — no filesystem touches
+// global so the JIT'd module is self-contained -- no filesystem touches
 // at launch time.
 //
 // Stream is the host wrapper's arg(0) by convention. Cluster dims
@@ -47,7 +47,7 @@ static SmallString<128> getUniqueLLVMGlobalName(ModuleOp mod,
       counter);
 }
 
-// Lazy decl — trivial payloads with no launches don't carry runtime decls.
+// Lazy decl -- trivial payloads with no launches don't carry runtime decls.
 struct FunctionCallBuilder {
   FunctionCallBuilder(StringRef functionName, Type returnType,
                       ArrayRef<Type> argumentTypes)
@@ -130,7 +130,7 @@ public:
   void runOnOperation() final;
 
 private:
-  // Binary erased after all launches consumed — inline erase invalidates
+  // Binary erased after all launches consumed -- inline erase invalidates
   // SymbolTable lookups for other launches into the same kernel.
   LogicalResult lowerOne(gpu::LaunchFuncOp op, ModuleOp mod,
                          SymbolTable &symbolTable,
@@ -169,7 +169,7 @@ static Value packKernelArgs(OpBuilder &builder, Location loc, ValueRange args,
   return argsArrayPtr;
 }
 
-// Pipeline never carries cluster dims; null → 0 (runtime: <=1 means "no
+// Pipeline never carries cluster dims; null -> 0 (runtime: <=1 means "no
 // cluster").
 static std::array<Value, 3> resolveClusterDims(OpBuilder &builder, Location loc,
                                                gpu::LaunchFuncOp op,
@@ -207,7 +207,7 @@ LogicalResult HCLowerLaunchFuncToRuntimePass::lowerOne(
         "inside an llvm.func with a leading stream argument");
   Value stream = enclosingFunc.getArgument(0);
 
-  // Per-callsite cache slot — runtime's atomic single-flight handles the race.
+  // Per-callsite cache slot -- runtime's atomic single-flight handles the race.
   StringRef kernelName = op.getKernelName();
   Value kernelHandle = createKernelHandle(builder, symbolTable, ptrType, mod,
                                           kernelName + "_handle");
@@ -268,7 +268,7 @@ void HCLowerLaunchFuncToRuntimePass::runOnOperation() {
 
   SymbolTable symbolTable(mod);
 
-  // Snapshot — erase inside `lowerOne` would invalidate the walk.
+  // Snapshot -- erase inside `lowerOne` would invalidate the walk.
   SmallVector<gpu::LaunchFuncOp> launches;
   mod.walk([&](gpu::LaunchFuncOp op) { launches.push_back(op); });
 
@@ -280,7 +280,7 @@ void HCLowerLaunchFuncToRuntimePass::runOnOperation() {
     }
   }
 
-  // Binaries — consumers gone, blob in per-callsite `_data` globals.
+  // Binaries -- consumers gone, blob in per-callsite `_data` globals.
   SmallVector<gpu::BinaryOp> binaries;
   mod.walk([&](gpu::BinaryOp op) { binaries.push_back(op); });
   for (gpu::BinaryOp op : binaries)

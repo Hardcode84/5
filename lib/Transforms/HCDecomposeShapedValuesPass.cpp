@@ -266,7 +266,7 @@ static SmallVector<Value> materializeTargetCast(OpBuilder &builder,
       .getResults();
 }
 
-// Slot 0/1 → `.data`/`.mask`; higher slots → `.2`, `.3`, ...
+// Slot 0/1 -> `.data`/`.mask`; higher slots -> `.2`, `.3`, ...
 static void appendSplitParameterNames(MLIRContext *ctx, StringRef name,
                                       size_t typeCount,
                                       SmallVectorImpl<Attribute> &out) {
@@ -713,7 +713,7 @@ struct ConvertVLoadOp : public OpConversionPattern<HCVLoadOp> {
                             /*layout=*/LayoutAttr{})
               .getResult();
     } else if (indices.empty()) {
-      // Broadcast vload: no per-axis carriers → load_mask can't plant.
+      // Broadcast vload: no per-axis carriers -> load_mask can't plant.
       maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
                                        bareMaskType(originalType))
                       .getMask();
@@ -796,7 +796,7 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
 
     Value dataSource;
     Value maskSource;
-    // Buffer roots stay undecomposed; one adapted operand → fully valid
+    // Buffer roots stay undecomposed; one adapted operand -> fully valid
     // storage.
     if (adaptor.getBuffer().size() == 1 &&
         isa<BufferType>(op.getBuffer().getType())) {
@@ -847,7 +847,7 @@ struct ConvertGetItemOp : public OpConversionPattern<HCGetItemOp> {
 
     Value dataSource;
     Value maskSource;
-    // Buffer roots stay undecomposed; one adapted operand → fully valid
+    // Buffer roots stay undecomposed; one adapted operand -> fully valid
     // storage.
     if (adaptor.getBase().size() == 1 &&
         isa<BufferType>(op.getBase().getType())) {

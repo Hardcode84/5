@@ -14,13 +14,13 @@
 //  2. Seed a worklist with every `hc_front.call` reachable from the
 //     module whose callee's `hc_front.name` carries the inline
 //     classification (including calls inside inline helpers
-//     themselves — those are inlined first, so each clone of a
+//     themselves -- those are inlined first, so each clone of a
 //     helper's body is already free of inline calls by the time it
 //     lands at a real use site).
 //  3. At each call site: look up the callee, clone its body into a
 //     fresh `hc_front.inlined_region`, match the region's result
 //     types to the callee's explicit `hc_front.return` operands, and replace
-//     the call with the region. A cycle is a hard error — inline helpers
+//     the call with the region. A cycle is a hard error -- inline helpers
 //     must not recurse.
 //  4. Erase every inlinable `hc_front.func`; post-condition: no
 //     `ref.kind == "inline"` symbol survives to the
@@ -57,7 +57,7 @@ namespace {
 
 // Check whether a `hc_front.call`'s callee is a `ref.kind = "inline"`
 // name op. Absent defining op / absent ref / different kind all
-// collapse to false — non-inline calls are outside this pass's scope.
+// collapse to false -- non-inline calls are outside this pass's scope.
 static bool isInlineCall(hc_front::CallOp call) {
   auto nameOp = call.getCallee().getDefiningOp<hc_front::NameOp>();
   if (!nameOp)
@@ -70,7 +70,7 @@ static bool isInlineCall(hc_front::CallOp call) {
 }
 
 // Inline helpers are plain Python functions: exactly one return from
-// the helper itself. Only the top block's direct children count —
+// the helper itself. Only the top block's direct children count --
 // nested regions (a previously-inlined call's `hc_front.inlined_region`
 // or a `hc_front.if` body, etc.) have their own returns that aren't
 // *this* function's return.
@@ -98,7 +98,7 @@ public:
   Inliner(llvm::StringMap<hc_front::FuncOp> &funcs, hc_front::ValueType valueTy)
       : inlinableFuncs(funcs), valueTy(valueTy) {}
 
-  // Inline every call reachable from `root`. `root` itself is walked —
+  // Inline every call reachable from `root`. `root` itself is walked --
   // if it is an inlinable `hc_front.func`, calls inside get inlined
   // before anyone clones its body, so the clone is already
   // inline-free.
@@ -151,7 +151,7 @@ private:
 
   // Mint a fresh `hc_front.inlined_region` and clone the callee's body
   // into it. `emplaceBlock()` creates an empty block with no args; the
-  // inlined body doesn't use block args — parameter bindings flow via
+  // inlined body doesn't use block args -- parameter bindings flow via
   // operands + the `parameters` attribute, consumed at conversion time.
   hc_front::InlinedRegionOp cloneFuncBodyIntoRegion(hc_front::CallOp call,
                                                     hc_front::FuncOp func,
@@ -219,7 +219,7 @@ private:
       return failure();
     call.erase();
 
-    // `nameOp` is the original call's callee — only erase if it has
+    // `nameOp` is the original call's callee -- only erase if it has
     // no more uses.
     Operation *calleeNameOp = nameOp.getOperation();
     if (calleeNameOp->use_empty())
@@ -246,7 +246,7 @@ static bool isInlinableFuncOp(Operation &op) {
 }
 
 // First pass: gather every top-level inline helper into a name -> FuncOp
-// map. Duplicate names are a hard error — the inliner uses string-keyed
+// map. Duplicate names are a hard error -- the inliner uses string-keyed
 // lookup, so a duplicate would silently pick one and drop the other.
 static LogicalResult
 collectInlinableFuncs(Operation *root,
@@ -304,7 +304,7 @@ struct HCFrontInlinePass
 
     // Inline the bodies of the marker funcs themselves first. Cloning
     // a helper later sees no `hc_front.call`s to other inline helpers
-    // in its body — nested inline calls are already gone.
+    // in its body -- nested inline calls are already gone.
     for (auto &entry : inlinableFuncs) {
       hc_front::FuncOp func = entry.second;
       SmallVector<StringRef, 2> chain = {func.getName()};
@@ -332,5 +332,5 @@ struct HCFrontInlinePass
 } // namespace
 
 // `createHCFrontInlinePass()` is emitted by tablegen (friend of the
-// impl::HCFrontInlineBase CRTP). See `Passes.td` — no `let constructor`,
+// impl::HCFrontInlineBase CRTP). See `Passes.td` -- no `let constructor`,
 // so the generated factory is the only one.

@@ -98,18 +98,18 @@ def test_main_stages_package_native_artifacts(
 
     CLI entry for source-tree devs to refresh the cmake install without
     `pip install -e .`. Must invoke the same staging the wheel/editable
-    build hooks use — half-populated `hc/_native/` (e.g. missing
+    build hooks use -- half-populated `hc/_native/` (e.g. missing
     `ld.lld`) surfaces as confusing `hc-lower-gpu-to-binary` linker
     failures five passes downstream.
     """
     llvm_install_root = tmp_path / "llvm-install" / "toolchain-key"
     native_install_root = tmp_path / "native-install"
     project_root = tmp_path / "project"
-    # Stage lld into the fake llvm install — staging needs something
+    # Stage lld into the fake llvm install -- staging needs something
     # to copy. Layout mirrors real llvm bootstrap output.
     (llvm_install_root / "bin").mkdir(parents=True)
     (llvm_install_root / "bin" / "ld.lld").write_text("lld\n", encoding="utf-8")
-    # Fake out heavy bootstrap — no real LLVM toolchain or cmake
+    # Fake out heavy bootstrap -- no real LLVM toolchain or cmake
     # needed to exercise the staging surface.
     monkeypatch.setattr(
         hc_native_tools, "ensure_llvm_toolchain", lambda: llvm_install_root
@@ -121,7 +121,7 @@ def test_main_stages_package_native_artifacts(
             _build_fake_native_install(native_install_root) or native_install_root
         ),
     )
-    # `_project_root` runs inside `main` with no args — redirect to
+    # `_project_root` runs inside `main` with no args -- redirect to
     # the per-test fixture root so staging lands somewhere
     # inspectable, not the real `hc/_native/`.
     monkeypatch.setattr(

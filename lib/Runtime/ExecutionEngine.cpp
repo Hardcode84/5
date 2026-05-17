@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Two ingestion paths share one backend:
-//   `loadLLVMIR(text)` → parseAssembly → addLLVMModule
-//   `loadMLIR(text)`   → parseSourceString + translateModuleToLLVMIR →
+//   `loadLLVMIR(text)` -> parseAssembly -> addLLVMModule
+//   `loadMLIR(text)`   -> parseSourceString + translateModuleToLLVMIR ->
 //   addLLVMModule
 // The MLIR path is what the post-pipeline host wrapper goes through;
 // the LLVM-text path stays around for hand-written IR experiments and
@@ -68,7 +68,7 @@ static llvm::Error makeStringError(const llvm::Twine &message) {
 // Minimum dialect set the post-pipeline host wrapper needs: LLVM (for
 // the body) and the builtin/LLVM translations to lower the parsed
 // `ModuleOp` to `llvm::Module`. We deliberately stop there rather than
-// `registerAllDialects` — the lowering pipeline guarantees the IR is
+// `registerAllDialects` -- the lowering pipeline guarantees the IR is
 // pure LLVM dialect by the time it reaches us, and shrinking the
 // dialect surface keeps the wheel size honest. If a future pipeline
 // stage starts emitting something else, the parser will surface a
@@ -80,7 +80,7 @@ static std::unique_ptr<mlir::MLIRContext> makeMLIRContext() {
   mlir::registerLLVMDialectTranslation(registry);
   // Allow unknown attributes (e.g. `gpu.container_module` left on the
   // module by upstream passes) to pass through the parser without us
-  // having to load the corresponding dialect — the attribute is just a
+  // having to load the corresponding dialect -- the attribute is just a
   // marker, the translation step ignores it.
   auto context = std::make_unique<mlir::MLIRContext>(registry);
   context->allowUnregisteredDialects(true);
@@ -122,7 +122,7 @@ ExecutionEngine::ExecutionEngine(const ExecutionEngineOptions &options)
   auto tmBuilder =
       llvm::cantFail(llvm::orc::JITTargetMachineBuilder::detectHost());
 
-  // SectionMemoryManager is the conservative choice — slower than JITLink
+  // SectionMemoryManager is the conservative choice -- slower than JITLink
   // but bulletproof on every host LLVM supports. We can switch later if
   // measurements ever flag the manager as a bottleneck.
   auto objectLinkingLayerCreator = [](llvm::orc::ExecutionSession &session)
@@ -185,7 +185,7 @@ ExecutionEngine::loadMLIR(llvm::StringRef text) {
 
   // Translation needs its own `LLVMContext` so the resulting
   // `llvm::Module` has the same lifetime story as the LLVM-IR ingestion
-  // path — owned by the `ThreadSafeModule` and released when the JIT
+  // path -- owned by the `ThreadSafeModule` and released when the JIT
   // dylib is torn down.
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   std::unique_ptr<llvm::Module> llvmModule =
@@ -202,7 +202,7 @@ llvm::Expected<ExecutionEngine::ModuleHandle>
 ExecutionEngine::addLLVMModule(std::unique_ptr<llvm::Module> module,
                                std::unique_ptr<llvm::LLVMContext> context) {
   // Fresh dylib per module so we can release them independently. The
-  // counter is monotonic — we never reuse names because deleting a
+  // counter is monotonic -- we never reuse names because deleting a
   // dylib doesn't immediately free the name on the ExecutionSession
   // side.
   std::string dylibName;

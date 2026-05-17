@@ -71,8 +71,8 @@ def _install_package_native_artifacts(
 ) -> None:
     # Thin wrapper over the shared staging helper so the build-hook
     # call site stays readable and the existing tests' monkeypatch
-    # surface — `build_backend._install_package_native_artifacts` and
-    # `build_backend._PACKAGE_NATIVE_ROOT` — keep working without
+    # surface -- `build_backend._install_package_native_artifacts` and
+    # `build_backend._PACKAGE_NATIVE_ROOT` -- keep working without
     # leaking the project-root computation into the shared module.
     install_package_native_artifacts(
         native_install_root,

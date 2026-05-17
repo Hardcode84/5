@@ -41,7 +41,7 @@ struct CanonicalIdentity {
   sym::ExprHandle storage;
 };
 
-// Names → ixsimpl symbol handles, position-indexed.
+// Names -> ixsimpl symbol handles, position-indexed.
 static FailureOr<SmallVector<sym::ExprHandle>>
 liftSymbolHandles(sym::Store &store, ArrayRef<Attribute> names) {
   SmallVector<sym::ExprHandle> handles;
@@ -219,7 +219,7 @@ public:
   }
 };
 
-// `as_layout(as_layout(%v, L1), L2)` → `as_layout(%v, L2)`; outer `shape=`
+// `as_layout(as_layout(%v, L1), L2)` -> `as_layout(%v, L2)`; outer `shape=`
 // survives.
 struct CollapseAsLayoutChain : public OpConversionPattern<HCAsLayoutOp> {
   using OpConversionPattern::OpConversionPattern;

@@ -244,7 +244,7 @@ class IntrinsicRecipeCall:
         if expected_type is None:
             return value
         # Sugar for `t.cast(call.operand(name), to=expected_type)`. No-op
-        # at apply when types already match — safe for both bridged and
+        # at apply when types already match -- safe for both bridged and
         # not-yet-bridged configs.
         if self._builder is None:
             raise RuntimeError(
@@ -697,7 +697,7 @@ class _TransformModuleBuilder:
                 self.ir.IntegerType.get_signless(value.width, context=self.context),
                 value.value,
             )
-        # `bool` ⊂ `int`; check first to get `i1`, not i64.
+        # `bool` subset of `int`; check first to get `i1`, not i64.
         if isinstance(value, bool):
             return self.ir.BoolAttr.get(value, context=self.context)
         if isinstance(value, int):

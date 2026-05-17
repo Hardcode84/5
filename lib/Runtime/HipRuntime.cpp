@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implementation of the HIP launcher shim. Linux-only v0 — the wave
+// Implementation of the HIP launcher shim. Linux-only v0 -- the wave
 // reference also ports to Windows but we have no consumer there yet, so
 // we error out early to keep the surface area honest.
 
@@ -92,7 +92,7 @@ static void bindMandatorySymbols(ModuleHandle module) {
   // Mandatory: the bench-path `hc_rt_launch_kernel_repeat` needs it for
   // the trailing sync, and any HIP install we'd care about exports it.
   // Listing as mandatory here (rather than lazy on first bench call) keeps
-  // the failure mode consistent — either `hc_rt_init` succeeds and the
+  // the failure mode consistent -- either `hc_rt_init` succeeds and the
   // whole ABI is callable, or it throws.
   g_hipStreamSynchronize =
       requireSymbol<hipStreamSynchronize_t>(module, "hipStreamSynchronize");
@@ -142,7 +142,7 @@ extern "C" void hc_rt_init() {
   ModuleHandle module = openHipModule();
   bindMandatorySymbols(module);
 
-  // Optional — older HIPs predate `hipDrvLaunchKernelEx`. We only need
+  // Optional -- older HIPs predate `hipDrvLaunchKernelEx`. We only need
   // it on the cluster-launch path; missing here is reported lazily.
   g_hipDrvLaunchKernelEx = reinterpret_cast<hipDrvLaunchKernelEx_t>(
       symbolOrNull(module, "hipDrvLaunchKernelEx"));
@@ -252,7 +252,7 @@ hc_rt_launch_kernel_repeat(void *stream, void *function,
   // Bracket covers the inner launch loop AND the final stream sync.
   // Picking the bracket here (rather than letting the caller wrap us)
   // keeps the timer inside the same TU as the HIP calls and avoids a
-  // language-boundary crossing inside the sample window — the caller
+  // language-boundary crossing inside the sample window -- the caller
   // outer benchmark loop only does `samples[i] = repeat(...)`.
   uint64_t start_ns = hc_clock_now_ns();
   for (size_t i = 0; i < n_inner; ++i) {

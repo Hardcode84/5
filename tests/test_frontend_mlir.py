@@ -193,7 +193,7 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
         ]
         assert _parameter_passing_records(kernel_op) == ["positional", "positional"]
         # Shape axes ride as string arrays for later `#hc.shape`
-        # assembly. `subgroup_size` absent — kernel doesn't declare it.
+        # assembly. `subgroup_size` absent -- kernel doesn't declare it.
         assert _string_array_values(kernel_op.attributes["work_shape"]) == ["4"]
         assert _string_array_values(kernel_op.attributes["group_shape"]) == ["4"]
         assert "subgroup_size" not in kernel_op.attributes

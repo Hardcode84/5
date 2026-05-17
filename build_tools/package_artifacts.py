@@ -25,7 +25,7 @@ def install_package_native_artifacts(
 ) -> None:
     """Refresh `package_native_root` from `native_install_root`.
 
-    Rebuilt from scratch each call — prior toolchain keys would shadow
+    Rebuilt from scratch each call -- prior toolchain keys would shadow
     the current install. `llvm_install_root=None` skips lld staging
     (sdist / metadata-only paths).
     """

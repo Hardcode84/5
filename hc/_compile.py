@@ -54,7 +54,7 @@ class CompiledKernel:
     # `.bench()` with a message pointing back at `bench=True`.
     bench_wrapper_name: str | None = field(default=None)
     # Mutable side-channel for the lazy JIT so the dataclass stays frozen.
-    # Excluded from compare/repr — invocation state doesn't define identity.
+    # Excluded from compare/repr -- invocation state doesn't define identity.
     _invoker_cache: InvokerCache = field(
         default_factory=InvokerCache, compare=False, repr=False
     )
@@ -112,10 +112,10 @@ class CompiledKernel:
         nanoseconds. Timing never crosses the language boundary.
 
         Caveats:
-        * Inputs reused across every launch — cache-hot latency for
+        * Inputs reused across every launch -- cache-hot latency for
           small / L2-fitting kernels. Rotate in warmup if it matters.
         * One number per outer sample. Sweep `n_inner` to separate
-          submit vs sync (large → submit; 1 → submit + sync per launch).
+          submit vs sync (large -> submit; 1 -> submit + sync per launch).
 
         Raises `RuntimeError` if the handle was not built with
         `bench=True`.
@@ -248,7 +248,7 @@ def compile(
     match the kernel's `literals=` whitelist if declared; missing
     entries are legal (partial specialization). `$`-prefixed keys
     (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) are launch-context
-    overrides — they bypass the whitelist and override the values the
+    overrides -- they bypass the whitelist and override the values the
     front-to-hc handshake would seed from integer-literal `group_shape`
     / `work_shape` / `subgroup_size`. Use them to pin those dims for
     the native lowering when the decorator left them symbolic.
@@ -258,7 +258,7 @@ def compile(
 
     `target`: substituted into the schedule's `__HC_TARGET__`
     placeholder, feeds `hc-interpret-intrinsic-recipes`'s `target=`.
-    `None` leaves it empty — every recipe fires regardless of
+    `None` leaves it empty -- every recipe fires regardless of
     `hc.target` (correct while each intrinsic registers at most one
     recipe per compile). A user `schedule` without the placeholder
     silently ignores `target`.
@@ -354,7 +354,7 @@ def _normalise_bindings(
     for key, value in symbols.items():
         name = _symbol_name(key)
         # `$`-prefixed entries (`$WGS<axis>`, `$WS<axis>`, `$WV0`,
-        # `$GSZ0`) bypass the whitelist by design — launch-context
+        # `$GSZ0`) bypass the whitelist by design -- launch-context
         # overrides, not kernel-declared specialization points. Mirrors
         # `validateBindingsAgainstLiterals` in
         # `HCSpecializeLiteralsPass.cpp`. Empty `literals` means no

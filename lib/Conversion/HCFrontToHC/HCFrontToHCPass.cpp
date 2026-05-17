@@ -15,7 +15,7 @@
 // Python-level name bindings are emitted as `hc.assign` / `hc.name_load`
 // placeholder ops; `-hc-promote-names` then folds them into SSA. See
 // `ConvertHCFrontToHC` in `include/hc/Conversion/HCFrontToHC/Passes.td`
-// for the canonical pipeline contract — this banner doesn't repeat it.
+// for the canonical pipeline contract -- this banner doesn't repeat it.
 //
 // What this pass handles today:
 //  * the structural rewrites for every `hc_front` op the WMMA kernel touches
@@ -23,18 +23,18 @@
 //    a `range(...)` iter, constant, binop, name dispatched on `ref`,
 //    target_* + assign, slice, tuple/keyword glue, subscript, call dispatched
 //    on the callee's `ref`, plus a small `dsl_method` subset that's mechanical
-//    enough to fit — `a.shape[N]`, `x.vec()`, `x.with_inactive(value=...)`,
+//    enough to fit -- `a.shape[N]`, `x.vec()`, `x.with_inactive(value=...)`,
 //    `x.astype(...)`);
 //  * DSL method dispatch reads `hc_front.attr`'s `$name` (the op-level
 //    spelling the frontend always stamps) rather than `ref.method`,
 //    which the resolver can only fill in when the attr's base was
-//    classifiable — chained attrs on subscript/call results arrive with
+//    classifiable -- chained attrs on subscript/call results arrive with
 //    no `ref.method` but still dispatch on the attr's name;
 //  * `numpy_dtype_type` attrs (`np.float32`, `np.float16`, ...) lower to
 //    an `hc.const` wrapping the dtype's `TypeAttr`, usable both as an
 //    argument (`x.astype(np.float32)`) and as a value-constructor
 //    callee (`np.float16(0)`);
-//  * most produced values get `!hc.undef` — type inference pins later;
+//  * most produced values get `!hc.undef` -- type inference pins later;
 //    kernel group parameters and launch-geometry query results are the
 //    exceptions because launch metadata and internal `$` symbols are known
 //    here.
@@ -44,10 +44,10 @@
 // lowering recipes ride alongside as a sibling top-level `builtin.module`
 // (`@__hc_intrinsic_lowerings__`) carrying a `transform.named_sequence`
 // per `(intrinsic, target)` pair. That sibling is not an `hc_front.*` op,
-// so this pass leaves it untouched — the eventual interpreter pass picks
+// so this pass leaves it untouched -- the eventual interpreter pass picks
 // the recipes up by walking the tagged module. The lowered `hc.intrinsic`
 // is a declaration (signature + scope/effects/const_kwargs + empty entry
-// block with param args, zero body ops — no `hc.assign` either, since
+// block with param args, zero body ops -- no `hc.assign` either, since
 // there is no body scan downstream for them to seed). A consequence worth
 // spelling out: this pass does *not* validate the contents of an
 // intrinsic body. Malformed ops inside a simulator fallback pass through
@@ -194,7 +194,7 @@ public:
   }
 
   // Build from a bare `DictionaryAttr` that already carries the
-  // ref-shaped payload — used for parameter-side sub-dicts (e.g. the
+  // ref-shaped payload -- used for parameter-side sub-dicts (e.g. the
   // captured `layout=` payload on an `hc_front.kernel` parameter
   // entry) that share the body-level ref schema but don't live on a
   // dedicated op of their own.
@@ -211,7 +211,7 @@ public:
   // True iff a `ref` dict was present on the op.
   explicit operator bool() const { return static_cast<bool>(dict_); }
 
-  // The `kind` payload. Empty when no `ref` or no `kind` string — callers
+  // The `kind` payload. Empty when no `ref` or no `kind` string -- callers
   // that need to distinguish "missing ref" from "present but malformed"
   // should check `bool(info) && getKind().empty()`.
   StringRef getKind() const { return kind_; }
@@ -228,7 +228,7 @@ public:
 
   // Typed attribute lookup. Returns a default-constructed (null) `AttrT`
   // when the dict is absent, the key is missing, or the value is not of
-  // the requested type — mirrors `DictionaryAttr::getAs` exactly.
+  // the requested type -- mirrors `DictionaryAttr::getAs` exactly.
   template <typename AttrT> AttrT getAs(StringRef key) const {
     if (!dict_)
       return {};
@@ -237,7 +237,7 @@ public:
 
   // Driver-contract check: `ref` is how the Python driver tells the pass
   // "this name/attr is a <kind>". A dict with no string `kind` is a
-  // driver bug, not a fallback — return failure so every call site that
+  // driver bug, not a fallback -- return failure so every call site that
   // consumes `ref` can stop short rather than dropping into a misleading
   // "unsupported" path downstream. Absent `ref` is fine: hand-written IR
   // uses that to mean "no classification" and different consumers handle
@@ -342,7 +342,7 @@ static std::optional<EffectClass> parseEffectClass(StringRef text) {
 // (`_numpy_dtype_name` in `hc/_resolve.py`) classifies any live numpy
 // scalar type as `ref = {kind = "numpy_dtype_type", dtype = "<name>"}`
 // using the identifier numpy itself exposes. This pass supports a
-// curated subset — the fixed-width scalars plus their common size-
+// curated subset -- the fixed-width scalars plus their common size-
 // aliases. Signed aliases land as builtin `si<N>` and unsigned aliases land
 // as builtin `ui<N>`, so downstream passes can recover the user's dtype
 // intent instead of guessing from a signless width. Anything outside the set
@@ -392,7 +392,7 @@ static std::optional<Type> resolveNumpyDtypeType(MLIRContext *ctx,
 // outside `[INT64_MIN, INT64_MAX]` (C++ [conv.fpint]). Use hex-float
 // literals of +/-2^63 (both exactly representable as `double`) to
 // bracket the safe range, and treat i1 separately as NumPy's `bool_`
-// truthiness rather than bit-pattern truncation — `APInt(1, 2)` would
+// truthiness rather than bit-pattern truncation -- `APInt(1, 2)` would
 // store 0 (low bit), flipping the user's boolean under our feet.
 // Coerce `src` to the target float type. Float -> Float keeps the
 // double precision, Int -> Float widens via `int64 -> double`.
@@ -443,7 +443,7 @@ static Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
 }
 
 //===----------------------------------------------------------------------===//
-// `group.load(a[row_sl, col_sl], shape=(M, K))` — the WMMA pattern —
+// `group.load(a[row_sl, col_sl], shape=(M, K))` -- the WMMA pattern --
 // has to land as `hc.load %a[%row_sl, %col_sl], shape %shape`, not as a
 // chained `hc.buffer_view` + zero-index `hc.load`. This helper peels
 // the `hc.buffer_view` produced by `lowerSubscript` on the handle of
@@ -455,7 +455,7 @@ static Attribute coerceNumpyLiteral(Type targetTy, Attribute src) {
 // Single-level peel only. Nested `hc.buffer_view`s arise from chained
 // Python subscripts (`a[i][j]`), and by `hc.buffer_view`'s Python-like
 // semantics the inner view applies to the outer-view's *leading* axis
-// — not the original buffer's next axis. Splicing two index lists
+// -- not the original buffer's next axis. Splicing two index lists
 // together would silently misaddress in the general slice/slice case,
 // so we stop at one level and let the caller diagnose.
 static Value peelBufferView(Value handle,
@@ -476,7 +476,7 @@ static Value peelBufferView(Value handle,
 // use `!hc.undef`, consistent with the rest of the pipeline's progressive
 // typing.
 //
-// `Pow` is the structural-only entry — the front pass emits the carrier
+// `Pow` is the structural-only entry -- the front pass emits the carrier
 // `hc.pow` and `-hc-lower-pow` does the unfold + diagnostic; no shape
 // checking happens here so the diagnostic surface is single-sourced.
 //===----------------------------------------------------------------------===//
@@ -493,7 +493,7 @@ static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
   // ODS summary is "integer/float division (Python `//` for ints)": int
   // operands floor, float operands do true division. That collapses
   // Python's `/`-on-ints (true division returning float) into `//`-style
-  // floor — an intentional compromise pre-inference. If a later pass
+  // floor -- an intentional compromise pre-inference. If a later pass
   // wants strict Python `/` semantics it needs a dedicated truediv op;
   // only this branch has to change.
   if (kind == "FloorDiv" || kind == "Div")
@@ -661,11 +661,11 @@ static void appendShapeBoundSymbols(MLIRContext *ctx, ShapeAttr shape,
 // Free symbols inside a `#hc.layout<...>` payload that are *not*
 // declared as layout-internal placeholders (`shape_syms`, `index_syms`,
 // `params` keys) need to join the kernel's `bound_symbols` so the host
-// wrapper / scope binder knows to materialize them at launch — for the
+// wrapper / scope binder knows to materialize them at launch -- for the
 // default fully-strided buffer layout that's exactly the per-axis
 // `$STRIDE_<N>_<argname>` symbols emitted in `parameterTypeFromDict`.
-// Collect the names that bind locally to a layout — `shape_syms`,
-// `index_syms`, and the `params` keys — into `layoutLocals`. These
+// Collect the names that bind locally to a layout -- `shape_syms`,
+// `index_syms`, and the `params` keys -- into `layoutLocals`. These
 // don't get promoted to kernel-level bound symbols.
 static void collectLayoutLocalSymbolNames(LayoutAttr layout,
                                           llvm::StringSet<> &layoutLocals) {
@@ -909,9 +909,9 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
 // Default fully-strided np/torch-style layout for a buffer kernel
 // argument. Names per-axis stride symbols `$STRIDE_<axis>_<argname>`
 // so the host wrapper / scope binder can match them against the
-// runtime descriptor — `_mlir_ciface_hc_get_stride` is the eventual
+// runtime descriptor -- `_mlir_ciface_hc_get_stride` is the eventual
 // binding point. The structural form keeps `shape_syms` / `index_syms`
-// as opaque placeholders (`d<i>` / `i<i>`) — the bound-name contract
+// as opaque placeholders (`d<i>` / `i<i>`) -- the bound-name contract
 // documented on `HC_LayoutAttr` only requires them to be unique and
 // disjoint from `params` keys; the layout-flatten pass substitutes
 // their identity at the use site.
@@ -923,7 +923,7 @@ static LogicalResult validateLaunchContextParameter(Operation *sourceOp,
 //
 // Built structurally via `composeExpr*` so the resulting handles
 // hash-cons against any other producer that builds the same expression
-// — never via `parseExpr` / string templating per the symbolic-engine
+// -- never via `parseExpr` / string templating per the symbolic-engine
 // rules in `AGENTS.md`.
 // Build the parallel `dN` (shape) and `iN` (index) symbol arrays for
 // the default strided layout.
@@ -1033,9 +1033,9 @@ buildDefaultStridedBufferLayout(Operation *sourceOp, StringRef argName,
 // `DictionaryAttr` keyed on the param name with `ExprAttr` values,
 // `ExprAttr` for `storage_size` / `offset`); see the resolver-side
 // contract documented at `hc/_resolve.py::_index_map_ref`. No text is
-// parsed here — assemble straight from the typed payload.
+// parsed here -- assemble straight from the typed payload.
 // Validate that every entry in `names` is a `StringAttr`. A bad entry
-// is a frontend / resolver bug — surface with a localized diagnostic
+// is a frontend / resolver bug -- surface with a localized diagnostic
 // pointing at the offending index.
 static LogicalResult validateLayoutSymNameArray(Operation *sourceOp,
                                                 ArrayAttr names,
@@ -1088,7 +1088,7 @@ static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
 
   // Params is optional only in the "I have no derived params" sense
   // (default-strided builds a `DictionaryAttr::get(ctx, {})` of its own).
-  // The Python resolver always emits the key — even empty — so a missing
+  // The Python resolver always emits the key -- even empty -- so a missing
   // entry here is a driver bug, not a parameterless layout.
   DictionaryAttr paramsAttr = ref.getAs<DictionaryAttr>("params");
   if (!paramsAttr)
@@ -1105,7 +1105,7 @@ static FailureOr<LayoutAttr> layoutAttrFromRef(Operation *sourceOp,
 // Resolve the layout descriptor SSA argument fed to a `layout_op` call
 // (currently `as_layout(value, descriptor)`). The descriptor must be
 // produced by an `hc_front.name` whose `ref` was classified as
-// `kind = "layout"`; anything else is a frontend bug — diagnose at the
+// `kind = "layout"`; anything else is a frontend bug -- diagnose at the
 // call site so users get the offending op rather than a downstream
 // "missing attribute" complaint.
 static FailureOr<LayoutAttr>
@@ -1153,7 +1153,7 @@ static hc_front::KeywordOp findKeywordArg(hc_front::CallOp call,
 
 // Consume the optional `layout=` keyword on a tensor-creation call,
 // resolving the captured `IndexMap` descriptor to a `LayoutAttr`. Null
-// `LayoutAttr` on success means "no `layout=` kwarg present" — the
+// `LayoutAttr` on success means "no `layout=` kwarg present" -- the
 // caller leaves the result untouched. `failure()` is a real error
 // (malformed layout ref, wrong-kind descriptor, etc.) that has already
 // emitted a diagnostic.
@@ -1196,7 +1196,7 @@ buildLaunchContextParameterType(Operation *sourceOp, DictionaryAttr param,
          << launchContext << "'";
 }
 
-// Resolve the layout attribute for a buffer parameter — either the
+// Resolve the layout attribute for a buffer parameter -- either the
 // frontend-captured `IndexMap` ref dict or the default fully-strided
 // layout namespaced by the arg name.
 static FailureOr<LayoutAttr> resolveBufferParameterLayout(Operation *sourceOp,
@@ -1540,18 +1540,18 @@ private:
 
   // Resolves a classified `hc_front.name`. Classifier kinds that name a
   // Python-level binding (`param`/`local`/`iv`) lower to an
-  // `hc.name_load "<ident>"` — a placeholder the promotion pass replaces
+  // `hc.name_load "<ident>"` -- a placeholder the promotion pass replaces
   // with a direct SSA use. Constant and symbol kinds materialize a real
   // `hc` producer eagerly.
   // Returns:
-  //   * `success(Value)`  — a usable hc value for the name;
-  //   * `success(Value())` — the name is consumed at the call site and
+  //   * `success(Value)`  -- a usable hc value for the name;
+  //   * `success(Value())` -- the name is consumed at the call site and
   //                          intentionally has no SSA counterpart (e.g.
   //                          callee/intrinsic/inline/builtin/module refs);
-  //   * `failure()`        — a diagnostic was emitted.
+  //   * `failure()`        -- a diagnostic was emitted.
   FailureOr<Value> lowerName(hc_front::NameOp op);
 
-  // Lowers `hc_front.attr`. Most attrs produce no standalone SSA value —
+  // Lowers `hc_front.attr`. Most attrs produce no standalone SSA value --
   // they are consumed by the parent call/subscript via the attr op's
   // `$name`. The one exception is `ref.kind = "numpy_dtype_type"`: these
   // materialize to an `hc.const` wrapping the dtype's `TypeAttr`, reused
@@ -1697,7 +1697,7 @@ private:
   // parameter in `params`. Must be called after the enclosing op has
   // taken ownership of `entry`, since `hc.assign` needs an insertion
   // point inside the live region. `params` is assumed pre-validated by
-  // `materializeParameters` — this helper does not re-check the dict.
+  // `materializeParameters` -- this helper does not re-check the dict.
   // Positions the builder itself (caller is expected to hold an
   // `OpBuilder::InsertionGuard` if the builder state matters past this
   // call).
@@ -1815,7 +1815,7 @@ private:
 //
 // Block ownership: on `materializeParameters` failure we delete
 // `entry` here; on success `build` is contractually attach-then-erase
-// — attaches `entry` to the hc op first, so any later failure can
+// -- attaches `entry` to the hc op first, so any later failure can
 // `hcOp->erase()` and take the block with it.
 LogicalResult Lowerer::runCallableBody(Operation *frontOp, ArrayAttr runParams,
                                        bool returnsValue, bool ensureReturn,
@@ -1880,8 +1880,8 @@ LogicalResult Lowerer::populateKernelMetadata(HCKernelOp hcKernel,
   // for the specialization point. Carry it over so the downstream
   // `hc-specialize-literals` pass can fold them into the IR, and
   // augment it with the launch-geo `$`-prefixed bindings the
-  // launcher can't see — `group_shape` / `work_shape` literal dims,
-  // `subgroup_size`, static `group_size` — so symbolic launch-context
+  // launcher can't see -- `group_shape` / `work_shape` literal dims,
+  // `subgroup_size`, static `group_size` -- so symbolic launch-context
   // syms get folded the same way as user-named ones.
   DictionaryAttr launcherBindings =
       frontOp->getAttrOfType<DictionaryAttr>("literal_bindings");
@@ -2208,8 +2208,8 @@ LogicalResult Lowerer::lowerRegion(Region &src) {
   // Every `hc_front` region-carrying op declares its regions as
   // `SizedRegion<1>` (see HCFrontOps.td), so multi-block input is rejected
   // by the dialect verifier before this pass runs. We still keep a runtime
-  // guard (not just `assert`) so a pipeline that bypasses verification —
-  // fuzzing, hand-built IR, a buggy upstream transform — fails loud
+  // guard (not just `assert`) so a pipeline that bypasses verification --
+  // fuzzing, hand-built IR, a buggy upstream transform -- fails loud
   // instead of silently lowering only `front()` under NDEBUG.
   if (!src.hasOneBlock()) {
     Operation *parent = src.getParentOp();
@@ -2346,7 +2346,7 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
 
 // Returns the lowered hc value for an hc_front SSA operand. Null is a
 // deliberate sentinel meaning "no SSA counterpart" (keywords, callee-like
-// names, attr chains) — new consumers must either treat it as
+// names, attr chains) -- new consumers must either treat it as
 // consumed-by-parent or null-check and diagnose; binding it into a scope or
 // handing it to an hc op builder silently produces bad IR.
 FailureOr<Value> Lowerer::lowerValueOperand(Value v, Operation *consumer,
@@ -2421,7 +2421,7 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
   if (kind == "param" || kind == "local" || kind == "iv") {
     // `hc.name_load` is a placeholder the promotion pass folds into the
     // reaching SSA definition. An unresolved read (no reaching
-    // `hc.assign`) surfaces a diagnostic there, not here — this pass
+    // `hc.assign`) surfaces a diagnostic there, not here -- this pass
     // does not know what names will be bound by siblings / ancestors
     // yet to be walked.
     auto name = StringAttr::get(op.getContext(), ident);
@@ -2444,14 +2444,14 @@ FailureOr<Value> Lowerer::lowerName(hc_front::NameOp op) {
     Type idxTy = IdxType::get(op.getContext(), expr);
     return HCSymbolOp::create(builder, op.getLoc(), idxTy).getResult();
   }
-  // callee / intrinsic / inline / builtin / module / numpy_* — the call
+  // callee / intrinsic / inline / builtin / module / numpy_* -- the call
   // dispatcher and subscript pattern read these off the original op.
   // Success with a null Value is the intentional "no SSA result" sentinel.
   return Value();
 }
 
 // Closest ancestor (inclusive of self's parent chain) carrying a
-// front-pass `parameters` attribute — typically the enclosing kernel
+// front-pass `parameters` attribute -- typically the enclosing kernel
 // or helper-function op. Lets the alias dispatch below stay agnostic
 // to which front-pass region kind owns the parameters list.
 static Operation *findFrontParamsHost(Operation *startOp) {
@@ -2482,9 +2482,9 @@ static DictionaryAttr findFrontParamDict(Operation *paramHost, StringRef name) {
 // Walks the enclosing front-pass region(s) for a `parameters` dict
 // and decides whether `nameOp` binds to a launch-context entry. The
 // lowered base value's MLIR type is the erased `!hc.undef` placeholder
-// at conversion time — the kernel block argument only acquires its
+// at conversion time -- the kernel block argument only acquires its
 // launch-context (`!hc.group` / `!hc.workitem` / `!hc.subgroup`) type
-// after `-hc-promote-names` — so the front-pass `parameters` attribute
+// after `-hc-promote-names` -- so the front-pass `parameters` attribute
 // is the only authoritative source available here.
 //
 // Used to disambiguate the Python-side `shape` alias (which on
@@ -2559,10 +2559,10 @@ FailureOr<Value> Lowerer::lowerAttr(hc_front::AttrOp op) {
             .getResult()};
   }
   // Strict (name-only) classification handles the canonical method
-  // spellings — `group_id`, `local_id`, `work_offset`, `group_shape`,
+  // spellings -- `group_id`, `local_id`, `work_offset`, `group_shape`,
   // etc. The Python-side `CurrentGroup.shape` alias collides by name
   // with buffer / tensor `.shape`, so disambiguate by walking the
-  // front-pass `parameters` dict on the enclosing kernel — that's the
+  // front-pass `parameters` dict on the enclosing kernel -- that's the
   // earliest checkpoint where the base's launch-context-ness is
   // available (lowered base types are still the erased placeholder).
   std::optional<LaunchGeoMethodInfo> info =
@@ -2824,7 +2824,7 @@ FailureOr<hc_front::CallOp> Lowerer::lowerForIterRegion(hc_front::ForOp op,
   if (iter.empty() || iter.front().empty())
     return op.emitOpError("for-iter region is empty");
   // `hc_front.for` declares all three sub-regions as `SizedRegion<1>`, so
-  // multi-block bodies cannot reach this pass — but keep a runtime check
+  // multi-block bodies cannot reach this pass -- but keep a runtime check
   // so a verifier-bypass doesn't silently walk only the first block under
   // NDEBUG.
   if (!iter.hasOneBlock())
@@ -2895,7 +2895,7 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
   if (!ivTarget)
     return op.emitOpError("for-target must be a single target_name");
 
-  // Build the `hc.for_range` with no iter_args — loop-carried value
+  // Build the `hc.for_range` with no iter_args -- loop-carried value
   // analysis is a later pass. The `hc.assign "<iv>", %iv` emitted as
   // the first body op is the IV self-bind placeholder documented on
   // `hc.assign` in HCOps.td; promotion matches and folds it into
@@ -2926,7 +2926,7 @@ LogicalResult Lowerer::lowerFor(hc_front::ForOp op) {
 //
 // Walks nested regions inside the same lexical scope (e.g.
 // `hc_front.for` / `hc_front.workitem_region`), but stops at any
-// nested `hc_front.inlined_region` — that one is its own name
+// nested `hc_front.inlined_region` -- that one is its own name
 // boundary and gets rewritten with its own prefix when it in turn is
 // flattened. Touching a nested inlined body here would double-prefix
 // its params and break the `parameters` -> body mapping.
@@ -2964,7 +2964,7 @@ static void alphaRenameInlinedBody(Region &body, StringRef prefix) {
           target.setName((prefix + target.getName()).str());
           continue;
         }
-        // Respect nested inline name boundaries — their bodies get
+        // Respect nested inline name boundaries -- their bodies get
         // their own per-site prefix when flattened.
         if (isa<hc_front::InlinedRegionOp>(&op))
           continue;
@@ -3483,7 +3483,7 @@ bindIntrinsicOperands(hc_front::CallOp op, StringRef callee,
     op.emitOpError("intrinsic '@")
         << callee
         << "' call has keyword arguments but callee declares no "
-           "`parameters` — the hc_front driver must stamp them";
+           "`parameters` -- the hc_front driver must stamp them";
     return failure();
   }
   ArrayAttr params = sets.declaredParameters;
@@ -3578,7 +3578,7 @@ FailureOr<Value> Lowerer::lowerNamedCall(hc_front::CallOp op, RefInfo ref,
   return lowerIntrinsicCall(op, symRef, callee, args);
 }
 
-// Diagnose surviving `inline`/`local` calls — both should have been
+// Diagnose surviving `inline`/`local` calls -- both should have been
 // consumed by upstream passes (`-hc-front-inline` and
 // `-hc-front-fold-region-defs` respectively). Surfacing them here as a
 // loud, located error catches pipeline misordering.
@@ -3594,7 +3594,7 @@ static FailureOr<Value> diagnoseUnconsumedFrontCallKind(hc_front::CallOp op,
     // `name{local}+call(+return)` trail Python emits for a
     // `@group.workitems def inner(): ...; inner()` immediate-call
     // shape. A surviving call to a local identifier means the folder
-    // didn't run — the region op itself is already the lowering, so
+    // didn't run -- the region op itself is already the lowering, so
     // there is no callable for us to dispatch against.
     op.emitOpError(
         "`ref.kind = \"local\"` call survived to conversion; run "
@@ -3626,7 +3626,7 @@ FailureOr<Value> Lowerer::lowerCall(hc_front::CallOp op) {
 
   // Layout primitives (today: `as_layout(value, descriptor)`) want their
   // descriptor argument inspected as a captured `hc_front.name` rather
-  // than lowered to an SSA value — the descriptor maps to a null entry
+  // than lowered to an SSA value -- the descriptor maps to a null entry
   // in `valueMap`, and `collectCallArgs` would reject it as "did not
   // lower". Dispatch early.
   if (kind == "layout_op")
@@ -3670,7 +3670,7 @@ static bool isReduceMethod(StringRef method) {
 }
 
 // `np.<func>(...)` calls the front-to-hc rewrite forwards to a
-// `hc.builtin_call "numpy.<func>"` carrier. Dispatch is name-based —
+// `hc.builtin_call "numpy.<func>"` carrier. Dispatch is name-based --
 // every entry here is an opaque-from-the-dialect's-POV NumPy ufunc that
 // downstream lowering must recognise. We don't restrict to unary because
 // `np.maximum(a, b)` etc. share the same shape; arity is enforced
@@ -3709,7 +3709,7 @@ FailureOr<Value> Lowerer::lowerDslMethodCall(hc_front::CallOp call,
     return failure();
   CallArgs &args = *argsOr;
 
-  // Module-namespace attr bases — numpy as a module isn't a lowerable
+  // Module-namespace attr bases -- numpy as a module isn't a lowerable
   // value, so these branches dispatch without lowering `attr.getBase()`
   // (which would null-fail). Every other attr base goes through the
   // value-base bucket dispatch.
@@ -3751,7 +3751,7 @@ FailureOr<Value> Lowerer::lowerValueBaseMethodCall(hc_front::CallOp call,
 // Layout descriptor sentinel: ``as_layout(value, None)`` is the
 // user-marked boundary that drops the value's layout (the operand's
 // wave-wide / broadcast addressing convenience stops applying past
-// this point — the result is a standalone bare carrier whose
+// this point -- the result is a standalone bare carrier whose
 // effective span is the dim product). Recognize the descriptor here
 // by chasing back to the ``hc_front.constant`` producer; the
 // emitter stamps ``python_kind = "NoneType"`` on the constant when
@@ -3765,13 +3765,13 @@ static bool isAsLayoutNoneSentinel(Value descriptor) {
 }
 
 // Validate the call shape `as_layout(value, descriptor, *, shape=?)`
-// — exactly two positionals, optional `shape=` kwarg, nothing else.
+// -- exactly two positionals, optional `shape=` kwarg, nothing else.
 // Tensor / vector callers (the verifier rejects `shape=` on those
 // flavors) must leave `shape=` absent; pointer-rooted (`!hc.buffer`)
 // callers use it to declare the layout's reinterpreted extent.
 LogicalResult Lowerer::validateAsLayoutCallShape(hc_front::CallOp op,
                                                  ValueRange args) {
-  // Drop kwargs before counting positionals — the same call may carry
+  // Drop kwargs before counting positionals -- the same call may carry
   // a `shape=` kwarg, and `args.size()` includes both kinds.
   unsigned positional = 0;
   bool seenShape = false;
@@ -3867,8 +3867,8 @@ FailureOr<Value> Lowerer::lowerLayoutOpCall(hc_front::CallOp op,
 FailureOr<Value> Lowerer::lowerNumpyDtypeCall(hc_front::CallOp call,
                                               const RefInfo &ref,
                                               const CallArgs &args) {
-  // `np.<dtype>(lit)` — Python's value-constructor form for numpy
-  // scalar types — shows up as a call whose callee is an attr
+  // `np.<dtype>(lit)` -- Python's value-constructor form for numpy
+  // scalar types -- shows up as a call whose callee is an attr
   // classified as `numpy_dtype_type`. The attr's `ref.dtype` names
   // the destination type; the single positional literal supplies the
   // payload. Emit a fresh `hc.const` carrying a typed `FloatAttr` /
@@ -3925,7 +3925,7 @@ FailureOr<Value> Lowerer::lowerNumpyBuiltinCall(hc_front::CallOp call,
     }
     operands.push_back(operand);
   }
-  // `numpy.<method>` — dotted so the lowering can dispatch on the full
+  // `numpy.<method>` -- dotted so the lowering can dispatch on the full
   // path. New library namespaces (`math.*`, ...) compose the same way.
   std::string qualified = ("numpy." + method).str();
   StringAttr name = builder.getStringAttr(qualified);
@@ -3965,7 +3965,7 @@ static FailureOr<Value> lowerWithInactiveMethod(OpBuilder &builder, Type undef,
 }
 
 // Lower `base.astype(target)`. The target must resolve to a TypeAttr
-// — either an `hc.const` carrying it directly, or a plain `TypeAttr`
+// -- either an `hc.const` carrying it directly, or a plain `TypeAttr`
 // stashed on the source name op.
 static FailureOr<Value> lowerAsTypeMethod(OpBuilder &builder, Type undef,
                                           hc_front::CallOp call, Value base,
@@ -4005,8 +4005,8 @@ static std::optional<ReduceKind> reduceMethodKind(StringRef method) {
 // fail. Reductions live at the DSL boundary where `axis=N` arrives
 // as an `hc.const` over an `IntegerAttr` (the same shape the
 // classifier already emits for `np.<dtype>` literals, buffer-dim
-// indices, etc.). Anything else — a captured variable, a `range`
-// iteration variable, a `.shape[k]` query — leaks an SSA value that
+// indices, etc.). Anything else -- a captured variable, a `range`
+// iteration variable, a `.shape[k]` query -- leaks an SSA value that
 // won't fold here, and the dialect would reject the resulting
 // non-attr axis anyway.
 static FailureOr<int64_t> tryGetLiteralInt(Value v) {
@@ -4063,7 +4063,7 @@ static FailureOr<Value> pickReduceAxisOperand(hc_front::CallOp call,
 }
 
 // Decode the picked axis SSA value into a non-negative integer. Tuple
-// and `None` axis values get bespoke diagnostics — both would also
+// and `None` axis values get bespoke diagnostics -- both would also
 // fail `tryGetLiteralInt`, but the specific messages tell the user
 // which surface form they wrote.
 static FailureOr<uint64_t> resolveReduceAxis(hc_front::CallOp call,
@@ -4129,7 +4129,7 @@ static LogicalResult rejectExtraReduceKwargs(hc_front::CallOp call,
 // matches the numpy / simulator signature and is the only way to write a
 // reduction at the surface today. Keepdims defaults to false. Tuple axis
 // and `axis=None` are diagnosed via `resolveReduceAxis` rather than
-// silently folded — a full-tensor reduction needs a different lowering,
+// silently folded -- a full-tensor reduction needs a different lowering,
 // and the simulator doesn't accept a tuple form either. `prod` parses as
 // a reduction method so the dispatcher routes it here, but the dialect
 // doesn't carry the kind yet; reject it explicitly instead of crashing
@@ -4176,7 +4176,7 @@ FailureOr<Value> Lowerer::lowerUnaryBaseMethod(hc_front::CallOp call,
   // launch-geo fast path.
   // All unary-base DSL methods share the "base did not lower" guard; a
   // classification gap must not let us ship an hc op built on a null
-  // operand — the later verifier error would be harder to attribute.
+  // operand -- the later verifier error would be harder to attribute.
   if (!base) {
     call.emitOpError(method) << ": base did not lower";
     return failure();
@@ -4282,7 +4282,7 @@ FailureOr<Value> Lowerer::lowerMemLoad(hc_front::CallOp call, StringRef method,
   return op->getResult(0);
 }
 
-// `store` is the one mem op without a shaped result — reinterpreting its
+// `store` is the one mem op without a shaped result -- reinterpreting its
 // (absent) output via `layout=` is meaningless, so diagnose at the call
 // site instead of silently dropping the kwarg.
 FailureOr<Value> Lowerer::lowerMemStore(hc_front::CallOp call,
@@ -4459,7 +4459,7 @@ static void noteAttrSubscriptLaunchGeoRank(
 
 // Walks every use of `result` and folds the structural rank of each
 // subscript index. Returns `nullopt` when any use isn't a single-index
-// constant subscript — i.e. the tuple escapes — so the caller leaves the
+// constant subscript -- i.e. the tuple escapes -- so the caller leaves the
 // conservative cap-sized fallback in place.
 static std::optional<unsigned> allSubscriptUsesRank(Value result) {
   unsigned rank = 0;
@@ -4481,8 +4481,8 @@ static std::optional<unsigned> allSubscriptUsesRank(Value result) {
 // call result is a structural-constant subscript. Any escape (passing the
 // tuple by value, dynamic index, etc.) keeps the conservative cap-sized
 // fallback intact. The rank is recorded against `attr.getBase()` (the
-// launch context SSA value) — the same key used by the property-style
-// `noteAttrSubscriptLaunchGeoRank` — so the launch-geo op `lowerAttr`
+// launch context SSA value) -- the same key used by the property-style
+// `noteAttrSubscriptLaunchGeoRank` -- so the launch-geo op `lowerAttr`
 // emits sees the merged rank regardless of whether the user wrote the
 // property or call form.
 static void noteCallSubscriptLaunchGeoRank(
@@ -4760,7 +4760,7 @@ Lowerer::tryLowerLaunchGeoAttrSubscript(hc_front::SubscriptOp op,
     return Value();
   std::optional<LaunchGeoMethodInfo> methodInfo =
       classifyLaunchGeoMethod(attr.getName());
-  // `group.shape[N]` etc. — same alias dispatch as `lowerAttr` uses
+  // `group.shape[N]` etc. -- same alias dispatch as `lowerAttr` uses
   // for the bare attr; see `isLaunchContextFrontParam` for why we
   // walk the front-pass `parameters` dict rather than inspecting the
   // lowered base type.
@@ -4796,8 +4796,8 @@ FailureOr<Value> Lowerer::tryLowerAttrSubscript(hc_front::SubscriptOp op,
   IntegerAttr ax = indexConstantAxisAttr(idxVal);
   if (attr.getName() == "shape") {
     // `x.shape[N]` lowers two different ways depending on whether the
-    // base is a buffer / tensor / vector (→ `hc.buffer_dim`) or a
-    // launch-context handle (→ `hc.getitem` against the cached
+    // base is a buffer / tensor / vector (-> `hc.buffer_dim`) or a
+    // launch-context handle (-> `hc.getitem` against the cached
     // `hc.group_shape` tuple). Disambiguate using the front-pass
     // parameter binding; the lowered base's MLIR type is still the
     // erased `!hc.undef` placeholder at this point.
@@ -5004,7 +5004,7 @@ struct ConvertHCFrontToHCPass
   // When the module declares exactly one `hc_front.kernel`, its launch
   // metadata is the default for any helper that doesn't carry its own
   // (intrinsics, func helpers compiled in the same module). With more
-  // than one kernel there's no unique default — pass back an empty
+  // than one kernel there's no unique default -- pass back an empty
   // attrs bundle.
   static LaunchMetadataAttrs
   pickDefaultLaunchMetadata(ArrayRef<Operation *> frontOps) {
@@ -5061,5 +5061,5 @@ struct ConvertHCFrontToHCPass
 } // namespace
 
 // `createConvertHCFrontToHCPass()` is emitted by tablegen (friend of
-// the impl::ConvertHCFrontToHCBase CRTP). See `Passes.td` — no `let
+// the impl::ConvertHCFrontToHCBase CRTP). See `Passes.td` -- no `let
 // constructor`, so the generated factory is the only one.

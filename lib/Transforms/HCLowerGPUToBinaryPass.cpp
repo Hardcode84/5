@@ -4,7 +4,7 @@
 //
 // Implements `-hc-lower-gpu-to-binary`. Compile each `gpu.module` to
 // an HSACO blob, attach as a sibling `gpu.binary`, erase the source.
-// Uses our pinned `ld.lld` — no ROCm-install fallback.
+// Uses our pinned `ld.lld` -- no ROCm-install fallback.
 
 #include "hc/Transforms/Passes.h"
 
@@ -65,7 +65,7 @@ public:
 private:
   LogicalResult lowerOne(gpu::GPUModuleOp module);
 
-  // Search order: option → `HC_LLD` → `$PATH`. ROCM_PATH excluded —
+  // Search order: option -> `HC_LLD` -> `$PATH`. ROCM_PATH excluded --
   // consumers should fail loudly, not silently pick up a host install.
   std::string resolveLldPath(gpu::GPUModuleOp module);
 
@@ -99,13 +99,13 @@ private:
   emitISAFromLLVMModule(gpu::GPUModuleOp module, llvm::Module &llvmModule,
                         llvm::TargetMachine &targetMachine);
 
-  // ISA → ELF (AMDGPU MC) → HSACO (`ld.lld`); dumps `2b-object.o` and
+  // ISA -> ELF (AMDGPU MC) -> HSACO (`ld.lld`); dumps `2b-object.o` and
   // `3-binary.hsaco`.
   FailureOr<SmallVector<char, 0>>
   assembleAndLinkBinary(gpu::GPUModuleOp module, llvm::SmallString<0> &isa,
                         llvm::TargetMachine &targetMachine);
 
-  // Target attr rides along — launch-time can still introspect the chip.
+  // Target attr rides along -- launch-time can still introspect the chip.
   void attachBinaryAndEraseModule(gpu::GPUModuleOp module, Attribute targetAttr,
                                   ArrayRef<char> binary);
 };
@@ -145,7 +145,7 @@ LogicalResult HCLowerGPUToBinaryPass::dumpLLVMModule(gpu::GPUModuleOp module,
 }
 
 std::string HCLowerGPUToBinaryPass::resolveLldPath(gpu::GPUModuleOp module) {
-  // Order: `--lld-path` / `HC_LLD` / `$PATH`. Existence-check first —
+  // Order: `--lld-path` / `HC_LLD` / `$PATH`. Existence-check first --
   // `ExecuteAndWait` swallows missing-binary into "lld invocation
   // failed". Explicit candidates fail loud on a miss; PATH fallback
   // only fires when neither was set.
@@ -340,7 +340,7 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
   std::unique_ptr<llvm::TargetMachine> targetMachine =
       std::move(*targetMachineOr);
 
-  // Pre-opt dump first — survives an optimizer crash.
+  // Pre-opt dump first -- survives an optimizer crash.
   if (failed(dumpLLVMModule(module, "0-pre-opt.ll", *llvmModule)))
     return failure();
   if (failed(optimizeLLVMModule(module, *llvmModule, *targetMachine)))
@@ -362,7 +362,7 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
 
 void HCLowerGPUToBinaryPass::runOnOperation() {
   ModuleOp root = getOperation();
-  // Materialize first — `lowerOne` erases as it walks.
+  // Materialize first -- `lowerOne` erases as it walks.
   SmallVector<gpu::GPUModuleOp> modules(root.getOps<gpu::GPUModuleOp>());
   for (gpu::GPUModuleOp module : modules) {
     if (failed(lowerOne(module))) {

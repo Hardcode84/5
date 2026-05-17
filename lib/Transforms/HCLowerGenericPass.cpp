@@ -52,7 +52,7 @@ constexpr int kUnrollBudget = 32;
 constexpr int kAxisOrderCap = 4;
 static constexpr std::array<int, 6> kFactorChoices = {1, 2, 4, 8, 16, 32};
 
-// `boundExpr` absent on opaque `index` bound → divisibility probe
+// `boundExpr` absent on opaque `index` bound -> divisibility probe
 // conservatively rejects factor > 1.
 struct IterAxis {
   size_t origIdx;
@@ -66,7 +66,7 @@ using Partition = SmallVector<int, 4>;
 using AxisOrder = SmallVector<size_t, 4>;
 
 // `ixs_check` returns UNKNOWN on already-folded sentinels; peek tag
-// first, fall through to interval check. Null → UNKNOWN.
+// first, fall through to interval check. Null -> UNKNOWN.
 static ixs_check_result resolveProbe(ixs_session *session, ixs_node *cmp) {
   if (!cmp)
     return IXS_CHECK_UNKNOWN;
@@ -80,7 +80,7 @@ static ixs_check_result resolveProbe(ixs_session *session, ixs_node *cmp) {
   }
 }
 
-// `factor | bound`? Opaque bound → false (conservative).
+// `factor | bound`? Opaque bound -> false (conservative).
 static bool probeDivisible(sym::Store &store,
                            const std::optional<sym::ExprHandle> &boundExpr,
                            int factor) {
@@ -103,7 +103,7 @@ static bool probeDivisible(sym::Store &store,
   return resolveProbe(session.raw(), cmp) == IXS_CHECK_TRUE;
 }
 
-// `b - a == 1` symbolically. UNKNOWN → false: uncertain stays scalar.
+// `b - a == 1` symbolically. UNKNOWN -> false: uncertain stays scalar.
 static bool probeContig(sym::Store &store, sym::ExprHandle a,
                         sym::ExprHandle b) {
   sym::Session session(store);
@@ -189,7 +189,7 @@ static sym::ExprHandle substituteIterDeltas(sym::Store &store,
   return sym::ExprHandle(out);
 }
 
-// Lane k → per-axis deltas. Rightmost in `order` varies fastest.
+// Lane k -> per-axis deltas. Rightmost in `order` varies fastest.
 // Output indexed by declaration position, not `order`.
 static SmallVector<int, 4> decomposeLane(int k, ArrayRef<size_t> order,
                                          ArrayRef<int> p) {
@@ -241,7 +241,7 @@ static SmallVector<AxisOrder> enumerateAxisOrders(int n) {
   return out;
 }
 
-// All partitions p with `prod(p) <= budget`, p_a ∈ kFactorChoices.
+// All partitions p with `prod(p) <= budget`, p_a in kFactorChoices.
 // Trivial `(1,...,1)` included.
 static SmallVector<Partition> enumeratePartitions(int n, int budget) {
   SmallVector<Partition> out;
@@ -266,7 +266,7 @@ static SmallVector<Partition> enumeratePartitions(int n, int budget) {
   return out;
 }
 
-// `boundExpr` from `!hc.idx<expr>` SSA type; plain `index` → absent.
+// `boundExpr` from `!hc.idx<expr>` SSA type; plain `index` -> absent.
 static SmallVector<IterAxis> collectIterAxes(HCGenericOp op) {
   SmallVector<IterAxis> axes;
   ArrayAttr symsAttr = op.getIterSymsAttr();
@@ -408,7 +408,7 @@ selectBest(HCGenericOp op, ArrayRef<IterAxis> axes, sym::Store &store) {
   return {bestOrder, bestP};
 }
 
-// `!hc.idx<...>` → `index` via UCC; downstream reconcile folds it.
+// `!hc.idx<...>` -> `index` via UCC; downstream reconcile folds it.
 static Value castIdxToIndex(OpBuilder &builder, Location loc, Value v) {
   if (v.getType().isIndex())
     return v;
@@ -437,7 +437,7 @@ static std::optional<int64_t> getValueOutLaneCount(Type t) {
   return std::nullopt;
 }
 
-// Any non-ptr outs → forces fully-unrolled compose path.
+// Any non-ptr outs -> forces fully-unrolled compose path.
 static bool hasValueOuts(HCGenericOp op) {
   for (Value v : op.getOuts())
     if (!isa<PtrType>(v.getType()))
@@ -445,7 +445,7 @@ static bool hasValueOuts(HCGenericOp op) {
   return false;
 }
 
-// Any non-ptr ins → forces fully-unrolled gather (extract per lane);
+// Any non-ptr ins -> forces fully-unrolled gather (extract per lane);
 // partition path has no shape for value-typed ins.
 static bool hasValueIns(HCGenericOp op) {
   for (Value v : op.getIns())
@@ -568,7 +568,7 @@ static std::optional<std::string> diagnoseGenericTerminator(HCGenericOp op) {
 }
 
 // Value-typed operand offset must be iter-sym only: slot-eval
-// constant-folds per lane. Ptr operands skip — `emitOffset`
+// constant-folds per lane. Ptr operands skip -- `emitOffset`
 // resolves ambient syms.
 static std::optional<std::string>
 findAmbientSymInOffsets(ArrayAttr arr, OperandRange operands, StringRef kind,
@@ -792,7 +792,7 @@ static Value coerceMaskToI1(OpBuilder &builder, Location loc, Value mask,
 }
 
 // Plain yield: raw vals, null masks. Predicated: vals + i1 masks.
-// Predicated routes to ptr_store_pred — dodges OOB write race.
+// Predicated routes to ptr_store_pred -- dodges OOB write race.
 static LogicalResult
 cloneBodyPredicatedYield(OpBuilder &builder, HCGenericOp op,
                          HCYieldPredicatedOp pyield, ValueRange outsVals,
@@ -968,7 +968,7 @@ static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
 }
 
 // Per-lane loads for ptr-typed ins, flat `[in_idx][lane]`. Value
-// ins left empty here — only the unrolled path reaches them and
+// ins left empty here -- only the unrolled path reaches them and
 // fills via gather extracts.
 static SmallVector<SmallVector<Value>>
 emitInsLoadsLaned(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
@@ -1041,8 +1041,8 @@ static SmallVector<Value> emitOutsInitLoadsPartitioned(
 }
 
 // Outs stores at parallel-iter scope, contig-group merged. Empty
-// `flatRaw`/`flatMasks` → carry path. Non-empty + predicated slot
-// → `hc.ptr_store_pred` (skips OOB read-modify-write race).
+// `flatRaw`/`flatMasks` -> carry path. Non-empty + predicated slot
+// -> `hc.ptr_store_pred` (skips OOB read-modify-write race).
 static void emitOutsStoresPartitioned(OpBuilder &builder, HCGenericOp op,
                                       ArrayRef<IterAxis> axes,
                                       ArrayRef<size_t> order, ArrayRef<int> p,
@@ -1237,7 +1237,7 @@ static FailureOr<SmallVector<Value>> emitReductionNestPartitioned(
 }
 
 // One parallel-iter call: outs init, body or reduction nest, store.
-// Pure-parallel predicated → ptr_store_pred (OOB-safe). Reduction
+// Pure-parallel predicated -> ptr_store_pred (OOB-safe). Reduction
 // stores blended unconditionally.
 static LogicalResult lowerPartitionPerParallelBody(
     OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
@@ -1329,7 +1329,7 @@ static LogicalResult lowerWithPartition(HCGenericOp op, ArrayRef<IterAxis> axes,
 }
 
 // Element conversion must match the upstream UCC producer so
-// canonicalize folds the `ptr<wg> ↔ bare_tensor` pair.
+// canonicalize folds the `ptr<wg> <-> bare_tensor` pair.
 static Type convertBareTensorElement(Type t) {
   if (isa<PredType>(t))
     return IntegerType::get(t.getContext(), 1);
@@ -1348,7 +1348,7 @@ static PtrType workgroupPtrFor(BareTensorType bt) {
   return PtrType::get(bt.getContext(), AddrSpace::Workgroup, elem);
 }
 
-// Workgroup-staged outs inside `gpu.launch` → collective path
+// Workgroup-staged outs inside `gpu.launch` -> collective path
 // (shared tile needs cross-wave partition). Reduction iter ok:
 // per-thread scf.for over its LDS slot.
 static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> /*axes*/) {
@@ -1372,7 +1372,7 @@ static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> /*axes*/) {
   return op->getParentOfType<gpu::LaunchOp>() != nullptr;
 }
 
-// Pin every outs to workgroup ptr. bare_tensor → UCC to backing
+// Pin every outs to workgroup ptr. bare_tensor -> UCC to backing
 // ptr (folds with upstream pair at canonicalize).
 static SmallVector<Value> collectiveOutsPtrs(OpBuilder &builder, Location loc,
                                              HCGenericOp op) {
@@ -1426,7 +1426,7 @@ static SmallVector<Value> unlinearizeCollectiveCoords(OpBuilder &builder,
   return coords;
 }
 
-// Load + UCC-bridge to body arg type (e.g. `!hc.pred` ↔ `i1` LDS).
+// Load + UCC-bridge to body arg type (e.g. `!hc.pred` <-> `i1` LDS).
 static Value loadCollectiveOperandElement(OpBuilder &builder, Location loc,
                                           Value ptr, Value off,
                                           Type bodyArgTy) {
@@ -1440,7 +1440,7 @@ static Value loadCollectiveOperandElement(OpBuilder &builder, Location loc,
   return loaded;
 }
 
-// Store + symmetric UCC bridge. Non-null `mask` →
+// Store + symmetric UCC bridge. Non-null `mask` ->
 // `hc.ptr_store_pred`.
 static void storeCollectiveYielded(OpBuilder &builder, Location loc, Value ptr,
                                    Value off, Value yielded, Value mask) {
@@ -1484,7 +1484,7 @@ static void loadCollectiveOperands(OpBuilder &builder, Location loc,
 }
 
 // Body clone + outs store for one in-range chunk-thread. Predicated
-// slots → `hc.ptr_store_pred`, plain → unconditional.
+// slots -> `hc.ptr_store_pred`, plain -> unconditional.
 static LogicalResult
 emitCollectiveChunkInRange(OpBuilder &builder, Location loc, HCGenericOp op,
                            ArrayRef<Value> outsPtrs, ValueRange insVals,
@@ -1615,7 +1615,7 @@ static LogicalResult emitCollectiveChunkReductionNest(
   if (failed(finals))
     return failure();
   // Carry already folded masking via blendOrPassthrough; store
-  // unconditionally. All-false reduction mask writes init back —
+  // unconditionally. All-false reduction mask writes init back --
   // OOB race ptr_store_pred dodges in the pure-parallel path.
   for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
     Value off =
@@ -1652,7 +1652,7 @@ static LogicalResult emitCollectiveChunkBody(
 
 // Wave-strided dispatch: each thread runs `c * wgSize + lin_tid`,
 // trailing partial chunk gated by `lin < total`. Cross-generic LDS
-// sync owned by `hc-insert-workgroup-barriers` upstream — don't
+// sync owned by `hc-insert-workgroup-barriers` upstream -- don't
 // emit `gpu.barrier` here (canonicalizer won't drop duplicates).
 static LogicalResult lowerCollective(HCGenericOp op, ArrayRef<IterAxis> axes) {
   Location loc = op.getLoc();
@@ -1898,7 +1898,7 @@ static FailureOr<VectorCarrier> valueOperandVectorCarrier(HCGenericOp op,
 }
 
 // UCC `v` to `vecTy`. Same shape fast-paths. Sees only value
-// carriers — LDS-backed bare_tensor already swapped to ptr upstream.
+// carriers -- LDS-backed bare_tensor already swapped to ptr upstream.
 static Value castToVectorCarrier(OpBuilder &builder, Location loc, Value v,
                                  mlir::VectorType vecTy) {
   if (v.getType() == Type(vecTy))
@@ -2046,7 +2046,7 @@ static LogicalResult emitBodyClonesPerLane(
   return success();
 }
 
-// Ptr outs stores, contig-group merged. Predicated slot →
+// Ptr outs stores, contig-group merged. Predicated slot ->
 // `hc.ptr_store_pred` (skips OOB write).
 static void emitPtrOutsStores(OpBuilder &builder, Location loc, HCGenericOp op,
                               size_t oi, Value v, ExprAttr origOff,
@@ -2209,7 +2209,7 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
 }
 
 // Dispatch precedence: collective (workgroup-shared outs in
-// `gpu.launch`) → value-typed operands → partition (all-ptr).
+// `gpu.launch`) -> value-typed operands -> partition (all-ptr).
 // Order matters: LDS-backed bare_tensor must partition across the
 // wave even though carrier type would admit the value path.
 static LogicalResult lowerOne(HCGenericOp op) {
@@ -2235,7 +2235,7 @@ static LogicalResult lowerOne(HCGenericOp op) {
   if (failed(lowerWithPartition(op, axes, order, p)))
     return failure();
 
-  // Partition path is all-ptr-outs → no SSA results. Guard catches
+  // Partition path is all-ptr-outs -> no SSA results. Guard catches
   // future gate relaxations that would drop results silently.
   if (op.getNumResults() != 0)
     return op.emitOpError("ptr-out lowering only handles all-ptr outs "

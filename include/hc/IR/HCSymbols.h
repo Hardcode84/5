@@ -154,7 +154,7 @@ void walkSymbolNames(PredHandle value,
 mlir::FailureOr<ExprHandle> parseExprHandle(AsmParser &parser);
 mlir::FailureOr<PredHandle> parsePredHandle(AsmParser &parser);
 
-/// Render straight from the immutable hash-consed node — these don't take
+/// Render straight from the immutable hash-consed node -- these don't take
 /// `Store &` and won't reacquire the store mutex through the dialect.
 void printExprHandle(AsmPrinter &printer, ExprHandle value);
 void printPredHandle(AsmPrinter &printer, PredHandle value);

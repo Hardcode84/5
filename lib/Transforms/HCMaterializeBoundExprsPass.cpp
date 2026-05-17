@@ -102,7 +102,7 @@ static bool shouldMaterializeValue(Value value,
       value.use_empty())
     return false;
   if (auto result = dyn_cast<OpResult>(value)) {
-    // Empty-binding apply is the fixed point — don't re-sever.
+    // Empty-binding apply is the fixed point -- don't re-sever.
     Operation *owner = result.getOwner();
     if (auto idx = dyn_cast<HCIdxApplyOp>(owner))
       return !idx.getOperands().empty() || !idx.getSymbols().empty();
@@ -183,7 +183,7 @@ static void materializeValue(Value value, OpBuilder &builder) {
 }
 
 // First unbound ambient symbol in `exprAttr`; empty if all are bound.
-// First-hit only — diagnostics are per-symbol.
+// First-hit only -- diagnostics are per-symbol.
 static std::string
 firstUndeclaredAmbientSymbolName(Attribute exprAttr, ArrayAttr explicitSymbols,
                                  const BoundSymbolSet &boundSymbols) {
@@ -241,7 +241,7 @@ verifyMaterializedExprSymbols(Operation *root,
   return failure(status.wasInterrupted());
 }
 
-// Pre-collect — rewrite phase mutates IR; walk-in-place would invalidate.
+// Pre-collect -- rewrite phase mutates IR; walk-in-place would invalidate.
 static SmallVector<Value>
 collectValuesToMaterialize(Operation *root,
                            const BoundSymbolSet &boundSymbols) {

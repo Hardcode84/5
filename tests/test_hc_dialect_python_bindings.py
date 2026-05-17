@@ -96,7 +96,7 @@ def test_hc_dialect_registers_and_parses_lowered_ir() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
-    # `PassManager.parse` raises on unknown pass names → a successful
+    # `PassManager.parse` raises on unknown pass names -> a successful
     # parse proves hc-specific + upstream stock passes both registered.
     result = _run_python("""
         import json

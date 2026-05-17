@@ -76,7 +76,7 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
   PyTypeExprType::bind(hcFrontM);
 
   // `hc` submodule mirrors `hc_front`'s shape but only needs dialect
-  // registration today — the hc dialect has no Python-side type constructors
+  // registration today -- the hc dialect has no Python-side type constructors
   // we want to expose yet. The name matches the Python shim in
   // `hc_mlir/dialects/hc.py`, which re-exports everything we bind here.
   auto hcM = m.def_submodule("hc");
@@ -89,7 +89,7 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
         MlirDialectRegistry registry = mlirDialectRegistryCreate();
         mlirDialectHandleInsertDialect(hcDialect, registry);
         mlirRegisterHCTransformDialectExtension(registry);
-        // Carry the same HC→dlti preload extension that hc-opt installs.
+        // Carry the same HC->dlti preload extension that hc-opt installs.
         // The Python `Context` already calls `load_all_available_dialects()`
         // during `_site_initialize`, so dlti is in fact already loaded here;
         // wiring the extension regardless keeps the registration story
@@ -107,7 +107,7 @@ NB_MODULE(_hcFrontDialectsNanobind, m) {
   // families. Upstream stock passes (transform-interpreter, canonicalize,
   // ...) are already registered by `_mlirRegisterEverything` during
   // `_site_initialize`, so callers can freely reference them in pipeline
-  // strings without calling anything here. The CAPI side is idempotent —
+  // strings without calling anything here. The CAPI side is idempotent --
   // calling this once per context in the same process is safe.
   hcM.def("register_passes", []() { mlirRegisterHCAllPasses(); });
 }

@@ -83,7 +83,7 @@ public:
     if (loweringsModule) {
       if (failed(applyAllRecipes(root, loweringsModule, targetRef)))
         return signalPassFailure();
-      // Recipes spent — clear before downstream sees transform IR.
+      // Recipes spent -- clear before downstream sees transform IR.
       loweringsModule.erase();
     }
 

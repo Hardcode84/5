@@ -53,7 +53,7 @@ def splice_dump_passes(module: Any) -> int:
 
     Probe hangs off the result handle for `apply_registered_pass`,
     off the operand handle for `apply_patterns`/`apply_cse`/`apply_dce`.
-    Other ops (yield, nested pattern descriptors) skipped — not
+    Other ops (yield, nested pattern descriptors) skipped -- not
     inspect-worthy mid-schedule states.
 
     Returns probe count. Mutates `module` in place.

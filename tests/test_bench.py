@@ -130,7 +130,7 @@ def test_bench_result_std_matches_numpy_population() -> None:
 
 def test_bench_result_percentiles() -> None:
     result = _result_with_known_samples()
-    # Contract is numpy linear-interp default — mirror, don't pin.
+    # Contract is numpy linear-interp default -- mirror, don't pin.
     expected_p25 = float(np.percentile(result.samples_ns, 25))
     expected_p75 = float(np.percentile(result.samples_ns, 75))
     assert result.p25_ns == pytest.approx(expected_p25)
@@ -138,7 +138,7 @@ def test_bench_result_percentiles() -> None:
 
 
 def test_bench_result_per_launch_is_sample_divided_by_n_inner() -> None:
-    # per_launch = outer_sample / n_inner. Headline for sub-µs kernels.
+    # per_launch = outer_sample / n_inner. Headline for sub-us kernels.
     result = _result_with_known_samples()
     assert result.per_launch_median_ns == pytest.approx(
         result.median_ns / result.n_inner
@@ -147,7 +147,7 @@ def test_bench_result_per_launch_is_sample_divided_by_n_inner() -> None:
 
 
 def test_bench_result_single_sample_does_not_crash_std() -> None:
-    # m_outer=1: ddof=0 std collapses to 0 — no divide-by-zero.
+    # m_outer=1: ddof=0 std collapses to 0 -- no divide-by-zero.
     result = BenchResult(
         samples_ns=np.array([1234], dtype=np.int64),
         n_inner=5,
@@ -164,7 +164,7 @@ def test_bench_result_single_sample_does_not_crash_std() -> None:
 def test_bench_result_summary_contains_headline_fields() -> None:
     result = _result_with_known_samples()
     text = result.summary()
-    # Pin load-bearing pieces only — table layout may evolve.
+    # Pin load-bearing pieces only -- table layout may evolve.
     assert "kfn" in text
     assert "m_outer=8" in text
     assert "n_inner=10" in text
@@ -227,7 +227,7 @@ def test_compiled_kernel_bench_raises_when_pipeline_did_not_run() -> None:
 
 
 def test_compiled_kernel_bench_raises_when_compiled_without_bench_flag() -> None:
-    # `hc_ir` set + `bench_wrapper_name=None` means no `bench=True` —
+    # `hc_ir` set + `bench_wrapper_name=None` means no `bench=True` --
     # diagnostic must name it.
     handle = _make_handle(hc_ir=object(), bench_wrapper_name=None)
     with pytest.raises(RuntimeError, match=r"bench=True"):
@@ -249,7 +249,7 @@ def test_compiled_kernel_bench_validates_loop_counts() -> None:
 
 
 # End-to-end needs a kernel whose lowering emits a real
-# `hc_rt_launch_kernel` — bench pass only mints a sibling when the
+# `hc_rt_launch_kernel` -- bench pass only mints a sibling when the
 # host wrapper dispatches one. WMMA covers it.
 _BENCH_SMOKE_SCRIPT = textwrap.dedent("""
     import hc

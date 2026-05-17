@@ -70,7 +70,7 @@ static FailureOr<SmallVector<ExprAttr>> getOperandShape(Type t) {
   return dims;
 }
 
-// Per-axis (base, step). Scalar `!hc.idx<expr>` → (expr, 1); slice →
+// Per-axis (base, step). Scalar `!hc.idx<expr>` -> (expr, 1); slice ->
 // (lower or 0, step or 1).
 struct AxisIndex {
   ExprAttr base;
@@ -78,7 +78,7 @@ struct AxisIndex {
 };
 
 // Extract the bound expression off a pinned `!hc.idx<expr>`. Anything
-// else — raw `index`, untyped `!hc.idx`, non-idx — fails: there's no
+// else -- raw `index`, untyped `!hc.idx`, non-idx -- fails: there's no
 // symbolic name to bind into a `lower + step*iter` offset.
 static FailureOr<ExprAttr> extractPinnedIdxExpr(Type t) {
   auto idx = llvm::dyn_cast<IdxType>(t);
@@ -89,7 +89,7 @@ static FailureOr<ExprAttr> extractPinnedIdxExpr(Type t) {
 
 // `(base, step)` for a slice index operand. Accepts default-step
 // slices (`step = 1`) and pinned `!hc.idx<expr>` lower / step. Anything
-// else fails the whole rewrite — silently lowering would emit an
+// else fails the whole rewrite -- silently lowering would emit an
 // offset the launch-body would walk without the stride contribution.
 static FailureOr<AxisIndex> extractAxisIndexFromSlice(MLIRContext *ctx,
                                                       sym::Store &store,
@@ -140,7 +140,7 @@ extractAxisIndex(MLIRContext *ctx, sym::Store &store, Type indexType) {
 // Compose `base + step * iterSym` for the per-axis offset on the
 // memory-side operand. Folds the trivial `step == 1` to `base +
 // iterSym` so the printed offset stays the form scalar-idx callers
-// already produce — without the fold, otherwise-identical loads land
+// already produce -- without the fold, otherwise-identical loads land
 // on two distinct hash-consed sums and obscure the diff. ixsimpl
 // hash-conses, so building via the store keeps the printed offset
 // canonical and shares storage with other identical sums elsewhere in
@@ -169,7 +169,7 @@ static FailureOr<ExprAttr> composeBasePlusStepIter(MLIRContext *ctx,
   return ExprAttr::get(ctx, *sum);
 }
 
-// Build an `ArrayAttr<#hc.expr>` from a list of bare iter sym names —
+// Build an `ArrayAttr<#hc.expr>` from a list of bare iter sym names --
 // identity offsets on the value-side operand. Mirrors the helper
 // in `hc-shaped-compute-to-generic`.
 static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
@@ -187,7 +187,7 @@ static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
 // Build the per-axis offset attribute on the memory-side operand:
 // `[base_0 + step_0*i_0, base_1 + step_1*i_1, ...]`. Empty `axes`
 // (whole-tensor access, e.g. `hc.store %dst[]`) collapses to identity
-// over the iter syms — same shape, no addressing addend. Sizes must
+// over the iter syms -- same shape, no addressing addend. Sizes must
 // match post-pre-checks; this helper just assembles the array.
 static FailureOr<ArrayAttr>
 composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
@@ -215,7 +215,7 @@ composeMemoryOffsetArray(MLIRContext *ctx, sym::Store &store,
 
 // Synthesise a fresh value-typed init of the given shape. The body
 // of an all-parallel `hc.generic` never reads its outs carry, so
-// any zero-cost initialisation is fine — `hc.zeros` for bare tensors,
+// any zero-cost initialisation is fine -- `hc.zeros` for bare tensors,
 // `hc.vzeros` for bare vectors. Result type drives the choice.
 // Semantic carriers are rejected by the contract gate in
 // `hc-decompose-shaped-values` and never reach this pass.
@@ -231,7 +231,7 @@ static Value emitValueInit(OpBuilder &builder, Location loc, Type resultTy,
 }
 
 // Common shape:
-//   * iter syms `i_0`, ..., `i_{r-1}` — distinct from the source-level
+//   * iter syms `i_0`, ..., `i_{r-1}` -- distinct from the source-level
 //     symbol names that index operands carry. Conflicts with a body
 //     name `i_0` are theoretically possible but very unlikely in
 //     practice; the verifier catches it and a proper collision-free
@@ -273,7 +273,7 @@ static CommonRewriteData buildCommon(OpBuilder &builder, Location loc,
 // Pull the per-axis `(base, step)` off an op's index operands. v0
 // handles pinned `!hc.idx<expr>` scalar indices and slices whose
 // lower/step (when present) are pinned `!hc.idx<expr>`. Anything else
-// fails the whole rewrite — the launch-body lowering still owns those
+// fails the whole rewrite -- the launch-body lowering still owns those
 // shapes.
 static FailureOr<SmallVector<AxisIndex>>
 collectAxisIndices(MLIRContext *ctx, sym::Store &store, ValueRange indices) {
@@ -290,7 +290,7 @@ collectAxisIndices(MLIRContext *ctx, sym::Store &store, ValueRange indices) {
 
 // Element / pointee type the body block-arg carries for a given
 // operand. Mirrors `genericOperandElement` in `lib/IR/HCOps.cpp` for
-// the shaped + ptr cases the rewriter actually emits — kept local
+// the shaped + ptr cases the rewriter actually emits -- kept local
 // because hardcoding the shape here is fine while we only emit
 // shaped + ptr/buffer operands.
 static Type bodyArgElementType(Type t) {
@@ -302,7 +302,7 @@ static Type bodyArgElementType(Type t) {
 // ----- hc.load / hc.vload -----------------------------------------------
 
 // Compose ins_offsets[0] for a load whose source rank differs from the
-// result tile rank. The result type's layout maps `index_syms` → a
+// result tile rank. The result type's layout maps `index_syms` -> a
 // single flat offset into source storage. Substituting iter syms
 // (i_0, i_1, ...) for `index_syms` and the tile's per-axis bound
 // expressions for `shape_syms` produces an expression in iter syms
@@ -338,7 +338,7 @@ static FailureOr<ArrayAttr> composeBroadcastSourceOffset(
 
 // Divide `extent` by the slice's `step` when the step is a pinned
 // `!hc.idx<expr>` that isn't the integer literal 1. Unit steps leave
-// `extent` untouched — the hash-consed `/1` would print as a
+// `extent` untouched -- the hash-consed `/1` would print as a
 // redundant ride-along otherwise. Absent step (null `stepTy`) also
 // leaves `extent` alone since "no step" means unit by convention.
 static FailureOr<sym::ExprHandle>
@@ -459,14 +459,14 @@ struct LoadPreflight {
 // type is `!hc.buffer<elem, [D0, ...], LAY>` carrying both the
 // declared shape and the layout that maps each access position to
 // the underlying buffer's row-major flatten. The access op itself
-// stays addressing-shape-agnostic — pinned + slice indices mix on
+// stays addressing-shape-agnostic -- pinned + slice indices mix on
 // the as_layout result; the layout's `offset` formula reconstructs
 // the flat target.
 //
 // Peeling here lets the rewriter route the access through a gather
 // decomposition against the *underlying* buffer's shape, which is
 // what the per-axis offsets the post-flatten pipeline expects. The
-// alternative — leaving the `hc.as_layout` in place — would have
+// alternative -- leaving the `hc.as_layout` in place -- would have
 // `hc-flatten-with-layouts` compose the source-side layout into the
 // access offsets, but that path also assumes the access op's
 // per-axis offsets are pre-layout coords and would double-apply LAY.
@@ -531,7 +531,7 @@ static LogicalResult classifyLoadAccess(Type resultTy, ValueRange indices,
 // Compose the layout's `offset` expression with iter syms
 // substituted for `index_syms` and `tileShape` for `shape_syms`.
 // The result is the per-iter-point flat position into the slice's
-// row-major flatten — the value the per-axis decomposition splits
+// row-major flatten -- the value the per-axis decomposition splits
 // back into source coordinates.
 static FailureOr<sym::ExprHandle>
 composeLayoutFlatOffset(MLIRContext *ctx, sym::Store &store, LayoutAttr layout,
@@ -579,7 +579,7 @@ composeInnerProducts(sym::Store &store, ArrayRef<ExprAttr> extents) {
 // / inner_prod), extent)`. The last axis (`isLast=true`) skips the
 // `/inner_prod` since `inner_prod_{N-1} = 1` would print as a
 // redundant `/1`. The floor wrapper is mandatory on the non-last
-// axes — `composeExprBinary(Div)` is exact-rational; without the
+// axes -- `composeExprBinary(Div)` is exact-rational; without the
 // floor we'd carry `1/16*X` through every later use and downstream
 // ixsimpl never recovers an integer index.
 static FailureOr<ExprAttr>
@@ -674,7 +674,7 @@ static FailureOr<ArrayAttr> composeLayoutGatherSourceOffsets(
 // idx's expression directly; slice positions bind `lo + step *
 // iter_sym`, consuming `iterSyms` in order (one per slice axis,
 // matching the result tile rank). The access is expected to carry
-// exactly `iterSyms.size()` slice positions — the preflight pinned-
+// exactly `iterSyms.size()` slice positions -- the preflight pinned-
 // vs-slice classification has already enforced that.
 static FailureOr<SmallVector<ExprAttr>>
 composeLayoutBearingAccessBindings(MLIRContext *ctx, sym::Store &store,
@@ -810,7 +810,7 @@ static FailureOr<LoadPreflight> preflightLoadLikeLayoutBearing(
 // coords.
 // Pad partial indices with default full-slice axes (`base=0,
 // step=1`) so the per-axis offset composer sees one axis per tile
-// dim. Only pads when the source's rank matches the tile rank — the
+// dim. Only pads when the source's rank matches the tile rank -- the
 // rank-1 broadcast path keeps the empty-axes form for the layout-
 // driven gather to pick up. A no-op for empty or already-rank-equal
 // axis lists.
@@ -832,7 +832,7 @@ padTrailingFullSliceAxes(MLIRContext *ctx, sym::Store &store, size_t targetRank,
 
 // Slice-extents are only meaningful on the layout-driven gather path
 // (`resultLayout != null && !broadcastFromRank1`); other paths return
-// an empty list. Extraction failure on the gather path is fine —
+// an empty list. Extraction failure on the gather path is fine --
 // `composeLoadInsOffsets` falls back to the per-axis identity offsets
 // when the layout-driven gather doesn't fit the structural shape.
 static SmallVector<ExprAttr> harvestLayoutSliceExtents(MLIRContext *ctx,
@@ -856,7 +856,7 @@ preflightLoadLikePlain(MLIRContext *ctx, sym::Store &store, Value source,
   // access addresses the operand at the tile origin, which is just the
   // iter syms with no addressing addend. Non-empty lists may match
   // the tile rank exactly (the canonical fully-indexed form) or fall
-  // short of it (NumPy `X[gid[0]:]` against a rank-2 `X` — trailing
+  // short of it (NumPy `X[gid[0]:]` against a rank-2 `X` -- trailing
   // axes are implicit-full slices). Over-indexing is inconsistent IR.
   if (!indices.empty() && indices.size() > tileShape.size())
     return failure();
@@ -891,7 +891,7 @@ preflightLoadLikePlain(MLIRContext *ctx, sym::Store &store, Value source,
 // Top-level load preflight. Layout-bearing buffer source
 // (`hc.as_layout` with `shape=` operand) gets its own path because
 // the access's index list rank-matches the layout's `index_syms`,
-// not the underlying buffer's shape — running it through the plain
+// not the underlying buffer's shape -- running it through the plain
 // path's rank-parity gate would reject the mixed pinned + slice
 // ergonomic form outright.
 static FailureOr<LoadPreflight>
@@ -946,7 +946,7 @@ composeLoadInsOffsets(MLIRContext *ctx, sym::Store &store,
 }
 
 // Emit a fresh block carrying one src arg and one dst arg, terminated
-// with `hc.yield %src` — the trivial "copy element through" body the
+// with `hc.yield %src` -- the trivial "copy element through" body the
 // load rewrites all share.
 static void populateLoadBody(HCGenericOp generic, Type srcElem, Type resElem,
                              Location loc) {
@@ -1023,7 +1023,7 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 // carrier whose lane `i_k` says whether the source's per-axis slice
 // subscript `(lo_k + step_k * i_k)` stays in-bounds against the source's
 // k-th dim `D_k`. Pre-flatten the source still carries its multi-dim
-// shape, so `D_k` is the source operand's k-th symbolic dim — a sym
+// shape, so `D_k` is the source operand's k-th symbolic dim -- a sym
 // leaf for kernel-arg buffers (`"A"`, `"B"`, ...) or an integer literal
 // for static bare tensors.
 //
@@ -1042,7 +1042,7 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 //     hc.yield %p : !hc.pred
 //   }
 //
-// The pinned-pred → unpinned-pred UCC is the same bridge
+// The pinned-pred -> unpinned-pred UCC is the same bridge
 // `hc.yield_predicated`'s consumers use for body-computed masks; the
 // downstream `bindIterSymsInClone` (in `hc-lower-generic`'s value-outs
 // path) binds each iter sym to its per-lane compile-time integer on
@@ -1053,16 +1053,16 @@ static LogicalResult rewriteLoadLike(OpT op, sym::Store &store) {
 //
 // Bails (op stays for legacy lowering / diagnostics):
 //   * Non-shaped source / non-shaped result types (`!hc.undef`, raw
-//     pointers, ...) — no shape to source bounds from.
-//   * Source axis carrying `#hc.dyn` instead of `#hc.expr` — host-owned
+//     pointers, ...) -- no shape to source bounds from.
+//   * Source axis carrying `#hc.dyn` instead of `#hc.expr` -- host-owned
 //     size, no in-IR sym to bound against.
 //   * Index operand mismatch (rank, non-canonical slice with `!hc.undef`
-//     lower / step parts, scalar idx with no expression) — same shapes
+//     lower / step parts, scalar idx with no expression) -- same shapes
 //     the data-side `rewriteLoadLike` punts on.
-//   * Rank-0 mask (no slice axes) — pathological shape that should
+//   * Rank-0 mask (no slice axes) -- pathological shape that should
 //     have been folded earlier; if it ever lands, `hc-full-mask` is
 //     the right primitive.
-// Per-axis (lo, step, src-dim) carriers, slice axes only — scalar
+// Per-axis (lo, step, src-dim) carriers, slice axes only -- scalar
 // idx axes drop out of the result rank by construction so they
 // contribute no iter dimension and no bounds term.
 struct SliceAxisInfo {
@@ -1077,7 +1077,7 @@ struct SliceAxisInfo {
 // axes have `isSlice=true`). Returns failure when the resulting
 // slice-axis count doesn't equal the result tile rank, or when
 // there are no slice axes at all (rank-0 mask is a pathological
-// shape — `hc-full-mask` is the right primitive).
+// shape -- `hc-full-mask` is the right primitive).
 static FailureOr<SmallVector<SliceAxisInfo>>
 collectMaskSliceAxes(sym::Store &store, ArrayRef<AxisIndex> axes,
                      ArrayRef<bool> isSliceAxis, ArrayRef<ExprAttr> srcShape,
@@ -1127,7 +1127,7 @@ composeSliceAxisBound(sym::Store &store, StringAttr iterSym,
 // producer, so two load_masks reading the same buffer with the same
 // slice geometry emit one pred_apply each pointing at the same
 // canonical node. Empty `sliceAxes` returns failure rather than the
-// rank-0 conjunction — `hc-full-mask` is the right primitive for
+// rank-0 conjunction -- `hc-full-mask` is the right primitive for
 // that pathological shape, and an empty fold here would leave the
 // outer `composeMaskConjunctionForResult` deref-on-empty-optional.
 static FailureOr<sym::PredHandle>
@@ -1213,7 +1213,7 @@ maskConjunctionFromOffsets(sym::Store &store, ArrayAttr offsets,
 // decomposed offset is the same row-major-flatten of the layout's
 // `composeAccessOffsetExpr` that the data-side gather uses. This
 // keeps the predicate's "in-bounds" notion structurally aligned with
-// the data access — without it, the mask says "in-bounds" for tile
+// the data access -- without it, the mask says "in-bounds" for tile
 // positions whose layout-driven source coordinates actually run off
 // the slice (e.g. lanes 16..31 in a 16x16 WMMA tile under
 // `WAVE_ACC_FRAG_LAYOUT`).
@@ -1255,12 +1255,12 @@ static FailureOr<sym::PredHandle> composeLayoutBearingMaskConjunction(
 // the matching data-side load uses, so masked-in lanes line up with
 // the data path's actual addressing:
 //   * Layout-bearing buffer source (`hc.as_layout` source with
-//     `shape=` operand) — the per-position bindings compose through
+//     `shape=` operand) -- the per-position bindings compose through
 //     the source layout and decompose against the peeled underlying.
 //   * Result-layout gather (layout on the mask result type, all
-//     pinned slices) — same decomposition through the result layout
+//     pinned slices) -- same decomposition through the result layout
 //     and slice extents.
-//   * Plain per-axis bound — `lo + step*iter < srcDim`.
+//   * Plain per-axis bound -- `lo + step*iter < srcDim`.
 static FailureOr<sym::PredHandle> composeMaskConjunctionForResult(
     MLIRContext *ctx, sym::Store &store, Value source, Type resultTy,
     ValueRange indices, ArrayRef<ExprAttr> srcShape,
@@ -1290,16 +1290,16 @@ static FailureOr<sym::PredHandle> composeMaskConjunctionForResult(
 }
 
 // Bail-out checks for a `hc.load_mask` rewrite. Two flavours of source:
-//   * Layout-bearing buffer source (`hc.as_layout` with `shape=`) —
+//   * Layout-bearing buffer source (`hc.as_layout` with `shape=`) --
 //     `srcShape` is the peeled underlying's shape; indices rank-
 //     match the layout's `index_syms`, not the underlying source.
-//   * Plain shaped source — `srcShape` is the source's shape and
+//   * Plain shaped source -- `srcShape` is the source's shape and
 //     indices must rank-match.
 struct MaskPreflight {
   SmallVector<ExprAttr> srcShape;
   SmallVector<AxisIndex> axes;
   // Slice-only axes per `collectMaskSliceAxes`. Empty when the access
-  // doesn't fit the rank-matched assumption — only legal for the
+  // doesn't fit the rank-matched assumption -- only legal for the
   // layout-bearing path, which uses `axes` and the captured layout
   // instead.
   SmallVector<SliceAxisInfo> sliceAxes;
@@ -1334,7 +1334,7 @@ resolveMaskSourceShape(Value source, ValueRange indices,
 // when the index list is rank-short. Partial-index form
 // (`X[gid[0]:]` against rank-2 X): the trailing axes are implicit-
 // full slices, contributing a structurally trivial `0 + 1*iter <
-// srcDim` bound. Layout-bearing path skips padding — the layout's
+// srcDim` bound. Layout-bearing path skips padding -- the layout's
 // own `index_syms` drive that flow.
 static LogicalResult buildMaskAxes(MLIRContext *ctx, sym::Store &store,
                                    ValueRange indices, size_t srcRank,
@@ -1394,7 +1394,7 @@ static LogicalResult rewriteLoadMask(HCLoadMaskOp op, sym::Store &store) {
   if (failed(pf))
     return failure();
 
-  // Iter sym names ahead of `buildCommon` — the conjunction composer
+  // Iter sym names ahead of `buildCommon` -- the conjunction composer
   // needs them, and `buildCommon` mints SSA `idx_apply` / `tuple`
   // ops we don't want orphaned if the conjunction picker bails. The
   // names depend only on `tileShape.size()` (canonical `i_0`,
@@ -1612,7 +1612,7 @@ preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
 // pass clones the body per-lane), bridges through a UCC to the
 // unpinned `!hc.pred` carrier the yield slot expects, and ANDs it
 // with the optional source mask. This is the OOB-write guard the
-// load side has had since day one — the store side was missing it,
+// load side has had since day one -- the store side was missing it,
 // and OOB lanes (workgroup-tile edges where (W1, W2) isn't a
 // multiple of `group_shape`) ended up writing past the live extent
 // into the next row's address space. The downstream
@@ -1714,7 +1714,7 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   // offsets the same way the load side composes its
   // `hc.load_mask` predicate. `maskConjunctionFromOffsets` failing on
   // an axis (non-`ExprAttr` entry, non-decomposable cmp) drops the
-  // guard for the whole store — the alternative is a partial guard
+  // guard for the whole store -- the alternative is a partial guard
   // that lets some axes through unchecked, and "we'd rather emit no
   // guard than the wrong guard" is the safer fallback at this layer
   // since the upstream `hc.full_mask` carrier on the source side is
@@ -1747,7 +1747,7 @@ struct HCLoadStoreToGenericPass
     Operation *root = getOperation();
     auto &store =
         root->getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
-    // Collect first, mutate after — `op->erase()` inside the walk
+    // Collect first, mutate after -- `op->erase()` inside the walk
     // would invalidate the iterator the walk is driving.
     SmallVector<HCLoadOp> loads;
     SmallVector<HCVLoadOp> vloads;

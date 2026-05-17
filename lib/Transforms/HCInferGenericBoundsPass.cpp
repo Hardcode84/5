@@ -62,7 +62,7 @@ static bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
   return offset.getValue() == *bareHandle;
 }
 
-// Iter syms still bound to `hc.undef` placeholder — others already bound.
+// Iter syms still bound to `hc.undef` placeholder -- others already bound.
 static SmallVector<size_t> findPlaceholderIters(OperandRange iterBounds) {
   SmallVector<size_t> placeholders;
   for (auto [iterIdx, bound] : llvm::enumerate(iterBounds))
@@ -121,7 +121,7 @@ diagnoseImpliedBoundConflicts(HCGenericOp op, ArrayAttr iterSyms,
   return success();
 }
 
-// Empty-binding `hc.idx_apply` — free syms are launch-context names
+// Empty-binding `hc.idx_apply` -- free syms are launch-context names
 // the launch-body lowering binds later.
 static void
 materializeInferredBounds(HCGenericOp op, OperandRange iterBounds,

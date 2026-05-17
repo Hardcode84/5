@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // `-hc-lower-launch-body`: runs after HC kernels are in `gpu.launch`.
-// Workgroup tiles → `hc.alloc` + `!hc.ptr<workgroup, T>`. Kernel-args
+// Workgroup tiles -> `hc.alloc` + `!hc.ptr<workgroup, T>`. Kernel-args
 // arrive as `(ptr<global>, dim*, stride*)` UCC; walk back, emit
 // `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
 // Contract: `doc/layouts.md` "hc.ptr and memory ops".
@@ -105,7 +105,7 @@ staticIntegerShape(SymbolicallyShapedTypeInterface shaped) {
   return *dims;
 }
 
-// `bare_tensor` → `!hc.ptr<workgroup, T>`; flat storage, static dims
+// `bare_tensor` -> `!hc.ptr<workgroup, T>`; flat storage, static dims
 // required (alloc needs a constant element count).
 static Type convertBareTensorType(BareTensorType type) {
   auto shaped = cast<SymbolicallyShapedTypeInterface>(type);
@@ -154,7 +154,7 @@ static Value materializeCast(OpBuilder &builder, Type type, ValueRange inputs,
                              Location loc) {
   if (inputs.size() != 1)
     return {};
-  // Short-circuit `idx<sym>` → `index` through the bundle root;
+  // Short-circuit `idx<sym>` -> `index` through the bundle root;
   // bare UCC won't fold via reconcileUnrealizedCasts.
   if (type.isIndex()) {
     if (Value direct = resolveToBundleIndex(inputs.front()))
@@ -216,7 +216,7 @@ struct BoundValues {
   }
 };
 
-// Launch-boundary UCC: `!hc.buffer<T, [dims]>` → `(ptr<global>,
+// Launch-boundary UCC: `!hc.buffer<T, [dims]>` -> `(ptr<global>,
 // dim_0..dim_{r-1}, stride_0..stride_{r-1})`.
 struct KernelArgSource {
   Value ptr;
@@ -228,7 +228,7 @@ struct KernelArgSource {
 
 static std::optional<KernelArgSource> resolveKernelArg(Value source);
 
-// Post-flatten bare-carrier UCC: rank-N bundle → rank-1 buffer view
+// Post-flatten bare-carrier UCC: rank-N bundle -> rank-1 buffer view
 // + idx aux. Validate shape, recurse into inner source.
 static std::optional<KernelArgSource>
 resolveKernelArgViaBareCarrier(UnrealizedConversionCastOp cast, Value source) {
@@ -377,7 +377,7 @@ static void bindShapeSymbols(BufferType type, const KernelArgSource &source,
   }
 }
 
-// `$STRIDE_<axis>_<argname>` → corresponding stride value, per
+// `$STRIDE_<axis>_<argname>` -> corresponding stride value, per
 // `buildDefaultStridedBufferLayout`. Null on miss.
 static Value resolveBundleStrideSym(const KernelArgSource &source,
                                     StringRef symName) {
@@ -427,7 +427,7 @@ static Value resolveToBundleIndex(Value value) {
   return resolveBundleStrideSym(*info, *symbol);
 }
 
-// Short-circuit `idx<sym>→index` through the kernel-arg bundle;
+// Short-circuit `idx<sym>->index` through the kernel-arg bundle;
 // fresh UCC otherwise.
 static Value indexCastViaBundle(OpBuilder &builder, Location loc, Value value) {
   if (Value direct = resolveToBundleIndex(value))
@@ -461,7 +461,7 @@ static void bindWorkOffsets(gpu::LaunchOp launch, OpBuilder &builder,
   }
 }
 
-// Pre-flatten UCC: multi-input bundle → single buffer output. Bind
+// Pre-flatten UCC: multi-input bundle -> single buffer output. Bind
 // buffer's shape syms (M, N, ...) to per-axis dim inputs.
 static void bindPreFlattenKernelArgCast(UnrealizedConversionCastOp cast,
                                         ConversionPatternRewriter &rewriter,
@@ -480,7 +480,7 @@ static void bindPreFlattenKernelArgCast(UnrealizedConversionCastOp cast,
     boundValues.bind(*symbol, indexCast(rewriter, loc, input));
 }
 
-// Post-flatten retype UCC: rank-N buffer → (rank-1 buffer, idx<sym>
+// Post-flatten retype UCC: rank-N buffer -> (rank-1 buffer, idx<sym>
 // aux*). Bind each idx-typed output's symbol so ambient lowering
 // can resolve applies that reference it.
 static void bindPostFlattenRetypeCast(UnrealizedConversionCastOp cast,
@@ -1133,7 +1133,7 @@ static Value allocateWorkgroupPtr(OpBuilder &builder, Location loc,
   return HCAllocOp::create(builder, loc, ptrType, countValue).getResult();
 }
 
-// Linear → per-axis coords, last axis fastest. Constant-index SSAs.
+// Linear -> per-axis coords, last axis fastest. Constant-index SSAs.
 static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
                                             int64_t lin,
                                             ArrayRef<int64_t> shape) {
@@ -1149,7 +1149,7 @@ static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
   return coords;
 }
 
-// Per-element store from vector → flat workgroup ptr, rightmost-
+// Per-element store from vector -> flat workgroup ptr, rightmost-
 // fastest. Scalar form dodges LLVM's i1 byte-vs-bit store mismatch.
 static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
                                                Value vector, Value ptr,
@@ -1199,8 +1199,8 @@ static Value sourcePtr(Value value) {
   return {};
 }
 
-// Workgroup-ptr source + lane→source-offset indexing pattern. No
-// buffer_view in chain → one full-slice axis per source dim.
+// Workgroup-ptr source + lane->source-offset indexing pattern. No
+// buffer_view in chain -> one full-slice axis per source dim.
 struct PtrViewSource {
   Value sourcePtr;
   PtrType ptrType;
@@ -1347,7 +1347,7 @@ static Value computeScalarAxesBaseOffset(OpBuilder &rewriter, Location loc,
   return base;
 }
 
-// Lane idx → per-axis view coords, row-major.
+// Lane idx -> per-axis view coords, row-major.
 static SmallVector<int64_t> unflattenLaneIndex(int64_t lin,
                                                ArrayRef<int64_t> viewShape) {
   SmallVector<int64_t> coords(viewShape.size());
@@ -1437,7 +1437,7 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
 // (LDS, alloc + per-element write).
 //
 // Scalar splat from a constant vector for the splat fast path.
-// Non-splat → null, caller falls back to unrolled stores.
+// Non-splat -> null, caller falls back to unrolled stores.
 static Value extractSplatScalar(OpBuilder &builder, Location loc,
                                 Value vector) {
   auto cst = vector.getDefiningOp<arith::ConstantOp>();
@@ -1531,7 +1531,7 @@ materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
 }
 
 // Read converted shaped value as multi-dim vector. Vector
-// passthrough; LDS → per-element loads via `loadVectorFromPtrView`.
+// passthrough; LDS -> per-element loads via `loadVectorFromPtrView`.
 static FailureOr<Value> shapedValueAsVector(ConversionPatternRewriter &rewriter,
                                             Location loc, Value original,
                                             Value remapped, Type convertedType,
@@ -1643,7 +1643,7 @@ struct LoadLikeResultShape {
   Type elementType;
 };
 
-// Bare-vector result → `(VectorType, shape, elementType)`.
+// Bare-vector result -> `(VectorType, shape, elementType)`.
 static FailureOr<LoadLikeResultShape>
 unpackLoadLikeResultShape(const TypeConverter &converter, Type bareResultType) {
   Type converted = converter.convertType(bareResultType);
@@ -1898,7 +1898,7 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
     if (!vectorType)
       return failure();
 
-    // `bare_tensor` (→ workgroup ptr) → `bare_vector`: per-element
+    // `bare_tensor` (-> workgroup ptr) -> `bare_vector`: per-element
     // load through any `hc.buffer_view` chain.
     if (auto ptrType = dyn_cast<PtrType>(adaptor.getValue().getType())) {
       if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
@@ -2003,7 +2003,7 @@ lowerStoreSource(HCStoreOp op, HCStoreOp::Adaptor adaptor,
   return std::make_pair(*source, sourceType);
 }
 
-// Optional store mask → `i1` vector matching `sourceType`. Null when absent.
+// Optional store mask -> `i1` vector matching `sourceType`. Null when absent.
 static FailureOr<Value> lowerStoreMask(HCStoreOp op, HCStoreOp::Adaptor adaptor,
                                        ConversionPatternRewriter &rewriter,
                                        const TypeConverter &converter,
@@ -2030,7 +2030,7 @@ static FailureOr<Value> lowerStoreMask(HCStoreOp op, HCStoreOp::Adaptor adaptor,
   return *maskVector;
 }
 
-// Per-lane scalar stores. Null mask → `hc.ptr_store`; non-null →
+// Per-lane scalar stores. Null mask -> `hc.ptr_store`; non-null ->
 // `hc.ptr_store_pred` (mask as first-class operand).
 static void emitStoreLanes(OpBuilder &rewriter, Location loc,
                            const KernelArgSource &kernelArg,
@@ -2176,7 +2176,7 @@ buildVectorViewPermutation(ArrayRef<SliceAxis> localAxes,
   }
 }
 
-// Reshape `result` → `converted`. Both must be vectors.
+// Reshape `result` -> `converted`. Both must be vectors.
 static FailureOr<Value> reshapeToConvertedVector(OpBuilder &rewriter,
                                                  Location loc, Value result,
                                                  Type converted) {
@@ -2404,7 +2404,7 @@ static void resolveBuffersInPlace(MutableArrayRef<Value> operands,
   }
 }
 
-// LDS-backed `bare_tensor` ins → workgroup ptr SSA the adaptor hands
+// LDS-backed `bare_tensor` ins -> workgroup ptr SSA the adaptor hands
 // back (producer conversion already planted it).
 static void swapInsLDSCarriersToPtrs(MutableArrayRef<Value> newIns,
                                      ValueRange adaptedIns, bool &changed) {
@@ -2419,8 +2419,8 @@ static void swapInsLDSCarriersToPtrs(MutableArrayRef<Value> newIns,
   }
 }
 
-// `hc.generic` operand resolve: kernel-arg buffer carriers → ptr<global>,
-// LDS bare_tensor ins → ptr<workgroup>. Body, bounds, offsets verbatim.
+// `hc.generic` operand resolve: kernel-arg buffer carriers -> ptr<global>,
+// LDS bare_tensor ins -> ptr<workgroup>. Body, bounds, offsets verbatim.
 // Composed offsets keep ABI sym refs (`$STRIDE_0_<buf>`); ambient
 // resolution happens at apply-lowering time.
 struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
@@ -2429,8 +2429,8 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
   LogicalResult
   matchAndRewrite(HCGenericOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Two HC-to-HC retypes: kernel-arg buffer → ptr<global> via UCC
-    // walk; LDS bare_tensor ins → ptr<workgroup> via adaptor. Outs
+    // Two HC-to-HC retypes: kernel-arg buffer -> ptr<global> via UCC
+    // walk; LDS bare_tensor ins -> ptr<workgroup> via adaptor. Outs
     // stays bare_tensor (swapping it would collapse the SSA result
     // the verifier matches against value-typed outs count). Iter
     // bounds take the index conversion to fold the trailing UCC chain.
@@ -2593,7 +2593,7 @@ static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
   if (!llvm::all_of(op.getOuts(), isHCGenericOperandLegal))
     return false;
   // `bare_tensor` ins must lower via `AdaptGenericOp`. Outs skipped
-  // — not swapped (see `AdaptGenericOp`).
+  // -- not swapped (see `AdaptGenericOp`).
   for (Value v : op.getIns()) {
     if (isa<BareTensorType>(v.getType()))
       return false;
@@ -2602,7 +2602,7 @@ static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
 }
 
 // Legal iff signature matches the converter projection. Missing
-// signature → legal (verifier flags separately).
+// signature -> legal (verifier flags separately).
 static bool isHCIntrinsicSignatureLegal(HCIntrinsicOp op,
                                         const TypeConverter &converter) {
   std::optional<FunctionType> fnType = op.getFunctionType();
@@ -2618,7 +2618,7 @@ static bool isHCIntrinsicSignatureLegal(HCIntrinsicOp op,
 }
 
 // Legal iff every operand/result type equals its boundary
-// projection. Unprojectable → illegal.
+// projection. Unprojectable -> illegal.
 static bool isHCCallIntrinsicLegal(HCCallIntrinsicOp op,
                                    const TypeConverter &converter) {
   for (Value arg : op.getArgs()) {
@@ -2693,7 +2693,7 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
 
 // Contract gate: `hc-decompose-shaped-values` upstream should have
 // split every semantic `!hc.tensor` / `!hc.vector` into bare pairs.
-// Surviving semantic carrier → producer-side fail-loud diagnostic.
+// Surviving semantic carrier -> producer-side fail-loud diagnostic.
 static bool isSemanticShapedType(Type type) {
   return isa<hc::TensorType, hc::VectorType>(type);
 }

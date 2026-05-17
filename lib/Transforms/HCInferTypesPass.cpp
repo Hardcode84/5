@@ -241,7 +241,7 @@ private:
       text += "_";
       text += Twine(element).str();
     }
-    // Bare symbol leaf — composeExprSym gives the canonical hash-cons.
+    // Bare symbol leaf -- composeExprSym gives the canonical hash-cons.
     auto *dialect = ctx->getOrLoadDialect<HCDialect>();
     std::string diag;
     FailureOr<sym::ExprHandle> handle =
@@ -389,7 +389,7 @@ public:
       join(lattice, factFromExistingType(input.getType()));
   }
 
-  // Inference failure or arity mismatch (verifier bug) → entry-state.
+  // Inference failure or arity mismatch (verifier bug) -> entry-state.
   void visitInferredRegionArguments(
       HCInferRegionArgTypeOpInterface infer, const RegionSuccessor &successor,
       ValueRange nonSuccessorInputs,
@@ -449,7 +449,7 @@ protected:
       }
     }
 
-    // No MLIR private visibility yet — use visible return sites so
+    // No MLIR private visibility yet -- use visible return sites so
     // unknown external predecessors don't erase all facts.
     ProgramPoint *point = getProgramPointAfter(call);
     const auto *predecessors =
@@ -710,7 +710,7 @@ static Type appendCollectiveSuffixToVector(Type type,
 static FailureOr<Type> liftCollectiveReturnType(Operation *op, Type type,
                                                 ArrayRef<Attribute> suffix);
 
-// Flat tuples only — nested tuples rejected.
+// Flat tuples only -- nested tuples rejected.
 static FailureOr<Type> liftCollectiveTupleReturn(Operation *op, TupleType tuple,
                                                  ArrayRef<Attribute> suffix) {
   SmallVector<Type> elements;
@@ -946,7 +946,7 @@ static void collectSyntheticJoinSymbols(CallableOpT op, llvm::StringSet<> &seen,
   }
 }
 
-// Both endpoints are bare symbol leaves — canonical handles, no
+// Both endpoints are bare symbol leaves -- canonical handles, no
 // reparse per rewrite.
 using SymbolSubstitution = std::pair<sym::ExprHandle, sym::ExprHandle>;
 

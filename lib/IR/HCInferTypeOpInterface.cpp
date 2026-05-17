@@ -146,7 +146,7 @@ static LogicalResult requireOperandCount(Operation *op, ArrayRef<Type> operands,
          << expected << " operand type fact(s), got " << operands.size();
 }
 
-// Caller guarantees ≥1 operand is IdxType.
+// Caller guarantees >=1 operand is IdxType.
 static LogicalResult
 inferIndexBinaryIdxArm(Type lhs, Type rhs, bool lhsIdx, bool rhsIdx,
                        sym::ExprBinaryOp opKind, Operation *op,
@@ -226,7 +226,7 @@ static Type rebuildShapedType(Type flavor, Type elementType, ShapeAttr shape) {
   return mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{});
 }
 
-// Same flavor + broadcast. Element via joinHCTypes (undef → concrete).
+// Same flavor + broadcast. Element via joinHCTypes (undef -> concrete).
 static FailureOr<Type> inferShapedBinaryResult(Type lhs, Type rhs,
                                                Operation *op) {
   if (!sameShapedFlavor(lhs, rhs))
@@ -388,7 +388,7 @@ static FailureOr<std::optional<ExprAttr>> optionalIdxExprAttr(Type t) {
   return expr;
 }
 
-// stop - start. Elided start → 0, elided stop → baseDim.
+// stop - start. Elided start -> 0, elided stop -> baseDim.
 static FailureOr<ExprAttr> composeSliceViewExtent(ExprAttr baseDim,
                                                   std::optional<ExprAttr> lower,
                                                   std::optional<ExprAttr> upper,
@@ -489,8 +489,8 @@ static LogicalResult verifyBufferViewLayoutRanks(
   return success();
 }
 
-// Non-trivial slice axes: index_sym ↦ lower + step*index_sym.
-// Caller has confirmed (lower, step) ≠ (0, 1).
+// Non-trivial slice axes: index_sym |-> lower + step*index_sym.
+// Caller has confirmed (lower, step) != (0, 1).
 static LogicalResult appendSliceIndexRebind(LayoutSubBuilder &builder,
                                             StringRef indexName,
                                             ExprAttr lowerExpr,
@@ -535,7 +535,7 @@ static LogicalResult composeKeptAxisSubstitutions(
   return appendSliceIndexRebind(builder, indexName, lowerExpr, stepExpr);
 }
 
-// Scalar-indexed axis: shape_sym ↦ dim, index_sym ↦ scalar. Drops from
+// Scalar-indexed axis: shape_sym |-> dim, index_sym |-> scalar. Drops from
 // residual.
 static LogicalResult composeScalarAxisSubstitutions(LayoutSubBuilder &builder,
                                                     Attribute baseDim,
@@ -603,10 +603,10 @@ static LogicalResult composeBufferViewAxes(
 }
 
 // Per-axis layout rewrite for `hc.buffer_view`:
-//   scalar:           index_syms[k]→scalar, shape_syms[k]→opDim; drop slot.
+//   scalar:           index_syms[k]->scalar, shape_syms[k]->opDim; drop slot.
 //   trivial slice:    keep slot, no sub.
-//   non-trivial slice: index_syms[k]→lower+step*idx; if extent ≠ opDim also
-//                     shape_syms[k]→opDim. Both slots remain (rank invariant).
+//   non-trivial slice: index_syms[k]->lower+step*idx; if extent != opDim also
+//                     shape_syms[k]->opDim. Both slots remain (rank invariant).
 //   pass-through:     keep slot, no sub.
 // Sub applies to every ExprAttr in params.
 static FailureOr<LayoutAttr> composeBufferViewLayout(
@@ -663,7 +663,7 @@ static FailureOr<LayoutAttr> composeBufferViewLayout(
 //   resultDim:         only when keep=true.
 //   scalarValueExpr:   scalar idx's IdxType expr; empty on kept axes.
 //   sliceLower/Step:   slice lower/step (default 0/1); empty otherwise.
-//   sliceShapeChanged: sliced extent ≠ opDim.
+//   sliceShapeChanged: sliced extent != opDim.
 struct BufferViewAxisEntry {
   Attribute resultDim;
   bool keep = false;
@@ -731,7 +731,7 @@ classifyBufferViewSliceAxis(ExprAttr baseDim, SliceType slice, Operation *op) {
 }
 
 // Scalar subscript: only IdxType pins. Plain index/i64 vs layout-bearing
-// source can't substitute → bail.
+// source can't substitute -> bail.
 static std::optional<BufferViewAxisEntry>
 classifyBufferViewScalarAxis(Type indexType, LayoutAttr sourceLayout) {
   ExprAttr scalarExpr;
@@ -818,7 +818,7 @@ classifyBufferViewIndices(ArrayRef<Type> indexTypes,
   return std::optional<BufferViewAxisArrays>(std::move(arrays));
 }
 
-// Result type selector. Rank-0 vector-root → element type.
+// Result type selector. Rank-0 vector-root -> element type.
 static Type buildBufferViewResultType(Type sourceType, bool vectorRoot,
                                       Type elementType,
                                       ArrayRef<Attribute> resultDims,
@@ -872,8 +872,8 @@ interleaveUnitAxes(ArrayRef<Attribute> keptDims, ArrayRef<int64_t> unitAxes,
   return result;
 }
 
-// keepAxis covers source rank. Composition fail → un-refined; null layout
-// in → empty layout out.
+// keepAxis covers source rank. Composition fail -> un-refined; null layout
+// in -> empty layout out.
 static FailureOr<LayoutAttr> maybeComposeBufferViewLayout(
     LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
     const BufferViewAxisArrays &arrays, Type currentResultType, Operation *op) {
@@ -950,7 +950,7 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
 }
 
 // Producer-side `layout` attr baked in by inference; lets non-injective
-// layouts (broadcasts, WMMA fragments) skip the bare→layout barrier that
+// layouts (broadcasts, WMMA fragments) skip the bare->layout barrier that
 // `hc.as_layout` enforces.
 static LayoutAttr producerLayoutAttr(Operation *op) {
   if (!op)
@@ -1009,7 +1009,7 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
   return sym::getIntegerLiteralValue(sym::ExprHandle(expr->getNode()));
 }
 
-// Tuple[idx] → slot. Python neg-index. Failure: not static or out of [-size,
+// Tuple[idx] -> slot. Python neg-index. Failure: not static or out of [-size,
 // size).
 static FailureOr<size_t> resolveTupleGetItemIndex(ArrayRef<Type> indexTypes,
                                                   TupleType tuple,
@@ -1299,7 +1299,7 @@ LogicalResult HCModOp::inferHCTypes(ArrayRef<Type> operandTypes,
                           resultTypes);
 }
 
-// `hc.pow`: ixsimpl has no Pow → idx arm bails to {}; unfold pass yields mul
+// `hc.pow`: ixsimpl has no Pow -> idx arm bails to {}; unfold pass yields mul
 // chain. Scalar/shaped: same-type passthrough.
 LogicalResult HCPowOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {

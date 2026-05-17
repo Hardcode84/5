@@ -95,7 +95,7 @@ static bool reduceComboSupported(ReduceKind kind, Type elem) {
   return false;
 }
 
-// Identity per kind: sum → 0, max → -inf, min → +inf. Interface dispatch
+// Identity per kind: sum -> 0, max -> -inf, min -> +inf. Interface dispatch
 // covers bare and semantic carriers uniformly. Caller pre-validates with
 // `reduceComboSupported`.
 static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
@@ -152,7 +152,7 @@ struct MatmulShape {
 };
 
 // Rank-2 + shape agreement (K between operands, M/N across in+out).
-// Disagreement → failure; caller leaves op for downstream diagnostics.
+// Disagreement -> failure; caller leaves op for downstream diagnostics.
 static FailureOr<MatmulShape> validateMatmulShape(HCMatmulOp op) {
   auto lhsShape = getOperandShape(op.getLhs());
   auto rhsShape = getOperandShape(op.getRhs());

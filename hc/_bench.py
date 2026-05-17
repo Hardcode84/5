@@ -14,7 +14,7 @@ elapsed nanoseconds.
 * `BenchResult` carries raw `samples_ns` plus on-demand stats.
 
 Outer-sample orchestration is on `CompiledKernel.bench`. Pure-Python
-outer loop is fine — the inner loop is in C.
+outer loop is fine -- the inner loop is in C.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def make_bench_invoker(
         raise RuntimeError(
             f"hc.bench: lookup of bench wrapper '@{bench_wrapper_name}' "
             "returned a null address (the JIT loaded the module but the "
-            "symbol is not visible — check that `-hc-emit-bench-wrapper` "
+            "symbol is not visible -- check that `-hc-emit-bench-wrapper` "
             "ran and `symbol-dce` did not drop the clone)"
         )
 
@@ -98,7 +98,7 @@ class BenchResult:
 
     `samples_ns[i]` = C-side wall-clock ns for sample i's inner loop +
     `hipStreamSynchronize`. `per_launch_*` = per-sample / `n_inner`,
-    the headline number for sub-µs kernels.
+    the headline number for sub-us kernels.
     """
 
     samples_ns: np.ndarray

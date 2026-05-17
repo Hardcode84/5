@@ -14,8 +14,8 @@ extern "C" {
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HC, hc);
 
-// Register hc's three pass families (front transforms, front→hc conversion,
-// hc transforms). Idempotent. Does NOT register upstream MLIR passes — Python
+// Register hc's three pass families (front transforms, front->hc conversion,
+// hc transforms). Idempotent. Does NOT register upstream MLIR passes -- Python
 // bindings do that via `_mlirRegisterEverything`; non-Python callers must
 // call `mlir::registerAllPasses()` themselves first.
 MLIR_CAPI_EXPORTED void mlirRegisterHCAllPasses(void);

@@ -137,7 +137,7 @@ static void dropWorkitemSuffixFromCallable(Operation *callable,
 // `result_storage == yield_storage * product(suffix)` and propagating
 // the yielded type through type-preserving consumers (`hc.for_range`
 // iter slots, `hc.if` yields, `hc.return`). Workgroup-shared tiles
-// never enter — they aren't workitem-region results.
+// never enter -- they aren't workitem-region results.
 namespace {
 class PostFlattenLiftRetyper {
 public:
@@ -179,7 +179,7 @@ void PostFlattenLiftRetyper::retypeOpResult(Operation *op, unsigned idx,
   if (!op || idx >= op->getNumResults())
     return;
   retype(op->getResult(idx), target);
-  // Yield operand co-types with the result — keep them in sync.
+  // Yield operand co-types with the result -- keep them in sync.
   for (Region &region : op->getRegions()) {
     if (region.empty())
       continue;
@@ -432,7 +432,7 @@ struct HCNormalizeScopeRegionsPass
       if (metadata && metadata->groupShape) {
         // Pre-flatten: per-type strip handles the rank-N suffix.
         // Post-flatten: strip is a no-op, retyper recovers lane-local
-        // form via workitem-region results. Run both — covers either regime.
+        // form via workitem-region results. Run both -- covers either regime.
         ArrayRef<Attribute> suffix = metadata->groupShape.getDims();
         dropWorkitemSuffixFromCallable(callable, suffix);
         retypePostFlattenLifts(callable, suffix);

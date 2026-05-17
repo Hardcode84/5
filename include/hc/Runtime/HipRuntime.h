@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Public C ABI of `libhc_hip_runtime.so` — launcher shim called by JIT'd
+// Public C ABI of `libhc_hip_runtime.so` -- launcher shim called by JIT'd
 // host wrappers. `libamdhip64.so` is dlopen'd lazily so the wheel has zero
 // ROCm build/load dependency; ROCm-free hosts can import `hc` and only
 // `hc_rt_init` actually touches the runtime. Launch path is allocation-
@@ -33,7 +33,7 @@ void hc_rt_init();
 // `stream` and `binary_size` are ABI-compat slots, unused today (load is
 // stream-agnostic, `hipModuleLoadData` reads a self-describing blob).
 //
-// The underlying `hipModule_t` leaks for process lifetime by design — a
+// The underlying `hipModule_t` leaks for process lifetime by design -- a
 // handful of kernels per run, an unload path is a separate problem.
 void *hc_rt_load_kernel(void *stream, void **cached_kernel_handle,
                         const void *binary_pointer, size_t binary_size,

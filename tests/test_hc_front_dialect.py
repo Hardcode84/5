@@ -99,4 +99,4 @@ def test_hc_opt_parses_and_prints_registered_hc_front_textual_ir() -> None:
     assert "hc_front.for" in result.stdout
     # Declarative assembly format infers `!hc_front.value` from
     # parameterless `HCFront_ValueType`; pretty-printer never spells
-    # the type → no string check for it here.
+    # the type -> no string check for it here.

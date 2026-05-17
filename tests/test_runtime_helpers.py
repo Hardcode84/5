@@ -28,7 +28,7 @@ _HELPER_NAMES = (
 
 
 class _NumpyTensor:
-    """Duck-typed torch.Tensor stand-in — drives the helpers without
+    """Duck-typed torch.Tensor stand-in -- drives the helpers without
     pulling torch into the test suite."""
 
     def __init__(self, array: np.ndarray) -> None:
@@ -95,7 +95,7 @@ def test_helpers_export_expected_symbols(helpers: ctypes.CDLL) -> None:
 
 
 def test_get_ptr_returns_data_pointer(helpers: ctypes.CDLL) -> None:
-    # `hc_get_ptr` is the `!hc.ptr<global, T?>` kernel-arg entry —
+    # `hc_get_ptr` is the `!hc.ptr<global, T?>` kernel-arg entry --
     # returns the same address as `data_ptr()`.
     array = np.arange(64, dtype=np.float16)
     tensor = _NumpyTensor(array)

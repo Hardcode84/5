@@ -62,3 +62,9 @@ repos:
         additional_dependencies: [lizard==1.21.6]
         types_or: [python, c, c++]
         args: [-l, python, -l, cpp, -C, "10", -L, "100", -W, whitelizard.txt]
+
+      - id: check-ascii-only
+        name: check ASCII-only (py / c / c++)
+        entry: python build_tools/check_ascii_only.py
+        language: python
+        types_or: [python, c, c++]

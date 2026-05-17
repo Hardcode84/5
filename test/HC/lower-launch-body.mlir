@@ -446,9 +446,22 @@ module {
   // the LDS through the same ptr-typed access path the kernel-arg
   // ptr / explicit `hc.alloc` ins already use — no UCC walk-back
   // needed at consume time.
+  //
+  // The fill itself lands as a fresh `hc.generic` over the flat slot
+  // range that yields the splat scalar, instead of an unrolled
+  // every-thread-stamps-every-slot store sequence. Downstream
+  // `hc-lower-generic` routes the init generic through `lowerCollective`,
+  // which dispatches one slot per thread and closes with `gpu.barrier`
+  // — every workgroup-AS write stays inside a structured generic so the
+  // forthcoming barrier-insertion pass has a uniform surface to work on.
   // CHECK-LABEL: func.func @workgroup_bare_tensor_ins_swap
   // CHECK: gpu.launch
   // CHECK: %[[LDS:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
+  // CHECK: hc.generic
+  // CHECK-SAME: iter (parallel lin = %{{.+}} : index)
+  // CHECK-SAME: ins ()
+  // CHECK-SAME: outs (%[[LDS]] at [#hc.expr<"lin">] : !hc.ptr<workgroup, f32>)
+  // CHECK:   hc.yield %{{.+}} : f32
   // CHECK: hc.generic
   // CHECK-SAME: ins (%[[LDS]] at [#hc.expr<"i">] : !hc.ptr<workgroup, f32>)
   // CHECK-NOT: !hc.bare_tensor<f32, ["8"]>

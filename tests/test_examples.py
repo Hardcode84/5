@@ -208,16 +208,33 @@ def test_pairwise_distance_native_compile(h: int) -> None:
 
 
 # Real-hardware end-to-end gate for pairwise. Default-skipped — see the
-# `_RUN_HIP_INVOKE_TESTS` comment block above. The matching shape is
-# the smallest one whose work_shape stays strictly inside one
-# `group_shape=(8, 8)` workgroup; larger shapes (those that hit the
-# tile boundary at `W1==8` or `W2==8`) currently miscompare against
-# the numpy reference — see the open bead on the workgroup-collective
-# boundary race so the test surface tracks where the GPU output is
-# actually trusted.
+# `_RUN_HIP_INVOKE_TESTS` comment block above.
+#
+# Shape coverage:
+#   * Sub-tile: (6, 5, h) stays inside one `group_shape=(8, 8)` workgroup
+#     and exercises the boundary-mask path with a partial chunk.
+#   * Tile-aligned: shapes whose `(W1, W2)` are multiples of (8, 8)
+#     exercise full workgroups (one or many) and the cross-wave LDS
+#     pre-fill ordering against the collective reductions.
+#
+# Shapes whose `(W1, W2)` are NOT multiples of (8, 8) still miscompare
+# because the value-outs writeback walks the full workgroup tile without
+# a live-extent bound — tracked as a separate bead.
 @_RUN_HIP_INVOKE_TESTS
-def test_pairwise_distance_invokes_on_real_hardware() -> None:
-    x1, x2 = make_pairwise_inputs(w1=6, w2=5, h=4, seed=29)
+@pytest.mark.parametrize(
+    ("w1", "w2", "h"),
+    [
+        (6, 5, 4),
+        (8, 8, 4),
+        (8, 8, 8),
+        (16, 8, 4),
+        (8, 16, 4),
+        (16, 16, 8),
+        (32, 24, 16),
+    ],
+)
+def test_pairwise_distance_invokes_on_real_hardware(w1: int, w2: int, h: int) -> None:
+    x1, x2 = make_pairwise_inputs(w1=w1, w2=w2, h=h, seed=29)
     out = run_pairwise_on_hardware(x1, x2)
     ref = reference_pairwise_distance(x1, x2)
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-6)

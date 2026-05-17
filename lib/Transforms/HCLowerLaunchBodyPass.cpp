@@ -1636,6 +1636,79 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
 //
 // Allocate an LDS tile sized for `shape`'s element count and write
 // the per-lane `vector` into it.
+// Pull the scalar splat element out of a constant vector. Returns a
+// fresh scalar `arith.constant` SSA value matching the vector's element
+// type when `vector` is a splat constant, or `nullptr` otherwise. Every
+// current caller of `writeVectorToFreshLDS` (zeros / ones / full /
+// full_mask / broadcast-of-scalar fill) feeds in a splat, so this
+// captures the common case; a non-splat vector means the caller already
+// has per-slot values and falls through to the unrolled-store path.
+static Value extractSplatScalar(OpBuilder &builder, Location loc,
+                                Value vector) {
+  auto cst = vector.getDefiningOp<arith::ConstantOp>();
+  if (!cst)
+    return Value{};
+  auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
+  if (!dense || !dense.isSplat())
+    return Value{};
+  TypedAttr scalarAttr = dense.getSplatValue<TypedAttr>();
+  return arith::ConstantOp::create(builder, loc, scalarAttr).getResult();
+}
+
+// Emit a workgroup-cooperative fill of a freshly allocated LDS tile as a
+// single `hc.generic` with one parallel iter per slot. `hc-lower-generic`
+// then routes this through `lowerCollective`, which dispatches one slot
+// per thread and closes with a trailing `gpu.barrier`. Net effect:
+//
+//   * fill cost drops from `wgSize * total` per-thread stores to one
+//     pass over the slot range divided across the workgroup;
+//   * every workgroup-AS write lives inside a structured `hc.generic`,
+//     which keeps the surface uniform for the dedicated barrier-insertion
+//     pass that will eventually own cross-generic synchronization (see
+//     the `hc-insert-workgroup-barriers` bead).
+//
+// `lin` is the canonical name for the flat slot iter sym; ixsimpl
+// hash-conses the `#hc.expr<"lin">` payload across uses so the canonical
+// handle stays cheap to compare downstream.
+static LogicalResult emitInitFillGeneric(OpBuilder &builder, Location loc,
+                                         Value lds, PtrType ptrType,
+                                         Value scalar, int64_t total) {
+  MLIRContext *ctx = builder.getContext();
+  Type elemTy = ptrType.getElementType();
+  if (!elemTy || scalar.getType() != elemTy)
+    return failure();
+
+  auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
+  FailureOr<sym::ExprHandle> linExpr = sym::composeExprSym(store, "lin");
+  if (failed(linExpr))
+    return failure();
+  ArrayAttr outOff = ArrayAttr::get(ctx, {ExprAttr::get(ctx, *linExpr)});
+  ArrayAttr insOffsets = ArrayAttr::get(ctx, {});
+  ArrayAttr outsOffsets = ArrayAttr::get(ctx, {outOff});
+
+  StringAttr linSym = StringAttr::get(ctx, "lin");
+  ArrayAttr iterSyms = ArrayAttr::get(ctx, {linSym});
+  ArrayAttr iterKinds =
+      ArrayAttr::get(ctx, {IterKindAttr::get(ctx, IterKind::Parallel)});
+
+  Value totalVal =
+      arith::ConstantIndexOp::create(builder, loc, total).getResult();
+
+  auto generic = HCGenericOp::create(
+      builder, loc,
+      /*resultTypes=*/TypeRange{}, iterSyms, ValueRange(totalVal), iterKinds,
+      /*ins=*/ValueRange{}, /*outs=*/ValueRange{lds},
+      /*ambient_idxs=*/ValueRange{},
+      /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
+
+  Block *body = new Block();
+  body->addArgument(elemTy, loc);
+  generic.getBody().push_back(body);
+  OpBuilder bodyBuilder(body, body->begin());
+  HCYieldOp::create(bodyBuilder, loc, ValueRange{scalar});
+  return success();
+}
+
 static FailureOr<Value> writeVectorToFreshLDS(OpBuilder &builder, Location loc,
                                               PtrType ptrType, Value vector,
                                               ArrayRef<int64_t> shape) {
@@ -1643,6 +1716,21 @@ static FailureOr<Value> writeVectorToFreshLDS(OpBuilder &builder, Location loc,
   for (int64_t d : shape)
     total *= d;
   Value lds = allocateWorkgroupPtr(builder, loc, ptrType, total);
+
+  // Splat path: lift the fill into a structured `hc.generic` so the
+  // workgroup-cooperative lowering (and the future barrier-insertion
+  // pass) sees a uniform surface. Captures every caller in tree today.
+  if (Value scalar = extractSplatScalar(builder, loc, vector)) {
+    if (failed(emitInitFillGeneric(builder, loc, lds, ptrType, scalar, total)))
+      return failure();
+    return lds;
+  }
+
+  // Fallback for the (currently unused) non-splat path: unrolled
+  // per-element stores. Leaves the stray-store pattern outside the
+  // generic-only contract; if a real caller appears, route it through
+  // a per-slot `hc.generic` instead so the barrier pass keeps working
+  // without special-casing this site.
   if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
     return failure();
   return lds;

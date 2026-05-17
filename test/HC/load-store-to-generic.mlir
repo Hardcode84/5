@@ -95,8 +95,13 @@ func.func @vload_uniform_layout(
 
 // Store into a buffer: ptr-out `hc.generic` with no SSA result.
 // `%src` has identity offsets; `%dst` carries the multi-index
-// addressing. Body still forwards the source element so the
-// downstream `hc.ptr_store` materialisation has the value to write.
+// addressing. Body forwards the source element through
+// `hc.yield_predicated` gated on the per-axis dst-bounds conjunction
+// (`hc.pred_apply ()`); the downstream `hc.ptr_store_pred`
+// materialisation skips inactive lanes so writes never escape the
+// destination's `["M", "N"]` extent on a partial-tile workgroup.
+// `hc-fold-predicates` folds the conjunction to a constant when
+// ixsimpl can prove the offsets are always in bounds.
 // CHECK-LABEL: func.func @store_buffer
 // CHECK-DAG: %[[A:.+]] = hc.idx_apply () : () -> !hc.idx<"A">
 // CHECK-DAG: %[[B:.+]] = hc.idx_apply () : () -> !hc.idx<"B">
@@ -104,9 +109,10 @@ func.func @vload_uniform_layout(
 // CHECK-SAME: iter (parallel i_0 = %[[A]] : !hc.idx<"A">, parallel i_1 = %[[B]] : !hc.idx<"B">)
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["A", "B"]>)
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i + i_0">, #hc.expr<"i_1 + j">] : !hc.buffer<f32, ["M", "N"]>)
-// CHECK-NOT: hc.yield {{.*}}, {{.*}} :
 // CHECK: ^bb0(%[[SV:.+]]: f32, %{{.+}}: f32):
-// CHECK:   hc.yield %[[SV]] : f32
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i + i_0 < 0 & -N + i_1 + j < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]]
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[BPU]] : (f32), (!hc.pred)
 // CHECK-NOT: hc.store
 func.func @store_buffer(%dst: !hc.buffer<f32, ["M", "N"]>,
                         %src: !hc.bare_tensor<f32, ["A", "B"]>,
@@ -209,8 +215,14 @@ func.func @load_partial_indices(%buf: !hc.buffer<f32, ["M", "N"]>,
 // CHECK: hc.generic iter (parallel i_0 = %[[A]] : !hc.idx<"A">{{[^)]*}})
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<f32, ["A"]>, %{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<!hc.pred, ["A"]>)
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i + i_0">] : !hc.buffer<f32, ["M"]>)
+// `hc.pred_apply ()` carries the per-axis dst-bounds predicate (the
+// store's OOB write guard); the body ANDs it with the per-lane
+// `!hc.pred` source mask before feeding `hc.yield_predicated`.
 // CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
-// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i + i_0 < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]] : !hc.pred<"-M + i + i_0 < 0"> to !hc.pred
+// CHECK:   %[[COMBINED:.+]] = hc.and %[[MV]], %[[BPU]] : (!hc.pred, !hc.pred) -> !hc.pred
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[COMBINED]] : (f32), (!hc.pred)
 // CHECK-NOT: hc.store
 func.func @store_masked(%dst: !hc.buffer<f32, ["M"]>,
                         %src: !hc.bare_tensor<f32, ["A"]>,
@@ -232,8 +244,15 @@ func.func @store_masked(%dst: !hc.buffer<f32, ["M"]>,
 // CHECK: hc.generic iter (parallel i_0 = {{[^,]+}}, parallel i_1 = {{[^)]+}})
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["A", "B"]>, %{{.+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<!hc.pred, ["A", "B"]>)
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i + i_0">, #hc.expr<"i_1 + j">] : !hc.buffer<f32, ["M", "N"]>)
+// Per-axis dst-bounds AND'd into the predicate path: rank-2 store
+// composes `(i + i_0 < M) AND (i_1 + j < N)` via `composePredAnd`,
+// the body materializes the conjunction as a single `hc.pred_apply`
+// and ANDs with the per-lane source mask.
 // CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
-// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i + i_0 < 0 & -N + i_1 + j < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]]
+// CHECK:   %[[COMBINED:.+]] = hc.and %[[MV]], %[[BPU]] : (!hc.pred, !hc.pred) -> !hc.pred
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[COMBINED]] : (f32), (!hc.pred)
 func.func @store_masked_rank2(%dst: !hc.buffer<f32, ["M", "N"]>,
                               %src: !hc.bare_tensor<f32, ["A", "B"]>,
                               %mask: !hc.bare_tensor<!hc.pred, ["A", "B"]>,
@@ -254,7 +273,10 @@ func.func @store_masked_rank2(%dst: !hc.buffer<f32, ["M", "N"]>,
 // CHECK: hc.generic iter (parallel i_0 = {{[^)]+}})
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_vector<f32, ["A"]>, %{{.+}} at [#hc.expr<"i_0">] : !hc.bare_vector<!hc.pred, ["A"]>)
 // CHECK: ^bb0(%[[SV:.+]]: f32, %[[MV:.+]]: !hc.pred, %{{.+}}: f32):
-// CHECK:   hc.yield_predicated %[[SV]] mask %[[MV]] : (f32), (!hc.pred)
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i + i_0 < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]]
+// CHECK:   %[[COMBINED:.+]] = hc.and %[[MV]], %[[BPU]] : (!hc.pred, !hc.pred) -> !hc.pred
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[COMBINED]] : (f32), (!hc.pred)
 func.func @store_masked_bare_vector(%dst: !hc.buffer<f32, ["M"]>,
                                     %src: !hc.bare_vector<f32, ["A"]>,
                                     %mask: !hc.bare_vector<!hc.pred, ["A"]>,
@@ -454,10 +476,19 @@ func.func @load_slice_unpinned_step_falls_through(%buf: !hc.buffer<f32, ["M"]>,
 // Slice-indexed store: same `lo + step*iter` composition fires on
 // the outs side of `hc.store`. Confirms the helper is shared between
 // load and store paths.
+// The body emits a single-axis dst-bounds predicate
+// (`i_0 + lo < M`) through `hc.pred_apply` and yields the source
+// element with that mask via `hc.yield_predicated`; downstream
+// lowering folds this to `hc.ptr_store_pred` so a partial slice
+// running past `M` never writes past the buffer.
 // CHECK-LABEL: func.func @store_slice_buffer
 // CHECK: hc.generic
 // CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i_0">] : !hc.bare_tensor<f32, ["A"]>)
 // CHECK-SAME: outs (%{{.+}} at [#hc.expr<"i_0 + lo">] : !hc.buffer<f32, ["M"]>)
+// CHECK: ^bb0(%[[SV:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[BP:.+]] = hc.pred_apply () : () -> !hc.pred<"-M + i_0 + lo < 0">
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]]
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[BPU]] : (f32), (!hc.pred)
 // CHECK-NOT: hc.store
 func.func @store_slice_buffer(%dst: !hc.buffer<f32, ["M"]>,
                               %src: !hc.bare_tensor<f32, ["A"]>,
@@ -712,14 +743,20 @@ func.func @vload_layout_bearing_buffer_source(
 // `outs` operand of the planted generic targets the underlying
 // `(16, 16)` tile. Same decomposition as the load side — the layout
 // composes `index_syms` to a flat offset and the row-major split
-// recovers `(row, col)`. This is the bd-npj3 path; the matching
-// init form in `@vload_layout_bearing_buffer_source` exercises the
-// load side.
+// recovers `(row, col)`. The body still emits the dst-bounds
+// `hc.yield_predicated`; here both axes carry `Mod(_, 16) < 16`
+// conjuncts that ixsimpl can prove always-true downstream
+// (`hc-fold-predicates` collapses the mask to `full_mask` and the
+// predicated store reduces to an unpredicated one).
 // CHECK-LABEL: func.func @store_layout_bearing_buffer_dest
 // CHECK: hc.generic
 // CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"8">)
 // CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">] : !hc.bare_vector<f32, ["8"]>)
 // CHECK-SAME: outs (%{{[^ ]+}} at [#hc.expr<"Mod(2*i_0 + floor(1/16*lane), 16)">, #hc.expr<"Mod(lane, 16)">] : !hc.buffer<f32, ["16", "16"]>)
+// CHECK: ^bb0(%[[SV:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[BP:.+]] = hc.pred_apply
+// CHECK:   %[[BPU:.+]] = builtin.unrealized_conversion_cast %[[BP]]
+// CHECK:   hc.yield_predicated %[[SV]] mask %[[BPU]] : (f32), (!hc.pred)
 // CHECK-NOT: hc.store
 func.func @store_layout_bearing_buffer_dest(
     %c_tile: !hc.buffer<f32, ["16", "16"]>,

@@ -216,10 +216,12 @@ def test_pairwise_distance_native_compile(h: int) -> None:
 #   * Tile-aligned: shapes whose `(W1, W2)` are multiples of (8, 8)
 #     exercise full workgroups (one or many) and the cross-wave LDS
 #     pre-fill ordering against the collective reductions.
-#
-# Shapes whose `(W1, W2)` are NOT multiples of (8, 8) still miscompare
-# because the value-outs writeback walks the full workgroup tile without
-# a live-extent bound — tracked as a separate bead.
+#   * Partial last-tile across multiple workgroups: (16, 12, 8) has the
+#     first row of workgroups fully in-bounds and the second row clipped
+#     in `W2`. That's the dst-bounds-mask-on-store regime — the writeback
+#     gets `hc.yield_predicated mask = (i_0 + WO0 < W1) & (i_1 + WO1 <
+#     W2)` AND'd into the source mask, lowered through
+#     `hc.ptr_store_pred` so OOB lanes never write into the next row.
 @_RUN_HIP_INVOKE_TESTS
 @pytest.mark.parametrize(
     ("w1", "w2", "h"),
@@ -229,6 +231,7 @@ def test_pairwise_distance_native_compile(h: int) -> None:
         (8, 8, 8),
         (16, 8, 4),
         (8, 16, 4),
+        (16, 12, 8),
         (16, 16, 8),
         (32, 24, 16),
     ],

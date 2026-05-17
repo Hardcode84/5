@@ -2885,6 +2885,13 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
       ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
       ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
+      // `hc.and` / `hc.or` on scalar `!hc.pred` arrive here from
+      // `hc-load-store-to-generic`, which AND-s the source mask with
+      // the dst-bounds predicate inside the generic body. Other
+      // shapes flow through `hc-elementwise-to-generic` first and
+      // land here as scalar ops on i1 too.
+      ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
+      ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
       ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
       ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
       ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
@@ -3007,12 +3014,12 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   // post-flatten lowering (which used to clamp every mask to
   // all-false against the placeholder 1D kernel-arg dim).
   target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
-                      HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp, HCCmpGeOp,
-                      HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp, HCLoadOp,
-                      HCVLoadOp, HCLoadMaskOp, HCBufferViewOp, HCVecOp,
-                      HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp,
-                      HCOnesOp, HCFullOp, HCEmptyOp, HCSelectOp, HCStoreOp,
-                      HCForRangeOp, HCIfOp>();
+                      HCAndOp, HCOrOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp,
+                      HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp,
+                      HCLoadOp, HCVLoadOp, HCLoadMaskOp, HCBufferViewOp,
+                      HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp,
+                      HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp, HCSelectOp,
+                      HCStoreOp, HCForRangeOp, HCIfOp>();
 }
 
 // `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are

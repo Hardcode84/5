@@ -1029,24 +1029,32 @@ static Value coerceMaskToI1(OpBuilder &builder, Location loc, Value mask,
 //
 // Terminator handling:
 //   * `hc.yield` — surface the yielded SSAs verbatim through
-//     `yieldedOut` for the caller to feed into the enclosing
-//     `scf.for` carry or the per-lane store path.
-//   * `hc.yield_predicated` — position `i` becomes
-//     `arith.select(mask, val, outsVals[i])`, so masked-out lanes
-//     preserve the init (the outs-as-init carry the per-lane
-//     init-load just published). Mask is coerced to `i1` /
-//     `vector<Nxi1>` via UCC because the body-side carrier is often
-//     `!hc.pred` and the broader pipeline owns the actual
-//     pred-to-i1 resolution.
-// Apply the per-lane `hc.yield_predicated` to fold the masked
-// per-value result against its `outs` init. Each lane's yielded
-// value is selected against the lane's init via `arith.select`; the
-// mask is coerced to `i1` so it matches `arith.select`'s signature.
+//     `yieldedOut`; `yieldedMasksOut[i]` stays null so consumers
+//     route the unconditional path.
+//   * `hc.yield_predicated` — `yieldedOut[i]` carries the *raw*
+//     yielded SSA and `yieldedMasksOut[i]` carries the matching
+//     i1 / vector<Nxi1> mask. Consumers decide what to do with the
+//     pair: reduction carries / value-outs result composition blend
+//     via `arith.select(mask, raw, init)` (delegated to
+//     `blendOrPassthrough`); ptr-outs stores ride
+//     `hc.ptr_store_pred` instead of a read-modify-write blend so
+//     OOB lanes never touch the destination. The mask is coerced to
+//     `i1` here so downstream consumers always see the builtin form
+//     even when the body's mask carrier is `!hc.pred`.
+//
+// Splitting blend out of body-cloning is what fixes the global-AS
+// writeback race: a read-modify-write through `arith.select` on a
+// ptr-outs slot reloads the OOB-aliased cell on inactive lanes and
+// then writes it back, which clobbers a concurrent in-range write
+// from a neighbouring workgroup's tile to the same physical address.
+// `hc.ptr_store_pred` skips the dest read entirely on inactive
+// lanes.
 static LogicalResult
 cloneBodyPredicatedYield(OpBuilder &builder, HCGenericOp op,
                          HCYieldPredicatedOp pyield, ValueRange outsVals,
                          const IRMapping &mapping,
-                         SmallVectorImpl<Value> &yieldedOut) {
+                         SmallVectorImpl<Value> &yieldedOut,
+                         SmallVectorImpl<Value> &yieldedMasksOut) {
   auto vals = pyield.getValues();
   auto masks = pyield.getMasks();
   if (vals.size() != outsVals.size())
@@ -1055,22 +1063,29 @@ cloneBodyPredicatedYield(OpBuilder &builder, HCGenericOp op,
   if (vals.size() != masks.size())
     return op.emitOpError("yield_predicated values/masks size mismatch");
   yieldedOut.reserve(vals.size());
+  yieldedMasksOut.reserve(vals.size());
   Location loc = op.getLoc();
-  for (auto [v, m, init] : llvm::zip_equal(vals, masks, outsVals)) {
+  for (auto [v, m] : llvm::zip_equal(vals, masks)) {
     Value mapped = mapping.lookupOrDefault(v);
     Value mappedMask = mapping.lookupOrDefault(m);
     Value i1Mask = coerceMaskToI1(builder, loc, mappedMask, mapped.getType());
-    Value sel =
-        arith::SelectOp::create(builder, loc, i1Mask, mapped, init).getResult();
-    yieldedOut.push_back(sel);
+    yieldedOut.push_back(mapped);
+    yieldedMasksOut.push_back(i1Mask);
   }
   return success();
 }
 
+// `yieldedMasksOut` is parallel to `yieldedOut`; entry `i` is null
+// when the body terminates with plain `hc.yield`, and the coerced
+// i1 mask when it terminates with `hc.yield_predicated`. Callers
+// blend through `blendOrPassthrough` at the consumer site (carry,
+// value-outs composition) or feed the (val, mask) pair directly to
+// a predicated store.
 static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
                                ValueRange insVals, ValueRange outsVals,
                                const llvm::StringMap<Value> &iterScope,
-                               SmallVectorImpl<Value> &yieldedOut) {
+                               SmallVectorImpl<Value> &yieldedOut,
+                               SmallVectorImpl<Value> &yieldedMasksOut) {
   Block &src = op.getBody().front();
   IRMapping mapping;
   size_t pos = 0;
@@ -1086,17 +1101,31 @@ static LogicalResult cloneBody(OpBuilder &builder, HCGenericOp op,
     bindIterSymsInClone(builder, nested, cloned, iterScope, mapping);
   }
   yieldedOut.clear();
+  yieldedMasksOut.clear();
   if (auto yield = dyn_cast<HCYieldOp>(&term)) {
     yieldedOut.reserve(yield.getValues().size());
+    yieldedMasksOut.assign(yield.getValues().size(), Value{});
     for (Value v : yield.getValues())
       yieldedOut.push_back(mapping.lookupOrDefault(v));
     return success();
   }
   if (auto pyield = dyn_cast<HCYieldPredicatedOp>(&term))
     return cloneBodyPredicatedYield(builder, op, pyield, outsVals, mapping,
-                                    yieldedOut);
+                                    yieldedOut, yieldedMasksOut);
   return op.emitOpError(
       "body must end with `hc.yield` or `hc.yield_predicated`");
+}
+
+// Per-slot blend at a consumer site (reduction carry, value-outs
+// composition). Plain `hc.yield` slots have a null mask and pass
+// through unmodified; `hc.yield_predicated` slots fold via
+// `arith.select(mask, raw, init)` so the consumer sees the same
+// blended value the previous lowering produced inside the body.
+static Value blendOrPassthrough(OpBuilder &builder, Location loc, Value raw,
+                                Value mask, Value init) {
+  if (!mask)
+    return raw;
+  return arith::SelectOp::create(builder, loc, mask, raw, init).getResult();
 }
 
 // Materialize one lane's offset as `index`-typed SSA via
@@ -1176,12 +1205,26 @@ static void emitGroupLoad(OpBuilder &builder, Location loc, Value ptr,
 
 // Emit a contig group's store (scalar for `size == 1`, vector
 // `<G x T>` otherwise). Vector stores pack the per-lane scalars into
-// a vector via `vector.from_elements` at the boundary.
+// a vector via `vector.from_elements` at the boundary. When
+// `laneMasks` is non-empty the entire group is gated through
+// `hc.ptr_store_pred`: scalar groups feed the i1 mask directly,
+// vector groups pack lane masks into a `vector<Nxi1>` alongside the
+// value. Each contig group is uniformly masked or uniformly
+// unmasked — the iter-axis-based contig grouping never mixes the
+// two (a slot's mask comes from the body's predicated yield, which
+// is per-slot, not per-lane within a group).
 static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
                            Value baseAddr, const ContigGroup &g,
-                           ArrayRef<Value> laneVals) {
+                           ArrayRef<Value> laneVals,
+                           ArrayRef<Value> laneMasks) {
+  bool masked = !laneMasks.empty() && laneMasks[g.start];
   if (g.size == 1) {
-    HCPtrStoreOp::create(builder, loc, laneVals[g.start], baseAddr);
+    if (masked) {
+      HCPtrStorePredOp::create(builder, loc, laneVals[g.start], baseAddr,
+                               laneMasks[g.start]);
+    } else {
+      HCPtrStoreOp::create(builder, loc, laneVals[g.start], baseAddr);
+    }
     return;
   }
   SmallVector<Value> elems;
@@ -1191,7 +1234,20 @@ static void emitGroupStore(OpBuilder &builder, Location loc, Type elemTy,
   auto vecTy = mlir::VectorType::get({g.size}, elemTy);
   Value vec =
       vector::FromElementsOp::create(builder, loc, vecTy, elems).getResult();
-  HCPtrStoreOp::create(builder, loc, vec, baseAddr);
+  if (!masked) {
+    HCPtrStoreOp::create(builder, loc, vec, baseAddr);
+    return;
+  }
+  SmallVector<Value> maskElems;
+  maskElems.reserve(g.size);
+  for (int k = 0; k < g.size; ++k)
+    maskElems.push_back(laneMasks[g.start + k]);
+  auto maskTy =
+      mlir::VectorType::get({g.size}, IntegerType::get(elemTy.getContext(), 1));
+  Value maskVec =
+      vector::FromElementsOp::create(builder, loc, maskTy, maskElems)
+          .getResult();
+  HCPtrStorePredOp::create(builder, loc, vec, baseAddr, maskVec);
 }
 
 // Emit per-lane loads for every ptr-typed input of `op`, returning a
@@ -1280,10 +1336,18 @@ static SmallVector<Value> emitOutsInitLoadsPartitioned(
 // Emit per-output outs stores at parallel-iter scope. Mirrors the
 // init-load path: contig groups of size > 1 pack per-lane scalars
 // via `vector.from_elements`, scalar groups emit one `hc.ptr_store`.
+// When the pure-parallel caller supplied per-lane raw values and
+// masks (predicated yield, no reduction), the store routes through
+// `hc.ptr_store_pred` with the raw value and i1 mask instead of the
+// blended carry; inactive lanes never touch the destination, which
+// is what fixes the OOB-aliased-cell race on workgroup-shape edges.
+// `flatRaw` / `flatMasks` are empty when the carry shape applies
+// (plain yield, or any reduction nest).
 static void emitOutsStoresPartitioned(OpBuilder &builder, HCGenericOp op,
                                       ArrayRef<IterAxis> axes,
                                       ArrayRef<size_t> order, ArrayRef<int> p,
-                                      ValueRange flatFinals,
+                                      ValueRange flatFinals, ValueRange flatRaw,
+                                      ValueRange flatMasks,
                                       const llvm::StringMap<Value> &scope,
                                       sym::Store &store) {
   Location loc = op.getLoc();
@@ -1301,35 +1365,65 @@ static void emitOutsStoresPartitioned(OpBuilder &builder, HCGenericOp op,
     auto groups = findContigGroups(store, offs);
     Value ptr = op.getOuts()[oi];
     Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
+    // Pure-parallel + predicated yield (mask non-null on this slot
+    // for at least one parLane — same body produced every parLane so
+    // either all are null or all are set) drops to raw + mask and
+    // routes through `hc.ptr_store_pred`. The default carry path
+    // (`laneVals = flatFinals`) handles plain yield and reduction.
+    bool slotMasked = !flatMasks.empty() && flatMasks[0 * numOuts + oi];
     SmallVector<Value> laneVals(prodPar);
+    SmallVector<Value> laneMasks;
     for (int pl = 0; pl < prodPar; ++pl)
-      laneVals[pl] = flatFinals[pl * numOuts + oi];
+      laneVals[pl] = slotMasked ? flatRaw[pl * numOuts + oi]
+                                : flatFinals[pl * numOuts + oi];
+    if (slotMasked) {
+      laneMasks.resize(prodPar);
+      for (int pl = 0; pl < prodPar; ++pl)
+        laneMasks[pl] = flatMasks[pl * numOuts + oi];
+    }
     for (const ContigGroup &g : groups) {
       Value off = emitLaneOffset(builder, loc, origOff, scope, store, axes,
                                  order, p, parMask, g.start);
       Value addr = HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off)
                        .getResult();
-      emitGroupStore(builder, loc, elemTy, addr, g, laneVals);
+      emitGroupStore(builder, loc, elemTy, addr, g, laneVals, laneMasks);
     }
   }
 }
 
 // Clone the body for one lane: pick out the lane's ins, hand it the
 // current accumulator slot for its parallel-lane, run the body, and
-// stash the yielded values back into the accumulator. Partition /
-// reduction path doesn't expose iter-sym SSA bindings to the body —
-// `emitInsLoadsLaned` bakes deltas into the operand-offset side, and
-// the body's only iter-sym story today is the value-outs unroll in
-// `lowerValueOuts` — so we pass an empty iter scope and
-// `bindIterSymsInClone` no-ops. Wiring this up properly is a
-// follow-up if a body op ever references an iter sym from the
-// partition path.
-static LogicalResult emitOneLaneBody(OpBuilder &builder, HCGenericOp op,
-                                     int lane, ArrayRef<size_t> order,
-                                     ArrayRef<size_t> parOrder, ArrayRef<int> p,
-                                     ArrayRef<SmallVector<Value>> insLanes,
-                                     size_t numOuts,
-                                     MutableArrayRef<SmallVector<Value>> acc) {
+// stash the yielded values back into the accumulator.
+//
+// Iter-sym SSA bindings ride along through `scope` so body applies
+// (`hc.idx_apply`, `hc.pred_apply`) that name a free iter sym pick
+// up the lane-local SSA value `iv_a + delta_a` instead of staying
+// free. The dst-bounds predicate planted by
+// `hc-load-store-to-generic` is the today consumer; previously the
+// partition path passed an empty iter scope and the body's apply was
+// expected to be iter-sym-free (loaded ins bake deltas into the
+// address side via `emitInsLoadsLaned`). The delta materialization
+// folds to a no-op when every `p[a] == 1` (full coverage by the
+// outer scf.parallel induction var without further unroll), which
+// is the common case.
+//
+// `acc` carries the blended-against-prev-iter form so reduction nests
+// see a correct carry; `lastRaw` / `lastMask` capture this iter's
+// raw yielded value and i1 mask in parallel so a pure-parallel
+// (no reduction) caller can route ptr-outs through `hc.ptr_store_pred`
+// — same lane's last write is also its only write, so the "last"
+// snapshot is the per-lane snapshot in that case. Plain `hc.yield`
+// leaves `lastMask` null and the consumer treats the slot as
+// unconditional.
+static LogicalResult
+emitOneLaneBody(OpBuilder &builder, HCGenericOp op, int lane,
+                ArrayRef<IterAxis> axes, ArrayRef<size_t> order,
+                ArrayRef<size_t> parOrder, ArrayRef<int> p,
+                ArrayRef<SmallVector<Value>> insLanes, size_t numOuts,
+                const llvm::StringMap<Value> &scope,
+                MutableArrayRef<SmallVector<Value>> acc,
+                MutableArrayRef<SmallVector<Value>> lastRaw,
+                MutableArrayRef<SmallVector<Value>> lastMask) {
   SmallVector<int, 4> delta = decomposeLane(lane, order, p);
   int parLane = computeSubLane(delta, parOrder, p);
   SmallVector<Value> insVals(insLanes.size());
@@ -1337,25 +1431,59 @@ static LogicalResult emitOneLaneBody(OpBuilder &builder, HCGenericOp op,
     insVals[ii] = insLanes[ii][lane];
   SmallVector<Value> outsVals = acc[parLane];
   SmallVector<Value> yielded;
-  llvm::StringMap<Value> emptyIterScope;
-  if (failed(
-          cloneBody(builder, op, insVals, outsVals, emptyIterScope, yielded)))
+  SmallVector<Value> masks;
+  llvm::StringMap<Value> laneIterScope = scope;
+  Location loc = op.getLoc();
+  for (auto [ax, d] : llvm::zip_equal(axes, delta)) {
+    Value base = scope.lookup(ax.name);
+    if (!base)
+      continue;
+    if (d == 0) {
+      laneIterScope[ax.name] = base;
+      continue;
+    }
+    Value deltaConst =
+        arith::ConstantIndexOp::create(builder, loc, d).getResult();
+    laneIterScope[ax.name] =
+        arith::AddIOp::create(builder, loc, base, deltaConst).getResult();
+  }
+  if (failed(cloneBody(builder, op, insVals, outsVals, laneIterScope, yielded,
+                       masks)))
     return failure();
   if (yielded.size() != numOuts)
     return op.emitOpError("body yielded wrong arity");
-  acc[parLane] = std::move(yielded);
+  for (size_t oi = 0; oi < numOuts; ++oi) {
+    acc[parLane][oi] =
+        blendOrPassthrough(builder, loc, yielded[oi], masks[oi], outsVals[oi]);
+    lastRaw[parLane][oi] = yielded[oi];
+    lastMask[parLane][oi] = masks[oi];
+  }
   return success();
 }
+
+// Per-output bundle the partition path threads through to its store
+// emitter. `blended` is the carry form that scf.for / scf.reduce
+// expects (raw on plain yield, `arith.select(mask, raw, init)` on
+// predicated yield). `raw` / `mask` are the unblended pair the
+// pure-parallel ptr-outs store path needs to swap the
+// load-select-store sequence for a single `hc.ptr_store_pred` — the
+// fix for the global-AS writeback race on workgroup-shape-aliased
+// OOB cells.
+struct PartitionFlat {
+  SmallVector<Value> blended;
+  SmallVector<Value> raw;
+  SmallVector<Value> mask;
+};
 
 // Innermost body emission: loads ins for every lane, clones the body
 // `prod(p)` times in axis-order lex (rightmost varies fastest), and
 // threads the `prodPar * numOuts` accumulator through. Within one
 // invocation the body sees scalar ins (its lane's loaded value) and
 // scalar outs (the running accumulator at this body's parallel-lane
-// slot); the post-body `acc[parLane] = yielded` assignment makes the
-// reduction-axis unrolls compose into the same accumulator slot in
-// declaration order.
-static FailureOr<SmallVector<Value>>
+// slot); the post-body `acc[parLane] = blendOrPassthrough(...)`
+// assignment makes the reduction-axis unrolls compose into the same
+// accumulator slot in declaration order.
+static FailureOr<PartitionFlat>
 emitInnerBodyClones(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
                     ArrayRef<size_t> order, ArrayRef<int> p,
                     ValueRange iterArgs, const llvm::StringMap<Value> &scope,
@@ -1377,23 +1505,36 @@ emitInnerBodyClones(OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
   SmallVector<SmallVector<Value>> insLanes =
       emitInsLoadsLaned(builder, op, axes, order, p, scope, store);
 
+  SmallVector<SmallVector<Value>> lastRaw(prodPar, SmallVector<Value>(numOuts));
+  SmallVector<SmallVector<Value>> lastMask(prodPar,
+                                           SmallVector<Value>(numOuts));
   for (int lane = 0; lane < prodAll; ++lane)
-    if (failed(emitOneLaneBody(builder, op, lane, order, parOrder, p, insLanes,
-                               numOuts, acc)))
+    if (failed(emitOneLaneBody(builder, op, lane, axes, order, parOrder, p,
+                               insLanes, numOuts, scope, acc, lastRaw,
+                               lastMask)))
       return failure();
 
-  SmallVector<Value> flat;
-  flat.reserve(prodPar * numOuts);
+  PartitionFlat out;
+  out.blended.reserve(prodPar * numOuts);
+  out.raw.reserve(prodPar * numOuts);
+  out.mask.reserve(prodPar * numOuts);
   for (int pl = 0; pl < prodPar; ++pl)
-    for (size_t oi = 0; oi < numOuts; ++oi)
-      flat.push_back(acc[pl][oi]);
-  return flat;
+    for (size_t oi = 0; oi < numOuts; ++oi) {
+      out.blended.push_back(acc[pl][oi]);
+      out.raw.push_back(lastRaw[pl][oi]);
+      out.mask.push_back(lastMask[pl][oi]);
+    }
+  return out;
 }
 
 // Reduction nest with per-axis step `p[a]`. Each `scf.for` carries
 // the same `prodPar * numOuts` flat accumulator through `iter_args`;
 // the innermost level invokes `emitInnerBodyClones` to expand the
 // `prod(p)` body invocations and yields the updated accumulator.
+// The reduction path carries the *blended* form across iters — the
+// raw / mask snapshot from `PartitionFlat` is meaningful only for
+// pure-parallel callers (one body invocation per parLane) and is
+// dropped here.
 static FailureOr<SmallVector<Value>> emitReductionNestPartitioned(
     OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
     ArrayRef<size_t> order, ArrayRef<int> p, ArrayRef<size_t> redOrder,
@@ -1406,9 +1547,13 @@ static FailureOr<SmallVector<Value>> emitReductionNestPartitioned(
       build = [&](size_t depth, ValueRange iterArgs,
                   llvm::StringMap<Value> &localScope)
       -> FailureOr<SmallVector<Value>> {
-    if (depth == redOrder.size())
-      return emitInnerBodyClones(builder, op, axes, order, p, iterArgs,
-                                 localScope, store);
+    if (depth == redOrder.size()) {
+      auto flat = emitInnerBodyClones(builder, op, axes, order, p, iterArgs,
+                                      localScope, store);
+      if (failed(flat))
+        return failure();
+      return std::move(flat->blended);
+    }
     size_t a = redOrder[depth];
     StringRef name = axes[a].name;
     Value bound = castIdxToIndex(builder, loc, bounds[a]);
@@ -1435,6 +1580,16 @@ static FailureOr<SmallVector<Value>> emitReductionNestPartitioned(
 // Lower one parallel-iter invocation. Loads outs initial values,
 // either emits the body directly (when there are no reduction axes)
 // or wraps an scf.for reduction nest, then stores the finals.
+//
+// Pure-parallel routes ptr-outs through `hc.ptr_store_pred` when the
+// body terminates with `hc.yield_predicated`: the same lane stores
+// at most once, so the per-lane (raw, mask) pair the body just
+// yielded fully describes the write and the read-modify-write
+// blend is redundant and OOB-aliased-race-prone. Reduction nests
+// carry the blend across iters (the carry shape needs it) and store
+// the final blended value unconditionally; a masked-everywhere
+// reduction still hits the same race against the init load and is
+// tracked separately.
 static LogicalResult lowerPartitionPerParallelBody(
     OpBuilder &builder, HCGenericOp op, ArrayRef<IterAxis> axes,
     ArrayRef<size_t> order, ArrayRef<int> p, ArrayRef<size_t> redOrder,
@@ -1442,12 +1597,16 @@ static LogicalResult lowerPartitionPerParallelBody(
   SmallVector<Value> initOuts =
       emitOutsInitLoadsPartitioned(builder, op, axes, order, p, scope, store);
   SmallVector<Value> finals;
+  SmallVector<Value> finalsRaw;
+  SmallVector<Value> finalsMask;
   if (redOrder.empty()) {
-    auto yielded = emitInnerBodyClones(builder, op, axes, order, p, initOuts,
-                                       scope, store);
-    if (failed(yielded))
+    auto flat = emitInnerBodyClones(builder, op, axes, order, p, initOuts,
+                                    scope, store);
+    if (failed(flat))
       return failure();
-    finals = std::move(*yielded);
+    finals = std::move(flat->blended);
+    finalsRaw = std::move(flat->raw);
+    finalsMask = std::move(flat->mask);
   } else {
     auto reduced = emitReductionNestPartitioned(
         builder, op, axes, order, p, redOrder, initOuts, scope, store);
@@ -1455,7 +1614,8 @@ static LogicalResult lowerPartitionPerParallelBody(
       return failure();
     finals = std::move(*reduced);
   }
-  emitOutsStoresPartitioned(builder, op, axes, order, p, finals, scope, store);
+  emitOutsStoresPartitioned(builder, op, axes, order, p, finals, finalsRaw,
+                            finalsMask, scope, store);
   return success();
 }
 
@@ -1687,9 +1847,11 @@ static Value loadCollectiveOperandElement(OpBuilder &builder, Location loc,
 
 // Store one yielded scalar back at `off` against the ptr at `ptr`,
 // inserting the symmetric UCC bridge if the body's element type
-// differs from the LDS pointer's surrogate.
+// differs from the LDS pointer's surrogate. A non-null `mask` routes
+// through `hc.ptr_store_pred` so inactive lanes never touch the
+// destination.
 static void storeCollectiveYielded(OpBuilder &builder, Location loc, Value ptr,
-                                   Value off, Value yielded) {
+                                   Value off, Value yielded, Value mask) {
   Type elemTy = cast<PtrType>(ptr.getType()).getElementType();
   Value addr =
       HCPtrOffsetOp::create(builder, loc, ptr.getType(), ptr, off).getResult();
@@ -1697,7 +1859,10 @@ static void storeCollectiveYielded(OpBuilder &builder, Location loc, Value ptr,
   if (toStore.getType() != elemTy)
     toStore = UnrealizedConversionCastOp::create(builder, loc, elemTy, toStore)
                   .getResult(0);
-  HCPtrStoreOp::create(builder, loc, toStore, addr);
+  if (mask)
+    HCPtrStorePredOp::create(builder, loc, toStore, addr, mask);
+  else
+    HCPtrStoreOp::create(builder, loc, toStore, addr);
 }
 
 // Load every ins / outs operand at its composed offset under
@@ -1732,20 +1897,24 @@ static void loadCollectiveOperands(OpBuilder &builder, Location loc,
 // setup above; `bindIterSymsInClone` only acts on names the apply's
 // pred/expr actually references and that aren't already in the
 // apply's `symbols` list, so any unused entries are harmless.
+// Predicated yield slots route through `hc.ptr_store_pred`; plain
+// yield slots use the unconditional store.
 static LogicalResult
 emitCollectiveChunkInRange(OpBuilder &builder, Location loc, HCGenericOp op,
                            ArrayRef<Value> outsPtrs, ValueRange insVals,
                            ValueRange outsVals,
                            const llvm::StringMap<Value> &scope) {
   SmallVector<Value> yielded;
-  if (failed(cloneBody(builder, op, insVals, outsVals, scope, yielded)))
+  SmallVector<Value> masks;
+  if (failed(cloneBody(builder, op, insVals, outsVals, scope, yielded, masks)))
     return failure();
   if (yielded.size() != op.getOuts().size())
     return op.emitOpError("body yielded wrong arity");
   ArrayAttr outsOff = op.getOutsOffsetsAttr();
   for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
     Value off = emitOffset(builder, loc, getOperandOffset(outsOff, oi), scope);
-    storeCollectiveYielded(builder, loc, outsPtrs[oi], off, yielded[oi]);
+    storeCollectiveYielded(builder, loc, outsPtrs[oi], off, yielded[oi],
+                           masks[oi]);
   }
   return success();
 }
@@ -1779,6 +1948,22 @@ static CollectiveIterSplit splitCollectiveIters(HCGenericOp op,
     }
   }
   return out;
+}
+
+// Per-slot reduction carry fold: collapses to raw `yielded[oi]` on
+// plain yield (`masks[oi]` null) and to `arith.select(mask, yielded,
+// carry)` on predicated yield, matching the carry semantics the
+// pre-cloneBody-split lowering produced inside the body.
+static SmallVector<Value> blendYieldedAgainstCarry(OpBuilder &builder,
+                                                   Location loc,
+                                                   ArrayRef<Value> yielded,
+                                                   ArrayRef<Value> masks,
+                                                   ValueRange carries) {
+  SmallVector<Value> blended(yielded.size());
+  for (size_t oi = 0; oi < yielded.size(); ++oi)
+    blended[oi] =
+        blendOrPassthrough(builder, loc, yielded[oi], masks[oi], carries[oi]);
+  return blended;
 }
 
 // Reduction-iter shape for the chunk body: load each outs init at the
@@ -1824,12 +2009,13 @@ static LogicalResult emitCollectiveChunkReductionNest(
       }
       SmallVector<Value> outsVals(carries.begin(), carries.end());
       SmallVector<Value> yielded;
-      if (failed(
-              cloneBody(builder, op, insVals, outsVals, localScope, yielded)))
+      SmallVector<Value> masks;
+      if (failed(cloneBody(builder, op, insVals, outsVals, localScope, yielded,
+                           masks)))
         return failure();
       if (yielded.size() != op.getOuts().size())
         return op.emitOpError("body yielded wrong arity");
-      return yielded;
+      return blendYieldedAgainstCarry(builder, loc, yielded, masks, carries);
     }
     size_t ri = split.redIdx[depth];
     Value c0 = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
@@ -1857,10 +2043,17 @@ static LogicalResult emitCollectiveChunkReductionNest(
   auto finals = build(0, ValueRange(outsInit), nestScope);
   if (failed(finals))
     return failure();
+  // Reduction final: store the carry value back unconditionally —
+  // any per-iter masking has already folded into the carry via
+  // `blendOrPassthrough` above. A reduction with the mask false on
+  // every iter still writes the init back; that's the OOB-aliased-
+  // race surface the pure-parallel `hc.ptr_store_pred` path
+  // dodges, tracked separately for the reduction shape.
   for (size_t oi = 0; oi < op.getOuts().size(); ++oi) {
     Value off =
         emitOffset(builder, loc, getOperandOffset(outsOff, oi), parScope);
-    storeCollectiveYielded(builder, loc, outsPtrs[oi], off, (*finals)[oi]);
+    storeCollectiveYielded(builder, loc, outsPtrs[oi], off, (*finals)[oi],
+                           /*mask=*/Value{});
   }
   return success();
 }
@@ -2358,11 +2551,21 @@ emitOutsInit(OpBuilder &builder, Location loc, HCGenericOp op,
 // otherwise have nothing to look these up against once generic
 // unrolling lifts the body out from under its launch ancestor
 // walker.
+// `finals` / `finalsRaw` / `finalsMask` are parallel `[lane][oi]`
+// buffers: `finals` carries the value the consumer should see for
+// plain yield (and the `arith.select`-blended form for predicated
+// yield's value-outs slot consumers); `finalsRaw` / `finalsMask`
+// preserve the body's raw yielded value and the i1 mask so ptr-outs
+// slots can route through `hc.ptr_store_pred` instead of a
+// read-modify-write blend. Plain-yield slots keep `finalsMask[lane][oi]
+// == nullptr` so the consumer routes the unconditional path.
 static LogicalResult emitBodyClonesPerLane(
     OpBuilder &builder, Location loc, HCGenericOp op, ArrayRef<IterAxis> axes,
     const ValueOutsLanes &lanes, ArrayRef<SmallVector<Value>> insLanes,
     ArrayRef<SmallVector<Value>> outsInit, const llvm::StringMap<Value> &scope,
-    SmallVectorImpl<SmallVector<Value>> &finals) {
+    SmallVectorImpl<SmallVector<Value>> &finals,
+    SmallVectorImpl<SmallVector<Value>> &finalsRaw,
+    SmallVectorImpl<SmallVector<Value>> &finalsMask) {
   size_t numIns = op.getIns().size();
   size_t numOuts = op.getOuts().size();
   for (int64_t lane = 0; lane < lanes.prodPar; ++lane) {
@@ -2376,18 +2579,27 @@ static LogicalResult emitBodyClonesPerLane(
       laneIterScope[ax.name] =
           arith::ConstantIndexOp::create(builder, loc, c).getResult();
     SmallVector<Value> yielded;
+    SmallVector<Value> masks;
     if (failed(cloneBody(builder, op, insVals, outsInit[lane], laneIterScope,
-                         yielded)))
+                         yielded, masks)))
       return failure();
     if (yielded.size() != numOuts)
       return op.emitOpError("body yielded wrong arity");
-    finals[lane] = std::move(yielded);
+    finalsRaw[lane] = yielded;
+    finalsMask[lane] = masks;
+    finals[lane].resize(numOuts);
+    for (size_t oi = 0; oi < numOuts; ++oi)
+      finals[lane][oi] = blendOrPassthrough(builder, loc, yielded[oi],
+                                            masks[oi], outsInit[lane][oi]);
   }
   return success();
 }
 
 // Ptr-typed outs ride the same per-parLane store path the partition
-// emitter uses, with contig-group merging on the writes.
+// emitter uses, with contig-group merging on the writes. Predicated
+// yield slots use the raw value + i1 mask through `hc.ptr_store_pred`
+// so OOB lanes never touch the destination; plain yield slots route
+// the unconditional shape.
 static void emitPtrOutsStores(OpBuilder &builder, Location loc, HCGenericOp op,
                               size_t oi, Value v, ExprAttr origOff,
                               ArrayRef<IterAxis> axes, ArrayRef<size_t> order,
@@ -2395,20 +2607,28 @@ static void emitPtrOutsStores(OpBuilder &builder, Location loc, HCGenericOp op,
                               int64_t prodPar,
                               const llvm::StringMap<Value> &scope,
                               sym::Store &store,
-                              ArrayRef<SmallVector<Value>> finals) {
+                              ArrayRef<SmallVector<Value>> finalsRaw,
+                              ArrayRef<SmallVector<Value>> finalsMask) {
   Type elemTy = cast<PtrType>(v.getType()).getElementType();
   SmallVector<sym::ExprHandle> offs =
       laneOffsets(store, origOff, axes, order, p, parMask, prodPar);
   auto groups = findContigGroups(store, offs);
-  SmallVector<Value> laneFinals(prodPar);
+  bool slotMasked = prodPar > 0 && finalsMask[0][oi];
+  SmallVector<Value> laneVals(prodPar);
+  SmallVector<Value> laneMasks;
   for (int64_t parLane = 0; parLane < prodPar; ++parLane)
-    laneFinals[parLane] = finals[parLane][oi];
+    laneVals[parLane] = finalsRaw[parLane][oi];
+  if (slotMasked) {
+    laneMasks.resize(prodPar);
+    for (int64_t parLane = 0; parLane < prodPar; ++parLane)
+      laneMasks[parLane] = finalsMask[parLane][oi];
+  }
   for (const ContigGroup &g : groups) {
     Value off = emitLaneOffset(builder, loc, origOff, scope, store, axes, order,
                                p, parMask, g.start);
     Value addr =
         HCPtrOffsetOp::create(builder, loc, v.getType(), v, off).getResult();
-    emitGroupStore(builder, loc, elemTy, addr, g, laneFinals);
+    emitGroupStore(builder, loc, elemTy, addr, g, laneVals, laneMasks);
   }
 }
 
@@ -2447,8 +2667,10 @@ emitValueOutResult(OpBuilder &builder, Location loc, HCGenericOp op, size_t oi,
       .getResult(0);
 }
 
-// Walk every out: emit the ptr-store contig group (no result), or
-// compose the value-out vector result into `opResults`.
+// Walk every out: emit the ptr-store contig group (no result, ptr
+// slot uses `hc.ptr_store_pred` for predicated yield), or compose
+// the value-out vector result into `opResults` from the blended
+// finals.
 static LogicalResult
 emitOutsFinalize(OpBuilder &builder, Location loc, HCGenericOp op,
                  ArrayRef<SmallVector<int64_t>> slotPerOut, ArrayAttr outsOff,
@@ -2456,12 +2678,15 @@ emitOutsFinalize(OpBuilder &builder, Location loc, HCGenericOp op,
                  ArrayRef<int> p, ArrayRef<bool> parMask, int64_t prodPar,
                  const llvm::StringMap<Value> &scope, sym::Store &store,
                  ArrayRef<SmallVector<Value>> finals,
+                 ArrayRef<SmallVector<Value>> finalsRaw,
+                 ArrayRef<SmallVector<Value>> finalsMask,
                  SmallVectorImpl<Value> &opResults) {
   size_t resultIdx = 0;
   for (auto [oi, v] : llvm::enumerate(op.getOuts())) {
     if (isa<PtrType>(v.getType())) {
       emitPtrOutsStores(builder, loc, op, oi, v, getOperandOffset(outsOff, oi),
-                        axes, order, p, parMask, prodPar, scope, store, finals);
+                        axes, order, p, parMask, prodPar, scope, store,
+                        finalsRaw, finalsMask);
       continue;
     }
     FailureOr<Value> result = emitValueOutResult(
@@ -2532,14 +2757,19 @@ static LogicalResult lowerValueOuts(HCGenericOp op, ArrayRef<IterAxis> axes) {
 
   SmallVector<SmallVector<Value>> finals(
       lanes->prodPar, SmallVector<Value>(op.getOuts().size()));
+  SmallVector<SmallVector<Value>> finalsRaw(
+      lanes->prodPar, SmallVector<Value>(op.getOuts().size()));
+  SmallVector<SmallVector<Value>> finalsMask(
+      lanes->prodPar, SmallVector<Value>(op.getOuts().size()));
   if (failed(emitBodyClonesPerLane(builder, loc, op, axes, *lanes, insLanes,
-                                   outsInit, scope, finals)))
+                                   outsInit, scope, finals, finalsRaw,
+                                   finalsMask)))
     return failure();
 
   SmallVector<Value, 2> opResults(op.getNumResults());
   if (failed(emitOutsFinalize(builder, loc, op, *slotPerOut, outsOff, axes,
                               order, p, parMask, lanes->prodPar, scope, store,
-                              finals, opResults)))
+                              finals, finalsRaw, finalsMask, opResults)))
     return failure();
   op->replaceAllUsesWith(opResults);
   return success();

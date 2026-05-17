@@ -1541,6 +1541,26 @@ preflightStoreLayoutBearing(MLIRContext *ctx, sym::Store &store, HCStoreOp op,
   return pf;
 }
 
+// Stash the destination's per-axis symbolic shape on `pf.dstShape`
+// so `populateStoreBody` can compose the OOB-store guard
+// (`offset_k < dstDim_k`) over the decomposed outs offsets. Only
+// fires when the rank matches the iter-axis count
+// (`composeMemoryOffsetArray` emits one offset per iter sym, so the
+// conjunction zips cleanly only when the access is per-axis
+// identity), and skips empty-index whole-tensor writes
+// (`hc.store %dst[]`): the offsets are identity over iter syms but
+// the dst shape equals the tile shape by construction so the bound
+// is vacuously true and emitting it just bloats the body.
+static void capturePlainStoreDstShape(HCStoreOp op, ValueRange indices,
+                                      StorePreflight &pf) {
+  if (indices.empty())
+    return;
+  auto dstShape = getOperandShape(op.getDest().getType());
+  if (failed(dstShape) || dstShape->size() != pf.tileShape.size())
+    return;
+  pf.dstShape = std::move(*dstShape);
+}
+
 // Validates the store's operand shapes and element types. Tensor-dst
 // is rejected (separate slice); src and dst element types must match;
 // when present, mask must match `src`'s tile shape (the
@@ -1589,16 +1609,32 @@ preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
   pf.srcElem = srcElem;
   pf.dstElem = dstElem;
   pf.maskElem = maskElem;
+  capturePlainStoreDstShape(op, indices, pf);
   return pf;
 }
 
 // Build the body block of the store generic: src arg, optional mask
-// arg, dst arg, terminated with `hc.yield_predicated` (masked) or
-// plain `hc.yield`. The masked terminator routes through
-// `hc.ptr_store_pred` downstream so masked-out lanes leave the
-// existing dst contents in place.
+// arg, dst arg, terminated with `hc.yield_predicated` (when any
+// predicate is in play) or plain `hc.yield`. The masked terminator
+// routes through `hc.ptr_store_pred` downstream so masked-out lanes
+// leave the existing dst contents in place.
+//
+// `destBoundsPred` (optional) is a conjunction `offset_k < dstDim_k`
+// composed from the per-axis decomposed outs offset against the
+// underlying destination shape. The body materializes it via
+// `hc.pred_apply ()` (iter syms bind ambiently when the lower-generic
+// pass clones the body per-lane), bridges through a UCC to the
+// unpinned `!hc.pred` carrier the yield slot expects, and ANDs it
+// with the optional source mask. This is the OOB-write guard the
+// load side has had since day one — the store side was missing it,
+// and OOB lanes (workgroup-tile edges where (W1, W2) isn't a
+// multiple of `group_shape`) ended up writing past the live extent
+// into the next row's address space. The downstream
+// `hc-fold-predicates` pass folds away the bounds check when ixsimpl
+// can prove the conjunction is always true.
 static void populateStoreBody(HCGenericOp generic, const StorePreflight &pf,
-                              Location loc, bool hasMask) {
+                              Location loc, bool hasMask,
+                              std::optional<sym::PredHandle> destBoundsPred) {
   Block *body = new Block();
   BlockArgument sv = body->addArgument(pf.srcElem, loc);
   BlockArgument mv;
@@ -1607,9 +1643,36 @@ static void populateStoreBody(HCGenericOp generic, const StorePreflight &pf,
   body->addArgument(pf.dstElem, loc);
   generic.getBody().push_back(body);
   OpBuilder bodyBuilder(body, body->begin());
-  if (hasMask)
+  MLIRContext *ctx = bodyBuilder.getContext();
+
+  Value boundPredVal;
+  if (destBoundsPred) {
+    Type unpinnedPredTy = PredType::get(ctx, PredAttr{});
+    PredAttr predAttr = PredAttr::get(ctx, *destBoundsPred);
+    Type pinnedTy = PredType::get(ctx, predAttr);
+    Value pinned = HCPredApplyOp::create(bodyBuilder, loc, pinnedTy,
+                                         /*operands=*/ValueRange{},
+                                         bodyBuilder.getStrArrayAttr({}))
+                       .getResult();
+    boundPredVal = UnrealizedConversionCastOp::create(bodyBuilder, loc,
+                                                      unpinnedPredTy, pinned)
+                       .getResult(0);
+  }
+
+  Value finalPred;
+  if (hasMask && boundPredVal) {
+    finalPred =
+        HCAndOp::create(bodyBuilder, loc, mv.getType(), mv, boundPredVal)
+            .getResult();
+  } else if (hasMask) {
+    finalPred = mv;
+  } else if (boundPredVal) {
+    finalPred = boundPredVal;
+  }
+
+  if (finalPred)
     HCYieldPredicatedOp::create(bodyBuilder, loc, ValueRange{sv},
-                                ValueRange{mv});
+                                ValueRange{finalPred});
   else
     HCYieldOp::create(bodyBuilder, loc, ValueRange{sv});
 }
@@ -1659,6 +1722,24 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
   ArrayAttr insOffsets = ArrayAttr::get(ctx, insOffArr);
   ArrayAttr outsOffsets = ArrayAttr::get(ctx, {*outOffArr});
 
+  // OOB-store guard: when the destination shape is known per-axis
+  // (layout-bearing dest path captures it as `pf->dstShape`), compose
+  // the `offset_k < dstDim_k` conjunction over the *decomposed* outs
+  // offsets the same way the load side composes its
+  // `hc.load_mask` predicate. `maskConjunctionFromOffsets` failing on
+  // an axis (non-`ExprAttr` entry, non-decomposable cmp) drops the
+  // guard for the whole store — the alternative is a partial guard
+  // that lets some axes through unchecked, and "we'd rather emit no
+  // guard than the wrong guard" is the safer fallback at this layer
+  // since the upstream `hc.full_mask` carrier on the source side is
+  // still in play.
+  std::optional<sym::PredHandle> destBoundsPred;
+  if (!pf->dstShape.empty()) {
+    auto conj = maskConjunctionFromOffsets(store, *outOffArr, pf->dstShape);
+    if (succeeded(conj))
+      destBoundsPred = *conj;
+  }
+
   SmallVector<Value> outsArr{dst};
   auto generic = HCGenericOp::create(
       builder, loc, /*resultTypes=*/TypeRange{}, common.iterSymsAttr,
@@ -1666,7 +1747,7 @@ static LogicalResult rewriteStore(HCStoreOp op, sym::Store &store) {
       ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  populateStoreBody(generic, *pf, loc, /*hasMask=*/(bool)mask);
+  populateStoreBody(generic, *pf, loc, /*hasMask=*/(bool)mask, destBoundsPred);
 
   op->erase();
   return success();

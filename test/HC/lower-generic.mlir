@@ -407,6 +407,85 @@ func.func @scalar_fallback_index_bound(%n: index,
 
 // -----
 
+// Partition path + `hc.yield_predicated` on a pure-parallel
+// generic with a ptr out. The body produces a per-lane (raw, mask)
+// pair; the lowering threads the mask through and routes the
+// writeback through `hc.ptr_store_pred` so inactive lanes never
+// touch the destination. The dst init load + carry blend the old
+// read-modify-write shape would feed to an unconditional store
+// linger as dead SSA (later DCE'd by canonicalize) but never
+// reach a store: the only write against `%c` is the predicated
+// one, which consumes the raw yielded value directly. We check
+// that invariant by forbidding any surviving unconditional
+// `hc.ptr_store %{val}, %{ptr}` against an `f32` source.
+// CHECK-LABEL: func.func @partition_pred_yield_scalar
+// CHECK: scf.parallel (%[[I:[^)]+]])
+// CHECK:   hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f32> -> f32
+// CHECK:   hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, !hc.pred> -> !hc.pred
+// CHECK:   builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.pred to i1
+// CHECK:   hc.ptr_store_pred %{{[^,]+}}, %{{[^,]+}}, %{{[^ ]+}} : f32, !hc.ptr<global, f32>, i1
+// CHECK-NOT: hc.ptr_store %{{[^,]+}}, %{{[^ ]+}} : f32
+// CHECK-NOT: hc.generic
+func.func @partition_pred_yield_scalar(%n: index,
+                                       %m: !hc.ptr<global, !hc.pred>,
+                                       %a: !hc.ptr<global, f32>,
+                                       %c: !hc.ptr<global, f32>) {
+  hc.generic
+      iter (parallel i = %n : index)
+      ins (%a at [#hc.expr<"i">] : !hc.ptr<global, f32>,
+           %m at [#hc.expr<"i">] : !hc.ptr<global, !hc.pred>)
+      outs (%c at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%av: f32, %mv: !hc.pred, %cv: f32):
+    hc.yield_predicated %av mask %mv : (f32), (!hc.pred)
+  }
+  return
+}
+
+// -----
+
+// Partition path + `hc.yield_predicated` over a vectorisable
+// contig run. With per-axis factor 32 on the inner iter the merge
+// probe folds every lane into one width-32 group; the body
+// computes its mask via `hc.pred_apply` against the iter sym (the
+// canonical "is `i` inside the live extent" shape the higher-level
+// passes emit when masking off the OOB tail of a fixed-step
+// partition) and yields a scalar predicated value per lane. The
+// lowering packs the per-lane raws + masks into a
+// `vector<32xf32>` / `vector<32xi1>` pair and writes back via one
+// `hc.ptr_store_pred`. The pre-store dst init load + per-lane
+// select blend the old shape would emit is dead (DCE'd by the
+// post-pass canonicalize); the predicated store is the only
+// surviving write against the dst, which we pin by forbidding any
+// surviving unconditional vector-typed `hc.ptr_store`.
+// CHECK-LABEL: func.func @partition_pred_yield_vec
+// CHECK: %[[STEP:[^ ]+]] = arith.constant 32 : index
+// CHECK: scf.parallel (%[[I:[^)]+]]) = {{.*}} step (%[[STEP]])
+// CHECK:   hc.ptr_load %{{[^ ]+}} : !hc.ptr<global, f32> -> vector<32xf32>
+// CHECK:   vector.from_elements {{.*}} : vector<32xf32>
+// CHECK:   vector.from_elements {{.*}} : vector<32xi1>
+// CHECK:   hc.ptr_store_pred %{{[^,]+}}, %{{[^,]+}}, %{{[^ ]+}} : vector<32xf32>, !hc.ptr<global, f32>, vector<32xi1>
+// CHECK-NOT: hc.ptr_store %{{[^,]+}}, %{{[^ ]+}} : vector<32xf32>
+// CHECK-NOT: hc.generic
+func.func @partition_pred_yield_vec(%a: !hc.ptr<global, f32>,
+                                    %c: !hc.ptr<global, f32>) {
+  %n = hc.idx_apply () : () -> !hc.idx<"32">
+  hc.generic
+      iter (parallel i = %n : !hc.idx<"32">)
+      ins (%a at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      outs (%c at [#hc.expr<"i">] : !hc.ptr<global, f32>)
+      -> () {
+  ^bb0(%av: f32, %cv: f32):
+    %p_pinned = hc.pred_apply () : () -> !hc.pred<"i < 30">
+    %p = builtin.unrealized_conversion_cast %p_pinned
+        : !hc.pred<"i < 30"> to !hc.pred
+    hc.yield_predicated %av mask %p : (f32), (!hc.pred)
+  }
+  return
+}
+
+// -----
+
 // Collective dispatch: outs is a `!hc.ptr<workgroup, T>` (workgroup-staged
 // tile), every iter is parallel, and the op sits inside `gpu.launch`.
 // The pass picks the chunk-and-publish shape instead of `scf.parallel`
@@ -803,16 +882,21 @@ func.func @value_in_1d_ptr_out(%vec: !hc.bare_vector<f32, ["8"]>,
 // + ptr out + `hc.yield_predicated`. Per-lane materialization:
 // UCC value carrier to `vector<8xf32>`, UCC mask carrier to
 // `vector<8xi1>` (the `!hc.pred` element is mapped to `i1` for the
-// arith.select boundary), `arith.select(mask, val, init)` per lane,
-// then per-lane store. The init feeds the masked-out lanes so they
-// preserve the dst contents the per-lane init-load just published.
+// downstream consumer), pack the per-lane raws and masks via
+// `vector.from_elements`, and write back through a single
+// `hc.ptr_store_pred` of width 8. The predicated store skips the
+// destination read entirely on inactive lanes, fixing the
+// read-modify-write race a `select`-then-`ptr_store` shape would
+// have against a concurrent in-range write to the same OOB-aliased
+// physical address.
 // CHECK-LABEL: func.func @value_in_wmma_writeback
 // CHECK-NOT: scf.parallel
 // CHECK: builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.bare_vector<f32, ["8"]> to vector<8xf32>
 // CHECK: builtin.unrealized_conversion_cast %{{[^ ]+}} : !hc.bare_vector<!hc.pred, ["8"]> to vector<8xi1>
-// CHECK: hc.ptr_load
-// CHECK: arith.select
-// CHECK: hc.ptr_store
+// CHECK: %[[VEC:.+]] = vector.from_elements {{.*}} : vector<8xf32>
+// CHECK: %[[MASK:.+]] = vector.from_elements {{.*}} : vector<8xi1>
+// CHECK: hc.ptr_store_pred %[[VEC]], %{{[^ ]+}}, %[[MASK]] : vector<8xf32>, !hc.ptr<global, f32>, vector<8xi1>
+// CHECK-NOT: hc.ptr_store %{{[^ ]+}}, %{{[^ ]+}} : {{vector|f32}}
 // CHECK-NOT: hc.generic
 func.func @value_in_wmma_writeback(%vec: !hc.bare_vector<f32, ["8"]>,
                                    %pred: !hc.bare_vector<!hc.pred, ["8"]>,

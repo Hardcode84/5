@@ -2999,12 +2999,65 @@ static LogicalResult assertNoSemanticShapedSurvives(Operation *rootOp) {
   return success(!walk.wasInterrupted());
 }
 
+// Bare carriers (`!hc.bare_tensor` / `!hc.bare_vector`) collapse to
+// `!hc.ptr<workgroup, T>` / `!vector<...>` here, both of which need
+// the element count known at compile time — workgroup LDS is a
+// fixed per-CU resource and the AMDGPU vector type is sized at the
+// MLIR level. A bare carrier whose shape still carries a free symbol
+// after `hc-specialize-literals` would identity-convert through the
+// type converter (the converter's static-shape predicate fails) and
+// then surface as a vague "explicitly marked illegal" rejection on
+// the producer (`hc.zeros` / `hc.full` / `hc.load`). Catching it
+// here, before the partial conversion, names the offending op and
+// the unresolved sym so the user can pin it via
+// `hc.compile(symbols={...})` (or by adding it to the kernel's
+// `literals=` whitelist) instead of decoding the post-conversion
+// failure two stages later. The symbolic-dim ergonomic case is
+// tracked separately — eventually a per-thread register-tile path
+// would let those bare carriers stay symbolic — but that's a
+// distinct architectural change; this gate just keeps the failure
+// mode honest in the meantime.
+static bool isStaticShape(ShapeAttr shape) {
+  if (!shape)
+    return true;
+  return succeeded(staticIntegerShape(shape, nullptr));
+}
+
+static LogicalResult assertBareCarriersAreStaticShape(Operation *rootOp) {
+  WalkResult walk = rootOp->walk([&](Operation *op) {
+    auto checkType = [&](Type type, StringRef role) -> WalkResult {
+      auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
+      if (!shaped || !isa<BareTensorType, BareVectorType>(type))
+        return WalkResult::advance();
+      if (isStaticShape(shaped.getSymbolicShape()))
+        return WalkResult::advance();
+      op->emitOpError("bare carrier ")
+          << type << " has a non-literal shape on " << role
+          << "; hc-lower-launch-body needs every dim resolved to an integer "
+             "literal to allocate the workgroup tile, so bind the free "
+             "symbol(s) via hc.compile(symbols={...}) (add the symbol to the "
+             "kernel decorator's `literals=` set if it isn't already)";
+      return WalkResult::interrupt();
+    };
+    for (Value v : op->getOperands())
+      if (WalkResult r = checkType(v.getType(), "operand"); r.wasInterrupted())
+        return r;
+    for (Type t : op->getResultTypes())
+      if (WalkResult r = checkType(t, "result"); r.wasInterrupted())
+        return r;
+    return WalkResult::advance();
+  });
+  return success(!walk.wasInterrupted());
+}
+
 struct HCLowerLaunchBodyPass
     : public hc::impl::HCLowerLaunchBodyBase<HCLowerLaunchBodyPass> {
   using Base::Base;
 
   void runOnOperation() override {
     if (failed(assertNoSemanticShapedSurvives(getOperation())))
+      return signalPassFailure();
+    if (failed(assertBareCarriersAreStaticShape(getOperation())))
       return signalPassFailure();
 
     MLIRContext *ctx = &getContext();

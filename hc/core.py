@@ -23,15 +23,8 @@ from ._intrinsic_recipes import (
 class BufferSpec:
     dimensions: tuple[Any, ...]
     dtype: str | None = None
-    # Optional captured `IndexMap` overriding the boundary's default
-    # fully-strided np/torch layout. The frontend lowering pass reads
-    # this off the resolved parameter annotation and stamps a structured
-    # `#hc.layout<...>` attribute on the matching parameter dict in
-    # `hc_front.kernel.parameters`, which `-convert-hc-front-to-hc`
-    # then uses verbatim instead of the default builder. `None` means
-    # "no override" — the C++ side falls back to its
-    # `$STRIDE_<i>_<argname>` layout, which is what every existing call
-    # site continues to get.
+    # Override the boundary's default fully-strided layout. `None`
+    # falls back to the C++ `$STRIDE_<i>_<argname>` layout.
     layout: IndexMap | None = None
 
     def __repr__(self) -> str:
@@ -86,11 +79,8 @@ class Buffer:
     def __class_getitem__(cls, item: Any) -> BufferSpec:
         if not isinstance(item, tuple):
             item = (item,)
-        # Trailing `IndexMap` (`Buffer[d1, d2, dtype, A_LAYOUT]`) is read
-        # as a layout override. `[]` syntax can't carry real kwargs, so
-        # the positional-by-type rule is the only way to attach a layout
-        # at the type-annotation surface — `IndexMap` is unambiguous
-        # against dims (`Symbol`/`int`/`Expr`) and dtypes (numpy types).
+        # Trailing `IndexMap` is a layout override: `[]` syntax has no
+        # kwargs, and IndexMap is unambiguous against dims and dtypes.
         layout: IndexMap | None = None
         if item and isinstance(item[-1], IndexMap):
             layout = item[-1]
@@ -144,14 +134,9 @@ class IndexMap:
     params: Callable[..., Any] | None
     storage_size: Callable[..., Any]
     offset: Callable[..., Any]
-    # Names the layout's `offset` / `storage_size` may reference
-    # without declaring them as shape / index / params syms. Resolved
-    # at access time from the surrounding kernel scope (kernel-arg
-    # aux, ancestor block argument, ambient launch geometry); see
-    # `doc/layouts.md` "Free symbols in layout offsets". Each name
-    # arrives in the lambdas as a keyword argument with a
-    # `hc.symbols.Symbol` value — `offset=lambda i, j, M, N, *, row0:
-    # ...` is the canonical signature shape.
+    # Names `offset` / `storage_size` reference outside shape / index /
+    # params. Each arrives as a `Symbol`-valued keyword arg; resolved
+    # at access time from kernel scope. See `doc/layouts.md`.
     free_syms: tuple[str, ...] = ()
 
 
@@ -182,12 +167,8 @@ def as_layout(
 ) -> Any:
     """Request an explicit layout on a layout-aware value.
 
-    `shape=` is only meaningful for pointer-rooted shaped values
-    (`!hc.buffer`-like wrappers): the layout's reinterpreted extent
-    isn't carried by the underlying pointer storage, so the caller
-    has to declare it explicitly — same way `hc.as_layout` carries
-    the reinterpreted shape on its result type when the source is a
-    buffer. Tensor/vector callers leave `shape=` as None.
+    `shape=` is required for buffer sources (pointer storage carries
+    no reinterpreted extent); tensor/vector callers leave it `None`.
     """
     method = getattr(value, "as_layout", None)
     if method is None:
@@ -267,8 +248,7 @@ def _register_sim_callable(fn: Callable[..., Any]) -> None:
 def _has_intrinsic_fallback_body(fn: Callable[..., Any]) -> bool:
     body = _function_body(fn)
     if body is None:
-        # Be conservative when source is unavailable: only obvious non-trivial
-        # bytecode counts as a simulator fallback body.
+        # No source: only non-trivial bytecode counts as a fallback body.
         return _has_nontrivial_fallback_bytecode(fn)
     return not _is_empty_fallback_body(body)
 
@@ -351,11 +331,8 @@ def _attach_intrinsic_hooks(fn: Callable[..., Any]) -> Callable[..., Any]:
                 target=target,
                 operand_names=_intrinsic_operand_names(intrinsic_fn, metadata),
                 attr_names=metadata.const_attrs,
-                # Recipes run after `hc-decompose-shaped-values`, which splits
-                # every shaped result into a `.data` + `.mask` pair (matching
-                # the operand-side split). Mirror that here so the recipe sees
-                # the same number of result handles the actual call site
-                # exposes once it reaches the interpreter pass.
+                # Post-decompose result count: each shaped result splits
+                # into `.data` + `.mask` (mirror operand-side split).
                 result_count=_intrinsic_result_count(metadata),
             )
             return cb
@@ -393,12 +370,8 @@ def _intrinsic_operand_names(
             and param.name in metadata.const_attrs
         ):
             continue
-        # Mirror the parameter-name split that `hc-decompose-shaped-values`
-        # performs on shaped operand types: a single `a_frag` declaration
-        # becomes `a_frag.data` + `a_frag.mask` at the call site once the
-        # decomposition pass runs. Recipes addressing operands by name need
-        # the same dotted form to land on the right index post-decompose;
-        # operands that aren't shaped (idx, undef, scalar) keep their name.
+        # Shaped operands split into `.data` + `.mask` post-decompose;
+        # idx/undef/scalar keep their bare name.
         kind = (
             None
             if operand_types is None or type_index >= len(operand_types)
@@ -414,9 +387,7 @@ def _intrinsic_operand_names(
 
 
 def _intrinsic_result_count(metadata: IntrinsicMetadata) -> int:
-    # Same `.data`/`.mask` split that the decomposition pass applies to
-    # shaped result types, counted at recipe-build time so the recipe records
-    # one handle per post-decomposition result.
+    # `.data` + `.mask` for each shaped result; one handle otherwise.
     count = 0
     for kind in metadata.result_types:
         if isinstance(kind, TensorTypeSpec | VectorTypeSpec):

@@ -37,11 +37,9 @@ def HCFront_IntrinsicOp : HCFront_RegionOp<"intrinsic"> {
   let assemblyFormat = "$name attr-dict-with-keyword $body";
 }
 
-// Operands and results across this dialect are uniformly `!hc_front.value`
-// (or, occasionally, `!hc_front.typeexpr`). Both are parameterless and therefore
-// buildable, so the declarative assembly format synthesizes the types without
-// needing explicit `type($x)` / `functional-type(...)` directives in the
-// spellings below.
+// Operands / results are uniformly `!hc_front.value` (occasionally
+// `!hc_front.typeexpr`). Both are parameterless, so assembly formats below
+// synthesize types implicitly — no `type($x)` / `functional-type(...)`.
 
 def HCFront_ConstantOp : HCFront_ValueProducer<"constant"> {
   let arguments = (ins AnyAttr:$value);
@@ -172,16 +170,12 @@ def HCFront_ReturnOp : HCFront_Op<"return"> {
   let assemblyFormat = "($values^)? attr-dict";
 }
 
-// `$name` carries the source-level identifier of the inner `def` Python
-// wrote to open the region. The Python emitter stamps it; the
-// `-hc-front-fold-region-defs` pass reads it to pair the region with the
-// ghost `hc_front.name {ref.kind = "local"} + hc_front.call` trail the
-// frontend emits for the immediate-call shape. Optional because
-// hand-written IR and round-trip fixtures need not carry it; both the
-// emitter and the fold pass treat absence as "unmatched". `$tail_return`
-// marks the `return inner()` ghost-call shape after folding: conversion
-// must lower the body's `hc_front.return` as a region yield and emit the
-// enclosing callable return immediately after the region.
+// `$name`: source-level inner `def` identifier. Python stamps it,
+// `-hc-front-fold-region-defs` reads it to pair the region with its ghost
+// `hc_front.name + hc_front.call` trail. Optional; absent = unmatched.
+// `$tail_return`: post-fold marker for the `return inner()` shape;
+// conversion must lower the body's `hc_front.return` as a region yield
+// and emit the enclosing callable return after the region.
 def HCFront_SubgroupRegionOp : HCFront_RegionOp<"subgroup_region"> {
   let arguments = (ins
     OptionalAttr<StrArrayAttr>:$captures,
@@ -206,7 +200,7 @@ def HCFront_WorkitemRegionOp : HCFront_RegionOp<"workitem_region"> {
 
 // Name-scope boundary around a cloned inline callee body. Stamped by
 // `-hc-front-inline`, consumed by `-convert-hc-front-to-hc`; no runtime
-// semantics. See the `HCFrontInline` pass description for the contract.
+// semantics.
 def HCFront_InlinedRegionOp : HCFront_RegionOp<"inlined_region"> {
   let arguments = (ins
     StrAttr:$callee,

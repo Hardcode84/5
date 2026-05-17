@@ -27,18 +27,15 @@ def hc_opt_path() -> Path:
 
 
 def package_native_lib_dir() -> Path:
-    """Directory where bundled runtime shared libraries live in the wheel."""
+    """Bundled runtime .so dir in the wheel."""
     return package_native_root() / "lib"
 
 
 def runtime_helpers_lib_path() -> Path:
-    """libhc_rt_helpers.so — provides the `_mlir_ciface_hc_get_*` family.
+    """libhc_rt_helpers.so — provides `_mlir_ciface_hc_get_*`.
 
-    The helpers are loaded by `ctypes` and their symbol addresses are
-    handed to the JIT execution engine, which resolves them when the host
-    wrapper calls in. ``HC_RT_HELPERS_PATH`` overrides for source-tree
-    development against a freshly-built install dir without going through
-    a full wheel install.
+    ctypes-loaded; addresses fed to the JIT. `HC_RT_HELPERS_PATH`
+    overrides for source-tree dev.
     """
     override = os.environ.get("HC_RT_HELPERS_PATH")
     if override:
@@ -47,11 +44,10 @@ def runtime_helpers_lib_path() -> Path:
 
 
 def hip_runtime_lib_path() -> Path:
-    """libhc_hip_runtime.so — exposes ``hc_rt_init / load_kernel /
-    launch_kernel`` to the JIT'd host wrapper. The shim has no
-    build-time ROCm dependency; ``hc_rt_init`` ``dlopen``'s
-    ``libamdhip64.so`` lazily, so the .so can be loaded on any host but
-    will only do useful work where an AMD HIP runtime is available.
+    """libhc_hip_runtime.so — `hc_rt_init / load_kernel / launch_kernel`.
+
+    No build-time ROCm dep; `hc_rt_init` dlopens `libamdhip64.so`
+    lazily.
     """
     override = os.environ.get("HC_RT_HIP_RUNTIME_PATH")
     if override:
@@ -60,12 +56,9 @@ def hip_runtime_lib_path() -> Path:
 
 
 def lld_path() -> Path:
-    """ld.lld — invoked by `hc-lower-gpu-to-binary` to link the AMDGPU
-    object into an HSACO blob. Bundled in `hc/_native/bin/ld.lld` (copied
-    from the pinned LLVM toolchain at wheel/editable install time) so
-    the pipeline never has to look at `$PATH` or a system ROCm install.
-    `HC_LLD` overrides for source-tree development against a freshly
-    built toolchain that hasn't been re-staged into `_native/`.
+    """ld.lld — used by `hc-lower-gpu-to-binary` to link HSACO.
+
+    Bundled at `hc/_native/bin/ld.lld`. `HC_LLD` overrides.
     """
     override = os.environ.get("HC_LLD")
     if override:

@@ -99,9 +99,9 @@ def test_hc_front_python_bindings_parse_ir_and_expose_front_types() -> None:
     payload = json.loads(result.stdout)
     assert "hc_front.kernel" in payload["module"]
     assert "hc_front.return" in payload["module"]
-    # `!hc_front.value` is inferred from the buildable `HCFront_ValueType`,
-    # so it is only visible via the explicit `str(type)` round-trip below —
-    # never in the pretty-printed op spelling.
+    # `!hc_front.value` is inferred from buildable `HCFront_ValueType`,
+    # visible only via `str(type)` round-trip, never in the
+    # pretty-printed op.
     assert payload["value_type"] == "!hc_front.value"
     assert payload["typeexpr_type"] == "!hc_front.typeexpr"
     assert payload["kernel_op"] is True

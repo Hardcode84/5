@@ -5,35 +5,28 @@
 """Python-side name resolution for `hc_front`.
 
 Walks every `@kernel.func` / `@kernel.intrinsic` reachable from the compile
-target, lowers them into one shared `hc_front` module, and stamps each
-`hc_front.name` / `hc_front.attr` with a `ref` dict attribute classifying the
-identifier. The eventual `hc_front -> hc` MLIR pass dispatches mechanically on
-these attrs instead of reaching back into Python state.
+target, lowers them into one shared `hc_front` module, stamps a `ref` dict
+attr on each `hc_front.name` / `hc_front.attr`. The `hc_front -> hc` pass
+dispatches on the refs, never on Python state.
 
-Kinds recognized on `hc_front.name`:
+`hc_front.name` kinds:
     param / iv / local   — stamped by the frontend from scope state.
     constant             — captured int/float/bool/str.
-    symbol               — captured ``hc.symbols.Symbol``.
+    symbol               — captured `hc.symbols.Symbol`.
     callee               — `@kernel.func` helper.
     intrinsic            — `@kernel.intrinsic` helper.
     inline               — undecorated Python helper.
-    builtin              — ``range``, ``len``, etc.
-    module               — whole-module alias (only ``numpy`` today).
+    builtin              — `range`, `len`, etc.
+    module               — whole-module alias (numpy only).
 
-Kinds recognized on `hc_front.attr`:
-    dsl_method           — attribute access on a param/iv/local-rooted value.
-    numpy_dtype_type     — attribute access on the numpy module that resolves
-                           to a scalar dtype (``np.float16``); the pass decides
-                           per-use whether the attr is called or passed as a
-                           type descriptor.
-    numpy_attr           — other attribute access on the numpy module
-                           (``np.empty``); opaque helper the pass treats as an
-                           inline call.
+`hc_front.attr` kinds:
+    dsl_method           — attr on a param/iv/local-rooted value.
+    numpy_dtype_type     — `np.<scalar>`; pass decides call-vs-descriptor per
+                           use.
+    numpy_attr           — other `np.*`; opaque, treated as inline call.
 
-Attribute access rooted at any other classified base (constant, callee, dtype
-chain, ...) is left unstamped: the pass can still see the base's own ref and
-decide what to do without the driver guessing. Unresolvable plain-name loads
-surface as `FrontendError` with file + line.
+Other bases (constant, callee, dtype chains, ...) stay unstamped — the pass
+uses the base's own ref. Unresolvable name loads raise `FrontendError`.
 """
 
 from __future__ import annotations
@@ -57,13 +50,11 @@ __all__ = [
 
 
 def _numpy_dtype_name(module: Any, attr: str) -> str | None:
-    """Return ``attr`` iff ``module.attr`` is a numpy scalar dtype.
+    """Return `attr` iff `module.attr` is a numpy scalar dtype, else None.
 
-    We resolve against the live numpy module instead of a hardcoded list so
-    platform-specific aliases (``intp``, ``float128`` on 64-bit linux, ...)
-    and any future scalar are recognized without edits here. A typo like
-    ``np.flaot32`` (intentional misspelling) still fails: ``getattr`` returns
-    ``None`` and the branch falls through to ``numpy_attr``.
+    Resolves via live numpy so platform-specific aliases (`intp`,
+    `float128`) and any future scalar work without edits. Typos fall
+    through to `numpy_attr`.
     """
 
     value = getattr(module, attr, None)
@@ -80,12 +71,11 @@ def _numpy_dtype_name(module: Any, attr: str) -> str | None:
 
 @dataclass(frozen=True)
 class ResolvedFrontIR:
-    """Output of the resolver: combined module + the dep set it describes.
+    """Resolver output: combined module + dep set.
 
-    ``functions`` interleaves decorated and inline helpers in BFS
-    discovery order; ``inline_names`` exposes the set of identifiers
-    that were emitted as `hc_front.func` with `ref.kind = "inline"`
-    so tests and callers don't have to re-walk the IR to find them.
+    `functions` is BFS discovery order (decorated and inline
+    interleaved). `inline_names` lists names emitted as
+    `hc_front.func` with `ref.kind = "inline"`.
     """
 
     module: Any
@@ -99,13 +89,7 @@ class ResolvedFrontIR:
 
     @property
     def exported_symbol_names(self) -> tuple[str, ...]:
-        """Names the resolver considers user-visible top-level symbols.
-
-        Every discovered function minus the ones emitted as inline
-        helpers (`ref.kind = "inline"`) — those are an implementation
-        detail of the `hc_front → hc` lowering and shouldn't leak
-        through public APIs like ``CompiledKernel.front_ir_symbols``.
-        """
+        """User-visible top-level symbols: discovered minus inline helpers."""
 
         return tuple(
             _fn_name(fn)
@@ -119,15 +103,13 @@ def resolve_front_ir(
     *,
     context: Any | None = None,
 ) -> ResolvedFrontIR:
-    """Transitively collect + lower + resolve names from ``kernel_fn``.
+    """Collect, lower, classify names reachable from `kernel_fn`.
 
-    The returned module contains one top-level op per reachable function
-    (kernel first, then decorated helpers/intrinsics and undecorated
-    inline helpers in discovery order), with every `hc_front.name` load
-    carrying a `ref` DictAttr. Undecorated helpers surface as
-    `hc_front.func` ops tagged `ref.kind = "inline"` so the
-    `-hc-front-inline` pass can consume them. Raises ``FrontendError``
-    when a captured name cannot be classified.
+    Module layout: kernel first, then decorated helpers/intrinsics, then
+    undecorated inline helpers (discovery order). Every `hc_front.name`
+    load carries a `ref` DictAttr; inline helpers carry
+    `ref.kind = "inline"` for `-hc-front-inline`. Raises `FrontendError`
+    on unclassifiable captures.
     """
 
     if not _is_kernel(kernel_fn):
@@ -154,22 +136,12 @@ def resolve_front_ir(
 
 
 def _walk_dep_set(kernel_fn: Any) -> tuple[tuple[Any, ...], set[str]]:
-    """BFS for every decorated or inline helper reachable from ``kernel_fn``.
+    """BFS reachable helpers; return `(ordered, inline_names)`.
 
-    Returns ``(ordered, inline_names)``: ``ordered`` starts with
-    ``kernel_fn`` and then interleaves `@kernel.func` /
-    `@kernel.intrinsic` callees and undecorated Python helpers (plain
-    callables with retrievable source) in first-seen order.
-    ``inline_names`` is the set of ``__name__``s that were discovered
-    as inline helpers — the caller uses it to tag those top-levels at
-    emission time.
-
-    Deduplicated on ``id(fn)`` because two bindings may point at the
-    same underlying function (re-export, alias). Inline helpers with
-    the same ``__name__`` but different identities collide at
-    emission (one top-level op per ``__name__``); this is loud by
-    design — two `_tile_origin`s in one module would be ambiguous
-    anyway, and the hc_front -> hc side keys lookups on the name.
+    `ordered` starts with `kernel_fn`, then interleaves decorated
+    callees and inline helpers in first-seen order. Dedup on `id(fn)`
+    (handles aliases); inline `__name__` collisions are loud by
+    design — `hc_front -> hc` keys lookups on the name.
     """
 
     seen_ids: set[int] = set()
@@ -192,12 +164,10 @@ def _walk_dep_set(kernel_fn: Any) -> tuple[tuple[Any, ...], set[str]]:
 
 
 def _reachable_references(fn: Any) -> Iterable[Any]:
-    """Yield every decorated or plain-callable free reference of ``fn``.
+    """Yield decorated and inline-helper free references of `fn`.
 
-    Plain callables are what become `hc_front.func` + `ref.kind =
-    "inline"` top-levels. We yield them at the same level as decorated
-    deps so the BFS picks up helpers-of-helpers too (e.g.
-    `_lane_output_row_slice_args` references `_lane_output_row_step`).
+    Inline helpers yield at the same level so BFS picks up
+    helpers-of-helpers.
     """
 
     namespace = _FunctionNamespace(fn)
@@ -217,13 +187,9 @@ def _reachable_references(fn: Any) -> Iterable[Any]:
 def _inline_overrides(
     fns: tuple[Any, ...], inline_names: set[str]
 ) -> dict[int, Mapping[str, object]]:
-    """Per-fn overrides pinning inline helpers to `hc_front.func` +
-    `ref.kind = "inline"`.
-
-    Keyed by ``id(fn)`` so the emitter can thread the override through
-    without relying on the helper's `__name__` (which it also uses as
-    the op's sym_name). The emitter skips the decorator sniff for any
-    fn carrying ``force_kind``.
+    """Per-fn overrides pinning inline helpers as `hc_front.func` +
+    `ref.kind = "inline"`. Keyed by `id(fn)`; `force_kind` skips the
+    decorator sniff.
     """
 
     overrides: dict[int, Mapping[str, object]] = {}
@@ -239,17 +205,12 @@ def _inline_overrides(
 
 
 def _referenced_names(fn: Any) -> tuple[str, ...]:
-    """All free names in ``fn`` (and any nested ``def`` bodies inside it).
+    """All free names in `fn`, including nested `def` bodies.
 
-    ``inspect.getclosurevars`` only looks at the top-level function's code,
-    so nested ``@group.workitems`` / ``@group.subgroups`` bodies would hide
-    their deps. Walk co_consts transitively to pick those up too.
-
-    This is intentionally a conservative over-approximation: a name string
-    that happens to appear in a nested code object's ``co_names`` resolves
-    against the outer fn's namespace. False matches only produce extra
-    (harmless) deps in the lowered module; missing a real dep would break
-    compilation, so we err on the inclusive side.
+    `inspect.getclosurevars` only sees the top-level code; walk
+    `co_consts` transitively to catch nested `@group.workitems` etc.
+    Conservative over-approximation — false matches add harmless deps,
+    missing a real dep would break compilation.
     """
 
     code = getattr(fn, "__code__", None)
@@ -300,12 +261,10 @@ def _fn_name(fn: Any) -> str:
 def _classify_module(module: Any, fns: tuple[Any, ...]) -> None:
     from .mlir import ir as _ir
 
-    # ``lower_functions_to_front_ir`` emits one top-level op per ``fn`` in
-    # the order of ``fns`` (see hc/_frontend.py), interleaved with optional
-    # support modules that the frontend appends as siblings (e.g. the
-    # ``__hc_intrinsic_lowerings__`` transform module that carries target
-    # recipes). Filter the latter out before pairing — they have no Python
-    # fn behind them and need no classification.
+    # `lower_functions_to_front_ir` emits one classifiable top-level
+    # per `fn` plus optional support modules (e.g.
+    # `__hc_intrinsic_lowerings__`) as siblings. Drop the latter — no
+    # Python fn behind them.
     ctx = module.context
     toplevels = [op for op in module.body.operations if _classifiable_toplevel(op)]
     if len(toplevels) != len(fns):
@@ -330,8 +289,7 @@ class _OpClassifier:
         self._fn = fn
         self._ctx = ctx
         self._ir = ir
-        # Cache the namespace: closurevars is cheap but not free, and the same
-        # ~200 names get looked up again and again for deeply-nested regions.
+        # ~200 names re-resolved across nested regions; cache once.
         self._namespace = _FunctionNamespace(fn)
 
     def classify(self, toplevel_op: Any) -> None:
@@ -354,10 +312,10 @@ class _OpClassifier:
     def _classify_name(self, op: Any) -> None:
         attrs = op.operation.attributes
         if "ref" in attrs:
-            return  # frontend already classified (param / iv / local).
+            return  # frontend already classified.
         ctx_value = _str_attr_or_none(attrs, "ctx")
         if ctx_value != "load":
-            return  # targets are never classified here.
+            return  # store targets never classified here.
         ident = _str_attr_or_none(attrs, "name")
         if ident is None:
             raise FrontendError(
@@ -373,8 +331,7 @@ class _OpClassifier:
         base = op.operation.operands[0]
         base_ref = _read_ref(base.owner)
         if base_ref is None:
-            return  # Unclassified base (e.g. subscript) — pass inspects the
-            # base op's own kind instead of a synthesized attr ref.
+            return  # Unclassified base: pass uses the base op's own kind.
         method_name = _str_attr_or_none(op.operation.attributes, "name") or ""
         kind = base_ref.get("kind")
         if kind in {"param", "iv", "local"}:
@@ -383,9 +340,8 @@ class _OpClassifier:
             )
             return
         if kind == "module" and base_ref.get("module") == "numpy":
-            # Dtypes need a dedicated kind so the pass can produce element
-            # types without reimplementing numpy's type catalog; everything
-            # else in ``np.*`` is opaque, pass handles as an inline call.
+            # Dtypes get a dedicated kind so the pass can produce
+            # element types without a numpy catalog clone.
             import numpy as _np
 
             dtype = _numpy_dtype_name(_np, method_name)
@@ -398,11 +354,8 @@ class _OpClassifier:
                     {"kind": "numpy_attr", "attr": method_name}
                 )
             return
-        # Chained attrs rooted in already-classified bases (constant, dtype,
-        # callee, ...) aren't meaningful enough for the driver to stamp a
-        # useful ref — leave it unstamped so the lowering pass can decide
-        # from the base's kind or fail with a precise diagnostic at the
-        # site where the attr is actually consumed.
+        # Chained attrs on already-classified bases stay unstamped; the
+        # lowering pass either uses the base's kind or fails at the use.
 
     def _classify_captured(self, name: str, op: Any) -> Mapping[str, object]:
         value = self._namespace.lookup(name)
@@ -431,26 +384,19 @@ class _OpClassifier:
 
 
 def _encode_ref_payload(value: object, ctx: Any, ir: Any) -> Any:
-    """Translate a Python ref-payload value into a typed MLIR attribute.
+    """Python ref-payload value -> typed MLIR attribute.
 
-    The translation table is fixed:
+    Fixed table:
         str          -> StringAttr
         bool / int   -> i64 IntegerAttr
         tuple        -> ArrayAttr (recursive)
         Mapping      -> DictionaryAttr (recursive, str keys)
         hc Expr      -> #hc.expr<...>
 
-    Shared by ``_OpClassifier._to_attr`` (stamping refs on
-    ``hc_front.name`` ops post-emission) and the parameter-side
-    layout-stamper (``build_index_map_layout_dict_attr``, used to put a
-    captured ``IndexMap`` onto an ``hc_front.kernel`` parameter dict
-    before the classifier ever runs). Keeping one translator means the
-    C++ reader contract for layout payloads is identical regardless of
-    whether the layout was attached to a body-level name capture or to
-    a parameter annotation.
+    One encoder for body-name captures and parameter-side layout stamps
+    (`build_index_map_layout_dict_attr`); C++ readers see one shape.
     """
-    # Local import: ``hc.symbols`` is heavy and only needed when the
-    # classifier surfaces an ``Expr`` carrier (layout descriptors).
+    # Lazy: `hc.symbols` only needed for `Expr` carriers.
     from .symbols import Expr
 
     if isinstance(value, str):
@@ -471,12 +417,8 @@ def _encode_ref_payload(value: object, ctx: Any, ir: Any) -> Any:
             context=ctx,
         )
     if isinstance(value, Expr):
-        # Construct an `#hc.expr` attribute via the MLIR parser bound to
-        # this context — the printed form of the ixsimpl-owned `Expr`
-        # round-trips through `sym::parseExpr` once at the frontend
-        # boundary, and downstream C++ readers see a typed `ExprAttr`
-        # instead of a `StringAttr` they would have to re-parse. See
-        # ``AGENTS.md`` → "Python -> MLIR attribute construction".
+        # One `sym::parseExpr` at the frontend boundary; downstream C++
+        # sees typed `ExprAttr`. See AGENTS.md.
         return ir.Attribute.parse(f'#hc.expr<"{value}">', context=ctx)
     raise FrontendError(f"cannot encode ref payload value {value!r}")
 
@@ -486,15 +428,12 @@ def build_index_map_layout_dict_attr(
     ctx: Any,
     ir: Any,
 ) -> Any:
-    """Symbolic-eval ``layout`` and return a ``DictionaryAttr`` matching
-    the body-level ``kind = "layout"`` ref shape.
+    """Symbolic-eval `layout`; return a `DictionaryAttr` matching the
+    body-level `kind = "layout"` ref shape.
 
-    Use this when the layout needs to land on something other than an
-    ``hc_front.name`` op — e.g. a parameter dict on
-    ``hc_front.kernel``, where the structured payload is consumed by
-    ``layoutAttrFromRef`` on the C++ side using the same key set
-    (``shape_syms`` / ``index_syms`` / ``params`` / ``storage_size`` /
-    ``offset``).
+    Use when the layout lands on something other than `hc_front.name`
+    (e.g. an `hc_front.kernel` parameter dict). C++ reads via
+    `layoutAttrFromRef` with the same key set.
     """
     payload = _index_map_ref(layout)
     return _encode_ref_payload(payload, ctx, ir)
@@ -583,15 +522,10 @@ def _classify_inline(name: str, value: Any) -> Mapping[str, object] | None:
 
 
 def _classify_as_layout(name: str, value: Any) -> Mapping[str, object] | None:
-    """`hc.core.as_layout` resolved by name — DSL primitive, not inlinable.
+    """`hc.core.as_layout` recognized by identity — DSL primitive, not inlinable.
 
-    Recognized by identity so a kernel doing ``from hc import as_layout``
-    (or ``as_layout = hc.as_layout``) classifies the captured function
-    here instead of falling through to ``_classify_inline``, which would
-    try to re-parse the helper's body as kernel source. The lowering
-    pass keys on ``kind = "layout_op"`` to emit ``hc.as_layout`` with
-    the structured ``#hc.layout`` attribute carried by the second
-    positional argument.
+    Catches imports / aliases before `_classify_inline` tries to re-parse
+    the dispatcher's body. Lowering keys on `kind = "layout_op"`.
     """
     del name
     if value is not _dsl_as_layout:
@@ -600,15 +534,10 @@ def _classify_as_layout(name: str, value: Any) -> Mapping[str, object] | None:
 
 
 def _classify_index_map(name: str, value: Any) -> Mapping[str, object] | None:
-    """Module-level ``IndexMap`` captured as a layout descriptor.
+    """Module-level `IndexMap` captured as a layout descriptor.
 
-    The lambdas are evaluated symbolically (with ``hc.symbols.Symbol``
-    args bound to the lambda's own parameter names) so the resulting
-    ``shape_syms``, ``index_syms``, ``params``, ``storage_size``, and
-    ``offset`` arrive at the MLIR side as textual ``#hc.expr`` bodies
-    ready to feed ``LayoutAttr``. Failure during evaluation surfaces as
-    a ``FrontendError`` against ``name`` so users see which capture is
-    the problem, not just an opaque traceback.
+    Lambdas eval symbolically; result lands as `#hc.expr` bodies feeding
+    `LayoutAttr`. Eval failure becomes a `FrontendError` naming the capture.
     """
     if not isinstance(value, IndexMap):
         return None
@@ -619,24 +548,17 @@ def _classify_index_map(name: str, value: Any) -> Mapping[str, object] | None:
 
 
 def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
-    """Symbolically evaluate ``layout`` into a serializable ref payload.
+    """Symbolic eval of `layout` -> serializable ref payload.
 
-    Strategy: discover the user's chosen ``shape_syms`` from the
-    ``params`` or ``storage_size`` signature (positional arg names),
-    discover ``index_syms`` from the leading positional args of
-    ``offset``, and bind every name through a fresh
-    ``SymbolNamespace`` so the resulting ``Expr`` carriers print as
-    textual ``#hc.expr`` bodies. Params are passed back into
-    ``storage_size`` / ``offset`` as symbol-valued, not expr-valued, so
-    the resulting offset stays ``i * row_stride + j`` instead of
-    fully-substituted ``i * (h + 4) + j`` — the named-table form lines
-    up with the design doc example and keeps post-hoc diagnostics
+    Discover shape syms from `params`/`storage_size` signatures, index
+    syms from `offset`'s leading positionals. Bind through a fresh
+    `SymbolNamespace`. Params feed back as symbol-valued (not
+    expr-valued) so offset prints `i * row_stride + j` instead of
+    fully-substituted — matches `doc/layouts.md` and keeps diagnostics
     readable.
 
-    Returns a mapping with parallel arrays for the params table; the
-    classifier-side encoder only handles flat scalar/tuple values
-    (see ``_OpClassifier._to_attr``) and a nested dict would need its
-    own encoder. The pairing is ``params_names[i] -> params_exprs[i]``.
+    Returns parallel arrays for the params table — encoder only handles
+    flat scalar/tuple values. Pairing: `params_names[i] -> params_exprs[i]`.
     """
     from .symbols import Context, SymbolNamespace
 
@@ -671,13 +593,8 @@ def _index_map_ref(layout: IndexMap) -> Mapping[str, object]:
     )
     offset_call = _coerce_layout_expr(offset_call, ctx)
 
-    # The ref payload carries raw ``Expr`` carriers (and a name->Expr table
-    # for params); the encoder (``_OpClassifier._to_attr``) builds typed
-    # ``#hc.expr`` attributes via the MLIR Python bindings before stamping.
-    # C++ readers get already-typed ``ExprAttr`` / ``DictionaryAttr`` /
-    # ``ArrayAttr`` and never see textual expression bodies — see
-    # ``doc/layouts.md`` slice 3 and ``AGENTS.md`` under
-    # "Python -> MLIR attribute construction".
+    # Payload carries raw `Expr` carriers; encoder stamps typed
+    # `#hc.expr` attrs via MLIR Python bindings. C++ never sees text.
     return {
         "kind": "layout",
         "shape_syms": tuple(shape_param_names),
@@ -693,13 +610,11 @@ def _validate_free_syms(
     shape_param_names: tuple[str, ...],
     index_param_names: tuple[str, ...],
 ) -> None:
-    """Reject duplicate / colliding ``free_syms`` before evaluation.
+    """Reject duplicate / colliding `free_syms` before evaluation.
 
-    `LayoutAttr::verify` already enforces a single namespace across
-    shape / index / params, but it only sees the post-lambda payload;
-    a Python-side conflict would surface as an opaque dup-name error
-    deep in MLIR. Catch it here so the diagnostic names the offending
-    layout descriptor and the colliding token.
+    `LayoutAttr::verify` enforces this on the post-lambda payload, but a
+    Python-side conflict would surface as an opaque MLIR dup-name. Catch
+    here so the error names the descriptor and the colliding token.
     """
     reserved = set(shape_param_names) | set(index_param_names)
     if layout.params is not None:
@@ -724,14 +639,11 @@ def _layout_eval_params(
     syms: Any,
     shape_syms: tuple[Any, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run ``layout.params`` (if any) symbolically and split the result.
+    """Eval `layout.params` symbolically; return `(params_exprs, params_named)`.
 
-    Returns ``(params_exprs, params_named)``:
-        ``params_exprs[name] -> hc.symbols.Expr`` (becomes a typed ``#hc.expr``
-            at stamp time)
-        ``params_named[name] -> Symbol with that name`` (fed back into
-            ``storage_size`` / ``offset`` so the symbolic eval prints
-            ``i * row_stride + j`` instead of the fully-substituted form)
+    `params_exprs[name]` -> `Expr` (stamps as `#hc.expr`).
+    `params_named[name]` -> `Symbol`, fed into `storage_size` / `offset`
+    so offset prints `i * row_stride + j`, not the substituted form.
     """
     params_exprs: dict[str, Any] = {}
     params_named: dict[str, Any] = {}
@@ -751,16 +663,11 @@ def _layout_eval_params(
 
 
 def _coerce_layout_expr(value: Any, ctx: Any) -> Any:
-    """Wrap a bare ``int`` in ``ctx.const(...)`` so encoders see an ``Expr``.
+    """Wrap bare `int` in `ctx.const(...)` so encoders see `Expr`.
 
-    Layout ``storage_size`` / ``offset`` / params values that never touch
-    a shape / index / params sym (e.g. ``lambda lc, fc: WMMA_M*WMMA_N``)
-    evaluate to a plain ``int``. The ref payload encoder routes bare
-    ``int`` to ``i64Attr``, but ``LayoutAttr`` requires ``ExprAttr`` for
-    those slots — coercing at the classifier boundary keeps the type
-    contract uniform without forcing every layout author to spell
-    ``ctx.const(...)`` or attach a no-op shape-sym factor like
-    ``lc*0 + 256``.
+    `LayoutAttr` needs `ExprAttr` everywhere; lambdas that never touch a
+    sym (e.g. `lambda lc, fc: WMMA_M*WMMA_N`) eval to bare `int`. Coerce
+    here so layout authors don't have to spell `ctx.const(...)`.
     """
     if isinstance(value, bool):
         raise FrontendError("layout expression cannot be a boolean")
@@ -776,16 +683,10 @@ def _layout_invoke(
     role: str,
     kwargs: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Call ``fn(*args, **kwargs_subset)`` and rewrap exceptions as ``FrontendError``.
+    """Call lambda; rewrap exceptions as `FrontendError` naming `role`.
 
-    User-supplied lambdas may raise anything (``TypeError`` on a missing
-    operator, ``KeyError`` on a typoed param, ...); flatten those into
-    a layout-descriptor diagnostic that names the offending callable's
-    role instead of leaking the raw exception class. ``kwargs`` carries
-    the layout-wide ``free_syms`` bindings, but each lambda only binds
-    a subset (the ones declared keyword-only on its own signature);
-    pass exactly that subset so lambdas that don't reference a given
-    free sym aren't forced to swallow it.
+    `kwargs` is the layout-wide `free_syms`; pass only the subset the
+    lambda declares keyword-only so others aren't forced to swallow it.
     """
     try:
         if kwargs:
@@ -811,14 +712,11 @@ def _layout_positional_names(
     role: str,
     allowed_kwonly: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
-    """Names of ``fn``'s positional args (no varargs, no defaults).
+    """`fn`'s positional names (no varargs, no defaults).
 
-    Layout lambdas must be straight positional shape -> ... -> params so
-    the simulator and the symbolic evaluator agree on slot binding; any
-    other signature shape produces a located diagnostic via ``role``.
-    Keyword-only parameters named in ``allowed_kwonly`` (the layout's
-    ``free_syms``) are permitted and not returned — the caller binds
-    them separately.
+    Layout lambdas must be straight positional shape -> ... -> params.
+    Keyword-only names in `allowed_kwonly` (the layout's `free_syms`)
+    are permitted but not returned — caller binds separately.
     """
     try:
         sig = inspect.signature(fn)
@@ -827,10 +725,7 @@ def _layout_positional_names(
     names: list[str] = []
     for param in sig.parameters.values():
         if param.kind == inspect.Parameter.KEYWORD_ONLY:
-            # Each lambda may bind a subset of the layout's free_syms;
-            # any keyword-only parameter outside that subset is a typo
-            # the layout author should hear about. Lambdas that don't
-            # reference a given free sym simply omit it.
+            # Lambda kw-only outside `allowed_kwonly` is a typo.
             if param.name not in allowed_kwonly:
                 raise FrontendError(
                     f"{role} keyword-only parameter {param.name!r} is not "
@@ -859,13 +754,10 @@ def _layout_positional_names(
 
 
 def _layout_shape_param_names(layout: IndexMap) -> tuple[str, ...]:
-    """Resolve the layout's shape-sym names from its lambda signatures.
+    """Shape-sym names: from `params` if present, else `storage_size`.
 
-    Priority: ``params`` (when present) — it takes only shape syms, so
-    its full signature is the shape-sym list. Without ``params``,
-    ``storage_size``'s signature is the shape-sym list (and offset's
-    trailing slots must match). Free syms (keyword-only) are tolerated
-    on both lambdas but never returned as shape names.
+    `params` takes shape syms only — full signature is the shape list.
+    Without it, `storage_size`'s signature is the list (offset must match).
     """
     free = frozenset(layout.free_syms)
     if layout.params is not None:
@@ -880,17 +772,12 @@ def _layout_shape_param_names(layout: IndexMap) -> tuple[str, ...]:
 def _layout_index_param_names(
     layout: IndexMap, shape_param_names: tuple[str, ...]
 ) -> tuple[str, ...]:
-    """Resolve the layout's index-sym names from ``offset``'s prefix.
+    """Index-sym names from `offset`'s leading positionals.
 
-    Convention from `doc/layouts.md`:
+    Convention (`doc/layouts.md`):
         offset(i, j, ..., *shape_syms[, params], *, free_syms...)
-    Index syms occupy the leading positional slots, shape syms the
-    next ``len(shape_syms)`` positional slots, and ``params`` (when
-    present) the last positional slot. Free syms appear as keyword-
-    only parameters after ``*`` and never count toward the positional
-    arity. `LayoutAttr` enforces `index_syms.size() == shape_syms.size()`
-    so the index prefix must be exactly the same length as the shape
-    suffix.
+
+    `LayoutAttr` requires `index_syms.size() == shape_syms.size()`.
     """
     free = frozenset(layout.free_syms)
     offset_names = _layout_positional_names(
@@ -916,12 +803,9 @@ def _layout_index_param_names(
     return index_names
 
 
-# Ordered most-specific-first: builtins win over constants (``True`` is a
-# builtin name rather than a random `1`), numpy wins over generic callables.
-# ``IndexMap`` and the ``as_layout`` primitive sit ahead of
-# ``_classify_inline`` so neither falls through to "re-parse as kernel
-# helper" — IndexMap holds three lambdas, ``as_layout`` is a thin
-# dispatcher, both produce nonsense inline IR.
+# Most-specific first: builtins beat constants (`True`, not `1`), numpy
+# beats callables. `IndexMap` and `as_layout` ahead of `_classify_inline`
+# so neither falls through to "re-parse as kernel".
 _CAPTURE_CLASSIFIERS: tuple[_CaptureClassifier, ...] = (
     _classify_builtin,
     _classify_numpy_module,
@@ -944,7 +828,7 @@ def _is_numpy_module(value: Any) -> bool:
 
 
 def _is_symbol(value: Any) -> bool:
-    # Lazy import: hc.symbols is heavy and not required on the simulator path.
+    # Lazy: `hc.symbols` not required on simulator path.
     from .symbols import Symbol
 
     return isinstance(value, Symbol)
@@ -956,7 +840,7 @@ def _symbol_name(value: Any) -> str:
 
 
 def _is_constant(value: Any) -> bool:
-    # `bool` is a subclass of `int`; check it first for an accurate python_kind.
+    # `bool` subclasses `int`; check first for accurate `python_kind`.
     return isinstance(value, bool | int | float | str)
 
 
@@ -991,17 +875,10 @@ def _is_plain_callable(value: Any) -> bool:
 
 
 def _is_inlinable_helper(value: Any) -> bool:
-    """True if ``value`` is a pure-Python helper we can re-parse from source.
+    """True if `value` is a pure-Python helper re-parsable from source.
 
-    Filters out the long tail of other callables (C builtins, classes,
-    bound methods, partials, numpy ufuncs, ...): the inliner frontend
-    needs a ``__code__`` object backed by real source, and only
-    ``types.FunctionType`` gives us that reliably. Decorated callables
-    are also excluded — those take the `@kernel.func` / `@kernel.intrinsic`
-    path with their own metadata. DSL primitives like ``as_layout`` are
-    also excluded so the BFS doesn't drag their dispatcher body into
-    the module as a "helper"; their classifier produces a dedicated
-    ref kind instead (see ``_classify_as_layout``).
+    `types.FunctionType` only. Decorated callables route via their own
+    metadata; DSL primitives (`as_layout`) get a dedicated ref kind.
     """
     import types
 
@@ -1025,10 +902,7 @@ def _qualified_name(fn: Any) -> str:
 
 
 def _scope_ref_text(scope: Any) -> str:
-    # A ref dict carries a fixed schema per kind, so we always emit a string
-    # ``scope`` — unlike ``hc/_frontend._scope_text`` which returns ``None``
-    # for unscoped ops and causes the emitter to drop the key. "None" is the
-    # chosen spelling for "no scope" in ref payloads.
+    # Ref dict has a fixed string schema; spell "no scope" as "None".
     if scope is None:
         return "None"
     from .core import Scope
@@ -1045,7 +919,7 @@ def _scope_ref_text(scope: Any) -> str:
 
 
 class _FunctionNamespace:
-    """Lazy namespace snapshot; avoids recomputing closurevars per-name."""
+    """Lazy namespace snapshot; avoids recomputing closurevars per name."""
 
     def __init__(self, fn: Any) -> None:
         self._fn = fn

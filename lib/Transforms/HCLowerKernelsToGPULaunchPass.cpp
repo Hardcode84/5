@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-kernels-to-gpu-launch`, the first wrapper slice of
-// HC-to-upstream GPU lowering.
+// `-hc-lower-kernels-to-gpu-launch`: first wrapper slice of HC →
+// upstream GPU lowering.
 
 #include "hc/Transforms/Passes.h"
 
@@ -63,11 +63,8 @@ static Type convertScalarABIType(Type type) {
 
 static Type convertABIType(Type type);
 
-// Resolve the `!hc.ptr<global, T?>` payload type for a buffer ABI arg.
-// `T` is dropped when the buffer's element type isn't trivially representable
-// in MLIR (the only example today is `!hc.undef`); LLVM is opaque-pointers-only
-// post-llvm17 so the carried element type is purely a typing convenience for
-// the surrounding HC code.
+// LLVM is opaque-pointers-only; element type is HC-side convenience.
+// `!hc.undef` drops to null.
 static PtrType convertBufferABIType(BufferType type) {
   Type elementType = type.getElementType();
   if (isa<UndefType>(elementType))
@@ -277,13 +274,9 @@ static void bindScalarSymbol(Type originalType, Value hostArg,
   boundValues.bind(StringRef(ixs_node_sym_name(node)), hostArg);
 }
 
-// Idempotently declare an `extern "C"` runtime helper at module scope. The
-// `llvm.emit_c_interface` attribute is what makes `convert-func-to-llvm`
-// (a) emit an external `_mlir_ciface_<name>` decl that matches the C ABI
-// exported by `libhc_rt_helpers.so`, and (b) generate a private body for
-// `<name>` that forwards to the cwrapper. All HC runtime helpers return
-// scalars / pointers (no sret packing). Call sites in this pass therefore
-// use the unmangled `@<name>`.
+// Idempotent extern "C" helper decl. `llvm.emit_c_interface` makes
+// convert-func-to-llvm emit the `_mlir_ciface_<name>` decl + a private
+// `<name>` forwarder. No sret — call sites use the unmangled `@<name>`.
 static func::FuncOp ensureRuntimeHelper(ModuleOp module, StringRef name,
                                         ArrayRef<Type> inputs,
                                         ArrayRef<Type> results) {
@@ -299,18 +292,14 @@ static func::FuncOp ensureRuntimeHelper(ModuleOp module, StringRef name,
   return func;
 }
 
-// Pre-declare every helper the host wrapper might reach for. Cheap and idem-
-// potent; cleaner than per-call existence checks scattered through the body.
 static void ensureRuntimeHelpers(ModuleOp module) {
   MLIRContext *ctx = module.getContext();
   Type ptr = LLVM::LLVMPointerType::get(ctx);
   Type i32 = IntegerType::get(ctx, 32);
   Type i64 = IntegerType::get(ctx, 64);
   Type f64 = Float64Type::get(ctx);
-  // `hc_get_ptr` is the buffer-ABI entry — the host wrapper hands its
-  // result straight to `gpu.launch_func` as the buffer arg. Returns
-  // `!llvm.ptr` (matching the `data_ptr()` raw address); per-axis dim and
-  // stride values arrive via the matching scalar helpers below.
+  // `hc_get_ptr` returns the raw `data_ptr()`; dims/strides via the
+  // scalar helpers below.
   ensureRuntimeHelper(module, "hc_get_ptr", {ptr}, {ptr});
   ensureRuntimeHelper(module, "hc_get_dim", {ptr, i32}, {i64});
   ensureRuntimeHelper(module, "hc_get_stride", {ptr, i32}, {i64});
@@ -318,9 +307,8 @@ static void ensureRuntimeHelpers(ModuleOp module) {
   ensureRuntimeHelper(module, "hc_get_float64", {ptr}, {f64});
 }
 
-// Shared shape: each `_mlir_ciface_hc_get_*(pyobj, axis)` accessor returns
-// an i64 in element units that we want as `index` for the kernel-arg
-// `(ptr, dim*, stride*)` UCC. Lifted out so dim and stride don't drift apart.
+// `_mlir_ciface_hc_get_*(pyobj, axis)` → i64 element units, cast to
+// `index`. Shared so dim and stride don't drift.
 static Value callIndexAccessor(OpBuilder &builder, Location loc,
                                ModuleOp module, StringRef name, Value pyArg,
                                unsigned axisIndex) {
@@ -345,36 +333,23 @@ static Value callGetStride(OpBuilder &builder, Location loc, ModuleOp module,
                            dimIndex);
 }
 
-// Per-buffer kernel-arg materialization. The original `!hc.buffer<T, [dims]>`
-// block arg expands at the kernel boundary into:
-//   1. a `!hc.ptr<global, T?>` carrying the raw `data_ptr()` (one slot per
-//      buffer, regardless of rank).
-//   2. one `index` slot per axis, holding the dim value pulled from
-//      `_mlir_ciface_hc_get_dim` or resolved through `ExprLowerer` for
-//      non-trivial shape exprs.
-//   3. one `index` slot per axis, holding the per-axis element stride from
-//      `_mlir_ciface_hc_get_stride` — that's what makes a transposed /
-//      sliced input (`numpy[..., ::2]`, `torch.transpose`) compute the
-//      right offsets without us silently falling back to a contiguous
-//      identity layout.
-// The values are stitched into a single 1-to-N `unrealized_conversion_cast`
-// whose result type is the original `!hc.buffer<...>` so the kernel body's
-// existing buffer-typed code sees no immediate change. Launch-body walks
-// the cast back to (ptr, dims, strides) when it lowers `hc.load` /
-// `hc.store` to `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+// Kernel-boundary expansion of `!hc.buffer<T, [dims]>`:
+//   1. `!hc.ptr<global, T?>` from `data_ptr()`.
+//   2. per-axis dim (`_mlir_ciface_hc_get_dim` or ExprLowerer).
+//   3. per-axis stride (`_mlir_ciface_hc_get_stride`) — without this
+//      transposed / sliced inputs silently fall back to contiguous.
+// Stitched through a 1-to-N UCC back to the original buffer type so
+// the kernel body is unchanged; launch-body unwinds the UCC at lower-
+// to `hc.ptr_offset` + load/store.
 struct BufferABIPack {
   Value ptr;
   SmallVector<Value> dims;
   SmallVector<Value> strides;
 };
 
-// Materialize all the host-scope values that need to flow into the launch
-// region for a single buffer arg. The values are kept as a flat tuple
-// (ptr, dim0, dim1, ..., stride0, stride1, ...); the matching 1-to-N UCC
-// is built INSIDE the launch region by `cloneKernelBodyIntoLaunch` so that
-// `gpu-kernel-outlining` captures the raw ptr / dim / stride values (each
-// llvm-translatable) instead of the bridged `!hc.buffer<T, [dims]>` (not
-// translatable to LLVM).
+// Flat (ptr, dims..., strides...) at host scope. The matching UCC
+// is built inside the launch region (so gpu-kernel-outlining captures
+// the llvm-translatable scalars, not the buffer type).
 static BufferABIPack buildBufferPack(OpBuilder &builder, Location loc,
                                      ModuleOp module, Value pyArg,
                                      PtrType ptrType,
@@ -405,11 +380,7 @@ static Value buildBufferUCC(OpBuilder &builder, Location loc, BufferType target,
       .getResult(0);
 }
 
-// Pull a scalar argument of arbitrary HC scalar ABI type out of a PyObject.
-// `targetType` is the post-`convertScalarABIType` MLIR type expected by the
-// kernel body (e.g. `index`, `i32`, `f16`). We always go through i64/f64 on
-// the wire and then narrow / convert in-IR — matches wave's helper surface
-// and keeps the C ABI tiny.
+// PyObject → scalar of `targetType`. Wire is i64/f64; narrow in-IR.
 static FailureOr<Value> buildScalar(OpBuilder &builder, Location loc,
                                     ModuleOp module, Value pyArg,
                                     Type targetType) {
@@ -485,14 +456,8 @@ static LogicalResult lowerLaunchGeometry(OpBuilder &builder, Location loc,
   return success();
 }
 
-// `kernelABIArgs[i]` is non-null for scalar args (already correctly typed
-// for the kernel body's expectation). `bufferPacks[i]` is set for buffer
-// args; the bridging 1-to-N UCC is materialized inside the launch region
-// here (not at host scope) so `gpu-kernel-outlining` captures the raw
-// ptr/dim/stride values rather than the bridged `!hc.buffer<...>`.
-// Return the kernel block's trailing `hc.return` if there is one, or
-// null otherwise. Surfaces a non-empty return as a hard error since
-// the gpu.launch terminator carries no operands.
+// Trailing `hc.return` or null. Non-empty return is a hard error —
+// `gpu.launch` terminator has no operands.
 static FailureOr<Operation *> findTrailingReturn(Block &kernelBlock) {
   if (kernelBlock.empty())
     return nullptr;
@@ -505,8 +470,7 @@ static FailureOr<Operation *> findTrailingReturn(Block &kernelBlock) {
   return returnOp.getOperation();
 }
 
-// Make sure the launch block ends with a `gpu.terminator`. Returns the
-// terminator op, which is the insertion point the body clone uses.
+// Returned op is the body-clone insertion point.
 static Operation *ensureLaunchTerminator(OpBuilder &builder,
                                          gpu::LaunchOp launch, Location loc) {
   Block &launchBlock = launch.getBody().front();
@@ -518,11 +482,8 @@ static Operation *ensureLaunchTerminator(OpBuilder &builder,
   return term;
 }
 
-// Build the in-launch replacement for one kernel block argument. Group
-// args become an undef-fed UCC (the runtime has no group concept); buffer
-// args expand into the pre-built UCC pack; scalar args either pass
-// through or get bridged through a UCC when ABI conversion changed the
-// type.
+// Group: undef-fed UCC (no runtime concept). Buffer: UCC pack.
+// Scalar: passthrough or UCC-bridged on ABI type change.
 static Value materializeKernelArgReplacement(
     OpBuilder &builder, MLIRContext *ctx, BlockArgument arg, unsigned index,
     ArrayRef<Value> kernelABIArgs,
@@ -573,11 +534,8 @@ cloneKernelBodyIntoLaunch(OpBuilder &builder, HCKernelOp kernel,
   return success();
 }
 
-// Resolved aux-arg meta entry from `hc.flatten_aux_args`. See
-// `buildFlattenAuxArgsMeta` in `HCFlattenWithLayoutsPass.cpp` for the
-// attribute shape — `aux_of` is the parent buffer arg's post-flatten
-// index, `axis` is the axis in the parent's pre-flatten shape, and
-// `kind` distinguishes the `_get_dim` and `_get_stride` accessor.
+// `aux_of`: parent buffer arg index. `axis`: axis in parent's pre-
+// flatten shape. `kind`: "dim" vs "stride" accessor.
 struct FlattenAuxInfo {
   unsigned auxOf;
   unsigned axis;
@@ -603,10 +561,8 @@ static std::optional<FlattenAuxInfo> lookupFlattenAux(DictionaryAttr meta,
                         kindAttr.getValue()};
 }
 
-// Compute per-arg ABI types and host-wrapper slot indices, returning the
-// number of user-visible host args (the wrapper signature is then
-// `(stream, arg0..argN)` with `N = userArgCount`). Group args and
-// flatten-aux slots aren't user-visible and get a sentinel host slot.
+// Group + flatten-aux slots aren't user-visible (sentinel host slot).
+// Wrapper sig becomes `(stream, arg0..argN)` with N = userArgCount.
 static LogicalResult
 convertKernelABISignature(HCKernelOp kernel, DictionaryAttr auxMeta,
                           SmallVectorImpl<Type> &kernelABITypes,
@@ -629,10 +585,8 @@ convertKernelABISignature(HCKernelOp kernel, DictionaryAttr auxMeta,
   return success();
 }
 
-// Pass 1: scalar idx args. A kernel that declares `M: idx` alongside
-// `Buffer[M, K, ...]` binds `M` from the explicit scalar (authoritative)
-// rather than from the buffer's dim — matches the previous first-wins
-// behaviour now that we're free of lexical kernel-arg order.
+// Pass 1: scalar idx args. Explicit `M: idx` wins over buffer-dim
+// derivation of `M`.
 static LogicalResult materializeScalarABIArgs(
     OpBuilder &builder, Location loc, ModuleOp module, HCKernelOp kernel,
     Block *entry, ArrayRef<Type> kernelABITypes, ArrayRef<unsigned> hostArgFor,
@@ -658,10 +612,9 @@ static LogicalResult materializeScalarABIArgs(
   return success();
 }
 
-// Pass 2: flatten-aux `!hc.idx<sym>` slots, pulling each value from the
-// parent buffer's PyObject via `hc_get_dim` / `hc_get_stride`. The aux
-// symbol is bound just like any other scalar idx so post-flatten launch
-// geometry and pre-flatten kernels agree on `boundValues`.
+// Pass 2: flatten-aux `!hc.idx<sym>` from parent buffer's `hc_get_dim`
+// / `hc_get_stride`. Aux sym binds like any scalar idx so pre- and
+// post-flatten launches share `boundValues`.
 static LogicalResult materializeFlattenAuxArgs(
     OpBuilder &builder, Location loc, ModuleOp module, HCKernelOp kernel,
     Block *entry, ArrayRef<unsigned> hostArgFor, DictionaryAttr auxMeta,
@@ -685,10 +638,8 @@ static LogicalResult materializeFlattenAuxArgs(
   return success();
 }
 
-// Collect per-axis dim / stride values for `bufferIdx` from the
-// flatten-aux slot vector. Returns true if any aux entry was found
-// (signalling post-flatten layout). Missing dim slots stay null and
-// are filled by the caller from `hc_get_dim` runtime probes.
+// Returns true on aux hit (post-flatten layout). Missing dim slots
+// stay null for caller to probe via `hc_get_dim`.
 static bool collectFlattenAuxForBuffer(HCKernelOp kernel, unsigned bufferIdx,
                                        DictionaryAttr auxMeta,
                                        ArrayRef<Value> kernelABIArgs,
@@ -717,20 +668,14 @@ static bool collectFlattenAuxForBuffer(HCKernelOp kernel, unsigned bufferIdx,
   return postFlatten;
 }
 
-// Build the bridging `(ptr, total_elements, 1)` pack for a post-flatten
-// buffer. The flat carrier is a contiguous element view: every access
-// composed by flatten reads/writes against an offset already in element
-// units, so the bridging UCC doesn't need per-axis strides (those
-// already rode into the kernel via the aux idx slots).
+// Post-flatten contiguous view: `(ptr, total_elements, 1)`. Per-axis
+// strides already rode in via aux idx slots.
 static BufferABIPack
 buildPostFlattenBufferPack(OpBuilder &builder, Location loc, ModuleOp module,
                            Value pyArg, PtrType ptrType,
                            SmallVectorImpl<Value> &shapeValues,
                            ArrayRef<Value> strideValues) {
-  // Constant-dim axes have no implicit sym and therefore no dim aux
-  // pointing at them; fall back to a runtime probe (mirrors what the
-  // existing rank-N path does for `4 : i64` dims). Symbolic axes were
-  // already filled by `collectFlattenAuxForBuffer`.
+  // Constant-dim axes carry no aux — probe at runtime.
   unsigned rank = std::max(shapeValues.size(), strideValues.size());
   shapeValues.resize(rank);
   for (auto [axis, slot] : llvm::enumerate(shapeValues))
@@ -757,10 +702,8 @@ buildPostFlattenBufferPack(OpBuilder &builder, Location loc, ModuleOp module,
   return pack;
 }
 
-// Pre-flatten buffer materialization: harvest any first-occurrence
-// symbol from the buffer's shape (one `_get_dim` per name), then lower
-// the full shape attr — including non-trivial exprs — via `ExprLowerer`
-// into the dim values the per-buffer UCC will carry.
+// Harvest first-occurrence shape syms (one `_get_dim` per name), then
+// lower the full shape attr via `ExprLowerer`.
 static LogicalResult materializePreFlattenBufferPack(
     OpBuilder &builder, Location loc, ModuleOp module, HCKernelOp kernel,
     unsigned bufferIdx, BufferType buffer, Value pyArg, PtrType ptrType,
@@ -790,8 +733,7 @@ static LogicalResult materializePreFlattenBufferPack(
   return success();
 }
 
-// Pass 3: buffer args. For each, decide pre- vs post-flatten via the
-// aux meta and dispatch to the matching pack builder.
+// Pass 3: buffer args, dispatched on aux-meta presence.
 static LogicalResult materializeBufferABIArgs(
     OpBuilder &builder, Location loc, ModuleOp module, HCKernelOp kernel,
     Block *entry, ArrayRef<Type> kernelABITypes, ArrayRef<unsigned> hostArgFor,
@@ -837,21 +779,13 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   if (!module)
     return kernel.emitOpError("must be nested in a module");
 
-  // Post-flatten kernels (1D `?` buffers with per-axis dim/stride exposed
-  // as trailing `!hc.idx<sym>` aux slots) carry an `hc.flatten_aux_args`
-  // attribute pinning each aux slot back to its parent buffer arg, axis,
-  // and accessor kind. Pre-flatten the attribute is absent and the
-  // rank-N shape walk inside `materializeBufferABIArgs` carries all the
-  // information itself.
+  // Post-flatten kernels carry `hc.flatten_aux_args` pinning each aux
+  // slot to (parent buffer arg, axis, accessor kind). Absent pre-flatten.
   DictionaryAttr auxMeta =
       kernel->getAttrOfType<DictionaryAttr>("hc.flatten_aux_args");
 
-  // `kernelABITypes[i]` is the post-`convertABIType` type the kernel body
-  // expects; `hostArgFor[i]` is the index of the matching `PyObject *`
-  // slot in the host wrapper signature (or sentinel for `!hc.group` args
-  // and flatten-aux slots, neither of which is user-visible). The +1
-  // offset on host arg indices accounts for the leading stream pointer
-  // at slot 0.
+  // `hostArgFor[i]` indexes the host wrapper's `PyObject *` slot
+  // (sentinel for group / aux). +1 offset reserves slot 0 for stream.
   SmallVector<Type> kernelABITypes(kernelBlock.getNumArguments());
   SmallVector<unsigned> hostArgFor(kernelBlock.getNumArguments(),
                                    std::numeric_limits<unsigned>::max());
@@ -862,12 +796,8 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
 
   ensureRuntimeHelpers(module);
 
-  // Host wrapper signature: `(stream: !llvm.ptr, arg0: !llvm.ptr, ...)`.
-  // The leading stream pointer threads through to `hc_rt_load_kernel` /
-  // `hc_rt_launch_kernel` so callers can pin a launch to a specific HIP
-  // stream — passing a null pointer keeps the HIP default stream
-  // semantics. The lowering-to-runtime pass picks the stream up by
-  // walking back to this function's first argument.
+  // Host sig: `(stream: !llvm.ptr, arg0: !llvm.ptr, ...)`. Stream
+  // threads to `hc_rt_{load,launch}_kernel`; null = HIP default.
   OpBuilder builder(kernel);
   Type ptrType = LLVM::LLVMPointerType::get(ctx);
   SmallVector<Type> hostInputTypes(1 + userArgCount, ptrType);
@@ -877,11 +807,8 @@ static LogicalResult lowerKernel(HCKernelOp kernel) {
   Block *entry = hostFunc.addEntryBlock();
   builder.setInsertionPointToStart(entry);
 
-  // Three-pass arg materialization: scalar idx args first (the
-  // authoritative source for any sym they bind), then flatten-aux idx
-  // slots (which also bind syms via `hc_get_dim` / `hc_get_stride`),
-  // then buffer args (per-axis dims via `ExprLowerer` pre-flatten or
-  // a collapsed `(ptr, total, 1)` pack post-flatten).
+  // Three-pass arg materialization: scalar idx (authoritative for any
+  // sym they bind), aux idx, then buffers.
   SmallVector<Value> kernelABIArgs(kernelBlock.getNumArguments());
   SmallVector<std::optional<BufferABIPack>> bufferPacks(
       kernelBlock.getNumArguments());
@@ -937,4 +864,4 @@ struct HCLowerKernelsToGPULaunchPass
 
 } // namespace
 
-// `createHCLowerKernelsToGPULaunchPass()` is emitted by tablegen.
+// `createHCLowerKernelsToGPULaunchPass()` is tablegen-generated.

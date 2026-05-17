@@ -2,18 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-pow`: rewrite `hc.pow lhs, rhs` into the
-// `hc.mul` chain the rest of the pipeline understands. See the pass
-// description in `include/hc/Transforms/Passes.td` and the carrier-op
-// contract on `hc.pow` in `include/hc/IR/HCOps.td`.
-//
-// Today only positive integer-literal exponents are supported — the
-// realistic in-pipeline shape (`** 2` for squared distances, `** N`
-// for fixed small N) — via binary squaring on the bit walk of the
-// exponent. Non-constant, non-integer, zero, and negative exponents
-// each get their own diagnostic so the failure fingers the original
-// `**`. Generic `math.pow` codegen would need a new HC math op and is
-// intentionally out of scope here.
+// Implements `-hc-lower-pow`: rewrite `hc.pow lhs, rhs` into an
+// `hc.mul` chain via binary squaring. Only positive integer-literal
+// exponents supported; everything else diagnoses at the original `**`.
+// Generic `math.pow` codegen needs a separate HC math op.
 
 #include "hc/Transforms/Passes.h"
 
@@ -35,11 +27,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// Binary exponentiation: walk bits of `exp` high-to-low, squaring the
-// accumulator on each step and multiplying by `lhs` on every set bit.
-// `exp == 1` returns `lhs` unchanged (loop runs zero times). Counts: K
-// mults for K in {2,3} → 1,2; K in {4..7} → 2,3,3,4 — cheaper than the
-// naive K-1 chain for K >= 4.
+// Binary squaring high-to-low; `exp == 1` returns `lhs` unchanged.
 static Value emitIntegerPow(OpBuilder &builder, Location loc, Value lhs,
                             int64_t exp, Type resultType) {
   assert(exp >= 1 && "emitIntegerPow expects a positive exponent");
@@ -90,9 +78,7 @@ struct HCLowerPowPass : public hc::impl::HCLowerPowBase<HCLowerPowPass> {
   using Base::Base;
 
   void runOnOperation() override {
-    // Collect first, mutate after — erasing inside the walk would
-    // invalidate the iterator the walk is driving. Same shape as the
-    // sibling `-hc-lower-strip-layout` pass.
+    // Collect first; erase-in-walk invalidates the iterator.
     SmallVector<HCPowOp> pows;
     getOperation()->walk([&](HCPowOp op) { pows.push_back(op); });
     for (HCPowOp op : pows) {

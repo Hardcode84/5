@@ -34,12 +34,8 @@ _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     reason="native hc_front dialect smoke tests disabled by env",
 )
 
-# Real-hardware end-to-end gate. Default-skipped — running it dlopens
-# `libamdhip64.so` (via `hc_rt_init`) and dispatches a kernel onto the
-# GPU bound by `HIP_VISIBLE_DEVICES`, so it only makes sense on a host
-# with a working ROCm runtime and a gfx11-class device. Mirror the opt-in
-# convention `tests/test_hip_runtime.py` already established for the
-# init-path test.
+# Real-hardware gate. Default-skipped — dlopens `libamdhip64.so` and
+# dispatches on the GPU bound by `HIP_VISIBLE_DEVICES`.
 _RUN_HIP_INVOKE_TESTS = pytest.mark.skipif(
     os.environ.get("HC_RT_RUN_HIP_INVOKE_TEST") != "1",
     reason="set HC_RT_RUN_HIP_INVOKE_TEST=1 on a host with a gfx11 GPU to run",
@@ -60,12 +56,10 @@ def test_gfx11_wmma_example_matches_blocked_reference(m: int, n: int, k: int) ->
 
 
 def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
-    # Off-tile shape: M=24, N=24 are not multiples of WMMA_M=WMMA_N=16, so the
-    # single right/bottom tile for each `(M, N)` covers a strict superset of
-    # the live region. Pad `c` with sentinel values around the live `(M, N)`
-    # extent and assert the kernel never touches the padding — this is the
-    # "no OOB writes" property the bounds-aware accumulator mask is meant
-    # to enforce.
+    # (24, 24, 32): M=N=24 not multiples of WMMA_M=WMMA_N=16, so the
+    # last tile is a strict superset of the live region. Sentinel
+    # padding outside `c[:24, :24]` pins the OOB-write property the
+    # bounds-aware accumulator mask enforces.
     sentinel = np.float32(-1234.5)
     a, b = make_demo_inputs(m=24, n=24, k=32, seed=11)
     padded = np.full((40, 40), sentinel, dtype=np.float32)
@@ -76,9 +70,6 @@ def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
 
     reference = reference_blocked_matmul(a, b)
     np.testing.assert_allclose(live, reference, rtol=0.0, atol=2e-6)
-    # Tail region untouched: any fragment element whose `(row, col)` lies
-    # outside `c[:24, :24]` must be masked off by `init_wmma_acc` and thus
-    # skipped by the per-element store guards.
     assert np.all(padded[24:, :] == sentinel)
     assert np.all(padded[:24, 24:] == sentinel)
 
@@ -87,38 +78,27 @@ def test_gfx11_wmma_example_does_not_write_past_c_extent() -> None:
 def test_gfx11_wmma_example_benches_on_real_hardware() -> None:
     """End-to-end acceptance for `CompiledKernel.bench(...)`.
 
-    Goes through the same JIT + HIP path as the invoke test but via
-    the bench wrapper: `hc_rt_launch_kernel_repeat` drives an inner
-    loop of `n_inner` launches, `hipStreamSynchronize` closes the
-    window, the runtime hands back monotonic ns. Verifies the shape
-    of the returned `BenchResult` and that the headline numbers
-    relate consistently — anything tighter (e.g. an absolute upper
-    bound on per-launch latency) would be flaky against driver /
-    queue jitter.
+    Same JIT + HIP path as invoke, through the bench wrapper.
+    Verifies `BenchResult` shape and headline consistency; tighter
+    bounds would flake against driver/queue jitter.
     """
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("torch.cuda unavailable")
 
     a, b = make_demo_inputs(m=32, n=32, k=32, seed=17)
-    # Modest m_outer/n_inner so the test runs in a few hundred ms even
-    # on a slow gfx11 host. `bench_on_hardware` asserts the kernel
-    # output matches the numpy reference before timing, so reaching the
-    # `BenchResult` assertions here is also implicit numerics coverage.
+    # Modest m_outer/n_inner keeps wall time bounded.
+    # `bench_on_hardware` checks numerics before timing so reaching the
+    # asserts below also covers numerics.
     result, _ = bench_on_hardware(a, b, n_inner=4, m_outer=5, warmup=1)
     assert result.kernel_name == "tiled_gfx11_wmma_matmul"
     assert result.m_outer == 5
     assert result.n_inner == 4
     assert result.samples_ns.shape == (5,)
     assert result.samples_ns.dtype == np.int64
-    # Every sample must be positive — the C-side timer brackets at
-    # least one host->device dispatch + one stream sync; a zero or
-    # negative ns reading would mean the monotonic clock ran
-    # backwards, which would be a bug worth catching here.
+    # Positive ns: zero/negative would mean the monotonic clock
+    # regressed across at least one dispatch + sync.
     assert int(result.samples_ns.min()) > 0
-    # Per-launch median is the outer-sample median divided by n_inner;
-    # mirror that contract from the C-side timing window down to the
-    # Python aggregation.
     assert result.per_launch_median_ns == pytest.approx(
         result.median_ns / result.n_inner
     )
@@ -132,19 +112,11 @@ def test_gfx11_wmma_example_benches_on_real_hardware() -> None:
     [(16, 16, 16), (32, 32, 32)],
 )
 def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> None:
-    """End-to-end acceptance for the gfx11 WMMA execution epic.
+    """End-to-end gfx11 WMMA dispatch through ORC LLJIT + HIP shim.
 
-    Compiles `tiled_gfx11_wmma_matmul` for `amdgpu-gfx11`, drives it
-    through the full ORC LLJIT + HIP shim stack (`hc.compile().invoke()`
-    -> JIT'd host wrapper -> `hc_rt_load_kernel` / `hc_rt_launch_kernel`
-    -> `libamdhip64`), and checks the result matches the numpy reference
-    to FP32 round-off. Requires GPU memory for the inputs/outputs;
-    `torch.cuda` is the path of least resistance because its
-    `Tensor.data_ptr()` returns a HIP-allocated device pointer that
-    `_mlir_ciface_hc_get_ptr` hands straight to `gpu.launch_func` —
-    the runtime helpers don't allocate or copy on their own. Skip
-    cleanly if torch isn't installed so the gate stays usable
-    on minimal Python envs.
+    `torch.cuda` backs device buffers: `Tensor.data_ptr()` returns the
+    HIP-allocated pointer `_mlir_ciface_hc_get_ptr` hands to
+    `gpu.launch_func`. Skip cleanly if torch isn't installed.
     """
 
     torch = pytest.importorskip("torch")
@@ -170,13 +142,11 @@ def test_gfx11_wmma_example_invokes_on_real_hardware(m: int, n: int, k: int) -> 
     [(6, 5, 4), (8, 8, 3), (3, 7, 5)],
 )
 def test_pairwise_distance_simulator_matches_numpy(w1: int, w2: int, h: int) -> None:
-    """End-to-end simulator pass for the langref WG-level pairwise distance.
+    """Simulator pin for the langref WG-level pairwise Euclidean distance.
 
-    Pins the workgroup-level pairwise Euclidean distance kernel from
-    `doc/langref.md` against a plain NumPy reference. Broadcasting axes
-    are corrected from the langref text (which writes the result
-    transposed); the per-element contract matches the workitem-level
-    form in the same doc section.
+    Broadcasting axes here are corrected from the langref text (which
+    writes the result transposed); per-element contract matches the
+    workitem-level form in the same doc section.
     """
 
     x1, x2 = make_pairwise_inputs(w1=w1, w2=w2, h=h, seed=29)
@@ -187,14 +157,10 @@ def test_pairwise_distance_simulator_matches_numpy(w1: int, w2: int, h: int) -> 
 
 @pytest.mark.parametrize("h", [3, 4, 8])
 def test_pairwise_distance_native_compile(h: int) -> None:
-    """Native compile pass for the langref WG-level pairwise distance.
+    """Compile-only gate: hc pipeline with `H` bound via `symbols=`.
 
-    Drives `hc.compile` through the full hc pipeline with `H` bound via
-    `symbols={H: h}`; asserts the handle exposes a non-empty hc_ir
-    artifact (= every pass succeeded) and surfaces any pipeline
-    diagnostics if it doesn't. This is the compile-only gate — the
-    `invoke` path needs a HIP-visible build and is covered by the
-    matmul example's `_RUN_HIP_INVOKE_TESTS` surface.
+    Non-empty `hc_ir` proves every pass succeeded; diagnostics surface
+    otherwise. Invoke path is covered by the matmul HIP gate.
     """
 
     x1, x2 = make_pairwise_inputs(w1=6, w2=5, h=h, seed=29)
@@ -207,21 +173,17 @@ def test_pairwise_distance_native_compile(h: int) -> None:
     assert compiled.hc_ir_text
 
 
-# Real-hardware end-to-end gate for pairwise. Default-skipped — see the
-# `_RUN_HIP_INVOKE_TESTS` comment block above.
+# Real-hardware gate for pairwise. Default-skipped.
 #
 # Shape coverage:
-#   * Sub-tile: (6, 5, h) stays inside one `group_shape=(8, 8)` workgroup
-#     and exercises the boundary-mask path with a partial chunk.
-#   * Tile-aligned: shapes whose `(W1, W2)` are multiples of (8, 8)
-#     exercise full workgroups (one or many) and the cross-wave LDS
-#     pre-fill ordering against the collective reductions.
-#   * Partial last-tile across multiple workgroups: (16, 12, 8) has the
-#     first row of workgroups fully in-bounds and the second row clipped
-#     in `W2`. That's the dst-bounds-mask-on-store regime — the writeback
-#     gets `hc.yield_predicated mask = (i_0 + WO0 < W1) & (i_1 + WO1 <
-#     W2)` AND'd into the source mask, lowered through
-#     `hc.ptr_store_pred` so OOB lanes never write into the next row.
+#   * Sub-tile (6, 5, h): single `group_shape=(8, 8)` workgroup with a
+#     partial chunk — exercises the boundary-mask path.
+#   * Tile-aligned (multiples of (8, 8)): full workgroups + cross-wave
+#     LDS pre-fill against collective reductions.
+#   * (16, 12, 8): partial-last-tile across multiple workgroups,
+#     clipped in W2. Pins dst-bounds mask on store — without it stride
+#     aliasing turns OOB column writes into next-row hits via
+#     `hc.ptr_store_pred`.
 @_RUN_HIP_INVOKE_TESTS
 @pytest.mark.parametrize(
     ("w1", "w2", "h"),
@@ -249,16 +211,8 @@ def test_gfx11_wmma_example_writes_dump_intermediates(
 ) -> None:
     """`HC_DUMP_DIR` makes hc-lower-gpu-to-binary emit per-stage artifacts.
 
-    Compiling for `amdgpu-gfx11` runs the WMMA kernel through the full
-    device chain, which includes `hc-lower-gpu-to-binary`. With
-    `HC_DUMP_DIR` set Python-side, the pass should drop four files per
-    `gpu.module`: pre-opt LLVM IR, post-opt LLVM IR, ISA assembly, and
-    the linked HSACO blob. Doesn't need a real GPU — the LLD linker
-    runs at compile time, not on a HIP device. Pin both that the
-    files exist and that they look plausible (LLVM module headers,
-    nonzero ELF blob) so a regression in the placeholder substitution
-    or per-stage dump call site fails this test, not the harder-to-
-    diagnose downstream "where did my disassembly go" stage.
+    Four files per `gpu.module`: pre-opt LLVM IR, post-opt LLVM IR,
+    ISA, HSACO blob. Runs at compile time — no GPU needed.
     """
 
     monkeypatch.setenv("HC_DUMP_DIR", str(tmp_path))
@@ -275,10 +229,8 @@ def test_gfx11_wmma_example_writes_dump_intermediates(
         assert p.is_file(), f"missing {p.name}"
         assert p.stat().st_size > 0, f"empty {p.name}"
 
-    # LLVM modules carry a `; ModuleID = '...'` header on line 1 and a
-    # `target triple = "amdgcn-amd-amdhsa"` line. Cheap shape check —
-    # we don't pin the IR contents (those drift with every llvm bump),
-    # just that the file is what we claimed it is.
+    # Shape check on LLVM module headers; IR body drifts with every
+    # llvm bump.
     pre_text = pre.read_text(encoding="utf-8")
     post_text = post.read_text(encoding="utf-8")
     assert pre_text.startswith("; ModuleID")
@@ -286,14 +238,11 @@ def test_gfx11_wmma_example_writes_dump_intermediates(
     assert 'target triple = "amdgcn-amd-amdhsa"' in pre_text
     assert 'target triple = "amdgcn-amd-amdhsa"' in post_text
 
-    # ISA is plain text from the AMDGPU MC stack; it must reference
-    # the kernel symbol so we know it's *this* kernel's assembly and
-    # not stale state from a previous run that landed in the dir.
+    # ISA must name the kernel so we're not picking up stale state.
     isa_text = isa.read_text(encoding="utf-8")
     assert name in isa_text
 
-    # HSACO is an ELF; magic bytes at offset 0 are 0x7f 'E' 'L' 'F'.
-    # File-typing the blob in full is overkill here.
+    # ELF magic at offset 0.
     assert hsaco.read_bytes()[:4] == b"\x7fELF"
 
 
@@ -304,21 +253,14 @@ def test_gfx11_wmma_example_dumps_current_pipeline_ir(
     dump_hc_ir()
 
     captured = capsys.readouterr()
-    # The default schedule lowers all the way through to a self-
-    # contained LLVM module: `hc-lower-gpu-to-binary` produces a
-    # `gpu.binary` HSACO blob, then `hc-lower-launch-func-to-runtime`
-    # embeds that blob as an LLVM global and rewrites every
-    # `gpu.launch_func` as a pair of `hc_rt_load_kernel` +
-    # `hc_rt_launch_kernel` calls. Source `gpu.binary` is erased.
-    # The host wrapper takes one `PyObject *` (lowered to `!llvm.ptr`)
-    # per kernel argument and calls the `_mlir_ciface_hc_get_*`
-    # helpers (declared with `llvm.emit_c_interface` so the wrapper
-    # mangling lands on the symbols that libhc_rt_helpers.so exports)
-    # to materialize each tensor's data pointer, shape dims, and
-    # strides before dispatching. The pointer arrives via
-    # `hc_get_ptr` (raw `!llvm.ptr`, addrspace-cast on the way to the
-    # kernel). Pin each load-bearing milestone so the dump test fails
-    # loudly if anything regresses.
+    # Default schedule lowers to self-contained LLVM:
+    # `hc-lower-gpu-to-binary` → HSACO `gpu.binary`,
+    # `hc-lower-launch-func-to-runtime` embeds it as LLVM global +
+    # rewrites `gpu.launch_func` → `hc_rt_load_kernel` +
+    # `hc_rt_launch_kernel`. Host wrapper takes one `!llvm.ptr` per
+    # kernel arg, calls `_mlir_ciface_hc_get_*` (via
+    # `llvm.emit_c_interface` mangling onto `libhc_rt_helpers.so`)
+    # before dispatch.
     assert "module attributes {gpu.container_module}" in captured.out
     assert (
         "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "

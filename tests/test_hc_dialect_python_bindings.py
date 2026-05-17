@@ -21,22 +21,17 @@ from build_tools.hc_native_tools import (
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# The hc_front smoke test already builds the native package once per session
-# via `@lru_cache`; this suite hangs off the same knob so both sets skip
-# together when the env opts out.
-# The env knob is named `HC_SKIP_HC_FRONT_DIALECT_TESTS` across the suite;
-# keeping the mark symbol aligned with its sibling files makes grep for
-# "which tests get gated by that env" honest.
+# Shares the `HC_SKIP_HC_FRONT_DIALECT_TESTS` knob with sibling files
+# so the hc_front smoke suite and this one skip together.
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
     reason="native hc dialect smoke tests disabled by env",
 )
 _PYTHON_BINDINGS_TIMEOUT_SECONDS = 60.0
 
-# A fully-lowered `hc` module — no `hc_front` ops — exercises the hc dialect
-# registration path without relying on the conversion pass. `hc.kernel` +
-# `hc.return` is the smallest shape the verifier accepts; trying to make
-# this smaller starts getting pedantic about typed/untyped values.
+# Fully-lowered `hc` module (no `hc_front` ops) exercises hc dialect
+# registration without the conversion pass. `hc.kernel` + `hc.return`
+# is the smallest the verifier accepts.
 _HC_MODULE_SOURCE = textwrap.dedent("""
     module {
       hc.kernel @example {
@@ -101,10 +96,8 @@ def test_hc_dialect_registers_and_parses_lowered_ir() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
-    # PassManager.parse raises if any pass name in the pipeline string is
-    # unknown, so a successful parse is proof that both our hc-specific
-    # passes and upstream stock passes made it into the registry. Covers
-    # the `hc.compile` driver's minimum surface.
+    # `PassManager.parse` raises on unknown pass names → a successful
+    # parse proves hc-specific + upstream stock passes both registered.
     result = _run_python("""
         import json
 
@@ -168,9 +161,8 @@ def test_hc_register_dialects_exposes_transform_recipe_ops() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_register_passes_is_idempotent_across_contexts() -> None:
-    # The CAPI shim wraps registration in a `std::once_flag`, but callers
-    # invoking it from two ad-hoc contexts should still observe a coherent
-    # registry. Re-register on the second context and re-parse to prove it.
+    # CAPI shim wraps registration in `std::once_flag`; two ad-hoc
+    # contexts must still observe a coherent registry.
     result = _run_python("""
         import json
 

@@ -2,27 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-specialize-literals`. Folds the compile-time literal
-// bindings stamped by the launcher (`hc.compile(symbols={K: 4, ...})` on the
-// enclosing `hc.kernel`'s `literal_bindings` dict attr) into the IR by
-// substituting each named symbol with its integer value in every reachable
-// `#hc.expr` / `#hc.pred` payload and rebuilding the surrounding shape /
+// Implements `-hc-specialize-literals`. Folds `literal_bindings`
+// (stamped by `hc.compile(symbols={K: 4, ...})` on `hc.kernel`) into
+// IR: substitute each named symbol with its integer value in every
+// reachable `#hc.expr` / `#hc.pred`, rebuild surrounding shape /
 // layout / shaped-type stack via `AttrTypeReplacer`.
 //
-// Bindings live in the IR rather than on a pass option: the front IR
-// snapshot inspected via `compile().hc_ir_text` is then self-contained
-// (re-running the pass on the snapshot reproduces the specialized IR
-// without any out-of-band state), `hc-opt -hc-specialize-literals` on a
-// hand-written module just reads what's already there, and the
-// declaration / valuation split lives where it belongs (`literals` says
-// which symbols *can* be bound; `literal_bindings` says what they are
-// bound to here).
-//
-// After the pass, dims, offsets, and storage_size expressions that were
-// symbolic in K become integer-literal-ground, and every shape-sensitive
-// downstream pass — `hc-verify-static-shapes`, `hc-decompose-shaped-values`,
-// `hc-flatten-with-layouts`, `hc-lower-launch-body` — sees concrete dims
-// without any new substitution plumbing inside each consumer.
+// Bindings live in IR (not a pass option) so a `hc_ir_text` snapshot
+// is self-contained — re-running on the snapshot reproduces the
+// specialized IR. `literals` declares what may be bound;
+// `literal_bindings` carries the bound values.
 
 #include "hc/Transforms/Passes.h"
 
@@ -49,15 +38,8 @@ using namespace mlir::hc;
 
 namespace {
 
-// Cross-check every binding key against the kernel's declared `literals`
-// whitelist when one is present. A binding for an undeclared symbol is a
-// hard error here so the pipeline fails loud at the specialization point
-// instead of silently folding a name the kernel never opted in to —
-// matches the `hc.compile(symbols={...})` Python-side rejection of
-// undeclared keys but covers IR-side stamping paths (LIT, hand-written
-// modules) too. An absent `literals` list (legacy / IR-only test
-// payloads) is permissive: nothing has been promised one way or the
-// other, so any binding is accepted.
+// Cross-check binding keys against the `literals` whitelist when present.
+// Undeclared key = hard error. Absent `literals` is permissive.
 static LogicalResult validateBindings(HCKernelOp kernel,
                                       DictionaryAttr bindings) {
   ArrayAttr literals = kernel.getLiteralsAttr();
@@ -70,15 +52,8 @@ static LogicalResult validateBindings(HCKernelOp kernel,
     StringRef name = entry.getName().getValue();
     if (declared.count(name))
       continue;
-    // Launch-context symbols (`$WGS<axis>`, `$WS<axis>`, `$WV0`,
-    // `$GSZ0`, `$STRIDE_<axis>_<arg>`, ...) are seeded by the front-
-    // to-hc handshake from `group_shape` / `work_shape` /
-    // `subgroup_size`, not by `hc.compile(symbols={...})`; the
-    // `literals` whitelist is the user-facing specialization
-    // contract and doesn't speak for system-managed names. Skip the
-    // cross-check for them so a kernel that declared a user literal
-    // (e.g. `literals = ["TILE"]`) still legally carries
-    // launch-context bindings.
+    // `$`-prefixed names are launch-context (seeded by the front-to-hc
+    // handshake), not user literals — skip the whitelist check.
     if (name.starts_with("$"))
       continue;
     return kernel->emitOpError("literal_bindings key '")
@@ -87,11 +62,8 @@ static LogicalResult validateBindings(HCKernelOp kernel,
   return success();
 }
 
-// Convert a `DictionaryAttr` of `name -> IntegerAttr` into a parallel pair
-// of `ixs_node *` arrays (target symbol nodes, replacement int nodes) that
-// `ixs_subs_multi` can consume. Reports the first offending entry on
-// failure instead of accumulating diagnostics; specialization is all-or-
-// nothing per kernel.
+// Build `ixs_subs_multi` inputs from `name -> IntegerAttr`. Fail-fast on
+// the first invalid entry — specialization is all-or-nothing per kernel.
 static LogicalResult
 composeSubstitutionPairs(HCKernelOp kernel, DictionaryAttr bindings,
                          sym::Store &store,
@@ -117,10 +89,8 @@ composeSubstitutionPairs(HCKernelOp kernel, DictionaryAttr bindings,
   return success();
 }
 
-// Apply a list of (target, replacement) substitutions to a single symbolic
-// handle. Templated so the same machinery serves both `ExprHandle` and
-// `PredHandle` — the two have identical substitution semantics and
-// re-implementing the body for each just invites them to drift apart.
+// Shared between `ExprHandle` / `PredHandle` — identical substitution
+// semantics.
 template <typename Handle>
 static Handle substituteHandle(sym::Session &session, Handle handle,
                                ArrayRef<ixs_node *> targets,
@@ -134,9 +104,8 @@ static Handle substituteHandle(sym::Session &session, Handle handle,
   return Handle(result ? result : handle.raw());
 }
 
-// Block-argument types ride on each block (not on the parent op's
-// attributes), so `AttrTypeReplacer::recursivelyReplaceElementsIn` does
-// not visit them. Walk the regions explicitly after the op tree walk.
+// `AttrTypeReplacer::recursivelyReplaceElementsIn` doesn't visit block
+// argument types — walk regions explicitly after the op tree.
 static void retypeBlockArguments(Operation *op, AttrTypeReplacer &replacer) {
   for (Region &region : op->getRegions())
     for (Block &block : region)
@@ -147,11 +116,8 @@ static void retypeBlockArguments(Operation *op, AttrTypeReplacer &replacer) {
       }
 }
 
-// Substitute every reachable `#hc.expr` / `#hc.pred` (and through them
-// every `#hc.shape`, `#hc.layout`, `!hc.idx`, `!hc.pred`, shaped type)
-// inside the kernel body. `replaceTypes=true` covers block-argument types
-// — kernel-arg buffer shapes, region IV types — so no symbolic carrier
-// for a bound name survives.
+// Substitute every `#hc.expr` / `#hc.pred` and through them every
+// shape / layout / shaped type. `replaceTypes=true` covers block-arg types.
 static void specializeKernel(HCKernelOp kernel, sym::Store &store,
                              ArrayRef<ixs_node *> targets,
                              ArrayRef<ixs_node *> replacements) {
@@ -164,11 +130,7 @@ static void specializeKernel(HCKernelOp kernel, sym::Store &store,
             substituteHandle(session, attr.getValue(), targets, replacements);
         if (replaced == attr.getValue())
           return {attr, WalkResult::skip()};
-        // `ExprAttr` wraps an opaque `ixs_node *` (not an MLIR
-        // sub-element), so the replacer would not recurse into it
-        // even with `advance()`. `skip` documents that this rebuild
-        // is the leaf — the parent (`ShapeAttr`, `LayoutAttr`,
-        // `IdxType`, ...) takes over from here.
+        // `ExprAttr` is a leaf — opaque `ixs_node *`, not an MLIR sub-element.
         return {ExprAttr::get(attr.getContext(), replaced), WalkResult::skip()};
       });
   replacer.addReplacement(
@@ -180,22 +142,15 @@ static void specializeKernel(HCKernelOp kernel, sym::Store &store,
         return {PredAttr::get(attr.getContext(), replaced), WalkResult::skip()};
       });
 
-  // Walk the kernel op itself so its own attribute dictionary
-  // (`function_type` in particular — block args and the declared
-  // function type must stay in sync, the verifier checks parity) gets
-  // rewritten alongside the body. The `literal_bindings` dict only
-  // holds `IntegerAttr` values, so the `ExprAttr` / `PredAttr`
-  // replacements registered above don't match anything inside it —
-  // safe to recurse through.
+  // Walk the kernel op so `function_type` stays parity with block args
+  // (verifier enforces). `literal_bindings` holds only `IntegerAttr` —
+  // no Expr/Pred matches, safe to recurse through.
   replacer.recursivelyReplaceElementsIn(kernel, /*replaceAttrs=*/true,
                                         /*replaceLocs=*/false,
                                         /*replaceTypes=*/true);
   retypeBlockArguments(kernel, replacer);
 
-  // Drop the consumed `literal_bindings` so a downstream re-run is a
-  // no-op and a `hc_ir_text` snapshot doesn't suggest there is more
-  // specialization to do. `literals` stays put — it's the declaration,
-  // not the bound state.
+  // Drop consumed bindings (re-run = no-op). `literals` stays — declaration.
   kernel.removeLiteralBindingsAttr();
 }
 
@@ -212,9 +167,7 @@ struct HCSpecializeLiteralsPass
           DictionaryAttr bindings = kernel.getLiteralBindingsAttr();
           if (!bindings)
             return WalkResult::advance();
-          // Empty `literal_bindings = {}` is the trivial case — still drop
-          // the attribute so a subsequent run / `hc_ir_text` snapshot is
-          // clean, but skip the substitution machinery.
+          // Empty bindings — drop attribute, skip substitution.
           if (bindings.empty()) {
             kernel.removeLiteralBindingsAttr();
             return WalkResult::advance();

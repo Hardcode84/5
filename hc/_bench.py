@@ -4,23 +4,17 @@
 
 """Microbenchmark surface for `CompiledKernel`.
 
-`hc.compile(kernel, bench=True)` flips on `-hc-emit-bench-wrapper`,
-which mints an `i64 wrapper_bench` sibling per host wrapper that calls
-`hc_rt_launch_kernel_repeat` instead of `hc_rt_launch_kernel`. The
-C-side runtime entry does the inner N-launch loop + `hipStreamSynchronize`
-under one `CLOCK_MONOTONIC` bracket and hands back the elapsed
-nanoseconds. This module wraps that contract for Python callers:
+`bench=True` flips on `-hc-emit-bench-wrapper`: a `<wrapper>_bench`
+sibling calls `hc_rt_launch_kernel_repeat`, which loops N launches +
+`hipStreamSynchronize` under one `CLOCK_MONOTONIC` bracket and returns
+elapsed nanoseconds.
 
-* `make_bench_invoker(cache, module, kernel_name, bench_wrapper_name)`
-  builds a ctypes thunk into the bench wrapper and returns a small
-  closure `(stream, *args, n_inner) -> int` returning ns.
-* `BenchResult` is the value type the public `CompiledKernel.bench`
-  method returns: `samples_ns` plus on-demand numpy aggregates.
+* `make_bench_invoker(...)` -> ctypes thunk closure
+  `(stream, *args, n_inner) -> ns`.
+* `BenchResult` carries raw `samples_ns` plus on-demand stats.
 
-Outer-sample orchestration lives on `CompiledKernel.bench` itself; the
-factory here only owns the ctypes thunk + the per-sample contract.
-Pure-Python loop for the outer iterations is fine — the inner loop is
-in C and dominates the wall clock for any kernel worth benchmarking.
+Outer-sample orchestration is on `CompiledKernel.bench`. Pure-Python
+outer loop is fine — the inner loop is in C.
 """
 
 from __future__ import annotations
@@ -43,22 +37,15 @@ def make_bench_invoker(
     kernel_name: str,
     bench_wrapper_name: str,
 ) -> Callable[..., int]:
-    """Build a callable that runs one outer sample against `<name>_bench`.
+    """One-outer-sample callable into `<name>_bench`.
 
-    Reuses the cache's `ExecutionEngine` so the JIT compiles the
-    module exactly once per `CompiledKernel`, no matter how the user
-    interleaves `.invoke()` / `.bench()` calls. The returned closure's
-    signature mirrors `make_invoker`'s — `(*args, stream=None, n_inner=N)` —
-    except it returns the `uint64` elapsed-ns the runtime measured for
-    the (n_inner launches + trailing sync) bracket. The outer M-sample
-    loop and stats aggregation live on the caller (`CompiledKernel.bench`),
-    so this layer stays single-sample.
+    Shares the cache's `ExecutionEngine` with `.invoke()`. Signature:
+    `(*args, stream=None, n_inner=N) -> elapsed_ns`. Outer M-sample
+    loop and stats live in `CompiledKernel.bench`.
     """
     engine, handle = ensure_engine(cache, module)
-    # Both wrappers carry the same user-arg arity; `kernel_arg_count`
-    # reads it off the regular wrapper, which is always present in the
-    # post-pipeline module (the bench pass mints a sibling, never
-    # replaces the original).
+    # Bench wrapper inherits the regular wrapper's user-arg arity;
+    # bench pass adds a sibling, never replaces.
     num_args = kernel_arg_count(module, kernel_name)
     func_ptr = engine.lookup(handle, bench_wrapper_name)
     if not func_ptr:
@@ -69,13 +56,9 @@ def make_bench_invoker(
             "ran and `symbol-dce` did not drop the clone)"
         )
 
-    # `uint64 (void* stream, PyObject* arg0, ..., size_t n_inner)` —
-    # leading `c_void_p` is the HIP stream, the middle `py_object` slots
-    # are passed by borrowed reference (a `py_object` _is_ a borrowed
-    # `PyObject *`), and the trailing `c_size_t` carries the inner loop
-    # count the C-side `hc_rt_launch_kernel_repeat` consumes. The
-    # `restype = c_uint64` is the elapsed-ns the runtime measured under
-    # `CLOCK_MONOTONIC`.
+    # Signature: `uint64 (void* stream, PyObject* arg0..., size_t n_inner)`.
+    # `py_object` slots are borrowed `PyObject*`; `c_size_t` -> n_inner;
+    # `c_uint64` -> elapsed `CLOCK_MONOTONIC` ns.
     func_type = ctypes.CFUNCTYPE(
         ctypes.c_uint64,
         ctypes.c_void_p,
@@ -85,10 +68,8 @@ def make_bench_invoker(
     cfunc = func_type(func_ptr)
 
     def bench(*args: Any, stream: int | None = None, n_inner: int) -> int:
-        # Pin the engine for the same reason `make_invoker` does — ctypes
-        # cfunc references aren't tracked as strong references against
-        # the engine, so without this the JIT'd code could be reclaimed
-        # mid-loop on a low-refcount path.
+        # Pin engine: ctypes cfunc isn't a strong ref; without this the
+        # JIT'd code could be reclaimed mid-loop on a low-refcount path.
         _ = engine
         if len(args) != num_args:
             raise TypeError(
@@ -113,38 +94,23 @@ def make_bench_invoker(
 
 @dataclass(frozen=True)
 class BenchResult:
-    """Outcome of `CompiledKernel.bench(...)` — raw samples + stats.
+    """Raw samples + on-demand stats from `CompiledKernel.bench(...)`.
 
-    `samples_ns[i]` is the wall-clock nanoseconds the C-side runtime
-    measured for outer-sample `i`'s inner loop of `n_inner` kernel
-    launches plus the trailing `hipStreamSynchronize`. Each statistic
-    is computed on-demand from `samples_ns`; the array is the source
-    of truth and external callers can hang their own numpy reductions
-    off it without going through the canned properties.
-
-    `per_launch_*` numbers are the per-sample value divided by
-    `n_inner`, i.e. the average launch+sync amortized cost from one
-    outer iteration. They are the conventional headline number for
-    sub-µs kernels.
+    `samples_ns[i]` = C-side wall-clock ns for sample i's inner loop +
+    `hipStreamSynchronize`. `per_launch_*` = per-sample / `n_inner`,
+    the headline number for sub-µs kernels.
     """
 
     samples_ns: np.ndarray
     n_inner: int
     kernel_name: str
-    # Frozen-but-mutable side-channel for the formatted-table cache.
-    # Computing the table is a microsecond, but `__repr__` may be hit
-    # in REPL completion / debugger loops where a tiny per-access cost
-    # adds up — and `__post_init__` writes go through `object.__setattr__`
-    # to dodge the frozen check.
+    # Mutable side-channel for the summary-table cache.
     _summary_cache: dict[str, str] = field(
         default_factory=dict, compare=False, repr=False
     )
 
     def __post_init__(self) -> None:
-        # Pin the dtype defensively: stat formulas below assume integer
-        # nanoseconds and `float64` math derived from it. A caller that
-        # constructs a `BenchResult` from Python ints would land us at
-        # the wrong dtype otherwise.
+        # Stat formulas assume int64 ns / float64 math; reject other dtypes.
         if not isinstance(self.samples_ns, np.ndarray):
             raise TypeError(
                 "BenchResult.samples_ns must be an np.ndarray, got "
@@ -180,11 +146,7 @@ class BenchResult:
 
     @property
     def std_ns(self) -> float:
-        # Population std (ddof=0). Sample variance with ddof=1 collapses
-        # at m_outer=1 (which we don't reject — single-sample bench is
-        # legal, just uninformative), so ddof=0 keeps the property
-        # total. The reported number is "spread of the samples we have";
-        # callers wanting Bessel-corrected SE-of-mean can derive it.
+        # ddof=0 stays total at m_outer=1; sample bench is legal.
         return float(np.std(self.samples_ns))
 
     @property
@@ -212,9 +174,7 @@ class BenchResult:
         return self.mean_ns / self.n_inner
 
     def __repr__(self) -> str:
-        # One-line shape: enough to identify the result in a REPL /
-        # debugger frame, but not so wide it wraps. Per-launch median
-        # is the headline number for sub-µs kernels.
+        # One-liner; per-launch median is the headline number.
         return (
             f"BenchResult(kernel={self.kernel_name!r}, "
             f"n_outer={self.m_outer}, n_inner={self.n_inner}, "
@@ -232,12 +192,8 @@ class BenchResult:
 
 
 def _format_summary(result: BenchResult) -> str:
-    # Twin-column layout: left column is the per-launch amortized cost
-    # (the headline for sub-µs kernels), right column is the raw outer
-    # sample (visible only when n_inner > 1 — otherwise they're equal
-    # by definition and the second column is noise). Column widths are
-    # hand-picked at 22 chars so the table fits in an 80-col terminal
-    # with header padding to spare.
+    # Twin columns: per-launch amortized cost (left), raw outer sample
+    # (right; equal when n_inner=1). 22-char columns fit 80 cols.
     n_inner = result.n_inner
     per_launch = result.samples_ns.astype(np.float64) / n_inner
 

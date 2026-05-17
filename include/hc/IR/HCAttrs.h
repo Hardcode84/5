@@ -23,8 +23,8 @@ void printInlineShapeAttr(AsmPrinter &printer, ShapeAttr attr);
 
 } // namespace mlir::hc
 
-// The enum header is included before the attrdef header so that the
-// generated `ReduceKindAttr` class can refer to the underlying enum.
+// Enum header before attrdef header: generated `ReduceKindAttr` refers to
+// the underlying enum.
 #include "hc/IR/HCEnums.h.inc"
 
 #define GET_ATTRDEF_CLASSES
@@ -32,35 +32,18 @@ void printInlineShapeAttr(AsmPrinter &printer, ShapeAttr attr);
 
 namespace mlir::hc {
 
-// Compute the storage_size expression a shaped value effectively
-// addresses: substitutes `layout.shape_syms` with `originalShape`'s
-// dim entries in `layout.storage_size` and returns the canonical
-// `ExprAttr`. When `layout` is null the result is the product of the
-// shape's dim entries (the default identity layout's storage size).
-// Returns failure when the layout's shape_syms arity doesn't match
-// the shape's rank or when ixsimpl composition fails.
-//
-// Promoted to a public helper so any verifier or pass that needs to
-// compare a shaped type's address footprint (e.g. `hc.as_layout`'s
-// storage-size-equivalence check, or `hc-flatten-with-layouts`'s
-// 1-D collapse) reaches the same canonical handle via hash-consing.
+/// Storage extent in elements addressed by a shaped value. Substitutes
+/// `layout.shape_syms` with `originalShape` dims into `layout.storage_size`;
+/// null `layout` yields the dim product (identity-layout default). Fails on
+/// rank mismatch or ixsimpl composition failure.
 mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
                                                  LayoutAttr layout,
                                                  ShapeAttr originalShape);
 
-// Compose the linear access offset expression for accessing a shaped
-// operand with `layout` and `originalShape` at the per-axis index
-// expressions `indexExprs`. Substitutes `shape_syms` positionally
-// with the operand's shape entries and `index_syms` positionally with
-// `indexExprs`, then evaluates `layout.offset`. When `layout` is null,
-// falls back to the identity layout's row-major offset over `dims`.
-// Returns failure on rank mismatch or ixsimpl composition failure.
-//
-// Public so multiple passes (`hc-flatten-with-layouts`,
-// `hc-load-store-to-generic`'s broadcast/non-injective vload path)
-// share one canonical substitution, which keeps the hash-consed
-// offset handles aligned across passes and the resulting offsets
-// textually identical.
+/// Linear access offset for `(layout, originalShape)` at per-axis
+/// `indexExprs`. `shape_syms` bind positionally to shape entries,
+/// `index_syms` to `indexExprs`. Null `layout` uses identity row-major
+/// over dims. Fails on rank mismatch or ixsimpl composition failure.
 mlir::FailureOr<ExprAttr>
 composeAccessOffsetExpr(mlir::MLIRContext *ctx, LayoutAttr layout,
                         ShapeAttr originalShape,

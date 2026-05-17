@@ -2,31 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""IR-dumping knobs threaded through the compile pipeline.
+"""IR-dump knobs for the compile pipeline.
 
-`HC_DUMP_PASSES=1` turns on per-pass IR printing across the whole
-compile, in two surfaces:
+`HC_DUMP_PASSES=1` enables per-pass IR printing on two surfaces:
 
-* The device-side `PassManager` (the appended `_GPU_LOWERING_PIPELINE`
-  in `_pipeline.py`) gets `enable_ir_printing(...)` on it, which is
-  the upstream `--mlir-print-ir-after-all` machinery applied to every
-  pass in that chain. Catches `fold-memref-alias-ops`, the rocdl
-  conversions, `gpu-to-llvm`, `hc-lower-gpu-to-binary`, and
-  `hc-lower-launch-func-to-runtime`.
+* Device-side `PassManager` (`_GPU_LOWERING_PIPELINE`): standard
+  `enable_ir_printing(...)`.
+* Transform schedule: the interpreter spawns throwaway PMs per
+  `transform.apply_registered_pass`, no instrumentation inherited.
+  We splice `transform.print` after every payload-mutating op so the
+  interpreter prints between passes.
 
-* The transform schedule (`hc/schedules/front_to_hc.mlir`) does NOT
-  see the device PM's instrumentation: the transform interpreter
-  spawns a fresh, throwaway `PassManager` per
-  `transform.apply_registered_pass`, and it doesn't inherit
-  instrumentation from the parent PM. We work around it by walking
-  the parsed schedule and inserting a `transform.print` after every
-  payload-mutating transform op. The interpreter then prints the
-  payload between passes for free.
-
-Output goes to stderr (matching `--mlir-print-ir-after-all` and
-`transform.print` upstream conventions). Disk-backed dumping (the
-`hc-lower-gpu-to-binary --dump-intermediates` half) is a separate
-knob and not handled here.
+Stderr only. `hc-lower-gpu-to-binary --dump-intermediates` lives
+elsewhere.
 """
 
 from __future__ import annotations
@@ -42,12 +30,9 @@ __all__ = [
 
 DUMP_PASSES_ENV = "HC_DUMP_PASSES"
 
-# Transform ops that take a payload handle and mutate it in place
-# (`results == 0`, `operands == 1`). The probe fires on the *operand*
-# handle since there's no SSA result to chain off. We keep the list
-# explicit instead of "anything with one operand and no result" so we
-# don't accidentally start probing future structural ops that don't
-# correspond to a pass step the user wants to inspect.
+# Transform ops that mutate in place (0 results, 1 operand); probe
+# fires on the operand. Explicit list avoids accidentally probing
+# future structural ops.
 _OPERAND_HANDLE_OPS: frozenset[str] = frozenset(
     {
         "transform.apply_patterns",
@@ -58,29 +43,20 @@ _OPERAND_HANDLE_OPS: frozenset[str] = frozenset(
 
 
 def dump_passes_enabled() -> bool:
-    """True when `HC_DUMP_PASSES` is set to `1` in the process env."""
+    """True when `HC_DUMP_PASSES=1`."""
 
     return os.environ.get(DUMP_PASSES_ENV) == "1"
 
 
 def splice_dump_passes(module: Any) -> int:
-    """Insert `transform.print` after every payload-mutating transform op.
+    """Insert `transform.print` after each payload-mutating transform op.
 
-    Walks the module body, recursing into every region. For each
-    `transform.apply_registered_pass` we hang the print off the
-    *result* handle (`%mN+1 = apply_registered_pass ... to %mN`) and
-    label it with the pass name. For `transform.apply_patterns` /
-    `apply_cse` / `apply_dce` — which mutate the payload referenced
-    by their operand and don't produce a result handle — we hang it
-    off the operand. Other transform ops (`transform.yield`, nested
-    apply-pattern descriptors like `transform.apply_patterns.canonicalization`,
-    ...) are skipped because they don't represent an inspect-worthy
-    mid-schedule state — `apply_patterns.canonicalization` only
-    describes a pattern set, the parent `apply_patterns` is the
-    actual mutator and the one we probe.
+    Probe hangs off the result handle for `apply_registered_pass`,
+    off the operand handle for `apply_patterns`/`apply_cse`/`apply_dce`.
+    Other ops (yield, nested pattern descriptors) skipped — not
+    inspect-worthy mid-schedule states.
 
-    Returns the number of probes inserted, mostly for tests/asserts.
-    Mutates `module` in place.
+    Returns probe count. Mutates `module` in place.
     """
 
     from .mlir import ir
@@ -91,9 +67,7 @@ def splice_dump_passes(module: Any) -> int:
         nonlocal inserted
         for region in op.regions:
             for block in region.blocks:
-                # Snapshot before iterating: we'll be inserting new ops
-                # immediately after each child, and rebinding the block's
-                # operations list mid-loop would visit our own probes.
+                # Snapshot; inserting mid-loop would visit our probes.
                 children = list(block.operations)
                 for child in children:
                     visit(child)

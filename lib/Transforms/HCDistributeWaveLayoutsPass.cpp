@@ -2,35 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-distribute-wave-layouts`: rewrite wave-cooperative
-// layout-bearing carriers into per-lane peers before the rest of the
-// substrate composes per-axis offsets through them. See the pass
-// description in `include/hc/Transforms/Passes.td` and the substrate
-// rationale in `doc/layouts.md` — the short version is that a
-// user-spelled layout like `vector<["32", "8"], <offset = 32*fi +
-// lane>>` over a 32-lane subgroup distributes one slot per lane per
-// fragment index, and the rewrite makes that fact visible to flatten /
-// suffix-drop / post-flatten retyper without forcing them to invent
-// it.
-//
-// Recognition is offset-driven: for a `#hc.layout` whose first
-// index sym `lane` shows up in `offset` as the affine factor `lane *
-// <stride>`, substituting `lane := $WI0` (the workitem axis-0 sym, by
-// the substrate's `LaunchGeoMethod::LocalId` prefix convention) gives
-// the per-lane offset, and substituting `lane := 0` gives the residue
-// (the iter-only term flatten composes against). The shape's leading
-// dim must equal the launch context's `subgroup_size` so the lane
-// extent matches the carrier extent.
-//
-// Rewrite scope is intentionally narrow: only carriers that live
-// inside an `hc.workitem_region` body get distributed (outside the
-// region the per-lane peer has nowhere to live). The four ops the
-// rewrite touches — `hc.vzeros` / `hc.vones` / `hc.vfull` and their
-// tensor-flavoured siblings, `hc.generic`, `hc.buffer_view`,
-// `hc.strip_layout` — are the ones the WMMA accumulator chain
-// exercises end-to-end; broader carriers fall through unchanged and
-// the downstream `hc-lower-generic` diagnostic still fires on
-// anything the rewrite missed.
+// Implements `-hc-distribute-wave-layouts`: wave-cooperative layout carriers
+// → per-lane peers. Recognition: first index sym `lane` enters `offset` as an
+// affine `lane * stride` term; `lane := $WI0` gives per-lane offset, `lane :=
+// 0` gives the iter-only residue. Leading shape dim must equal `subgroup_size`.
+// Scope is `hc.workitem_region` bodies only. See `doc/layouts.md`.
 
 #include "hc/Transforms/Passes.h"
 
@@ -59,13 +35,8 @@ using namespace mlir::hc;
 
 namespace {
 
-// Factorization of a wave-distributable layout's `offset` along the
-// first index sym (the lane axis). `residue` is the offset after
-// substituting `lane := 0`; `laneStride` is the affine coefficient of
-// `lane` (constant integer); `perLaneStorage` is `storage_size /
-// wave_size`. Caller has already validated that `offset` is affine in
-// `lane` with constant stride and that `storage_size` is a constant
-// multiple of `wave_size`.
+// `offset = lane*laneStride + residueOffset`; perLaneStorage =
+// storage_size/wave_size.
 struct WaveFactorization {
   sym::ExprHandle residueOffset;
   int64_t laneStride;
@@ -73,11 +44,7 @@ struct WaveFactorization {
   StringRef laneIndexSymName;
 };
 
-// Substitute `target` with `replacement` in `expr` via the symbol
-// store's `ixs_subs_multi`. Returns a fresh handle on success. Mirrors
-// the substitution shape `composeAccessOffsetExpr` uses; extracted
-// here so the pass body doesn't repeat the session / target / value
-// dance.
+// Substitute `targetName -> replacement` in `expr` via `ixs_subs_multi`.
 static FailureOr<sym::ExprHandle> substituteOne(sym::Store &store,
                                                 sym::ExprHandle expr,
                                                 StringRef targetName,
@@ -96,7 +63,7 @@ static FailureOr<sym::ExprHandle> substituteOne(sym::Store &store,
   return sym::ExprHandle(bound);
 }
 
-// Same as `substituteOne` but the replacement is a literal integer.
+// Literal-int replacement variant of `substituteOne`.
 static FailureOr<sym::ExprHandle> substituteInt(sym::Store &store,
                                                 sym::ExprHandle expr,
                                                 StringRef targetName,
@@ -107,11 +74,7 @@ static FailureOr<sym::ExprHandle> substituteInt(sym::Store &store,
   return substituteOne(store, expr, targetName, *replacement);
 }
 
-// Predicate-flavoured analogue of `substituteOne`: walks
-// `ixs_subs_multi` to rewrite `targetName` → `replacement` inside the
-// predicate node. Returned handle is canonical hash-consed; type
-// uniquing on `!hc.pred<...>` propagates the substitution to every
-// SSA user the same way an `ExprAttr` swap does on `!hc.idx<...>`.
+// Predicate analogue of `substituteOne`; type uniquing propagates to users.
 static FailureOr<sym::PredHandle>
 substituteOnePred(sym::Store &store, sym::PredHandle pred, StringRef targetName,
                   sym::ExprHandle replacement) {
@@ -147,8 +110,7 @@ static bool referencesSymbol(sym::PredHandle pred, StringRef target) {
   return found;
 }
 
-// True iff `layout` and `shape` agree on rank: both must be present,
-// non-empty, and index_syms / shape_syms / dims share the same arity.
+// Rank parity: index_syms / shape_syms / dims share the same non-zero arity.
 static bool layoutShapeHaveMatchedRank(LayoutAttr layout, ShapeAttr shape) {
   if (!layout || !shape)
     return false;
@@ -160,10 +122,8 @@ static bool layoutShapeHaveMatchedRank(LayoutAttr layout, ShapeAttr shape) {
   return indexSyms.size() == dims.size() && shapeSyms.size() == dims.size();
 }
 
-// Validate the layout / shape headers and pull the lane index sym
-// name off the leading entry. Returns nullopt if the layout / shape
-// don't agree on rank, the leading index sym isn't a StringAttr, or
-// the leading shape dim doesn't match the wave extent.
+// Lane sym name off the layout's leading index sym; leading dim must ==
+// waveSize.
 static std::optional<StringRef>
 extractWaveLaneSym(LayoutAttr layout, ShapeAttr shape, int64_t waveSize) {
   if (!layoutShapeHaveMatchedRank(layout, shape))
@@ -178,10 +138,8 @@ extractWaveLaneSym(LayoutAttr layout, ShapeAttr shape, int64_t waveSize) {
   return laneSymAttr.getValue();
 }
 
-// Probe the lane axis of `offset` for an affine factorization: the
-// residue at `lane := 0` must not still mention `lane`, and `offset[lane :=
-// 1] - residue` must be a positive constant stride. Caller has
-// already validated the layout / shape headers.
+// Probe affine factorization: residue@(lane:=0) lane-free; offset@(lane:=1)
+// - residue must be positive constant stride.
 static std::optional<std::pair<sym::ExprHandle, int64_t>>
 probeLaneStride(sym::Store &store, sym::ExprHandle offset, StringRef laneSym) {
   auto residue = substituteInt(store, offset, laneSym, 0);
@@ -205,17 +163,8 @@ probeLaneStride(sym::Store &store, sym::ExprHandle offset, StringRef laneSym) {
   return std::make_pair(*residue, *strideInt);
 }
 
-// Validate that `storage_size` is a positive constant divisible by
-// `waveSize`; produce `storage_size / waveSize` as the per-lane peer's
-// storage extent.
-//
-// The simplest sufficient condition the v0 recogniser accepts is
-// `storage_size == lane_stride * wave_size * <per_lane_extent>` for
-// some positive per-lane extent — i.e. the lane axis tiles
-// `lane_stride * wave_size` slots, leaving the residual to encode
-// the per-lane extent. We don't enforce the exact tiling here; the
-// storage_size of the per-lane peer is just `storage_size /
-// wave_size`.
+// `storage_size > 0`, divisible by `waveSize`; per-lane =
+// storage_size/waveSize.
 static std::optional<sym::ExprHandle>
 computePerLaneStorage(sym::Store &store, ExprAttr storageAttr,
                       int64_t waveSize) {
@@ -230,10 +179,8 @@ computePerLaneStorage(sym::Store &store, ExprAttr storageAttr,
   return *perLaneStorage;
 }
 
-// Try to factor `layout.offset` along `layout.index_syms[0]`.
-// Returns nullopt when the offset isn't affine in the lane sym with a
-// constant stride, or the layout / shape parities don't support a
-// clean lane distribution.
+// Factor `layout.offset` along `index_syms[0]`; nullopt on non-affine / parity
+// mismatch.
 static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
                                                             ShapeAttr shape,
                                                             int64_t waveSize,
@@ -256,15 +203,7 @@ static std::optional<WaveFactorization> tryFactorWaveLayout(LayoutAttr layout,
                            *laneSym};
 }
 
-// Compute the per-lane peer of `shaped`: drop the first shape dim and
-// the layout slot. The wave-cooperative carrier's layout encodes the
-// (lane, residual_indices) → wave-wide slot mapping, which is exactly
-// what disappears once we project onto a single lane — each lane's
-// fragment is just a vector of `prod(residual_dims)` slots indexed
-// row-major by the residual iters. Downstream producers (`hc.generic`
-// outs / `hc.vload` etc.) have their offset arrays rewritten in
-// lockstep so the per-lane composed offset on the layout-less peer is
-// the residual iter sym alone.
+// Per-lane peer: drop leading shape dim and layout slot.
 static Type distributedTypeMaybeBare(SymbolicallyShapedTypeInterface shaped,
                                      int64_t /*waveSize*/,
                                      StringRef /*waveSym*/,
@@ -286,18 +225,14 @@ static Type distributedTypeMaybeBare(SymbolicallyShapedTypeInterface shaped,
   return reshapedShaped.cloneWithSymbolicLayout(LayoutAttr{});
 }
 
-// True when `op` is one of the nullary / fill alloc ops the rewrite
-// handles. Each of these owns its result-type layout slot via the
-// op-side `layout` attr and a shape SSA tuple; the rewrite updates
-// both in lockstep.
+// Nullary / fill alloc ops the rewrite handles.
 static bool isShapedAllocOp(Operation *op) {
   return isa<HCVZerosOp, HCVOnesOp, HCVFullOp, HCZerosOp, HCOnesOp, HCFullOp>(
       op);
 }
 
-// Build a `tuple<idx<...>, ...>` SSA tuple at `loc` from the given
-// per-axis dim exprs. Each dim materialises as an empty-binding
-// `hc.idx_apply` carrying `!hc.idx<dim>`.
+// Build `tuple<idx<dim>, ...>` from per-axis dim exprs; empty-binding
+// `hc.idx_apply` each.
 static Value buildShapeTuple(OpBuilder &builder, Location loc, MLIRContext *ctx,
                              ArrayRef<Attribute> dims) {
   SmallVector<Value> idxs;
@@ -318,10 +253,7 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc, MLIRContext *ctx,
   return HCTupleOp::create(builder, loc, tupleTy, idxs);
 }
 
-// Set the `shape` operand and `layout` attribute on a nullary / fill
-// alloc op. Each of the six alloc ops has the same accessor shape but
-// different concrete types, so the dispatch is by op kind. Returns
-// failure on an unknown op kind.
+// Six alloc ops share accessor shape, distinct types; dispatch by kind.
 static LogicalResult patchAllocShape(Operation *op, Value newShape,
                                      LayoutAttr newLayout) {
   if (auto vz = dyn_cast<HCVZerosOp>(op)) {
@@ -348,9 +280,7 @@ static LogicalResult patchAllocShape(Operation *op, Value newShape,
   return success();
 }
 
-// Extract the `shape` SSA tuple operand off any of the six
-// nullary / fill alloc ops the rewrite touches. Returns null for
-// anything else.
+// `shape` SSA tuple operand off any of the six alloc ops.
 static Value getAllocShapeOperand(Operation *op) {
   if (auto vz = dyn_cast<HCVZerosOp>(op))
     return vz.getShape();
@@ -367,10 +297,7 @@ static Value getAllocShapeOperand(Operation *op) {
   return Value{};
 }
 
-// Pull pinned `!hc.idx<dim>` expressions off a `tuple<!hc.idx<...>,
-// ...>` type. Returns nullopt when any element isn't a pinned idx
-// (the rewriter has no signal to compare against the result type's
-// shape).
+// Pinned `!hc.idx<dim>` exprs off a `tuple<idx<...>, ...>` type.
 static std::optional<SmallVector<Attribute>>
 pinnedDimsFromIdxTuple(Type tupleType) {
   auto tupleTy = dyn_cast<TupleType>(tupleType);
@@ -390,8 +317,7 @@ pinnedDimsFromIdxTuple(Type tupleType) {
   return dims;
 }
 
-// Read the alloc op's `shape` SSA tuple's element types and return
-// the per-axis dim exprs they pin.
+// Per-axis dim exprs pinned in the alloc's `shape` tuple element types.
 static std::optional<SmallVector<Attribute>>
 shapeFromAllocOperand(Operation *op) {
   Value shape = getAllocShapeOperand(op);
@@ -400,16 +326,8 @@ shapeFromAllocOperand(Operation *op) {
   return pinnedDimsFromIdxTuple(shape.getType());
 }
 
-// Update a wave-distributable nullary / fill alloc to match the type
-// the producer-side rewrite established on its result. The result
-// type's shape may have shrunk (lane axis dropped) and its layout may
-// have been cleared by the generic-driven cascade; this helper
-// detects the shape divergence between the alloc's `shape` SSA tuple
-// (still pinning the pre-rewrite per-axis dims) and the alloc's
-// (now-cascaded) result type, and rebuilds both the shape operand
-// and the layout attr in lockstep. No-op when the shape operand
-// already matches the result-type shape (the producer rewrite didn't
-// touch this alloc).
+// Sync the alloc's `shape` operand and `layout` attr to its (cascaded) result
+// type.
 static LogicalResult harmoniseAllocOp(Operation *op) {
   Value result = op->getResult(0);
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(result.getType());
@@ -423,9 +341,7 @@ static LogicalResult harmoniseAllocOp(Operation *op) {
       llvm::equal(*operandDims, resultDims))
     return failure();
 
-  // Rebuild the shape tuple from the result type's per-axis dims and
-  // clear the layout attr (the per-lane peer is layout-less; the
-  // generic-driven cascade has retyped the result accordingly).
+  // Rebuild from result-type dims; per-lane peer is layout-less.
   OpBuilder builder(op);
   Value newShape =
       buildShapeTuple(builder, op->getLoc(), op->getContext(), resultDims);
@@ -434,18 +350,13 @@ static LogicalResult harmoniseAllocOp(Operation *op) {
   return patchAllocShape(op, newShape, shaped.getSymbolicLayout());
 }
 
-// Helper: extract the iter sym name (StringRef) bound by an offset
-// array entry that's a bare lane index (i.e. the operand's per-axis
-// offset is literally one of the generic's iter syms). Returns
-// nullopt when the entry isn't a bare sym name expression.
+// Iter sym name when the offset entry is exactly one sym leaf; nullopt
+// otherwise.
 static std::optional<StringRef> getBareIterSym(ExprAttr offsetEntry,
                                                sym::Store &store) {
   if (!offsetEntry)
     return std::nullopt;
-  // A bare iter sym renders as a single ixs sym leaf; walk and accept
-  // only when there's exactly one leaf and the expression reduces to
-  // that leaf alone. We test that by comparing the expression handle
-  // against the constructed sym handle for the recovered name.
+  // Exactly one sym leaf, expression handle == reconstructed sym handle.
   StringRef found;
   unsigned count = 0;
   sym::walkSymbolNames(offsetEntry.getValue(), [&](StringRef n) {
@@ -462,14 +373,8 @@ static std::optional<StringRef> getBareIterSym(ExprAttr offsetEntry,
   return found;
 }
 
-// Type-level substitution: rewrite every embedded sym leaf
-// `targetName` in `ty` to point at `replacement`. The walker recurses
-// into the structural carriers the dialect's symbolic types expose
-// (`!hc.idx`, `!hc.pred`, `!hc.slice`, the five shaped types' shape
-// + layout payloads). Anything outside those carriers — builtin
-// scalars, opaque MLIR types, etc. — returns unchanged. Returning
-// `Type()` signals a substitution failure the caller should treat
-// as a bail.
+// Recurse through `!hc.idx`/`!hc.pred`/`!hc.slice`/shaped carriers; `Type()` =
+// bail.
 static Type substituteInType(MLIRContext *ctx, sym::Store &store, Type ty,
                              StringRef targetName, sym::ExprHandle replacement);
 
@@ -527,9 +432,7 @@ static LayoutAttr substituteLayoutAttr(MLIRContext *ctx, sym::Store &store,
                          layout.getParams(), newStorage, newOffset);
 }
 
-// Per-type-kind handlers for `substituteInType`. Each returns the
-// rewritten type, `ty` when nothing changed, or `Type{}` (i.e. null)
-// on a substitution failure the caller propagates upstream.
+// `Type{}` propagates failure to the caller.
 static Type substituteInIdx(MLIRContext *ctx, sym::Store &store, IdxType ty,
                             StringRef targetName, sym::ExprHandle replacement) {
   auto e = ty.getExpr();
@@ -608,15 +511,8 @@ static Type substituteInType(MLIRContext *ctx, sym::Store &store, Type ty,
   return ty;
 }
 
-// Substitute the lane iter sym for the wave sym inside every value
-// the rewritten generic produces in its body region. The body's
-// `hc.idx_apply` / `hc.pred_apply` ops carry the iter sym as an
-// ambient binding in their result types (`!hc.idx<E[i_0]>` /
-// `!hc.pred<P[i_0]>`); the surrounding generic used to bind `i_0`
-// for them, but the rewrite has just dropped it. Replacing the leaf
-// in every carrier in topological order leaves the body referencing
-// `$WI0` from the enclosing `hc.workitem_region` instead, which the
-// existing lowering paths handle natively.
+// Rewrite leaves in body carriers so they reference `$WI0` from the enclosing
+// workitem region after the generic has dropped the lane iter.
 static LogicalResult substituteInRegionBody(Region &region, sym::Store &store,
                                             StringRef targetName,
                                             sym::ExprHandle replacement) {
@@ -635,9 +531,7 @@ static LogicalResult substituteInRegionBody(Region &region, sym::Store &store,
   return success(!walkResult.wasInterrupted());
 }
 
-// Substitute `laneIterSym -> waveExpr` in one operand's per-axis
-// offset array, optionally dropping the leading axis. Returns null
-// on a malformed entry, a failed substitution, or a drop-from-empty.
+// Per-axis substitution with optional leading-axis drop.
 static ArrayAttr substituteOneOperandOffsets(MLIRContext *ctx, ArrayAttr inner,
                                              StringRef laneIterSym,
                                              sym::ExprHandle waveExpr,
@@ -660,10 +554,7 @@ static ArrayAttr substituteOneOperandOffsets(MLIRContext *ctx, ArrayAttr inner,
   return ArrayAttr::get(ctx, rewritten);
 }
 
-// Apply the lane-iter substitution to an entire operand-major offsets
-// attribute (`outs_offsets` / `ins_offsets` on `hc.generic`). The
-// outer array maps to operands; per-operand arrays are per-axis
-// offset entries.
+// Operand-major substitution over the whole `*_offsets` attribute.
 static ArrayAttr
 substituteAndOptionallyDropAxis(MLIRContext *ctx, ArrayAttr perOperandOffsets,
                                 StringRef laneIterSym, StringRef waveSym,
@@ -690,36 +581,17 @@ substituteAndOptionallyDropAxis(MLIRContext *ctx, ArrayAttr perOperandOffsets,
   return ArrayAttr::get(ctx, outer);
 }
 
-// Rewrite a `hc.generic` whose outs include wave-distributable
-// carriers. The rewrite is in-place: the lane iter axis (identified
-// by the leading entry of any wave-distributable outs's offset array)
-// is dropped from `iter_syms` / `iter_bounds` / `iter_kinds`, every
-// remaining offset expression substitutes the lane iter sym for
-// `$WI0`, every wave-distributable operand's offset array drops its
-// leading axis, and the value-typed results / outs that carry the
-// wave-distributable type are retyped to their per-lane peers.
-//
-// Bails (returning failure) when:
-//   * the outs's offset array's leading entry isn't a bare iter sym
-//     (we'd be unable to identify the lane iter axis structurally),
-//   * the lane iter sym shows up in multiple operands' non-leading
-//     positions with conflicting subexpression shapes (we'd need a
-//     cross-axis substitution the v0 doesn't model),
-//   * the generic carries reduction iters that name the lane iter sym
-//     (a wave reduction across the dropped axis would lose its
-//     accumulator semantics under the rewrite).
-// Bundles the classification state computed by `classifyWaveOuts`
-// before any IR mutation: the shared lane iter sym, per-out drop
-// flags, and the rewritten per-out types.
+// In-place generic rewrite: drop lane iter axis, sub `lane -> $WI0`, retype
+// outs/results to per-lane peers. Bails on: outs leading entry not a bare
+// iter sym; lane sym in conflicting non-leading positions; reduction over
+// the lane axis.
 struct WaveOutsClassification {
   StringRef laneIterSym;
   SmallVector<bool> outsDropLeading;
   SmallVector<Type> newOutsTypes;
 };
 
-// Pull the leading bare iter sym off operand `k`'s per-axis offset
-// array; failure means a malformed offsets entry the caller treats
-// as fatal.
+// Leading bare iter sym on operand `k`'s offset array; fatal on failure.
 static FailureOr<StringRef>
 readLeadingIterSymOnOperand(ArrayAttr offsets, size_t k, sym::Store &store) {
   auto perOperand = dyn_cast<ArrayAttr>(offsets[k]);
@@ -734,9 +606,8 @@ readLeadingIterSymOnOperand(ArrayAttr offsets, size_t k, sym::Store &store) {
   return *iterSym;
 }
 
-// True iff `out` carries a wave-distributable layout; if so, sets
-// `*factor` to the factorization (caller owns the lifetime). Reads
-// the layout + shape off the type interface.
+// Sets `factor` on a wave-distributable carrier; reads layout/shape off the
+// type.
 static bool isWaveDistributableOuts(Value out, int64_t waveSize,
                                     sym::Store &store,
                                     std::optional<WaveFactorization> &factor) {
@@ -752,12 +623,7 @@ static bool isWaveDistributableOuts(Value out, int64_t waveSize,
   return factor.has_value();
 }
 
-// Inspect one outs operand `out` at index `k` and update
-// `classification` if it's a wave-distributable carrier. Returns
-// failure for outs whose offset array's leading entry can't be
-// resolved to a bare iter sym (we couldn't identify the lane axis
-// structurally) or whose distributed type can't be computed; signals
-// "non-wave outs, skip" via success() with `matched` set false.
+// Failure: malformed bare iter sym or distributed type. Skip: matched=false.
 static LogicalResult tryClassifyWaveOut(Value out, size_t k,
                                         ArrayAttr outsOffsets, int64_t waveSize,
                                         StringRef waveSym, sym::Store &store,
@@ -784,10 +650,8 @@ static LogicalResult tryClassifyWaveOut(Value out, size_t k,
   return success();
 }
 
-// First pass: identify every wave-distributable outs operand and the
-// lane iter sym they share. Returns failure when at least one outs is
-// wave-distributable but resolution against the offsets attribute
-// fails, or when none are wave-distributable (nothing to rewrite).
+// Identify wave-distributable outs and the shared lane iter sym; failure when
+// none qualify or any qualifier fails offset resolution.
 static FailureOr<WaveOutsClassification>
 classifyWaveOuts(ArrayRef<Value> outs, ArrayAttr outsOffsets, int64_t waveSize,
                  StringRef waveSym, sym::Store &store) {
@@ -809,13 +673,8 @@ classifyWaveOuts(ArrayRef<Value> outs, ArrayAttr outsOffsets, int64_t waveSize,
   return c;
 }
 
-// Second pass: identify wave-distributable INS so their leading
-// offset axis drops in lockstep with the outs side. The ins carrier
-// is typically the same wave-cooperative value the outs writes (e.g.
-// a `hc.buffer_view` forward the rewrite collapses), but the
-// rewrite handles both forms via the same offset-leading-iter-sym
-// detector. Soft-skip semantics — anything that doesn't look like a
-// wave-distributable ins is left alone; we don't reject the rewrite.
+// Wave-distributable ins drop their leading axis in lockstep; soft-skip
+// non-matches.
 static SmallVector<bool>
 classifyWaveIns(ArrayRef<Value> ins, ArrayAttr insOffsets, int64_t waveSize,
                 StringRef waveSym, StringRef laneIterSym, sym::Store &store) {
@@ -845,9 +704,8 @@ classifyWaveIns(ArrayRef<Value> ins, ArrayAttr insOffsets, int64_t waveSize,
   return insDropLeading;
 }
 
-// Locate the lane iter sym's index inside `iterSyms` and validate
-// it's `Parallel`. A reduction over the lane axis would be a wave
-// reduction the v0 doesn't model.
+// Lane iter must be `Parallel`; wave-reduction across the lane axis isn't
+// modelled.
 static FailureOr<size_t> findAndValidateLaneIterPos(ArrayAttr iterSyms,
                                                     ArrayAttr iterKinds,
                                                     StringRef laneIterSym) {
@@ -861,15 +719,14 @@ static FailureOr<size_t> findAndValidateLaneIterPos(ArrayAttr iterSyms,
   return failure();
 }
 
-// Bundles the iter-list slices after dropping the lane axis.
+// Iter-list slices after the lane axis is dropped.
 struct IterListsMinusLane {
   SmallVector<Attribute> syms;
   SmallVector<Value> bounds;
   SmallVector<Attribute> kinds;
 };
 
-// Rebuild the per-axis iter lists with the lane axis at `lanePos`
-// removed.
+// Per-axis iter lists with the entry at `lanePos` removed.
 static IterListsMinusLane buildIterListsWithoutLane(ArrayAttr iterSyms,
                                                     ValueRange iterBounds,
                                                     ArrayAttr iterKinds,
@@ -888,9 +745,7 @@ static IterListsMinusLane buildIterListsWithoutLane(ArrayAttr iterSyms,
   return out;
 }
 
-// Apply all the producer-side mutations once classification has
-// committed: new iter lists, new offsets, retyped outs operands,
-// retyped results, and the in-body lane-sym substitution.
+// Commit classification: iter lists, offsets, outs/result types, body sub.
 static LogicalResult applyGenericRewriteMutations(
     HCGenericOp op, MLIRContext *ctx, const IterListsMinusLane &iters,
     ArrayAttr newInsOffsets, ArrayAttr newOutsOffsets, ArrayRef<Value> outs,
@@ -908,13 +763,7 @@ static LogicalResult applyGenericRewriteMutations(
   }
   for (auto [k, res] : llvm::enumerate(op.getResults()))
     res.setType(newOutsTypes[k]);
-  // The body's `hc.idx_apply` / `hc.pred_apply` ops still carry
-  // `laneIterSym` in their result-type expressions (the iter sym was
-  // an ambient binding from the surrounding generic, which we just
-  // dropped). Rewrite the body in lockstep so every leaf references
-  // the wave sym instead — `$WI0` is bound by the enclosing
-  // `hc.workitem_region` and reaches every nested op via the same
-  // ambient-binding path.
+  // Body carriers still bind `laneIterSym`; rewrite leaves to `$WI0`.
   auto waveExpr = sym::composeExprSym(store, waveSym);
   if (failed(waveExpr))
     return failure();

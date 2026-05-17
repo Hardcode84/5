@@ -2,22 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-strip-layout`: rewrite the user-marked
-// boundary op `hc.strip_layout` into the body-driven `hc.generic`
-// surface. See the pass description in
-// `include/hc/Transforms/Passes.td` and the bare-result contract on
-// `hc.strip_layout` in `include/hc/IR/HCOps.td`.
-//
-// Shape parity with `hc-load-store-to-generic`'s `rewriteLoadLike` —
-// emit one parallel iter per result axis, source on `ins` with
-// identity per-axis offsets (flatten composes them through the
-// source's layout into the gather offset post-flatten), bare init
-// on `outs` with identity per-axis offsets, body is a single
-// `hc.yield` of the loaded element. The helper functions
-// (`materializeIdxBound`, `buildShapeTuple`, `offsetArrayFromIterSyms`)
-// duplicate the same shapes that live in three sibling pass files;
-// extracting them is a follow-up tidy that's noted in the
-// generic-funneling cluster.
+// Implements `-hc-lower-strip-layout`: rewrite `hc.strip_layout` into
+// `hc.generic` — one parallel iter per result axis, source on `ins`
+// with identity per-axis offsets, bare init on `outs`, body yields
+// the loaded element.
 
 #include "hc/Transforms/Passes.h"
 
@@ -45,10 +33,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// Materialize one bound dim as `!hc.idx<dim>` SSA via an
-// `hc.idx_apply` with no listed symbols (free shape names stay
-// ambient). Mirrors the helper in the sibling generic-funneling
-// passes.
+// Empty-binding `hc.idx_apply`; free shape names stay ambient.
 static Value materializeIdxBound(OpBuilder &builder, Location loc,
                                  ExprAttr dim) {
   auto idxTy = IdxType::get(builder.getContext(), dim);
@@ -56,8 +41,7 @@ static Value materializeIdxBound(OpBuilder &builder, Location loc,
                               builder.getStrArrayAttr({}));
 }
 
-// Build a `tuple<idx<...>, ...>` SSA tuple for the shape operand the
-// nullary allocators consume.
+// Shape operand for the nullary allocators.
 static Value buildShapeTuple(OpBuilder &builder, Location loc,
                              ValueRange dims) {
   SmallVector<Type> elemTypes(
@@ -66,9 +50,7 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc,
   return HCTupleOp::create(builder, loc, tupleTy, dims);
 }
 
-// Build the per-axis offset attribute from iter sym names — `[#hc.expr
-// <"i_0">, #hc.expr<"i_1">, ...]`. ixsimpl hash-conses these so the
-// printed form stays canonical across emitters.
+// Per-axis offset attr from iter sym names; hash-consed so canonical.
 static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
                                          ArrayRef<StringAttr> names) {
   SmallVector<Attribute> exprs;
@@ -81,13 +63,8 @@ static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
   return ArrayAttr::get(ctx, exprs);
 }
 
-// Synthesise a zero-init of the strip's result type. The verifier
-// enforces `result.layout == null` (the whole point of the op is to
-// drop the layout), so the nullary allocator's optional layout attr
-// is left absent. Flavor preserved: `hc.vzeros` for bare_vector
-// results, `hc.zeros` for bare_tensor. Semantic carriers are
-// rejected by the contract gate in `hc-decompose-shaped-values` and
-// never reach this pass.
+// Zero-init the strip's result; `result.layout == null` by verifier so
+// allocator's layout attr stays absent. `hc.vzeros` / `hc.zeros` per flavor.
 static Value emitBareInit(OpBuilder &builder, Location loc, Type resultTy,
                           Value shape) {
   if (isa<mlir::hc::BareVectorType>(resultTy))
@@ -99,8 +76,7 @@ static Value emitBareInit(OpBuilder &builder, Location loc, Type resultTy,
                            /*layout=*/LayoutAttr{});
 }
 
-// Extract the per-axis ExprAttr dim list from a shaped type's symbolic
-// shape, or fail if the shape is absent or any dim is not an ExprAttr.
+// Fail if shape absent or any dim is not an `ExprAttr`.
 static FailureOr<SmallVector<ExprAttr>>
 collectTileShape(SymbolicallyShapedTypeInterface shaped) {
   ShapeAttr shape = shaped.getSymbolicShape();
@@ -117,9 +93,7 @@ collectTileShape(SymbolicallyShapedTypeInterface shaped) {
   return tile;
 }
 
-// Per-axis iter spec for the generic op: sym name, bound SSA, and the
-// matching attributes for the op's `iter_syms` / `iter_kinds` arrays.
-// All axes are Parallel for the strip rewrite.
+// All axes Parallel for the strip rewrite.
 struct ParallelIterSpace {
   SmallVector<StringAttr> syms;
   SmallVector<Value> bounds;
@@ -127,11 +101,7 @@ struct ParallelIterSpace {
   SmallVector<Attribute> kindAttrs;
 };
 
-// Iter syms `i_0`, ..., `i_{r-1}` (parallel) — matches the naming the
-// load-side rewriter uses; collisions with body-local names are
-// structurally unlikely and the verifier catches them. Bounds come
-// from the result shape's per-axis dim exprs, materialised as
-// `!hc.idx<dim>` via empty-binding `hc.idx_apply`.
+// Iter syms `i_0`..`i_{r-1}`; verifier catches body-local collisions.
 static ParallelIterSpace buildParallelIterSpace(OpBuilder &builder,
                                                 Location loc,
                                                 ArrayRef<ExprAttr> tile) {
@@ -151,9 +121,7 @@ static ParallelIterSpace buildParallelIterSpace(OpBuilder &builder,
   return space;
 }
 
-// Build the element-copy generic: one parallel iter per axis, identity
-// per-axis offsets on both source and init, body yields the source
-// element so the init's value goes unread.
+// Body yields source element; init value goes unread.
 static HCGenericOp
 emitElementCopyGeneric(OpBuilder &builder, Location loc, Type resTy,
                        Type srcElem, Type resElem, Value src, Value initOut,
@@ -186,23 +154,14 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
   if (!srcShaped || !resShaped)
     return failure();
 
-  // Defensive no-op: source already matches the result. The user
-  // reached for `as_layout(value, None)` against a producer that
-  // already gave them a bare-with-no-layout carrier, so the strip
-  // collapses to a forward — no allocator, no generic. Common in
-  // helpers that don't know upfront whether the caller's
-  // ``group.vload`` carried an explicit layout.
+  // src matches result — forward, no allocator/generic.
   if (srcTy == resTy) {
     op.getResult().replaceAllUsesWith(src);
     op.erase();
     return success();
   }
 
-  // Result shape drives the iter range and the init's shape tuple.
-  // The op's verifier already requires operand and result shape to
-  // agree; we read from the result side so a missing op-side shape
-  // bails this rewrite cleanly without surfacing the operand /
-  // result divergence elsewhere.
+  // Read result shape; verifier already enforces operand-result parity.
   FailureOr<SmallVector<ExprAttr>> tileShape = collectTileShape(resShaped);
   if (failed(tileShape))
     return failure();
@@ -218,20 +177,12 @@ static LogicalResult lowerStripLayout(HCStripLayoutOp op, sym::Store &store) {
 
   ParallelIterSpace iters = buildParallelIterSpace(builder, loc, *tileShape);
 
-  // Allocate bare destination matching the result type. The bare
-  // allocators don't take a layout attribute on emission — the
-  // result type's layout is null by `hc.strip_layout`'s verifier.
+  // Bare allocator; `result.layout == null` by verifier.
   Value shapeTuple = buildShapeTuple(builder, loc, iters.bounds);
   Value initOut = emitBareInit(builder, loc, resTy, shapeTuple);
 
-  // Per-axis offsets on both operands are identity (the iter syms).
-  // The source's layout (if any) provides the actual gather offset —
-  // flatten substitutes the iter exprs into the layout's `offset` at
-  // `index_syms[k]` and yields the linear storage offset post-1D.
-  // For a layout-less source (the verifier allows this; the strip is
-  // a layout-and/or-flavor change) flatten composes the identity
-  // layout, which collapses the per-axis exprs into the linear
-  // dim-product offset — a trivial element copy.
+  // Identity per-axis offsets; flatten substitutes iter syms into the
+  // source's layout (or identity layout when none).
   ArrayAttr inOff = offsetArrayFromIterSyms(ctx, store, iters.syms);
   ArrayAttr outOff = offsetArrayFromIterSyms(ctx, store, iters.syms);
   ArrayAttr insOffsets = ArrayAttr::get(ctx, {inOff});
@@ -254,8 +205,7 @@ struct HCLowerStripLayoutPass
     Operation *root = getOperation();
     auto &store =
         root->getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
-    // Collect first, mutate after — erasing inside the walk would
-    // invalidate the iterator the walk is driving.
+    // Collect first; erase-in-walk invalidates the iterator.
     SmallVector<HCStripLayoutOp> strips;
     root->walk([&](HCStripLayoutOp op) { strips.push_back(op); });
     for (HCStripLayoutOp op : strips)

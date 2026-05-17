@@ -2,12 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Sanity checks for `libhc_hip_runtime.so`. The default test surface is
-# explicitly ROCm-free: we ctypes-load the shim and confirm the C ABI is
-# present and that the build did NOT pick up an accidental link against
-# libamdhip64. The optional `HC_RT_RUN_HIP_INIT_TEST=1` opt-in actually
-# calls `hc_rt_init`, which dlopen's libamdhip64.so — only meaningful on
-# hosts that have ROCm installed.
+# Sanity checks for `libhc_hip_runtime.so`. Default surface is ROCm-free:
+# ctypes-load the shim, confirm C ABI presence, confirm no accidental
+# `libamdhip64` link. `HC_RT_RUN_HIP_INIT_TEST=1` opt-in actually calls
+# `hc_rt_init` (dlopens `libamdhip64.so`) — needs ROCm on the host.
 
 from __future__ import annotations
 
@@ -69,8 +67,8 @@ def hip_runtime(hip_runtime_path: Path) -> ctypes.CDLL:
     lib = ctypes.CDLL(str(hip_runtime_path))
     lib.hc_rt_init.argtypes = []
     lib.hc_rt_init.restype = None
-    # The launch entry points have wide signatures; we only declare them
-    # so ctypes can resolve them. Real calls happen from JIT'd code.
+    # Wide launch signatures declared so ctypes resolves them. Real
+    # calls come from JIT'd code.
     lib.hc_rt_load_kernel.argtypes = [
         ctypes.c_void_p,  # stream
         ctypes.POINTER(ctypes.c_void_p),  # cached_kernel_handle
@@ -96,10 +94,8 @@ def hip_runtime(hip_runtime_path: Path) -> ctypes.CDLL:
         ctypes.c_int,  # num_args
     ]
     lib.hc_rt_launch_kernel.restype = None
-    # Bench variant: same kernel-launch signature as `hc_rt_launch_kernel`,
-    # plus a `size_t n_inner` and a `uint64_t` elapsed-ns return. Mirrored
-    # here so ctypes consumers (and the test below) can resolve the symbol
-    # without rediscovering the C ABI shape.
+    # Bench variant: same launch signature + `size_t n_inner` arg +
+    # `uint64_t` elapsed-ns return.
     lib.hc_rt_launch_kernel_repeat.argtypes = [
         ctypes.c_void_p,  # stream
         ctypes.c_void_p,  # function
@@ -127,11 +123,10 @@ def test_hip_runtime_exports_expected_symbols(hip_runtime: ctypes.CDLL) -> None:
 
 
 def test_hip_runtime_has_no_rocm_link(hip_runtime_path: Path) -> None:
-    """The whole point of the dlopen-at-init design is that the .so loads
-    on hosts without ROCm. A regression that adds an accidental
-    `-lamdhip64` (or pulls in some ROCm CMake target transitively) would
-    silently break import on such hosts. Catch it at build verification
-    time."""
+    """`.so` must load on hosts without ROCm — dlopen-at-init is the
+    whole point. Catch accidental `-lamdhip64` (or transitive ROCm
+    CMake deps) at build-verification time.
+    """
     result = subprocess.run(
         ["ldd", str(hip_runtime_path)],
         check=True,
@@ -146,12 +141,12 @@ def test_hip_runtime_has_no_rocm_link(hip_runtime_path: Path) -> None:
 def test_hip_runtime_loads_in_subprocess_without_rocm(
     hip_runtime_path: Path,
 ) -> None:
-    """Importing and ctypes-loading the shim must work even if there is
-    no libamdhip64.so on the system. We run in a subprocess with
-    LD_LIBRARY_PATH cleared so any locally installed ROCm can't hide a
-    misconfiguration."""
-    # Symbol list mirrors `_SYMBOLS` — keep them in sync via the module
-    # constant so a new entry only has to be added in one place.
+    """Import + ctypes-load must work without `libamdhip64.so`. Subprocess
+    with cleared `LD_LIBRARY_PATH` so a locally installed ROCm can't
+    hide a misconfiguration.
+    """
+    # Mirror `_SYMBOLS` via the module constant — new entries land in
+    # one place.
     script = (
         "import ctypes\n"
         f"lib = ctypes.CDLL({str(hip_runtime_path)!r})\n"
@@ -175,9 +170,9 @@ def test_hip_runtime_loads_in_subprocess_without_rocm(
     reason="set HC_RT_RUN_HIP_INIT_TEST=1 on a host with libamdhip64.so to run",
 )
 def test_hc_rt_init_dlopens_libamdhip64(hip_runtime: ctypes.CDLL) -> None:
-    """Opt-in: actually exercise the dlopen path. Calling twice verifies
-    idempotency. On a host without libamdhip64 the first call would
-    throw `std::runtime_error`, which the C ABI translates to an
-    abort — hence the explicit gate."""
+    """Opt-in: exercise the dlopen path. Two calls verify idempotency.
+    Without `libamdhip64`, first call throws `std::runtime_error` →
+    C ABI translates to abort. Hence the explicit gate.
+    """
     hip_runtime.hc_rt_init()
     hip_runtime.hc_rt_init()

@@ -2,63 +2,21 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-flatten-with-layouts`. Every shaped value loses its
-// `#hc.layout` slot AND collapses its shape to a single entry. Tensors
-// and vectors get a concrete `storage_size_expr` (from the layout's
-// `storage_size` after binding `shape_syms` to the original shape, or
-// the dim product when the implicit identity-layout contract
-// applies); buffers collapse to `[?]` (`#hc.dyn`) because the host
-// owns the allocation.
+// `-hc-flatten-with-layouts`: every shaped value drops its `#hc.layout`
+// and collapses its shape to one entry. Tensors/vectors get a
+// `storage_size_expr` (from layout or dim product); buffers collapse
+// to `[?]` (host-owned allocation).
 //
-// In addition to the shape collapse, the converter is **1-to-N**:
-// every shaped operand expands to (flat_value, idx_value_0, ...,
-// idx_value_{k-1}) where the trailing values are typed `!hc.idx<sym>`
-// for each free symbol the type implicitly carries — shape syms from
-// the operand's dim entries, layout's free syms from the offset /
-// storage_size / params expressions, minus the layout's index_syms
-// which are bound at access sites instead. Names are sorted
-// lexicographically to keep the expansion deterministic across
-// rebuilds.
+// 1-to-N converter: each shaped operand expands to `(flat_value,
+// idx_aux_0, ..., idx_aux_{k-1})` — one `!hc.idx<sym>` per implicit
+// free symbol (shape syms + layout's free syms minus `index_syms`).
+// Names sorted lex for determinism.
 //
-// The expansion is what makes the flattened IR self-contained. Pre-
-// flatten the dim names (`M`, `N`, ...) and stride params
-// (`$STRIDE_*`) are reachable through the type and resolved by the
-// downstream launch-walk via ambient binding; post-flatten those
-// names disappear from the type, so we surface them as ordinary SSA
-// values that ride alongside the flat carrier. Access ops that
-// compose layouts can then bind every free symbol of the resulting
-// offset expression in `hc.idx_apply` explicitly, instead of leaving
-// the binding to the lowering pass.
-//
-// `hc.generic` per-operand per-axis `#hc.expr` offset arrays compose
-// post-flatten: each operand's array of axis exprs goes through the
-// operand's pre-flatten layout offset (or the identity-layout
-// fallback when no layout is attached) into a single 1D `#hc.expr`,
-// matching the post-flatten 1D operand rank. The verifier on
-// `hc.generic` enforces rank parity in both regimes.
-//
-// Per-access ops (`hc.load`, `hc.vload`, `hc.store`) also get
-// rewritten in this pass: their multi-index lists collapse to a
-// single 1D base-offset SSA value composed from the operand's
-// layout against the access site's index expressions. `hc.load_mask`
-// is rewritten to an `hc.generic` upstream by
-// `hc-load-store-to-generic`, so its addressing rides the same
-// generic-offset compose path the data generics do. Composition
-// runs during conversion so the layout is still on the (pre-
-// conversion) operand type when we read it. Free symbols of the
-// composed offset that have a matching SSA in the operand's
-// expansion (or in the index ops themselves, since `!hc.idx<sym>`
-// values *are* their own binding) end up as explicit operands of
-// `hc.idx_apply`; anything else stays unlisted and gets resolved
-// ambiently by the launch-body lowering.
-//
-// `hc.buffer_view` and `hc.vec` stay untouched here — buffer_view is
-// a sub-view producer with different semantics than a single base
-// offset, and vec has no indices.
-//
-// `hc.as_layout` is dropped unconditionally — both endpoints route
-// through the converter, so the relabel becomes cosmetic by the time
-// the rewriter sees it.
+// Access ops (`hc.load`/`hc.vload`/`hc.store`) and `hc.generic`
+// compose their per-axis offset arrays into a single 1D offset
+// during conversion (layout still readable on pre-conversion type).
+// `hc.buffer_view` / `hc.vec` keep their shape. `hc.as_layout`
+// drops unconditionally.
 
 #include "hc/Transforms/Passes.h"
 
@@ -91,21 +49,10 @@ using namespace mlir::hc;
 
 namespace {
 
-// Collect the free symbol names a shaped type *implicitly* carries:
-// names that appear in any dim expression or in the layout's
-// `offset` / `storage_size` / `params` payloads, minus the layout's
-// own `index_syms` (those bind at access sites, not on the type) and
-// the layout's `shape_syms` (those alias to dim entries, which we
-// already walked through the shape).
-//
-// The list is the post-flatten 1-to-N expansion's tail: for every
-// name returned here the converter produces an `!hc.idx<name>`
-// trailing the flat carrier, in the same order, so the access-site
-// rewriters can pair operand position to symbol name without a side
-// Insert every symbol name appearing in `expr` into `seen`. Null
-// `expr` is a no-op so callers don't need to special-case missing
-// layout pieces (e.g. `LayoutAttr::getOffset()` may legitimately be
-// null on a stripped layout).
+// Implicit free syms of a shaped type: names in dim exprs + layout's
+// offset/storage_size/params, minus `index_syms` and `shape_syms`.
+// Post-flatten 1-to-N expansion's tail: one `!hc.idx<name>` per
+// returned name, same order. Null `expr` is a no-op.
 static void noteExprSymbolNames(ExprAttr expr, llvm::StringSet<> &seen) {
   if (!expr)
     return;
@@ -113,7 +60,6 @@ static void noteExprSymbolNames(ExprAttr expr, llvm::StringSet<> &seen) {
                        [&](StringRef name) { seen.insert(name); });
 }
 
-// Collect every dim-side symbol name referenced by `shaped`.
 static void noteSymsInSymbolicShape(SymbolicallyShapedTypeInterface shaped,
                                     llvm::StringSet<> &seen) {
   ShapeAttr shape = shaped.getSymbolicShape();
@@ -124,11 +70,9 @@ static void noteSymsInSymbolicShape(SymbolicallyShapedTypeInterface shaped,
       noteExprSymbolNames(expr, seen);
 }
 
-// Collect every layout-side symbol name referenced by `shaped` (offset,
-// storage size, and named layout params), then strip the names that
-// bind at access sites (`index_syms`) or that alias dim entries
-// (`shape_syms`) — the dim walk already noted those names and we don't
-// want both (e.g. `d0` *and* `M`) in the expansion.
+// Layout-side syms (offset / storage_size / params) minus `index_syms`
+// (bound at access sites) and `shape_syms` (alias dim entries already
+// covered).
 static void noteSymsInSymbolicLayout(SymbolicallyShapedTypeInterface shaped,
                                      llvm::StringSet<> &seen) {
   LayoutAttr layout = shaped.getSymbolicLayout();
@@ -146,9 +90,7 @@ static void noteSymsInSymbolicLayout(SymbolicallyShapedTypeInterface shaped,
     seen.erase(cast<StringAttr>(attr).getValue());
 }
 
-// table. Sort lexicographically for determinism — `StringSet`
-// iteration is unordered and the test corpus pins the operand list
-// in textual IR.
+// Sort lex for determinism (StringSet iteration is unordered).
 static SmallVector<std::string>
 collectImplicitSyms(SymbolicallyShapedTypeInterface shaped) {
   llvm::StringSet<> seen;
@@ -163,11 +105,8 @@ collectImplicitSyms(SymbolicallyShapedTypeInterface shaped) {
   return result;
 }
 
-// Pull the bare symbol name out of a shape dim entry, or return an
-// empty `StringRef` when the dim isn't a single-symbol expression
-// (constant, composite expression, dyn-size sentinel). Used to map
-// `axis -> sym name` for the host-wrapper aux-arg metadata so the
-// dim-slot path can recover axis order post-flatten.
+// Bare sym name of a single-symbol dim, else empty. Drives the
+// host-wrapper aux-arg `axis -> sym name` map.
 static StringRef bareDimSymbolName(Attribute dimAttr) {
   auto expr = dyn_cast<ExprAttr>(dimAttr);
   if (!expr)
@@ -178,11 +117,8 @@ static StringRef bareDimSymbolName(Attribute dimAttr) {
   return StringRef(ixs_node_sym_name(node));
 }
 
-// `$STRIDE_<axis>_<bufname>` is the frontend's stride symbol shape (see
-// `buildDefaultStridedBufferLayout`). Parsing the axis back out of the
-// symbol name keeps `5-1qy4`'s host-wrapper lowering name-driven on the
-// stride side, mirroring the dim side's axis lookup against the buffer
-// shape. Returns `std::nullopt` for symbols that aren't strides.
+// Parse axis out of `$STRIDE_<axis>_<bufname>` (frontend stride sym
+// shape). nullopt for non-strides.
 static std::optional<unsigned> parseStrideAxis(StringRef name) {
   static constexpr StringLiteral kStridePrefix = "$STRIDE_";
   if (!name.starts_with(kStridePrefix))
@@ -195,10 +131,7 @@ static std::optional<unsigned> parseStrideAxis(StringRef name) {
   return axis;
 }
 
-// Build the !hc.idx<sym> type carrying a bare-symbol expression
-// for each implicit name. Returns failure if any name fails to
-// compose into the dialect store (extreme edge case; the names
-// already came out of valid type payloads).
+// Build `!hc.idx<sym>` per implicit name.
 static LogicalResult buildAuxIdxTypes(MLIRContext *ctx,
                                       ArrayRef<std::string> names,
                                       SmallVectorImpl<Type> &results) {
@@ -212,45 +145,11 @@ static LogicalResult buildAuxIdxTypes(MLIRContext *ctx,
   return success();
 }
 
-// Compute the 1D `storage_size_expr` for `originalShape` given an
-// optional `layout`. With a layout, that is `layout.storage_size`
-// after substituting `layout.shape_syms` with the original shape's
-// per-axis expressions. Without a layout, the type sits on the
-// implicit identity-layout contract and the storage size is the
-// product of the original dimensions. Rank-0 falls out as the empty
-// product `1`.
-//
-// Caller's responsibility: the shape's entries must all be
-// `ExprAttr` (no `DynSizeAttr`). Buffers — the only flatten input
-// that legitimately carries a `?` post-collapse — handle that case
-// directly in the converter instead of routing through here, so
-// any `DynSize` here would mean a bug upstream and the cast asserts.
-//
-// All work goes through hash-consed ixsimpl handles via the
-// dialect-owned store: no rendering, no parsing, no string traffic.
-// `ixs_subs_multi` wants raw `ixs_node *` arrays for both targets
-// and replacements, so we collect those via `composeExprSym` /
-// `getNode()` and let the substitution canonicalize through the same
-// store any other producer of these expressions would. The actual
-// composition lives in `lib/IR/HCAttrs.cpp::computeStorageSizeExpr`
-// — promoted to a public helper so the `hc.as_layout` verifier
-// uses the same path; the comment above documents the contract for
-// both call sites.
-
-// Pull the symbolic expression that names the SSA index value at an
-// access site. Three legal sources:
-//   - `!hc.idx<expr>`               -> `expr` (the typical case;
-//     index ops produced by the kernel scope are pinned),
-//   - `!hc.slice<lower=!hc.idx<expr>, ...>` -> the lower-bound expr
-//     (slice's first element address is the access base; the tile
-//     walk steps from there),
-//   - `!hc.slice` with no `lower`   -> integer `0` (Python-style
-//     full-slice; base offset on this axis is 0).
-// Anything else (raw `index`, untyped `!hc.idx`, slice without a
-// pinned lower) -> failure: the rewrite can't compose a base offset
-// without a symbolic name to bind to the layout's index_sym, and
-// silently leaving the multi-index list alone would mismatch the
-// op's now-1D operand type.
+// Access-site index expr. Three legal sources:
+//   `!hc.idx<expr>` -> expr,
+//   `!hc.slice<lower=!hc.idx<expr>, ...>` -> lower,
+//   `!hc.slice` no lower -> 0 (Python full-slice).
+// Anything else fails: missing sym name to bind to layout's index_sym.
 static FailureOr<ExprAttr>
 extractAccessIndexExpr(MLIRContext *ctx, sym::Store &store, Type indexType) {
   if (auto idx = llvm::dyn_cast<IdxType>(indexType)) {
@@ -274,20 +173,11 @@ extractAccessIndexExpr(MLIRContext *ctx, sym::Store &store, Type indexType) {
   return failure();
 }
 
-// Identity-layout offset and `composeAccessOffsetExpr` itself live in
-// `lib/IR/HCAttrs.cpp` as `mlir::hc::composeAccessOffsetExpr` so other
-// passes (notably `hc-load-store-to-generic`'s non-injective vload
-// path) reuse the same substitution and stay aligned with this pass
-// on hash-consed offset handles.
+// `composeAccessOffsetExpr` lives in `lib/IR/HCAttrs.cpp` — shared with
+// `hc-load-store-to-generic` for hash-cons alignment.
 
-// Materialize the composed offset as an SSA value typed
-// `!hc.idx<offset_expr>` via an `hc.idx_apply`. Free symbols of the
-// expression that have a known SSA binding in `bindings` are listed
-// explicitly (operand + symbol name pair); anything else stays
-// unlisted and gets resolved ambiently by the launch-body lowering
-// from the surrounding launch context. Listed symbol order is
-// lexicographic so the textual form is deterministic across
-// rebuilds.
+// Materialize composed offset as `!hc.idx<offset_expr>` via
+// `hc.idx_apply`. Bound syms listed lex; unbound resolved ambiently.
 static Value materializeOffsetSSA(ConversionPatternRewriter &rewriter,
                                   Location loc, ExprAttr offsetExpr,
                                   const llvm::StringMap<Value> &bindings) {
@@ -316,27 +206,8 @@ static Value materializeOffsetSSA(ConversionPatternRewriter &rewriter,
       .getResult();
 }
 
-// Per-access-op helper: extracts each index operand's symbolic expr,
-// composes the base offset against the operand's pre-flatten layout
-// + shape, materializes the offset as a single SSA value with
-// explicit bindings for every free symbol whose SSA we have at
-// hand. The buffer/source operand's 1-to-N expansion (`shapedAux`,
-// in declaration order matching `collectImplicitSyms` of the
-// operand's pre-flatten type) supplies the dim and stride values;
-// each idx-typed index operand binds its own symbol because the
-// `!hc.idx<sym>` value *is* the binding for that name. Returns
-// failure (and leaves the IR untouched) if any index can't yield a
-// symbolic expression, or if the operand isn't a shaped HC type, or
-// if rank parity breaks. Failure here means the access op stays on
-// the multi-index surface; `RetypeAnyHCOp` then handles type-only
-// retyping and the lowering downstream still has to deal with the
-// uncomposed access.
-// Validate that `preFlattenOperand` is a shaped type carrying a usable
-// symbolic shape (and, for buffer operands, a layout). Returns the
-// triple `(shaped, layout, shape)` on success. A missing layout on a
-// buffer is a frontend bug — every buffer carries the default strided
-// layout — and we surface it as a rewrite failure instead of silently
-// emitting `0` from an identity-layout fallback over the wrong dims.
+// Buffer with missing layout is a frontend bug (default strided
+// layout always attached) — fail rather than emit `0` over wrong dims.
 struct ShapedAccessOperandInfo {
   SymbolicallyShapedTypeInterface shaped;
   LayoutAttr layout;
@@ -360,8 +231,6 @@ validateShapedAccessOperand(Value preFlattenOperand) {
   return ShapedAccessOperandInfo{shaped, layout, originalShape};
 }
 
-// Convert each index value's type into an `ExprAttr` via the access
-// helper. Any failure short-circuits the whole compose.
 static FailureOr<SmallVector<ExprAttr>>
 buildAccessIndexExprs(MLIRContext *ctx, sym::Store &store,
                       OperandRange indices) {
@@ -376,11 +245,8 @@ buildAccessIndexExprs(MLIRContext *ctx, sym::Store &store,
   return indexExprs;
 }
 
-// Bind one SSA value per implicit symbol from the shaped operand's
-// post-flatten aux expansion. The converter is supposed to produce
-// the operand and exactly one aux per implicit sym; a mismatch means
-// someone fed us a partially-converted operand range and we bail
-// rather than guess.
+// Bind one SSA per implicit sym from aux expansion. Mismatch fails:
+// partially-converted operand range is upstream's bug.
 static LogicalResult
 bindShapedAuxImplicitSyms(SymbolicallyShapedTypeInterface shaped,
                           ValueRange shapedAux,
@@ -393,12 +259,8 @@ bindShapedAuxImplicitSyms(SymbolicallyShapedTypeInterface shaped,
   return success();
 }
 
-// Pull the bare sym name pinned by an `!hc.idx<sym>` type. Composite
-// expressions (`i + 1`, `i * stride`) are not their own binding for
-// any single name; the value-as-binding shortcut only applies when
-// the type's symbol set is exactly `{name}` and the expression *is*
-// that symbol leaf. The cheapest check: walk and single-out a unique
-// name, then confirm by reconstruction.
+// Bare sym name pinned by `!hc.idx<sym>`, else empty. Composite exprs
+// fail: value-as-binding only when type's expr IS the symbol leaf.
 static StringRef pinsBareIdxSymbol(Type type, sym::Store &store) {
   auto idxType = dyn_cast<IdxType>(type);
   if (!idxType)
@@ -424,9 +286,7 @@ static StringRef pinsBareIdxSymbol(Type type, sym::Store &store) {
   return onlyName;
 }
 
-// Bind each idx-typed access index whose own type pins a single bare
-// symbol. Doesn't overwrite a binding already produced by the
-// operand's aux expansion.
+// Bind each bare-sym idx index. Doesn't overwrite aux-supplied bindings.
 static void bindBareSymbolIndexOperands(OperandRange indices, sym::Store &store,
                                         llvm::StringMap<Value> &bindings) {
   for (Value idx : indices) {
@@ -437,16 +297,9 @@ static void bindBareSymbolIndexOperands(OperandRange indices, sym::Store &store,
   }
 }
 
-// Walk enclosing region/loop block arguments (the canonical example is
-// an `hc.for_range` induction variable typed `!hc.idx<"$join0">`) and
-// bind any bare-sym `!hc.idx` we find. Without this the composed
-// offset would leave such names as free symbols, and the launch-body
-// lowering would have to resolve them ambiently — fragile, because
-// the structured-loop converter rewrites the for_range to `scf.for`
-// before the inner apply gets lowered, and at that point the original
-// `!hc.idx<sym>` type is gone from the IR. Explicit operand binding
-// here keeps the apply's free-sym set bounded to the launch geometry
-// and kernel-arg shape syms.
+// Bind ancestor bare-sym block args (e.g. `hc.for_range` IV typed
+// `!hc.idx<"$join0">`). Must bind here: for_range→scf.for rewrite
+// strips the sym type before the inner apply lowers.
 static void bindAncestorBareSymbolBlockArgs(Operation *op, sym::Store &store,
                                             llvm::StringMap<Value> &bindings) {
   for (Block *block = op->getBlock(); block;) {
@@ -492,12 +345,8 @@ composeAccessBaseOffset(ConversionPatternRewriter &rewriter, Operation *op,
   return materializeOffsetSSA(rewriter, op->getLoc(), *offsetExpr, bindings);
 }
 
-// Decides whether a shaped type is already in its post-flatten
-// canonical form: no layout slot, and a single-entry shape (an
-// `ExprAttr` for tensors / vectors, the `?` sentinel for buffers).
-// Already-flat types convert 1-to-1 — re-running the expansion on
-// them would never reach a fixed point because the converter would
-// keep producing a non-trivial 1-to-N expansion for the same type.
+// True iff shaped is already post-flatten canonical (no layout,
+// single-entry shape). Re-expanding would never fixed-point.
 static bool isAlreadyFlat(SymbolicallyShapedTypeInterface shaped) {
   if (shaped.getSymbolicLayout())
     return false;
@@ -512,10 +361,8 @@ static bool isAlreadyFlat(SymbolicallyShapedTypeInterface shaped) {
   return isa<ExprAttr>(dims.front());
 }
 
-// Compute the 1D shaped form of a `SymbolicallyShapedTypeInterface`
-// (the leading flat carrier the converter prepends to the implicit
-// sym aux). Returns std::nullopt for types the conversion declines
-// (e.g. an unresolvable `storage_size`).
+// 1D shaped form (the leading flat carrier). nullopt when conversion
+// declines (e.g. unresolvable storage_size).
 static std::optional<Type>
 computeFlatShapedType(SymbolicallyShapedTypeInterface shaped) {
   ShapeAttr originalShape = shaped.getSymbolicShape();
@@ -525,12 +372,8 @@ computeFlatShapedType(SymbolicallyShapedTypeInterface shaped) {
   MLIRContext *ctx = shaped.getContext();
   LayoutAttr layout = shaped.getSymbolicLayout();
 
-  // Buffers collapse to `[?]`: the host owns the allocation and
-  // the default strided layout's `storage_size = 0` placeholder
-  // is informational, so a `#hc.dyn` sentinel is the honest
-  // 1D form. Any consumer that needs a concrete extent reaches
-  // for the host descriptor instead of trying to derive it from
-  // the in-IR symbol set.
+  // Buffers collapse to `[?]`: host owns allocation; extent comes
+  // from host descriptor, not from in-IR sym set.
   if (isa<BufferType>(Type(shaped))) {
     ShapeAttr collapsed = ShapeAttr::get(ctx, {DynSizeAttr::get(ctx)});
     if (collapsed == originalShape && !layout)
@@ -553,34 +396,10 @@ computeFlatShapedType(SymbolicallyShapedTypeInterface shaped) {
   return reshaped.cloneWithSymbolicLayout(LayoutAttr{});
 }
 
-// 1-to-N `TypeConverter` for the flatten pass. Every
-// `SymbolicallyShapedTypeInterface` value expands to (flat shaped
-// type, aux idx for each implicit free symbol). The 1-to-N model
-// makes every dynamic dim and stride sym visible as ordinary SSA
-// post-flatten so access ops can bind them explicitly in
-// `hc.idx_apply`, instead of leaking the type's name list into the
-// downstream launch-walk.
-//
-// For shape-preserving non-access HC ops the catch-all retyper feeds
-// only the leading flat value into the new op and threads the
-// trailing aux through to the result expansion (the result and the
-// operand share the same implicit sym set because shape is
-// preserved). Shape-changing rewriters whose result aux can't be
-// sourced from any operand fall back to ambient (unlisted)
-// `hc.idx_apply` per missing sym, mirroring today's
-// materialize-bound-exprs behavior on those names.
-//
-// Tuples and function types recurse via `convertTypes`; both can
-// host shaped element/argument types and propagate the expansion
-// transparently. The catch-all identity is registered first so the
-// shaped / tuple / function overrides take precedence on dispatch
-// (last-registered-wins).
-//
-// `unrealized_conversion_cast` materializations bridge the ABI: the
-// 1-to-N target form takes the original value and produces N
-// converted values; the source form takes N values back to one.
-// Surviving casts on a boundary nothing converted fold via
-// `reconcile-unrealized-casts` downstream.
+// 1-to-N TypeConverter. Shaped value -> (flat carrier, aux idx per
+// implicit sym). Tuples / function types recurse via convertTypes.
+// Identity registered first (last-wins). Cast materializations
+// fold via `reconcile-unrealized-casts` downstream.
 class FlattenLayoutConverter : public TypeConverter {
 public:
   FlattenLayoutConverter() {
@@ -603,12 +422,7 @@ private:
     addConversion([](SymbolicallyShapedTypeInterface shaped,
                      SmallVectorImpl<Type> &results)
                       -> std::optional<LogicalResult> {
-      // Already-flat types convert 1-to-1: no layout, single-entry
-      // shape, and any free symbols inside that single dim
-      // expression are now part of the storage-size expression and
-      // not re-exposed as separate aux. Re-running the expansion on
-      // them would never reach a fixed point because the converter
-      // would keep emitting the same 1-to-N tuple for the same type.
+      // Already-flat: 1-to-1; expansion would never fixed-point.
       if (isAlreadyFlat(shaped)) {
         results.push_back(Type(shaped));
         return success();
@@ -670,12 +484,8 @@ private:
   }
 };
 
-// `hc.as_layout` was the layout-relabel surface op. Once both endpoints
-// route through `FlattenLayoutConverter`, the op is purely cosmetic —
-// the source value already has the converted type that the result is
-// asking for. Drop the op and replace its result with the converted
-// operand expansion (the 1-to-N adapter forwards every value the
-// converter emitted, including any aux idx values).
+// `hc.as_layout` is cosmetic post-conversion; forward the converted
+// operand expansion.
 struct DropAsLayout : public OpConversionPattern<HCAsLayoutOp> {
   using OpConversionPattern::OpConversionPattern;
   using Base = OpConversionPattern<HCAsLayoutOp>;
@@ -690,15 +500,9 @@ struct DropAsLayout : public OpConversionPattern<HCAsLayoutOp> {
   }
 };
 
-// Re-key a per-result aux-value lookup table from a converted operand
-// expansion. The input `operandRange` is the 1-to-N adapter's value
-// range for one original operand; the leading entry is the flat
-// shaped value, the trailing entries match the operand's pre-flatten
-// type's `collectImplicitSyms` order. We thread the trailing values
-// into `bindings` keyed by symbol name so a downstream lookup can
-// pull the SSA for a given name without re-running the converter.
-// Operands with empty implicit-sym lists (constant-shape vectors,
-// scalars, `!hc.idx<sym>` carriers) contribute nothing.
+// Thread the trailing aux values of one converted operand into
+// `bindings` keyed by implicit-sym name (order matches
+// `collectImplicitSyms` on the pre-flatten type).
 static void noteOperandBindings(Type preFlattenType, ValueRange operandRange,
                                 llvm::StringMap<Value> &bindings) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(preFlattenType);
@@ -714,13 +518,8 @@ static void noteOperandBindings(Type preFlattenType, ValueRange operandRange,
     bindings.try_emplace(name, value);
 }
 
-// Identify a type that pins a single bare symbol — used to recognize
-// `!hc.idx<"$WG0">`-style block args / SSAs whose own type IS the
-// binding for one name. Composite expressions (`i + 1`, `i * stride`)
-// are not their own binding; the value-as-binding shortcut only
-// applies when the type's symbol set is exactly `{name}` and the
-// expression is that symbol leaf. Returns empty `StringRef` if the
-// type doesn't qualify.
+// Bare sym name pinned by `!hc.idx<sym>` (e.g. `!hc.idx<"$WG0">`),
+// else empty. Composite exprs fail.
 static StringRef typePinsBareSymbol(sym::Store &store, Type type) {
   auto idxType = dyn_cast<IdxType>(type);
   if (!idxType)
@@ -746,17 +545,11 @@ static StringRef typePinsBareSymbol(sym::Store &store, Type type) {
   return onlyName;
 }
 
-// Walk enclosing region/loop block arguments and operand-result SSAs
-// produced by ancestor ops, binding every `!hc.idx<"$name">` value we
-// find to its bare symbol name. Canonical sources: `hc.for_range`'s
-// induction var (typed `!hc.idx<"$joinN">`), `gpu.launch`'s block
-// args ($WG*, $WI*, $WGS*), buffer-from-ptr UCC retype aux outputs
-// ($STRIDE_*, dim syms), and other `hc.idx_apply` results that
-// happen to land in scope.
-//
-// `bindings.try_emplace` preserves the first binding wins rule —
-// callers that pre-seed the map (with op-local 1-to-N operand
-// expansions) keep precedence over ancestor scans.
+// Bind every `!hc.idx<sym>` block arg and pre-`op` SSA in ancestor
+// scopes. Sources: for_range IVs, gpu.launch block args ($WG*/$WI*/
+// $WGS*), kernel-arg-bundle UCC retype aux ($STRIDE_*, dim syms),
+// upstream `hc.idx_apply` results. `try_emplace` keeps pre-seeded
+// op-local bindings winning over ancestor scans.
 static void collectAncestorIdxBindings(sym::Store &store, Operation *op,
                                        llvm::StringMap<Value> &bindings) {
   for (Block *block = op->getBlock(); block;) {
@@ -765,11 +558,6 @@ static void collectAncestorIdxBindings(sym::Store &store, Operation *op,
       if (!name.empty())
         bindings.try_emplace(name, arg);
     }
-    // Also pick up `!hc.idx<sym>` results from ops preceding `op` in
-    // its own block — the kernel-arg-bundle retype UCC plants these,
-    // and they're the SSA value for `$STRIDE_*` / dim syms in scope
-    // for any op that comes after it. Pre-`op` SSAs in ancestor
-    // blocks were already covered by traversing parent->block->ops.
     for (Operation &prev : *block) {
       if (&prev == op)
         break;
@@ -786,14 +574,9 @@ static void collectAncestorIdxBindings(sym::Store &store, Operation *op,
   }
 }
 
-// Resolve the trailing aux value for each implicit sym a result type
-// carries. The first matching operand expansion wins; missing
-// names fall through to an empty-binding `hc.idx_apply` sourced
-// against the kernel's ambient bindings (same severance form
-// `materialize-bound-exprs` lays down). Returns one `Value` per
-// trailing aux in the result's expansion, in `collectImplicitSyms`
-// order — the caller pairs these with the new op's flat result to
-// form the `replaceOpWithMultiple` argument.
+// Trailing aux value per implicit sym of `preFlattenResult`. First
+// matching operand binding wins; missing names emit an unlisted
+// `hc.idx_apply` pinned to the bare sym.
 static FailureOr<SmallVector<Value>>
 resolveResultAuxValues(ConversionPatternRewriter &rewriter, Location loc,
                        Type preFlattenResult,
@@ -815,10 +598,6 @@ resolveResultAuxValues(ConversionPatternRewriter &rewriter, Location loc,
       auxValues.push_back(it->second);
       continue;
     }
-    // No operand carries this name: emit an unlisted `hc.idx_apply`
-    // pinned to the bare symbol. Lower-launch-body resolves it
-    // against the kernel's ambient bindings the same way the old
-    // empty-binding severance did.
     auto handle = sym::composeExprSym(store, name);
     if (failed(handle))
       return failure();
@@ -830,10 +609,7 @@ resolveResultAuxValues(ConversionPatternRewriter &rewriter, Location loc,
   return auxValues;
 }
 
-// Slice the leading flat values out of a 1-to-N operand range so a
-// rebuilt op only sees the carrier types. The trailing aux values
-// flow through to result expansions via the binding map and don't
-// belong on the new op's operand list.
+// Leading flat values only; trailing aux flows via binding map.
 static SmallVector<Value> flatOperandsOnly(ArrayRef<ValueRange> operands) {
   SmallVector<Value> flatOnly;
   flatOnly.reserve(operands.size());
@@ -845,26 +621,8 @@ static SmallVector<Value> flatOperandsOnly(ArrayRef<ValueRange> operands) {
   return flatOnly;
 }
 
-// Compose multi-index access ops down to a single 1D base offset. Pre-
-// flatten the operand's type still carries the layout (and the original
-// nD shape); we read both off `op.get<Operand>().getType()`, build the
-// composed offset (binding every free symbol whose SSA we can source
-// from the buffer/source operand's expansion or from the index ops
-// themselves), and rebuild the op with the converted (1D) operand
-// type and a one-element index list.
-//
-// Each pattern bumps benefit above the generic `RetypeAnyHCOp` so the
-// driver picks it first; on failure (unbound index, untyped operand,
-// rank mismatch) the rewrite signals failure and `RetypeAnyHCOp` does
-// the type-only retyping fallback — the access op stays on the nD
-// index list and the consuming pass owns the uncomposed access.
-//
-// Per-op pattern bodies are nearly identical except for the operand
-// shape (which fields carry the buffer / source / dest, the indices,
-// and the optional shape / source / mask passthroughs); a small CRTP
-// base would shrink the boilerplate but obscures which ODS attribute
-// each op carries. Four short rewrites are easier to read.
-
+// Compose multi-index access down to 1D base offset. Benefit 2 so
+// driver picks before `RetypeAnyHCOp`'s type-only fallback.
 template <typename OpT>
 struct ComposeAccessOffsetBase : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
@@ -873,10 +631,8 @@ struct ComposeAccessOffsetBase : public OpConversionPattern<OpT> {
       : OpConversionPattern<OpT>(converter, ctx, /*benefit=*/2) {}
 };
 
-// Drain a 1-to-N adapter's variadic operand range to a flat
-// `Value` list, asserting each sub-range is single-valued. Used
-// for index lists where every entry is an `index` or `!hc.idx<...>`
-// scalar that the converter passes through unchanged.
+// Drain a 1-to-N adapter range to a flat `Value` list; fails when
+// any sub-range isn't single-valued.
 static FailureOr<SmallVector<Value>>
 collectScalarOperands(ArrayRef<ValueRange> operands) {
   SmallVector<Value> values;
@@ -889,13 +645,8 @@ collectScalarOperands(ArrayRef<ValueRange> operands) {
   return values;
 }
 
-// Already-flat single-index loads against a layout-less source need no
-// offset folding — the generic retype handles the operand type.
-// Layout-bearing 1D sources (the buffer_view-with-strided-slice
-// residual that `composeBufferViewLayout` produces) still need
-// composition, so this returns true (i.e. the access needs
-// composition) when either the indexing isn't 1D or the source's
-// pre-flatten type carries a layout.
+// True iff access still needs composition: non-1D indexing, or 1D
+// source still carrying a layout (buffer_view strided-slice residual).
 static bool needsAccessOffsetComposition(unsigned indexCount, Type sourceType) {
   if (indexCount != 1)
     return true;
@@ -903,9 +654,6 @@ static bool needsAccessOffsetComposition(unsigned indexCount, Type sourceType) {
   return shaped && shaped.getSymbolicLayout();
 }
 
-// Convert `t` via `converter` and verify the result is non-empty.
-// Both `convertType` failure and an empty result indicate the access
-// can't be lowered to its expected post-flatten shape.
 static FailureOr<SmallVector<Type>>
 convertResultTypeOrFailure(const TypeConverter &converter, Type t) {
   SmallVector<Type> result;
@@ -916,9 +664,6 @@ convertResultTypeOrFailure(const TypeConverter &converter, Type t) {
   return result;
 }
 
-// Splice the new op's primary result with its post-flatten aux values
-// (resolved from the result-type bindings) and rewrite `op` against
-// the combined sequence using the 1-to-N replacement entry point.
 template <typename OpT>
 static LogicalResult
 replaceLoadWithAuxValues(OpT op, Value newResult,
@@ -1033,8 +778,6 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
   LogicalResult
   matchAndRewrite(HCStoreOp op, OneToNOpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // See `ComposeLoadOffsets` — 1D layout-bearing destinations still
-    // need composition.
     if (op.getIndices().size() == 1) {
       auto shaped =
           dyn_cast<SymbolicallyShapedTypeInterface>(op.getDest().getType());
@@ -1071,35 +814,11 @@ struct ComposeStoreOffsets : public ComposeAccessOffsetBase<HCStoreOp> {
   }
 };
 
-// Rewrite an `hc.buffer_view` whose source has been flattened to its 1D
-// carrier. The pre-flatten subscript list is rank-N (one entry per
-// source axis); post-flatten the source carries a single composite
-// axis so the verifier on the consumer side rejects the original
-// subscript count.
-//
-// Two cases:
-//
-// * Identity: the converted (1D) source shape matches the converted
-//   (1D) result shape. The buffer_view is a no-op against the
-//   collapsed storage — every scalar subscript landed on an axis that
-//   the flatten layout already factors out (unit-size axis, or a
-//   work-distributed axis whose lane index is implicit per thread).
-//   Forward the flat source through.
-//
-// * Single-slice strided: exactly one subscript is a slice; the rest
-//   are scalar `!hc.idx<...>` indices. Compose the identity-layout
-//   offset into a single contiguous-stride slice on the flat carrier.
-//   Layout-less sources are the canonical contract for this rewrite;
-//   sources carrying an explicit `#hc.layout<...>` payload bail (the
-//   v0 surface uses the identity layout for these views — a custom
-//   layout would need to participate in the offset composition the
-//   same way `composeAccessOffsetExpr` does for access ops, which is
-//   out of scope here).
-//
-// Anything else (multi-slice on a non-trivial layout, missing
-// Bundle of pre-checked inputs the buffer-view flattener carries
-// across its sub-stages: the flat carrier values, the pre-flatten
-// source's shape/layout view, and the result-type halves.
+// Flattener cases for `hc.buffer_view`:
+//   identity (1D source shape == 1D result shape) -> forward,
+//   single-slice strided (one slice + scalar idx rest, no layout) ->
+//   compose row-major offset on flat carrier.
+// Anything else bails to the catch-all retyper.
 struct BufferViewFlattenInputs {
   Value flatSource;
   ValueRange sourceAux;
@@ -1111,11 +830,8 @@ struct BufferViewFlattenInputs {
   Type origResultType;
 };
 
-// Pre-flatten buffer-view shape parity gate: the flattener has nothing
-// to do when the indexing is already 1D and the source is 1D, and the
-// strided-slice branch can't fold subscripts when the rank doesn't
-// match the shape (unless a layout is in play, in which case the
-// identity branch handles it).
+// Gate: nothing to flatten when source + indices are already 1D;
+// strided-slice can't fold on rank-mismatch without a layout.
 static bool bufferViewNeedsFlatten(unsigned indexCount, ShapeAttr preShape,
                                    bool hasLayout) {
   size_t dimCount = preShape.getDims().size();
@@ -1126,10 +842,6 @@ static bool bufferViewNeedsFlatten(unsigned indexCount, ShapeAttr preShape,
   return true;
 }
 
-// Validate operand and result shapes for the buffer-view flattener.
-// `convertedBufferOperand` is the 1-to-N expansion of `op.getBuffer()`
-// from the conversion adaptor — passing `ValueRange` instead of the
-// adaptor type sidesteps the non-public-alias on the op class.
 static FailureOr<BufferViewFlattenInputs>
 prepareBufferViewFlatten(HCBufferViewOp op, ValueRange convertedBufferOperand,
                          const TypeConverter &converter) {
@@ -1168,10 +880,6 @@ prepareBufferViewFlatten(HCBufferViewOp op, ValueRange convertedBufferOperand,
       flatSourceShaped, flatResultShaped, flatResultType, origResultType};
 }
 
-// Replace `op` with the computed `flatValue` plus the per-result aux
-// values resolved from the source operand's expansion. Mirrors the
-// existing `replaceLoadWithAuxValues` pathway but typed for an
-// `HCBufferViewOp`.
 static LogicalResult
 pushBufferViewReplacement(HCBufferViewOp op, ValueRange convertedBufferOperand,
                           Value flatValue, Type origResultType,
@@ -1190,29 +898,15 @@ pushBufferViewReplacement(HCBufferViewOp op, ValueRange convertedBufferOperand,
   return success();
 }
 
-// Identity case: the flat carriers match between source and result, so
-// the view describes the same physical storage. Two distinct cases
-// converge here. (1) Full-bind on a layout-less source where every
-// scalar subscript hits an axis the surrounding flatten layout has
-// already factored out; the source-side strides land on the same 1-D
-// carrier the result wants. (2) Layout-bearing source where
-// `inferBufferViewResult` substituted scalar-axis index values into
-// the result's offset and dropped the corresponding shape syms —
-// residual `storage_size` still names the same physical span, the
-// flat carrier types match, and the only delta is the relabel of the
-// per-axis aux set, which `resolveResultAuxValues` rebinds from the
-// source's expansion. Cross-element-type view requests don't exist in
-// the v0 surface; the carrier-type equality check rejects any flat-
-// shape coincidence that would change the element type before it can
-// silently miscompile.
+// Identity: flat carrier matches and types are equal. Type equality
+// blocks an element-type miscompile from a shape coincidence.
 static bool isBufferViewFlatIdentity(const BufferViewFlattenInputs &in) {
   return in.flatSourceShaped.getSymbolicShape() ==
              in.flatResultShaped.getSymbolicShape() &&
          in.flatSource.getType() == in.flatResultType;
 }
 
-// Locate the single slice axis among `indices`; reject anything
-// non-idx, non-slice, or multiple slices.
+// Single slice axis among indices; fail on non-idx/non-slice or >1 slice.
 static FailureOr<int64_t> findSingleSliceAxis(OperandRange indices) {
   int64_t sliceAxis = -1;
   for (auto [axis, idx] : llvm::enumerate(indices)) {
@@ -1229,8 +923,7 @@ static FailureOr<int64_t> findSingleSliceAxis(OperandRange indices) {
   return sliceAxis;
 }
 
-// Symbolic row-major stride at axis `k` of a static dim list: the
-// product of dim sizes for every axis after `k`.
+// Row-major stride at axis k: product of dims after k.
 static FailureOr<sym::ExprHandle>
 composeRowMajorStrideExpr(sym::Store &store, ArrayRef<Attribute> preDims,
                           size_t k) {
@@ -1251,9 +944,7 @@ composeRowMajorStrideExpr(sym::Store &store, ArrayRef<Attribute> preDims,
   return stride;
 }
 
-// Sum the per-scalar-axis `index * row_stride` contributions to a
-// running flat base offset (identity when `indices` only carries the
-// one slice axis).
+// Sum `index * row_stride` over scalar axes (skip slice axis).
 static FailureOr<sym::ExprHandle>
 composeScalarBaseOffsetExpr(sym::Store &store, OperandRange indices,
                             int64_t sliceAxis, ArrayRef<Attribute> preDims,
@@ -1287,9 +978,7 @@ struct SliceTripleExprs {
   sym::ExprHandle step;
 };
 
-// Pull (lower, upper, step) from a slice producer's optional operands,
-// substituting the Python slice defaults (`lower → 0`, `upper → axis
-// size`, `step → 1`) whenever an operand is absent.
+// Slice triple with Python defaults: lower→0, upper→axis size, step→1.
 static FailureOr<SliceTripleExprs>
 extractSliceTripleExprs(HCSliceExprOp sliceProducer, sym::ExprHandle zero,
                         sym::ExprHandle axisDim, sym::ExprHandle one) {
@@ -1314,9 +1003,8 @@ extractSliceTripleExprs(HCSliceExprOp sliceProducer, sym::ExprHandle zero,
   return SliceTripleExprs{*lower, *upper, *step};
 }
 
-// Compose the flat (lower, upper, step) triple: each of the lower /
-// upper bounds gets `slice_X * row_stride` summed onto the scalar-axis
-// base offset; step is just `slice.step * row_stride` (no base added).
+// Flat triple: lower/upper add `slice_X * stride` to base; step is
+// `slice.step * stride`.
 static FailureOr<SliceTripleExprs>
 composeFlatSliceTripleExprs(sym::Store &store, sym::ExprHandle baseOffset,
                             sym::ExprHandle sliceRowStride,
@@ -1346,14 +1034,8 @@ composeFlatSliceTripleExprs(sym::Store &store, sym::ExprHandle baseOffset,
   return SliceTripleExprs{*flatLower, *flatUpper, *flatStep};
 }
 
-// Build the symbol-binding map the same way `composeAccessBaseOffset`
-// does for the per-access patterns: the source operand's 1-to-N
-// expansion supplies dim / stride aux; idx-typed subscripts bind
-// their own bare symbol; ancestor block args (loop induction vars)
-// bind any bare-sym `!hc.idx` they carry. `materializeOffsetSSA`
-// emits `hc.idx_apply` ops with the right operand list so the
-// launch-body lowering downstream picks them up by SSA, not by
-// ambient resolution.
+// Same binding shape as `composeAccessBaseOffset`: aux dim/stride
+// from source expansion + bare-sym subscripts + ancestor IV block args.
 static llvm::StringMap<Value>
 collectBufferViewBindings(HCBufferViewOp op, const BufferViewFlattenInputs &in,
                           sym::Store &store) {
@@ -1367,8 +1049,6 @@ collectBufferViewBindings(HCBufferViewOp op, const BufferViewFlattenInputs &in,
   return bindings;
 }
 
-// Materialize the flat slice triple as SSA, build the new
-// `hc.slice_expr` + `hc.buffer_view`, and return the new view value.
 static Value emitFlatBufferViewSlice(HCBufferViewOp op, Type flatResultType,
                                      Value flatSource,
                                      const SliceTripleExprs &flatTriple,
@@ -1398,8 +1078,6 @@ struct SymZeroOne {
   sym::ExprHandle one;
 };
 
-// Compose the (0, 1) symbolic constants together so the caller pays
-// for the failure short-circuit once instead of twice.
 static FailureOr<SymZeroOne> composeZeroOneExprs(sym::Store &store) {
   auto z = sym::composeExprInt(store, 0);
   auto o = sym::composeExprInt(store, 1);
@@ -1408,10 +1086,8 @@ static FailureOr<SymZeroOne> composeZeroOneExprs(sym::Store &store) {
   return SymZeroOne{*z, *o};
 }
 
-// Synthesize the strided-slice flat view for an `hc.buffer_view` that
-// the identity branch couldn't handle: exactly one slice subscript
-// (the rest must be scalar-typed `!hc.idx`), composed against the
-// pre-flatten source's row-major stride layout.
+// Strided-slice flat view: one slice subscript + scalar idx rest,
+// composed via row-major stride layout.
 static FailureOr<Value>
 synthesizeFlatStridedSliceView(HCBufferViewOp op,
                                const BufferViewFlattenInputs &in,
@@ -1460,9 +1136,6 @@ synthesizeFlatStridedSliceView(HCBufferViewOp op,
                                  *flatTriple, bindings, rewriter);
 }
 
-// `hc.slice_expr` producer for the slice operand, ...) bails to the
-// catch-all retyper. The remaining producer is `hc-vec`-style WMMA
-// tile loads through workgroup-staged LDS.
 struct ComposeBufferViewOffsets
     : public ComposeAccessOffsetBase<HCBufferViewOp> {
   using ComposeAccessOffsetBase::ComposeAccessOffsetBase;
@@ -1491,47 +1164,14 @@ struct ComposeBufferViewOffsets
   }
 };
 
-// Compose the per-operand per-axis offset arrays on `hc.generic` into
-// single-entry arrays — the post-flatten contract per `doc/layouts.md`.
-// For each shaped operand the rewrite reads the operand's pre-flatten
-// layout / shape, treats the per-axis array as the access-site index
-// list, and composes a single 1D offset through ixsimpl using the same
-// machinery the per-access patterns above use. Without an explicit
-// layout the fallback is the identity layout over the operand's shape.
+// Compose `hc.generic` per-operand per-axis offsets into single-entry
+// arrays (post-flatten 1D contract). Type-retype rolled in: leading
+// flat carrier per operand, trailing aux into result expansions via
+// shared sym-name bindings. Bail on rank mismatch / missing layout.
+// Layout-less operands fall back to identity layout.
 //
-// Free symbols of the composed offset (iter syms, dim / stride params)
-// stay free — they're resolved by the surrounding kernel scope and the
-// downstream `hc-lower-generic` lowering. Operands that aren't shaped
-// (`!hc.ptr<...>`, `!hc.undef`) keep their offset arrays unchanged: a
-// ptr already rides on a single 1D address by ODS contract and undef
-// has no shape to compose against.
-//
-// The pattern also performs the type-only retype that `RetypeAnyHCOp`
-// would otherwise have done — the operand 1-to-N expansion is sliced
-// to its leading flat carrier per operand, result types run through
-// the converter, and trailing aux values flow into the result
-// expansions via the shared sym-name binding map. Doing both here
-// keeps the post-flatten op single-pass: nD offset arrays never live
-// alongside 1D operand types in the IR.
-//
-// On any rank mismatch / missing layout (buffer with no layout) the
-// rewrite bails. The verifier on `hc.generic` enforces
-// `len(offset array) == operand rank`, so a bailed op surfaces as a
-// downstream verification error rather than silent miscompile.
-// Compose one per-operand offset array against its operand's
-// pre-flatten layout / shape. Operands that aren't shaped (or are
-// already-flat) pass through unchanged. Returns failure to bail the
-// whole rewrite to `RetypeAnyHCOp`. `composed` flips to true when the
-// folded result actually differs from the input — a rank-1 layout-less
-// operand round-trips through the identity layout to itself, and we
-// don't want to claim a rewrite happened when nothing on the surface
-// moved.
-//
-// Layout-less operands (including buffers that haven't picked up the
-// default strided layout — `hc-canonicalize-layouts` only attaches one
-// for kernel-arg buffers) fall back to the identity layout, the
-// canonical contract for layout-free shaped types. Same path
-// `composeAccessOffsetExpr` takes for tensor / vector operands.
+// `composed` flips only when the folded offset differs from input —
+// rank-1 layout-less operand identity-folds to itself.
 static FailureOr<ArrayAttr> composeGenericOperandOffsets(MLIRContext *ctx,
                                                          Value origOperand,
                                                          ArrayAttr perAxis,
@@ -1564,8 +1204,6 @@ static FailureOr<ArrayAttr> composeGenericOperandOffsets(MLIRContext *ctx,
   return result;
 }
 
-// Apply `composeGenericOperandOffsets` across an operand range,
-// collecting the per-operand results (or short-circuiting to failure).
 static FailureOr<SmallVector<Attribute>>
 composeGenericOffsetsArray(MLIRContext *ctx, OperandRange operands,
                            ArrayAttr offsets, bool &composed) {
@@ -1581,11 +1219,8 @@ composeGenericOffsetsArray(MLIRContext *ctx, OperandRange operands,
   return result;
 }
 
-// Pick the first entry out of every ValueRange in `expansion` (the
-// flat carrier; trailing aux belongs to the operand's own expansion).
-// Returns failure when any range is empty or, if `requireSingleton` is
-// set, when any range carries more than one value (matches the
-// `iter_bounds` contract that's strictly 1:1).
+// Leading flat carrier per range. `requireSingleton` matches the
+// `iter_bounds` 1:1 contract.
 static FailureOr<SmallVector<Value>>
 collectFlatLeadingValues(ArrayRef<ValueRange> expansion,
                          bool requireSingleton = false) {
@@ -1601,9 +1236,7 @@ collectFlatLeadingValues(ArrayRef<ValueRange> expansion,
   return result;
 }
 
-// Collect free symbols referenced by composed offset arrays, minus any
-// iter syms (those stay scoped to the `hc.generic` body and are
-// substituted per-lane by `hc-lower-generic`).
+// Free syms in composed offsets minus iter syms (stay body-scoped).
 static void collectAmbientSymsFromOffsets(ArrayRef<Attribute> perOperandAttrs,
                                           const llvm::StringSet<> &iterSymSet,
                                           llvm::StringSet<> &ambientNeeded) {
@@ -1623,23 +1256,9 @@ static void collectAmbientSymsFromOffsets(ArrayRef<Attribute> perOperandAttrs,
   }
 }
 
-// Body `hc.idx_apply` / `hc.pred_apply` ops can reference ambient syms
-// directly (post-flatten, the body authoring convention is that any
-// sym not on the apply's `symbols` list is either an iter sym scoped
-// to the body or an ambient sym the surrounding `hc.generic` is
-// responsible for plumbing). Pick those up too so `hc-lower-generic`
-// can seed the per-lane scope from `ambient_idxs` and the second
-// `hc-lower-launch-body` invocation finds bindings for them via
-// `seedAmbientScope` inside the unrolled body. The `hc.load_mask`
-// rewrite in `hc-load-store-to-generic` is today the only emitter that
-// puts ambient-referencing applies inside the body (its predicate is
-// `(lo + step*i_k) < D_k` with `lo` / `D_k` being kernel-arg or
-// launch-geometry syms) — extending the walk now keeps the contract
-// general.
-// Helper: visit each unbound free symbol name surfaced by `walker`,
-// skipping those already named on the apply op and those that are
-// part of the iter-sym set (which are bound by the surrounding
-// `hc.generic`).
+// Body applies can reference ambient syms directly (anything not on
+// apply's `symbols` list is iter-scoped or ambient). Surface those
+// so `ambient_idxs` carries SSA for the body lowering to find.
 static void noteFreeAmbientSyms(
     ArrayAttr alreadyBound, const llvm::StringSet<> &iterSymSet,
     llvm::StringSet<> &ambientNeeded,
@@ -1690,9 +1309,7 @@ collectAmbientSymsFromBodyApplies(Block &body,
   }
 }
 
-// Carry over ambient bindings the source op already had — the
-// pre-flatten emitters may have left them empty, but if a prior pass
-// populated them we don't want to drop the SSA edge silently.
+// Carry over existing ambient bindings; prior passes may have populated.
 static void
 notePreExistingAmbientBindings(ArrayRef<ValueRange> ambientIdxsExpansion,
                                HCGenericOp op, llvm::StringMap<Value> &bindings,
@@ -1707,10 +1324,8 @@ notePreExistingAmbientBindings(ArrayRef<ValueRange> ambientIdxsExpansion,
   }
 }
 
-// Lex-sort the ambient sym names for deterministic operand order, then
-// pin bindings whose SSA we resolved. The rest stay free in the offset
-// expression and `hc.idx_apply`'s severing form handles them via the
-// downstream ambient-context resolution.
+// Lex-sort ambient names for determinism, pin resolved bindings;
+// unbound stay free for downstream ambient-context resolution.
 static void
 buildAmbientOperandLists(const llvm::StringSet<> &ambientNeeded,
                          const llvm::StringMap<Value> &bindings,
@@ -1729,9 +1344,7 @@ buildAmbientOperandLists(const llvm::StringSet<> &ambientNeeded,
   }
 }
 
-// Convert each result type via the 1-to-N converter and split into
-// (flat leading types + per-result widths). Empty conversions or
-// outright failures bail to the catch-all retyper.
+// Per-result (flat leading type, expansion width). Empty conversion fails.
 static LogicalResult
 convertGenericResultTypesToFlat(HCGenericOp op, const TypeConverter &converter,
                                 SmallVectorImpl<Type> &flatResultTypes,
@@ -1750,9 +1363,7 @@ convertGenericResultTypesToFlat(HCGenericOp op, const TypeConverter &converter,
   return success();
 }
 
-// True iff any result type or any operand type would actually change
-// across the rewrite. Without this gate the driver loops on a no-op
-// rewrite.
+// No-op gate; without it the driver loops forever.
 static bool
 genericTypesChangedAcrossRewrite(HCGenericOp op, ArrayRef<Type> flatResultTypes,
                                  ArrayRef<ValueRange> operandExpansion) {
@@ -1766,10 +1377,8 @@ genericTypesChangedAcrossRewrite(HCGenericOp op, ArrayRef<Type> flatResultTypes,
   return false;
 }
 
-// Carry over any extra discardable attributes (e.g. location-name
-// hints) the original op picked up before we got here. The named
-// attributes the builder wrote — iter_syms, iter_kinds, ins/outs
-// offsets, segment sizes — already match.
+// Copy discardable attrs (location hints etc.); the named ones the
+// builder wrote already match.
 static void copyDiscardableHCGenericAttrs(HCGenericOp op, HCGenericOp newOp) {
   StringSet<> handled = {
       op.getIterSymsAttrName().getValue(),
@@ -1784,9 +1393,8 @@ static void copyDiscardableHCGenericAttrs(HCGenericOp op, HCGenericOp newOp) {
       newOp->setAttr(attr.getName(), attr.getValue());
 }
 
-// Pair each new flat result with the aux values its pre-flatten type
-// expects; when bindings already have an SSA edge for an aux name use
-// it instead of materialising a fresh ambient apply.
+// Pair flat result with aux values; reuse binding SSA where available
+// instead of materialising fresh ambient applies.
 static LogicalResult
 replaceGenericWithAuxValues(HCGenericOp op, HCGenericOp newOp,
                             llvm::StringMap<Value> &bindings,
@@ -1810,10 +1418,6 @@ replaceGenericWithAuxValues(HCGenericOp op, HCGenericOp newOp,
   return success();
 }
 
-// Bundles every per-operand precomputation a `ComposeGenericOffsets`
-// rewrite needs: composed offset arrays, the flat carrier slice of
-// each variadic operand, and the bool that flags whether the offset
-// composition step changed anything (used as a fixed-point guard).
 struct ComposedGenericOperands {
   SmallVector<Attribute> insOffsets;
   SmallVector<Attribute> outsOffsets;
@@ -1841,10 +1445,6 @@ composeAndSliceGenericOperands(HCGenericOp op, HCGenericOpOneToNAdaptor adaptor,
     return failure();
   if (adaptor.getIterBounds().size() != op.getIterBounds().size())
     return failure();
-  // Flat carrier slicing matches RetypeAnyHCOp's contract — each
-  // 1-to-N adapter range hands back the flat shaped value as the
-  // leading entry; trailing aux values feed the result-expansion
-  // binding map.
   FailureOr<SmallVector<Value>> iterBounds = collectFlatLeadingValues(
       adaptor.getIterBounds(), /*requireSingleton=*/true);
   if (failed(iterBounds))
@@ -1865,34 +1465,23 @@ composeAndSliceGenericOperands(HCGenericOp op, HCGenericOpOneToNAdaptor adaptor,
   return out;
 }
 
-// Build the sym → SSA map and the ambient operand list a generic
-// rewrite ships to the new op. Captures: per-operand expansions,
-// ancestor block-arg bindings, ambient symbols transitively needed by
-// composed offsets and body applies, and any pre-existing ambient
-// bindings on the source op.
+// Sym→SSA map + ambient operand list for the new op: operand
+// expansions, ancestor block-arg bindings, ambient syms transitively
+// needed by offsets and body applies, pre-existing ambient bindings.
 static void buildGenericBindingsAndAmbient(
     HCGenericOp op, HCGenericOpOneToNAdaptor adaptor,
     ArrayRef<Attribute> insOffsets, ArrayRef<Attribute> outsOffsets,
     ConversionPatternRewriter &rewriter, llvm::StringMap<Value> &bindings,
     SmallVectorImpl<Value> &ambientIdxsVec,
     SmallVectorImpl<Attribute> &ambientSymsVec) {
-  // Pull the shape-preserving sym-name bindings off every operand
-  // expansion so result aux can be sourced from a matching name
-  // before falling back to an ambient `hc.idx_apply`.
   for (auto [orig, range] : llvm::zip_equal(op.getIns(), adaptor.getIns()))
     noteOperandBindings(orig.getType(), range, bindings);
   for (auto [orig, range] : llvm::zip_equal(op.getOuts(), adaptor.getOuts()))
     noteOperandBindings(orig.getType(), range, bindings);
 
-  // Capture ambient sym → SSA bindings now, while the kernel-arg
-  // bundle UCC chain, gpu.launch block args, and structured-loop
-  // induction vars are all still HC-typed and reachable. Walking
-  // ancestor blocks here also picks up `$joinN` from `hc.for_range`'s
-  // IV — `hc-lower-launch-body` will later rewrite for_range to
-  // scf.for and strip the `!hc.idx<sym>` payload off the IV, but by
-  // then `ambient_idxs` already holds the SSA edge and the
-  // launch-body type converter only changes the operand's type (the
-  // sym name lives on `ambient_idx_syms`).
+  // Capture ambient sym→SSA now: for_range→scf.for later strips the
+  // `!hc.idx<sym>` payload off the IV but `ambient_idxs` already
+  // holds the SSA edge by then.
   MLIRContext *ctx = op.getContext();
   auto &store = ctx->getOrLoadDialect<HCDialect>()->getSymbolStore();
   collectAncestorIdxBindings(store, op, bindings);
@@ -1963,11 +1552,7 @@ struct ComposeGenericOffsets : public ComposeAccessOffsetBase<HCGenericOp> {
   }
 };
 
-// Convert one shaped-allocator op's result type to its post-flatten
-// 1D form. Returns the (non-original) flat type when a rebuild is
-// warranted; failure on a no-op (the type-converter declines, the
-// result didn't actually change, or the converted type doesn't carry
-// a usable symbolic shape).
+// Flat 1D result type of an allocator op; fails on no-op rebuild.
 static FailureOr<Type> flatAllocOpResultType(const TypeConverter &converter,
                                              Type origResultType) {
   SmallVector<Type> convertedResults;
@@ -1986,12 +1571,8 @@ static FailureOr<Type> flatAllocOpResultType(const TypeConverter &converter,
   return flatResult;
 }
 
-// Materialise a rank-matching shape tuple from the converted result's
-// symbolic shape. Each dim becomes an empty-binding `hc.idx_apply`
-// pinned to the dim expression — same severance form
-// `resolveResultAuxValues` uses for ambient syms the launch-body
-// walker rebinds at lower time. Returns failure if any dim isn't an
-// `ExprAttr` (no symbolic content to pin).
+// Rank-matching shape tuple from flat shape: each dim becomes an
+// empty-binding `hc.idx_apply` pinned to the dim expr.
 static FailureOr<Value>
 buildFlatAllocShapeTuple(ConversionPatternRewriter &rewriter, Location loc,
                          ShapeAttr flatShape) {
@@ -2017,8 +1598,6 @@ buildFlatAllocShapeTuple(ConversionPatternRewriter &rewriter, Location loc,
       .getResult();
 }
 
-// Splice a freshly-built shape tuple into the flat operand vector at
-// the position the interface advertised the shape lives at.
 static LogicalResult
 spliceFlatAllocShapeOperand(SmallVectorImpl<Value> &flatOperands,
                             HCStaticShapeOpInterface shapeOp, Value newShape) {
@@ -2035,18 +1614,8 @@ spliceFlatAllocShapeOperand(SmallVectorImpl<Value> &flatOperands,
   return success();
 }
 
-// Rebuild the shape tuple on nullary/fill shaped-allocator ops
-// (`hc.zeros` / `hc.ones` / `hc.empty` / `hc.full` and their `v*`
-// vector twins) after the result type collapses to a 1D bare carrier.
-// `RetypeAnyHCOp` would copy the original shape operand verbatim,
-// leaving an nD tuple paired with a 1D result — the `HCStaticShapeOp`
-// rule wants the tuple arity to match the result rank, and the
-// post-flatten launch-body lowering reads dim count off the operand.
-//
-// Source operands threaded by `hc.load` / friends are handled by the
-// per-access patterns and never hit this branch (the
-// `getStaticShapeSourceOperand` gate excludes anything but the
-// nullary/fill allocators).
+// Rebuild shape tuple on nullary/fill allocators (zeros/ones/empty/
+// full + vec twins) so tuple arity matches the collapsed 1D result.
 struct RebuildShapedAllocOpShape
     : public OpInterfaceConversionPattern<HCStaticShapeOpInterface> {
   using Base = OpInterfaceConversionPattern<HCStaticShapeOpInterface>;
@@ -2101,33 +1670,8 @@ struct RebuildShapedAllocOpShape
   }
 };
 
-// Generic op-rebuild pattern for HC dialect ops. The function/SCF
-// populators retype signatures and structural ops, but ops in the
-// middle of the IR (`hc.generic`, `hc.load`, `hc.cast`, ...) need to
-// be rebuilt with converted operand/result types so the post-flatten
-// IR carries 1D types end-to-end without `unrealized_conversion_cast`
-// stranded in the middle. This pattern is "type-only" by design —
-// attributes (including the per-axis `#hc.expr` offset arrays on
-// `hc.generic`) and regions are carried over unchanged. Body block
-// args of `hc.generic` and friends carry scalar element types that
-// don't change under the flatten, so no signature conversion is
-// needed inside the regions.
-//
-// Under the 1-to-N converter the rewrite hands the new op only the
-// leading flat carrier of each 1-to-N operand expansion; the
-// trailing aux idx values flow into the result expansions via the
-// shared sym-name binding map (shape-preserving ops by default
-// thread the same aux through, since the result and operand share
-// the same implicit sym set). When a result aux can't be sourced
-// from any operand the helper emits an empty-binding `hc.idx_apply`
-// — same severance form `materialize-bound-exprs` lays down — so
-// the launch-body lowering's ambient walker can resolve it.
-//
-// Scoped to ops in the `hc` dialect to stay out of the way of
-// upstream patterns (func / scf / call) and avoid silent wins over
-// patterns the rest of the codebase relies on. Returning `failure()`
-// on a no-op match lets the driver short-circuit to the next pattern
-// without us paying for a clone.
+// Type-only rebuild for HC dialect ops the populators miss. Attrs +
+// regions carry over unchanged. Scoped to `hc` dialect.
 struct RetypeAnyHCOp : public ConversionPattern {
   RetypeAnyHCOp(const TypeConverter &converter, MLIRContext *ctx)
       : ConversionPattern(converter, MatchAnyOpTypeTag(), 1, ctx) {}
@@ -2160,9 +1704,7 @@ struct RetypeAnyHCOp : public ConversionPattern {
     return replaceWithRetypedAuxValues(op, newOp, operands, rewriter);
   }
 
-  // Cheap no-op check: skip if every result and every operand is
-  // already legal under the converter (the driver would re-fire us
-  // forever otherwise).
+  // No-op gate; driver loops forever without it.
   static bool retypeWouldChangeOp(Operation *op, ArrayRef<ValueRange> operands,
                                   ArrayRef<Type> convertedResultTypes) {
     if (op->getNumResults() != convertedResultTypes.size())
@@ -2177,11 +1719,7 @@ struct RetypeAnyHCOp : public ConversionPattern {
     return false;
   }
 
-  // Pick the leading (flat) result type out of each 1-to-N expansion;
-  // the new op only carries those (the trailing aux idx values are
-  // SSA-generated alongside, not on the op surface). A zero-width
-  // expansion means a result the converter can't produce a flat type
-  // for, which the caller must treat as a hard failure.
+  // Leading flat type per 1-to-N expansion; zero-width is hard failure.
   static LogicalResult
   narrowResultTypesToFlat(ArrayRef<Type> convertedResultTypes,
                           ArrayRef<unsigned> resultWidths, unsigned numResults,
@@ -2197,13 +1735,9 @@ struct RetypeAnyHCOp : public ConversionPattern {
     return success();
   }
 
-  // Build the replacement op with flat-only operands and result types.
-  // Inlines the original op's regions verbatim, then re-runs the
-  // converter on each region body — `inlineRegionBefore` doesn't
-  // touch block-arg types, and `hc.for_range`'s body iter-arg block
-  // args must match the converted `iter_inits` or the parent
-  // verifier rejects the op. For ops whose body block args don't
-  // get flattened this is a no-op.
+  // Build replacement with flat operands/results. Re-runs converter
+  // on each region body: `hc.for_range` iter-arg block args must
+  // match converted `iter_inits` or the parent verifier rejects.
   static Operation *cloneOpWithFlatTypes(Operation *op,
                                          ArrayRef<ValueRange> operands,
                                          ArrayRef<Type> flatResultTypes,
@@ -2230,10 +1764,8 @@ struct RetypeAnyHCOp : public ConversionPattern {
     return newOp;
   }
 
-  // Pair each new flat result with the aux values its pre-flatten
-  // type expects, sourcing each aux name from the operand expansion
-  // bindings when possible (so a result sym matches an operand sym
-  // instead of a fresh ambient apply).
+  // Pair flat result with aux; source from operand bindings before
+  // emitting fresh ambient applies.
   static LogicalResult
   replaceWithRetypedAuxValues(Operation *op, Operation *newOp,
                               ArrayRef<ValueRange> operands,
@@ -2262,8 +1794,6 @@ struct RetypeAnyHCOp : public ConversionPattern {
     return success();
   }
 
-  // Local ResultTypes helper that reuses the 1-to-N converter to
-  // build (per-result widths + flat type list).
   static LogicalResult
   convertResultTypes(TypeRange resultTypes, const TypeConverter &converter,
                      SmallVectorImpl<Type> &convertedResults,
@@ -2278,14 +1808,9 @@ struct RetypeAnyHCOp : public ConversionPattern {
   }
 };
 
-// Build a sparse `DictionaryAttr` keyed by stringified post-flatten arg
-// index. Each entry records, for one of flatten's aux `!hc.idx<sym>`
-// Resolve the (kind, axis) classification for an implicit sym tied to
-// an aux slot: stride syms are recognized from the canonical
-// `$Sx<axis>` spelling; dim syms match a position in the buffer's
-// shape axis names. A dim that doesn't match any shape axis leaks in
-// via a non-shape source (`storage_size`, layout params); the host
-// wrapper can't bind it from `hc_get_dim` alone, so we drop it.
+// Classify implicit aux sym: stride (from `$Sx<axis>`) or dim (matches
+// a buffer axis). Non-shape-sourced names (storage_size, layout
+// params) can't bind from `hc_get_dim` and get dropped.
 struct FlattenAuxKindAxis {
   StringRef kind;
   int64_t axis;
@@ -2300,8 +1825,7 @@ classifyImplicitAuxSym(StringRef name, ArrayRef<StringRef> axisSyms) {
   return std::nullopt;
 }
 
-// Build one `(aux_of, axis, kind)` dictionary entry for the given aux
-// slot, keyed by its post-flatten function-arg index.
+// One `(aux_of, axis, kind)` entry keyed by post-flatten arg index.
 static NamedAttribute
 buildFlattenAuxArgEntry(MLIRContext *ctx, IntegerType i64Type,
                         unsigned auxPostIdx, unsigned flatCarrierIdx,
@@ -2320,10 +1844,8 @@ buildFlattenAuxArgEntry(MLIRContext *ctx, IntegerType i64Type,
                         DictionaryAttr::get(ctx, auxEntries));
 }
 
-// Walk the implicit-sym list for one buffer arg and append one
-// `(aux_of, axis, kind)` entry per recognized (dim or stride) aux
-// slot. Aux slots whose sym leaks in via a non-shape source are
-// silently dropped (see `classifyImplicitAuxSym`).
+// Append one entry per recognized aux slot for a buffer arg; drops
+// non-shape-sourced names per `classifyImplicitAuxSym`.
 static void
 noteFlattenAuxArgsForBuffer(MLIRContext *ctx, IntegerType i64Type,
                             unsigned flatCarrierIdx,
@@ -2346,17 +1868,11 @@ noteFlattenAuxArgsForBuffer(MLIRContext *ctx, IntegerType i64Type,
   }
 }
 
-// slots, the parent (flat carrier) buffer arg's post-flatten index, the
-// axis the aux corresponds to in the parent's pre-flatten shape, and
-// whether it's a `"dim"` or `"stride"` aux. Pre-flatten the host
-// wrapper recovers dim values from the buffer arg's symbolic shape;
-// post-flatten the shape collapses to `[?]` and the per-axis info
-// lives on the trailing aux slots — the meta lets the lowering pair
-// each aux slot back to a `(parent buf pyArg, axis, kind)` triple
-// without re-deriving it from the surrounding signature.
-//
-// Returns a null attribute when no buffer arg expanded (e.g. a func
-// that only takes scalars, or one whose buffers were already flat).
+// Build `hc.flatten_aux_args` meta: DictionaryAttr keyed by
+// post-flatten arg index, value `(aux_of, axis, kind)` per aux slot.
+// Lets the host-wrapper lowering pair each aux back to its parent
+// buffer arg without re-deriving from the signature. Null on funcs
+// without expanded buffer args.
 static DictionaryAttr buildFlattenAuxArgsMeta(MLIRContext *ctx,
                                               FunctionType origType,
                                               const TypeConverter &converter) {
@@ -2384,27 +1900,10 @@ static DictionaryAttr buildFlattenAuxArgsMeta(MLIRContext *ctx,
   return DictionaryAttr::get(ctx, entries);
 }
 
-// Update the `function_type` attribute and body block arguments of a
-// HC dialect symbol op (`hc.intrinsic`, `hc.func`, `hc.kernel`) so the
-// signature stays in sync with the converted call sites and bodies.
-// Unlike `func.func`, these ops don't implement `FunctionOpInterface`,
-// so the upstream populator doesn't see them; without this pattern,
-// the verifier on `hc.call_intrinsic` / `hc.call` rejects the op once
-// the operand types diverge from the still-original declared
-// signature.
-//
-// The body block args are converted via `applySignatureConversion` so
-// the 1-to-N expansion the converter emits for shaped types (one flat
-// carrier + N aux `!hc.idx<sym>` for free dim/stride symbols) lands
-// as parallel block arguments — the same surface call sites get on
-// their operand expansion.
-//
-// `hc.flatten_aux_args` is attached on rewrite so the host-wrapper
-// lowering (`hc-lower-kernels-to-gpu-launch`) can identify which
-// post-flatten args are flatten-emitted aux slots (vs user-passed
-// scalars) and resolve their values from the parent buffer's PyObject
-// instead of allocating a fresh PyObject slot per aux. See
-// `buildFlattenAuxArgsMeta` for the attribute shape.
+// Retype `hc.intrinsic` / `hc.func` / `hc.kernel` signatures + body
+// block args. These don't implement `FunctionOpInterface` so upstream
+// populator misses them. Attaches `hc.flatten_aux_args` for the
+// host-wrapper lowering to find aux slots.
 template <typename SymbolOp>
 struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
   using OpConversionPattern<SymbolOp>::OpConversionPattern;
@@ -2453,10 +1952,8 @@ struct ConvertHCSymbolSignatureOp : public OpConversionPattern<SymbolOp> {
   }
 };
 
-// Determine the rank of a single `hc.generic` operand for the
-// post-flatten parity check. `nullopt` means the operand isn't
-// rank-constrained at this boundary and shouldn't gate the legality
-// decision (e.g. `hc.undef`-typed sentinels or non-shaped scalars).
+// Operand rank for parity check; nullopt for non-rank-constrained
+// (`hc.undef`, non-shaped scalars).
 static std::optional<size_t> hcGenericOperandRank(Type t) {
   if (isHCUndefType(t))
     return std::nullopt;
@@ -2468,12 +1965,8 @@ static std::optional<size_t> hcGenericOperandRank(Type t) {
   return std::nullopt;
 }
 
-// `hc.generic` legality gates on offset-array rank parity: a type-only
-// retype with no offset composition leaves nD arrays sitting on
-// now-1D operands, which the post-flatten verifier rejects. This
-// returns false (i.e. the op is illegal) the moment any operand's
-// offset count diverges from its rank, forcing the driver back
-// through `ComposeGenericOffsets`.
+// Legality: offset count must match operand rank or driver forces
+// back to `ComposeGenericOffsets`.
 static bool checkHCGenericRoleParity(OperandRange ops, ArrayAttr offsets) {
   for (auto [val, off] :
        llvm::zip_equal(ops, offsets.getAsRange<ArrayAttr>())) {
@@ -2496,12 +1989,9 @@ static bool isHCGenericLegalAtFlattenBoundary(HCGenericOp generic,
   return true;
 }
 
-// HC's symbol-carrying ops carry their signature in a `function_type`
-// attribute; `converter.isLegal(op)` only inspects operand/result
-// types, which are zero on these ops. Match the upstream
-// `FunctionOpInterface` legality rule explicitly. Returns nullopt
-// when the op isn't a symbol-carrier (caller should fall through to
-// the generic legality rules).
+// HC symbol-carrier signature legality. `converter.isLegal` only
+// inspects op operand/result types (zero on these ops). nullopt for
+// non-symbol-carriers.
 static std::optional<bool>
 hcSymbolSignatureLegality(Operation *op, const TypeConverter &converter) {
   auto checkSignature = [&](FunctionType fnType) {
@@ -2519,10 +2009,8 @@ hcSymbolSignatureLegality(Operation *op, const TypeConverter &converter) {
   return std::nullopt;
 }
 
-// Top-level legality predicate for `markUnknownOpDynamicallyLegal`.
-// Combines the upstream `FunctionOpInterface` rule, the func/return
-// op rule, the HC symbol-signature rule, the HCGenericOp parity rule,
-// and the HC dialect operand/result rule. Anything else is legal.
+// Top-level legality. Composes function-iface / func.return / call /
+// hc-symbol / hc-generic-parity / hc-dialect rules. Default: legal.
 static bool isFlattenLegalAtPassBoundary(Operation *op,
                                          const TypeConverter &converter,
                                          MLIRContext *ctx) {
@@ -2531,20 +2019,13 @@ static bool isFlattenLegalAtPassBoundary(Operation *op,
       return converter.isSignatureLegal(fnType);
   if (isa<func::ReturnOp, func::CallOp>(op))
     return converter.isLegal(op);
-  // `hc.as_layout` is always illegal: the rewriter above unconditionally
-  // drops it. Without that gate the driver would consider the op legal
-  // when both endpoints already have the same converted type, leaving
-  // the cosmetic relabel in place.
+  // `hc.as_layout` always illegal — rewriter drops unconditionally.
   if (isa<HCAsLayoutOp>(op))
     return false;
   if (std::optional<bool> sigLegal = hcSymbolSignatureLegality(op, converter))
     return *sigLegal;
   if (auto generic = dyn_cast<HCGenericOp>(op))
     return isHCGenericLegalAtFlattenBoundary(generic, converter);
-  // HC dialect ops are legal iff every operand and every result type
-  // is already in its converted form. The `RetypeAnyHCOp` pattern
-  // takes care of the rebuild when one side still carries the
-  // pre-flatten shape.
   if (op->getDialect() == ctx->getLoadedDialect<HCDialect>())
     return converter.isLegal(op);
   return true;
@@ -2565,9 +2046,8 @@ struct HCFlattenWithLayoutsPass final
     scf::populateSCFStructuralTypeConversionsAndLegality(converter, patterns,
                                                          target);
 
-    // Per-access-op patterns are listed first by intent — the
-    // conversion driver still picks via benefit (2 vs the generic
-    // retype's 1), but having them grouped reads as the design.
+    // Per-access patterns first by intent; driver picks via benefit
+    // (2 vs the generic retype's 1).
     patterns.add<ComposeLoadOffsets, ComposeVLoadOffsets, ComposeStoreOffsets,
                  ComposeGenericOffsets, ComposeBufferViewOffsets, DropAsLayout,
                  RebuildShapedAllocOpShape, RetypeAnyHCOp,

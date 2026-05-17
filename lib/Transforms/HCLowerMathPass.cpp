@@ -2,15 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-math`: rewrite the NumPy-named `hc.builtin_call`
-// carriers into upstream `math.<op>`. See the pass description in
-// `include/hc/Transforms/Passes.td` and the carrier-op contract on
-// `hc.builtin_call` in `include/hc/IR/HCOps.td`.
-//
-// Mirrors `-hc-lower-pow` in shape: collect first, mutate after, fail
-// the pass with a single localised diagnostic per unsupported case so
-// the original `np.<func>(...)` source is what gets fingerprinted
-// rather than a downstream LLVM lowering reporting an unknown op.
+// Implements `-hc-lower-math`: rewrite NumPy-named `hc.builtin_call`
+// carriers into upstream `math.<op>`. Collect first, mutate after.
+// Diagnose at the original op so failure points at `np.<func>(...)`.
 
 #include "hc/Transforms/Passes.h"
 
@@ -33,20 +27,11 @@ using namespace mlir::hc;
 
 namespace {
 
-// Single dispatch surface for the NumPy ufunc family carried by
-// `hc.builtin_call`. The op definition keeps the name string opaque on
-// purpose (so the carrier scales with the wider numpy surface), but
-// every supported lowering lives here in one table — new entries are a
-// one-row edit. The float-only check matches what upstream `math.*`
-// accepts; the math dialect ops themselves take any
-// math-compatible operand type uniformly (scalar / vector / shaped),
-// so we don't have to dispatch on that here.
+// Single dispatch table for the NumPy ufunc family. Float-only —
+// upstream `math.*` rejects non-float element types.
 static LogicalResult lowerBuiltinCall(HCBuiltinCallOp op) {
   StringRef name = op.getName();
   OperandRange args = op.getArgs();
-  // Unary float family covers what the langref blesses today: `sqrt`,
-  // `exp`. Binary math (`maximum`, `minimum`) and other ufuncs add
-  // their own arms here when they're wired in.
   if (name == "numpy.sqrt" || name == "numpy.exp") {
     if (args.size() != 1)
       return op.emitOpError("`hc.builtin_call \"")

@@ -233,5 +233,3 @@ struct HCLowerBarePredicatesPass
 };
 
 } // namespace
-
-// `createHCLowerBarePredicatesPass()` is emitted by tablegen.

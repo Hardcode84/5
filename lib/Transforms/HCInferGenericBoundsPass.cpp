@@ -31,10 +31,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// One identity binding for an iter sym: which (operand, axis) supplied
-// it, and the dim expression carried by the operand's shape at that
-// axis. The operand is kept around so conflict diagnostics can name
-// the producer instead of just the iter symbol.
+// Identity binding for one iter sym. Operand kept for conflict diagnostics.
 struct ImpliedBound {
   ExprAttr dim;
   Value operand;
@@ -43,10 +40,7 @@ struct ImpliedBound {
   size_t roleIdx;
 };
 
-// Try to read an operand's symbolic shape entry at `axis`. Returns null
-// for non-shaped operands (e.g. `!hc.undef`) or non-`#hc.expr` shape
-// entries. Either case means the operand can't bind anything here, and
-// we move on to the next pair.
+// Null for non-shaped operands (e.g. `!hc.undef`) or non-`#hc.expr` entries.
 static ExprAttr operandDimExpr(Value operand, size_t axis) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(operand.getType());
   if (!shaped)
@@ -57,11 +51,9 @@ static ExprAttr operandDimExpr(Value operand, size_t axis) {
   return dyn_cast<ExprAttr>(shape.getDims()[axis]);
 }
 
-// Identity-only matcher: true iff `offset` is structurally the bare
-// symbol `iterSym` under ixsimpl-canonical form. Built via the
-// hash-consed compose API so pointer equality is the comparison;
-// affine and scaled patterns deliberately fall through the floor for
-// now — a richer matcher is the obvious next axis to grow.
+// True iff `offset` is structurally the bare symbol `iterSym`. Hash-consed
+// compose gives pointer equality; affine / scaled patterns need a richer
+// matcher.
 static bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
                                 StringRef iterSym) {
   auto bareHandle = sym::composeExprSym(store, iterSym);
@@ -70,8 +62,7 @@ static bool offsetIsIdentitySym(sym::Store &store, ExprAttr offset,
   return offset.getValue() == *bareHandle;
 }
 
-// Iter syms whose bound is still a placeholder `hc.undef` — only those
-// need inference, the others were already bound by the producer.
+// Iter syms still bound to `hc.undef` placeholder — others already bound.
 static SmallVector<size_t> findPlaceholderIters(OperandRange iterBounds) {
   SmallVector<size_t> placeholders;
   for (auto [iterIdx, bound] : llvm::enumerate(iterBounds))
@@ -80,10 +71,8 @@ static SmallVector<size_t> findPlaceholderIters(OperandRange iterBounds) {
   return placeholders;
 }
 
-// Collect every identity binding for every placeholder sym in one pass
-// over the offsets for a single role (ins or outs). The per-iter list
-// is grown so the diagnose step can flag conflicts and name both
-// producers in the diagnostic.
+// One-pass identity-binding collection per role; list grown for conflict
+// diagnose.
 static void collectImpliedBoundsForRole(
     OperandRange operands, ArrayAttr offsetsAttr, StringRef role,
     ArrayAttr iterSyms, ArrayRef<size_t> placeholderIters, sym::Store &store,
@@ -105,9 +94,7 @@ static void collectImpliedBoundsForRole(
   }
 }
 
-// Diagnose first, mutate after — keeps the IR untouched on failure.
-// An iter sym with no identity occurrence in any operand offset, or
-// with conflicting dim expressions across operands, is a hard error.
+// Diagnose first; IR untouched on failure. Missing or conflicting = hard error.
 static LogicalResult
 diagnoseImpliedBoundConflicts(HCGenericOp op, ArrayAttr iterSyms,
                               ArrayRef<size_t> placeholderIters,
@@ -134,11 +121,8 @@ diagnoseImpliedBoundConflicts(HCGenericOp op, ArrayAttr iterSyms,
   return success();
 }
 
-// Materialise an `!hc.idx<dim>` SSA via empty-binding `hc.idx_apply`
-// for each placeholder. No explicit operand bindings: the dim
-// expression's free symbols are kernel / launch-context names whose
-// runtime SSA isn't known here. They stay ambient and the launch-body
-// lowering binds them through its existing walk.
+// Empty-binding `hc.idx_apply` — free syms are launch-context names
+// the launch-body lowering binds later.
 static void
 materializeInferredBounds(HCGenericOp op, OperandRange iterBounds,
                           ArrayRef<size_t> placeholderIters,

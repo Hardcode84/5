@@ -104,10 +104,8 @@ def test_intrinsic_decorator_registers_hooks() -> None:
 
 
 def _assert_wmma_require_steps(require_steps) -> None:
-    # The recipe asserts both `arch` and `wave_size` before letting the
-    # rewrite touch the call. Match the literal types/values the frontend
-    # emits at the call site (`arch` as a plain string, `wave_size` at i64
-    # because the call-site attribute is `wave_size = 32 : i64`).
+    # Pre-rewrite asserts: `arch` plain string, `wave_size` i64
+    # (call-site emits `wave_size = 32 : i64`).
     from hc._intrinsic_recipes import TypedIntAttr
 
     require_by_name = {step.name: step for step in require_steps}
@@ -120,10 +118,9 @@ def _assert_wmma_require_steps(require_steps) -> None:
 
 
 def _assert_wmma_create_step(create, cast_steps) -> None:
-    # Each `call.operand(name, expected_type=...)` planted a cast step;
-    # the create op consumes the cast results directly. Cast names are
-    # generated in builder order, so the three `a/b/acc` inputs map to
-    # the first three casts.
+    # `call.operand(name, expected_type=...)` plants a cast; create
+    # consumes cast results in builder order, so `a`/`b`/`acc` map
+    # to the first three casts.
     from hc._intrinsic_recipes import TypedIntAttr
 
     assert create.op_name == "amdgpu.wmma"
@@ -138,8 +135,8 @@ def _assert_wmma_create_step(create, cast_steps) -> None:
         "operand_b_frag_data",
         "operand_acc_frag_data",
     ]
-    # `amdgpu.wmma` only takes `m`/`n`/`k` (i32). `arch`/`wave_size` ride
-    # on the call site for dispatch but never make it onto the created op.
+    # `amdgpu.wmma` carries only `m`/`n`/`k` (i32); `arch`/`wave_size`
+    # stay call-site for dispatch.
     attrs = dict(create.attrs)
     assert set(attrs) == {"m", "n", "k"}
     for name, value in attrs.items():
@@ -179,17 +176,14 @@ def test_wmma_lowering_records_transform_recipe() -> None:
         s for s in recipe.steps if isinstance(s, RecipeConstantTypeStep)
     ]
     _assert_wmma_require_steps(require_steps)
-    # Two literal types are referenced: the f16 fragment vector that
-    # `amdgpu.wmma` expects for the `a`/`b` inputs, and the f32 accumulator
-    # vector for the third input + result. The builder dedupes by literal
-    # text so each shows up exactly once.
+    # f16 fragment for `a`/`b`, f32 accumulator for the third operand
+    # + result. Builder dedupes by literal text → each appears once.
     literals = {step.type_literal for step in const_type_steps}
     assert literals == {"vector<16xf16>", "vector<8xf32>"}
     _assert_wmma_create_step(create_steps[0], cast_steps)
-    # Two replacement values: the cast that bridges the upstream
-    # `amdgpu.wmma` result back to `!hc.bare_vector<f32, [8]>` so the call
-    # replacement type-checks, and the original `acc_frag.mask` operand
-    # passed through (the matmul step preserves accumulator validity).
+    # Replacement: cast bridging `amdgpu.wmma` result back to
+    # `!hc.bare_vector<f32, [8]>`; `acc_frag.mask` passed through
+    # (matmul preserves accumulator validity).
     assert len(recipe.replacement) == 2
     assert recipe.replacement[0].source == "cast"
     assert recipe.replacement[1].name == "operand_acc_frag_mask"

@@ -2,11 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Internal masked-value runtime primitives for `hc.simulator`.
+"""Masked-value runtime primitives for `hc.simulator`.
 
-This module implements the simulator's tensor/vector value model: masked
-payloads, poison-aware scalar reads, a deliberately small NumPy-facing
-operator surface, and layout metadata over dense host storage.
+Tensor/vector model: masked payloads, poison-aware scalar reads, a small
+NumPy operator surface, layout metadata over dense host storage.
 """
 
 from __future__ import annotations
@@ -26,8 +25,8 @@ type ReducerIndex = tuple[int | slice, ...]
 
 _KEEP_LAYOUT = object()
 _KEEP_COLLECTIVE_SUFFIX = object()
-# Keep host-side validation bounded for large shapes while still checking the
-# layout's declared shape and storage size.
+# Cap per-cell offset validation; the layout's shape/storage check is
+# still unconditional.
 _LAYOUT_VALIDATION_LIMIT = 4096
 
 _SUPPORTED_UFUNCS = frozenset(
@@ -136,14 +135,11 @@ def _raise_poison() -> Never:
 
 
 def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
-    """Resolve validated layout metadata for a concrete logical shape.
+    """Validated layout metadata for a concrete logical shape.
 
-    The simulator keeps dense NumPy payloads and uses the resolved layout as
-    logical-placement metadata. Layout offsets may be non-injective —
-    distinct logical indices mapping to the same storage offset is a
-    first-class feature (per-lane fragments, broadcast layouts, ...) —
-    so we validate bounds (every offset lands inside `storage_size`) but
-    do not enforce injectivity.
+    Simulator keeps dense NumPy payloads; the layout is logical-placement
+    metadata. Non-injective offsets are legal (per-lane fragments,
+    broadcasts) — bounds checked, injectivity not enforced.
     """
     resolved_shape = tuple(int(dim) for dim in shape)
     if layout is None:
@@ -154,12 +150,8 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
         return layout
     if not isinstance(layout, IndexMap):
         raise SimulatorError("layout must be an IndexMap or None")
-    # Free syms are kernel-scope bindings resolved by the lowering
-    # pipeline at access time. The simulator path doesn't have a
-    # surrounding kernel scope to query, so layouts that declare
-    # free syms fall off the simulator entirely. Tracked separately
-    # under the simulator gather path; see `doc/layouts.md` "Free
-    # symbols in layout offsets" and the deferred-work list there.
+    # Free syms need a surrounding kernel scope; simulator has none.
+    # See `doc/layouts.md` "Free symbols in layout offsets".
     if layout.free_syms:
         raise SimulatorError(
             "layout declares free_syms "
@@ -179,17 +171,14 @@ def resolve_layout(layout: Any, shape: Sequence[int]) -> ResolvedLayout | None:
 
 
 def _validate_layout_arities(layout: IndexMap, shape: tuple[int, ...]) -> None:
-    """Confirm the layout's lambda signatures match the contract.
+    """Check layout lambda arities against the contract.
 
-    Contract (mirrors `_resolve.py` / `doc/layouts.md`):
-        storage_size(*shape_syms[, params])           -> arity = R + t
-        offset(*index_syms, *shape_syms[, params])    -> arity = R + R + t
+    Contract (`doc/layouts.md`):
+        storage_size(*shape_syms[, params])           -> R + t
+        offset(*index_syms, *shape_syms[, params])    -> 2R + t
 
-    where R = rank and t in {0, 1} is the optional params slot. We
-    inspect arities directly rather than importing the frontend's
-    helpers (which raise `FrontendError`); signature surprises surface
-    as `SimulatorError` so the diagnostic source matches the validator
-    that fired.
+    R = rank, t in {0,1}. Bypass frontend helpers (they raise
+    `FrontendError`); surface mismatches as `SimulatorError`.
     """
     trailing = 1 if layout.params is not None else 0
     storage_arity = _layout_positional_arity(
@@ -218,12 +207,10 @@ def _validate_layout_arities(layout: IndexMap, shape: tuple[int, ...]) -> None:
 
 
 def _layout_positional_arity(fn: Callable[..., Any], *, role: str) -> int:
-    """Count of strictly positional, no-default parameters on `fn`.
+    """Strictly positional, no-default param count for `fn`.
 
-    Layout lambdas must be a flat positional list (shape syms, then index
-    syms, then an optional `params` dict). Any other shape — varargs,
-    kw-only, defaults — is a contract violation that would make the slot
-    binding ambiguous, so reject it up front.
+    Layout lambdas must be flat positional (shape, index, optional
+    `params`). Varargs/kw-only/defaults are slot-binding ambiguous.
     """
     try:
         sig = inspect.signature(fn)
@@ -278,15 +265,10 @@ def _validate_layout_offsets(
     params: dict[str, Any],
     storage_size: int,
 ) -> None:
-    """Bounds-check the layout's offset at every logical index.
+    """Bounds-check `layout.offset` at every logical index.
 
-    Non-injective layouts are allowed (multiple logical indices may map
-    to the same storage offset — that's how per-lane fragments and
-    broadcast layouts work). We only check that every offset lands
-    inside `[0, storage_size)`, catching obvious typos (wrong sym name
-    in the formula, negative results, out-of-range arithmetic) without
-    enforcing the injectivity invariant the user may intentionally have
-    relaxed.
+    Every offset must land in `[0, storage_size)`. Non-injective layouts
+    pass (per-lane fragments, broadcasts).
     """
     logical_size = int(np.prod(shape))
     if logical_size == 0:
@@ -314,21 +296,15 @@ def layout_int(value: Any, *, what: str) -> int:
 
 
 class KernelBuffer:
-    """Wrapper for kernel `ndarray` arguments that preserves slice intent.
+    """ndarray wrapper that records pre-clip slice extents.
 
-    The kernel sees a NumPy-ish object whose `__getitem__` records the
-    user's pre-clip slice extent in addition to the natural NumPy
-    clipped view. A layout-driven `vload` against a sliced buffer
-    needs the *intent* shape — e.g. `(WMMA_M, WMMA_N)` — to OOB-pad
-    the source up to the layout's `storage_size`. NumPy alone clips
-    silently at the buffer's bounds, so by the time `vload` sees the
-    slice the user's logical extent is gone.
+    Layout-driven `vload` needs the intent shape (e.g. `(WMMA_M, WMMA_N)`)
+    to OOB-pad up to `storage_size`. NumPy clips at buffer bounds; by
+    the time `vload` runs the user's logical extent is gone.
 
-    Stays duck-type compatible with `np.ndarray` for the attributes
-    kernels actually touch (`shape`, `dtype`, `ndim`, `size`,
-    `__array__`, `__setitem__`). Anything fancier (Ellipsis,
-    `np.newaxis`, advanced indexing) falls through to NumPy with no
-    intent tracking — those patterns don't drive layout-aware loads.
+    Duck-type compatible with `np.ndarray` for what kernels touch.
+    Ellipsis / `np.newaxis` / advanced indexing fall through without
+    intent tracking.
     """
 
     __array_priority__ = 1000
@@ -378,24 +354,17 @@ class KernelBuffer:
         *,
         shape: Sequence[int] | None = None,
     ) -> LayoutBufferView:
-        """Reinterpret the whole buffer via `layout`.
-
-        Same semantics as `BufferSlice.as_layout`. The buffer's
-        intent shape is its plain shape (no clipping applied yet).
-        """
+        """Reinterpret whole buffer via `layout`. Intent = plain shape."""
         return _make_layout_buffer_view(self._array, self.shape, layout, shape)
 
 
 class BufferSlice:
-    """Numpy-clipped slice view plus the user's pre-clip extent per axis.
+    """NumPy-clipped slice view + per-axis pre-clip extent.
 
-    `view` is the natural NumPy slice (clipped at the buffer's
-    bounds). `intent_shape` is what the user's slice expression
-    *would* have shaped if the buffer were large enough — i.e.
-    `(stop - start)` (or its strided ceil-divide) per axis. The
-    simulator's gather path consumes `intent_shape` to OOB-pad the
-    source up to the layout's logical extent; the dense overlap path
-    keeps using the clipped view and is unaffected.
+    `view`: clipped at buffer bounds. `intent_shape`: what the slice
+    would have shaped without clipping (per-axis stride ceil-divide).
+    Gather path uses `intent_shape` to OOB-pad up to the layout's
+    logical extent; dense path uses `view`.
     """
 
     __array_priority__ = 1000
@@ -440,10 +409,8 @@ class BufferSlice:
         self._view[index] = value
 
     def __getitem__(self, index: Any) -> Any:
-        # Chained slicing: re-derive intent against the previous
-        # intent shape (not the clipped view) so OOB extents
-        # compose. Kernels in the tree don't currently double-slice,
-        # but the API would lie if it forgot the outer extent.
+        # Chained slicing composes against the prior intent (not the
+        # clipped view) so OOB extents propagate.
         sliced = _slice_with_intent(self._view, index, parent_intent=self._intent_shape)
         if sliced is None:
             return self._view[index]
@@ -455,47 +422,26 @@ class BufferSlice:
         *,
         shape: Sequence[int] | None = None,
     ) -> LayoutBufferView:
-        """Reinterpret this buffer slice's access pattern through `layout`.
+        """Reinterpret this slice through `layout`.
 
-        Mirrors `hc.as_layout` on a buffer source. The buffer-side
-        verifier explicitly skips the storage-size structural check
-        because pointer-rooted shaped storage holds whatever the
-        user-supplied allocation contains; a non-injective layout
-        over the same physical storage is a legitimate
-        reinterpretation. The simulator mirrors that by attaching the
-        resolved layout without size enforcement against the slice's
-        intent shape.
-
-        `shape=` declares the layout's reinterpreted extent (the
-        result of `hc.as_layout` on the MLIR side carries this on its
-        result type). It is required for buffer sources because the
-        layout's `shape_syms` aren't bound by the underlying buffer's
-        own shape — pointer storage and logical extent are
-        independent concepts here.
+        Mirrors `hc.as_layout` on a buffer source: storage-size check
+        is skipped (`HCAsLayoutOp::verify`) — pointer storage and
+        layout extent are independent. `shape=` is required: layout
+        `shape_syms` aren't bound by the underlying buffer shape.
         """
         return _make_layout_buffer_view(self._view, self._intent_shape, layout, shape)
 
 
 class LayoutBufferView:
-    """A buffer (or buffer slice) reinterpreted via a layout.
+    """A buffer (or slice) reinterpreted via a layout.
 
-    `as_layout(c_tile, WAVE_ACC_FRAG_LAYOUT, shape=(WAVE_LANES,
-    WMMA_ACC_FRAGMENT))` on a `(WMMA_M, WMMA_N)` buffer slice yields
-    a layout-bearing view of shape `(WAVE_LANES, WMMA_ACC_FRAGMENT)`
-    whose subscript applies the layout's offset to compute the per-
-    element flat position in the underlying tile. Per-lane
-    subscripts like `view[lane, :]` give a `(WMMA_ACC_FRAGMENT,)`
-    `LayoutBufferSlice` rooted at the lane's per-element positions —
-    the runtime side of a symmetric `hc.buffer_view` of a layout-
-    bearing buffer, and the natural target for both the load
-    (`group.vload`) and the store (`group.store`) against the same
-    layout, killing the strided per-lane slice arithmetic the manual
-    inverse forms otherwise need.
+    `view[lane, :]` -> `(...)`-shape `LayoutBufferSlice` rooted at the
+    lane's per-element flat positions in the underlying tile. Natural
+    target for both load (`group.vload`) and store (`group.store`)
+    against the same layout — kills manual per-lane stride arithmetic.
 
-    Mirrors `hc.as_layout` on a buffer source: the verifier
-    explicitly skips the storage-size structural check for buffers
-    (`HCAsLayoutOp::verify`), so the layout shape need not equal the
-    underlying intent's flat extent.
+    Mirrors `hc.as_layout` on a buffer source: layout shape need not
+    equal the underlying intent's flat extent.
     """
 
     __array_priority__ = 1000
@@ -534,20 +480,13 @@ class LayoutBufferView:
 
 
 class LayoutBufferSlice:
-    """A `LayoutBufferView` subscripted to a concrete set of positions.
+    """A `LayoutBufferView` subscripted to concrete positions.
 
-    Carries the explicit flat positions (into the underlying base's
-    *intent* shape) for each output cell. Loads gather through these
-    positions; stores scatter through them. Mirrors `hc.buffer_view`
-    of a layout-bearing buffer whose subscript stream has bound
-    enough axes for `composeBufferViewLayout` to leave a residual
-    addressing expression — except materialised as concrete flat
-    indices instead of a symbolic offset expression.
-
-    `positions` are intent-shape flat indices, not raw NumPy view
-    flat indices, so OOB intent positions (positions past the
-    clipped base extent) mask False at load/store time without
-    aliasing into a different cell of the clipped ravel.
+    Carries flat positions in the base's *intent* shape (not the
+    clipped NumPy view), so OOB intent positions mask False at
+    load/store time without aliasing into a different ravel cell.
+    Mirrors `hc.buffer_view` of a layout-bearing buffer with bound
+    axes, materialized as concrete indices.
     """
 
     __array_priority__ = 1000
@@ -584,16 +523,11 @@ def _make_layout_buffer_view(
     layout: Any,
     shape: Sequence[int] | None,
 ) -> LayoutBufferView:
-    """Resolve `layout` against the explicit `shape` and wrap `base`.
+    """Resolve `layout` for the explicit `shape`; wrap `base`.
 
-    The layout's `shape_syms` bind to the *reinterpreted* extent —
-    not the underlying buffer's intent shape. Buffers on `hc.as_layout`
-    skip the storage-size structural check (`HCAsLayoutOp::verify`)
-    because pointer-rooted shaped storage holds whatever the user-
-    supplied allocation contains; the layout's offset is the
-    substrate's contract with the addressing it encodes and the
-    simulator's gather / scatter clips against the actual NumPy view
-    at access time.
+    Layout `shape_syms` bind to the *reinterpreted* extent. Buffers
+    skip the storage-size check (`HCAsLayoutOp::verify`); gather /
+    scatter clip against the NumPy view at access time.
     """
     if layout is None:
         raise SimulatorError("as_layout on a buffer requires a layout")
@@ -618,15 +552,10 @@ def _layout_subscript(
     layout: ResolvedLayout,
     index: Any,
 ) -> LayoutBufferSlice:
-    """Materialise `layout.offset` over the subscripted positions.
+    """Materialize `layout.offset` over the subscript's cross product.
 
-    Iterates the output positions (the cross product of the slice
-    axes, with scalar axes pinned), evaluates `layout.offset` for
-    each, and packs the results into a `LayoutBufferSlice`. Output
-    rank matches the number of slice axes in the index, dropping
-    axes consumed by scalar subscripts — mirrors NumPy slice
-    semantics so `view[lane, :]` is rank-1 and `view[:, :]` is
-    rank-2.
+    Output rank = slice-axis count (scalar axes drop), matching NumPy.
+    `view[lane, :]` -> rank-1; `view[:, :]` -> rank-2.
     """
     layout_rank = len(layout.shape)
     padded = _pad_layout_subscript(index, layout_rank)
@@ -651,10 +580,8 @@ def _resolve_layout_axes(
 ) -> tuple[list[Sequence[int]], list[int], list[int]]:
     """Split a padded subscript into per-axis value lists.
 
-    Slice axes contribute the full `range(start, stop, step)`; scalar
-    axes pin a singleton list. `slice_axes` records which layout
-    axes survive into the output rank — same shape contract NumPy's
-    subscripting follows.
+    Slice axes -> full `range(start, stop, step)`. Scalar axes ->
+    singleton. `slice_axes` records survivors -> output rank.
     """
     axis_values: list[Sequence[int]] = []
     slice_axes: list[int] = []
@@ -723,14 +650,11 @@ def _slice_with_intent(
     *,
     parent_intent: tuple[int, ...] | None = None,
 ) -> BufferSlice | None:
-    """Build a `BufferSlice` from an `ndarray` plus a slice index.
+    """`BufferSlice` from an ndarray + slice index; `None` to fall through.
 
-    Returns `None` for index patterns the wrapper deliberately doesn't
-    track (advanced indexing, Ellipsis, `None`/`np.newaxis`, scalar
-    indices that drop rank, mixed shapes) so the caller can fall
-    through to plain NumPy. The dropped cases aren't reachable from
-    layout-driven loads in the current frontend; revisit if a
-    kernel ever needs them.
+    Falls through for advanced indexing, Ellipsis, `np.newaxis`,
+    rank-dropping scalars, mixed shapes — none of which drive layout
+    loads today.
     """
     index_tuple = index if isinstance(index, tuple) else (index,)
     if not all(isinstance(idx, slice) for idx in index_tuple):
@@ -752,14 +676,11 @@ def _slice_with_intent(
 
 
 def _slice_intent_extent(idx: slice, bound: int) -> int | None:
-    """Pre-clip element count for a single-axis slice against a bound.
+    """Pre-clip element count for a single-axis slice.
 
-    `(stop - start)` with the usual stride ceil-divide. `bound` is the
-    intent shape on that axis (so chained slicing composes against
-    the outer intent, not the inner clipped view). A zero step is a
-    contract violation in NumPy too — surfaced as `None` so the
-    wrapper falls through to NumPy's own `ValueError` rather than
-    silently masking it.
+    `bound` is the intent axis (chained slicing composes against the
+    outer intent). Zero step -> `None` -> fall through to NumPy's
+    `ValueError`.
     """
     start = 0 if idx.start is None else int(idx.start)
     stop = bound if idx.stop is None else int(idx.stop)

@@ -79,14 +79,8 @@ def export_toolchain_environment(
     exported["HC_LLVM_INSTALL_DIR"] = str(install_root)
     exported["LLVM_DIR"] = str(install_root / "lib" / "cmake" / "llvm")
     exported["MLIR_DIR"] = str(install_root / "lib" / "cmake" / "mlir")
-    # `ld.lld` was previously exported as `HC_LLD` here for the
-    # `hc-lower-gpu-to-binary` pass to pick up. The Python pipeline now
-    # bundles the linker into `hc/_native/bin/ld.lld` at build time and
-    # propagates the resolved path through the pass's `--lld-path=`
-    # option, so neither `hc.compile` nor the C++ pass needs the
-    # environment variable. `HC_LLD` survives in the C++ pass as a
-    # documented escape hatch for direct `hc-opt --hc-lower-gpu-to-binary`
-    # invocations against a non-default toolchain.
+    # No HC_LLD: pipeline passes `--lld-path=` from bundled `hc/_native/bin/ld.lld`.
+    # Env var is escape hatch for direct hc-opt.
     return exported
 
 

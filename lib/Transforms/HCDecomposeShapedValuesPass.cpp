@@ -30,15 +30,8 @@ static bool isSemanticShaped(Type type) {
   return isa<mlir::hc::TensorType, mlir::hc::VectorType>(type);
 }
 
-// Decomposition into `(bareData, bareMask)` carries the semantic
-// carrier's layout onto both halves. The bare types' `LayoutAttr` slot
-// is what `hc-flatten-with-layouts` reads when composing per-access
-// offsets, so dropping the layout here would collapse every non-
-// injective access (broadcasts, per-lane WMMA fragments where
-// `storage_size < product(shape)`) to identity indexing — materialising
-// the access pattern instead of preserving it. The mask side mirrors
-// the data side so `hc.store`'s mask/source verifier still finds the
-// pair structurally consistent.
+// Carry layout onto both halves; dropping it collapses non-injective access
+// (broadcasts, WMMA fragments where storage_size < product(shape)) to identity.
 static Type bareDataType(Type type) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type);
   LayoutAttr layout = shaped ? shaped.getSymbolicLayout() : LayoutAttr{};
@@ -273,9 +266,7 @@ static SmallVector<Value> materializeTargetCast(OpBuilder &builder,
       .getResults();
 }
 
-// Append the per-component split names for a parameter whose converted
-// type list has size N>1. Slot 0/1 use the canonical "data"/"mask"
-// suffixes; higher slots fall back to numeric ".2", ".3", ... .
+// Slot 0/1 → `.data`/`.mask`; higher slots → `.2`, `.3`, ...
 static void appendSplitParameterNames(MLIRContext *ctx, StringRef name,
                                       size_t typeCount,
                                       SmallVectorImpl<Attribute> &out) {
@@ -296,10 +287,7 @@ static void appendSplitParameterNames(MLIRContext *ctx, StringRef name,
   }
 }
 
-// Resolve one parameter slot. `inputIndex` is bumped iff the parameter
-// isn't a const kwarg. Returns failure if the converter fails or the
-// input index runs past the function type — both surface as a `{}`
-// ArrayAttr from the caller, which the rewrite reads as "give up".
+// Const kwargs don't consume an input slot; failure surfaces as `{}` upstream.
 static LogicalResult
 convertOneParameter(MLIRContext *ctx, StringAttr parameter,
                     const llvm::SmallDenseSet<StringRef> &constKwargs,
@@ -607,8 +595,8 @@ struct ConvertStoreOp : public OpConversionPattern<HCStoreOp> {
         expectSplit(adaptor.getDest(), op, "store destination");
     if (failed(dest))
       return failure();
-    // Tensor-backed stores update the decomposed payload and validity channels
-    // independently; a later lowering pass decides how those channels alias.
+    // Payload and validity channels updated independently; aliasing decided
+    // later.
     HCStoreOp::create(rewriter, op.getLoc(), dest->first, indices,
                       source->first, Value{});
     HCStoreOp::create(rewriter, op.getLoc(), dest->second, indices,
@@ -669,10 +657,8 @@ struct ConvertLoadOp : public OpConversionPattern<HCLoadOp> {
     auto data =
         HCLoadOp::create(rewriter, op.getLoc(), bareDataType(originalType),
                          *buffer, indices, *shape, /*layout=*/LayoutAttr{});
-    // Same broadcast-mask rationale as `ConvertVLoadOp`: empty indices
-    // means there are no per-axis slice carriers to plant a predicate
-    // from, so the layout is the user's contract for legal addressing
-    // and `hc.full_mask` is the right seed.
+    // Empty indices: no per-axis carriers to plant predicates from; full_mask
+    // seed.
     Value maskValue = indices.empty()
                           ? HCFullMaskOp::create(rewriter, op.getLoc(),
                                                  bareMaskType(originalType))
@@ -727,14 +713,7 @@ struct ConvertVLoadOp : public OpConversionPattern<HCVLoadOp> {
                             /*layout=*/LayoutAttr{})
               .getResult();
     } else if (indices.empty()) {
-      // Broadcast vload (source rank < tile rank, no per-axis indices).
-      // `hc.load_mask` plants its predicate per slice axis from the
-      // index carriers; with no indices there is nothing to plant from,
-      // and the user's layout is the contract for legal addressing into
-      // the flat source. Emit `hc.full_mask` directly — same primitive
-      // the allocator path uses for whole-shape-known-valid carriers.
-      // Keeps `hc-load-store-to-generic`'s `rewriteLoadMask` from
-      // bailing on `indices.size() != srcShape.size()`.
+      // Broadcast vload: no per-axis carriers → load_mask can't plant.
       maskValue = HCFullMaskOp::create(rewriter, op.getLoc(),
                                        bareMaskType(originalType))
                       .getMask();
@@ -817,8 +796,8 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
 
     Value dataSource;
     Value maskSource;
-    // Buffer roots are not decomposed by this pass, so a single adapted operand
-    // means the view starts from fully valid buffer storage.
+    // Buffer roots stay undecomposed; one adapted operand → fully valid
+    // storage.
     if (adaptor.getBuffer().size() == 1 &&
         isa<BufferType>(op.getBuffer().getType())) {
       dataSource = adaptor.getBuffer().front();
@@ -835,9 +814,7 @@ struct ConvertBufferViewOp : public OpConversionPattern<HCBufferViewOp> {
                                        "buffer_view index", indices)))
       return failure();
 
-    // Pass the `unit_axes` set through so the result rank matches the
-    // residual-index count + unit-axis count — same contract the input
-    // op had, just on the decomposed data/mask pair.
+    // Carry `unit_axes` through; result rank = residual indices + unit axes.
     DenseI64ArrayAttr unitAxes = op.getUnitAxesAttr();
     auto data = HCBufferViewOp::create(rewriter, op.getLoc(),
                                        bareDataType(originalType), dataSource,
@@ -870,8 +847,8 @@ struct ConvertGetItemOp : public OpConversionPattern<HCGetItemOp> {
 
     Value dataSource;
     Value maskSource;
-    // Buffer roots are not decomposed by this pass, so a single adapted operand
-    // means the item starts from fully valid buffer storage.
+    // Buffer roots stay undecomposed; one adapted operand → fully valid
+    // storage.
     if (adaptor.getBase().size() == 1 &&
         isa<BufferType>(op.getBase().getType())) {
       dataSource = adaptor.getBase().front();
@@ -932,11 +909,7 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
   }
 };
 
-// `hc.strip_layout` lives in the post-decompose surface as one
-// strip per channel: the original op operates on a semantic
-// shaped value, the decomposed form drops the layout on both the
-// data and mask channels independently. Mirrors `ConvertVecOp`'s
-// shape — single operand, two emitted ops, no indices.
+// One strip per channel; layout dropped on data and mask independently.
 struct ConvertStripLayoutOp : public OpConversionPattern<HCStripLayoutOp> {
   using Base::Base;
 
@@ -988,16 +961,8 @@ struct ConvertWithInactiveOp : public OpConversionPattern<HCWithInactiveOp> {
   }
 };
 
-// Elementwise binary arith (`hc.add` / `hc.sub` / `hc.mul` / `hc.div`
-// / `hc.mod`) on semantic shaped operands. Each side arrives as a
-// (data, mask) pair from the OneToN adaptor; the data half is the
-// op cloned on the data values, and validity is the per-operand
-// `hc.and`. Broadcasting on the data side is the op's standard
-// `inferShapedBinaryResult` outcome; we mirror it on the mask
-// channel by handing `hc.and` the matching `bareMaskType` of the
-// original op's broadcast result, so downstream
-// `hc-elementwise-to-generic` sees the same broadcast shape on
-// both halves.
+// Data: clone op on data values. Validity: `hc.and` of operand masks,
+// typed at the op's broadcast result so both halves share shape downstream.
 template <typename OpT>
 struct ConvertElementwiseBinaryShapedOp : public OpConversionPattern<OpT> {
   using Base = OpConversionPattern<OpT>;
@@ -1030,10 +995,7 @@ struct ConvertElementwiseBinaryShapedOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Elementwise unary arith (`hc.neg` / `hc.not`) on semantic shaped
-// operands. Data half clones the op on the data value; validity
-// passes through unchanged — unary arithmetic doesn't gate lanes
-// any further than its input already did.
+// Validity passes through; unary arith doesn't gate lanes further.
 template <typename OpT>
 struct ConvertElementwiseUnaryShapedOp : public OpConversionPattern<OpT> {
   using Base = OpConversionPattern<OpT>;
@@ -1060,12 +1022,7 @@ struct ConvertElementwiseUnaryShapedOp : public OpConversionPattern<OpT> {
   }
 };
 
-// `hc.astype` is the user-visible numeric conversion surface — same
-// shape as the unary template, but the op carries a `target` type
-// attribute that has to be threaded through manually. Element type on
-// the data half changes from the source element to the target; the
-// mask half passes through unchanged because element-cast doesn't
-// gate lanes.
+// Unary-shape; `target` attr threaded through. Mask passes through.
 struct ConvertAsTypeShapedOp : public OpConversionPattern<HCAsTypeOp> {
   using Base::Base;
 
@@ -1090,12 +1047,7 @@ struct ConvertAsTypeShapedOp : public OpConversionPattern<HCAsTypeOp> {
   }
 };
 
-// `hc.builtin_call` (numpy ufunc surface) is elementwise homogeneous
-// by the dispatch invariant (see the op's td description). For the
-// single-arg case (numpy.sqrt / np.exp / ...) the input mask passes
-// through unchanged; for the multi-arg case we AND the per-operand
-// masks the way binary arithmetic does so downstream lowering sees
-// the same validity surface regardless of arity.
+// Single-arg: mask passthrough. Multi-arg: AND of operand masks.
 struct ConvertBuiltinCallShapedOp
     : public OpConversionPattern<HCBuiltinCallOp> {
   using Base::Base;
@@ -1137,16 +1089,9 @@ struct ConvertBuiltinCallShapedOp
   }
 };
 
-// `hc.reduce` on a semantic shaped operand. The data half clones the
-// reduction; the mask half is `hc.full_mask` of the reduced shape.
-// Reduction over invalid lanes is correct as long as the data path
-// keeps the neutral element in those lanes (`hc.zeros` initializer
-// + `inferShapedBinaryResult`'s broadcast invariant cover this),
-// which matches the broadcast / fill / load_mask story the upstream
-// decompose rewriters plant. Per-output-tile validity is a
-// store-side concern handled downstream; full_mask here is the
-// "result lanes are addressable" seed, not a claim that every
-// reduction summand was in bounds.
+// Data: clone reduction. Mask: full_mask of reduced shape (invalid lanes
+// already neutral via upstream init/load_mask; per-tile validity is
+// store-side).
 struct ConvertReduceShapedOp : public OpConversionPattern<HCReduceOp> {
   using Base::Base;
 
@@ -1173,15 +1118,8 @@ struct ConvertReduceShapedOp : public OpConversionPattern<HCReduceOp> {
   }
 };
 
-// `hc.matmul` on semantic shaped operands. Same correctness story as
-// `hc.reduce`: the K dimension is a reduction whose summands come
-// through `hc.load_mask` zero-padding (or `hc.full`-style fills), so
-// invalid K lanes contribute the additive identity and the data half
-// of the matmul is correct regardless of per-K validity. The output
-// mask is `hc.full_mask` over the result shape — claiming "every
-// (m, n) output lane is addressable", not "every reduction summand
-// was in bounds". Per-tile-bounds validity stays a store-side
-// concern.
+// Mask: full_mask over result. Invalid K lanes already carry additive identity
+// via upstream load_mask / fill; per-tile validity is store-side.
 struct ConvertMatmulShapedOp : public OpConversionPattern<HCMatmulOp> {
   using Base::Base;
 
@@ -1274,16 +1212,8 @@ makeShapedDecompositionTarget(MLIRContext *ctx,
   return target;
 }
 
-// Post-conversion belt-and-suspenders: walk the IR and assert no
-// `!hc.tensor` / `!hc.vector` survived. The conversion driver returns
-// success iff the target's legality predicates accept the result, so
-// in principle this walk is redundant with `applyFullConversion`. In
-// practice the target is built from explicit op lists and an unknown-
-// op legality lambda; if either set ever drifts (forgets a new HC op,
-// loses a converter check), a semantic carrier could slip through and
-// trip every downstream pass. The walk is cheap and the diagnostic
-// names the offending op directly, instead of letting the failure
-// surface several passes later as a vague type mismatch.
+// Belt-and-suspenders sweep: catch any semantic carrier the target's
+// legality lists missed; diagnostic names the offender at the source.
 static bool isSemanticShapedType(Type type) {
   return isa<mlir::hc::TensorType, mlir::hc::VectorType>(type);
 }
@@ -1335,5 +1265,3 @@ struct HCDecomposeShapedValuesPass
 };
 
 } // namespace
-
-// `createHCDecomposeShapedValuesPass()` is emitted by tablegen.

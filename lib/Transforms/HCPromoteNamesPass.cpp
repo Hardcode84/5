@@ -2,30 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// -hc-promote-names: rebuild IR so every `hc.assign` / `hc.name_load` is
-// lowered into a real SSA edge.
-//
-// Algorithm, in one paragraph: walk each callable (kernel / func /
-// intrinsic) bottom-up; for every region-carrying op that opts in via
-// `NameStoreRegionOpInterface`, rebuild it so the Python-level names
-// `hc.assign`-ed inside cross the boundary via the op's native carrying
-// mechanism (iter_args for `hc.for_range`, results for `hc.if`, etc).
-// Each promoted op is flanked with transient `hc.name_load` (before) and
-// `hc.assign` (after) ops that snapshot the outer binding in and push the
-// new binding back out; snapshots are driven by first use in block order
-// (read-first names only), not by `reads ∪ writes`. The enclosing region
-// (or the final flat sweep on the callable body) then resolves those. Once
-// every region-carrying op under a callable has been promoted, the top-level
-// block is swept linearly to collapse the remaining `hc.name_load` /
-// `hc.assign` pairs into direct SSA edges.
-//
-// Implemented in this file: flat-body sweep, `hc.for_range` promotion,
-// `hc.if` promotion, nested-scope sweep for `hc.workitem_region` /
-// `hc.subgroup_region`. The nested-scope sweep is Python-style —
-// writes shadow without leaking, reads capture the outer binding,
-// and an `hc.region_return` terminator lifts named bindings as
-// region results. `promoteNestedScope` documents the two body
-// shapes in detail; this banner stops at the policy level.
+// -hc-promote-names: rewrite `hc.assign` / `hc.name_load` into SSA.
+// Bottom-up per callable: each `NameStoreRegionOpInterface` op carries
+// names across via iter_args / results / region_return; transient
+// snap/writeback pairs surface at the parent block, a final flat sweep
+// fuses them into direct uses. Nested-scope reads capture outward,
+// writes stay local unless lifted by an explicit region_return.
 
 #include "hc/Transforms/Passes.h"
 
@@ -64,13 +46,8 @@ namespace {
 using NameSet = llvm::SmallSetVector<StringAttr, 4>;
 using SnapMap = llvm::SmallDenseMap<StringAttr, Value>;
 
-// Callback that materializes a capture-from-outer-scope snapshot for
-// `name`. Returned `Value` seeds the binding for the first in-scope
-// `hc.name_load` of `name`; subsequent reads hit the binding directly.
-// A null `SnapFactory` disables capture — the scan errors on any
-// unresolved read, which is what we want at the top level of a
-// callable body (nothing to capture from) and inside `hc.for_range` /
-// `hc.if` scans where the caller pre-seeds the binding.
+// Materializes an outer-scope snap for an unbound read; null disables
+// capture (top-level body and pre-seeded for_range/if scans).
 using SnapFactory = llvm::function_ref<Value(StringAttr)>;
 
 struct TopLevelNameFacts {
@@ -79,15 +56,9 @@ struct TopLevelNameFacts {
   NameSet snapshot;
 };
 
-// Gathers the top-level `hc.assign` / `hc.name_load` facts in `block`.
-// "Top-level" = direct children only; nested region ops at this point
-// are assumed to already be promoted (bottom-up walk precondition) and
-// their inner name-store ops have either been erased or hoisted out as
-// transient snap/writeback pairs at `block`.
-//
-// `snapshot` is deliberately not `reads`: it records only names whose
-// first top-level mention is a read, in block order. A write-first name
-// can be carried without loading an outer binding that may not exist.
+// Direct children only; nested region ops already promoted by the time
+// we run. `snapshot` = read-first names only; write-first carries don't
+// need an outer binding.
 static TopLevelNameFacts collectTopLevelNameFacts(Block &block) {
   TopLevelNameFacts facts;
   llvm::SmallDenseSet<StringAttr> firstSeen;
@@ -111,11 +82,8 @@ static TopLevelNameFacts collectTopLevelNameFacts(Block &block) {
   return facts;
 }
 
-// True iff `op` is a `NameStoreRegionOpInterface` op whose subtree
-// still contains `hc.assign` / `hc.name_load`. The preflight pass
-// uses this to catch promoters that left residual name-store ops
-// behind (or a new op kind that joined the interface without a
-// matching case in `promoteRegionOp`'s dispatch).
+// Catches a promoter that left name-store ops behind, or a new
+// interface op without a `promoteRegionOp` dispatch case.
 static bool hasStaleNameStoreOps(Operation &op) {
   bool stale = false;
   op.walk([&](Operation *inner) {
@@ -128,12 +96,7 @@ static bool hasStaleNameStoreOps(Operation &op) {
   return stale;
 }
 
-// Phase 1 of `scanAndPromoteBlock`: walk `block` with a presence-only
-// binding set. Every `hc.assign` adds its name; every `hc.name_load`
-// must be bound (via the seeded keys, a prior in-block assign, or
-// `capture`); every `NameStoreRegionOpInterface` op must have an
-// assign/load-free subtree. Returns `failure()` after emitting a
-// diagnostic on the first violation, without mutating IR.
+// Presence-only check; diagnoses first violation without mutating IR.
 static LogicalResult preflightNameBindings(Block &block,
                                            const llvm::StringMap<Value> &seeded,
                                            bool haveCapture) {
@@ -170,12 +133,8 @@ static LogicalResult preflightNameBindings(Block &block,
   return success();
 }
 
-// Phase 2 of `scanAndPromoteBlock`: preflight passed, so every load
-// is guaranteed resolvable. `hc.assign` binds, `hc.name_load` either
-// resolves from `binding` or triggers a real (IR-mutating)
-// `capture()` call, and residual ops get erased in one pass at the
-// end. The only failure mode here is a preflight/commit desync —
-// handled with a loud, release-safe abort.
+// Preflight guarantees every load resolves; unbound here = desync,
+// fatal abort.
 static void commitNameRewrites(Block &block, llvm::StringMap<Value> &binding,
                                SnapFactory capture) {
   SmallVector<Operation *> toErase;
@@ -207,28 +166,10 @@ static void commitNameRewrites(Block &block, llvm::StringMap<Value> &binding,
     o->erase();
 }
 
-// Two-phase linear scan over `block`'s non-terminator ops; see
-// `preflightNameBindings` / `commitNameRewrites` for the per-phase
-// contracts.
-//
-// Atomicity guarantee: **within a single call**, either every
-// in-`block` mutation runs or none do. That is the guarantee the
-// callable-level flat sweep in `promoteCallable` relies on — a
-// failing user body bubbles out as a clean pass failure. It is
-// **not** a pipeline-wide guarantee: `promoteForRange` / `promoteIf`
-// restructure the outer IR (`takeBody`, result-extended clone)
-// before calling this function, so if the scan failed there, the
-// module would still be torn. Those callers sidestep the problem by
-// seeding `binding` with every reachable name and then treating any
-// scan failure as a pass-invariant break (fatal abort), not a
-// recoverable failure — see their call sites for the rationale.
-//
-// The `capture` factory is a capture-from-outer-scope hook: invoked
-// only on truly unbound reads, its returned Value seeds the binding
-// so repeated reads share the same snapshot. `capture = nullptr`
-// disables outer capture — used at the callable top level (no outer
-// to reach for) and inside the `hc.for_range` / `hc.if` scans (the
-// caller pre-seeds `binding` for every reachable name).
+// Per-call atomicity: every in-block mutation lands or none do. Caller
+// owns the wider IR — for_range/if/nested-scope already restructured
+// before calling, so they pre-seed `binding` and treat failure here as
+// a fatal invariant break.
 static LogicalResult scanAndPromoteBlock(Block &block,
                                          llvm::StringMap<Value> &binding,
                                          SnapFactory capture = nullptr) {
@@ -238,10 +179,7 @@ static LogicalResult scanAndPromoteBlock(Block &block,
   return success();
 }
 
-// Ensures `block` has an `hc.yield` terminator; if not (e.g. a
-// just-emplaced empty else-region block), append an empty yield at
-// `loc`. This is the minimal prelude every branch/body needs before the
-// post-scan yield-rebuild step.
+// Empty yield on a fresh else-region; prelude to yield-rebuild.
 static void ensureYieldTerminator(Block &block, Location loc) {
   if (!block.empty() && isa<HCYieldOp>(block.back()))
     return;
@@ -249,14 +187,8 @@ static void ensureYieldTerminator(Block &block, Location loc) {
   HCYieldOp::create(b, loc);
 }
 
-// Resolves `name` against `binding` or aborts with a consistent
-// diagnostic. Both terminator-rebuild helpers share this: a carried
-// name that isn't in the binding by the time we build the new
-// yield is always a caller-side invariant break (the caller seeded
-// the binding with every reachable name before the scan, and the
-// scan only overwrites entries). `llvm::report_fatal_error` keeps
-// the abort loud in release builds; a plain `assert` would compile
-// out and leave `it->second` dereferencing `end()`.
+// Caller pre-seeds every carried name; miss here = fatal invariant
+// break (release-safe abort, not `assert`).
 static Value resolveCarriedValue(const llvm::StringMap<Value> &binding,
                                  StringAttr name, const char *where) {
   auto it = binding.find(name.getValue());
@@ -267,11 +199,7 @@ static Value resolveCarriedValue(const llvm::StringMap<Value> &binding,
   return it->second;
 }
 
-// Drops `block`'s current `hc.yield` and replaces it with a new yield
-// whose operands are the existing yield's operands followed by
-// `binding[name]` for each `name` in `carried`. Callers use this to
-// extend a region-op terminator with the carried-name values produced
-// during the block's linear scan.
+// Appends `binding[name]` for each carried name to the existing yield.
 static void rewriteYieldWithCarried(Block &block,
                                     const llvm::StringMap<Value> &binding,
                                     ArrayRef<StringAttr> carried,
@@ -286,12 +214,7 @@ static void rewriteYieldWithCarried(Block &block,
   oldYield.erase();
 }
 
-// Swaps `block`'s `hc.region_return <names>` terminator for an
-// `hc.yield %v1, ...` with one value per `carried` name. Mirrors
-// `rewriteYieldWithCarried`, minus the "append to existing yield"
-// step — nested-scope regions don't stack yields. Callers pre-seed
-// `binding` so every carried name resolves; `resolveCarriedValue`
-// aborts on an invariant break.
+// Nested-scope region_return → yield. One value per carried name.
 static void rewriteRegionReturnToYield(Block &block,
                                        const llvm::StringMap<Value> &binding,
                                        ArrayRef<StringAttr> carried) {
@@ -306,11 +229,7 @@ static void rewriteRegionReturnToYield(Block &block,
   term.erase();
 }
 
-// Inserts an `hc.name_load` for every name in `snapshot` at the current
-// insertion point; records each snap Value in `out`. The pass uses these
-// "outer-scope snapshots" to seed the branch/loop bindings so a name
-// that's read in the body (possibly before any in-body write) has a
-// value to bind to.
+// Outer-scope snaps to seed branch/loop bindings before any in-body write.
 static void materializeSnapshots(OpBuilder &builder, Location loc, Type undefTy,
                                  const NameSet &snapshot, SnapMap &out) {
   for (StringAttr name : snapshot) {
@@ -319,11 +238,8 @@ static void materializeSnapshots(OpBuilder &builder, Location loc, Type undefTy,
   }
 }
 
-// After a region op has been rebuilt with extra carried-name results,
-// every one of those results needs to flow back into the enclosing
-// scope's name store. One transient `hc.assign` per carried name at the
-// op's insertion point does the job — the enclosing flat sweep then
-// resolves them into direct SSA uses.
+// One transient `hc.assign` per carried result; outer flat sweep
+// resolves to direct uses.
 static void writebackCarriedResults(OpBuilder &builder, Location loc,
                                     Operation *newOp,
                                     ArrayRef<StringAttr> carried,

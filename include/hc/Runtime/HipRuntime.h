@@ -2,16 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Public C ABI of `libhc_hip_runtime.so` — the small launcher shim that
-// JIT'd host wrappers call instead of linking HIP directly. The shim
-// dlopen's `libamdhip64.so` lazily so the wheel itself has zero ROCm
-// build-time or load-time dependency: a host without ROCm can still
-// import `hc` and resolve these symbols; only `hc_rt_init` will actually
-// touch the runtime.
-//
-// All entry points are `extern "C"` and the launch path is intentionally
-// allocation-free so it can be reached from JIT'd LLVM IR without
-// surprising hidden malloc traffic.
+// Public C ABI of `libhc_hip_runtime.so` — launcher shim called by JIT'd
+// host wrappers. `libamdhip64.so` is dlopen'd lazily so the wheel has zero
+// ROCm build/load dependency; ROCm-free hosts can import `hc` and only
+// `hc_rt_init` actually touches the runtime. Launch path is allocation-
+// free so JIT'd LLVM IR doesn't trip hidden malloc.
 
 #ifndef HC_RUNTIME_HIPRUNTIME_H
 #define HC_RUNTIME_HIPRUNTIME_H
@@ -21,78 +16,47 @@
 
 extern "C" {
 
-// dlopen libamdhip64.so and bind the function pointers used by the
-// launch path. Idempotent: subsequent calls are no-ops once the
-// mandatory entry points are bound. Throws `std::runtime_error` on
-// failure (missing library, missing mandatory symbol). The exception
-// unwinds to abort when called from JIT'd code that lacks unwind tables;
-// callers that care about graceful failure should wrap the first
-// invocation in a try/catch on the C++ side.
+// dlopen libamdhip64.so and bind the launch-path entry points. Idempotent.
+// Throws `std::runtime_error` on missing library / missing mandatory
+// symbol; from JIT'd code without unwind tables that aborts. Callers that
+// want graceful failure must catch on the C++ side.
 void hc_rt_init();
 
-// Resolve `kernel_name` inside `binary_pointer` (an HSACO blob in
-// memory) and return the resulting `hipFunction_t` as a `void*`.
+// Resolve `kernel_name` inside `binary_pointer` (HSACO blob) and return
+// the `hipFunction_t` as `void*`.
 //
-// `cached_kernel_handle` points to caller-owned storage that we use for
-// single-flight memoization: the first caller loads the module + binds
-// the function and stores the result; concurrent callers spin on a
-// global mutex, see the cached value, and skip the load. Wave's
-// equivalent uses a plain non-atomic read which races and can leak
-// modules under contention; we close that gap with acquire/release
-// atomics around the slow-path mutex.
+// `cached_kernel_handle` is caller-owned single-flight memoization
+// storage: first caller loads + binds + stores, concurrent callers spin
+// on a global mutex, observe the cached value, skip the load. Acquire /
+// release atomics around the slow-path mutex.
 //
-// `stream` and `binary_size` are accepted for ABI compatibility with
-// wave's signature but unused today (load is stream-agnostic in HIP and
-// `hipModuleLoadData` consumes a NUL-terminated/self-describing blob).
+// `stream` and `binary_size` are ABI-compat slots, unused today (load is
+// stream-agnostic, `hipModuleLoadData` reads a self-describing blob).
 //
-// Note: the underlying `hipModule_t` is intentionally leaked for the
-// process lifetime. We never expect more than a handful of distinct
-// kernels per run, and an explicit cache + unload path is a separate
-// design problem we'll only owe once we ship long-running services.
+// The underlying `hipModule_t` leaks for process lifetime by design — a
+// handful of kernels per run, an unload path is a separate problem.
 void *hc_rt_load_kernel(void *stream, void **cached_kernel_handle,
                         const void *binary_pointer, size_t binary_size,
                         const char *kernel_name);
 
-// Launch `function` (returned by `hc_rt_load_kernel`) with the given
-// grid/block dims and dynamic shared-memory bytes. If any cluster dim
-// is > 1 we route through `hipDrvLaunchKernelEx` with the cluster
-// attribute; otherwise we use the simpler `hipModuleLaunchKernel`. The
-// cluster path requires a HIP that exposes `hipDrvLaunchKernelEx` —
-// `hc_rt_init` makes that symbol optional, so missing it is only fatal
-// when a cluster launch is actually requested.
-//
-// `args` is an array of `void*` pointing at each kernel argument's
-// storage (matching the HIP `kernelParams` convention). `num_args` is
-// passed for parity with wave's signature but currently unused — the
-// underlying HIP entry points read until the trailing `nullptr`.
+// Launch with the given grid / block / shared-mem. Cluster dim > 1 routes
+// through `hipDrvLaunchKernelEx` (its symbol is optional in `hc_rt_init`
+// so missing it is only fatal on actual cluster launches); otherwise
+// `hipModuleLaunchKernel`. `args` follows the HIP `kernelParams`
+// convention; `num_args` is unused (HIP reads until trailing `nullptr`).
 void hc_rt_launch_kernel(void *stream, void *function, int shared_memory_bytes,
                          int grid_x, int grid_y, int grid_z, int block_x,
                          int block_y, int block_z, int cluster_x, int cluster_y,
                          int cluster_z, void **args, int num_args);
 
-// Bench variant: launch `function` `n_inner` times back-to-back on `stream`,
-// `hipStreamSynchronize` at the end, and return the wall-clock nanoseconds
-// elapsed for the (N launches + sync) window. Timing is sampled in C via
-// `hc_clock_now_ns` (CLOCK_MONOTONIC on Linux today) so the measurement
-// never crosses the language boundary inside the sample window — the
-// caller's outer benchmark loop only needs to collect the returned value
-// per outer iteration, not bracket the call with `perf_counter_ns`.
-//
-// Same arg-conventions as `hc_rt_launch_kernel`: cluster dim > 1 routes
-// through `hipDrvLaunchKernelEx`, otherwise `hipModuleLaunchKernel`. The
-// args array is reused verbatim for every iteration — caller is
-// responsible for any per-launch state rotation (e.g. cache-cold input
-// reshuffling), this entry intentionally measures the hot path with
-// the args held constant.
-//
-// HIP errors propagate via the same `throw std::runtime_error` path the
-// single-shot launch uses; the partial sample is lost. `n_inner == 0` is
-// well-defined: no launches, still calls `hipStreamSynchronize` (drains
-// any prior work on `stream`), returns the clock-pair overhead.
-//
-// Return type is `uint64_t` (5+ centuries of headroom) so wrappers can
-// pass the value straight through to a Python caller via ctypes without
-// signed-overflow concerns at extreme sample sizes.
+// Bench variant: launch `n_inner` times back-to-back on `stream`,
+// `hipStreamSynchronize`, return wall-clock ns for the (N launches + sync)
+// window. Timing sampled in C via `hc_clock_now_ns` so the sample window
+// never crosses the language boundary. Routing rule, args, and HIP-error
+// path match `hc_rt_launch_kernel`; partial samples are lost on throw.
+// `n_inner == 0` is well-defined: no launches, sync still drains prior
+// work, returns clock-pair overhead. `uint64_t` return type lets Python
+// receive the value through ctypes without signed-overflow concerns.
 uint64_t hc_rt_launch_kernel_repeat(void *stream, void *function,
                                     int shared_memory_bytes, int grid_x,
                                     int grid_y, int grid_z, int block_x,

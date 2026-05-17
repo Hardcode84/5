@@ -87,18 +87,8 @@ def hc_native_tools_layout(
 
 
 def main() -> int:
-    # CLI entry for `python -m build_tools.hc_native_tools`. Beyond
-    # running the cmake configure + install for hc-opt and the MLIR
-    # python bindings, we also refresh the package-relative
-    # `hc/_native/` tree the runtime actually loads from. Historically
-    # only `pip install -e .` / `build_wheel` populated that tree (via
-    # `build_backend._install_package_native_artifacts`), which left
-    # the README-documented "explicit source-tree bootstrap" command
-    # with a misleading half-state: cmake install succeeded, but
-    # `hc/_native/` carried whatever a previous pip run had left
-    # behind — or nothing — and the WMMA pipeline tripped on a missing
-    # `hc/_native/bin/ld.lld` five passes downstream. Routing the
-    # staging through here makes this command self-contained.
+    # Stage into `hc/_native/` so source-tree bootstrap is self-contained
+    # (ld.lld lands here, not just install root).
     llvm_root = ensure_llvm_toolchain()
     install_root = ensure_hc_native_tools_built(llvm_root)
     install_package_native_artifacts(

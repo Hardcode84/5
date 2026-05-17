@@ -72,8 +72,7 @@ def _run_compile_smoke(script: Path) -> subprocess.CompletedProcess[str]:
 
 
 # --- public hc.compile entry point ----------------------------------------
-# Validation runs before the frontend is imported, so these tests do not
-# need the native toolchain.
+# Validation runs pre-frontend; no native toolchain needed.
 
 
 def test_compile_rejects_non_kernel() -> None:
@@ -91,8 +90,7 @@ def test_compile_rejects_non_mapping_symbols() -> None:
     def foo(group: CurrentGroup, x: Buffer[sym.W]) -> None:
         return None
 
-    # A list of pairs is a classic mistake; fail early with a message
-    # that names the argument instead of a cryptic AttributeError later.
+    # List-of-pairs → loud early failure, not a downstream AttributeError.
     with pytest.raises(TypeError, match="symbols must be a Mapping"):
         compile(foo, [("W", 16)])  # type: ignore[arg-type]
 
@@ -120,11 +118,10 @@ def test_compile_rejects_non_int_binding() -> None:
 
 
 def test_compile_rejects_target_with_forbidden_chars() -> None:
-    # The driver substitutes `target` into a literal MLIR string in the
-    # default schedule; characters that would close the string early
-    # ('"', '\\') or break the option parser ('\\n', '\\r') are rejected
-    # up front so the user sees a clear error instead of a downstream
-    # MLIR diagnostic.
+    # `target` substitutes into a literal MLIR string in the default
+    # schedule. Quote-closers (`"`, `\\`) and option-parser breakers
+    # (`\\n`, `\\r`) get rejected up front instead of producing a
+    # confusing MLIR diagnostic downstream.
     sym = _sym()
 
     @kernel(work_shape=(sym.W,), literals={sym.W})
@@ -161,7 +158,7 @@ def test_normalise_bindings_rejects_bool_and_str_values() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    # `True` is an int subclass but booleans are not intended shape values.
+    # `True` is an `int` subclass but is not a valid shape value.
     with pytest.raises(TypeError, match="must bind to an int"):
         normalise_bindings({sym.W: True}, metadata)
 
@@ -173,16 +170,14 @@ def test_normalise_bindings_allows_empty_map() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    # Partial specialization (empty here) must be valid; later pipeline
-    # stages refine what is left — the doc calls this out.
+    # Partial specialization (empty) must be valid; later stages refine.
     assert normalise_bindings({}, metadata) == {}
 
 
 def test_normalise_bindings_allows_any_key_when_no_literals_declared() -> None:
     metadata = KernelMetadata()
 
-    # Deliberate: a kernel without a `literals=` whitelist lets any key
-    # through. Doc calls this out; later stages will tighten it.
+    # No `literals=` whitelist → any key passes. Later stages tighten.
     assert normalise_bindings({"wave_size": 32}, metadata) == {"wave_size": 32}
 
 
@@ -199,8 +194,8 @@ def test_normalise_bindings_flags_conflicting_duplicate_keys() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    # Same logical key via two forms pointing at different values is
-    # ambiguous — fail loudly instead of last-write-wins.
+    # Same key via two forms with different values → fail loud, not
+    # last-write-wins.
     with pytest.raises(ValueError, match="bound twice"):
         normalise_bindings({sym.W: 8, "W": 16}, metadata)
 
@@ -209,11 +204,9 @@ def test_normalise_bindings_admits_system_keys_past_whitelist() -> None:
     sym = _sym()
     metadata = KernelMetadata(literals=frozenset({sym.W}))
 
-    # `$`-prefixed launch-context keys are system bindings, not
-    # user-declared specialization points; they ride alongside the
-    # declared literals and bypass the whitelist by design — the C++
-    # specializer (`HCSpecializeLiteralsPass`) applies the same skip
-    # when validating `literal_bindings` against `literals`.
+    # `$`-prefixed launch-context keys are system bindings: they
+    # bypass the literal whitelist by design. The C++ specializer
+    # applies the same skip when validating `literal_bindings`.
     bindings = normalise_bindings({"$WGS0": 2, "$WGS1": 2, sym.W: 8}, metadata)
     assert bindings == {"$WGS0": 2, "$WGS1": 2, "W": 8}
 
@@ -221,9 +214,8 @@ def test_normalise_bindings_admits_system_keys_past_whitelist() -> None:
 def test_normalise_bindings_admits_system_keys_with_no_declared_literals() -> None:
     metadata = KernelMetadata()
 
-    # No `literals=` whitelist means the user-key check was already a
-    # pass-through; pin this explicitly so the system-key contract
-    # stays stable independent of the kernel's literal declarations.
+    # No `literals=` whitelist → user-key check is already pass-through;
+    # pin the system-key contract independent of literal declarations.
     assert normalise_bindings({"$WGS0": 8, "$WGS1": 4}, metadata) == {
         "$WGS0": 8,
         "$WGS1": 4,
@@ -243,8 +235,8 @@ def test_symbol_name_accepts_symbol_instance() -> None:
 
 
 def test_symbol_name_rejects_arbitrary_dot_name_objects() -> None:
-    # A path-like object has a `.name` attribute but is not a Symbol;
-    # rejecting it prevents bindings from silently using a surprising key.
+    # `Path` has a `.name` attr but isn't a `Symbol` — reject so
+    # bindings can't silently key on a surprising attribute.
     with pytest.raises(TypeError, match="cannot interpret"):
         symbol_name(Path("/tmp/W"))
 
@@ -253,11 +245,10 @@ def test_symbol_name_rejects_arbitrary_dot_name_objects() -> None:
 
 
 def test_compiled_kernel_call_raises_when_pipeline_did_not_run() -> None:
-    # Handle with `hc_ir = None` means the lowering pipeline either
-    # failed (diagnostics captured) or was never run (constructed
-    # directly in tests). Either way the call surface is the same:
-    # surface a `RuntimeError` instead of segfaulting on a missing
-    # module.
+    # `hc_ir is None` → pipeline failed (diagnostics captured) or
+    # was never run (constructed directly in tests). Either way the
+    # call surface raises `RuntimeError` instead of segfaulting on
+    # a missing module.
     def kfn() -> None:
         return None
 
@@ -295,15 +286,11 @@ def test_compiled_kernel_repr_is_informative() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None:
-    # The real frontend needs both native MLIR bindings (hence the managed
-    # env, same pattern as test_hc_front_python_bindings.py) and a kernel
-    # function whose source file is on disk — `inspect.getsource` is used
-    # to recover the text. `python -c '...'` scripts do not satisfy that.
-    #
-    # The pipeline has to actually run for the `hc_ir` assertion below to
-    # mean anything — a weaker version of this test that only poked at
-    # `front_ir_text` would silently pass against a fully broken default
-    # schedule.
+    # Real frontend wants native MLIR bindings (managed env) and a
+    # source file on disk for `inspect.getsource`. `python -c '...'`
+    # has no file. Pipeline must run for the `hc_ir` assertion below
+    # to mean anything; a `front_ir_text`-only check passes against
+    # a broken default schedule.
     script = tmp_path / "smoke.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -337,14 +324,10 @@ def test_compile_returns_handle_with_front_ir_end_to_end(tmp_path: Path) -> None
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
-    # Happy path for the transform-schedule driver: compile a trivial
-    # kernel and assert the `hc_ir_text` snapshot has reached the
-    # post-`gpu-to-llvm` stage where the host wrapper is `llvm.func`,
-    # with no captured diagnostics. This trivial kernel never lays down
-    # a `gpu.launch` (no real compute), so the schedule's gpu-outlining
-    # path is a no-op and there's no `gpu.binary` to assert — the
-    # surviving signal is "host-side IR is fully LLVM and the original
-    # `hc_front.*` is gone".
+    # Happy-path schedule check: `hc_ir_text` reaches post-`gpu-to-llvm`
+    # (`llvm.func` host wrapper, no diagnostics). Trivial kernel has no
+    # `gpu.launch` so outlining is a no-op — signal is "host IR is
+    # fully LLVM and `hc_front.*` is gone".
     script = tmp_path / "compile_pipeline.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -366,9 +349,9 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
                 assert "llvm.func @foo" in handle.hc_ir_text, handle.hc_ir_text
                 assert "hc.kernel" not in handle.hc_ir_text, handle.hc_ir_text
                 assert "hc_front." not in handle.hc_ir_text, handle.hc_ir_text
-                # `front_ir_text` must remain the pre-pipeline snapshot
-                # even after a successful run; the module clone in
-                # hc._compile is the load-bearing mechanism.
+                # `front_ir_text` stays the pre-pipeline snapshot even
+                # after a successful run — the module clone in
+                # `hc._compile` is what makes that hold.
                 assert "hc_front.kernel" in handle.front_ir_text
                 assert handle.pipeline_diagnostics == ()
                 print("OK")
@@ -385,13 +368,11 @@ def test_compile_runs_front_to_hc_pipeline_end_to_end(tmp_path: Path) -> None:
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_specializes_literal_bindings_into_ir(tmp_path: Path) -> None:
     # `hc-specialize-literals` is the single fold point for compile-time
-    # bindings; the front-IR snapshot must carry the dict (so a re-run
-    # against the snapshot reproduces the specialized hc-IR) and the
-    # post-pipeline hc-IR must contain the bound integer rather than
-    # the original symbolic name. Without this fold, downstream passes
-    # like `hc-lower-launch-body` reject ops that require static dims
-    # (`hc.vzeros`, `hc.vfull`, ...) on a symbolic carrier — that's the
-    # path this test pins shut against future regressions.
+    # bindings. Front-IR snapshot must carry the dict (so re-run against
+    # it reproduces specialized hc-IR); post-pipeline hc-IR must contain
+    # the bound integer instead of the symbolic name. Downstream passes
+    # like `hc-lower-launch-body` reject `hc.vzeros`/`hc.vfull` on a
+    # symbolic carrier without this fold.
     script = tmp_path / "compile_specialize.py"
     script.write_text(textwrap.dedent("""
             import numpy as np
@@ -411,22 +392,21 @@ def test_compile_specializes_literal_bindings_into_ir(tmp_path: Path) -> None:
             def main() -> None:
                 handle = hc.compile(specialize_me, {K: 4})
                 assert isinstance(handle, CompiledKernel)
-                # Front-IR snapshot has bindings stamped — the snapshot
-                # is reproducible against `hc-opt` from this point on.
+                # Front-IR snapshot has bindings stamped → reproducible
+                # against `hc-opt`.
                 assert "literal_bindings = {K = 4 : i64}" in handle.front_ir_text, (
                     handle.front_ir_text
                 )
-                # Post-pipeline IR must not contain a symbolic `K` carrier
-                # anymore; the pass dropped the bindings dict and folded
-                # K -> 4 into every shape / type / op-shape reference.
+                # Post-pipeline IR has no symbolic `K` carrier: pass
+                # dropped the dict and folded K=4 into every shape /
+                # type / op-shape reference.
                 assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
                 assert "literal_bindings" not in handle.hc_ir_text, (
                     handle.hc_ir_text
                 )
-                # Specialization unblocked the launch-body lowering for
-                # `vzeros` on a previously-symbolic dim — the host wrapper
-                # made it through `gpu-to-llvm`. Without the fold this is
-                # exactly the assertion that would fire.
+                # Specialization unblocked launch-body lowering for
+                # `vzeros` on a previously-symbolic dim; host wrapper
+                # made it through `gpu-to-llvm`.
                 assert "llvm.func @specialize_me" in handle.hc_ir_text, (
                     handle.hc_ir_text
                 )
@@ -529,10 +509,10 @@ def test_compile_reports_invalid_intrinsic_type_contracts_from_python_metadata(
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
-    # A custom schedule that only runs `-convert-hc-front-to-hc` — no
-    # fold/inline — must still produce valid hc IR for a kernel without
-    # inline helpers. Proves the override API threads inline text all the
-    # way through the transform-dialect driver, not just the default.
+    # Custom schedule running only `-convert-hc-front-to-hc` (no fold/
+    # inline) must still produce valid hc IR for a kernel with no
+    # inline helpers — proves the override API threads inline text
+    # through the transform-dialect driver.
     script = tmp_path / "compile_override.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -560,9 +540,9 @@ def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
                 handle = hc.compile(bar, {sym.W: 64}, schedule=SCHEDULE)
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 assert "hc.kernel" in handle.hc_ir_text
-                # Skipping promote-names means hc.name_load/hc.assign
-                # ops stay in the output — presence of `hc.name_load`
-                # proves the override skipped that stage.
+                # Skipping promote-names → `hc.name_load`/`hc.assign`
+                # survive; presence of `hc.name_load` proves the
+                # override skipped that stage.
                 assert "hc.name_load" in handle.hc_ir_text, handle.hc_ir_text
                 print("OK")
 
@@ -577,11 +557,10 @@ def test_compile_honors_inline_schedule_override(tmp_path: Path) -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_honors_path_schedule_override(tmp_path: Path) -> None:
-    # The `str` and `None` paths through `schedule=` go through
-    # `_schedule_file`'s tempfile branch; a real `Path` goes through
-    # the resolve/exists/yield branch. Exercise that explicitly so the
-    # path branch has an actual gate, including the resolve-to-absolute
-    # behaviour (we pass a relative path via cwd and still expect a hit).
+    # `str`/`None` paths through `schedule=` hit `_schedule_file`'s
+    # tempfile branch; a real `Path` hits resolve/exists/yield. Gate
+    # the path branch including resolve-to-absolute (relative cwd input
+    # → still a hit).
     script = tmp_path / "compile_path_override.py"
     schedule_file = tmp_path / "custom_schedule.mlir"
     schedule_file.write_text(textwrap.dedent("""
@@ -612,7 +591,7 @@ def test_compile_honors_path_schedule_override(tmp_path: Path) -> None:
                 handle = hc.compile(bar, {{sym.W: 64}}, schedule=schedule)
                 assert handle.hc_ir is not None, handle.pipeline_diagnostics
                 # Same schedule shape as the inline-override test —
-                # name_load survives because promote-names is skipped.
+                # `name_load` survives because promote-names is skipped.
                 assert "hc.name_load" in handle.hc_ir_text, handle.hc_ir_text
                 print("OK")
 
@@ -627,9 +606,9 @@ def test_compile_honors_path_schedule_override(tmp_path: Path) -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_rejects_missing_schedule_path(tmp_path: Path) -> None:
-    # A Path that doesn't exist has to fail loudly with FileNotFoundError
-    # rather than getting silently fed into the MLIR options parser and
-    # producing a confusing diagnostic far from the source of the mistake.
+    # Missing `Path` must raise `FileNotFoundError` up front, not get
+    # fed into the MLIR options parser to produce a confusing
+    # diagnostic far from the source of the mistake.
     script = tmp_path / "compile_missing_path.py"
     missing = tmp_path / "not_a_real_schedule.mlir"
     script.write_text(textwrap.dedent(f"""
@@ -666,10 +645,9 @@ def test_compile_rejects_missing_schedule_path(tmp_path: Path) -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_surfaces_pipeline_failure_non_fatal(tmp_path: Path) -> None:
-    # Hand the driver an inline schedule that names a pass that doesn't
-    # exist. We expect the handle to come back with hc_ir=None, the
-    # front-IR snapshot preserved, and a non-empty diagnostics tuple —
-    # not an exception. Callers want a value they can inspect.
+    # Bad-pass schedule → handle returns with `hc_ir=None`, front-IR
+    # snapshot preserved, non-empty diagnostics — not an exception.
+    # Callers want a value to inspect.
     script = tmp_path / "compile_failure.py"
     script.write_text(textwrap.dedent("""
             import hc
@@ -712,10 +690,9 @@ def test_compile_surfaces_pipeline_failure_non_fatal(tmp_path: Path) -> None:
     assert result.stdout.strip().endswith("OK"), result.stdout
 
 
-# End-to-end assertion script for the canonical WMMA pipeline. Pinned at
-# module level (rather than dropped inline into the test) so lizard's
-# function-length lint stays happy and the assertions read in one piece
-# rather than wrapped in `textwrap.dedent` boilerplate.
+# End-to-end script for canonical WMMA pipeline. Module-level so
+# lizard's function-length lint stays happy and the assertions read
+# in one piece, not wrapped in `textwrap.dedent` boilerplate.
 _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
     import re
 
@@ -723,12 +700,11 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
     from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
 
 
-    # `llvm.mlir.global ... constant @<name>("..."` carries the raw
-    # bytes of the HSACO blob and the kernel name string. Either body
-    # can contain literal "amdgpu", "gpu.module", etc. substrings (ELF
-    # section names, escaped payload) that would false-positive the
-    # negative scan below. Strip every quoted body on these lines so the
-    # check sees only structural IR.
+    # `llvm.mlir.global ... constant @<name>("..."` carries HSACO
+    # bytes + kernel name string. Bodies can contain literal "amdgpu",
+    # "gpu.module" substrings (ELF section names, escaped payload) that
+    # would false-positive the negative scan below. Strip every quoted
+    # body so only structural IR remains.
     _GLOBAL_RE = re.compile(
         r'(llvm\\.mlir\\.global[^(]*\\([^()"]*)"[^"]*"'
     )
@@ -751,22 +727,19 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert handle.front_ir_symbols[0] == "tiled_gfx11_wmma_matmul"
         assert handle.hc_ir is not None, handle.pipeline_diagnostics
         assert handle.hc_ir_text is not None
-        # Default schedule lowers all the way to a self-contained LLVM
-        # IR module: front-end → kernels-to-launch → intrinsic recipes
-        # → kernel outlining → alloca-to-global + vector-transfer
-        # reduction → rocdl attach → full ROCDL/LLVM lowering inside
-        # `gpu.module` → host `gpu-to-llvm` → `hc-lower-gpu-to-binary`
-        # (HSACO blob attached to a `gpu.binary`) →
-        # `hc-lower-launch-func-to-runtime` (HSACO embedded as an LLVM
-        # global, `gpu.launch_func` rewritten into `hc_rt_load_kernel`
-        # + `hc_rt_launch_kernel` calls, source `gpu.binary` erased) →
-        # symbol-dce. Nothing GPU-dialect-shaped survives in the post-
-        # pipeline IR — only `gpu.container_module` (the module
-        # attribute) is left, which the negative scan below excludes.
-        # The HSACO blob ships in a `_data` global; its bytes can
-        # carry literal "hc.", "amdgpu.", etc. substrings (ELF
-        # metadata + escaped payload), so we strip every global string
-        # body before the negative checks fire.
+        # Default schedule lowers to a self-contained LLVM IR module:
+        # front → kernels-to-launch → intrinsic recipes → kernel
+        # outlining → alloca-to-global + vector-transfer reduction →
+        # rocdl attach → ROCDL/LLVM inside `gpu.module` → host
+        # `gpu-to-llvm` → `hc-lower-gpu-to-binary` (HSACO attached to
+        # `gpu.binary`) → `hc-lower-launch-func-to-runtime` (HSACO as
+        # LLVM global, `gpu.launch_func` → `hc_rt_load_kernel` +
+        # `hc_rt_launch_kernel`, source `gpu.binary` erased) →
+        # symbol-dce. No GPU-dialect ops survive; only the
+        # `gpu.container_module` attribute, which the negative scan
+        # below excludes. HSACO blob bytes (in `_data` global) can
+        # contain "hc.", "amdgpu." substrings, so strip every global
+        # string body before negative checks.
         ir_lines_no_blob = [
             _strip_global_string_body(line)
             for line in handle.hc_ir_text.splitlines()
@@ -784,17 +757,15 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert "amdgpu." not in ir_no_blob, ir_no_blob
         assert "vector.transfer" not in ir_no_blob, ir_no_blob
         assert "unrealized_conversion_cast" not in ir_no_blob, ir_no_blob
-        # Positive structural assertions: host wrapper landed as
-        # `llvm.func` after `gpu-to-llvm`, takes one `PyObject *`
-        # (lowered to `!llvm.ptr`) per kernel argument, calls the
-        # `_mlir_ciface_hc_get_*` helpers (which `convert-func-to-llvm`
-        # routes via the public-name wrappers `@hc_get_*`) to unpack
-        # each tensor's data pointer (raw `!llvm.ptr` from
-        # `hc_get_ptr`, addrspace-cast to `!llvm.ptr<1>` on the way to
-        # the kernel) plus shape dims and strides, then dispatches via
-        # the HIP shim (`hc_rt_load_kernel` + `hc_rt_launch_kernel`).
-        # The HSACO blob and per-callsite handle/name globals live at
-        # module scope.
+        # Positive structural assertions: host wrapper is `llvm.func`
+        # after `gpu-to-llvm`, one `PyObject *` (→ `!llvm.ptr`) per
+        # kernel arg, calls `_mlir_ciface_hc_get_*` helpers (public
+        # wrappers `@hc_get_*` via `convert-func-to-llvm`) to unpack
+        # data ptr (raw `!llvm.ptr` from `hc_get_ptr`, addrspace-cast
+        # to `!llvm.ptr<1>` on the way to the kernel) + dims +
+        # strides, then dispatches via HIP shim (`hc_rt_load_kernel`
+        # + `hc_rt_launch_kernel`). HSACO blob and per-callsite
+        # handle/name globals live at module scope.
         assert "module attributes {gpu.container_module}" in handle.hc_ir_text
         assert (
             "llvm.func @tiled_gfx11_wmma_matmul(%arg0: !llvm.ptr, "
@@ -821,7 +792,7 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
         assert (
             "@tiled_gfx11_wmma_matmul_kernel_handle" in handle.hc_ir_text
         ), handle.hc_ir_text
-        # NUL-terminated kernel name string lands as a separate global.
+        # NUL-terminated kernel name string → separate global.
         assert (
             '"tiled_gfx11_wmma_matmul_kernel\\\\00"' in handle.hc_ir_text
         ), handle.hc_ir_text
@@ -843,10 +814,10 @@ _WMMA_COMPILE_SMOKE_SCRIPT = textwrap.dedent("""
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> None:
-    # End-to-end assertion that what the resolver stamps flows through
-    # ``hc.compile``: ``front_ir_symbols`` exposes the closed dep set and
-    # every load-context ``hc_front.name`` carries a ``ref`` attribute.
-    # The real WMMA example is the richest fixture we have for this check.
+    # Resolver stamps must flow through `hc.compile`:
+    # `front_ir_symbols` exposes the closed dep set; every load-context
+    # `hc_front.name` carries a `ref` attribute. The WMMA example is
+    # the richest fixture for this.
     script = tmp_path / "compile_wmma.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n"
@@ -859,22 +830,17 @@ def test_compile_wmma_collects_deps_and_stamps_every_load(tmp_path: Path) -> Non
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_target_selects_recipe(tmp_path: Path) -> None:
-    # Three-way subprocess check on the `target=` plumbing:
-    #   * `target=None` — recipe still fires (default empty target runs
-    #     every named sequence) so the pipeline reaches a `gpu.binary`.
-    #   * `target="amdgpu-gfx11"` — explicit match, same outcome plus
-    #     the handle echoes the value back.
-    #   * `target="amdgpu-gfx12"` — no recipe matches, so
-    #     `hc-interpret-intrinsic-recipes` surfaces a hard "no
-    #     intrinsic lowering recipe matched" diagnostic instead of
-    #     silently passing the call through to whichever stage runs
-    #     next.
+    # Three-way subprocess check on `target=`:
+    #   * `target=None` — recipe fires (default empty target runs every
+    #     named sequence); pipeline reaches `gpu.binary`.
+    #   * `target="amdgpu-gfx11"` — explicit match, same outcome, handle
+    #     echoes the value back.
+    #   * `target="amdgpu-gfx12"` — no recipe matches;
+    #     `hc-interpret-intrinsic-recipes` raises "no intrinsic lowering
+    #     recipe matched" instead of silently passing the call through.
     #
-    # Pre-binary-emission this test pinned `amdgpu.wmma` as proof the
-    # recipe fired. Now that the schedule lowers all the way through
-    # to HSACO, `amdgpu.*` ops are gone — the structural signal of
-    # success is `gpu.binary @<kernel>_kernel` with the rocdl target
-    # attribute attached.
+    # Post-binary-emission `amdgpu.*` ops are gone; the success signal
+    # is the per-callsite HSACO global + the runtime call.
     script = tmp_path / "compile_target.py"
     script.write_text(
         f"import sys\nsys.path.insert(0, {str(REPO_ROOT)!r})\n" + textwrap.dedent("""
@@ -883,10 +849,10 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
 
 
             def _check_compiled_to_binary(handle) -> None:
-                # After `hc-lower-launch-func-to-runtime` the HSACO
-                # ships in a `_data` global and the launch lands as a
-                # `hc_rt_launch_kernel` call — the recipe-fired signal
-                # is the per-callsite global + the runtime call.
+                # Post `hc-lower-launch-func-to-runtime`: HSACO in
+                # `_data` global, launch as `hc_rt_launch_kernel` call.
+                # Recipe-fired signal = per-callsite global + runtime
+                # call.
                 assert handle.hc_ir_text is not None, handle.pipeline_diagnostics
                 assert (
                     "@tiled_gfx11_wmma_matmul_kernel_data"
@@ -931,17 +897,11 @@ def test_compile_target_selects_recipe(tmp_path: Path) -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
-    # End-to-end: compile a no-op kernel that needs only the runtime
-    # helpers (no `gpu.launch_func` survives the pipeline because the
-    # body is empty), then invoke it through the JIT'd host wrapper. The
-    # call must succeed without an actual GPU because the helpers are
-    # all that runs.
-    #
-    # We deliberately use a kernel that bottoms out at the runtime
-    # helpers — this exercises the whole invoke path (engine create,
-    # shared-lib load, packed-args wrapper lookup, ctypes thunk) without
-    # depending on libamdhip64.so being installed. WMMA-on-hardware
-    # smoke is a separate task.
+    # No-op kernel: empty body → no surviving `gpu.launch_func` → host
+    # wrapper bottoms out at runtime helpers, JIT'd and invoked.
+    # Exercises full invoke path (engine create, shared-lib load,
+    # packed-args wrapper lookup, ctypes thunk) without
+    # `libamdhip64.so`. WMMA-on-hardware is a separate test.
     script = tmp_path / "compile_invoke.py"
     script.write_text(textwrap.dedent("""
             import numpy as np
@@ -951,9 +911,8 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
 
 
             class _TensorView:
-                # Minimal duck-type the runtime helpers require — we
-                # depend on `data_ptr()` / `size(i)` / `stride(i)`
-                # because those are the names BufferUtils.cpp looks up.
+                # Minimal duck-type: `data_ptr()` / `size(i)` /
+                # `stride(i)` are what `BufferUtils.cpp` looks up.
                 def __init__(self, arr):
                     self._arr = arr
 
@@ -972,8 +931,7 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
 
             @kernel(work_shape=(sym.W,), literals={sym.W})
             def trivial(group: CurrentGroup, x: Buffer[sym.W]) -> None:
-                # Empty body — the lowered IR boils down to a host
-                # wrapper that calls the runtime helpers and returns.
+                # Empty body → host wrapper calls runtime helpers, returns.
                 return None
 
 
@@ -983,19 +941,17 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
                 view = _TensorView(arr)
 
                 handle(view)
-                # Cache populated on the first call; second call must
-                # reuse the same invoker (no fresh engine spin-up).
+                # Cache populated on first call; second call reuses
+                # the same invoker (no fresh engine spin-up).
                 cached = handle._invoker_cache.invoker
                 assert cached is not None, "expected invoker cache populated"
                 handle(view)
                 assert handle._invoker_cache.invoker is cached
 
-                # `stream=` is plumbed through to the host wrapper's
-                # leading slot. This kernel has no gpu.launch_func so
-                # the pointer never reaches the runtime — but the call
-                # must accept it (None or 0) without complaint, which
-                # is what tells us the ctypes thunk knows about the
-                # extra leading slot.
+                # `stream=` rides the host wrapper's leading slot. No
+                # `gpu.launch_func` here so pointer never reaches the
+                # runtime, but the call must accept `None`/`0` — that
+                # proves the ctypes thunk knows about the leading slot.
                 handle(view, stream=None)
                 handle(view, stream=0)
 
@@ -1025,13 +981,12 @@ def test_compile_invoke_dispatches_runtime_helpers(tmp_path: Path) -> None:
 
 
 def test_compile_invoke_accepts_non_contiguous_tensor(tmp_path: Path) -> None:
-    # The host wrapper pulls per-axis strides at runtime via
-    # `_mlir_ciface_hc_get_stride` and feeds them into the kernel-arg
-    # `(!hc.ptr<global, T>, dim*, stride*)` tuple, where the launch-body
-    # lowering uses them to linearize `hc.ptr_offset` indices. A numpy
-    # slice with stride > 1 must therefore flow through without complaint.
-    # The kernel body is empty — we're not checking output values, just
-    # proving the strided pointer + per-axis strides reach the kernel intact.
+    # Host wrapper reads strides at runtime via
+    # `_mlir_ciface_hc_get_stride`, feeds them into the kernel-arg
+    # `(!hc.ptr<global, T>, dim*, stride*)` tuple; launch-body lowering
+    # uses them to linearize `hc.ptr_offset` indices. numpy slice with
+    # stride > 1 must round-trip. Empty body — just proving strided
+    # pointer + strides reach the kernel intact.
     script = tmp_path / "compile_invoke_strided.py"
     script.write_text(textwrap.dedent("""
             import numpy as np
@@ -1079,8 +1034,8 @@ def test_compile_invoke_accepts_non_contiguous_tensor(tmp_path: Path) -> None:
 
 
 def test_compile_invoke_raises_when_pipeline_failed() -> None:
-    # `invoke` on a handle whose pipeline failed must surface the
-    # captured diagnostics instead of segfaulting on a missing module.
+    # `invoke` on a failed-pipeline handle surfaces captured diagnostics
+    # instead of segfaulting on a missing module.
     handle = CompiledKernel(
         kernel=lambda: None,
         bindings={},
@@ -1095,9 +1050,8 @@ def test_compile_invoke_raises_when_pipeline_failed() -> None:
 
 
 def test_compile_invoke_rejects_kwargs() -> None:
-    # Positional-only ABI for kernel arguments — the host wrapper has
-    # no notion of named arguments beyond the dedicated `stream=` slot.
-    # Reject other kwargs loudly instead of silently dropping them.
+    # Positional-only ABI; `stream=` is the only named slot. Other
+    # kwargs reject loudly, don't drop silently.
     handle = CompiledKernel(
         kernel=lambda: None,
         bindings={},

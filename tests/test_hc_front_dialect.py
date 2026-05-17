@@ -15,8 +15,7 @@ import pytest
 from build_tools.hc_native_tools import ensure_hc_native_tools_built
 from build_tools.llvm_toolchain import ensure_llvm_toolchain
 
-# Successful parse of real `hc_front.*` text is the stable contract that
-# matters here.
+# Stable contract: `hc_front.*` text parses.
 _SKIP_HC_FRONT_DIALECT_TESTS = pytest.mark.skipif(
     os.environ.get("HC_SKIP_HC_FRONT_DIALECT_TESTS") == "1",
     reason="native hc_front dialect smoke tests disabled by env",
@@ -98,6 +97,6 @@ def test_hc_opt_parses_and_prints_registered_hc_front_textual_ir() -> None:
     assert "hc_front.kernel" in result.stdout
     assert "hc_front.if" in result.stdout
     assert "hc_front.for" in result.stdout
-    # The declarative assembly format infers `!hc_front.value` from the
-    # parameterless, buildable `HCFront_ValueType`, so the pretty-printed
-    # form never spells the type out — hence no string check for it here.
+    # Declarative assembly format infers `!hc_front.value` from
+    # parameterless `HCFront_ValueType`; pretty-printer never spells
+    # the type → no string check for it here.

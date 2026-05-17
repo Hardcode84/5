@@ -17,11 +17,7 @@ mlir::hc::linearizedThreadAndSize(OpBuilder &builder, Location loc,
   if (!launch)
     return failure();
   gpu::KernelDim3 tids = launch.getThreadIds();
-  // `getBlockSizeOperandValues` reaches the values defined above the launch
-  // (the operands that pin the block shape). Inside the body they're still
-  // dominating SSA values, and using the outer form keeps the cooperative
-  // loop's IR close to the values the materializeBoundExpr lowering already
-  // surfaces under the `$WGS*` symbols.
+  // Outer operand form: dominates body, aligns with `$WGS*` symbols.
   gpu::KernelDim3 sizes = launch.getBlockSizeOperandValues();
   Value tzBy = arith::MulIOp::create(builder, loc, tids.z, sizes.y);
   Value tzByPlusTy = arith::AddIOp::create(builder, loc, tzBy, tids.y);

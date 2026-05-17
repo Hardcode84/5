@@ -16,8 +16,8 @@ from build_tools.llvm_toolchain import (
     toolchain_key,
 )
 
-# White-box bootstrap tests intentionally exercise private file-state helpers
-# that are not part of the runtime-facing API.
+# White-box bootstrap: exercises private file-state helpers, not the
+# runtime-facing API.
 
 
 def _sample_lock(
@@ -107,10 +107,9 @@ def test_export_toolchain_environment_sets_mlir_config_dirs(tmp_path: Path) -> N
     assert env["HC_LLVM_INSTALL_DIR"] == str(install_root)
     assert env["LLVM_DIR"] == str(install_root / "lib" / "cmake" / "llvm")
     assert env["MLIR_DIR"] == str(install_root / "lib" / "cmake" / "mlir")
-    # `HC_LLD` is intentionally not exported here. The pipeline resolves
-    # ld.lld from the bundled `hc/_native/bin/ld.lld` and propagates it
-    # through the `hc-lower-gpu-to-binary` pass option; the env var is
-    # only a manual escape hatch for direct `hc-opt` users.
+    # `HC_LLD` deliberately absent: pipeline resolves `ld.lld` from
+    # bundled `hc/_native/bin/ld.lld` via the `hc-lower-gpu-to-binary`
+    # pass option. The env var is a manual escape hatch for `hc-opt`.
     assert "HC_LLD" not in env
 
 

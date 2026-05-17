@@ -35,8 +35,7 @@ static std::string joinSessionErrors(ixs_session *session) {
 static std::string renderNode(const ixs_node *node) {
   assert(node && "expected non-null ixsimpl node");
   auto *rawNode = const_cast<ixs_node *>(node);
-  // The vendored ixsimpl printer is a pure read-only walk over the immutable
-  // node graph, so rendering does not need an ixs_session scratch object.
+  // ixsimpl printer walks immutable graph: no session needed.
   size_t n = ixs_print(rawNode, nullptr, 0);
   if (n == std::numeric_limits<size_t>::max())
     llvm::report_fatal_error("hc symbolic printer reported an invalid length");
@@ -76,8 +75,7 @@ static void walkSymbolNamesImpl(const ixs_node *node,
   stack.push_back(node);
   while (!stack.empty()) {
     const ixs_node *current = stack.pop_back_val();
-    // ixsimpl's introspection accessors are read-only in practice but not
-    // const-qualified in the C API.
+    // ixsimpl introspection accessors are read-only but C API lacks const.
     auto *rawNode = const_cast<ixs_node *>(current);
     if (ixs_node_tag(rawNode) == IXS_SYM)
       callback(ixs_node_sym_name(rawNode));
@@ -127,8 +125,7 @@ Store::Store() : ctx(ixs_ctx_create()) {
 Store::~Store() { ixs_ctx_destroy(ctx); }
 
 std::string Store::render(const ixs_node *node) const {
-  // Keep a serialized rendering entry point for store-centric callers that want
-  // one obvious synchronization policy around the dialect-owned context.
+  // Serialized: callers get one sync policy around dialect-owned context.
   llvm::sys::SmartScopedLock<true> lock(mutex);
   return renderNode(node);
 }
@@ -294,8 +291,7 @@ FailureOr<ExprHandle> mlir::hc::sym::composeExprNeg(Store &store,
 FailureOr<ExprHandle> mlir::hc::sym::composeExprSym(Store &store,
                                                     llvm::StringRef name,
                                                     std::string *diagnostic) {
-  // ixs_sym needs a NUL-terminated buffer; copy once instead of asking
-  // callers to do it.
+  // ixs_sym needs NUL-terminated buffer.
   std::string nulTerminated(name);
   Session session(store);
   ixs_node *node = ixs_sym(session.raw(), nulTerminated.c_str());
@@ -373,8 +369,7 @@ std::optional<int64_t> mlir::hc::sym::getIntegerLiteralValue(ExprHandle value) {
   const ixs_node *node = value.raw();
   if (!node)
     return std::nullopt;
-  // ixsimpl's introspection accessors are read-only in practice but not
-  // const-qualified in the C API.
+  // ixsimpl introspection accessors are read-only but C API lacks const.
   auto *rawNode = const_cast<ixs_node *>(node);
   if (!ixs_node_is_expr(rawNode))
     return std::nullopt;
@@ -430,8 +425,7 @@ FailureOr<PredHandle> mlir::hc::sym::parsePredHandle(AsmParser &parser) {
 }
 
 void mlir::hc::sym::printExprHandle(AsmPrinter &printer, ExprHandle value) {
-  // ODS printer hooks do not receive Store&; render directly from the immutable
-  // node instead of re-looking up the dialect just to take the store lock.
+  // No Store& at ODS hook; node is immutable, skip dialect lookup + lock.
   printer.printString(renderNode(value.raw()));
 }
 

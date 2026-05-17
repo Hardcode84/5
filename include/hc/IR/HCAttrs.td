@@ -60,16 +60,14 @@ def HC_PredAttr : HC_Attr<"Pred", "pred"> {
 def HC_DynSizeAttr : HC_Attr<"DynSize", "dyn"> {
   let summary = "Sentinel `?` for an unknown / host-owned shape entry.";
   let description = [{
-    Marker attribute that fills the slot of a regular `#hc.expr` dimension when
-    the size is not knowable inside the compiler — e.g. a buffer argument whose
-    backing storage is owned by the host descriptor and not derivable from the
-    in-IR symbol set. Renders as `?` inside `#hc.shape<[...]>` and on the
-    surface form of any shaped type.
+    Marker for a shape slot whose size isn't knowable in-compiler — e.g. a
+    buffer argument whose backing storage lives on the host descriptor.
+    Renders as `?` in `#hc.shape<[...]>` and on shaped-type surfaces.
 
-    The attribute participates in `ShapeAttr.dims` alongside `ExprAttr` so
-    every shape-entry walker has to discriminate explicitly: there is no
-    `composeExprBinary` / `walkSymbolNames` overload for `DynSize`, by design.
-    Consumers that need a concrete size must reach for the host descriptor.
+    Lives in `ShapeAttr.dims` alongside `ExprAttr`; every shape walker must
+    discriminate explicitly. No `composeExprBinary` / `walkSymbolNames`
+    overload for `DynSize` — consumers needing a concrete size must reach
+    the host descriptor.
   }];
   let parameters = (ins);
   let assemblyFormat = "";
@@ -98,24 +96,18 @@ def HC_ConstraintSetAttr : HC_Attr<"ConstraintSet", "constraints"> {
 def HC_ScopeAttr : HC_Attr<"Scope", "scope"> {
   let summary = "Kernel execution scope.";
   let description = [{
-    One of `"WorkGroup"`, `"SubGroup"`, or `"WorkItem"`. Used by
-    `hc.intrinsic` declarations and by the `hc.workitem_region` /
-    `hc.subgroup_region` structuring ops so later passes can dispatch per-scope
-    without string-matching mnemonics.
+    One of `"WorkGroup"`, `"SubGroup"`, `"WorkItem"`. Carried by
+    `hc.intrinsic` and the `hc.{workitem,subgroup}_region` ops so passes
+    dispatch per-scope without mnemonic matching.
   }];
   let parameters = (ins StringRefParameter<"scope name">:$name);
   let assemblyFormat = "`<` $name `>`";
   let genVerifyDecl = 1;
 }
 
-// `HC_EffectsAttr` used to be a stringly-typed whitelist; it is now an enum so
-// wrong spellings fail at parse time and `hc.call` / `hc.call_intrinsic`
-// can dispatch on a typed handle instead of a `StringRef` comparison.
-
 //===----------------------------------------------------------------------===//
-// Typed enum attributes for operand kinds. Using `I32EnumAttr` gates wrong
-// spellings at parse time (no `hc.reduce %v, kind = avg` making it to the
-// verifier) and gives lowerings a typed handle instead of a `StringRef`.
+// Typed enum attributes for operand kinds. `I32EnumAttr` rejects wrong
+// spellings at parse time and gives lowerings a typed handle.
 //===----------------------------------------------------------------------===//
 
 def HC_ReduceKindSum : I32EnumAttrCase<"Sum", 0, "sum">;
@@ -138,9 +130,8 @@ def HC_ReduceKindAttr
 def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
   let summary = "Symbolic layout descriptor for shaped values.";
   let description = [{
-    Captures `index_map(...)` from the source layer as a quintuple of
-    bound-name lists and `#hc.expr` payloads. Textual form, single-lined
-    here for clarity:
+    Source-level `index_map(...)` as a quintuple of bound-name lists +
+    `#hc.expr` payloads:
 
       #hc.layout<shape_syms = ["W", "H"],
                  index_syms = ["i", "j"],
@@ -148,41 +139,29 @@ def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
                  storage_size = #hc.expr<"W * row_stride">,
                  offset = #hc.expr<"i * row_stride + j">>
 
-    Bound-name conventions: `shape_syms` are bound positionally to the
-    shape entries of the attached type; `index_syms` are bound at access
-    sites; `params` are derived expressions over `shape_syms` whose
-    names `storage_size` and `offset` may reference. Names listed in
-    `shape_syms` and `index_syms` must be unique within their list and
-    disjoint from each other; `params` keys must not collide with
-    either. Symbolic-engine-side substitution at the use site relies on
-    that disjointness.
+    `shape_syms` bind positionally to the attached type's shape;
+    `index_syms` bind at access sites; `params` are derived expressions
+    over `shape_syms`. `shape_syms` and `index_syms` names must be
+    unique within each list and disjoint; `params` keys must not collide
+    with either — substitution at the use site relies on disjointness.
 
-    `shape_syms` and `index_syms` must have the same length and both
-    match the attached type's rank. Every `index_syms[k]` is the access
-    coordinate for logical axis `k`; every `shape_syms[k]` names the
-    extent of that axis. The N positional indices on `hc.load` /
-    `hc.vload` / `hc.store` / `hc.load_mask` bind to `index_syms` in
-    order; each may be a scalar (pin) or a slice (iter sweep over that
-    axis).
+    `shape_syms.size() == index_syms.size() == rank`. `index_syms[k]` is
+    the access coordinate for axis `k`; `shape_syms[k]` its extent. The
+    N positional indices on `hc.load` / `hc.vload` / `hc.store` /
+    `hc.load_mask` bind to `index_syms` in order; each may be a scalar
+    pin or a slice iter sweep.
 
-    Non-injective offsets are allowed: distinct logical-index tuples
-    may map to the same flat storage offset. Per-lane fragments,
-    broadcast layouts, and similar patterns express this directly —
-    the logical shape carries the lane / wave extent and the layout's
-    offset collapses it. `storage_size` is the flat extent in elements
-    and may be smaller than the logical-shape product when the offset
-    is non-injective; consumers reading through the layout get the
-    canonical slot, consumers writing accept that lanes which collide
-    overwrite each other (use that intentionally or don't).
+    Non-injective offsets are allowed (per-lane fragments, broadcast
+    layouts). `storage_size` is the flat element extent and may be
+    smaller than the logical-shape product when offset is non-injective;
+    colliding writes overwrite, by design.
 
-    All `#hc.expr` payloads go through the dialect symbolic store at
-    construction so type uniquing across ixsimpl-canonical equality
-    gives free layout equality.
+    All `#hc.expr` payloads go through the dialect store at construction
+    so ixsimpl-canonical equality gives layout equality.
 
-    No restriction on the offset / storage_size grammar in v1: we
-    accept what ixsimpl can chew and leave injectivity / size proofs
-    to the consumers (canonicalize, flatten). See `doc/layouts.md` for
-    the full design.
+    No grammar restriction on `offset` / `storage_size`: we accept what
+    ixsimpl accepts and leave injectivity / size proofs to consumers
+    (canonicalize, flatten). See `doc/layouts.md` for the full design.
   }];
   let parameters = (ins
     ArrayRefParameter<"::mlir::Attribute">:$shapeSyms,
@@ -195,11 +174,8 @@ def HC_LayoutAttr : HC_Attr<"Layout", "layout"> {
   let genVerifyDecl = 1;
 }
 
-// Address space tag carried by `!hc.ptr` (and any future memory carrier
-// in this dialect). Workgroup / global / private are the three classes
-// the AMDGPU and SPIR-V backends actually distinguish; richer schemes
-// (constant, image, named driver classes) are not in v1 — extending the
-// enum later is additive.
+// Address space tag for `!hc.ptr`. Workgroup / global / private are the
+// three classes the AMDGPU and SPIR-V backends distinguish.
 def HC_AddrSpaceWorkgroup : I32EnumAttrCase<"Workgroup", 0, "workgroup">;
 def HC_AddrSpaceGlobal    : I32EnumAttrCase<"Global", 1, "global">;
 def HC_AddrSpacePrivate   : I32EnumAttrCase<"Private", 2, "private">;
@@ -207,17 +183,14 @@ def HC_AddrSpacePrivate   : I32EnumAttrCase<"Private", 2, "private">;
 def HC_AddrSpace : I32EnumAttr<"AddrSpace",
     "Memory address space (workgroup/global/private).",
     [HC_AddrSpaceWorkgroup, HC_AddrSpaceGlobal, HC_AddrSpacePrivate]> {
-  // No specialized attr companion: the enum surfaces only as a typed type
-  // parameter on `!hc.ptr`; we don't want stray `#hc<addr_space ...>`
-  // attributes growing other surfaces.
+  // No specialized attr companion: surfaces only as a typed parameter on
+  // `!hc.ptr`. No stray `#hc<addr_space ...>` attributes.
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::hc";
 }
 
-// Iteration kind tag for `hc.generic`: parallel iters are independent and
-// vectorizable; reduction iters carry a sequential init across the loop.
-// The split mirrors `linalg.generic`'s `iterator_types` but stays inside the
-// dialect so the symbolic engine — not affine maps — owns offset analysis.
+// Iteration kind for `hc.generic`. `parallel` iters are independent and
+// vectorizable; `reduction` iters thread a sequential carry.
 def HC_IterKindParallel  : I32EnumAttrCase<"Parallel",  0, "parallel">;
 def HC_IterKindReduction : I32EnumAttrCase<"Reduction", 1, "reduction">;
 

@@ -36,9 +36,7 @@ static ParseResult parseShapeDim(AsmParser &parser,
   if (failed(*parsedString))
     return failure();
 
-  // The lone `"?"` spelling lifts a `#hc.dyn` sentinel into the shape
-  // entry — used for buffer 1D-collapse and any other shape slot whose
-  // size is host-owned / not derivable from the in-IR symbol set.
+  // `"?"` → #hc.dyn sentinel: host-owned size, not symbol-derivable.
   if (text == "?") {
     dims.push_back(DynSizeAttr::get(parser.getContext()));
     return success();
@@ -236,11 +234,8 @@ static ParseResult parseTypedAttribute(AsmParser &parser, llvm::SMLoc loc,
   return success();
 }
 
-// Accumulator for the textual fields of a `#hc.layout` attribute.
-// `LayoutAttr::parse` drives one field at a time into this; the
-// individual flags are checked at the end so a missing field
-// produces a single "requires ..." diagnostic instead of a per-
-// field one.
+// Flags checked at end → single "requires ..." diagnostic for any missing
+// field.
 struct LayoutFields {
   SmallVector<Attribute> shapeSyms;
   SmallVector<Attribute> indexSyms;
@@ -254,8 +249,6 @@ struct LayoutFields {
   bool gotOffset = false;
 };
 
-// Mark `flag` seen, emitting a "duplicate field 'name'" diagnostic at
-// `nameLoc` if it had already been set.
 static ParseResult markFieldSeen(AsmParser &parser, llvm::SMLoc nameLoc,
                                  StringRef name, bool &flag) {
   if (flag)
@@ -264,7 +257,6 @@ static ParseResult markFieldSeen(AsmParser &parser, llvm::SMLoc nameLoc,
   return success();
 }
 
-// Parse one `params = { ... }` value as a DictionaryAttr.
 static ParseResult parseLayoutParamsField(AsmParser &parser,
                                           DictionaryAttr &out) {
   llvm::SMLoc valueLoc = parser.getCurrentLocation();
@@ -278,9 +270,6 @@ static ParseResult parseLayoutParamsField(AsmParser &parser,
   return success();
 }
 
-// Per-field parsers. Each handles its own value parse but shares the
-// duplicate-check + flag-set via `markFieldSeen` on the relevant
-// LayoutFields flag.
 static ParseResult parseLayoutShapeSymsField(AsmParser &parser,
                                              LayoutFields &out,
                                              llvm::SMLoc nameLoc) {
@@ -323,9 +312,6 @@ static ParseResult parseLayoutOffsetField(AsmParser &parser, LayoutFields &out,
   return parseTypedAttribute<ExprAttr>(parser, valueLoc, "offset", out.offset);
 }
 
-// Table mapping `#hc.layout` field names to their parsers. Sized
-// statically so adding a new field is one line; the dispatcher
-// walks the array linearly (five entries — branchless on hot paths).
 struct LayoutFieldDispatch {
   StringRef name;
   ParseResult (*parse)(AsmParser &, LayoutFields &, llvm::SMLoc);
@@ -339,10 +325,6 @@ static const std::array<LayoutFieldDispatch, 5> kLayoutFieldDispatch = {{
     {"offset", &parseLayoutOffsetField},
 }};
 
-// Parse one `<name> = <value>` field inside a `#hc.layout<...>` and
-// dispatch onto the matching per-field parser. Unknown names emit at
-// `nameLoc`. Returns failure on a malformed field, on a duplicate,
-// or on an unknown name.
 static ParseResult parseLayoutField(AsmParser &parser, LayoutFields &out) {
   StringRef name;
   llvm::SMLoc nameLoc = parser.getCurrentLocation();
@@ -397,10 +379,7 @@ void LayoutAttr::print(AsmPrinter &printer) const {
 
 namespace {
 
-// Validate one `#hc.layout` quoted name list: every entry must be a
-// non-empty StringAttr, and each name must be unique across the
-// shared `seen` set (shape_syms / index_syms / params keys live in
-// the same expression-symbol namespace at substitution time).
+// shape_syms / index_syms / params keys share one namespace at substitution.
 static LogicalResult
 verifyLayoutNameList(function_ref<InFlightDiagnostic()> emitError,
                      ArrayRef<Attribute> names, StringRef field,
@@ -419,8 +398,6 @@ verifyLayoutNameList(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
-// Validate the `params` dictionary: non-null, non-empty keys,
-// `#hc.expr` values, and key uniqueness against the shared `seen` set.
 static LogicalResult
 verifyLayoutParams(function_ref<InFlightDiagnostic()> emitError,
                    DictionaryAttr params, llvm::DenseSet<StringRef> &seen) {
@@ -470,11 +447,8 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 
 namespace {
 
-// Product of `dims` for layout-less storage: row-major contiguous, no
-// padding, so `storage_size = d_0 * d_1 * ... * d_{n-1}`. Empty dims
-// (rank-0) is `1` — that's the convention the layout-driven path also
-// observes (`storage_size = 1` for scalar storage), so the two
-// branches stay shape-consistent.
+// Row-major contiguous: prod(dims), empty → 1 (matches layout-driven scalar
+// case).
 static FailureOr<sym::ExprHandle>
 identityShapeProduct(sym::Store &store, ArrayRef<Attribute> dims) {
   if (dims.empty())
@@ -496,10 +470,6 @@ identityShapeProduct(sym::Store &store, ArrayRef<Attribute> dims) {
   return product;
 }
 
-// Compose `(targets, replacements)` parallel arrays from a quoted
-// name list and matching `ExprAttr` replacements. Used to substitute
-// `shape_syms` / `index_syms` placeholders for actual operand
-// expressions before invoking ixsimpl's `ixs_subs_multi`.
 static LogicalResult
 collectSubstitutionPairs(sym::Store &store, ArrayRef<Attribute> nameAttrs,
                          ArrayRef<Attribute> replacementAttrs,
@@ -520,8 +490,6 @@ collectSubstitutionPairs(sym::Store &store, ArrayRef<Attribute> nameAttrs,
   return success();
 }
 
-// Drive `ixs_subs_multi` on `expr`; returns the substituted handle or
-// failure if the engine rejected the input.
 static FailureOr<sym::ExprHandle>
 substituteMulti(sym::Store &store, sym::ExprHandle expr,
                 ArrayRef<ixs_node *> targets,
@@ -577,9 +545,8 @@ mlir::FailureOr<ExprAttr> computeStorageSizeExpr(mlir::MLIRContext *ctx,
 
 namespace {
 
-// Identity row-major offset for a layout-less operand:
-// `i_0 * (d_1 * ... * d_{n-1}) + ... + i_{n-1}`. Returns `0` for
-// rank-0. Caller verifies rank parity between `dims` and `indexExprs`.
+// Row-major: sum_i (i * prod(dims[i+1:])). Rank-0 → 0. Caller checks rank
+// parity.
 static FailureOr<sym::ExprHandle>
 identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
                      ArrayRef<Attribute> dims) {
@@ -614,10 +581,6 @@ identityLayoutOffset(sym::Store &store, ArrayRef<ExprAttr> indexExprs,
 
 namespace {
 
-// Append one `(target, replacement)` pair, composing the target sym
-// handle on the fly. Used by `composeAccessOffsetExpr` to seed both
-// the shape-sym and index-sym substitutions into the same pair of
-// arrays before one `ixs_subs_multi` call.
 static LogicalResult
 appendSubstitutionPair(sym::Store &store, StringRef name,
                        sym::ExprHandle replacement,
@@ -631,8 +594,7 @@ appendSubstitutionPair(sym::Store &store, StringRef name,
   return success();
 }
 
-// Stage the layout-driven substitutions: shape_syms[k] → dims[k],
-// index_syms[k] → indexExprs[k]. Caller has already checked rank
+// shape_syms[k] → dims[k]; index_syms[k] → indexExprs[k]. Caller checks rank
 // parity.
 static LogicalResult stageLayoutSubstitutions(
     sym::Store &store, ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> dims,

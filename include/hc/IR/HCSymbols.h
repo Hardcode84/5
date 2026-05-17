@@ -74,8 +74,7 @@ public:
   Store &operator=(const Store &) = delete;
 
   ixs_ctx *raw() const { return ctx; }
-  /// Renders through the store while holding the store mutex. Use this from
-  /// store-centric helpers that already traffic in `Store &`.
+  /// Render under the store mutex. For helpers already holding a `Store &`.
   std::string render(const ixs_node *node) const;
 
 private:
@@ -101,8 +100,8 @@ private:
   ixs_session session;
 };
 
-/// Parses symbolic text into the destination store. The helper copies the
-/// input to satisfy the upstream NUL-terminated parser contract.
+/// Parses symbolic text into the destination store. Copies the input to
+/// satisfy the upstream NUL-terminated parser contract.
 mlir::FailureOr<ExprHandle> parseExpr(Store &store, llvm::StringRef text,
                                       std::string *diagnostic = nullptr);
 mlir::FailureOr<PredHandle> parsePred(Store &store, llvm::StringRef text,
@@ -118,20 +117,15 @@ composeExprBinary(Store &store, ExprHandle lhs, ExprBinaryOp op, ExprHandle rhs,
                   std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprCeil(Store &store, ExprHandle value,
                                             std::string *diagnostic = nullptr);
-/// Floor function. Use `composeExprFloor(store, composeExprBinary(store, a,
-/// Div, b))` to get Python `//` semantics (floored integer division), since
-/// `composeExprBinary` with `Div` is *exact rational* division.
+/// `composeExprBinary` with `Div` is *exact rational*. For Python `//`
+/// (floored integer division) wrap a Div in `composeExprFloor`.
 mlir::FailureOr<ExprHandle> composeExprFloor(Store &store, ExprHandle value,
                                              std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprNeg(Store &store, ExprHandle value,
                                            std::string *diagnostic = nullptr);
 
-/// Leaf constructors for symbolic expressions: `composeExprSym` returns
-/// the canonical handle for a bare symbol with the given name (e.g. "M",
-/// "i", "$STRIDE_0_a"). `composeExprInt` returns the canonical handle for
-/// an integer literal. Both go through the dialect-owned store so callers
-/// that build expressions structurally (without touching `parseExpr`'s
-/// text path) get the same hash-consed nodes any other producer would.
+/// Symbol / integer leaves. Go through the dialect store so structurally
+/// built expressions share hash-consed nodes with parsed ones.
 mlir::FailureOr<ExprHandle> composeExprSym(Store &store, llvm::StringRef name,
                                            std::string *diagnostic = nullptr);
 mlir::FailureOr<ExprHandle> composeExprInt(Store &store, int64_t value,
@@ -139,11 +133,7 @@ mlir::FailureOr<ExprHandle> composeExprInt(Store &store, int64_t value,
 mlir::FailureOr<PredHandle> composePredCmp(Store &store, ExprHandle lhs,
                                            PredCmpOp op, ExprHandle rhs,
                                            std::string *diagnostic = nullptr);
-/// Conjunction / disjunction of two predicates. Constructs the
-/// canonical hash-consed AND / OR node so combinators built by the
-/// rewriters (per-axis bounds conjunctions on the `hc.load_mask`
-/// emitter, future OOB-tile guard chains) share storage with any
-/// other identical conjunction elsewhere in the IR.
+/// Hash-consed AND / OR of two predicates.
 mlir::FailureOr<PredHandle> composePredAnd(Store &store, PredHandle lhs,
                                            PredHandle rhs,
                                            std::string *diagnostic = nullptr);
@@ -151,13 +141,11 @@ mlir::FailureOr<PredHandle> composePredOr(Store &store, PredHandle lhs,
                                           PredHandle rhs,
                                           std::string *diagnostic = nullptr);
 
-/// Returns the integer payload when an expression is structurally integral:
-/// an ixs integer node, or a rational node with unit denominator. Does not
-/// render or parse the expression text.
+/// Integer payload of a structurally-integral expression (ixs integer node
+/// or unit-denominator rational). Structural, no parse / render.
 std::optional<int64_t> getIntegerLiteralValue(ExprHandle value);
 
-/// Walk every symbolic leaf name in a hash-consed expression or predicate.
-/// Traversal is structural and does not render or parse the expression text.
+/// Walk every symbolic leaf name. Structural, no parse / render.
 void walkSymbolNames(ExprHandle value,
                      llvm::function_ref<void(llvm::StringRef)> callback);
 void walkSymbolNames(PredHandle value,
@@ -166,9 +154,8 @@ void walkSymbolNames(PredHandle value,
 mlir::FailureOr<ExprHandle> parseExprHandle(AsmParser &parser);
 mlir::FailureOr<PredHandle> parsePredHandle(AsmParser &parser);
 
-/// ODS printer hooks only receive `AsmPrinter` plus the handle value. They
-/// intentionally render directly from the immutable hash-consed node instead of
-/// reacquiring the store mutex through the dialect.
+/// Render straight from the immutable hash-consed node — these don't take
+/// `Store &` and won't reacquire the store mutex through the dialect.
 void printExprHandle(AsmPrinter &printer, ExprHandle value);
 void printPredHandle(AsmPrinter &printer, PredHandle value);
 

@@ -129,5 +129,3 @@ struct HCInlineHelpersPass
 };
 
 } // namespace
-
-// `createHCInlineHelpersPass()` is emitted by tablegen.

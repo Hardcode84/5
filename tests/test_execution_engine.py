@@ -2,11 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# JIT smoke test for `hc.execution_engine`. We build a tiny LLVM IR
-# module (a function returning 42 plus one that calls a host symbol),
-# JIT-compile, lookup, and call via ctypes. Validates the full ORC
-# wiring including the per-process symbol generator and the explicit
-# symbol-map injection path.
+# JIT smoke for `hc.execution_engine`: parse, compile, lookup, call.
+# Covers the per-process symbol generator and explicit symbol-map
+# injection.
 
 from __future__ import annotations
 
@@ -49,9 +47,9 @@ def _engine_module_paths() -> list[Path]:
 
 
 def _ensure_engine_on_path() -> None:
-    """Prepend the directory containing the engine .so so ``import
-    hc_runtime.hc_execution_engine`` succeeds even before a full
-    ``pip install`` has populated ``hc/_native``."""
+    """Prepend the engine `.so`'s parent so
+    `hc_runtime.hc_execution_engine` imports before `pip install`
+    has populated `hc/_native`."""
     for so in _engine_module_paths():
         if so.exists():
             entry = str(so.parent.parent)
@@ -77,7 +75,7 @@ def engine(engine_module: object) -> object:
 
 
 def test_engine_loads_llvm_ir_and_returns_42(engine: object) -> None:
-    """The canonical ORC smoke test: parse, JIT, lookup, call."""
+    """Canonical ORC smoke: parse, JIT, lookup, call."""
     ir = """
 define i64 @return42() {
 entry:
@@ -94,9 +92,8 @@ entry:
 def test_engine_resolves_libc_symbol_via_process_generator(
     engine: object,
 ) -> None:
-    """The DynamicLibrarySearchGenerator should let JIT'd code call any
-    symbol already loaded in the host process. ``abs`` from libc is a
-    good lowest-common-denominator probe."""
+    """`DynamicLibrarySearchGenerator` reaches any symbol loaded in
+    the host process. `abs` from libc is the lowest-common probe."""
     ir = """
 declare i32 @abs(i32)
 
@@ -117,11 +114,9 @@ entry:
 def test_engine_resolves_explicit_symbol_map(
     engine_module: object,
 ) -> None:
-    """When the host wrapper plumbs `_mlir_ciface_*` helpers in via
-    ``set_symbol_map``, JIT'd IR has to see those addresses. We use a
-    libc symbol again but route it through the explicit map (and under
-    a different name) to verify the injection path independently of
-    process-level resolution."""
+    """`set_symbol_map` surfaces to JIT'd IR. Route a libc symbol
+    under a different name so process-level resolution can't shadow
+    the injection path."""
     libc_path = ctypes.util.find_library("c")
     assert libc_path, "libc not found"
     libc = ctypes.CDLL(libc_path)
@@ -162,9 +157,7 @@ entry:
 
 
 def test_engine_release_invalidates_handle(engine: object) -> None:
-    """After release, lookups against the handle should not succeed.
-    ORC reports it as a missing dylib; we just need to confirm we get a
-    Python-level error rather than a crash."""
+    """Post-release lookups raise Python-level errors, not crash."""
     ir = """
 define i64 @before_release() {
 entry:
@@ -194,10 +187,10 @@ def test_engine_options_jit_opt_level_round_trips(engine_module: object) -> None
 
 
 def test_engine_facade_module_re_exports() -> None:
-    """The hc.execution_engine facade should surface the same symbols."""
+    """`hc.execution_engine` re-exports match the extension."""
     if not any(p.exists() for p in _engine_module_paths()):
         pytest.skip("hc_execution_engine extension not built")
-    # Cleared in case a previous test injected a stub.
+    # Clear stub left by earlier test.
     os.environ.pop("HC_EXECUTION_ENGINE_DISABLED", None)
     import hc.execution_engine as facade
 

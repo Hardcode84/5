@@ -2,11 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-shaped-compute-to-generic`: rewrite the source-level
-// `hc.matmul` and `hc.reduce` ops into the body-driven `hc.generic`
-// surface that the post-flatten compute pipeline understands. See the
-// pass description in `include/hc/Transforms/Passes.td` and the
-// design in `doc/layouts.md`.
+// Implements `-hc-shaped-compute-to-generic`: rewrite `hc.matmul` and
+// `hc.reduce` into `hc.generic`. See `doc/layouts.md`.
 
 #include "hc/Transforms/Passes.h"
 
@@ -35,13 +32,7 @@ using namespace mlir::hc;
 
 namespace {
 
-// Wrap a single dim attr (taken from an operand's symbolic shape) as
-// an `hc.idx_apply` carrying `!hc.idx<dim>` so later bound-resolution
-// sees a fully-typed source. No listed symbols: the dim's free
-// names (shape syms) are ambient and get bound by the launch-body
-// lowering. The rewriter has full structural knowledge of the
-// iteration space, so the bounds-inference pass would be a no-op if
-// it ran after this one.
+// Empty-binding `hc.idx_apply`; free shape names stay ambient.
 static Value materializeIdxBound(OpBuilder &builder, Location loc,
                                  ExprAttr dim) {
   auto idxTy = IdxType::get(builder.getContext(), dim);
@@ -49,9 +40,7 @@ static Value materializeIdxBound(OpBuilder &builder, Location loc,
                               builder.getStrArrayAttr({}));
 }
 
-// Build a `tuple<idx<...>, idx<...>, ...>` SSA value from the
-// per-axis materialized bounds. `hc.zeros` / `hc.full` need a
-// concrete shape operand of this exact shape.
+// Shape operand for `hc.zeros` / `hc.full`.
 static Value buildShapeTuple(OpBuilder &builder, Location loc,
                              ValueRange dims) {
   SmallVector<Type> elemTypes(
@@ -60,10 +49,7 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc,
   return HCTupleOp::create(builder, loc, tupleTy, dims);
 }
 
-// Build the per-axis offset attribute from a list of iter sym names:
-// `[#hc.expr<"i">, #hc.expr<"j">, ...]`. ixsimpl hash-conses
-// expressions, so building via `composeExprSym` keeps the printed
-// form canonical and shares storage across uses.
+// Per-axis offset attr from iter sym names; hash-consed via compose API.
 static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
                                          ArrayRef<StringAttr> names) {
   SmallVector<Attribute> exprs;
@@ -76,9 +62,7 @@ static ArrayAttr offsetArrayFromIterSyms(MLIRContext *ctx, sym::Store &store,
   return ArrayAttr::get(ctx, exprs);
 }
 
-// Pull the symbolic shape off a tensor/vector operand. Returns
-// failure rather than emitting — callers fold it into a leave-as-is
-// outcome so this pass is a no-op on pre-inference fragments.
+// Failure = no-op on pre-inference fragments.
 static FailureOr<SmallVector<ExprAttr>> getOperandShape(Value v) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(v.getType());
   if (!shaped)
@@ -97,10 +81,7 @@ static FailureOr<SmallVector<ExprAttr>> getOperandShape(Value v) {
   return dims;
 }
 
-// (kind, elementType) pairs handled in v0. Sum works on float and
-// integer; max / min are float only — integer max/min identity needs
-// a signed-vs-unsigned slot decision and the matching combinator
-// op, which is a separate piece of work.
+// Sum: float + int. Max / min: float only (int needs sign decision).
 static bool reduceComboSupported(ReduceKind kind, Type elem) {
   bool isFloat = isa<FloatType>(elem);
   bool isInt = isa<IntegerType>(elem);
@@ -114,17 +95,9 @@ static bool reduceComboSupported(ReduceKind kind, Type elem) {
   return false;
 }
 
-// Identity fill matching the reduce kind. Sum -> 0 (`hc.zeros` for
-// floats, `hc.full <0>` for ints); max -> -inf; min -> +inf. Caller
-// pre-validates with `reduceComboSupported`.
-//
-// `resultTy` is the reduce-generic outs type — a
-// `SymbolicallyShapedTypeInterface` carrier (post `hc-decompose-shaped-values`
-// the data half of a split is a bare `!hc.bare_tensor`; isolated unit-test
-// pipelines that skip decompose still pin semantic `!hc.tensor` here).
-// Threading the interface keeps the helper flavour-agnostic; element type comes
-// from the interface accessor and feeds straight into `HCZerosOp` / `HCFullOp`,
-// which accept any `HC_ValueType` result.
+// Identity per kind: sum → 0, max → -inf, min → +inf. Interface dispatch
+// covers bare and semantic carriers uniformly. Caller pre-validates with
+// `reduceComboSupported`.
 static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
                                     ReduceKind kind, Type resultTy,
                                     Value shape) {
@@ -149,9 +122,7 @@ static Value emitReduceIdentityFill(OpBuilder &builder, Location loc,
                           /*layout=*/LayoutAttr{});
 }
 
-// Combinator used by `hc.reduce` body. Caller pre-validates with
-// `reduceComboSupported`, so element type is float for max/min and
-// either float or integer for sum.
+// Caller pre-validates; element type matches `reduceComboSupported`.
 static Value emitReduceCombine(OpBuilder &builder, Location loc,
                                ReduceKind kind, Value acc, Value cur) {
   switch (kind) {
@@ -165,9 +136,7 @@ static Value emitReduceCombine(OpBuilder &builder, Location loc,
   llvm_unreachable("reduceComboSupported gating skipped");
 }
 
-// Insert an `hc.astype` if the source's element type differs from
-// `target`. The block arg type doubles as the source element type
-// because `hc.generic` lowers per-element work in scalar form.
+// `hc.astype` if needed; block arg is element-typed.
 static Value promoteScalar(OpBuilder &builder, Location loc, Value v,
                            Type target) {
   if (v.getType() == target)
@@ -175,18 +144,15 @@ static Value promoteScalar(OpBuilder &builder, Location loc, Value v,
   return HCAsTypeOp::create(builder, loc, target, v, TypeAttr::get(target));
 }
 
-// M / N / K dimensions extracted from a v0-rank-2 matmul whose operand
-// and result shapes have been shape-agreement-checked.
+// M / N / K from a rank-2 matmul (operand and result shapes agree).
 struct MatmulShape {
   ExprAttr mDim;
   ExprAttr nDim;
   ExprAttr kDim;
 };
 
-// Rank-2 + shape-agreement check across lhs, rhs, out. K must agree
-// between operands; M and N must agree across inputs and output. A
-// shape disagreement is a hard `failure()` so the caller can leave
-// the original op for downstream diagnostics.
+// Rank-2 + shape agreement (K between operands, M/N across in+out).
+// Disagreement → failure; caller leaves op for downstream diagnostics.
 static FailureOr<MatmulShape> validateMatmulShape(HCMatmulOp op) {
   auto lhsShape = getOperandShape(op.getLhs());
   auto rhsShape = getOperandShape(op.getRhs());
@@ -201,7 +167,7 @@ static FailureOr<MatmulShape> validateMatmulShape(HCMatmulOp op) {
   ExprAttr nDim = (*rhsShape)[1];
   ExprAttr mOut = (*outShape)[0];
   ExprAttr nOut = (*outShape)[1];
-  // ExprHandle defines `==` only; pre-C++20 doesn't synthesize `!=`.
+  // `ExprHandle` defines `==` only.
   if (!(kDim.getValue() == kDim2.getValue()) ||
       !(mDim.getValue() == mOut.getValue()) ||
       !(nDim.getValue() == nOut.getValue()))
@@ -209,9 +175,7 @@ static FailureOr<MatmulShape> validateMatmulShape(HCMatmulOp op) {
   return MatmulShape{mDim, nDim, kDim};
 }
 
-// v0 only accepts a uniform arith family across operands. Mixed FP / int
-// won't promote cleanly via `hc.astype` for the matmul body without
-// picking a sign convention; we punt in that case.
+// Uniform arith family only (mixed FP / int needs sign convention).
 static bool matmulElementsSupported(Type lhsElem, Type rhsElem, Type outElem) {
   if (!isa<FloatType, IntegerType>(outElem))
     return false;
@@ -219,13 +183,8 @@ static bool matmulElementsSupported(Type lhsElem, Type rhsElem, Type outElem) {
          isa<FloatType>(outElem) == isa<FloatType>(rhsElem);
 }
 
-// Rewrite a single `hc.matmul lhs, rhs -> out` into an `hc.zeros` +
-// `hc.generic` pair. v0 only handles rank-2 operands and a uniform
-// arith family on inputs and output (all-float or all-int). Mixed
-// input element types promote through `hc.astype` to the output
-// element type. Returns failure (and leaves the op alone) on
-// anything unsupported so the original op survives for downstream
-// diagnostics.
+// Rank-2 + uniform arith only; mixed inputs `hc.astype`-promote to
+// output element type. Failure leaves op for downstream diagnostics.
 static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   FailureOr<MatmulShape> shapeDims = validateMatmulShape(op);
   if (failed(shapeDims))
@@ -234,11 +193,7 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   ExprAttr nDim = shapeDims->nDim;
   ExprAttr kDim = shapeDims->kDim;
 
-  // Same interface-dispatch story as `rewriteReduce`: production
-  // pipelines deliver bare `!hc.bare_tensor` carriers post
-  // `hc-decompose-shaped-values`; isolated unit-test pipelines that
-  // skip decompose still pin semantic `!hc.tensor`. Going through
-  // the interface keeps the rewrite flavour-agnostic.
+  // Interface dispatch covers bare and semantic carriers uniformly.
   auto lhsTy = dyn_cast<SymbolicallyShapedTypeInterface>(op.getLhs().getType());
   auto rhsTy = dyn_cast<SymbolicallyShapedTypeInterface>(op.getRhs().getType());
   auto outTy =
@@ -259,8 +214,7 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   Value nBound = materializeIdxBound(builder, loc, nDim);
   Value kBound = materializeIdxBound(builder, loc, kDim);
   Value shape = buildShapeTuple(builder, loc, {mBound, nBound});
-  // Sum identity matches the matmul accumulator for both float and
-  // integer flavours.
+  // Sum identity matches the matmul accumulator for both float and int.
   Value fill =
       emitReduceIdentityFill(builder, loc, ReduceKind::Sum, outTy, shape);
 
@@ -287,8 +241,7 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
       ValueRange(outsArr), /*ambient_idxs=*/ValueRange{},
       /*ambient_idx_syms=*/ArrayAttr::get(ctx, {}), insOffsets, outsOffsets);
 
-  // Body: %p = lhs * rhs (with astype-promotion to the accumulator
-  // element type), %s = acc + %p, yield %s.
+  // Body: prod = lhs * rhs (astype-promoted), acc += prod.
   Block *body = new Block();
   BlockArgument av = body->addArgument(lhsElem, loc);
   BlockArgument bv = body->addArgument(rhsElem, loc);
@@ -306,18 +259,14 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   return success();
 }
 
-// Validated reduce input/output shapes and the reduction axis. The
-// per-axis-dim agreement (input minus `axis` equals output) has been
-// verified.
+// Input minus `axis` equals output; rank and per-axis dims verified.
 struct ReduceShape {
   SmallVector<ExprAttr> valShape;
   SmallVector<ExprAttr> outShape;
   uint64_t axis;
 };
 
-// v0 acceptance: keepdims=false, valid axis, rank-1-smaller result with
-// non-axis dims matching positionally. Anything off the path is left
-// alone for downstream diagnostics.
+// Accepts: keepdims=false, valid axis, rank-1-smaller, positional dim agree.
 static FailureOr<ReduceShape> validateReduceShape(HCReduceOp op) {
   if (op.getKeepdims())
     return failure();
@@ -340,9 +289,7 @@ static FailureOr<ReduceShape> validateReduceShape(HCReduceOp op) {
   return ReduceShape{std::move(*vs), std::move(*os), axis};
 }
 
-// Build parallel iter sym names (`i_<n>`) and bound values for every
-// non-axis input position in input order. The reduction sym (`r`) is
-// the caller's concern — it's a single name independent of the rank.
+// One parallel iter (`i_<n>`) per non-axis position; reduction sym separate.
 static void buildReduceParallelIters(OpBuilder &builder, Location loc,
                                      MLIRContext *ctx,
                                      ArrayRef<ExprAttr> valShape, uint64_t axis,
@@ -358,8 +305,7 @@ static void buildReduceParallelIters(OpBuilder &builder, Location loc,
   }
 }
 
-// Per-axis offsets for the reduce input: parallel iters fill non-axis
-// positions in input order; the reduction iter fills `axis`.
+// Parallel iters at non-axis positions; reduction iter at `axis`.
 static ArrayAttr buildReduceInputOffsets(MLIRContext *ctx, sym::Store &store,
                                          size_t inputRank, uint64_t axis,
                                          ArrayRef<StringAttr> parallelSyms,
@@ -377,10 +323,7 @@ static ArrayAttr buildReduceInputOffsets(MLIRContext *ctx, sym::Store &store,
   return ArrayAttr::get(ctx, inAxisExprs);
 }
 
-// Rewrite a single `hc.reduce val, kind, axis -> out` into an
-// identity fill + `hc.generic`. v0 only handles `keepdims = false`,
-// floats fully (sum / max / min) and integer sum. Other shapes
-// leave the op alone for downstream diagnostics.
+// Accepts keepdims=false; floats fully, int sum only. Failure leaves op.
 static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   FailureOr<ReduceShape> shape = validateReduceShape(op);
   if (failed(shape))
@@ -388,19 +331,14 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   ArrayRef<ExprAttr> valShape = shape->valShape;
   uint64_t axis = shape->axis;
 
-  // Operand and result are `SymbolicallyShapedTypeInterface` carriers.
-  // In the production schedule they're bare post `hc-decompose-shaped-values`;
-  // unit-test pipelines that skip decompose still pin semantic forms here.
-  // The rewrite is structural over the reduce shape so the interface
-  // dispatch covers both without branching.
+  // Interface dispatch covers bare and semantic carriers.
   auto valTy =
       dyn_cast<SymbolicallyShapedTypeInterface>(op.getValue().getType());
   auto outTy =
       dyn_cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
   if (!valTy || !outTy)
     return failure();
-  // Reduction-to-scalar (rank 0 result with non-shaped result type)
-  // would need a different output carrier; leave it for now.
+  // Rank-0 result needs a different output carrier; skipped.
   if (valTy.getSymbolicElementType() != outTy.getSymbolicElementType())
     return failure();
   Type elem = outTy.getSymbolicElementType();
@@ -411,11 +349,7 @@ static LogicalResult rewriteReduce(HCReduceOp op, sym::Store &store) {
   Location loc = op.getLoc();
   OpBuilder builder(op);
 
-  // Materialize iter bounds in iter-sym order: parallel iters track
-  // every non-`axis` input dimension in input order, then a single
-  // reduction iter for `axis`. Naming uses `i_<n>` for parallels and
-  // `r` for the reduction so the printed IR reads cleanly even for
-  // large ranks.
+  // Bounds in iter-sym order: parallels (non-axis), then `axis` reduction.
   SmallVector<StringAttr> parallelSyms;
   SmallVector<Value> parallelBounds;
   buildReduceParallelIters(builder, loc, ctx, valShape, axis, parallelSyms,
@@ -474,8 +408,7 @@ struct HCShapedComputeToGenericPass
     Operation *root = getOperation();
     auto &store =
         root->getContext()->getOrLoadDialect<HCDialect>()->getSymbolStore();
-    // Collect first, mutate after — `op->erase()` inside the walk
-    // would invalidate the iterator the walk is driving.
+    // Collect first; erase-in-walk invalidates the iterator.
     SmallVector<HCMatmulOp> matmuls;
     SmallVector<HCReduceOp> reduces;
     root->walk([&](Operation *op) {

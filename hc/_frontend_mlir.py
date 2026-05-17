@@ -55,24 +55,18 @@ class HCFrontEmitter:
     def __init__(self, *, context: Any | None = None) -> None:
         self._context = ir.Context() if context is None else context
         hc_front.register_dialects(self._context)
-        # The semantic ``hc`` dialect rides on the same context so the
-        # resolver can stamp typed ``#hc.expr`` / ``#hc.layout`` payloads
-        # built straight from Python ``IndexMap`` captures (see
-        # ``hc/_resolve.py`` → "Python -> MLIR attribute construction").
-        # Without this the parser would refuse the structured forms with
-        # "unregistered dialect" and force a textual round-trip through
-        # ``-convert-hc-front-to-hc``.
+        # `hc` on the same context so the resolver can stamp typed
+        # `#hc.expr` / `#hc.layout`; otherwise parser rejects with
+        # "unregistered dialect".
         hc.register_dialects(self._context)
         self._filename = "<unknown>"
         self._module: Any | None = None
         self._blocks: list[Any] = []
         self._frames: list[_Frame] = []
         self._value_type = hc_front.ValueType.get(self._context)
-        # Lazily-created sibling top-level `builtin.module` that aggregates
-        # `transform.named_sequence` recipes for every intrinsic-with-lowerings
-        # encountered during this lowering. Stays None when no intrinsic
-        # surfaces target lowerings, keeping the dump stable for unrelated
-        # tests.
+        # Lazily-created sibling `builtin.module` collecting
+        # `transform.named_sequence` recipes for intrinsics-with-lowerings;
+        # `None` keeps the IR dump stable when no recipes fire.
         self._intrinsic_lowerings_block: Any | None = None
 
     @property
@@ -585,10 +579,8 @@ class HCFrontEmitter:
         )
         self._set_optional_string_attr(op, "returns", payload.get("returns"))
         self._set_optional_toplevel_metadata_attrs(op, payload.get("metadata"))
-        # `ref` on a top-level op is used by `-hc-front-inline` to spot
-        # undecorated helpers tagged `{kind = "inline"}` — same payload
-        # shape as the per-site `ref` stamped by the resolver on name
-        # ops, just rehomed on the function itself.
+        # Top-level `ref` lets `-hc-front-inline` spot `{kind="inline"}`
+        # helpers. Same payload shape as per-site `ref`.
         self._set_optional_ref_attr(op, payload.get("ref"))
 
     def _set_region_metadata_attrs(
@@ -608,11 +600,9 @@ class HCFrontEmitter:
             payload.get("parameter_annotations"),
             self._region_launch_context(kind),
         )
-        # The region's source-level name (the inner `def`'s identifier).
-        # `-hc-front-fold-region-defs` uses it to pair a region with the
-        # ghost `hc_front.name {ref = {kind = "local"}} + hc_front.call`
-        # trail emitted when Python writes `inner()` right after
-        # `def inner(...)`.
+        # Inner `def`'s identifier; `-hc-front-fold-region-defs` pairs
+        # the region with the ghost name+call trail Python emits when a
+        # region def is followed by `inner()`.
         self._set_optional_string_attr(op, "name", payload.get("name"))
 
     def _set_optional_parameters_attr(
@@ -694,13 +684,9 @@ class HCFrontEmitter:
             self._set_parameter_launch_context(parameter, launch_context)
         layout = record.get("layout")
         if layout is not None:
-            # Captured `IndexMap` overriding the boundary's default
-            # fully-strided layout. Build the same `kind = "layout"`
-            # `DictionaryAttr` shape body-level layout refs use, so
-            # `parameterTypeFromDict` on the C++ side can route both
-            # through `layoutAttrFromRef`. Local import keeps `_resolve`
-            # off the cold-path import chain for callers that never
-            # build a layout-bearing kernel.
+            # Build the same `kind="layout"` `DictionaryAttr` body-level
+            # refs use; C++ routes both through `layoutAttrFromRef`.
+            # Lazy import: cold-path for callers without layouts.
             from ._resolve import build_index_map_layout_dict_attr
             from .core import IndexMap
 
@@ -730,7 +716,7 @@ class HCFrontEmitter:
         return None
 
     def _launch_context_from_annotation(self, annotation: str) -> str | None:
-        # Accept simple names and module-qualified names in source-only entrypoints.
+        # Bare and module-qualified names from source-only entrypoints.
         return _ANNOTATION_LAUNCH_CONTEXTS.get(annotation.rsplit(".", 1)[-1])
 
     def _set_parameter_launch_context(
@@ -842,11 +828,9 @@ class HCFrontEmitter:
         return ir.DictAttr.get(entries, context=self._context)
 
     def _emit_intrinsic_lowering_recipes(self, value: object) -> None:
-        # Recipes ride along as real `transform.named_sequence` ops inside a
-        # sibling top-level `builtin.module @__hc_intrinsic_lowerings__`. The
-        # transform interpreter pass walks them by symbol; symbol names encode
-        # `<intrinsic>_<target>` so we don't need a string DictAttr to carry
-        # the binding.
+        # Recipes land as real `transform.named_sequence` ops in a
+        # sibling `builtin.module @__hc_intrinsic_lowerings__`. Symbol
+        # names encode `<intrinsic>_<target>` — no DictAttr needed.
         if value is None:
             return
         if isinstance(value, str | bytes) or not isinstance(value, Sequence):
@@ -888,9 +872,8 @@ class HCFrontEmitter:
         return block
 
     def _set_optional_i32_attr(self, op: Any, name: str, value: object) -> None:
-        # Symmetrical with sibling _set_optional_* helpers: loud on bad
-        # payload so a serializer regression is caught at emit time, not
-        # in the eventual hc_front -> hc pass.
+        # Loud on bad payload: catch serializer regressions at emit, not
+        # in the `hc_front -> hc` pass.
         if isinstance(value, bool) or not isinstance(value, int):
             raise RuntimeError(
                 f"frontend metadata '{name}' must be a non-bool int, got {value!r}"
@@ -912,10 +895,8 @@ class HCFrontEmitter:
             )
 
     def _set_optional_ref_attr(self, op: Any, value: object) -> None:
-        # `ref` keys are always strings; values are the JSON-like leaves
-        # accepted by ``_ref_value_attr`` (str / int / bool / sequence[str]).
-        # Kinds are disambiguated by their payload shape during the
-        # hc_front -> hc pass, not inside hc_front itself.
+        # Keys: str. Values: str/int/bool/sequence[str]. Kinds
+        # disambiguate by payload shape during `hc_front -> hc`.
         if value is None:
             return
         if not isinstance(value, Mapping):
@@ -934,8 +915,7 @@ class HCFrontEmitter:
         if isinstance(value, str):
             return self._string_attr(value)
         if isinstance(value, bool | int):
-            # Drop bools together with ints — both serialize via i64 so the
-            # pass gets stable numeric payloads.
+            # bool ⊂ int; both serialize as i64 for stable payloads.
             return ir.IntegerAttr.get(
                 ir.IntegerType.get_signless(64, context=self._context),
                 int(value),

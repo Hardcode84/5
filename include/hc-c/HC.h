@@ -12,34 +12,22 @@
 extern "C" {
 #endif
 
-// Dialect handle for the `hc` semantic dialect. Load it onto an MLIR
-// context alongside `hc_front` before parsing modules that have already
-// been lowered past `-convert-hc-front-to-hc`.
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HC, hc);
 
-// Register hc's own three pass families (hc-front transforms, hc-front→hc
-// conversion, hc transforms) into the process-wide pass registry.
-// Idempotent — repeated calls from the same process are safe.
-//
-// Upstream MLIR passes (transform-interpreter, canonicalize, ...) are NOT
-// registered here: the Python bindings already do that via
-// `_mlirRegisterEverything`'s site initialization, and re-registering
-// would double-register pipelines and abort. Callers driving this from
-// outside a Python process should instead call `mlir::registerAllPasses()`
-// themselves once before `mlirRegisterHCAllPasses`.
+// Register hc's three pass families (front transforms, front→hc conversion,
+// hc transforms). Idempotent. Does NOT register upstream MLIR passes — Python
+// bindings do that via `_mlirRegisterEverything`; non-Python callers must
+// call `mlir::registerAllPasses()` themselves first.
 MLIR_CAPI_EXPORTED void mlirRegisterHCAllPasses(void);
 
-// Append HC's Transform dialect extension to an MLIR dialect registry. The
-// extension injects `transform.hc.*` recipe ops into the upstream Transform
-// dialect; append it before parsing transform libraries that use those ops.
+// Append the `transform.hc.*` extension. Required before parsing transform
+// libraries that use those ops.
 MLIR_CAPI_EXPORTED void
 mlirRegisterHCTransformDialectExtension(MlirDialectRegistry registry);
 
-// Append HC's "load these upstream dialects when HC is loaded" extensions to
-// a registry. Currently this force-loads `dlti` so that passes dispatched
-// from within `transform-interpreter` (notably `gpu-to-llvm`) don't trip the
-// multi-threaded dialect-load guard the first time they query
-// `dlti.dl_spec` for a pointer width.
+// Force-load `dlti` alongside HC. Avoids the multi-threaded dialect-load
+// trip when `gpu-to-llvm` queries `dlti.dl_spec` from inside
+// `transform-interpreter`.
 MLIR_CAPI_EXPORTED void
 mlirRegisterHCDependentDialectExtensions(MlirDialectRegistry registry);
 

@@ -251,12 +251,11 @@ def test_context_mismatch_raises() -> None:
 
 
 def test_floor_ceil_propagate_non_default_context() -> None:
-    # `Symbol // int` and `Symbol % int` (and their floor/ceil
-    # building blocks) must succeed for symbols whose context is not
-    # the module-default one; `_resolve._index_map_ref` builds a fresh
-    # `Context()` per IndexMap classification, so any non-default-ctx
-    # failure here cascades into "layout descriptor offset(...) raised
-    # ContextMismatchError" at the use site.
+    # `Symbol // int`, `Symbol % int`, and their floor/ceil building
+    # blocks must work for non-default contexts. `_resolve._index_map_ref`
+    # builds a fresh `Context()` per `IndexMap` classification, so
+    # non-default-ctx failure here cascades into "layout descriptor
+    # offset(...) raised ContextMismatchError" at the use site.
     ctx = hs.Context()
     syms = hs.SymbolNamespace(ctx)
     lane = syms["lane"]
@@ -268,7 +267,7 @@ def test_floor_ceil_propagate_non_default_context() -> None:
     ceiled = hs.ceil(lane / 16)
     assert ceiled.ctx is ctx
 
-    # Composed forms — the WMMA per-lane fragment offset shape.
+    # Composed: WMMA per-lane fragment offset shape.
     offset = (lane // 16 + fi * 2) * 16 + (lane % 16)
     assert offset.ctx is ctx
 

@@ -2,15 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-interpret-intrinsic-recipes`. The frontend emitter plants
-// target lowering recipes as real `transform.named_sequence` ops inside a
-// sibling top-level `builtin.module @__hc_intrinsic_lowerings__`. This pass
-// is the matching consumer: it walks that module, applies every sequence
-// whose `hc.target` attribute matches the requested target against the
-// outer payload, then erases the lowerings module so downstream passes
-// don't see stray transform IR. Any `hc.call_intrinsic` that survives the
-// rewriting wave is surfaced as a hard error — silent passthrough would
-// just relocate the bug to the next pass.
+// Implements `-hc-interpret-intrinsic-recipes`. Walks the sibling
+// `__hc_intrinsic_lowerings__` module, applies every transform sequence
+// whose `hc.target` matches against the outer payload, then erases the
+// module. Surviving `hc.call_intrinsic` is a hard error.
 
 #include "hc/Transforms/Passes.h"
 
@@ -40,10 +35,7 @@ constexpr StringRef kLoweringsModuleSym = "__hc_intrinsic_lowerings__";
 constexpr StringRef kSequenceTargetAttrName = "hc.target";
 
 static ModuleOp findLoweringsModule(ModuleOp root) {
-  // The frontend always plants the lowerings module at top level, but we
-  // accept it anywhere directly under the pass root just to keep this
-  // robust if the layout shifts. We don't recurse — nested kernels keep
-  // their own modules out of bounds.
+  // Direct children only; nested kernels keep their own modules.
   ModuleOp result;
   for (Operation &op : *root.getBody()) {
     auto child = dyn_cast<ModuleOp>(op);
@@ -91,21 +83,14 @@ public:
     if (loweringsModule) {
       if (failed(applyAllRecipes(root, loweringsModule, targetRef)))
         return signalPassFailure();
-      // The recipes are spent — keeping the module around would just
-      // confuse downstream passes that don't know about transform IR.
+      // Recipes spent — clear before downstream sees transform IR.
       loweringsModule.erase();
     }
 
     if (failed(diagnoseUncovered(root, targetRef)))
       return signalPassFailure();
 
-    // The intrinsic decl is a symbol op the recipe machinery only reads
-    // through `hc.call_intrinsic` users. Once every call site in the
-    // surrounding module has been rewritten, the decl is dead — and
-    // because `HCIntrinsicOp` carries the `Symbol` trait, regular
-    // canonicalize/DCE leaves it alone. Sweeping unused decls here keeps
-    // the post-interpretation IR free of stray HC ops without forcing
-    // every caller to add a separate symbol-DCE pass.
+    // `Symbol`-trait ops survive DCE; sweep dead intrinsic decls here.
     eraseUnusedIntrinsics(root);
   }
 
@@ -119,9 +104,7 @@ private:
       if (failed(transform::applyTransformNamedSequence(
               root.getOperation(), seq.getOperation(), loweringsModule,
               options))) {
-        // applyTransformNamedSequence already emitted a diagnostic at the
-        // failing op; re-attach context so the user knows which recipe
-        // tripped.
+        // Upstream already diagnosed; attach the recipe context.
         seq.emitError("failed to apply intrinsic lowering recipe '")
             << seq.getSymName() << "' for target '" << target << "'";
         return failure();
@@ -145,10 +128,7 @@ private:
   }
 
   void eraseUnusedIntrinsics(ModuleOp root) {
-    // Build the live-callee set in one walk so a second pass can erase
-    // anything it didn't see referenced. Walking calls is cheaper than
-    // calling `SymbolTable::symbolKnownUseEmpty` per intrinsic when there
-    // are many decls.
+    // One-walk reference scan; per-decl `symbolKnownUseEmpty` is O(n*k).
     llvm::StringSet<> liveCallees;
     root.walk(
         [&](HCCallIntrinsicOp call) { liveCallees.insert(call.getCallee()); });

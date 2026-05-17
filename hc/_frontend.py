@@ -2,16 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Restricted AST lowering helpers for the `hc_front` frontend boundary.
+"""Restricted AST lowering for the `hc_front` frontend boundary.
 
-This module owns source recovery, AST validation, and the shared visitor/emitter
-protocol for frontend lowering. `RecordingEmitter` remains an ephemeral test
-harness for visitor unit tests, while `lower_*_to_front_ir()` lowers the same
-restricted subset into real `hc_front` MLIR through the managed Python
-bindings. Unsupported syntax is rejected explicitly instead of being interpreted
-in Python. Collective-region capture lists are the only derived scope summary
-computed here, and they stay limited to naming outer bindings referenced by
-nested collective regions.
+Source recovery, AST validation, shared visitor/emitter protocol.
+`RecordingEmitter` is a test harness; `lower_*_to_front_ir()` emits real
+`hc_front` MLIR via the managed Python bindings. Unsupported syntax raises
+`FrontendError`. Collective regions track outer-binding captures only.
 """
 
 from __future__ import annotations
@@ -157,7 +153,7 @@ class FrontendEmitter(Protocol):
 
 
 class RecordingEmitter:
-    """Record a frontend-shaped event trace for visitor unit tests."""
+    """Frontend-shaped event trace for visitor unit tests."""
 
     def __init__(self) -> None:
         self.events: list[RecordedEvent] = []
@@ -182,7 +178,7 @@ class RecordingEmitter:
 
 
 def lower_function(fn: Any, emitter: FrontendEmitter) -> None:
-    """Recover a Python function's source and lower the supported subset."""
+    """Recover `fn`'s source and lower the supported subset."""
 
     source = _source_buffer_from_function(fn)
     module = _parse_source(source)
@@ -197,7 +193,7 @@ def lower_source(
     *,
     filename: str = "<memory>",
 ) -> None:
-    """Lower source text after dedenting it into a standalone module buffer."""
+    """Lower source text (dedented) as a standalone module buffer."""
 
     source_buffer = _source_buffer_from_text(source, filename=filename)
     module = _parse_source(source_buffer)
@@ -210,12 +206,7 @@ def lower_module(
     *,
     filename: str = "<memory>",
 ) -> None:
-    """Lower an existing AST module using its existing node coordinates.
-
-    This entrypoint does not rewrite the caller's AST and cannot provide source
-    text snippets for diagnostics unless the caller already attached them to the
-    AST elsewhere.
-    """
+    """Lower a pre-parsed AST module in place; no source-snippet diagnostics."""
 
     _lower_parsed_module(module, emitter, _opaque_source_buffer(filename))
 
@@ -225,10 +216,10 @@ def lower_function_to_front_ir(
     *,
     context: Any | None = None,
 ) -> Any:
-    """Lower a Python function directly into an `hc_front` MLIR module.
+    """Lower `fn` into an `hc_front` MLIR module.
 
-    Invalid frontend input raises `FrontendError`. Internal emitter invariant
-    failures still surface as `RuntimeError`.
+    Bad frontend input raises `FrontendError`; emitter invariant failures
+    raise `RuntimeError`.
     """
 
     emitter = _new_hc_front_emitter(context=context)
@@ -242,10 +233,9 @@ def lower_source_to_front_ir(
     filename: str = "<memory>",
     context: Any | None = None,
 ) -> Any:
-    """Lower source text directly into an `hc_front` MLIR module.
+    """Lower source text into an `hc_front` MLIR module.
 
-    Invalid frontend input raises `FrontendError`. Internal emitter invariant
-    failures still surface as `RuntimeError`.
+    Bad input -> `FrontendError`; emitter invariant failures -> `RuntimeError`.
     """
 
     emitter = _new_hc_front_emitter(context=context)
@@ -259,10 +249,9 @@ def lower_module_to_front_ir(
     filename: str = "<memory>",
     context: Any | None = None,
 ) -> Any:
-    """Lower a pre-parsed AST module directly into an `hc_front` MLIR module.
+    """Lower a pre-parsed AST module into an `hc_front` MLIR module.
 
-    Invalid frontend input raises `FrontendError`. Internal emitter invariant
-    failures still surface as `RuntimeError`.
+    Bad input -> `FrontendError`; emitter invariant failures -> `RuntimeError`.
     """
 
     emitter = _new_hc_front_emitter(context=context)
@@ -277,21 +266,16 @@ def lower_functions_to_front_ir(
     filename: str | None = None,
     per_function_overrides: Mapping[int, Mapping[str, object]] | None = None,
 ) -> Any:
-    """Lower several Python functions into one shared `hc_front` module.
+    """Lower several functions into one shared `hc_front` module.
 
-    Each function is re-parsed from its source and emitted as a separate
-    top-level op (`hc_front.kernel` / `hc_front.func` /
-    `hc_front.intrinsic`) in the returned module. The driver uses this to
-    package a kernel together with every `@kernel.func` /
-    `@kernel.intrinsic` it transitively invokes, plus any undecorated
-    inline helpers the resolver discovered.
+    Each `fn` becomes one top-level op (`hc_front.kernel`/`.func`/`.intrinsic`).
+    Driver uses this to pack a kernel with transitively-invoked helpers and
+    resolver-discovered inline helpers.
 
-    ``per_function_overrides`` — keyed by ``id(fn)`` — lets callers attach
-    extra per-top-level metadata that `_FrontendLowerer` splices into the
-    emitted op. The resolver uses it to force ``force_kind="func"`` and
-    stamp ``ref={"kind": "inline", ...}`` on undecorated helpers, which
-    makes them targetable by `-hc-front-inline` without needing a
-    decorator.
+    `per_function_overrides` (keyed by `id(fn)`): extra per-top-level metadata
+    spliced into the emitted op. Resolver uses it to force
+    `force_kind="func"` + `ref.kind="inline"` on undecorated helpers so
+    `-hc-front-inline` can target them.
     """
 
     if not fns:
@@ -308,13 +292,9 @@ def lower_functions_to_front_ir(
         combined = _function_overrides(fn)
         extra = overrides_by_id.get(id(fn))
         if extra:
-            # `_lower_toplevel` keys the override bag on the Python
-            # name (the AST `FunctionDef.name`), so we need a string
-            # here. Callers hitting the hot path — the resolver —
-            # always pass `types.FunctionType`s, but silently dropping
-            # the payload when `__name__` is weird would leave
-            # `force_kind` unapplied and the resulting IR misclassified.
-            # Loud, not lossy.
+            # `_lower_toplevel` keys the override bag on the AST
+            # `FunctionDef.name`. Reject non-string `__name__` loudly:
+            # silent drop would leave `force_kind` unapplied.
             name = getattr(fn, "__name__", None)
             if not isinstance(name, str):
                 raise RuntimeError(
@@ -322,8 +302,6 @@ def lower_functions_to_front_ir(
                     f"`__name__` is not a string (got {name!r}); override "
                     "payload cannot be keyed into the emitter bag"
                 )
-            # Merge into the by-name override bag that
-            # ``_lower_toplevel`` threads through to the emitter.
             slot = dict(combined.get(name, {}))
             slot.update(extra)
             combined = dict(combined)
@@ -376,8 +354,8 @@ class _FrontendLowerer:
         self._binding_stack: list[frozenset[str]] = []
         self._scope_stack: list[_RegionScope] = []
         self._callable_kind_stack: list[str] = []
-        # ``lower_function`` threads decorator metadata + resolved annotations
-        # here; source-only entry points pass ``None``.
+        # Decorator metadata + resolved annotations from `lower_function`;
+        # source-only entrypoints pass `None`.
         self._toplevel_overrides: Mapping[str, Mapping[str, object]] = (
             toplevel_overrides or {}
         )
@@ -388,9 +366,8 @@ class _FrontendLowerer:
         self._emitter.end_module()
 
     def lower_module_body(self, module: ast.Module) -> None:
-        # Split out from ``lower_module`` so ``lower_functions_to_front_ir``
-        # can append several functions into one already-opened module
-        # without re-running begin_module/end_module per fn.
+        # Split out so `lower_functions_to_front_ir` can append several
+        # fns into one open module without re-bracketing begin/end.
         for stmt in _strip_docstring(module.body):
             self._lower_toplevel(stmt)
 
@@ -401,10 +378,8 @@ class _FrontendLowerer:
             raise self._error("unsupported top-level statement", stmt)
         overrides = self._toplevel_overrides.get(stmt.name)
         forced = _peek_force_kind(overrides) if overrides else None
-        # ``force_kind`` bypasses the decorator sniff: undecorated inline
-        # helpers that the resolver chose to emit as `hc_front.func` use
-        # this path. Decorated top-levels never set ``force_kind``, so
-        # their decorator is still the source of truth.
+        # `force_kind` bypasses the decorator sniff for undecorated
+        # inline helpers; decorated tops never set it.
         kind = forced if forced is not None else _toplevel_kind(stmt, self._source)
         payload = _function_payload(stmt, self._source)
         if overrides:
@@ -473,10 +448,9 @@ class _FrontendLowerer:
         self._emitter.end_op("aug_assign", **payload)
 
     def _lower_return(self, stmt: ast.Return) -> None:
-        # `has_value` is the emitter contract: whether `hc_front.return`
-        # receives an SSA operand. Kernels are void, so literal `None` has
-        # the same shape as a bare `return`; funcs/intrinsics keep today's
-        # value-returning contract until their signatures model `-> None`.
+        # `has_value` = `hc_front.return` gets an SSA operand. Kernels
+        # are void, so `return None` shapes like bare `return`;
+        # funcs/intrinsics keep the value-returning contract.
         has_value = stmt.value is not None and not (
             self._is_kernel_body() and _is_none_literal(stmt.value)
         )
@@ -559,8 +533,7 @@ class _FrontendLowerer:
         node: ast.AST,
         body: Callable[[], None],
     ) -> None:
-        # These private region markers mirror MLIR-style nested regions without
-        # inventing a second semantic IR for the fake emitter.
+        # Private region markers mirror MLIR-style nested regions.
         payload = _node_payload(node)
         self._emitter.begin_op(kind, **payload)
         body()
@@ -577,8 +550,8 @@ class _FrontendLowerer:
     @_lower_expr.register
     def _lower_name_expr(self, expr: ast.Name) -> None:
         payload = _node_payload(expr, id=expr.id, ctx=_expr_context_name(expr.ctx))
-        # Only stamp refs on loads; stores/deletes become `hc_front.target_name`,
-        # whose classification is implicit in the containing assignment.
+        # Only stamp refs on loads; stores/deletes become
+        # `hc_front.target_name` and inherit classification.
         if isinstance(expr.ctx, ast.Load):
             ref = self._classify_name(expr.id)
             if ref is not None:
@@ -753,18 +726,14 @@ class _FrontendLowerer:
         self._scope_stack.pop()
 
     def _visible_bindings(self) -> frozenset[str]:
-        # Nested collective regions capture against every enclosing local scope,
-        # not just the immediately enclosing helper or region.
+        # Nested collective regions capture every enclosing scope.
         bindings: set[str] = set()
         for frame in self._binding_stack:
             bindings.update(frame)
         return frozenset(bindings)
 
     def _classify_name(self, name: str) -> dict[str, object] | None:
-        # Walk innermost -> outermost: an outer ``local`` that gets captured
-        # into an inner region is still semantically "a value flowing in via
-        # SSA" to that region, but for diagnostics we want the innermost
-        # matching kind first.
+        # Innermost -> outermost: diagnostics want the closest matching kind.
         for scope in reversed(self._scope_stack):
             if name in scope.params:
                 return {"kind": "param"}
@@ -827,7 +796,7 @@ class _BindingCollector(ast.NodeVisitor):
 
 
 class _CaptureCollector(ast.NodeVisitor):
-    """Collect names loaded from enclosing scopes within one region body."""
+    """Names loaded from enclosing scopes within one region body."""
 
     def __init__(self, *, outer: frozenset[str], local: frozenset[str]) -> None:
         self._outer = outer
@@ -850,13 +819,10 @@ class _CaptureCollector(ast.NodeVisitor):
         self._captures.append(node.id)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        # Nested function bodies define their own lexical scopes and therefore
-        # must not contribute captures to the current collective region.
-        return
+        return  # nested fn: own lexical scope.
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        # Nested async function bodies are separate scopes for capture purposes.
-        return
+        return  # nested async fn: own lexical scope.
 
 
 def _source_buffer_from_function(fn: Any) -> _SourceBuffer:
@@ -1120,13 +1086,10 @@ def _function_payload(
 
 
 def _peek_force_kind(overrides: Mapping[str, object]) -> str | None:
-    """Peek at a ``force_kind`` override without scrubbing the mapping.
+    """Return normalized `force_kind` (or `None`); leave mapping intact.
 
-    Returns the normalized kind string (one of the `_TOPLEVEL_KINDS`
-    values) or ``None`` if unset; leaves the override mapping alone so
-    downstream payload-merging still sees any other keys it consumed.
-    ``force_kind`` itself is harmless in the merged payload — the
-    emitter ignores unknown kwargs.
+    Emitter ignores unknown kwargs so `force_kind` is harmless if it
+    flows through.
     """
 
     value = overrides.get("force_kind")
@@ -1143,12 +1106,10 @@ def _peek_force_kind(overrides: Mapping[str, object]) -> str | None:
 
 
 def _function_overrides(fn: Any) -> dict[str, dict[str, object]]:
-    """Collect decorator metadata + resolved parameter annotations for ``fn``.
+    """Decorator metadata + resolved annotations, keyed by `__name__`.
 
-    Keyed by the function's ``__name__`` so the lowerer can match against the
-    top-level AST it re-parses from source. Empty mapping when nothing worth
-    overriding is available — this lets callers unconditionally forward the
-    result without the lowerer having to special-case source-only paths.
+    Empty mapping when nothing's worth overriding so callers can
+    forward unconditionally.
     """
 
     name = getattr(fn, "__name__", None)
@@ -1188,7 +1149,7 @@ def _serialize_kernel_metadata(meta: Any) -> dict[str, object]:
     if meta.subgroup_size is not None:
         result["subgroup_size"] = int(meta.subgroup_size)
     if meta.literals:
-        # Sort for stable round-trip; `frozenset` iteration order is nondeterministic.
+        # `frozenset` iteration order is nondeterministic; sort.
         result["literals"] = tuple(
             sorted(_literal_name(item) for item in meta.literals)
         )
@@ -1238,8 +1199,7 @@ def _shape_tuple(values: Iterable[Any]) -> tuple[str, ...]:
 
 
 def _literal_name(value: Any) -> str:
-    # `@kernel(literals=...)` accepts either `Symbol` objects (exposing `.name`)
-    # or already-textual symbol names; normalize both to the textual form.
+    # `literals=` accepts `Symbol` (`.name`) or `str`; normalize to text.
     name = getattr(value, "name", None)
     if isinstance(name, str):
         return name
@@ -1253,9 +1213,8 @@ def _scope_text(scope: Any) -> str | None:
 
     if isinstance(scope, Scope):
         return scope.name
-    # `WorkItem` / `SubGroup` are bare classes in `hc.core`; we key on their
-    # Python name rather than introducing a dedicated `Scope`-valued singleton
-    # so user code can keep writing `scope=WorkItem`.
+    # `WorkItem` / `SubGroup` are bare classes; key on `__name__` so
+    # users can keep writing `scope=WorkItem`.
     name = getattr(scope, "__name__", None)
     if isinstance(name, str):
         return name
@@ -1267,9 +1226,8 @@ def _collect_parameter_annotations(fn: Any) -> dict[str, dict[str, object]]:
     try:
         hints = inspect.get_annotations(fn, eval_str=True)
     except (NameError, AttributeError, SyntaxError, TypeError):
-        # PEP 563 strings can reference names not in scope at parse time
-        # (forward refs, missing helpers). Fall back to the raw mapping;
-        # string entries will fail the isinstance check below and be dropped.
+        # PEP 563 strings can reference out-of-scope names. Raw fallback;
+        # string entries fail the isinstance check and drop.
         hints = raw
     result: dict[str, dict[str, object]] = {}
     for name, value in hints.items():
@@ -1310,11 +1268,8 @@ def _serialize_buffer_spec(value: Any) -> dict[str, object]:
     if value.dtype is not None:
         record["dtype"] = value.dtype
     if value.layout is not None:
-        # Stash the raw `IndexMap` here; the emitter
-        # (`HCFrontEmitter._apply_structural_annotation`) is the one
-        # with an MLIR context handy and does the symbolic
-        # `IndexMap -> #hc.layout` conversion via the same helper that
-        # body-level `layout=` kwargs go through.
+        # Raw `IndexMap`; emitter does the `IndexMap -> #hc.layout`
+        # conversion via the same helper as body-level `layout=`.
         record["layout"] = value.layout
     return record
 
@@ -1345,9 +1300,7 @@ def _parameter_records(
     source: _SourceBuffer,
 ) -> tuple[tuple[str, str | None, str], ...]:
     _validate_arguments(args, source)
-    # Keep the source signature shape on every callable record. Most lowerings
-    # only need names today, but consumers that bind call operands must not
-    # rediscover Python's positional/keyword-only split from list position.
+    # Tag positional vs kw-only so callers don't infer from list index.
     positional = tuple(
         (arg.arg, _annotation_text(arg.annotation), _PASSING_POSITIONAL)
         for arg in args.args
@@ -1402,12 +1355,7 @@ def _function_bindings(
 
 @dataclass(frozen=True)
 class _RegionScope:
-    """Partitioned view of a region's own bindings, used to stamp name refs.
-
-    Outer-scope captures are intentionally not tracked here: the innermost
-    match wins during classification, and a captured name in an inner region
-    resolves against an outer ``_RegionScope`` frame.
-    """
+    """Region's own bindings for name-ref stamping; no outer captures."""
 
     params: frozenset[str]
     for_ivs: frozenset[str]
@@ -1426,7 +1374,7 @@ def _region_scope(fn: ast.FunctionDef, source: _SourceBuffer) -> _RegionScope:
 
 
 class _ForIVCollector(ast.NodeVisitor):
-    """Pick out names bound by ``for`` targets, skipping nested function bodies."""
+    """Names bound by `for` targets; skip nested function bodies."""
 
     def __init__(self) -> None:
         self.names: list[str] = []
@@ -1451,7 +1399,7 @@ class _ForIVCollector(ast.NodeVisitor):
         self.visit_block(node.orelse)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return  # Nested function bodies are separate regions.
+        return  # nested fn: separate region.
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         return
@@ -1505,7 +1453,7 @@ def _end_column(node: ast.AST) -> int | None:
 def _syntax_offset(column: int | None) -> int | None:
     if column is None:
         return None
-    # AST columns are zero-based; SyntaxError.offset is one-based.
+    # AST: 0-based; SyntaxError.offset: 1-based.
     return column + 1
 
 

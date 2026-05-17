@@ -90,11 +90,8 @@ static FailureOr<PredAttr> composePredAttr(ExprAttr lhs, sym::PredCmpOp op,
   return PredAttr::get(ctx, *handle);
 }
 
-// Leaf builders. These exist so the per-op inference helpers below
-// can stay terse and so we go through the same hash-consed leaves
-// any other producer in the dialect would — `composeExprInt(0)` and
-// `composeExprSym("$WG0")` give back canonical handles, and pointer
-// equality on those is the right comparison everywhere downstream.
+// Hash-consed leaves: pointer equality on canonical handle drives downstream
+// comparison.
 static FailureOr<ExprAttr> composeIntExprAttr(int64_t value,
                                               Operation *diagOp) {
   MLIRContext *ctx = diagOp->getContext();
@@ -118,11 +115,7 @@ static FailureOr<ExprAttr> composeSymExprAttr(StringRef name,
 }
 
 static FailureOr<Type> inferIntegerAttrAsIdx(IntegerAttr value, Operation *op) {
-  // ixsimpl's `IXS_INT` carries int64; reject wider IntegerAttrs up front
-  // instead of letting them silently truncate. The previous textual round-
-  // trip masked this — the integer was rendered with `toStringSigned` and
-  // re-parsed, where ixsimpl would either accept the truncation or fail
-  // with a generic diagnostic.
+  // IXS_INT is int64. Wider IntegerAttrs must not truncate.
   std::optional<int64_t> intValue = value.getValue().trySExtValue();
   if (!intValue) {
     SmallString<32> rendered;
@@ -153,10 +146,7 @@ static LogicalResult requireOperandCount(Operation *op, ArrayRef<Type> operands,
          << expected << " operand type fact(s), got " << operands.size();
 }
 
-// Idx-vs-idx arm of `inferIndexBinary`. Caller has already checked
-// that at least one operand is an `IdxType`; this resolves the
-// expression-composition and pinning cases and appends a single
-// result.
+// Caller guarantees ≥1 operand is IdxType.
 static LogicalResult
 inferIndexBinaryIdxArm(Type lhs, Type rhs, bool lhsIdx, bool rhsIdx,
                        sym::ExprBinaryOp opKind, Operation *op,
@@ -178,15 +168,7 @@ inferIndexBinaryIdxArm(Type lhs, Type rhs, bool lhsIdx, bool rhsIdx,
   return success();
 }
 
-// Same-rank NumPy-style broadcast on `#hc.shape<>` dim arrays. Returns
-// the broadcasted dim list, or failure when ranks differ or a pair of
-// non-`1` non-equal dims meet. Literal `1` is the broadcast neutral
-// element — the canonical `composeExprInt(1)` handle gives pointer
-// equality on the hash-consed `ExprAttr` so the per-axis test is one
-// comparison, no parser involved. Different-rank inputs aren't
-// supported yet: the front pass already aligns ranks via
-// `unit_axes` so they don't reach this helper, and NumPy's
-// left-padding rule needs more careful element-typing.
+// Same-rank NumPy broadcast. Frontend `unit_axes` aligns ranks beforehand.
 static FailureOr<SmallVector<Attribute>>
 broadcastShapeDims(ArrayRef<Attribute> lhs, ArrayRef<Attribute> rhs,
                    Operation *diagOp) {
@@ -219,11 +201,7 @@ broadcastShapeDims(ArrayRef<Attribute> lhs, ArrayRef<Attribute> rhs,
   return out;
 }
 
-// True iff `lhs` and `rhs` are the same HC shaped flavor (both
-// tensor / both bare-tensor / both vector / both bare-vector). The
-// elementwise rewriter only emits a result whose flavor matches the
-// operands, so cross-flavor binaries land on the diagnostic surface
-// instead of silently casting.
+// Cross-flavor binaries diagnose; no silent cast.
 static bool sameShapedFlavor(Type lhs, Type rhs) {
   if (isa<mlir::hc::TensorType>(lhs))
     return isa<mlir::hc::TensorType>(rhs);
@@ -236,11 +214,7 @@ static bool sameShapedFlavor(Type lhs, Type rhs) {
   return false;
 }
 
-// Rebuild a shaped HC type with a fresh shape and element. Layout is
-// always null — broadcasting on a non-identity layout has no obvious
-// result-side layout to carry and the elementwise rewriter doesn't
-// read layouts off the result. Caller has already verified that
-// `flavor` is one of the four shaped HC kinds.
+// Layout dropped: broadcast has no result-side layout.
 static Type rebuildShapedType(Type flavor, Type elementType, ShapeAttr shape) {
   MLIRContext *ctx = flavor.getContext();
   if (isa<mlir::hc::TensorType>(flavor))
@@ -252,11 +226,7 @@ static Type rebuildShapedType(Type flavor, Type elementType, ShapeAttr shape) {
   return mlir::hc::BareVectorType::get(ctx, elementType, shape, LayoutAttr{});
 }
 
-// Shaped binary inference: tensors / vectors of the same flavor.
-// Broadcast-aware — `[A, 1, C] op [1, B, C]` yields `[A, B, C]`.
-// Element type joins through `joinHCTypes` so a partly-inferred
-// `!hc.undef` element on one side picks up the concrete element from
-// the other.
+// Same flavor + broadcast. Element via joinHCTypes (undef → concrete).
 static FailureOr<Type> inferShapedBinaryResult(Type lhs, Type rhs,
                                                Operation *op) {
   if (!sameShapedFlavor(lhs, rhs))
@@ -313,8 +283,6 @@ static LogicalResult inferIndexBinary(ArrayRef<Type> operands,
   return success();
 }
 
-// Idx-vs-idx arm of `inferIndexCmp`. Mirror of
-// `inferIndexBinaryIdxArm` but yields a `PredType` result.
 static LogicalResult inferIndexCmpIdxArm(Type lhs, Type rhs, bool lhsIdx,
                                          bool rhsIdx, sym::PredCmpOp predKind,
                                          Operation *op,
@@ -410,9 +378,7 @@ static FailureOr<ExprAttr> composeDivExprAttr(ExprAttr lhs, ExprAttr rhs,
   return composeExprAttr(lhs, sym::ExprBinaryOp::Div, rhs, op);
 }
 
-// Bound-type → optional pinned `ExprAttr`. A null type means the bound
-// was elided (`std::nullopt`); a non-null type must carry a pinned
-// `IdxType` expression or we fail outright.
+// Null type = elided; non-null must pin to ExprAttr.
 static FailureOr<std::optional<ExprAttr>> optionalIdxExprAttr(Type t) {
   if (!t)
     return std::optional<ExprAttr>();
@@ -422,8 +388,7 @@ static FailureOr<std::optional<ExprAttr>> optionalIdxExprAttr(Type t) {
   return expr;
 }
 
-// `stop - start`, with `start` defaulting to 0 and `stop` defaulting
-// to the operand's base dim when the slice elides the bound.
+// stop - start. Elided start → 0, elided stop → baseDim.
 static FailureOr<ExprAttr> composeSliceViewExtent(ExprAttr baseDim,
                                                   std::optional<ExprAttr> lower,
                                                   std::optional<ExprAttr> upper,
@@ -436,8 +401,7 @@ static FailureOr<ExprAttr> composeSliceViewExtent(ExprAttr baseDim,
   return composeSubExprAttr(stop, start, op);
 }
 
-// `ceil(extent / step)`, with a fast path when `step == 1`. Caller
-// has already verified that a step was supplied.
+// ceil(extent / step); step==1 short-circuits.
 static FailureOr<ExprAttr> scaleSliceViewExtent(ExprAttr extent, ExprAttr step,
                                                 Operation *op) {
   FailureOr<ExprAttr> one = defaultOneExpr(op);
@@ -475,12 +439,7 @@ static FailureOr<ExprAttr> inferSliceViewDim(ExprAttr baseDim, SliceType slice,
 }
 
 namespace {
-// Accumulator for symbolic-leaf substitutions inside a
-// `hc.buffer_view` layout rewrite. Holds the parallel
-// `targets[i] -> replacements[i]` arrays in the raw form
-// `ixs_subs_multi` expects, plus helpers to (a) extend the lists
-// from named-symbol replacements and (b) apply them to an
-// `ExprAttr`.
+// Parallel target/replacement arrays in raw form for ixs_subs_multi.
 struct LayoutSubBuilder {
   MLIRContext *ctx;
   sym::Store &store;
@@ -516,10 +475,7 @@ struct LayoutSubBuilder {
 };
 } // namespace
 
-// Cross-check that every per-axis input array is rank-aligned with
-// `baseDims` so we don't accidentally substitute against a
-// partially-typed source (rank-0 placeholder + layout, retype
-// intermediate, ...).
+// All per-axis arrays must rank-align with baseDims.
 static LogicalResult verifyBufferViewLayoutRanks(
     ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> indexSyms,
     ArrayRef<Attribute> baseDims, ArrayRef<bool> keepAxis,
@@ -533,9 +489,8 @@ static LogicalResult verifyBufferViewLayoutRanks(
   return success();
 }
 
-// Non-trivial slice axes substitute the index sym with
-// `lower + step * index_sym`. Caller has already established that at
-// least one of (lower, step) departs from (0, 1).
+// Non-trivial slice axes: index_sym ↦ lower + step*index_sym.
+// Caller has confirmed (lower, step) ≠ (0, 1).
 static LogicalResult appendSliceIndexRebind(LayoutSubBuilder &builder,
                                             StringRef indexName,
                                             ExprAttr lowerExpr,
@@ -558,16 +513,12 @@ static LogicalResult appendSliceIndexRebind(LayoutSubBuilder &builder,
   return success();
 }
 
-// Kept (sliced) axis: drive the shape-sym / index-sym rebinds dictated
-// by the slice's per-axis policy. Caller has already pushed the
-// shape/index slot into the residual layout's lists.
+// Kept axis: shape-sym/index-sym rebinds per slice policy. Slot pre-pushed.
 static LogicalResult composeKeptAxisSubstitutions(
     LayoutSubBuilder &builder, Attribute baseDim, Attribute shapeSymAttr,
     Attribute indexSymAttr, ExprAttr lowerExpr, ExprAttr stepExpr,
     bool sliceShapeChanged, ExprAttr zeroAttr, ExprAttr oneAttr) {
-  // Pass-through axes (more axes than subscripts) have empty slice
-  // exprs and structurally cannot have a shape change; they shortcut
-  // to the trivial-slice "no substitution" branch.
+  // Pass-through axes (more axes than subscripts): no substitution.
   if (!lowerExpr || !stepExpr)
     return success();
   auto dimExpr = dyn_cast<ExprAttr>(baseDim);
@@ -584,9 +535,8 @@ static LogicalResult composeKeptAxisSubstitutions(
   return appendSliceIndexRebind(builder, indexName, lowerExpr, stepExpr);
 }
 
-// Scalar-indexed axis: substitute both the shape sym (operand dim)
-// and the index sym (scalar value). The slot is dropped from the
-// residual's lists.
+// Scalar-indexed axis: shape_sym ↦ dim, index_sym ↦ scalar. Drops from
+// residual.
 static LogicalResult composeScalarAxisSubstitutions(LayoutSubBuilder &builder,
                                                     Attribute baseDim,
                                                     Attribute shapeSymAttr,
@@ -602,10 +552,7 @@ static LogicalResult composeScalarAxisSubstitutions(LayoutSubBuilder &builder,
   return builder.pushSymPair(indexName, scalarExpr.getValue());
 }
 
-// Rewrite every `ExprAttr` value inside `params` through `builder`;
-// non-expr entries pass through untouched. Returns the rebuilt
-// dictionary (empty when `params` was null) so the layout's params
-// continue to refer to canonical handles after the rebind.
+// Rewrite each ExprAttr in params via builder; non-expr pass through.
 static FailureOr<DictionaryAttr>
 rewriteLayoutParams(DictionaryAttr params, const LayoutSubBuilder &builder,
                     MLIRContext *ctx) {
@@ -627,10 +574,7 @@ rewriteLayoutParams(DictionaryAttr params, const LayoutSubBuilder &builder,
   return DictionaryAttr::get(ctx, newParams);
 }
 
-// Walk each axis, push the appropriate substitution into `builder`
-// and (for kept axes) record the residual layout's slot in
-// `remainShapeSyms`/`remainIndexSyms`. Caller has already verified
-// rank alignment across all per-axis arrays.
+// Per-axis: push sub into builder; record residual slot for kept axes.
 static LogicalResult composeBufferViewAxes(
     LayoutSubBuilder &builder, ArrayRef<Attribute> baseDims,
     ArrayRef<Attribute> shapeSyms, ArrayRef<Attribute> indexSyms,
@@ -658,34 +602,13 @@ static LogicalResult composeBufferViewAxes(
   return success();
 }
 
-// Compose `sourceLayout` against a `hc.buffer_view`'s per-axis
-// disposition. The substitution rules per axis:
-//
-//   * Scalar-indexed axes: substitute `index_syms[k]` with the
-//     scalar's `IdxType` expression and `shape_syms[k]` with the
-//     operand's actual dim expression, then drop both names from the
-//     residual layout's slot lists.
-//   * Trivial-slice axes (`[:]`, `[0:dim:1]` — sliced extent equals
-//     the operand's dim, lower defaults to 0, step defaults to 1):
-//     keep both slots in the residual, no substitution. The original
-//     index/shape sym names continue to refer to the operand's axis
-//     k.
-//   * Non-trivial slice axes (`[lo:hi:st]` where any of lower /
-//     upper / step departs from the trivial defaults): substitute
-//     `index_syms[k]` with `lower + step * index_syms[k]` and (if the
-//     sliced extent differs from the operand's dim) substitute
-//     `shape_syms[k]` with the operand's dim expression. Both slots
-//     remain in the residual's lists to satisfy
-//     `shape_syms.size() == index_syms.size() == rank`; the
-//     substituted names are reachable through their handles in the
-//     rebound expressions but no longer appear as bare references in
-//     the offset / storage_size / params formulas.
-//   * Implicit pass-through axes (more axes than subscript entries):
-//     keep both slots, no substitution. Same as trivial slices.
-//
-// The substitution also runs through every `ExprAttr` in the params
-// dict so derived params (`row_stride = 4 + d1`) stay well-formed
-// against the residual shape sym set.
+// Per-axis layout rewrite for `hc.buffer_view`:
+//   scalar:           index_syms[k]→scalar, shape_syms[k]→opDim; drop slot.
+//   trivial slice:    keep slot, no sub.
+//   non-trivial slice: index_syms[k]→lower+step*idx; if extent ≠ opDim also
+//                     shape_syms[k]→opDim. Both slots remain (rank invariant).
+//   pass-through:     keep slot, no sub.
+// Sub applies to every ExprAttr in params.
 static FailureOr<LayoutAttr> composeBufferViewLayout(
     LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
     ArrayRef<bool> keepAxis, ArrayRef<ExprAttr> scalarValueExpr,
@@ -701,10 +624,8 @@ static FailureOr<LayoutAttr> composeBufferViewLayout(
 
   sym::Store &store = symbolStore(ctx);
   LayoutSubBuilder builder(ctx, store);
-  // ixsimpl canonicalises `0` / `1` to a single hash-consed handle,
-  // so structural-equality checks against these leaves let us skip
-  // the `m -> 0 + 1 * m` self-substitution that would otherwise
-  // bloat trivial-slice offsets.
+  // Hash-consed 0/1 leaves: pointer-eq skips `m -> 0 + 1 * m` on trivial
+  // slices.
   FailureOr<sym::ExprHandle> zeroLeaf = sym::composeExprInt(store, 0);
   FailureOr<sym::ExprHandle> oneLeaf = sym::composeExprInt(store, 1);
   if (failed(zeroLeaf) || failed(oneLeaf))
@@ -737,21 +658,12 @@ static FailureOr<LayoutAttr> composeBufferViewLayout(
                          *newStorage, *newOffset);
 }
 
-// Per-axis classification result for `inferBufferViewResult`. The
-// layout composer consumes these as parallel arrays; here they're
-// bundled so the per-axis classifiers can return one struct.
-//
-//   * `keep` is true for slice-subscripted axes (and pass-throughs)
-//     that survive in the residual rank, false for scalar-consumed
-//     axes whose slot drops out.
-//   * `resultDim` is populated only for kept axes.
-//   * `scalarValueExpr` carries the scalar index's `IdxType`
-//     expression for the layout-offset substitution; empty for kept
-//     axes.
-//   * `sliceLowerExpr` / `sliceStepExpr` capture the slice's lower /
-//     step (defaulting to 0 / 1); empty for non-slice cases.
-//   * `sliceShapeChanged` records whether the sliced extent departs
-//     from the operand's dim.
+// Per-axis classification for `inferBufferViewResult`:
+//   keep:              survives in residual rank.
+//   resultDim:         only when keep=true.
+//   scalarValueExpr:   scalar idx's IdxType expr; empty on kept axes.
+//   sliceLower/Step:   slice lower/step (default 0/1); empty otherwise.
+//   sliceShapeChanged: sliced extent ≠ opDim.
 struct BufferViewAxisEntry {
   Attribute resultDim;
   bool keep = false;
@@ -761,10 +673,8 @@ struct BufferViewAxisEntry {
   bool sliceShapeChanged = false;
 };
 
-// Per-source-axis arrays consumed by `composeBufferViewLayout`. All
-// vectors stay rank-aligned with the source's logical shape; the
-// vector-root "collective suffix" branch never appends to any of
-// them.
+// Per-source-axis arrays for `composeBufferViewLayout`. Rank-aligned with
+// source. Vector-root collective suffix never appends.
 struct BufferViewAxisArrays {
   SmallVector<Attribute> resultDims;
   SmallVector<bool> keepAxis;
@@ -793,11 +703,8 @@ struct BufferViewAxisArrays {
   }
 };
 
-// Slice subscript handler. Defaults missing slice parts to 0 / 1
-// per Python semantics and computes the residual extent through
-// `inferSliceViewDim`. Returns `nullopt` to mean "bail to
-// currentResultType" (malformed slice bound) and `failure()` only
-// for hard sym-store errors.
+// Slice subscript: Python 0/1 defaults; extent via inferSliceViewDim.
+// nullopt = bail (malformed bound); failure = sym-store error.
 static FailureOr<std::optional<BufferViewAxisEntry>>
 classifyBufferViewSliceAxis(ExprAttr baseDim, SliceType slice, Operation *op) {
   FailureOr<ExprAttr> dim = inferSliceViewDim(baseDim, slice, op);
@@ -823,10 +730,8 @@ classifyBufferViewSliceAxis(ExprAttr baseDim, SliceType slice, Operation *op) {
   return std::optional<BufferViewAxisEntry>(entry);
 }
 
-// Scalar subscript handler. Only `IdxType` carries a symbolic
-// expression; a plain `index` / `i64` indexed against a layout-bearing
-// source means we can't substitute a name into the layout offset, so
-// we bail.
+// Scalar subscript: only IdxType pins. Plain index/i64 vs layout-bearing
+// source can't substitute → bail.
 static std::optional<BufferViewAxisEntry>
 classifyBufferViewScalarAxis(Type indexType, LayoutAttr sourceLayout) {
   ExprAttr scalarExpr;
@@ -839,8 +744,7 @@ classifyBufferViewScalarAxis(Type indexType, LayoutAttr sourceLayout) {
   return entry;
 }
 
-// Implicit pass-through axis (more source axes than subscripts):
-// keep the slot and inherit the operand's dim.
+// Implicit pass-through (more source axes than subscripts): keep, inherit dim.
 static BufferViewAxisEntry buildPassThroughAxisEntry(Attribute baseDim) {
   BufferViewAxisEntry entry;
   entry.resultDim = baseDim;
@@ -848,19 +752,15 @@ static BufferViewAxisEntry buildPassThroughAxisEntry(Attribute baseDim) {
   return entry;
 }
 
-// Subscripts past the source's logical rank are only legal on a
-// vector root (workitem/subgroup-lifted collective suffix). Once the
-// local axes are consumed, the typed suffix indices refine no local
-// result dimensions and must just type-check.
+// Subscripts past source rank: legal only on vector root (collective suffix);
+// refine no local dims, only type-check.
 static bool acceptsExtraSubscript(bool vectorRoot, Type indexType) {
   if (!vectorRoot || !indexType || isHCUndefType(indexType))
     return false;
   return isa<SliceType, IdxType>(indexType) || indexType.isIntOrIndex();
 }
 
-// Dispatcher: pick the slice / scalar arm based on `indexType`'s
-// type and append the resulting entry to `arrays`. Returns `false`
-// to mean "bail to currentResultType".
+// Dispatcher by indexType; appends to arrays. false = bail.
 static FailureOr<bool> classifyOneBufferViewAxis(BufferViewAxisArrays &arrays,
                                                  ExprAttr baseDim,
                                                  Type indexType,
@@ -887,10 +787,8 @@ static FailureOr<bool> classifyOneBufferViewAxis(BufferViewAxisArrays &arrays,
   return false;
 }
 
-// Walk every subscript against the source's logical rank, building
-// the per-axis arrays consumed by the layout composer. Returns
-// `nullopt` to mean "bail to currentResultType"; `failure()` for
-// hard errors only.
+// Walk subscripts vs source rank; build per-axis arrays. nullopt = bail;
+// failure() = hard error.
 static FailureOr<std::optional<BufferViewAxisArrays>>
 classifyBufferViewIndices(ArrayRef<Type> indexTypes,
                           ArrayRef<Attribute> baseDims, bool vectorRoot,
@@ -920,8 +818,7 @@ classifyBufferViewIndices(ArrayRef<Type> indexTypes,
   return std::optional<BufferViewAxisArrays>(std::move(arrays));
 }
 
-// Result type selector. The shape comes from `arrays.resultDims`;
-// the rank-0 vector-root case collapses to the element type.
+// Result type selector. Rank-0 vector-root → element type.
 static Type buildBufferViewResultType(Type sourceType, bool vectorRoot,
                                       Type elementType,
                                       ArrayRef<Attribute> resultDims,
@@ -946,12 +843,8 @@ static Type buildBufferViewResultType(Type sourceType, bool vectorRoot,
   return mlir::hc::TensorType::get(ctx, elementType, resultShape, resultLayout);
 }
 
-// Interleave unit-size dims into `keptDims` at the output positions
-// listed by `unitAxes`. Output rank = `keptDims.size() + unitAxes.size()`.
-// Positions are pre-verified unique, sorted is NOT assumed; we sort a
-// local copy so the merge runs in one pass. Returns failure only on
-// internal one-expr lookup, which should not happen for well-formed
-// inputs.
+// Interleave size-1 dims at unitAxes into keptDims.
+// Output rank = keptDims + unitAxes. Sorted locally for single-pass merge.
 static FailureOr<SmallVector<Attribute>>
 interleaveUnitAxes(ArrayRef<Attribute> keptDims, ArrayRef<int64_t> unitAxes,
                    Operation *op) {
@@ -979,13 +872,8 @@ interleaveUnitAxes(ArrayRef<Attribute> keptDims, ArrayRef<int64_t> unitAxes,
   return result;
 }
 
-// Vector-root collective-suffix indices (beyond `baseDims.size()`) were
-// dropped during classification, so by the time we reach the layout
-// compose `keepAxis` covers exactly the source rank. If composition
-// fails (non-`IdxType` scalar against a layout, malformed shape entry,
-// ...) leave the result type un-refined and let a later inference pass
-// try again — encoded by returning the input `currentResultType`. A
-// null `sourceLayout` short-circuits with an empty result layout.
+// keepAxis covers source rank. Composition fail → un-refined; null layout
+// in → empty layout out.
 static FailureOr<LayoutAttr> maybeComposeBufferViewLayout(
     LayoutAttr sourceLayout, ArrayRef<Attribute> baseDims,
     const BufferViewAxisArrays &arrays, Type currentResultType, Operation *op) {
@@ -1016,15 +904,8 @@ finalizeBufferViewResult(Type sourceType, const BufferViewAxisArrays &arrays,
     return currentResultType;
   LayoutAttr resultLayout = *resultLayoutOr;
 
-  // `unit_axes` interleave size-1 dims into the kept shape. Layout
-  // composition above only walks consuming subscripts; the unit dims
-  // exist only on the result side and don't enter the layout offset,
-  // so it's safe to splice them in afterwards. Bail conservatively if
-  // a layout-bearing source ever needs unit-axis insertion — the
-  // current frontend never plants `unit_axes` on layout-bearing
-  // tensors, so this branch is unreachable from real input; if it ever
-  // does, we'd need to extend the layout to carry zero-stride dims at
-  // the inserted positions.
+  // unit_axes interleave size-1 dims result-side only. Layout-bearing source +
+  // unit-axis insertion would need zero-stride dims; bail conservatively.
   if (!unitAxes.empty() && resultLayout)
     return currentResultType;
   FailureOr<SmallVector<Attribute>> finalDims =
@@ -1068,14 +949,9 @@ static FailureOr<Type> inferBufferViewResult(Type sourceType,
                                   sourceLayout, currentResultType, op);
 }
 
-// Optional `layout` attribute on load/alloc/`hc.vec` producer ops: when
-// FrontToHC sees a `layout=` kwarg on the call site it stamps the
-// captured `LayoutAttr` directly on the producing op rather than emitting
-// a separate `hc.as_layout` overlay. Inference reads it here and bakes
-// it into the result type so non-injective layouts (broadcasts, per-lane
-// WMMA fragments — `layout.storage_size` < `product(shape)`) flow
-// through without producing a bare→layout-bearing transition that the
-// `hc.as_layout` storage_size verifier would reject.
+// Producer-side `layout` attr baked in by inference; lets non-injective
+// layouts (broadcasts, WMMA fragments) skip the bare→layout barrier that
+// `hc.as_layout` enforces.
 static LayoutAttr producerLayoutAttr(Operation *op) {
   if (!op)
     return {};
@@ -1129,14 +1005,12 @@ static std::optional<int64_t> staticIntegerIndex(Type type) {
   std::optional<ExprAttr> expr = idxExprAttr(type);
   if (!expr)
     return std::nullopt;
-  // Tuple getitem needs literal indexing, not general symbolic evaluation.
+  // Tuple getitem needs literal indexing, not symbolic eval.
   return sym::getIntegerLiteralValue(sym::ExprHandle(expr->getNode()));
 }
 
-// Resolve a tuple `[idx]` subscript to a non-negative slot index,
-// accounting for Python negative-index semantics. Emits an op error
-// and returns failure when the subscript isn't a static integer or
-// falls outside `[-size, size)`.
+// Tuple[idx] → slot. Python neg-index. Failure: not static or out of [-size,
+// size).
 static FailureOr<size_t> resolveTupleGetItemIndex(ArrayRef<Type> indexTypes,
                                                   TupleType tuple,
                                                   Operation *op) {
@@ -1203,11 +1077,8 @@ static LogicalResult appendPrefixedIdxTypes(Operation *op, StringRef prefix,
                                             SmallVectorImpl<Type> &types) {
   MLIRContext *ctx = op->getContext();
   for (unsigned axis = 0; axis < count; ++axis) {
-    // Bypass the parser entirely: launch-axis names like "$WG0" are a
-    // single symbol leaf, not an expression in need of tokenizing. A
-    // bad character in `prefix` (which comes from a programmatic
-    // LaunchGeoMethodInfo field) would silently produce a wrong tree
-    // through parseExpr; composeExprSym builds the leaf directly.
+    // composeExprSym builds leaf directly: "$WG0" is a single symbol; parseExpr
+    // would mis-tokenize.
     SmallString<32> name(prefix);
     llvm::raw_svector_ostream(name) << axis;
     FailureOr<ExprAttr> expr = composeSymExprAttr(name, op);
@@ -1267,9 +1138,7 @@ static FailureOr<Type> groupSizeType(ShapeAttr shape, Operation *op) {
   return Type(IdxType::get(ctx, product));
 }
 
-// Launch-axis id family (`group_id`, `local_id`, `subgroup_id`,
-// `work_offset`). Returns `nullopt` when `raw` isn't one of those op
-// kinds.
+// Launch-axis id family. nullopt when raw is not one.
 static std::optional<LogicalResult>
 tryInferLaunchAxisIdTypes(Operation *raw, unsigned count,
                           SmallVectorImpl<Type> &types) {
@@ -1288,9 +1157,7 @@ tryInferLaunchAxisIdTypes(Operation *raw, unsigned count,
   return std::nullopt;
 }
 
-// Launch shape projectors (`group_shape`, `work_shape`). Reads the
-// matching shape attribute off `metadata` and stamps it across all
-// results.
+// Launch shape projectors: stamp shape attr from metadata across results.
 static std::optional<LogicalResult>
 tryInferLaunchShapeTypes(Operation *raw, MLIRContext *ctx,
                          const LaunchContextMetadata &metadata, unsigned count,
@@ -1306,9 +1173,7 @@ tryInferLaunchShapeTypes(Operation *raw, MLIRContext *ctx,
   return std::nullopt;
 }
 
-// Launch scalar accessors (`group_size`, `wave_size`). Produces one
-// `IdxType` from the relevant aggregate (product of `group_shape`,
-// or `subgroup_size` directly).
+// Launch scalar: one IdxType from product(group_shape) or subgroup_size.
 static std::optional<LogicalResult>
 tryInferLaunchScalarTypes(Operation *raw, MLIRContext *ctx,
                           const LaunchContextMetadata &metadata,
@@ -1381,8 +1246,7 @@ LogicalResult HCSymbolOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
 
 LogicalResult HCIdxApplyOp::inferHCTypes(ArrayRef<Type> /*operandTypes*/,
                                          SmallVectorImpl<Type> &resultTypes) {
-  // Result type is fully pinned by the carried `!hc.idx<expr>` and the
-  // declared symbols list; operand types contribute nothing further.
+  // Result pinned by carried `!hc.idx<expr>` + declared syms.
   resultTypes.push_back(getResult().getType());
   return success();
 }
@@ -1435,15 +1299,8 @@ LogicalResult HCModOp::inferHCTypes(ArrayRef<Type> operandTypes,
                           resultTypes);
 }
 
-// `hc.pow` is a carrier; the structural lowering (`-hc-lower-pow`)
-// rewrites it into a mul chain before infer-types runs in the canonical
-// schedule, so this only fires when a non-standard pipeline forces
-// inference on a surviving pow. ixsimpl has no `Pow` primitive, so the
-// idx arm bails to `{}` and lets the unfold pass produce the chain
-// whose mul ops `inferIndexBinary` will then type-refine. The scalar /
-// shaped arm mirrors `inferIndexBinary`'s fall-through (same-type
-// numeric in → same-type out) so a stray `hc.pow %x, %x` between
-// matching scalars still gets a result type during partial pipelines.
+// `hc.pow`: ixsimpl has no Pow → idx arm bails to {}; unfold pass yields mul
+// chain. Scalar/shaped: same-type passthrough.
 LogicalResult HCPowOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
   if (failed(requireOperandCount(*this, operandTypes, 2)))
@@ -1485,12 +1342,8 @@ LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
-// `hc.builtin_call` is elementwise homogeneous by the dispatch
-// invariant (see the op definition): result type matches the first
-// operand's type. Pre-inference `!hc.undef` arms propagate as `{}` so
-// the type-inference pass keeps probing; once any operand has a
-// concrete shaped HC type we plant it. Symbolic `!hc.idx` operands
-// don't have a sensible math.* lowering so they fall through as `{}`.
+// `hc.builtin_call` elementwise homogeneous: result type = first operand's
+// type. `!hc.undef` and `!hc.idx` arms fall through as `{}`.
 LogicalResult
 HCBuiltinCallOp::inferHCTypes(ArrayRef<Type> operandTypes,
                               SmallVectorImpl<Type> &resultTypes) {
@@ -1614,7 +1467,7 @@ LogicalResult HCSliceExprOp::inferHCTypes(ArrayRef<Type> operandTypes,
 LogicalResult HCLoadOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                      SmallVectorImpl<Type> &resultTypes) {
   Type sourceType = operandTypes.empty() ? Type{} : operandTypes.front();
-  // Shape is the trailing operand after the variadic index list.
+  // Shape is trailing operand after variadic indices.
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.back();
   resultTypes.push_back(inferLoadLikeResult(sourceType, shapeType,
                                             /*vectorResult=*/false, *this));
@@ -1624,7 +1477,7 @@ LogicalResult HCLoadOp::inferHCTypes(ArrayRef<Type> operandTypes,
 LogicalResult HCVLoadOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                       SmallVectorImpl<Type> &resultTypes) {
   Type sourceType = operandTypes.empty() ? Type{} : operandTypes.front();
-  // Shape is the trailing operand after the variadic index list.
+  // Shape is trailing operand after variadic indices.
   Type shapeType = operandTypes.empty() ? Type{} : operandTypes.back();
   resultTypes.push_back(
       inferLoadLikeResult(sourceType, shapeType, /*vectorResult=*/true, *this));
@@ -1653,9 +1506,8 @@ LogicalResult HCVecOp::inferHCTypes(ArrayRef<Type> operandTypes,
     return success();
   }
   if (auto bareTensor = dyn_cast_or_null<mlir::hc::BareTensorType>(value)) {
-    // Bare carriers carry no layout; if the source has been decomposed we
-    // can't honour `layout=` here anymore, but the original layout-bearing
-    // path will already have run on the semantic type before decomposition.
+    // Bare carriers have no layout slot. Layout-bearing path already ran on
+    // semantic type before decomposition.
     resultTypes.push_back(mlir::hc::BareVectorType::get(
         getContext(), bareTensor.getElementType(), bareTensor.getShape()));
     return success();
@@ -1695,11 +1547,8 @@ HCCallIntrinsicOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
-// Apply the op's `layout` attribute to a (operand) shaped type's
-// flavor, preserving element type and shape. Returns null when the
-// flavor isn't one we know how to retype (buffer is handled by the
-// caller, which also has to pull the new shape off the optional shape
-// operand). Mirrors `stripLayoutForCarrier` on the strip side.
+// Apply op's layout to shaped operand's flavor, keep element+shape.
+// Null on unknown flavors (buffer is caller's job).
 static Type applyLayoutToCarrier(Type valueType, Type elementType,
                                  ShapeAttr shape, LayoutAttr layout,
                                  MLIRContext *ctx) {
@@ -1714,10 +1563,8 @@ static Type applyLayoutToCarrier(Type valueType, Type elementType,
   return {};
 }
 
-// Buffer-rooted as_layout: result is a fresh `!hc.buffer` carrying
-// the op's layout. When the op has a `shape=` operand, the declared
-// shape from the tuple type drives the result; without it, the
-// operand's dims pass through so a no-op relabel stays well-typed.
+// Buffer-rooted as_layout: fresh !hc.buffer with op's layout.
+// `shape=` operand wins over operand dims when present.
 static Type inferAsLayoutBufferResult(BufferType buffer, Type shapeType,
                                       LayoutAttr layout, MLIRContext *ctx) {
   ShapeAttr resultShape = buffer.getShape();
@@ -1728,11 +1575,8 @@ static Type inferAsLayoutBufferResult(BufferType buffer, Type shapeType,
                                    layout);
 }
 
-// Value-semantic operand (tensor / vector, bare or not): bake the
-// op's layout onto the operand's existing element type and shape.
-// Returns the unchanged operand type when the shape couldn't be
-// recovered structurally — the verifier still pins the storage_size
-// invariant downstream.
+// Value operand: bake op's layout onto operand's element/shape. Fall back to
+// operand type when shape is unrecoverable; verifier still pins storage_size.
 static Type inferAsLayoutShapedResult(Type valueType, LayoutAttr layout,
                                       MLIRContext *ctx) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(valueType);
@@ -1749,18 +1593,12 @@ static Type inferAsLayoutShapedResult(Type valueType, LayoutAttr layout,
 
 LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                          SmallVectorImpl<Type> &resultTypes) {
-  // operandTypes is [value, (shape?)]; the shape slot is only present
-  // when the op carries a `shape=` operand (buffer-rooted only — the
-  // verifier rejects shape= on tensor/vector).
+  // operandTypes = [value, (shape?)]; shape only on buffer-rooted.
   Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
   Type shapeType =
       (getShape() && operandTypes.size() > 1) ? operandTypes[1] : Type{};
 
-  // Pre-inference operand → preserve any refined result type the
-  // frontend may have stamped (e.g. a buffer-rooted `as_layout` whose
-  // result was pre-typed from the shape kwarg + layout). Without this
-  // a subsequent inference round would clobber the refined slot with
-  // `!hc.undef`.
+  // Pre-inference operand: preserve frontend-stamped refined result.
   if (!valueType || isHCUndefType(valueType)) {
     resultTypes.push_back(getResult().getType());
     return success();
@@ -1777,11 +1615,8 @@ LogicalResult HCAsLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
-// Strip preserves carrier flavor — drops the layout slot, not the
-// semantic-vs-bare distinction. Returns the rebuilt type for the
-// carrier kinds we know how to strip; returns null for everything
-// else (buffer, unknown), at which point the caller leaves the
-// result un-refined.
+// Strip preserves flavor; drops layout, keeps semantic-vs-bare.
+// Null on unknown flavors (buffer): caller leaves un-refined.
 static Type stripLayoutForCarrier(Type valueType, Type elementType,
                                   ShapeAttr shape, MLIRContext *ctx) {
   if (isa<mlir::hc::VectorType>(valueType))
@@ -1798,14 +1633,9 @@ static Type stripLayoutForCarrier(Type valueType, Type elementType,
 LogicalResult
 HCStripLayoutOp::inferHCTypes(ArrayRef<Type> operandTypes,
                               SmallVectorImpl<Type> &resultTypes) {
-  // Mixing the flavor at the strip boundary would clash with
-  // downstream inference (e.g. an `hc.call_intrinsic` whose result
-  // is `vector<...>` and the loop's iter init type would conflict).
-  // Buffers don't have a bare counterpart in the v0 surface — the
-  // verifier rejects them, and we mirror that here by leaving the
-  // result un-refined so a later inference pass sees the existing
-  // placeholder. Pre-inference (`!hc.undef`) operands fall through
-  // to the same un-refined branch.
+  // Flavor must survive: mix would clash downstream (vector intrinsic vs loop
+  // iter init). Buffer has no bare counterpart; verifier rejects, leave
+  // un-refined.
   Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
   if (!valueType || isHCUndefType(valueType)) {
     resultTypes.push_back(getResult().getType());
@@ -1893,9 +1723,7 @@ LogicalResult HCEmptyOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
-// `keepdims = false` drops the axis dim (rank shrinks by one);
-// `keepdims = true` replaces it with literal `1`. Pulled out so the
-// outer op-inference can stay a flat sequence of guards.
+// keepdims=false drops axis dim; keepdims=true replaces with 1.
 static FailureOr<SmallVector<Attribute>>
 collapseReduceShape(ArrayRef<Attribute> dims, uint64_t axis, bool keepdims,
                     Operation *diagOp) {
@@ -1915,14 +1743,8 @@ collapseReduceShape(ArrayRef<Attribute> dims, uint64_t axis, bool keepdims,
   return outDims;
 }
 
-// `hc.reduce`'s ODS pins the operand to `HC_DecomposableShapedValueType`
-// (`!hc.undef` / `!hc.tensor` / `!hc.vector` / `!hc.bare_tensor` /
-// `!hc.bare_vector`). Mirror the operand flavour on the result. Semantic
-// carriers arrive pre `hc-decompose-shaped-values`; bare ones arrive after,
-// when the decompose pass has planted the reduce on the data half of a
-// (data, mask) split. Layout is intentionally dropped — the reduced
-// axis was part of the operand's index space, and carrying the operand
-// layout's name list past the collapse would dangle a stale dim sym.
+// Mirror operand flavor on result. Layout dropped: reduced axis is in operand's
+// index space; carrying its name list past collapse would dangle.
 static Type rebuildReduceResultType(Type valueType, Type elem,
                                     ShapeAttr outShape) {
   MLIRContext *ctx = elem.getContext();
@@ -1937,27 +1759,14 @@ static Type rebuildReduceResultType(Type valueType, Type elem,
   return {};
 }
 
-// `hc.reduce` collapses `$value`'s `$axis` dim. Without an inference
-// rule the result stays `!hc.undef` after `hc-infer-types`, which makes
-// `hc-shaped-compute-to-generic` bail (it needs both input and output
-// shapes to validate the reduce surface). The flatten pass then
-// retypes the surviving reduce's operand to a single product dim and
-// the verifier catches the out-of-range axis. Refining the result
-// here keeps the reduce rewritable before flatten and lets the
-// existing rewriter own the only post-rewrite shape contract.
-//
-// Anything not shaped (`!hc.undef`, non-shaped builtins) keeps the
-// result unknown so the next inference barrier or the verifier
-// handles it.
+// `hc.reduce` collapses $value's $axis dim. Refines result so
+// `hc-shaped-compute-to-generic` validates before flatten.
 LogicalResult HCReduceOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                        SmallVectorImpl<Type> &resultTypes) {
   Type valueType = operandTypes.empty() ? Type{} : operandTypes.front();
   auto shaped = dyn_cast_or_null<SymbolicallyShapedTypeInterface>(valueType);
   ShapeAttr shape = shaped ? shaped.getSymbolicShape() : ShapeAttr{};
-  // Out-of-range axis is the verifier's job once the operand type is
-  // concrete; we bail with no inference so the diagnostic fires
-  // against the typed input instead of being masked by a refined
-  // result.
+  // Out-of-range axis is verifier's job; bail with typed diagnostic.
   if (!shape || getAxis() >= shape.getDims().size()) {
     resultTypes.push_back({});
     return success();

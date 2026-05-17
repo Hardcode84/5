@@ -2,12 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-infer-types`, an opt-in pass that refines the placeholder
-// `!hc.undef` type left by mechanical frontend lowering. The dataflow analysis
-// computes facts to a solver fixpoint; a separate monotonic rewrite step then
-// updates IR result/block-argument types. If that rewrite exposes more concrete
-// surface types to later transfer functions, the pass reruns the solver until
-// the type surface stops changing.
+// `-hc-infer-types`: refine `!hc.undef` placeholders. Dataflow solver to
+// fixpoint, rewrite pass on results / block-args, rerun until stable.
 
 #include "hc/Transforms/Passes.h"
 
@@ -120,7 +116,6 @@ struct TypeFact {
   }
 
   void print(raw_ostream &os) const {
-    // `dataflow::Lattice` calls this when dumping analysis state.
     if (isUnknown()) {
       os << "<unknown>";
       return;
@@ -138,10 +133,7 @@ struct TypeFact {
 
 static bool containsSyntheticJoinSymbol(IdxType type);
 
-// Per-element join over two tuple types: zip and recurse, pushing /
-// popping the element index onto `elementPath` so the recursive call
-// can address the conflict location. Returns `{}` when arities don't
-// match or any element pair fails to join.
+// Per-element join; `{}` on arity mismatch or any element failure.
 template <typename JoinIdxConflictFn>
 static Type joinConcreteTuplesWithPolicy(TupleType lhsTuple, TupleType rhsTuple,
                                          SmallVectorImpl<unsigned> &elementPath,
@@ -164,11 +156,8 @@ static Type joinConcreteTuplesWithPolicy(TupleType lhsTuple, TupleType rhsTuple,
   return TupleType::get(lhsTuple.getContext(), elements);
 }
 
-// Conflict resolution between two pinned `!hc.idx<expr>` types. Once
-// a conflict has a synthetic representative, keep it stable across
-// later solver reruns and expressions derived from that
-// representative. Returns null when neither side has a synthetic
-// representative and the caller's conflict factory declines.
+// Pinned-vs-pinned `!hc.idx` join: synthetic representative wins to
+// stay stable across reruns; else delegate to the conflict factory.
 template <typename JoinIdxConflictFn>
 static Type joinConcreteIdxWithPolicy(IdxType lhsIdx, IdxType rhsIdx, Type lhs,
                                       Type rhs,
@@ -183,11 +172,8 @@ static Type joinConcreteIdxWithPolicy(IdxType lhsIdx, IdxType rhsIdx, Type lhs,
   return joinIdxConflict(lhs.getContext(), elementPath);
 }
 
-// Tuple-vs-tuple arm of `joinConcreteTypesWithPolicy`, extracted to
-// keep the parent's branch count below the lizard CCN threshold.
-// `nullopt` means the tuple shape doesn't apply (neither side is a
-// tuple); a default-constructed `Type` is an explicit mismatch
-// (tuple-vs-non-tuple); a non-null `Type` is the joined tuple.
+// Tuple arm. `nullopt` = neither side tuple; `Type{}` = tuple-vs-
+// non-tuple; non-null = joined tuple.
 template <typename JoinIdxConflictFn>
 static std::optional<Type>
 tryJoinConcreteTuplesWithPolicy(Type lhs, Type rhs,
@@ -255,9 +241,7 @@ private:
       text += "_";
       text += Twine(element).str();
     }
-    // Bare symbol leaf — no need to round-trip through the parser to
-    // get one. composeExprSym builds the canonical hash-consed leaf
-    // directly.
+    // Bare symbol leaf — composeExprSym gives the canonical hash-cons.
     auto *dialect = ctx->getOrLoadDialect<HCDialect>();
     std::string diag;
     FailureOr<sym::ExprHandle> handle =
@@ -381,10 +365,8 @@ public:
     return success();
   }
 
-  // Push the IV's seeding fact onto its lattice. An unknown or
-  // unpinned IV is still a distinct symbolic value; use the same
-  // representative machinery as idx joins so IV-derived expressions
-  // retain something to reason about.
+  // Unpinned/undef IV: seed via synthetic-representative so derived
+  // exprs aren't permanently free.
   void seedForRangeIvLattice(HCForRangeOp forRange, Type ivType,
                              HCTypeLattice *ivLattice) {
     if (isHCUndefType(ivType) || isUnpinnedIdxType(ivType))
@@ -394,9 +376,6 @@ public:
       join(ivLattice, factFromExistingType(ivType));
   }
 
-  // HCForRangeOp branch of `visitNonControlFlowArguments`: seed the
-  // IV from the loop entry, then bind every iter_arg's lattice from
-  // its current type.
   void visitForRangeNonControlFlowArguments(
       HCForRangeOp forRange, const RegionSuccessor &successor,
       ValueRange nonSuccessorInputs,
@@ -410,10 +389,7 @@ public:
       join(lattice, factFromExistingType(input.getType()));
   }
 
-  // HCInferRegionArgTypeOpInterface branch: invoke the op's region-
-  // arg type inference and broadcast the concrete results onto the
-  // lattices. Falls back to entry-state on inference failure or
-  // arity mismatch (the latter is a verifier bug).
+  // Inference failure or arity mismatch (verifier bug) → entry-state.
   void visitInferredRegionArguments(
       HCInferRegionArgTypeOpInterface infer, const RegionSuccessor &successor,
       ValueRange nonSuccessorInputs,
@@ -473,9 +449,8 @@ protected:
       }
     }
 
-    // HC helpers are module-local in practice today, but they don't carry MLIR
-    // private visibility yet. Use the visible return sites instead of letting a
-    // public symbol's unknown external predecessors erase all useful facts.
+    // No MLIR private visibility yet — use visible return sites so
+    // unknown external predecessors don't erase all facts.
     ProgramPoint *point = getProgramPointAfter(call);
     const auto *predecessors =
         getOrCreateFor<dataflow::PredecessorState>(point, point);
@@ -512,8 +487,7 @@ protected:
     ProgramPoint *point = getProgramPointBefore(&region->front());
     const auto *callsites = getOrCreateFor<dataflow::PredecessorState>(
         point, getProgramPointAfter(callable));
-    // Same visibility story as call results: use known in-module callsites
-    // even when public helper symbols make the generic framework conservative.
+    // Same visibility story as call results.
     for (Operation *callsite : callsites->getKnownPredecessors()) {
       auto call = cast<CallOpInterface>(callsite);
       for (auto [operand, arg] :
@@ -736,10 +710,7 @@ static Type appendCollectiveSuffixToVector(Type type,
 static FailureOr<Type> liftCollectiveReturnType(Operation *op, Type type,
                                                 ArrayRef<Attribute> suffix);
 
-// Element-wise lift over a tuple type: recurse into each element,
-// rejecting nested tuples (collective regions return flat tuples
-// only). Caller has already ruled out empty `suffix` and non-tuple
-// types.
+// Flat tuples only — nested tuples rejected.
 static FailureOr<Type> liftCollectiveTupleReturn(Operation *op, TupleType tuple,
                                                  ArrayRef<Attribute> suffix) {
   SmallVector<Type> elements;
@@ -835,10 +806,8 @@ static FailureOr<bool> updateYieldedRegionResultTypes(Operation *root,
   return changed;
 }
 
-// Merge one `hc.return`'s values into `resultFacts`, preferring a
-// strict refinement over the cumulative join. Out-of-arity returns
-// (a verifier bug at the boundary) are silently dropped — they'd
-// land on a missing fact slot otherwise.
+// Strict refinement preferred over cumulative join. Out-of-arity
+// returns dropped (verifier bug; would hit missing slot).
 static void mergeReturnIntoFacts(HCReturnOp ret, DataFlowSolver &solver,
                                  SmallVectorImpl<TypeFact> &resultFacts) {
   for (auto [idx, value] : llvm::enumerate(ret.getValues())) {
@@ -900,9 +869,8 @@ static bool updateCallableFunctionTypes(Operation *root,
 static FailureOr<bool> applyInferredTypes(Operation *root,
                                           DataFlowSolver &solver) {
   bool changed = updateCallableFunctionTypes(root, solver);
-  // Region result refinement can itself update enclosing callable signatures
-  // through return users; the outer solver loop reruns until those surfaces
-  // converge.
+  // Region results update callable sigs via return users; outer
+  // loop reruns until surfaces converge.
   FailureOr<bool> regionResultsChanged =
       updateYieldedRegionResultTypes(root, solver);
   if (failed(regionResultsChanged))
@@ -978,10 +946,8 @@ static void collectSyntheticJoinSymbols(CallableOpT op, llvm::StringSet<> &seen,
   }
 }
 
-// Both endpoints of every substitution are bare symbol leaves
-// (synthesizeIdxConflictType produces them, renumberSyntheticJoinSymbols
-// remaps them to "$join<index>" form). Carry the canonical handles
-// straight through instead of re-parsing on every rewrite.
+// Both endpoints are bare symbol leaves — canonical handles, no
+// reparse per rewrite.
 using SymbolSubstitution = std::pair<sym::ExprHandle, sym::ExprHandle>;
 
 static FailureOr<ixs_node *>
@@ -1038,9 +1004,6 @@ static FailureOr<Type>
 rewriteSyntheticJoinSymbols(Type type,
                             ArrayRef<SymbolSubstitution> substitutions);
 
-// Per-type-kind dispatchers for `rewriteSyntheticJoinSymbols`. Each
-// returns the rewritten type, the unchanged `type` if nothing
-// rewrote, or failure if a sub-rewrite bailed.
 static FailureOr<Type>
 rewriteIdxSyntheticJoinSymbols(IdxType idx, MLIRContext *ctx,
                                ArrayRef<SymbolSubstitution> substitutions) {
@@ -1168,9 +1131,7 @@ rewriteCallableFunctionType(CallableOpT op,
   return success();
 }
 
-// Rewrite the function-type attribute on any callable kind that
-// carries one. Returns success when `op` isn't a callable (nothing
-// to do).
+// No-op (success) when `op` isn't a callable.
 static LogicalResult rewriteCallableFunctionTypeIfNeeded(
     Operation *op, ArrayRef<SymbolSubstitution> substitutions) {
   if (auto kernel = dyn_cast<HCKernelOp>(op))
@@ -1182,9 +1143,6 @@ static LogicalResult rewriteCallableFunctionTypeIfNeeded(
   return success();
 }
 
-// Rewrite every op-result's type and every nested block-arg's type
-// in-place. Used by `renumberSyntheticJoinSymbols`'s walk to update
-// types alongside the callable type-attr rewrite.
 static LogicalResult
 rewriteOpResultAndRegionTypes(Operation *op,
                               ArrayRef<SymbolSubstitution> substitutions) {
@@ -1222,9 +1180,6 @@ renumberSyntheticJoinSymbols(Operation *root,
   return failure(walkStatus.wasInterrupted());
 }
 
-// Collect every synthetic-join symbol reachable from `op`: callable
-// function-type slot, every op result type, every nested block-arg
-// type.
 static void
 collectSyntheticJoinSymbolsFromOp(Operation *op, llvm::StringSet<> &seen,
                                   SmallVectorImpl<std::string> &symbols) {
@@ -1242,9 +1197,7 @@ collectSyntheticJoinSymbolsFromOp(Operation *op, llvm::StringSet<> &seen,
         collectSyntheticJoinSymbols(arg.getType(), seen, symbols);
 }
 
-// Build the (from, to) handles once via `composeExprSym` — both ends
-// are bare symbol leaves, no parser required, and the canonical
-// handles are what `ixs_subs_multi` compares against during rewrite.
+// Canonical handles for `ixs_subs_multi`; both ends bare leaves.
 static FailureOr<SmallVector<SymbolSubstitution>>
 buildSyntheticJoinSubstitutions(sym::Store &store,
                                 ArrayRef<std::string> symbols) {
@@ -1304,6 +1257,4 @@ struct HCInferTypesPass : public hc::impl::HCInferTypesBase<HCInferTypesPass> {
 
 } // namespace
 
-// `createHCInferTypesPass()` is emitted by tablegen (friend of the
-// `impl::HCInferTypesBase` CRTP). See `Passes.td` — no `let constructor`, so
-// the generated factory is the only one.
+// `createHCInferTypesPass()` is tablegen-generated.

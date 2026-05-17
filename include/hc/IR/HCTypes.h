@@ -67,31 +67,30 @@ struct LaunchContextMetadata {
 
 std::optional<LaunchContextMetadata> getLaunchContextMetadata(Type contextType);
 
-/// Returns true when `type` is HC's erased refinement placeholder.
+/// True when `type` is HC's erased refinement placeholder.
 bool isHCUndefType(Type type);
 
-/// Extract a static shape from a tuple whose elements are pinned `!hc.idx`.
-/// Returns null when the type is absent, erased, non-tuple, or contains a
-/// dynamic/non-index dimension.
+/// Static shape from tuple of pinned `!hc.idx`. Null when absent,
+/// erased, non-tuple, or contains a dynamic/non-index dim.
 ShapeAttr getStaticShapeFromTupleType(Type shapeType);
 
-/// Diagnostic form of `getStaticShapeFromTupleType` for verifier passes.
+/// Diagnostic form of `getStaticShapeFromTupleType`.
 FailureOr<ShapeAttr> verifyStaticShapeFromTupleType(Type shapeType,
                                                     Operation *diagOp);
 
-/// Join two concrete HC type facts, recursively joining tuple elements.
-/// Returns null when the facts are incompatible.
+/// Join two concrete HC type facts, recursing through tuples. Null on
+/// incompatibility.
 Type joinHCTypes(Type lhs, Type rhs);
 
-/// Compatibility used for progressive signatures: exact match, `!hc.undef`,
-/// or recursive tuple compatibility.
+/// Progressive-signature compat: exact, `!hc.undef`, or recursive
+/// tuple compat.
 bool areHCProgressiveTypesCompatible(Type source, Type dest);
 
-/// Compatibility used across region/control-flow edges. This includes
-/// progressive compatibility plus recursive `HCJoinableTypeInterface` joins.
+/// Region / control-flow edge compat: progressive + recursive
+/// `HCJoinableTypeInterface` joins.
 bool areHCBranchTypesCompatible(Type source, Type dest);
 
-/// Returns true when replacing `current` with `inferred` is a monotonic HC type
+/// True when replacing `current` with `inferred` is monotonic
 /// refinement.
 bool shouldRefineHCType(Type current, Type inferred);
 

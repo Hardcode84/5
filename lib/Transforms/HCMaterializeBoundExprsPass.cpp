@@ -2,16 +2,13 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-materialize-bound-exprs`, the HC-to-HC boundary that severs
-// launch/bound symbolic SSA values from their producer chains before scope
-// normalization. Replaces every reachable `!hc.idx<expr>` / `!hc.pred<pred>`
-// SSA value whose carried expression depends only on bound (launch geometry
-// or kernel-declared ABI) symbols with a fresh `hc.idx_apply` / `hc.pred_apply`
-// of the same type. The replacement carries no operand bindings — the listed
-// symbols stay ambient and the launch-body lowering resolves them later from
-// launch context. Cutting the SSA chain here lets scope normalization erase
-// the now-unused workitem / subgroup / group producer operations without
-// dragging dependent index / predicate values along.
+// Implements `-hc-materialize-bound-exprs`: sever `!hc.idx<expr>` /
+// `!hc.pred<pred>` SSA from producer chains when the carried expression
+// depends only on bound (launch geometry / kernel-ABI) symbols. Replace
+// with empty-binding `hc.idx_apply` / `hc.pred_apply` of the same type;
+// the launch-body lowering binds the ambient symbols later. Cutting the
+// chain here lets scope normalization erase the now-unused workitem /
+// subgroup / group producers.
 
 #include "hc/Transforms/Passes.h"
 
@@ -57,9 +54,8 @@ static bool isBoundSymbolName(StringRef name,
                               const BoundSymbolSet &boundSymbols) {
   if (boundSymbols.hasDeclarations)
     return boundSymbols.symbols.count(name);
-  // Legacy and helper-only IR can still be run without a kernel metadata
-  // anchor. Generated launch and scope symbols use a reserved `$` prefix;
-  // user/problem symbols such as `M`/`N` remain symbolic until specialization.
+  // No kernel anchor: `$`-prefixed names are bound (launch / scope);
+  // user / problem symbols stay symbolic until specialization.
   return name.starts_with("$");
 }
 
@@ -106,9 +102,7 @@ static bool shouldMaterializeValue(Value value,
       value.use_empty())
     return false;
   if (auto result = dyn_cast<OpResult>(value)) {
-    // Already-severed values (an empty-symbol `idx_apply` /
-    // `pred_apply` carrying just a type) are the post-pass fixed
-    // point — re-severing them would loop without progress.
+    // Empty-binding apply is the fixed point — don't re-sever.
     Operation *owner = result.getOwner();
     if (auto idx = dyn_cast<HCIdxApplyOp>(owner))
       return !idx.getOperands().empty() || !idx.getSymbols().empty();
@@ -172,10 +166,7 @@ static void materializeValue(Value value, OpBuilder &builder) {
       loc = parent->getLoc();
   }
 
-  // Empty operand / symbol lists: the new value carries the type
-  // only, severing the SSA chain just like the legacy
-  // `materialize_bound_expr`. Lowering binds the type's free symbols
-  // ambiently from the surrounding launch context.
+  // Type-only replacement; launch-body lowering binds free symbols ambiently.
   Type type = value.getType();
   ArrayAttr emptySymbols = builder.getStrArrayAttr({});
   Value replacement;
@@ -191,11 +182,8 @@ static void materializeValue(Value value, OpBuilder &builder) {
   value.replaceAllUsesExcept(replacement, replacement.getDefiningOp());
 }
 
-// First ambient symbol name referenced by `exprAttr` that isn't either
-// explicitly bound by the op or declared on the enclosing kernel.
-// Returns the empty string if no such name exists. Restricting to the
-// first hit keeps the diagnostic concise (operators care about the
-// missing declaration, not the full set).
+// First unbound ambient symbol in `exprAttr`; empty if all are bound.
+// First-hit only — diagnostics are per-symbol.
 static std::string
 firstUndeclaredAmbientSymbolName(Attribute exprAttr, ArrayAttr explicitSymbols,
                                  const BoundSymbolSet &boundSymbols) {
@@ -221,11 +209,8 @@ firstUndeclaredAmbientSymbolName(Attribute exprAttr, ArrayAttr explicitSymbols,
   return undeclared;
 }
 
-// Validates that every severed apply op's residual ambient symbols
-// are declared on the enclosing kernel's `bound_symbols` attribute.
-// Any free symbol the op explicitly binds via its `symbols` list is
-// resolved structurally and doesn't need to appear in the kernel's
-// declaration; only ambient names go through this check.
+// Every ambient symbol on a severed apply op must appear on the
+// enclosing kernel's `bound_symbols`. Explicit-binding syms exempt.
 static LogicalResult
 verifyMaterializedExprSymbols(Operation *root,
                               const BoundSymbolSet &boundSymbols) {
@@ -256,10 +241,7 @@ verifyMaterializedExprSymbols(Operation *root,
   return failure(status.wasInterrupted());
 }
 
-// Walk `root` and collect every result + block-argument value that
-// belongs under an `hc.callable` and carries a symbolic carrier the
-// rewrite should sever. Returning the full list up front lets the
-// rewrite phase mutate IR without invalidating the walk's iteration.
+// Pre-collect — rewrite phase mutates IR; walk-in-place would invalidate.
 static SmallVector<Value>
 collectValuesToMaterialize(Operation *root,
                            const BoundSymbolSet &boundSymbols) {
@@ -300,5 +282,3 @@ struct HCMaterializeBoundExprsPass
 };
 
 } // namespace
-
-// `createHCMaterializeBoundExprsPass()` is emitted by tablegen.

@@ -9,12 +9,11 @@ include "mlir/IR/OpBase.td"
 
 def HCJoinableTypeInterface : TypeInterface<"HCJoinableTypeInterface"> {
   let description = [{
-    Type-local join hook for HC's progressive type lattice.
+    Join hook for HC's progressive type lattice.
 
-    The hook returns the conservative common type for two distinct concrete
-    facts, or null when this type has no opinion. It is used by dataflow
-    analyses that need a sound over-approximation without hard-coding every
-    HC type pair in the analysis lattice.
+    Returns the conservative common type of two concrete facts, or null
+    when the type has no opinion. Used by dataflow analyses that need a
+    sound over-approximation without enumerating every HC type pair.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [
@@ -30,17 +29,16 @@ def HCJoinableTypeInterface : TypeInterface<"HCJoinableTypeInterface"> {
 def SymbolicallyShapedTypeInterface
     : TypeInterface<"SymbolicallyShapedTypeInterface"> {
   let description = [{
-    Type-local hook for HC types that carry symbolic shape metadata.
+    Symbolic-shape hook for HC shaped types.
 
-    Consumers that only need element type or rank/dimension expressions should
-    depend on this interface instead of enumerating buffer/tensor/vector shells.
+    Consumers wanting just element type or rank/dim expressions depend on
+    this interface instead of enumerating buffer/tensor/vector shells.
 
-    The layout accessors are nullable: a null `LayoutAttr` means the type has
-    no explicit layout slot (the v0 identity-layout contract). The clone
-    hook is the canonical "rebuild this type with a different layout" entry
-    point — passing a null `LayoutAttr` strips the slot and returns the
-    layout-less form, which is how `hc-canonicalize-layouts` collapses
-    explicit identity layouts back to absent.
+    Layout accessors are nullable: null `LayoutAttr` = no explicit slot
+    (identity-layout contract). The clone hook is the canonical
+    "rebuild this type with a different layout" entry — passing null
+    strips the slot, which is how `hc-canonicalize-layouts` collapses
+    explicit identity layouts to absent.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [

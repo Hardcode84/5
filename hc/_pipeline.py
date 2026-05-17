@@ -4,37 +4,24 @@
 
 """hc_front -> hc pipeline driver (transform-dialect schedule based).
 
-`hc.compile` calls `run_front_to_hc` to lower its resolved `hc_front`
-module into the `hc` dialect. The schedule itself is MLIR: a
-`transform.named_sequence @__transform_main` that invokes registered
-MLIR passes via `transform.apply_registered_pass`. The driver loads a
-schedule file with `-transform-preload-library` and runs it through
-`-transform-interpreter`, so the pass order lives in IR (not a pipeline
-string) and users can swap in their own schedule without touching
-Python.
+`hc.compile` calls `run_front_to_hc` to lower a resolved `hc_front`
+module to `hc`. Schedule is MLIR: a `transform.named_sequence
+@__transform_main` invoking passes via
+`transform.apply_registered_pass`, loaded with
+`-transform-preload-library` and run through `-transform-interpreter`.
+Pass order lives in IR, swappable without Python.
 
-After the schedule fires, the driver appends a fixed device-side
-lowering chain (`_GPU_LOWERING_PIPELINE`) that takes the
-`#rocdl.target`-stamped `gpu.module` ops to `gpu.binary` (HSACO) blobs
-via `hc-lower-gpu-to-binary`. The chain is appended as a raw
-`pass-pipeline` string rather than as more `transform.apply_registered_pass`
-ops because the transform-dialect pass-application op doesn't express
-the nested pass manager `gpu.module(...)` requires, and
-`convert-gpu-to-rocdl` is anchored on `gpu::GPUModuleOp` upstream.
-Custom schedules still get the chain appended — overriding it would
-mean composing your own binary-emission stage and is out of scope for
-`schedule=`.
+After the schedule, a fixed `_GPU_LOWERING_PIPELINE` (raw pass string,
+not transform ops — `convert-gpu-to-rocdl` is anchored on `GPUModuleOp`
+and needs `gpu.module(...)` nesting) takes `#rocdl.target`-stamped
+`gpu.module` ops to `gpu.binary` HSACO blobs via
+`hc-lower-gpu-to-binary`. Custom schedules get the chain appended too.
 
-The `ld.lld` path used by `hc-lower-gpu-to-binary` is resolved
-Python-side from `_native_paths.lld_path` (bundled binary in
-`hc/_native/bin/`, with an `HC_LLD` env override for source-tree
-work) and propagated through the `--lld-path=` pass option. The
-driver does not set or rely on `HC_LLD`; the pipeline is
-self-contained.
+`ld.lld` path is resolved Python-side from `_native_paths.lld_path`
+and threaded through `--lld-path=`. No env dependency at run time.
 
-Failure is non-fatal: on a pipeline error the result carries
-`module=None` + captured diagnostic strings. Callers inspect the
-result rather than wrapping in `try`.
+Pipeline failure is non-fatal: result carries `module=None` + captured
+diagnostics. Inspect, don't `try`.
 """
 
 from __future__ import annotations
@@ -53,114 +40,58 @@ from ._native_paths import lld_path
 _ENTRY_POINT = "__transform_main"
 _DEFAULT_SCHEDULE_PACKAGE = "hc.schedules"
 _DEFAULT_SCHEDULE_NAME = "front_to_hc.mlir"
-# Sentinel the default schedule plants in the
-# `transform.apply_registered_pass "hc-interpret-intrinsic-recipes"` op
-# for `target=`. The Python driver substitutes it with the value of
-# `hc.compile(target=...)` (empty string for the `None` default, which
-# tells the pass to apply every recipe). Substitution is intentionally
-# a literal string-replace — using a verbose sentinel keeps the
-# operation safe against unintended matches even if the schedule grows
-# additional `hc-interpret-intrinsic-recipes` calls.
+# Substituted with `hc.compile(target=...)` (empty for `None`, which
+# tells `hc-interpret-intrinsic-recipes` to apply every recipe).
 _TARGET_PLACEHOLDER = "__HC_TARGET__"
-# Characters that would either escape the MLIR string literal we
-# substitute into or break the transform option parser. Reject up
-# front so the user gets a clear error from `hc.compile` instead of a
-# garbled MLIR diagnostic.
+# Chars that would escape the MLIR string literal or break the
+# transform option parser.
 _TARGET_FORBIDDEN_CHARS = frozenset('"\\\n\r')
 
-# Sister sentinel for the AMDGPU chip name (e.g. "gfx1100") that
-# downstream gpu lowering passes need spelled out — `rocdl-attach-target`,
-# `convert-amdgpu-to-rocdl`, etc. The default schedule plants this in
-# `rocdl-attach-target`'s `chip=` option. A user-provided schedule that
-# omits the placeholder silently ignores the value.
+# Chip name (e.g. "gfx1100") for `rocdl-attach-target`,
+# `convert-amdgpu-to-rocdl`, etc. Schedule without the placeholder
+# silently ignores it.
 _CHIP_PLACEHOLDER = "__HC_CHIP__"
-# Same character blacklist as `_TARGET_FORBIDDEN_CHARS` — gfx-style
-# chip names are alphanumeric anyway, but being explicit lets callers
-# pass arbitrary strings (custom kernels, future targets) without
-# tripping the MLIR option parser.
 _CHIP_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
-# Default chip when the caller doesn't pass `target=`. The bigger
-# pipeline doesn't actually use the chip until `rocdl-attach-target`
-# fires, which only matters for kernels that reach `gpu.module` (i.e.
-# anything with non-trivial body). For trivial / fully-folded kernels
-# the value is moot. Keep it pointed at the gfx11 part the WMMA work
-# is built around so the default produces sensible IR for every
-# kernel the project currently exercises end-to-end.
+# Used when caller passes no `target=`. Only matters for kernels that
+# reach `gpu.module`; trivial kernels never use it.
 _DEFAULT_CHIP = "gfx1100"
-# `amdgpu-gfx11` is the only logical-target alias we expose today; bare
-# gfx-prefixed targets pass through `_resolve_chip` verbatim, so callers
-# on a chip we haven't catalogued yet can still get a working schedule
-# by passing `target="gfx<chip>"` directly. If a second alias shows up,
-# bring back a small dict here — until then a single conditional in
-# `_resolve_chip` is the whole "registry".
+# Only `amdgpu-gfx11` is aliased today; bare `gfx<chip>` strings pass
+# through verbatim.
 
-# Sister sentinel for `ld.lld` that `hc-lower-gpu-to-binary` invokes to
-# link the AMDGPU object into an HSACO blob. Substituted Python-side
-# with the bundled-or-overridden path returned by `_native_paths.lld_path`
-# (the wheel ships `ld.lld` in `hc/_native/bin/`; `HC_LLD` overrides for
-# source-tree work against a freshly-built toolchain that hasn't been
-# re-staged). The pipeline propagates the resolved path through the
-# pass's `--lld-path=` option so `hc.compile` never depends on the
-# environment to locate the linker.
+# `ld.lld` path threaded through `hc-lower-gpu-to-binary` so the pass
+# doesn't consult `HC_LLD`/`$PATH` at run time.
 _LLD_PLACEHOLDER = "__HC_LLD__"
 _LLD_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
-# Sister sentinel for the `--dump-intermediates=` option on
-# `hc-lower-gpu-to-binary`. Substituted Python-side from the
-# `HC_DUMP_DIR` env var; empty string when the env is unset (which
-# the pass interprets as "dumping disabled"). Same forbidden-char
-# blacklist as `_LLD_FORBIDDEN_CHARS` so a path containing `,` /
-# `}` / `=` doesn't break the option string.
+# `--dump-intermediates=` for `hc-lower-gpu-to-binary`; empty disables.
 _DUMP_DIR_PLACEHOLDER = "__HC_DUMP_DIR__"
 _DUMP_DIR_FORBIDDEN_CHARS = _LLD_FORBIDDEN_CHARS
 _DUMP_DIR_ENV = "HC_DUMP_DIR"
 
-# Sister sentinel for the AMDGPU LLVM target-features string. The
-# wavefront size in particular is part of this string (e.g.
-# `+wavefrontsize32`), and chips in the gfx10/gfx11/gfx12 families need
-# the wave32 feature explicitly to lower WMMA correctly — the LLVM
-# AMDGPU defaults for those chips compile to wave64 otherwise, which
-# silently produces garbage WMMA results because the per-lane fragment
-# layout differs. Older chips (gfx9 and below) only ever ran wave64; we
-# leave the features string empty for those so the LLVM defaults still
-# apply.
+# AMDGPU LLVM `target-features`. gfx10+ MUST set `+wavefrontsize32`
+# for WMMA correctness — LLVM defaults to wave64, which silently
+# produces garbage WMMA results. gfx9 and below: empty, only ran wave64.
 _FEATURES_PLACEHOLDER = "__HC_FEATURES__"
 _FEATURES_FORBIDDEN_CHARS = _TARGET_FORBIDDEN_CHARS
 
-# Optional `hc-emit-bench-wrapper` slot in `_GPU_LOWERING_PIPELINE`.
-# Substituted Python-side from the `bench=` kwarg threaded through
-# `run_front_to_hc` (and, eventually, `hc.compile`). Default-empty so
-# the post-pipeline LLVM IR for `bench=False` is byte-identical to the
-# pre-bench shape; `bench=True` expands the placeholder to the pass
-# spelling plus a trailing comma so the splice lands cleanly between
-# `hc-lower-launch-func-to-runtime` and `symbol-dce`.
+# Optional `hc-emit-bench-wrapper` slot. Empty for `bench=False` so the
+# IR stays byte-identical; `bench=True` expands to pass + trailing comma.
 _BENCH_PLACEHOLDER = "__HC_BENCH__"
 _BENCH_PASS_FRAGMENT = "hc-emit-bench-wrapper,"
 
-# Device-side lowering chain appended after the user's schedule fires.
+# Device-side lowering chain appended after the user's schedule.
 #
-# `convert-gpu-to-rocdl` is `Pass<"convert-gpu-to-rocdl", "gpu::GPUModuleOp">`
-# upstream — anchored on `gpu::GPUModuleOp`, so the pass-manager nesting
-# `gpu.module(...)` is mandatory and the gpu-internal vector / arith /
-# index conversions sit alongside it inside the same nested manager so
-# they see the LLVM types `convert-gpu-to-rocdl` materialised. The
-# outer `gpu-to-llvm` then handles the host-side launch boundary and
-# pulls vector/index patterns via `ConvertToLLVMPatternInterface`.
+# `convert-gpu-to-rocdl` is anchored on `gpu::GPUModuleOp`, so
+# `gpu.module(...)` nesting is mandatory; vector/arith/index conversions
+# live inside the nested manager so they see LLVM types. Outer
+# `gpu-to-llvm` handles host-side launch boundary.
 #
-# The chain is kept as a raw pipeline string (rather than threaded
-# through more `transform.apply_registered_pass` ops in the schedule)
-# primarily because `transform.apply_registered_pass` doesn't express
-# nested pass managers, which `gpu.module(...)` requires.
-#
-# The placeholders match the schedule's: `_substitute_chip` /
-# `_substitute_lld` swap them in before the pipeline string is
-# parsed.
+# Raw pipeline string (not transform-dialect ops) because
+# `transform.apply_registered_pass` can't express nested pass managers.
 _GPU_LOWERING_PIPELINE = (
-    # Lower the `!hc.ptr` family launch-body emits before the rocdl chain
-    # walks the gpu.module body — the convert-*-to-llvm passes nested in
-    # `gpu.module(...)` below have no idea about `hc.alloc`/`hc.ptr_*`,
-    # so they must be gone by the time we reach `convert-scf-to-cf`.
+    # `!hc.ptr` family must be lowered before `convert-scf-to-cf` — the
+    # convert-*-to-llvm passes nested below don't know `hc.alloc`/`hc.ptr_*`.
     "hc-lower-to-llvm,"
     "convert-scf-to-cf,"
     f"convert-amdgpu-to-rocdl{{chipset={_CHIP_PLACEHOLDER}}},"
@@ -180,22 +111,13 @@ _GPU_LOWERING_PIPELINE = (
     f"lld-path={_LLD_PLACEHOLDER} "
     f"dump-intermediates={_DUMP_DIR_PLACEHOLDER}"
     "},"
-    # Replace `gpu.launch_func` with `hc_rt_load_kernel` +
-    # `hc_rt_launch_kernel` calls and embed each binary's HSACO blob
-    # as an LLVM global. Runs after `hc-lower-gpu-to-binary` so the
-    # `gpu.binary` ops it consumes already exist; the pass erases each
-    # binary after the last launch_func references it. `symbol-dce`
-    # cleans the runtime helper decls `ensureRuntimeHelpers` plants
-    # for every payload regardless of whether the kernel ended up
-    # using them (`hc_get_int64`, `hc_get_float64` are the usual
-    # culprits).
-    # `hc-emit-bench-wrapper` mints an i64-returning `<wrapper>_bench`
-    # sibling per host wrapper, calling `hc_rt_launch_kernel_repeat` for
-    # tight-loop benchmarking. Opt-in via the `__HC_BENCH__` placeholder
-    # (driven by `bench=True`); empty by default so today's bench=False
-    # payload is byte-identical. Wired before `symbol-dce` so the new
-    # symbol is visible when the JIT consumer (`compiled.bench()`)
-    # looks it up.
+    # `hc-lower-launch-func-to-runtime` replaces `gpu.launch_func`
+    # with `hc_rt_load_kernel`/`launch_kernel` calls and embeds each
+    # HSACO blob as an LLVM global; needs `gpu.binary` from
+    # `hc-lower-gpu-to-binary` above. `hc-emit-bench-wrapper` (opt-in
+    # via `__HC_BENCH__`) mints `<wrapper>_bench` before `symbol-dce`
+    # so JIT can resolve it. `symbol-dce` drops unused runtime decls
+    # (`hc_get_int64`, `hc_get_float64`).
     "hc-lower-launch-func-to-runtime,"
     f"{_BENCH_PLACEHOLDER}"
     "symbol-dce"
@@ -203,24 +125,18 @@ _GPU_LOWERING_PIPELINE = (
 
 ScheduleSource = Path | str | None
 
-# hc's own passes register exactly once per process. Upstream passes are
-# already registered by `_mlirRegisterEverything` during
-# `hc._mlir_loader.load_hc_mlir`, so this guard is only about hc's three
-# pass families. The CAPI entry point is idempotent anyway (see
-# `lib/CAPI/HC.cpp`), but short-circuiting here avoids a per-compile
-# Python->C call.
+# Once-per-process guard for hc's pass registration. CAPI is idempotent;
+# this just skips a per-compile Python->C call.
 _passes_registered = False
 
 
 @dataclass(frozen=True)
 class PipelineResult:
-    """Outcome of running a transform schedule against an hc_front module.
+    """Transform-schedule run outcome.
 
-    `module` and `module_text` are `None` on failure; `diagnostics`
-    carries whatever the MLIR diagnostic handler captured while the
-    pipeline ran (including during schedule-file parsing and pipeline
-    parsing). Success still produces a possibly-non-empty `diagnostics`
-    tuple: passes may emit warnings/notes that don't fail the run.
+    `module`/`module_text` are `None` on failure; `diagnostics`
+    captures every severity (notes/warnings/errors) including parse-
+    time. Success may still produce non-empty diagnostics.
     """
 
     module: Any | None
@@ -237,44 +153,26 @@ def run_front_to_hc(
 ) -> PipelineResult:
     """Run the hc_front -> hc transform schedule on a parsed front module.
 
-    `front_module` must belong to a context set up by `prepared_context`
-    — one where both `hc_front` and `hc` dialects are registered and hc's
-    passes have been loaded into the process-wide pass registry. The
-    module is mutated in place on success: its body changes from
-    `hc_front.*` ops to `hc.*` ops. Callers wanting to preserve the
-    original should pass a clone (`ir.Module.parse(str(original),
-    context=ctx)`).
+    `front_module` must come from `prepared_context()` — context with
+    `hc_front` + `hc` dialects and hc's passes registered. Module is
+    mutated in place on success. Clone first to preserve the original.
 
-    `target` is substituted into the schedule's `__HC_TARGET__`
-    placeholder before the transform interpreter runs; the default
-    schedule wires it into `hc-interpret-intrinsic-recipes`'s `target=`
-    option. Pass `None` (the default) to leave the placeholder empty,
-    which tells the recipe interpreter to apply every named sequence
-    regardless of `hc.target`. A user-provided schedule that does not
-    contain the placeholder silently ignores the value — the override
-    owns its own pass invocations.
+    `target`: substituted into `__HC_TARGET__`; the default schedule
+    wires it into `hc-interpret-intrinsic-recipes`'s `target=`. `None`
+    -> empty -> apply every recipe. Schedules without the placeholder
+    ignore `target`.
 
-    The `__HC_CHIP__` placeholder is filled in two places: the schedule
-    (for `rocdl-attach-target`) and the appended GPU lowering chain
-    (for `convert-amdgpu-to-rocdl` / `convert-gpu-to-rocdl`). `target=`
-    is resolved by `_resolve_chip`: the logical alias `"amdgpu-gfx11"`
-    maps to `"gfx1100"`, and bare `gfx<chip>` strings pass through
-    verbatim. With `target=None` the chip falls back to `_DEFAULT_CHIP`,
-    which is fine because chip-keyed passes are no-ops on a payload
-    that never grew a `gpu.module` (trivial/fully-folded kernels).
+    `__HC_CHIP__`: filled by `_resolve_chip(target)`. Used by
+    `rocdl-attach-target` (in the schedule) and
+    `convert-{amdgpu,gpu}-to-rocdl` (in the appended chain).
+    `_DEFAULT_CHIP` covers `target=None` and trivial kernels that
+    never grow `gpu.module`.
 
-    `__HC_LLD__` is filled with the path returned by
-    `hc._native_paths.lld_path` — bundled `hc/_native/bin/ld.lld` by
-    default, or `$HC_LLD` when set (source-tree work against a freshly
-    built toolchain). The build never sets `HC_LLD`; the pipeline
-    propagates the resolved path through the pass's `--lld-path=`
-    option, so `hc.compile` is self-contained and doesn't lean on the
-    environment to find the linker.
+    `__HC_LLD__`: `hc._native_paths.lld_path` — bundled binary or
+    `$HC_LLD` for source-tree work. Pipeline is self-contained.
 
-    `bench=True` splices `-hc-emit-bench-wrapper` into the GPU lowering
-    chain so each host wrapper gets an i64-returning `<wrapper>_bench`
-    sibling driven by `hc_rt_launch_kernel_repeat`. Default `False`
-    leaves the IR byte-identical to the pre-bench shape.
+    `bench=True`: splice `-hc-emit-bench-wrapper`. `False` leaves the
+    IR byte-identical.
     """
 
     from .mlir import ir
@@ -283,10 +181,8 @@ def run_front_to_hc(
     diagnostics: list[str] = []
 
     def capture(diagnostic: Any) -> bool:
-        # Returning True tells MLIR the diagnostic was handled, which
-        # suppresses the default stderr print. We capture every severity
-        # (note/warning/error) since passes sometimes route the
-        # actionable context through notes attached to an error.
+        # `True` suppresses MLIR's stderr print. Capture every severity:
+        # actionable context often lives in notes attached to an error.
         diagnostics.append(str(diagnostic))
         return True
 
@@ -300,12 +196,9 @@ def run_front_to_hc(
             pm = _build_pass_manager(pipeline, context)
             pm.run(front_module.operation)
         except ir.MLIRError as exc:
-            # Narrow catch on purpose: `MLIRError` is the one thing
-            # `PassManager.parse`/`.run` contract to raise on pipeline
-            # trouble (bad schedule, verifier failure, pass error).
-            # Anything else (ValueError from our own driver, bugs,
-            # KeyboardInterrupt) propagates — silently swallowing
-            # them would turn real bugs into "hc_ir came back None".
+            # Narrow: `MLIRError` is the only contracted raise from
+            # `PassManager.parse`/`.run`. Anything else propagates —
+            # swallowing would turn real bugs into "hc_ir came back None".
             _capture_exception(diagnostics, exc)
             return PipelineResult(None, None, tuple(diagnostics))
         return PipelineResult(
@@ -316,20 +209,7 @@ def run_front_to_hc(
 
 
 def prepared_context() -> Any:
-    """Build an MLIR context with hc + hc_front registered and passes loaded.
-
-    Used by both the resolver (so the hc_front module it produces is
-    compatible with the pipeline) and `run_front_to_hc`. Caller owns the
-    context's lifetime.
-
-    Collocates three nominally-separate concerns — context allocation,
-    dialect registration on that context, and process-wide pass
-    registration — because every caller that wants one also wants the
-    other two. Splitting them would let callers build half-initialized
-    contexts and then get surprising failures at parse or pipeline-run
-    time; bundling makes the precondition "usable for hc_front + hc
-    work" a single call.
-    """
+    """MLIR context: hc + hc_front registered, passes loaded. Caller owns lifetime."""
 
     _ensure_passes_registered()
     from .mlir import ir
@@ -355,21 +235,11 @@ def _ensure_passes_registered() -> None:
 def _pipeline_string(
     schedule_path: Path, *, target: str | None, bench: bool = False
 ) -> str:
-    # Two-stage pipeline:
-    #   1) `transform-preload-library` + `transform-interpreter` runs the
-    #      user-or-default schedule (front-to-hc lowering, layout
-    #      cleanup, generic-pipeline funnels, kernel outlining, recipe
-    #      interpretation, `rocdl-attach-target`).
-    #   2) The fixed `_GPU_LOWERING_PIPELINE` chain takes the
-    #      `#rocdl.target`-stamped `gpu.module` to a `gpu.binary` blob.
-    #      Appended as raw passes because `convert-gpu-to-rocdl` is
-    #      anchored on `gpu::GPUModuleOp` upstream and the transform
-    #      dialect's pass-application op doesn't express nested pass
-    #      managers.
-    # The entry-point option is spelled redundantly because
-    # `__transform_main` is also the upstream default, but being explicit
-    # makes the pipeline self-documenting if we ever introduce secondary
-    # entry points (per-target lowerings, say).
+    # Two stages: 1) transform-preload-library + transform-interpreter
+    # runs the schedule, 2) `_GPU_LOWERING_PIPELINE` takes
+    # `#rocdl.target`-stamped `gpu.module` to `gpu.binary`. Stage 2 is
+    # raw passes (transform-dialect can't express nested pass managers).
+    # `entry-point=` is explicit so secondary entry points stay easy.
     gpu_lowering = _substitute_chip(_GPU_LOWERING_PIPELINE, target)
     gpu_lowering = _substitute_lld(gpu_lowering)
     gpu_lowering = _substitute_dump_dir(gpu_lowering)
@@ -389,20 +259,14 @@ def _build_pass_manager(pipeline: str, context: Any) -> Any:
 
     pm = passmanager.PassManager.parse(pipeline, context=context)
     if dump_passes_enabled():
-        # MLIR's IR printer can't be installed on a multi-threaded
-        # pass manager (LLVM ERRORs out at run time). Multi-threading
-        # is on by default; flipping it for the lifetime of the dump
-        # is fine — `HC_DUMP_PASSES` is opt-in debug, no one cares
-        # about the throughput hit.
+        # IR printer can't install on a multi-threaded PM (LLVM ERRORs).
+        # Opt-in debug, throughput loss is fine.
         context.enable_multithreading(False)
-        # Mirrors `mlir-opt --mlir-print-ir-after-all`. Catches every
-        # device-side pass appended by `_GPU_LOWERING_PIPELINE` plus the
-        # transform-interpreter pass itself. Per-pass output goes to
-        # stderr so a normal compile redirected to a file (e.g.
-        # `--dump-hc-ir > /tmp/hc.mlir`) keeps stdout clean. Per-pass
-        # transforms inside `transform.apply_registered_pass` aren't
-        # caught here — see `splice_dump_passes` in `_dump` for how the
-        # schedule itself is instrumented.
+        # `--mlir-print-ir-after-all` equivalent for the appended GPU
+        # chain and transform-interpreter. Per-pass output -> stderr so
+        # `--dump-hc-ir > /tmp/hc.mlir` stays clean. Passes inside
+        # `transform.apply_registered_pass` need `splice_dump_passes`
+        # in `_dump`.
         pm.enable_ir_printing(
             print_before_all=False,
             print_after_all=True,
@@ -413,9 +277,8 @@ def _build_pass_manager(pipeline: str, context: Any) -> Any:
 
 
 def _capture_exception(diagnostics: list[str], exc: Exception) -> None:
-    # `MLIRError` from the bindings already has a meaningful repr; keep it
-    # whole so the calling side can surface it alongside the captured
-    # handler diagnostics.
+    # `MLIRError`'s repr is already meaningful; surface alongside handler
+    # diagnostics.
     text = f"{type(exc).__name__}: {exc}"
     if text not in diagnostics:
         diagnostics.append(text)
@@ -428,16 +291,12 @@ def _schedule_file(
     target: str | None = None,
     context: Any = None,
 ) -> Iterator[Path]:
-    """Yield a filesystem path to the schedule, materializing inline text.
+    """Yield a filesystem path to the schedule (always materialized).
 
-    `transform-preload-library` takes file paths, not inline IR. We
-    always read the schedule into memory so we can apply the
-    `__HC_TARGET__` substitution before handing it to the pass manager;
-    every code path then writes a tempfile the driver controls. This
-    sidesteps the old `Path`-direct mode's footgun where a path
-    containing a character the MLIR option parser treated as a
-    delimiter (`,`, `}`, `=`) would break the pipeline string — the
-    tempfile path we generate is always safe.
+    `transform-preload-library` takes file paths. Always tempfile so
+    the driver controls the path — sidesteps option-parser-delimiter
+    chars in user-supplied paths and gives us a substitution slot for
+    `__HC_TARGET__`.
     """
 
     text = _resolve_schedule_text(schedule)
@@ -454,16 +313,10 @@ def _schedule_file(
 
 
 def _maybe_splice_dump_passes(text: str, *, context: Any) -> str:
-    # Only pay the parse/walk/restringify cost when the user asked for
-    # per-pass dumps. The splicer rewrites the schedule to interleave
-    # `transform.print` ops between every payload-mutating transform
-    # op so the interpreter dumps payload IR for free between passes —
-    # see `_dump.splice_dump_passes` for the rules. Borrows the
-    # caller's context (which has the transform dialect loaded via
-    # `prepared_context` / `_mlirRegisterEverything`) when given;
-    # falls back to a fresh `prepared_context` otherwise so this
-    # function stays usable from places that don't already hold one
-    # (tests, the `--dump-hc-ir` introspection path).
+    # Only parse/walk/restringify when per-pass dumps are enabled. See
+    # `_dump.splice_dump_passes` for the splicer rules. Borrows caller's
+    # context if given (transform dialect must be loaded); else fresh
+    # `prepared_context` for standalone use (tests, `--dump-hc-ir`).
     from ._dump import dump_passes_enabled, splice_dump_passes
     from .mlir import ir
 
@@ -494,9 +347,7 @@ def _resolve_schedule_text(schedule: ScheduleSource) -> str:
 
 
 def _substitute_target(text: str, target: str | None) -> str:
-    # `None` collapses to empty so the recipe interpreter's empty-target
-    # "run all" behaviour is the default; substituting unconditionally
-    # also keeps custom schedules without the placeholder untouched.
+    # `None` -> empty -> recipe interpreter "run all".
     value = "" if target is None else _validate_target(target)
     return text.replace(_TARGET_PLACEHOLDER, value)
 
@@ -506,11 +357,8 @@ def _validate_target(target: str) -> str:
         raise TypeError(f"target must be str | None, got {type(target).__name__}")
     bad = sorted({c for c in target if c in _TARGET_FORBIDDEN_CHARS})
     if bad:
-        # Reject up front so callers see "your target string is bad"
-        # instead of "MLIR refused to parse this schedule" 200 lines
-        # later. The blacklist covers everything that would either
-        # close the substituted MLIR string literal early or insert
-        # whitespace that the transform option parser splits on.
+        # Reject Python-side so callers see a clean ValueError, not a
+        # "MLIR refused to parse this schedule" 200 lines later.
         raise ValueError(f"target contains forbidden characters {bad}: {target!r}")
     return target
 
@@ -521,33 +369,20 @@ def _substitute_chip(text: str, target: str | None) -> str:
 
 
 def _substitute_lld(text: str) -> str:
-    # Resolve eagerly so the pipeline string is self-contained — the
-    # whole point of this substitution is to propagate the linker path
-    # through the pass's `--lld-path=` option instead of leaving the
-    # pass to consult `HC_LLD` / `$PATH` at run time. We do not validate
-    # that the resolved path actually exists: if the wheel is mis-staged
-    # the C++ pass will surface a clear "ld.lld not found" diagnostic
-    # naming the missing path, which is more actionable than a Python
-    # IO error from this layer.
+    # Eager resolve: pipeline is self-contained. Existence not validated
+    # here — C++ pass surfaces a clear "ld.lld not found" naming the
+    # missing path.
     return text.replace(_LLD_PLACEHOLDER, _resolve_lld())
 
 
 def _substitute_bench(text: str, *, bench: bool) -> str:
-    # `bench=False` collapses the placeholder to empty so the surrounding
-    # `prev_pass,_BENCH_PLACEHOLDER_next_pass` template flattens to
-    # `prev_pass,next_pass` (no double comma, no empty pass slot). The
-    # `True` form supplies its own trailing comma — keeps the splice as a
-    # single replace rather than two coordinated substitutions.
+    # `bench=False`: collapse to empty so `prev,placeholder,next`
+    # flattens to `prev,next`. `True`: pass + trailing comma.
     return text.replace(_BENCH_PLACEHOLDER, _BENCH_PASS_FRAGMENT if bench else "")
 
 
 def _substitute_dump_dir(text: str) -> str:
-    # Plumbs `HC_DUMP_DIR` into `hc-lower-gpu-to-binary`'s
-    # `--dump-intermediates=` option. Empty env -> empty value, which
-    # the pass interprets as "dumping disabled" and short-circuits to
-    # zero IO. We don't validate that the directory exists; the pass
-    # will fail loudly if it can't open the per-stage files for write,
-    # which is the right behaviour for an opt-in debug knob.
+    # `HC_DUMP_DIR` -> `--dump-intermediates=`. Empty -> pass disables.
     return text.replace(_DUMP_DIR_PLACEHOLDER, _resolve_dump_dir())
 
 
@@ -557,11 +392,6 @@ def _resolve_dump_dir() -> str:
         return ""
     bad = sorted({c for c in raw if c in _DUMP_DIR_FORBIDDEN_CHARS})
     if bad:
-        # Same rationale as `_validate_target` / `_resolve_lld`: a path
-        # containing `,`, `}`, `=`, quotes, or newlines would either
-        # break MLIR's option parser or close the option string early.
-        # Reject Python-side so the user gets a clear ValueError
-        # instead of a confusing MLIR diagnostic.
         raise ValueError(
             f"{_DUMP_DIR_ENV} contains forbidden characters {bad}: {raw!r}"
         )
@@ -572,10 +402,6 @@ def _resolve_lld() -> str:
     raw = str(lld_path())
     bad = sorted({c for c in raw if c in _LLD_FORBIDDEN_CHARS})
     if bad:
-        # Reject up front for the same reason `_validate_target` does:
-        # MLIR's option parser doesn't survive embedded quotes/newlines
-        # and the resulting diagnostic is much harder to debug than
-        # this exception.
         raise ValueError(
             f"resolved ld.lld path contains forbidden characters {bad}: {raw!r}"
         )
@@ -583,12 +409,11 @@ def _resolve_lld() -> str:
 
 
 def _resolve_chip(target: str | None) -> str:
-    """Map the user-facing `target=` to an AMDGPU chip name.
+    """`target=` -> AMDGPU chip name.
 
-    `None` -> `_DEFAULT_CHIP`; the single logical alias `amdgpu-gfx11`
-    -> `gfx1100`; bare `gfx<chip>` -> verbatim. Anything else falls
-    through to the default so `rocdl-attach-target` still gets a chip
-    it can parse.
+    `None` -> `_DEFAULT_CHIP`; `amdgpu-gfx11` -> `gfx1100`;
+    `gfx<chip>` -> verbatim; else -> default (recipe interpretation
+    surfaces its own diagnostic).
     """
 
     if target is None:
@@ -602,11 +427,6 @@ def _resolve_chip(target: str | None) -> str:
         return "gfx1100"
     if target.startswith("gfx"):
         return target
-    # Unknown logical target — recipe interpretation will simply not
-    # match anything (and surface its own diagnostic), so picking the
-    # default chip here keeps the schedule's GPU lowering passes
-    # well-formed enough to run without producing confusing
-    # second-order diagnostics from chip parsing.
     return _DEFAULT_CHIP
 
 
@@ -615,15 +435,11 @@ def _substitute_features(text: str, target: str | None) -> str:
 
 
 def _resolve_features(target: str | None) -> str:
-    """Pick the LLVM AMDGPU `target-features` string for `target`.
+    """LLVM AMDGPU `target-features` for `target`.
 
-    The only feature we set today is the wavefront size: gfx10+ chips
-    must compile in wave32 mode for WMMA to produce the per-lane
-    fragment layout the kernels assume, and the LLVM AMDGPU backend
-    defaults to wave64 for every chip when the feature string is empty.
-    Older chips (gfx9 and below) only ever ran wave64 and don't expose
-    a wave32 mode, so we leave their features empty and let the LLVM
-    defaults stand.
+    gfx10+ must set `+wavefrontsize32` for WMMA correctness (LLVM
+    default is wave64 -> silent garbage results). gfx9 and below run
+    wave64 only; empty.
     """
 
     chip = _resolve_chip(target)
@@ -634,13 +450,8 @@ def _resolve_features(target: str | None) -> str:
 
 
 def _gfx_family(chip: str) -> int | None:
-    # Pull the major version out of `gfx<major><minor><stepping>`. We
-    # only need the major to decide between wave32 and wave64, so the
-    # tail (which varies in width across families — gfx900, gfx1100,
-    # gfx12_50_) doesn't matter. Returns `None` for anything that
-    # doesn't look like a `gfx<digits>` chip so the caller can fall
-    # back to "no features"; that path also covers `_DEFAULT_CHIP`
-    # changes that drift away from the gfx scheme.
+    # Major version from `gfx<major><minor><stepping>`. Tail width
+    # varies (gfx900, gfx1100, gfx12_50). Non-`gfx<digits>` -> `None`.
     if not chip.startswith("gfx"):
         return None
     rest = chip[3:]

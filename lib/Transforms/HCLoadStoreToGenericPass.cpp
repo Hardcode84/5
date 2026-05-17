@@ -2,11 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-load-store-to-generic`: rewrite the per-tile memory
-// ops `hc.load` / `hc.vload` / `hc.store` into the body-driven
-// `hc.generic` surface that owns the post-flatten compute pipeline.
-// See the pass description in `include/hc/Transforms/Passes.td` and
-// the design in `doc/layouts.md`.
+// `-hc-load-store-to-generic`: rewrite `hc.load` / `hc.vload` /
+// `hc.store` into `hc.generic`. Design: `doc/layouts.md`.
 
 #include "hc/Transforms/Passes.h"
 
@@ -34,11 +31,8 @@ using namespace mlir::hc;
 
 namespace {
 
-// Materialize one bound dim as `!hc.idx<dim>` SSA via an
-// `hc.idx_apply` with no listed symbols (free shape names stay
-// ambient). Mirrors the helper in `hc-shaped-compute-to-generic` —
-// the rewriter has full structural knowledge of the iteration space,
-// so the bounds-inference pass is a no-op if it ever runs after.
+// Bound dim as `!hc.idx<dim>` SSA via `hc.idx_apply` (free shape
+// names stay ambient).
 static Value materializeIdxBound(OpBuilder &builder, Location loc,
                                  ExprAttr dim) {
   auto idxTy = IdxType::get(builder.getContext(), dim);
@@ -46,9 +40,8 @@ static Value materializeIdxBound(OpBuilder &builder, Location loc,
                               builder.getStrArrayAttr({}));
 }
 
-// Build a `tuple<idx<...>, ...>` SSA tuple from the per-axis bounds —
-// every shaped allocator (`hc.zeros` / `hc.vzeros`) takes its result
-// shape through one of these.
+// `tuple<idx<...>, ...>` over per-axis bounds; shaped allocator
+// shape operand.
 static Value buildShapeTuple(OpBuilder &builder, Location loc,
                              ValueRange dims) {
   SmallVector<Type> elemTypes(
@@ -57,10 +50,8 @@ static Value buildShapeTuple(OpBuilder &builder, Location loc,
   return HCTupleOp::create(builder, loc, tupleTy, dims);
 }
 
-// Pull each dim off a shaped operand. Bails on non-shaped types
-// (`!hc.undef`) and on shapes that carry non-`#hc.expr` dim entries —
-// either case means the rewriter can't materialize bounds and the op
-// stays for later inference / downstream diagnostics.
+// Dim list off a shaped operand. Fails on non-shaped (`!hc.undef`)
+// or non-`#hc.expr` dim entries.
 static FailureOr<SmallVector<ExprAttr>> getOperandShape(Type t) {
   auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(t);
   if (!shaped)
@@ -79,13 +70,8 @@ static FailureOr<SmallVector<ExprAttr>> getOperandShape(Type t) {
   return dims;
 }
 
-// Per-axis decomposition of an access op's index operand. `base` is the
-// lower bound of the tile walk on that axis (a scalar `!hc.idx<expr>`
-// contributes `base = expr`; a slice contributes `base = lower` or `0`
-// when the slice's lower is absent). `step` is the per-iter stride; a
-// scalar idx is always step 1, a slice contributes `step = step_expr`
-// or `1` when absent. Both are stored as `ExprAttr` so callers can
-// build the per-axis offset structurally without re-parsing.
+// Per-axis (base, step). Scalar `!hc.idx<expr>` → (expr, 1); slice →
+// (lower or 0, step or 1).
 struct AxisIndex {
   ExprAttr base;
   ExprAttr step;

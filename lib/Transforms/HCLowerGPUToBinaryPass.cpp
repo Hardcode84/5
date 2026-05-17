@@ -2,13 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-gpu-to-binary`. Compiles each `gpu.module`
-// in the payload into a HSACO blob attached as a sibling `gpu.binary`
-// op, then erases the source `gpu.module`. Mirrors wave's
-// `water-gpu-module-to-binary` pass — minus the dump/override knobs
-// (only useful when iterating on device-libs linking, which we don't
-// do yet) and minus any ROCm-install fallback (we use our own pinned
-// `ld.lld` exclusively, per the toolchain bead).
+// Implements `-hc-lower-gpu-to-binary`. Compile each `gpu.module` to
+// an HSACO blob, attach as a sibling `gpu.binary`, erase the source.
+// Uses our pinned `ld.lld` — no ROCm-install fallback.
 
 #include "hc/Transforms/Passes.h"
 
@@ -47,9 +43,7 @@ using namespace mlir;
 
 namespace {
 
-// AMDGPU initializers are gated on the build's target list; calling
-// them more than once is safe and they bail out cheaply if the target
-// is already registered.
+// Safe to call repeatedly; bail out cheap if already registered.
 static void initializeAMDGPUTargetOnce() {
   static const bool done = []() {
     LLVMInitializeAMDGPUTarget();
@@ -71,45 +65,31 @@ public:
 private:
   LogicalResult lowerOne(gpu::GPUModuleOp module);
 
-  // Resolve ld.lld in option → HC_LLD → $PATH order. Returns an empty
-  // string and emits a diagnostic on `module` if nothing usable is
-  // found. We deliberately do not look at ROCM_PATH — the toolchain
-  // bead is explicit that we own our own lld and that consumers
-  // should fail loudly rather than silently pick up a host install.
+  // Search order: option → `HC_LLD` → `$PATH`. ROCM_PATH excluded —
+  // consumers should fail loudly, not silently pick up a host install.
   std::string resolveLldPath(gpu::GPUModuleOp module);
 
-  // Write `bytes` to `<dumpIntermediates>/<moduleName>.<stage>` if the
-  // option is non-empty; no-op otherwise. Stage names embed an order
-  // prefix (`0-pre-opt.ll`, `1-post-opt.ll`, ...) so `ls` shows the
-  // pipeline order. Diagnostics on write failure attach to `module`
-  // and surface as a pass-level error — nobody opts into dumping
-  // expecting silent partial output.
+  // Dump to `<dumpIntermediates>/<moduleName>.<stage>`; stage names
+  // sort by pipeline order. Write failures surface as pass errors.
   LogicalResult dumpStage(gpu::GPUModuleOp module, StringRef stage,
                           StringRef bytes);
 
-  // LLVM module convenience: serialises `m` to text and forwards to
-  // `dumpStage`. Kept separate so the call sites stay readable.
+  // Serialize `m` to text; forward to `dumpStage`.
   LogicalResult dumpLLVMModule(gpu::GPUModuleOp module, StringRef stage,
                                const llvm::Module &m);
 
-  // Validate the module's `targets` attr and unwrap the single
-  // `#rocdl.target` element. Anything else is a hard error with the
-  // offending attr surfaced in the diagnostic.
+  // Exactly one `#rocdl.target` required; else hard error.
   FailureOr<ROCDL::ROCDLTargetAttr>
   validateAndExtractRocdlTarget(gpu::GPUModuleOp module);
 
-  // Build the AMDGPU target machine from the rocdl target attr and
-  // imprint its data layout / triple onto the just-translated LLVM
-  // module. Side effects on `llvmModule` are intentional — the data
-  // layout and triple must match the target machine for downstream
-  // emit / optimize to be well-defined.
+  // Side-effects `llvmModule`: data layout and triple must match the
+  // target machine for downstream emit / optimize.
   FailureOr<std::unique_ptr<llvm::TargetMachine>>
   buildTargetMachineFor(gpu::GPUModuleOp module,
                         ROCDL::ROCDLTargetAttr rocdlTarget,
                         llvm::Module &llvmModule);
 
-  // Run LLVM's standard optimization pipeline at the target machine's
-  // opt level. Dumps `1-post-opt.ll` on success.
+  // LLVM standard pipeline at the target opt level; dumps `1-post-opt.ll`.
   LogicalResult optimizeLLVMModule(gpu::GPUModuleOp module,
                                    llvm::Module &llvmModule,
                                    llvm::TargetMachine &targetMachine);
@@ -119,16 +99,13 @@ private:
   emitISAFromLLVMModule(gpu::GPUModuleOp module, llvm::Module &llvmModule,
                         llvm::TargetMachine &targetMachine);
 
-  // Assemble ISA text to an ELF object via the AMDGPU MC stack, then
-  // link with our own ld.lld into an HSACO. Dumps `2b-object.o` and
-  // `3-binary.hsaco` along the way.
+  // ISA → ELF (AMDGPU MC) → HSACO (`ld.lld`); dumps `2b-object.o` and
+  // `3-binary.hsaco`.
   FailureOr<SmallVector<char, 0>>
   assembleAndLinkBinary(gpu::GPUModuleOp module, llvm::SmallString<0> &isa,
                         llvm::TargetMachine &targetMachine);
 
-  // Attach the HSACO blob as a sibling `gpu.binary` op and drop the
-  // source `gpu.module`. The original rocdl target attr rides along
-  // on the object so launch-time pieces can still introspect the chip.
+  // Target attr rides along — launch-time can still introspect the chip.
   void attachBinaryAndEraseModule(gpu::GPUModuleOp module, Attribute targetAttr,
                                   ArrayRef<char> binary);
 };
@@ -168,30 +145,10 @@ LogicalResult HCLowerGPUToBinaryPass::dumpLLVMModule(gpu::GPUModuleOp module,
 }
 
 std::string HCLowerGPUToBinaryPass::resolveLldPath(gpu::GPUModuleOp module) {
-  // Three candidate sources in priority order:
-  //   1. `--lld-path=` option (populated Python-side by `_substitute_lld`
-  //      from `_native_paths.lld_path()`, which points at the bundled
-  //      `hc/_native/bin/ld.lld` by default).
-  //   2. `HC_LLD` env (source-tree dev override, undocumented but kept
-  //      working for users who run pre-staged toolchain builds).
-  //   3. `findProgramByName("ld.lld")` — last-ditch PATH search; not what
-  //      the production pipeline should rely on but harmless as a fallback
-  //      when the wheel is misconfigured.
-  //
-  // Each candidate is existence-checked before we hand it to
-  // `linkObjectCode` — the MLIR `ExecuteAndWait` wrapper surfaces an
-  // `execve` failure as the same unhelpful "lld invocation failed"
-  // diagnostic as a real linker error, and a missing-binary is by far
-  // the more common failure mode for source-tree devs and broken wheel
-  // installs. Validating up front lets the diagnostic name the missing
-  // path so the user knows exactly which file to stage.
-  //
-  // Explicit candidates (option, env) are authoritative — when the
-  // user sets one we fail loudly on a miss rather than cascading to
-  // PATH. Silently substituting a different `ld.lld` than was asked
-  // for would defeat the point of the override and surface as the
-  // next mysterious "why is my linker doing X" bug. Only the implicit
-  // PATH fallback fires when nothing was set.
+  // Order: `--lld-path` / `HC_LLD` / `$PATH`. Existence-check first —
+  // `ExecuteAndWait` swallows missing-binary into "lld invocation
+  // failed". Explicit candidates fail loud on a miss; PATH fallback
+  // only fires when neither was set.
   auto failMissing = [&](StringRef where, StringRef path) {
     module.emitError("hc-lower-gpu-to-binary: ld.lld not executable at ")
         << path << " (via " << where << ")";
@@ -276,8 +233,7 @@ LogicalResult
 HCLowerGPUToBinaryPass::optimizeLLVMModule(gpu::GPUModuleOp module,
                                            llvm::Module &llvmModule,
                                            llvm::TargetMachine &targetMachine) {
-  // Plain wrapper around LLVM's standard pipeline at the target's opt
-  // level; matches wave's `optimizeModule`.
+  // LLVM standard pipeline at target opt level.
   auto optimizer =
       makeOptimizingTransformer(static_cast<int>(targetMachine.getOptLevel()),
                                 /*sizeLevel=*/0, &targetMachine);
@@ -318,12 +274,9 @@ FailureOr<SmallVector<char, 0>> HCLowerGPUToBinaryPass::assembleAndLinkBinary(
       targetMachine.getTargetFeatureString(), emitOpError);
   if (failed(object))
     return failure();
-  // Stage `2b` because we want this between `2-isa.s` and `3-binary.hsaco`
-  // in `ls | sort` — the assembled ELF is the input lld actually sees,
-  // so when the linker step fails the .o is what you reach for first.
-  // The MLIR `linkObjectCode` wrapper swallows lld's stderr and surfaces
-  // only a generic "lld invocation failed", so without this dump every
-  // linker bug starts with a re-run-with-extra-instrumentation step.
+  // `2b` sorts between `2-isa.s` and `3-binary.hsaco`. `linkObjectCode`
+  // swallows lld stderr; without this dump every linker bug needs a
+  // re-run with extra instrumentation.
   if (failed(dumpStage(module, "2b-object.o",
                        StringRef(object->data(), object->size()))))
     return failure();
@@ -345,10 +298,7 @@ FailureOr<SmallVector<char, 0>> HCLowerGPUToBinaryPass::assembleAndLinkBinary(
 void HCLowerGPUToBinaryPass::attachBinaryAndEraseModule(gpu::GPUModuleOp module,
                                                         Attribute targetAttr,
                                                         ArrayRef<char> binary) {
-  // The `Binary` compilation target tells the GPU dialect that the
-  // attached string is the final device blob (no further translation
-  // needed downstream); the original rocdl target attr rides along so
-  // the launch-time pieces can still introspect the chip if they want.
+  // `Binary` compilation target = final device blob (no further translation).
   Builder b(module.getContext());
   StringAttr blob = b.getStringAttr(StringRef(binary.data(), binary.size()));
   Attribute objectAttr = gpu::ObjectAttr::get(
@@ -374,11 +324,8 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
 
   initializeAMDGPUTargetOnce();
 
-  // gpu.module → llvm::Module. The ROCDL/LLVM/Builtin dialect translation
-  // interfaces must already be registered on the context's dialect
-  // registry; that's `mlir::registerAllToLLVMIRTranslations`, wired up by
-  // every entry point that runs this pass (hc-opt main + any future
-  // Python driver).
+  // Translation interfaces must be registered on the context
+  // (`mlir::registerAllToLLVMIRTranslations`).
   llvm::LLVMContext llvmContext;
   std::unique_ptr<llvm::Module> llvmModule =
       translateModuleToLLVMIR(module, llvmContext);
@@ -393,10 +340,7 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
   std::unique_ptr<llvm::TargetMachine> targetMachine =
       std::move(*targetMachineOr);
 
-  // Dump the pre-optimization LLVM module first so it survives an
-  // optimizer crash — historically the most informative artifact when
-  // the backend miscompiles, since it shows what the optimizer was
-  // handed before fold-the-world set in.
+  // Pre-opt dump first — survives an optimizer crash.
   if (failed(dumpLLVMModule(module, "0-pre-opt.ll", *llvmModule)))
     return failure();
   if (failed(optimizeLLVMModule(module, *llvmModule, *targetMachine)))
@@ -418,9 +362,7 @@ LogicalResult HCLowerGPUToBinaryPass::lowerOne(gpu::GPUModuleOp module) {
 
 void HCLowerGPUToBinaryPass::runOnOperation() {
   ModuleOp root = getOperation();
-  // Materialize the module list up front; lowerOne erases entries as
-  // it walks. early_inc_range would also work but we'll stop on the
-  // first failure so a vector keeps the control flow obvious.
+  // Materialize first — `lowerOne` erases as it walks.
   SmallVector<gpu::GPUModuleOp> modules(root.getOps<gpu::GPUModuleOp>());
   for (gpu::GPUModuleOp module : modules) {
     if (failed(lowerOne(module))) {

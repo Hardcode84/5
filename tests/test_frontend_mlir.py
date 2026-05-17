@@ -77,8 +77,8 @@ _M = sym.M
 _K = sym.K
 
 
-# Fixture exercising every decorator kwarg surfaced to `hc_front`: symbolic
-# `work_shape`, concrete `group_shape`, `subgroup_size`, and `literals`.
+# Covers every decorator kwarg surfaced to `hc_front`: symbolic
+# `work_shape`, concrete `group_shape`, `subgroup_size`, `literals`.
 @kernel(
     work_shape=(ceil_div(_M, 16) * 32, ceil_div(_K, 16)),
     group_shape=(32, 1),
@@ -192,9 +192,8 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
             ("x", "int"),
         ]
         assert _parameter_passing_records(kernel_op) == ["positional", "positional"]
-        # Decorator kwargs arrive as builtin attrs on the op: shape axes as
-        # string arrays for later `#hc.shape` assembly, and `subgroup_size`
-        # absent because the sample kernel does not declare it.
+        # Shape axes ride as string arrays for later `#hc.shape`
+        # assembly. `subgroup_size` absent — kernel doesn't declare it.
         assert _string_array_values(kernel_op.attributes["work_shape"]) == ["4"]
         assert _string_array_values(kernel_op.attributes["group_shape"]) == ["4"]
         assert "subgroup_size" not in kernel_op.attributes
@@ -205,8 +204,8 @@ def test_lower_function_to_front_ir_builds_kernel_module() -> None:
         ]
         assert kernel_op.attributes["returns"].value == "int"
         assert _string_array_values(workitem_region.attributes["captures"]) == ["tmp"]
-        # Pinned so `-hc-front-fold-region-defs` can pair the region op
-        # with the ghost `name {ref.kind = "local"} + call` trail below.
+        # `-hc-front-fold-region-defs` pairs the region op with the
+        # ghost `name {ref.kind = "local"} + call` trail by this name.
         assert workitem_region.attributes["name"].value == "lane"
         assert str(kernel_op.location) == f'loc("{__file__}":{def_line}:1)'
 
@@ -300,9 +299,8 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         kernel_op = module.body.operations[0]
 
         assert isinstance(kernel_op, hc_front.KernelOp)
-        # Symbolic expressions serialize via ixsimpl's canonical form, so the
-        # pretty text we pin here is whatever `str(expr)` emits — not the
-        # Python source `ceil_div(M, 16) * 32`.
+        # Symbolic exprs serialize via ixsimpl canonical form: `str(expr)`,
+        # not the Python source.
         assert _string_array_values(kernel_op.attributes["work_shape"]) == [
             "32*ceiling(1/16*M)",
             "ceiling(1/16*K)",
@@ -310,8 +308,7 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         assert _string_array_values(kernel_op.attributes["group_shape"]) == ["32", "1"]
         assert kernel_op.attributes["subgroup_size"].value == 32
         assert str(kernel_op.attributes["subgroup_size"].type) == "i32"
-        # `literals` is a `frozenset` on the Python side; the emitter sorts
-        # it for stable round-trip.
+        # `literals` is a `frozenset`; emitter sorts for stable round-trip.
         assert _string_array_values(kernel_op.attributes["literals"]) == [
             "WMMA_K",
             "WMMA_M",
@@ -354,9 +351,9 @@ def test_lower_function_to_front_ir_emits_decorator_metadata() -> None:
         assert result_types[0]["kind"].value == "vector"
         assert _string_array_values(result_types[0]["shape"]) == ["8"]
         assert result_types[0]["dtype"].value == "float32"
-        # No `lowering_recipes` attribute lives on the intrinsic op. The
-        # recipes ride along as real `transform.named_sequence` ops inside a
-        # sibling top-level `builtin.module @__hc_intrinsic_lowerings__`.
+        # Recipes ride as `transform.named_sequence` ops inside the
+        # sibling `builtin.module @__hc_intrinsic_lowerings__`, not as
+        # an attribute on the intrinsic op.
         assert "lowering_recipes" not in intrinsic_op.attributes
         siblings = list(module.body.operations)
         lowerings = next(op for op in siblings if op.operation.name == "builtin.module")

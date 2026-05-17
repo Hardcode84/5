@@ -423,9 +423,7 @@ def test_lower_function_records_wmma_intrinsic_contract_metadata() -> None:
         "keyword_only",
         "keyword_only",
     )
-    # The intrinsic has no typed parameter annotations worth surfacing
-    # structurally; the emitter should omit the key rather than emit an
-    # empty mapping.
+    # No typed annotations → omit the key, not emit an empty mapping.
     assert "parameter_annotations" not in intrinsic_payload
 
 
@@ -443,9 +441,8 @@ def test_lower_source_does_not_fabricate_toplevel_metadata() -> None:
     lower_source(_CONTROL_FLOW_SOURCE, emitter, filename="control.py")
 
     func_payload = _payloads(emitter, "func_begin")[0]
-    # Source-only lowering has no Python function object to query for
-    # decorator kwargs or resolved annotations, so these keys must stay
-    # absent rather than leak stale values from a previous run.
+    # Source-only lowering: no live function object → no decorator
+    # kwargs or resolved annotations. Keys stay absent.
     assert "metadata" not in func_payload
     assert "parameter_annotations" not in func_payload
 
@@ -519,9 +516,8 @@ def test_region_capture_list_ignores_region_locals_and_builtins() -> None:
 
 
 def test_name_load_payloads_classify_param_iv_local() -> None:
-    # Covers the three frontend-owned ref kinds at once: ``x`` is a param,
-    # ``k`` is an iv, ``tmp`` is a local. Captures + builtins are left
-    # unclassified for the driver to fill in.
+    # Three frontend-owned ref kinds at once: param `x`, iv `k`, local
+    # `tmp`. Captures + builtins are left unclassified for the driver.
     emitter = RecordingEmitter()
     source = """
 @kernel(work_shape=(4,), group_shape=(4,))
@@ -548,15 +544,14 @@ def demo(group, x):
     assert kinds_by_name["x"] == {"param"}
     assert kinds_by_name["k"] == {"iv"}
     assert kinds_by_name["tmp"] == {"local"}
-    # Unresolved captures — the driver fills in ``builtin`` / ``constant``.
+    # Unresolved captures — driver fills `builtin` / `constant` later.
     assert kinds_by_name["range"] == {None}
     assert kinds_by_name["CONST"] == {None}
 
 
 def test_name_store_payloads_skip_ref() -> None:
-    # Store-context names become ``target_name`` ops; the plain ``name`` op
-    # only covers loads, so the ref classification shouldn't leak onto
-    # stores even when the identifier happens to shadow a param.
+    # Stores become `target_name` ops. Ref classification stays off
+    # stores even when the name shadows a param.
     emitter = RecordingEmitter()
     source = """
 @kernel(work_shape=(4,), group_shape=(4,))
@@ -569,9 +564,8 @@ def demo(group, x):
 
     name_events = [event for event in emitter.events if event.kind == "name"]
     assert all("ref" in event.payload for event in name_events), name_events
-    # No ``ref`` leaks onto ``target_name`` events, those have their own
-    # payload shape because storing into a name doesn't resolve against the
-    # function's scope the same way a load does.
+    # `target_name` events carry their own payload shape: storing into
+    # a name doesn't resolve against function scope like a load does.
     target_events = [event for event in emitter.events if event.kind == "target_name"]
     assert target_events
     assert all("ref" not in event.payload for event in target_events)

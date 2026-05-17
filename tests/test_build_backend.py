@@ -245,8 +245,7 @@ def test_install_package_native_artifacts_copies_runtime_tree(
     assert (package_native_root / "lib" / "libHC.a").read_text(
         encoding="utf-8"
     ) == "archive\n"
-    # `ld.lld` is bundled into `_native/bin/` so the pipeline can resolve
-    # it via `_native_paths.lld_path` without depending on `HC_LLD`.
+    # `ld.lld` lands in `_native/bin/` for `_native_paths.lld_path`.
     assert (package_native_root / "bin" / "ld.lld").read_text(
         encoding="utf-8"
     ) == "lld\n"
@@ -260,9 +259,7 @@ def test_install_package_native_artifacts_skips_lld_when_no_llvm_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # Build pathways that don't bootstrap LLVM (sdist, metadata-only)
-    # never see an install root; the artifact copier must skip the lld
-    # staging step rather than tripping its own validation.
+    # No LLVM root (sdist / metadata-only) -> skip lld stage, don't fail.
     native_install_root = tmp_path / "native-install"
     package_native_root = tmp_path / "package" / "_native"
     (native_install_root / "bin").mkdir(parents=True)

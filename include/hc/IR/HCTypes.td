@@ -25,9 +25,8 @@ def HC_InlineShapeAttrParameter
 def HC_UndefType : HC_Type<"Undef", "undef"> {
   let summary = "Placeholder type for values awaiting type inference.";
   let description = [{
-    `!hc.undef` is the "type not yet known" state produced by the mechanical
-    `hc_front` -> `hc` rewrite. A later inference pipeline refines it into a
-    concrete `hc` type (or builtin) via `unrealized_conversion_cast`.
+    Type-not-yet-known state produced by `hc_front` -> `hc`. Inference later
+    refines via `unrealized_conversion_cast`.
   }];
 }
 
@@ -35,14 +34,12 @@ def HC_IdxType : HC_Type<"Idx", "idx",
     [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Index-kind value, optionally pinned to a symbolic expression.";
   let description = [{
-    `!hc.idx` marks a value as a scalar index. When the symbolic expression is
-    pinned (`!hc.idx<"M + 1">`), type uniquing over the ixsimpl-canonicalized
-    expression gives free expression equality: two SSA values typed
-    `!hc.idx<"M + 1">` are known to denote the same index.
+    Scalar index. Pinned form (`!hc.idx<"M + 1">`) uses ixsimpl-canonical
+    expression uniquing — two values typed identically denote the same
+    index.
 
-    Textually the expression text is inlined as a quoted string to avoid the
-    ambiguous-looking `<<...>>` nesting the default attribute-parameter
-    printer would produce.
+    Expression text inlines as a quoted string to dodge ambiguous-looking
+    `<<...>>` nesting from the default parameter printer.
   }];
   let parameters = (ins OptionalParameter<"::mlir::hc::ExprAttr">:$expr);
   let hasCustomAssemblyFormat = 1;
@@ -52,9 +49,8 @@ def HC_PredType : HC_Type<"Pred", "pred",
     [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Boolean-kind value, optionally pinned to a symbolic predicate.";
   let description = [{
-    Boolean analogue of `!hc.idx`. When pinned (`!hc.pred<"M < N">`), the type
-    uniquely identifies the symbolic predicate; the text is inlined the same
-    way as for `!hc.idx`.
+    Boolean counterpart of `!hc.idx`. Pinned form (`!hc.pred<"M < N">`)
+    uniques on the symbolic predicate; text inlined the same way.
   }];
   let parameters = (ins OptionalParameter<"::mlir::hc::PredAttr">:$pred);
   let hasCustomAssemblyFormat = 1;
@@ -64,11 +60,10 @@ def HC_SliceType : HC_Type<"Slice", "slice",
     [DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "First-class slice value.";
   let description = [{
-    Produced by `hc.slice_expr` and consumed by `hc.load`, `hc.store`,
-    `hc.buffer_view`, and friends. Optional lower/upper/step parameters mirror
-    the syntactically present operands of the producing `hc.slice_expr`.
-    Missing parameters carry Python slice semantics (`None`-equivalent);
-    present-but-unknown parts use `!hc.undef`.
+    Produced by `hc.slice_expr`, consumed by `hc.load` / `hc.store` /
+    `hc.buffer_view` / friends. Optional `lower` / `upper` / `step` mirror
+    syntactically-present operands. Missing parts carry Python slice
+    semantics (`None`); present-but-unknown parts use `!hc.undef`.
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::Type">:$lowerType,
@@ -78,33 +73,27 @@ def HC_SliceType : HC_Type<"Slice", "slice",
   let hasCustomAssemblyFormat = 1;
 }
 
-// All five shaped types carry an optional `#hc.layout<...>` payload after
-// the shape. Absent layout is the v0 identity contract (canonical
-// identity offset, product-of-shape storage, rightmost axis varies
-// fastest); explicit layouts are interpreted by the canonicalize / flatten
-// passes documented in `doc/layouts.md`. Layouts attach to both semantic
-// (`!hc.tensor`, `!hc.vector`) and bare (`!hc.bare_tensor`,
-// `!hc.bare_vector`) shapes because the flatten pass needs them on either
-// side of the decompose-shaped-values boundary.
-
-// Each of the five shaped types below adds a `get(ctx, elem, shape)`
-// overload alongside the auto-generated 4-arg form so existing callers
-// that don't carry a layout don't need to spell `LayoutAttr{}`. Absent
-// layout is the v0 default and the canonical-fold target.
+// Shaped types carry an optional `#hc.layout<...>` after the shape. Absent
+// layout = identity contract (canonical identity offset, product-of-shape
+// storage, rightmost axis varies fastest); explicit layouts go through
+// canonicalize / flatten (`doc/layouts.md`). Both semantic
+// (`!hc.tensor` / `!hc.vector`) and bare (`!hc.bare_tensor` /
+// `!hc.bare_vector`) carry a layout slot because flatten needs them on
+// either side of the decompose-shaped-values boundary.
+//
+// Each shaped type below has a `get(ctx, elem, shape)` overload alongside
+// the auto-generated 4-arg form so layout-less callers skip `LayoutAttr{}`.
 
 def HC_BufferType : HC_Type<"Buffer", "buffer",
     [DeclareTypeInterfaceMethods<SymbolicallyShapedTypeInterface>,
      DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic buffer type";
   let description = [{
-    Initial semantic buffer type carrying an element type and a shape
-    attribute. The shape is intentionally modeled as an attribute payload so the
-    symbolic surface can evolve independently from the type shell, while the
-    textual type syntax inlines the shape dimensions as `["M", "N + 1"]`.
-    An empty shape is a rank-0 mutable scalar buffer, not missing metadata.
-    An optional `#hc.layout<...>` payload follows the shape; absent means
-    "default fully-strided np/torch layout" once host wrappers start
-    feeding strides in (see `doc/layouts.md`).
+    Element type + shape attribute. Shape inlines as `["M", "N + 1"]`. Empty
+    shape is a rank-0 mutable scalar buffer, not missing metadata. Optional
+    `#hc.layout<...>` payload follows; absent = default fully-strided
+    np/torch layout once host wrappers feed strides in (see
+    `doc/layouts.md`).
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -126,10 +115,8 @@ def HC_TensorType : HC_Type<"Tensor", "tensor",
      DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic tensor type";
   let description = [{
-    Initial semantic tensor type carrying an element type and a symbolic shape
-    attribute. The textual type syntax inlines the shape dimensions as
-    `["M", "N + 1"]`. An optional `#hc.layout<...>` payload follows the
-    shape; absent means the identity layout.
+    Element type + symbolic shape attribute. Shape inlines as
+    `["M", "N + 1"]`. Optional `#hc.layout<...>` follows; absent = identity.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -151,11 +138,9 @@ def HC_VectorType : HC_Type<"Vector", "vector",
      DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Semantic vector type";
   let description = [{
-    Immutable fixed-size vector value. Carries an element type and a symbolic
-    shape; activity mask semantics, the optional collective-return suffix, and
-    layout metadata sit on top of this shell as they settle. Printed as
-    `!hc.vector<elem, ["A", "B"]>`. An optional `#hc.layout<...>` payload
-    follows the shape; absent means the identity layout.
+    Immutable fixed-size vector. Element type + symbolic shape. Printed as
+    `!hc.vector<elem, ["A", "B"]>`. Optional `#hc.layout<...>` follows;
+    absent = identity.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -177,11 +162,9 @@ def HC_BareTensorType : HC_Type<"BareTensor", "bare_tensor",
      DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Compiler-internal tensor data without semantic validity.";
   let description = [{
-    Raw shaped tensor container produced by HC normalization before upstream
-    lowering. Unlike `!hc.tensor`, this type carries only data; validity travels
-    as a parallel `!hc.bare_tensor<!hc.pred, ...>` value with the same shape.
-    An optional `#hc.layout<...>` payload follows the shape; absent means
-    the identity layout.
+    Raw shaped tensor produced by HC normalization. Carries data only;
+    validity rides on a parallel `!hc.bare_tensor<!hc.pred, ...>` of the
+    same shape. Optional `#hc.layout<...>` follows; absent = identity.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -203,11 +186,9 @@ def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
      DeclareTypeInterfaceMethods<HCJoinableTypeInterface>]> {
   let summary = "Compiler-internal vector data without semantic validity.";
   let description = [{
-    Raw shaped vector container produced by HC normalization before upstream
-    lowering. Unlike `!hc.vector`, this type carries only data; validity travels
-    as a parallel `!hc.bare_vector<!hc.pred, ...>` value with the same shape.
-    An optional `#hc.layout<...>` payload follows the shape; absent means
-    the identity layout.
+    Raw shaped vector produced by HC normalization. Carries data only;
+    validity rides on a parallel `!hc.bare_vector<!hc.pred, ...>` of the
+    same shape. Optional `#hc.layout<...>` follows; absent = identity.
   }];
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
@@ -224,32 +205,25 @@ def HC_BareVectorType : HC_Type<"BareVector", "bare_vector",
   ];
 }
 
-// Memory carrier type, the post-flatten replacement for the
-// memref-shaped storage we used to hand to the launch-body lowering.
-// Element type is optional: typed pointers (`!hc.ptr<f16, addrspace = ...>`)
-// preserve the element through to the SPIR-V boundary; opaque pointers
-// (`!hc.ptr<addrspace = ...>`) match the LLVM-17 opaque-pointer surface
-// the AMDGPU backend expects. Address space is required — there's no
-// "default" memory class on a GPU, so omitting it would just hide bugs.
+// Memory carrier — post-flatten replacement for memref-shaped storage.
+// Element type optional: typed pointers preserve it through the SPIR-V
+// boundary; opaque pointers match the LLVM-17 opaque surface AMDGPU
+// expects. Address space required — no "default" memory class on a GPU.
 def HC_PtrType : HC_Type<"Ptr", "ptr"> {
   let summary = "Memory pointer in a named address space (workgroup/global/private).";
   let description = [{
-    Pointer to a single element of `$elementType` (or to opaque memory
-    when `$elementType` is absent), living in `$addrSpace`. See
-    `doc/layouts.md` for the role this plays in the post-flatten
-    pipeline. Element type carries through the dialect until the
-    `hc-lower-to-llvm` boundary drops it on the AMDGPU path; the
-    SPIR-V path keeps it.
+    Pointer to a single `$elementType` element (or opaque memory when
+    `$elementType` is absent) in `$addrSpace`. Element type carries through
+    to `hc-lower-to-llvm`, which drops it on the AMDGPU path and keeps it
+    on SPIR-V. See `doc/layouts.md` for the post-flatten role.
   }];
   let parameters = (ins
     EnumParameter<HC_AddrSpace>:$addrSpace,
     OptionalParameter<"::mlir::Type">:$elementType
   );
-  // Surface mirrors `!llvm.ptr<3>`: required address space first as a
-  // bare keyword, optional element type after the comma. Optional
-  // groups need a literal anchor for the parser to probe presence
-  // (the trailing `,` does that), so the optional positional element
-  // can't sit before the required one without going custom.
+  // Surface mirrors `!llvm.ptr<3>`: required addrspace keyword, optional
+  // element type after the comma. Optional group needs a literal anchor
+  // (the `,`) so the optional element can't precede the required AS.
   let assemblyFormat = "`<` $addrSpace (`,` $elementType^)? `>`";
   let builders = [
     TypeBuilder<(ins "::mlir::hc::AddrSpace":$addrSpace), [{
@@ -261,10 +235,10 @@ def HC_PtrType : HC_Type<"Ptr", "ptr"> {
 def HC_GroupType : HC_Type<"Group", "group"> {
   let summary = "Kernel launch-context token.";
   let description = [{
-    Carries invariant launch metadata for the special kernel `group`
-    parameter. Dynamic launch queries (`hc.group_id`, `hc.local_id`, ...)
-    still produce ordinary `!hc.idx` values; this type only records the
-    static metadata those queries can derive ranks and shape facts from.
+    Invariant launch metadata for the kernel `group` parameter. Dynamic
+    queries (`hc.group_id`, `hc.local_id`, ...) still produce `!hc.idx`;
+    this type only records the static facts those queries derive rank and
+    shape from.
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$workShape,
@@ -278,10 +252,9 @@ def HC_GroupType : HC_Type<"Group", "group"> {
 def HC_WorkitemType : HC_Type<"Workitem", "workitem"> {
   let summary = "Workitem launch-context token.";
   let description = [{
-    Carries the static workgroup metadata visible from a workitem-scoped
-    Python handle. `hc.local_id` uses this type to choose arity and synthesize
-    axis-specific `!hc.idx<"$WI...">` results without falling back to an
-    unknown-rank maximum.
+    Static workgroup metadata visible from a workitem-scoped Python handle.
+    `hc.local_id` uses this to pick arity and synthesize axis-specific
+    `!hc.idx<"$WI...">` results instead of falling back to unknown-rank.
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
@@ -294,9 +267,9 @@ def HC_WorkitemType : HC_Type<"Workitem", "workitem"> {
 def HC_SubgroupType : HC_Type<"Subgroup", "subgroup"> {
   let summary = "Subgroup launch-context token.";
   let description = [{
-    Carries the static workgroup metadata visible from a subgroup-scoped
-    Python handle. `hc.subgroup_id` uses this type to choose arity and
-    `hc.wave_size` can refine from the subgroup size metadata.
+    Static workgroup metadata visible from a subgroup-scoped Python handle.
+    `hc.subgroup_id` picks arity from it; `hc.wave_size` refines from the
+    subgroup-size slot.
   }];
   let parameters = (ins
     OptionalParameter<"::mlir::hc::ShapeAttr">:$groupShape,
@@ -306,11 +279,10 @@ def HC_SubgroupType : HC_Type<"Subgroup", "subgroup"> {
   let genVerifyDecl = 1;
 }
 
-// AnyOf constraint covering every type that a generic `hc` op (`hc.add`,
-// `hc.cmp.lt`, `hc.cast`, ...) is willing to see. Intentionally wide: an op
-// emitted by `hc_front` -> `hc` may see only `!hc.undef`; after inference it
-// may see any of the concrete `hc` types, builtin tuple, or builtin scalar. Folding and
-// verification dispatch on the concrete-type combinations within.
+// Open value-type constraint for generic ops (`hc.add`, `hc.cmp.lt`,
+// `hc.cast`, ...). Wide on purpose: pre-inference may only see `!hc.undef`;
+// post-inference any concrete HC type, builtin tuple, or builtin scalar.
+// Folders / verifiers dispatch on concrete combinations.
 def HC_ValueType : AnyTypeOf<[
   HC_UndefType,
   HC_IdxType,
@@ -331,20 +303,17 @@ def HC_ValueType : AnyTypeOf<[
   AnyTuple,
 ]>;
 
-// Tuple-rooted values. The dialect uses MLIR's builtin `tuple<...>` shell so
-// tuple values can carry arbitrary HC semantic element types without inventing
-// a dialect-specific aggregate type.
+// Tuple-rooted values. Uses MLIR's builtin `tuple<...>` so tuples carry
+// arbitrary HC element types without a dialect-specific aggregate.
 def HC_TupleValueType : AnyTypeOf<[
   HC_UndefType,
   AnyTuple,
 ]>;
 
-// Numeric/symbolic subset. Excludes `!hc.pred`, `!hc.slice`, `!hc.buffer` —
-// types that have no business flowing through arithmetic ops. `!hc.undef`
-// is kept for pre-inference compatibility. Bare carriers ride alongside
-// their semantic counterparts so `hc-decompose-shaped-values` can plant
-// arith on the data half of a (data, mask) split before the *to-generic
-// rewriters funnel the surface op into `hc.generic` form.
+// Numeric / symbolic subset. Excludes `!hc.pred`, `!hc.slice`, `!hc.buffer`.
+// `!hc.undef` admitted pre-inference. Bare carriers ride alongside semantic
+// counterparts so decomposition can plant arith on the data half before
+// the *-to-generic rewriters funnel into `hc.generic`.
 def HC_NumericValueType : AnyTypeOf<[
   HC_UndefType,
   HC_IdxType,
@@ -357,8 +326,8 @@ def HC_NumericValueType : AnyTypeOf<[
   Index,
 ]>;
 
-// Scalar numeric/symbolic values. Used for operands such as inactive fills
-// that must be ordinary SSA values but never shaped aggregates.
+// Scalar numeric / symbolic values (e.g. inactive fills) — SSA values
+// never shaped aggregates.
 def HC_ScalarValueType : AnyTypeOf<[
   HC_UndefType,
   HC_IdxType,
@@ -368,13 +337,11 @@ def HC_ScalarValueType : AnyTypeOf<[
   Index,
 ]>;
 
-// Value-side type for `hc.ptr_load` / `hc.ptr_store`: scalars (single-
-// element access) or upstream `vector<NxT>` (contiguous N-element access
-// starting at the pointer). Vector width is unconstrained at the op; the
-// LLVM lowering at the dialect boundary splits oversized vectors into
-// hardware-sized chunks. Kept distinct from `HC_ScalarValueType` because
-// only the pointer access ops grow this surface — the rest of `hc` keeps
-// its end-to-end scalar/HC-shaped invariant.
+// Value-side type for `hc.ptr_load` / `hc.ptr_store`: scalar (single
+// element) or `vector<NxT>` (contiguous N elements from the pointer).
+// Vector width unconstrained at op level; LLVM lowering splits oversized
+// vectors into hardware chunks. Kept distinct from `HC_ScalarValueType`
+// because only pointer access ops grow this surface.
 def HC_PtrAccessValueType : AnyTypeOf<[
   HC_UndefType,
   HC_IdxType,
@@ -385,18 +352,12 @@ def HC_PtrAccessValueType : AnyTypeOf<[
   FixedVectorOfAnyRank<[AnyInteger, AnyFloat, Index]>,
 ]>;
 
-// Predicate-side type for the mask operand of predicated ops
-// (`hc.ptr_load_pred` / `hc.ptr_store_pred` at ptr level,
-// `hc.yield_predicated` / `hc.predicate` at body level). Concrete
-// `i1` / `vector<Nxi1>` is the post-lowering surface; `!hc.pred` is
-// the pre-lowering body-level surface (the element type of a
-// `!hc.bare_tensor<!hc.pred, ...>` mask operand when an `hc.generic`
-// loads one element at a time, before `hc-lower-bare-predicates`
-// converts the carrier to `vector<Nxi1>`). Shape parity against the
-// matching value operand (scalar value <-> scalar mask, vector<NxT>
-// value <-> vector<Nxi1> of the same N) is enforced by the per-op
-// verifier; this constraint only restricts the type to one of the
-// flavours.
+// Mask operand type for predicated ops (`hc.ptr_load_pred`,
+// `hc.ptr_store_pred`, `hc.yield_predicated`, `hc.predicate`). Concrete
+// `i1` / `vector<Nxi1>` is the post-lowering surface; `!hc.pred` is the
+// pre-lowering body-level surface (mask element type before
+// `hc-lower-bare-predicates`). Shape parity with the value operand is on
+// the per-op verifier; this constraint only restricts the flavour.
 def HC_PtrPredicateType : AnyTypeOf<[
   HC_UndefType,
   HC_PredType,
@@ -404,45 +365,36 @@ def HC_PtrPredicateType : AnyTypeOf<[
   FixedVectorOfAnyRank<[I1]>,
 ]>;
 
-// Operand type for `hc.idx_apply` / `hc.pred_apply`: the SSA Value that
-// supplies the runtime integer for one explicitly-bound free symbol of
-// the carried expression / predicate. `index` is the natural form
-// (loop induction vars, kernel-arg dim/stride values, builtin arithmetic);
-// `!hc.idx<...>` is accepted so producers that already have a typed
-// symbolic SSA in hand don't have to round-trip through an
-// `unrealized_conversion_cast` to pass it as an operand. Lowering
-// converts both to `index` via the launch-body type converter before
-// substituting into the expression walk.
+// SSA operand type for `hc.idx_apply` / `hc.pred_apply`: the runtime
+// integer for one bound free symbol. `index` is the natural form;
+// `!hc.idx<...>` accepted so typed-symbolic SSA skips a UCC round-trip.
+// Lowering folds both to `index` via the launch-body type converter
+// before expression substitution.
 def HC_SymBindingValueType : AnyTypeOf<[
   Index,
   HC_IdxType,
 ]>;
 
-// Shaped values for ops that only make sense on tensors/vectors
-// (`hc.matmul`, `hc.reduce`, `hc.vec`, `hc.with_inactive`).
-// `!hc.undef` is admitted for the same pre-inference reason as above.
+// Shaped values for tensor/vector-only ops (`hc.matmul`, `hc.reduce`,
+// `hc.vec`, `hc.with_inactive`).
 def HC_ShapedValueType : AnyTypeOf<[
   HC_UndefType,
   HC_TensorType,
   HC_VectorType,
 ]>;
 
-// Compiler-internal raw data/mask containers used after semantic shaped values
-// are decomposed. Kept separate from `HC_ShapedValueType` so source-semantic ops
-// opt into the split representation deliberately.
+// Raw data/mask containers used post-decomposition. Separate from
+// `HC_ShapedValueType` so source-semantic ops opt into the split
+// deliberately.
 def HC_BareShapedValueType : AnyTypeOf<[
   HC_BareTensorType,
   HC_BareVectorType,
 ]>;
 
-// Both flavors at once plus the memory carrier: `hc.as_layout` is a
-// pure relabel that composes with decomposition (semantic ↔ bare) and
-// applies equally to pointer-rooted shaped storage (`!hc.buffer`),
-// since reinterpreting a buffer's access pattern is the motivating
-// shape for WMMA / multibuffered LDS. The storage_size verifier is
-// relaxed for the buffer side — see `HCAsLayoutOp::verify` — because
-// a buffer's named dims are a proxy for the actual allocation, not a
-// declaration of its byte extent.
+// Both flavours + the memory carrier. `hc.as_layout` is a pure relabel
+// that composes with decomposition (semantic ↔ bare) and applies to
+// `!hc.buffer` too (WMMA / multibuffered LDS). The storage_size verifier
+// is relaxed buffer-side — see `HCAsLayoutOp::verify`.
 def HC_AnyShapedValueType : AnyTypeOf<[
   HC_UndefType,
   HC_TensorType,
@@ -472,16 +424,12 @@ def HC_DecomposableShapedValueType : AnyTypeOf<[
   HC_BareVectorType,
 ]>;
 
-// Operand-type predicate for `hc.generic`. Widens
-// `HC_DecomposableShapedValueType` with the memory carriers
-// (`!hc.ptr<...>`, `!hc.buffer<...>`) so a generic body may freely
-// mix value-semantic results with in-place memory writes — the same
-// op covers both `linalg.generic`'s tensor regime (value outs) and
-// memref regime (ptr outs), and a mixed-flavor outs list is legal
-// (e.g. compute a result tensor while spilling a debug trace into LDS
-// in one fused loop nest). Per-operand effects are derived from
-// operand types in `getEffects`: value slots are pure, ptr/buffer
-// slots contribute Read (ins) or Read+Write (outs).
+// Operand type for `hc.generic`. Widens `HC_DecomposableShapedValueType`
+// with `!hc.ptr<...>` / `!hc.buffer<...>` so a generic body mixes value
+// results with in-place memory writes — one op covers `linalg.generic`'s
+// tensor + memref regimes; mixed-flavour outs are legal. Per-operand
+// effects derive in `getEffects`: value = pure, ptr/buffer ins = Read,
+// ptr/buffer outs = Read+Write.
 def HC_GenericOperandType : AnyTypeOf<[
   HC_UndefType,
   HC_TensorType,
@@ -492,18 +440,16 @@ def HC_GenericOperandType : AnyTypeOf<[
   HC_PtrType,
 ]>;
 
-// Buffer-rooted values. Used on the "handle" operand of data-movement and
-// subscript ops so a stray `!hc.pred` or scalar value cannot stand in for a
-// buffer even pre-inference.
+// Buffer-rooted handle for data-movement / subscript ops. Bars a stray
+// scalar or `!hc.pred` from sliding in pre-inference.
 def HC_BufferValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
 ]>;
 
-// Buffer or tensor root. Used by ops that can address either storage class:
-// `hc.vload` reads from either, and `hc.store` writes into either.
-// `hc.buffer_view` uses `HC_ViewRootValueType` because generic subscripts may
-// carry vectors and specialize them during type inference.
+// Buffer or tensor root: ops that address either storage class
+// (`hc.vload` reads, `hc.store` writes). `hc.buffer_view` widens to
+// `HC_ViewRootValueType` because vector subscripts may refine.
 def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
@@ -511,9 +457,9 @@ def HC_BufferOrTensorValueType : AnyTypeOf<[
   HC_BareTensorType,
 ]>;
 
-// Roots accepted by the generic subscript form that still lowers to
-// `hc.buffer_view` today. Vector subscripts refine to either a vector fragment
-// or the scalar element type once inference knows the root and index types.
+// Roots for the generic subscript form lowering to `hc.buffer_view`.
+// Vector subscripts refine to a vector fragment or element type once
+// inference knows root and index types.
 def HC_ViewRootValueType : AnyTypeOf<[
   HC_UndefType,
   HC_BufferType,
@@ -523,8 +469,7 @@ def HC_ViewRootValueType : AnyTypeOf<[
   HC_BareVectorType,
 ]>;
 
-// Launch-context root. `!hc.undef` keeps hand-written pre-inference IR legal;
-// concrete tokens are seeded from kernel/group/workitem/subgroup metadata.
+// Launch-context root. `!hc.undef` admitted pre-inference.
 def HC_GroupValueType : AnyTypeOf<[
   HC_UndefType,
   HC_GroupType,
@@ -532,8 +477,7 @@ def HC_GroupValueType : AnyTypeOf<[
   HC_SubgroupType,
 ]>;
 
-// Pointer-shaped operand. `!hc.undef` is admitted so the pointer ops can
-// be emitted before type inference fills the addrspace/element in.
+// Pointer-shaped operand. `!hc.undef` admitted pre-inference.
 def HC_PtrValueType : AnyTypeOf<[
   HC_UndefType,
   HC_PtrType,

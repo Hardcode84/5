@@ -83,13 +83,8 @@ static Type dropWorkitemSuffix(Type type, ArrayRef<Attribute> suffix) {
     return changed ? TupleType::get(type.getContext(), elements) : type;
   }
 
-  // Only bare vectors carry workitem-suffix dims at this point: the
-  // pass runs downstream of `hc-decompose-shaped-values`, which has
-  // already split every semantic `!hc.vector` into bare data and mask
-  // halves. Semantic `!hc.tensor` / `!hc.vector` reaching here is a
-  // contract violation caught by the post-conversion gate in decompose
-  // and by the `assertNoSemanticShapedSurvives` gate fronting
-  // `hc-lower-launch-body`.
+  // Only bare vectors carry workitem-suffix dims at this point;
+  // semantic shaped types filtered out upstream.
   auto bareVector = dyn_cast<BareVectorType>(type);
   if (!bareVector)
     return type;
@@ -136,18 +131,13 @@ static void dropWorkitemSuffixFromCallable(Operation *callable,
   });
 }
 
-// Post-flatten the rank-N suffix structure has collapsed to its 1D bare
-// carrier so `dropWorkitemSuffix` is a no-op on every type. Recover the
-// lane-local form by anchoring on `hc.workitem_region` results that carry a
-// `result_storage == yield_storage * product(suffix)` lift relationship and
-// propagating the yielded (lane-local) target type through type-preserving
-// consumer chains: `hc.for_range` iter-init / iter-result / block-arg /
-// yield slots, `hc.if` branch yields back through to the parent op result,
-// `hc.return` slots that bubble up to the enclosing `hc.func`'s declared
-// return-type list. Workgroup-shared tiles never enter the propagation
-// because they don't appear as a workitem-region result, so the same 1D
-// `bare_tensor` storage that matches a lifted vector by divisibility is
-// left untouched here.
+// Post-flatten: the rank-N suffix has collapsed to a 1D bare carrier
+// so `dropWorkitemSuffix` is a no-op. Recover the lane-local form by
+// anchoring on `hc.workitem_region` results with
+// `result_storage == yield_storage * product(suffix)` and propagating
+// the yielded type through type-preserving consumers (`hc.for_range`
+// iter slots, `hc.if` yields, `hc.return`). Workgroup-shared tiles
+// never enter — they aren't workitem-region results.
 namespace {
 class PostFlattenLiftRetyper {
 public:
@@ -177,10 +167,8 @@ void PostFlattenLiftRetyper::retype(Value v, Type target) {
     return;
   if (v.getType() == target)
     return;
-  // Conflicts (same value, different targets) shouldn't arise for
-  // well-formed IR; if they do, the verifier downstream surfaces the
-  // mismatch with a more useful diagnostic than this pass could emit.
-  // Skip silently and let it through.
+  // Conflicts shouldn't arise in well-formed IR; let the downstream
+  // verifier surface the mismatch.
   if (!targets.try_emplace(v, target).second)
     return;
   worklist.push_back(v);
@@ -191,9 +179,7 @@ void PostFlattenLiftRetyper::retypeOpResult(Operation *op, unsigned idx,
   if (!op || idx >= op->getNumResults())
     return;
   retype(op->getResult(idx), target);
-  // The matching yield operand in each region of `op` co-types with the
-  // result; keep them in sync so the parent's `hc.if` / `hc.workitem_region`
-  // / `hc.for_range` verifier sees consistent types after `apply` lands.
+  // Yield operand co-types with the result — keep them in sync.
   for (Region &region : op->getRegions()) {
     if (region.empty())
       continue;
@@ -240,7 +226,7 @@ void PostFlattenLiftRetyper::handleUse(OpOperand &use, Type target) {
   unsigned operandIdx = use.getOperandNumber();
 
   if (auto loop = dyn_cast<HCForRangeOp>(user)) {
-    // (lower, upper, step) sit on operands 0..2; iter_inits start at 3 and
+    // operands 0..2 = (lower, upper, step); iter_inits start at 3,
     // mirror iter_results 1:1.
     constexpr unsigned kIterInitStart = 3;
     if (operandIdx < kIterInitStart)
@@ -444,13 +430,9 @@ struct HCNormalizeScopeRegionsPass
       std::optional<LaunchContextMetadata> metadata =
           launchMetadataFromCallable(callable);
       if (metadata && metadata->groupShape) {
-        // Pre-flatten path: the rank-N suffix is in the type structure, so
-        // a uniform per-type strip handles every shaped value at once.
-        // Post-flatten path: every shaped value has collapsed to a 1D bare
-        // carrier and the suffix-strip walk is a no-op; the anchored lift
-        // retyper then recovers the lane-local form via workitem-region
-        // results. Running both per callable lets one schedule cover both
-        // regimes without the caller having to flag which one fired.
+        // Pre-flatten: per-type strip handles the rank-N suffix.
+        // Post-flatten: strip is a no-op, retyper recovers lane-local
+        // form via workitem-region results. Run both — covers either regime.
         ArrayRef<Attribute> suffix = metadata->groupShape.getDims();
         dropWorkitemSuffixFromCallable(callable, suffix);
         retypePostFlattenLifts(callable, suffix);
@@ -480,5 +462,3 @@ struct HCNormalizeScopeRegionsPass
 };
 
 } // namespace
-
-// `createHCNormalizeScopeRegionsPass()` is emitted by tablegen.

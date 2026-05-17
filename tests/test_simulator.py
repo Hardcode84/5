@@ -28,18 +28,16 @@ _REVERSED_VECTOR_LAYOUT = index_map(
     offset=lambda i, n: n - 1 - i,
 )
 
-# Out-of-bounds layout: offset(n-1, n) = 2*n - 1, which is >= storage_size = n
-# for any n >= 1. The resolver's bounds probe should reject it.
+# OOB layout: `offset(n-1, n) = 2*n - 1 >= storage_size = n` for n>=1.
+# Resolver's bounds probe rejects it.
 _OOB_VECTOR_LAYOUT = index_map(
     storage_size=lambda n: n,
     offset=lambda i, n: n + i,
 )
 
-# Non-injective uniform layout: distinct logical indices `(i, j)` may
-# map to the same flat offset (storage smaller than the logical-shape
-# product). LayoutAttr no longer enforces injectivity — broadcast /
-# per-lane-fragment layouts express their semantics through the
-# offset formula, and the resolver accepts them without complaint.
+# Non-injective uniform layout: distinct `(i, j)` may share a flat
+# slot. `LayoutAttr` doesn't enforce injectivity — broadcast /
+# per-lane-fragment layouts encode their semantics in the offset.
 _NONINJECTIVE_VECTOR_LAYOUT = index_map(
     storage_size=lambda n, m: n,
     offset=lambda i, j, n, m: i,
@@ -168,13 +166,12 @@ def test_launch_runs_workgroup_pairwise_kernel() -> None:
         lhs = group.load(x1[gid[0] :], shape=(g0, x1.shape[1]))
         rhs = group.load(x2[gid[1] :], shape=(g1, x2.shape[1]))
         diff = ((lhs[:, None, :] - rhs[None, :, :]) ** 2).sum(axis=2)
-        # Explicit-stop slicing pins the destination tile at the
-        # workgroup's `group.shape`. The simulator's `group.store`
-        # requires `source.shape == dest_slice.shape` so off-by-one
-        # / transposed-broadcast bugs fail loudly; open-ended slices
-        # past the buffer edge fall back to per-element NumPy
-        # clipping, which carries the source's boundary mask but
-        # leaves shape mismatches invisible.
+        # Explicit-stop slicing pins the dest tile at `group.shape`.
+        # `group.store` requires `source.shape == dest_slice.shape`
+        # so transposed-broadcast / off-by-one bugs fail loud.
+        # Open-ended slices past the edge fall back to per-element
+        # NumPy clipping — boundary mask survives, shape mismatches
+        # don't.
         group.store(out[gid[0] : gid[0] + g0, gid[1] : gid[1] + g1], np.sqrt(diff))
 
     x1 = np.arange(15, dtype=np.float32).reshape(5, 3)
@@ -188,14 +185,11 @@ def test_launch_runs_workgroup_pairwise_kernel() -> None:
 
 
 def test_group_store_rejects_shape_mismatched_source() -> None:
-    # Verbatim langref WG-level broadcast `x1[None, :, :] - x2[:, None, :]`
-    # produces a `(g1, g0, H)` tile, summed to `(g1, g0)`. The
-    # destination tile is `(g0, g1)`. The simulator used to fall through
-    # to NumPy per-position writes and silently emit `reference.T`-
-    # clipped output; we now expect a loud shape-mismatch error. The
-    # destination uses explicit-stop slicing so the dest shape matches
-    # the workgroup tile exactly, isolating the failure to the
-    # transposed broadcast.
+    # Transposed broadcast `x1[None, :, :] - x2[:, None, :]` yields
+    # `(g1, g0, H)` summed to `(g1, g0)` against a `(g0, g1)` dest
+    # tile. Expect a loud shape-mismatch error, not silent
+    # `reference.T`-clipped output. Explicit-stop dest slicing
+    # isolates the failure to the transposed broadcast.
     W1 = sym.W1
     W2 = sym.W2
     H = sym.H
@@ -288,10 +282,9 @@ def test_group_load_accepts_layout_and_preserves_logical_contents() -> None:
         seen.append((tile.layout.storage_size, tile.layout.params["row_stride"]))
         group.store(dst, tile + 1)
 
-    # Padded storage: row stride 4, last column is padding the
-    # logical (2, 3) tile doesn't see. `_ROW_PADDED_LAYOUT`'s
-    # `offset = i * (h+1) + j` skips the padding slot, so the
-    # gather reads the logical 2x3 sub-block out of the flat 8.
+    # Row stride 4, last column padding the logical (2, 3) tile
+    # ignores. `_ROW_PADDED_LAYOUT`'s `offset = i*(h+1) + j` skips
+    # the padding slot — gather reads the logical 2x3 out of flat 8.
     src = np.array([[0, 1, 2, -1], [3, 4, 5, -1]], dtype=np.int64)
     dst = np.zeros((2, 3), dtype=np.int64)
 
@@ -507,12 +500,9 @@ def test_layout_out_of_bounds_offset_is_rejected() -> None:
 
 
 def test_group_vload_gathers_through_noninjective_broadcast_layout() -> None:
-    # Per-lane row fragment: storage holds a single K-row; the
-    # offset formula `j` ignores `i` and `lane`, so every (i, lane)
-    # pair reads the same K-row out of the flat source. Pins the
-    # gather path's broadcast semantics — under the old contiguous
-    # copy a rank-1 source against a rank-3 logical tile failed at
-    # the rank check before the layout could even speak.
+    # Per-lane row fragment: storage = one K-row; offset `j` ignores
+    # `i`/`lane`, so every (i, lane) reads the same row out of the
+    # flat source. Pins broadcast semantics on the gather path.
     M, K, LANE = 2, 4, 3
     broadcast_layout = index_map(
         storage_size=lambda M, K, L: K,
@@ -537,11 +527,9 @@ def test_group_vload_gathers_through_noninjective_broadcast_layout() -> None:
 
 
 def test_group_vload_gather_clips_out_of_bounds_offsets() -> None:
-    # Storage size validates against the layout but flat source may
-    # be smaller (e.g. the user pre-trimmed). OOB offsets clip to a
-    # zero/false slot — same masking contract as the no-layout
-    # overlap copy. Pinning so a future refactor doesn't silently
-    # swap clipping for a hard error.
+    # Storage size validates against the layout, but flat source may
+    # be smaller (user pre-trimmed). OOB offsets clip to a zero/false
+    # slot — same masking contract as the no-layout overlap copy.
     short_then_pad_layout = index_map(
         storage_size=lambda n: n,
         offset=lambda i, n: i,
@@ -567,16 +555,13 @@ def test_group_vload_gather_clips_out_of_bounds_offsets() -> None:
 
 
 def test_group_vload_layout_pads_clipped_slice_to_intent_shape() -> None:
-    # 2D analogue of the 1D clip test. The kernel asks for the
-    # `(2, 4)` tile rooted at `(0, 0)`; the buffer is only `(1, 3)`,
-    # so NumPy clips the slice to `(1, 3)`. A row-major layout
-    # addresses the user's *logical* tile (`i * 4 + j`) — the
-    # simulator pads the clipped view up to `(2, 4)` so flat offsets
-    # `[3, 4..7]` land in the zero/False padding region and mask
-    # False, instead of falling off the end of the clipped ravel and
-    # silently misreading valid cells (e.g. `flat[3]` in a `(1, 3)`
-    # view would otherwise be OOB-clipped, but for a `(16, 3)` view
-    # in the WMMA case it would alias `c[1, 16]`).
+    # 2D clip case: kernel wants `(2, 4)` tile at `(0, 0)`; buffer
+    # is `(1, 3)`, NumPy clips slice to `(1, 3)`. Row-major layout
+    # addresses the *logical* tile (`i*4 + j`) — simulator pads the
+    # clipped view back to `(2, 4)` so flat `[3, 4..7]` land in zero/
+    # False padding (mask False), instead of falling off the clipped
+    # ravel. Stride aliasing would otherwise turn `flat[3]` in a
+    # `(16, 3)` view into `c[1, 16]` — the WMMA-shape failure mode.
     row_major = index_map(
         storage_size=lambda lc, fc: lc * fc,
         offset=lambda i, j, lc, fc: i * fc + j,
@@ -609,11 +594,10 @@ def test_group_vload_layout_pads_clipped_slice_to_intent_shape() -> None:
 
 
 def test_group_vload_layout_uses_native_shape_when_slice_fits() -> None:
-    # The intent-shape padding is a no-op when the user's slice fits
-    # entirely inside the buffer — the dense overlap covers the whole
-    # logical tile and no zero/False cells appear. Pinning the
-    # not-clipped path so the wrapper doesn't accidentally pad sources
-    # whose intent already matches the NumPy view.
+    # Intent-shape padding is a no-op when the slice fits — dense
+    # overlap covers the logical tile, no zero/False cells. Pins
+    # the not-clipped path against accidental padding when intent
+    # already matches the NumPy view.
     row_major = index_map(
         storage_size=lambda lc, fc: lc * fc,
         offset=lambda i, j, lc, fc: i * fc + j,
@@ -639,13 +623,12 @@ def test_group_vload_layout_uses_native_shape_when_slice_fits() -> None:
 
 
 def test_as_layout_on_buffer_slice_round_trips_through_layout_positions() -> None:
-    # `as_layout(buffer_slice, layout, shape=(...))` reinterprets the
-    # slice's access pattern through the layout. Subscripting gives a
+    # `as_layout(buffer_slice, layout, shape=...)` reinterprets the
+    # slice's access pattern. Subscripting yields a
     # `LayoutBufferSlice` whose flat positions are the layout's
-    # offsets — `group.vload` gathers through them, `group.store`
-    # scatters back through the same offsets, and a multiply-by-10
-    # round trip should land every cell back at its original times
-    # ten with no aliasing.
+    # offsets — `vload` gathers, `store` scatters back through them.
+    # Multiply-by-10 round trip → every cell lands at its original
+    # times ten with no aliasing.
     wave_lanes = 32
     frag = 8
     wmma_m = 16
@@ -676,14 +659,11 @@ def test_as_layout_on_buffer_slice_round_trips_through_layout_positions() -> Non
 
 
 def test_as_layout_on_buffer_slice_masks_oob_intent_positions() -> None:
-    # Partial-tile case: the buffer is smaller than the layout's
-    # logical extent, so per-lane positions past the clipped extent
-    # have to drop on both load and store. `as_layout(c[tile], LAY,
-    # shape=...)` followed by `[lane, :]` realises this OOB contract
-    # by clipping the per-position multi-index against the underlying
-    # buffer's actual shape — out-of-bounds reads mask False, out-of-
-    # bounds writes are dropped silently, matching the layout-aware
-    # gather/scatter contract on the load side.
+    # Partial-tile case: buffer smaller than layout's logical extent,
+    # so per-lane positions past the clipped extent drop on both
+    # load and store. `as_layout(c[tile], LAY, shape=...)[lane, :]`
+    # clips per-position multi-indices against the buffer's actual
+    # shape — OOB reads mask False, OOB writes drop silently.
     wave_lanes = 32
     frag = 8
     wmma_m = 16
@@ -707,11 +687,10 @@ def test_as_layout_on_buffer_slice_masks_oob_intent_positions() -> None:
 
         each()
 
-    # Buffer is 10x12 — the (0:16, 0:16) tile clips to 10x12; the
-    # per-lane positions for lanes whose `lane // wmma_n == 0` land
-    # at rows 0, 2, 4, 6, 8 (in-bounds) and 10, 12, 14 (OOB). Those
-    # OOB lanes drop the load (mask False) and skip the store; the
-    # in-bounds cells round-trip x10 cleanly with no aliasing.
+    # 10x12 buffer → (0:16, 0:16) tile clips to 10x12; lanes with
+    # `lane // wmma_n == 0` land at rows 0,2,4,6,8 (in) and 10,12,14
+    # (OOB). OOB lanes drop the load, skip the store; in-bounds
+    # cells round-trip x10 cleanly with no aliasing.
     c = np.arange(10 * 12, dtype=np.float32).reshape(10, 12).copy()
     expected = c * 10.0
     sim.launch(per_lane_x10, c)
@@ -719,9 +698,8 @@ def test_as_layout_on_buffer_slice_masks_oob_intent_positions() -> None:
 
 
 def test_resolve_layout_accepts_noninjective_layout() -> None:
-    # Non-injective layouts are first-class. The resolver records the
-    # storage_size and shape without complaining that multiple logical
-    # indices collapse to the same flat slot.
+    # Non-injective layouts are first-class — resolver records
+    # `storage_size` + `shape` without complaining about collisions.
     resolved = resolve_layout(_NONINJECTIVE_VECTOR_LAYOUT, (3, 4))
 
     assert resolved is not None
@@ -730,18 +708,16 @@ def test_resolve_layout_accepts_noninjective_layout() -> None:
 
 
 def test_resolve_layout_rejects_shape_rank_mismatch() -> None:
-    # `storage_size` takes two shape syms, so any other rank is a
-    # contract violation that resolve_layout should diagnose by name
-    # rather than by an opaque TypeError from inside the lambda.
+    # `storage_size` takes two shape syms; any other rank → named
+    # `SimulatorError` instead of opaque TypeError inside the lambda.
     with pytest.raises(sim.SimulatorError, match="rank"):
         resolve_layout(_NONINJECTIVE_VECTOR_LAYOUT, (3,))
 
 
 def test_resolve_layout_rejects_unbalanced_offset_arity() -> None:
-    # `LayoutAttr` requires `index_syms.size() == shape_syms.size()`,
-    # which means `offset` takes `2 * rank + params_slot` positional
-    # parameters. A lambda with the wrong index/shape split surfaces
-    # as a SimulatorError, not a TypeError from inside the lambda.
+    # `LayoutAttr` requires `index_syms.size() == shape_syms.size()`
+    # → `offset` takes `2*rank + params_slot` positional params.
+    # Bad index/shape split → `SimulatorError`, not TypeError.
     unbalanced = index_map(
         storage_size=lambda n: n,
         offset=lambda i, j, n: i,
@@ -751,15 +727,11 @@ def test_resolve_layout_rejects_unbalanced_offset_arity() -> None:
 
 
 def test_resolve_layout_rejects_free_syms() -> None:
-    # Free syms are a compile-only feature for now: the lowering
-    # pipeline binds them from the surrounding kernel scope (aux idx
-    # operands, ancestor block args, ambient launch geometry), but
-    # the simulator has no analogous scope and can't make up values
-    # for them. Surface that as a located SimulatorError instead of
-    # a TypeError from inside the lambda. The gather path that
-    # closes the gap is tracked separately under the simulator
-    # free-sym slice (see `doc/layouts.md` "Free symbols in layout
-    # offsets" deferred-work list).
+    # Free syms are compile-only: lowering binds them from kernel
+    # scope (aux idx operands, ancestor block args, launch geometry).
+    # Simulator has no analogous scope → named `SimulatorError`
+    # instead of TypeError inside the lambda. Gather path that
+    # closes the gap needs a separate pass.
     with_free = index_map(
         storage_size=lambda M, N: M * N,
         offset=lambda i, j, M, N, *, row0: (row0 + i) * N + j,

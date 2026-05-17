@@ -4,24 +4,17 @@
 
 """Public `hc.compile` entry point.
 
-`hc.compile` runs the Python frontend, drives an MLIR transform-dialect
-schedule over the resulting `hc_front` module to lower it into the `hc`
-dialect, and runs the GPU lowering chain to produce a self-contained
-LLVM IR module with the host wrapper plus an embedded HSACO blob. The
-default schedule lives at `hc/schedules/front_to_hc.mlir`; callers may
-override with their own file path or inline MLIR text via `schedule=`.
+Runs the Python frontend, drives an MLIR transform schedule from
+`hc_front` to the `hc` dialect, then the GPU lowering chain to a
+self-contained LLVM IR module (host wrapper + embedded HSACO blob).
+Default schedule: `hc/schedules/front_to_hc.mlir`; override via
+`schedule=` (file path or inline MLIR text).
 
-The returned handle is callable: invoking it with positional args lazily
-spins up an MLIR `ExecutionEngine` (loading the runtime helpers and HIP
-shim shared libraries), looks up the host wrapper, and dispatches via
-ctypes. Each argument is forwarded as a `PyObject *` and unpacked
-inside JIT'd code.
+The returned handle is callable: lazy `ExecutionEngine` + ctypes
+dispatch into the host wrapper, each arg forwarded as `PyObject *`.
 
-On pipeline failure, the handle carries `hc_ir = None` and the captured
-diagnostics in `pipeline_diagnostics`; no exception is raised at compile
-time so callers can still inspect `front_ir_text` for debugging.
-Attempting to invoke such a handle raises `RuntimeError` with the
-captured diagnostics.
+Pipeline failure: `hc_ir = None`, diagnostics in `pipeline_diagnostics`;
+no compile-time exception. Invoking such a handle raises `RuntimeError`.
 """
 
 from __future__ import annotations
@@ -35,10 +28,8 @@ from ._invoke import InvokerCache, make_invoker
 from ._pipeline import ScheduleSource
 from .core import KernelMetadata
 
-# `_pipeline` at the module top-level is cheap: it only touches stdlib at
-# import time. The MLIR-heavy imports (`hc.mlir.ir`, dialects, PassManager)
-# stay lazy inside function bodies, so simulator-only callers that never
-# invoke `hc.compile` don't load the native bindings.
+# MLIR imports stay lazy inside function bodies so simulator-only callers
+# never load the native bindings.
 
 __all__ = ["BenchResult", "CompiledKernel", "ScheduleSource", "compile"]
 
@@ -52,60 +43,39 @@ class CompiledKernel:
     front_ir: Any
     front_ir_text: str
     front_ir_symbols: tuple[str, ...] = field(default=())
-    # `hc_ir` mirrors the Python-side module handle after the transform
-    # schedule completes. `hc_ir` / `hc_ir_text` are both `None` when the
-    # pipeline fails — callers should treat that as "frontend ran but
-    # lowering didn't" and inspect `pipeline_diagnostics` for the why.
+    # `None` on pipeline failure; inspect `pipeline_diagnostics`.
     hc_ir: Any | None = field(default=None)
     hc_ir_text: str | None = field(default=None)
     pipeline_diagnostics: tuple[str, ...] = field(default=())
-    # Echo of the `target=` argument the caller passed (or `None` for
-    # "any target"). Useful for downstream stages and debugging — the
-    # actual recipe selection happened inside the pipeline.
+    # Echo of the caller's `target=`. Actual recipe selection happened
+    # inside the pipeline.
     target: str | None = field(default=None)
-    # Symbol name of the bench wrapper if `hc.compile(bench=True)` was
-    # used, else `None`. `-hc-emit-bench-wrapper` mints `<kernel>_bench`
-    # next to the regular `<kernel>` wrapper; recording the name here
-    # gives `.bench()` a direct ctypes-lookup target without re-parsing
-    # the IR. `None` is the trigger to refuse `bench()` cleanly with a
-    # message pointing the user back at `bench=True`.
+    # `<kernel>_bench` symbol when `bench=True`; `None` refuses
+    # `.bench()` with a message pointing back at `bench=True`.
     bench_wrapper_name: str | None = field(default=None)
-    # Lazy JIT cache. Lives in a mutable side-channel so the dataclass
-    # can stay frozen while the engine and cfunc materialize on first
-    # invoke. Excluded from compare/repr so two handles compiled from
-    # the same kernel still compare equal regardless of whether one of
-    # them has been invoked.
+    # Mutable side-channel for the lazy JIT so the dataclass stays frozen.
+    # Excluded from compare/repr — invocation state doesn't define identity.
     _invoker_cache: InvokerCache = field(
         default_factory=InvokerCache, compare=False, repr=False
     )
 
     def invoke(self, *args: Any, stream: int | None = None) -> None:
-        """Dispatch the JIT'd host wrapper, calling `hc_rt_helpers` inside.
+        """Dispatch the JIT'd host wrapper.
 
-        Lazy-builds an `hc.execution_engine.ExecutionEngine` (with the
-        `_mlir_ciface_hc_get_*` and `hc_rt_*` symbols resolved out of
-        the bundled shared libraries and registered via `set_symbol_map`)
-        the first time it's called, and caches the resulting invoker on
-        the handle so subsequent calls reuse the same JIT'd code. Each
-        positional argument is a Python object: tensor-like objects
-        (anything with `data_ptr()` / `size(i)` / `stride(i)`, e.g.
-        `torch.Tensor`) for buffer slots, plain `int`/`float` for
-        scalar slots. The host wrapper unpacks each slot inside JIT'd
-        code, so the Python-side call is just a ctypes thunk.
+        Lazy-builds an `ExecutionEngine` on first call, caches the
+        invoker on the handle. Buffer slots accept tensor-like objects
+        with `data_ptr()` / `size(i)` / `stride(i)` (e.g. `torch.Tensor`);
+        scalars accept plain `int`/`float`. The host wrapper unpacks
+        each slot inside JIT'd code.
 
-        `stream=` is the leading argument the host wrapper threads
-        through to `hc_rt_load_kernel` / `hc_rt_launch_kernel`; pass
-        `None` (the default) for HIP's default-stream semantics, or an
-        integer stream handle for explicit ordering. PyTorch users
-        usually want `torch.cuda.current_stream().cuda_stream`.
+        `stream=None` is HIP default-stream semantics; an `int` is a
+        raw stream-handle address (PyTorch:
+        `torch.cuda.current_stream().cuda_stream`).
 
-        Raises `RuntimeError` if the pipeline failed (the handle has no
-        `hc_ir`) or if either runtime shared library is not present in
-        the install. Helper-side errors (missing `data_ptr()`, wrong
-        type, etc.) currently unwind via a C++ exception across the C
-        boundary — this is undefined behavior and tends to manifest as
-        a process abort; replacement with a sentinel-return + PyErr
-        contract is on the runtime-helpers backlog.
+        Raises `RuntimeError` on pipeline failure or missing runtime
+        `.so`s. Helper-side errors currently unwind via C++ across the
+        C boundary (process abort); migration to a sentinel-return
+        contract is on the runtime backlog.
         """
         if self.hc_ir is None:
             diagnostics = (
@@ -133,45 +103,33 @@ class CompiledKernel:
         warmup: int = 2,
         stream: int | None = None,
     ) -> BenchResult:
-        """Run the bench wrapper m_outer x n_inner times, return stats.
+        """Run bench wrapper m_outer x n_inner times; return stats.
 
-        Driver shape: do `warmup` untimed outer iterations to prime the
-        kernel cache / JIT path, then collect `m_outer` timed outer
-        samples. Each outer sample drops into JIT'd code once, dispatches
-        `hc_rt_launch_kernel_repeat` for an inner loop of `n_inner`
-        launches plus one `hipStreamSynchronize`, and returns the
-        wall-clock nanoseconds the C-side measured under
-        `CLOCK_MONOTONIC`. No `perf_counter_ns` bracketing in Python —
-        the per-sample window never crosses the language boundary.
+        `warmup` untimed outer iters, then `m_outer` timed outer
+        samples. Each outer sample dispatches
+        `hc_rt_launch_kernel_repeat` for `n_inner` launches +
+        `hipStreamSynchronize` and returns C-side `CLOCK_MONOTONIC`
+        nanoseconds. Timing never crosses the language boundary.
 
-        Caveats baked into the contract:
-        * Inputs are reused across every `m_outer * n_inner` launch.
-          Small / L2-fitting kernels report cache-hot latency. Rotate
-          inputs in the warmup phase or wait for the cache-cold mode
-          slice if it matters for your kernel.
-        * One time number per outer sample. The submit-vs-sync split is
-          derivable by sweeping `n_inner` (large `n_inner` → submit
-          path; `n_inner=1` → submit + sync per launch).
+        Caveats:
+        * Inputs reused across every launch — cache-hot latency for
+          small / L2-fitting kernels. Rotate in warmup if it matters.
+        * One number per outer sample. Sweep `n_inner` to separate
+          submit vs sync (large → submit; 1 → submit + sync per launch).
 
-        Raises `RuntimeError` if this handle was not compiled with
-        `bench=True` (the bench wrapper would not exist in the JIT'd
-        module).
+        Raises `RuntimeError` if the handle was not built with
+        `bench=True`.
         """
         self._require_bench_ready()
         _validate_bench_counts(n_inner=n_inner, m_outer=m_outer, warmup=warmup)
         kernel_name = self._resolve_kernel_name(surface="hc.bench")
         bench_call = self._ensure_bench_invoker(kernel_name)
 
-        # Lazy numpy import so the bench surface respects the same
-        # "simulator-only callers don't load native deps" boundary
-        # `_compile` itself maintains for the resolver / pipeline.
+        # Lazy: simulator-only callers must not load native deps.
         import numpy as np
 
-        # Burn-in: the JIT'd module's first call also lazily fills the
-        # per-callsite `_handle` cache slot via `hc_rt_load_kernel`.
-        # That single-flight memoization is a one-time cost we want to
-        # exclude from the timing sample even if the caller passes
-        # warmup=0.
+        # Burn in `hc_rt_load_kernel`'s per-callsite cache slot before
+        # timing, even when caller passes warmup=0.
         for _ in range(warmup):
             bench_call(*args, stream=stream, n_inner=n_inner)
         samples = np.empty(m_outer, dtype=np.int64)
@@ -240,15 +198,12 @@ class CompiledKernel:
 
 
 def _snapshot_and_clone_front_ir(front_module: Any, context: Any) -> tuple[str, Any]:
-    """Pin the pre-pipeline IR text and produce a sibling module to mutate.
+    """Pin pre-pipeline IR text; return a mutable sibling for the pipeline.
 
-    The MLIR Python bindings don't expose a cheap in-memory module clone,
-    so we round-trip through text: `str(front_module)` is the snapshot
-    the public handle keeps, and a fresh `Module.parse` gives the
-    pipeline its own mutable copy. Parse + print does not round-trip
-    every piece of metadata (some debug info, some exotic attributes);
-    callers needing bit-exact lineage should compare `front_ir_text`
-    rather than the module objects.
+    No cheap in-memory module clone in the MLIR Python bindings, so
+    round-trip through text. Parse+print loses some debug info / exotic
+    attrs; bit-exact lineage callers must compare `front_ir_text`, not
+    module objects.
     """
     from .mlir import ir as _ir
 
@@ -258,13 +213,7 @@ def _snapshot_and_clone_front_ir(front_module: Any, context: Any) -> tuple[str, 
 
 
 def _bench_wrapper_symbol(kernel_fn: Any, hc_module: Any, *, bench: bool) -> str | None:
-    """Derive the bench wrapper symbol name without re-parsing the IR.
-
-    `-hc-emit-bench-wrapper` appends `_bench` to the host wrapper's
-    name, and the host wrapper inherits the kernel function's
-    `__name__`. Computing the derived symbol here lets `.bench()` jump
-    straight to a JIT lookup without an IR walk.
-    """
+    """`<kernel>_bench` when `bench=True`, else `None`. No IR walk needed."""
     if not bench or hc_module is None:
         return None
     kernel_name = getattr(kernel_fn, "__name__", None)
@@ -274,14 +223,7 @@ def _bench_wrapper_symbol(kernel_fn: Any, hc_module: Any, *, bench: bool) -> str
 
 
 def _validate_bench_counts(*, n_inner: int, m_outer: int, warmup: int) -> None:
-    """Surface the bench API's int contract before any JIT lookup happens.
-
-    Splitting the validation out of `CompiledKernel.bench` keeps the
-    method body close to the lizard CCN threshold; the checks themselves
-    are mechanical so collapsing them here costs nothing readability-
-    wise. Each error names the failing arg so a misuse points at a
-    single line in the caller.
-    """
+    """Reject non-int / non-positive counts before any JIT lookup."""
     if not isinstance(n_inner, int) or n_inner <= 0:
         raise ValueError(f"n_inner must be a positive int, got {n_inner!r}")
     if not isinstance(m_outer, int) or m_outer <= 0:
@@ -298,52 +240,36 @@ def compile(
     target: str | None = None,
     bench: bool = False,
 ) -> CompiledKernel:
-    """Run the current compilation pipeline (frontend + hc_front -> hc) on a kernel.
+    """Run the frontend + hc_front->hc pipeline on a kernel.
 
-    `kernel_fn` must be a `@kernel`-decorated function. `symbols` maps
-    literal symbol names (`Symbol` instances or plain strings) to
-    integer bindings. Keys must match the kernel's declared `literals=`
-    set; a kernel that did not declare a whitelist accepts any key
-    (later stages will tighten this). Missing entries are allowed —
-    partial specialization is legal and later pipeline stages refine
-    what remains symbolic.
+    `kernel_fn`: a `@kernel`-decorated function.
 
-    `$`-prefixed keys (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) are
-    launch-context system bindings; passing them through `symbols`
-    overrides the values the front-to-hc handshake derives from
-    integer-literal `group_shape` / `work_shape` / `subgroup_size`
-    metadata, and is the way to pin those dims for the native lowering
-    when the kernel decorator left them symbolic (the simulator picks
-    a `group_shape` at launch time; the native path needs the value
-    folded eagerly). System keys bypass the `literals=` whitelist.
+    `symbols`: name -> int bindings (`Symbol` or `str` keys). Keys must
+    match the kernel's `literals=` whitelist if declared; missing
+    entries are legal (partial specialization). `$`-prefixed keys
+    (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) are launch-context
+    overrides — they bypass the whitelist and override the values the
+    front-to-hc handshake would seed from integer-literal `group_shape`
+    / `work_shape` / `subgroup_size`. Use them to pin those dims for
+    the native lowering when the decorator left them symbolic.
 
-    `schedule` overrides the default `hc/schedules/front_to_hc.mlir`
-    transform-dialect schedule: a `pathlib.Path` is read from disk, a
-    `str` is treated as inline MLIR text. The schedule must define a
-    `@__transform_main` named sequence.
+    `schedule`: overrides `hc/schedules/front_to_hc.mlir`. `Path`: read
+    from disk. `str`: inline MLIR text. Must define `@__transform_main`.
 
-    `target` selects which intrinsic lowering recipe the schedule's
-    `hc-interpret-intrinsic-recipes` step applies. The string is
-    substituted into the schedule's `__HC_TARGET__` placeholder before
-    the pass runs, so it ends up in the pass's `target=` option and the
-    interpreter only fires named sequences whose `hc.target` matches.
-    Pass `None` (the default) to leave the placeholder empty — the pass
-    then runs every recipe regardless of `hc.target`, which is the
-    right behaviour while each intrinsic registers at most one recipe
-    per compile. A user-provided `schedule` that drops the placeholder
-    silently ignores `target`; the override owns its own pass
-    invocations.
+    `target`: substituted into the schedule's `__HC_TARGET__`
+    placeholder, feeds `hc-interpret-intrinsic-recipes`'s `target=`.
+    `None` leaves it empty — every recipe fires regardless of
+    `hc.target` (correct while each intrinsic registers at most one
+    recipe per compile). A user `schedule` without the placeholder
+    silently ignores `target`.
 
-    `bench=True` splices `-hc-emit-bench-wrapper` into the GPU lowering
-    chain so each host wrapper grows a sibling `<name>_bench` that calls
-    `hc_rt_launch_kernel_repeat`. The returned handle's `.bench(...)`
-    method becomes callable; default `False` leaves the JIT'd module
-    byte-identical to today and `.bench(...)` raises with a pointer
-    back here.
+    `bench=True`: splice `-hc-emit-bench-wrapper`, mint `<name>_bench`,
+    enable `.bench(...)`. Default `False` leaves the JIT'd module
+    byte-identical and `.bench(...)` raises.
 
-    Bindings are folded into the IR by `hc-specialize-literals` (see
-    `doc/schedules.md`). `front_ir` is the pre-specialization snapshot
-    with the binding dict attached; `hc_ir` is fully specialized.
+    `hc-specialize-literals` folds bindings into IR (see
+    `doc/schedules.md`). `front_ir` is the pre-specialization snapshot;
+    `hc_ir` is fully specialized.
     """
 
     metadata = getattr(kernel_fn, "__hc_kernel__", None)
@@ -359,8 +285,7 @@ def compile(
 
     bindings = _normalise_bindings(symbols, metadata)
 
-    # Lazy imports: the resolver and pipeline pull in the native MLIR
-    # bindings, which simulator-only callers should not have to install.
+    # Lazy: simulator-only callers must not load native MLIR bindings.
     from ._pipeline import prepared_context, run_front_to_hc
     from ._resolve import resolve_front_ir
 
@@ -373,11 +298,8 @@ def compile(
         pipeline_module, schedule=schedule, target=target, bench=bench
     )
     bench_wrapper_name = _bench_wrapper_symbol(kernel_fn, result.module, bench=bench)
-    # Only decorated top-levels are surfaced on the public handle;
-    # undecorated inline helpers are an implementation detail of the
-    # `hc_front` pipeline (they're consumed by `-hc-front-inline`
-    # before any downstream stage sees them) so exposing them here
-    # would commit the compiler to a shape users would then depend on.
+    # Only decorated top-levels reach the public handle; inline helpers
+    # are consumed by `-hc-front-inline` and stay internal.
     return CompiledKernel(
         kernel=kernel_fn,
         bindings=bindings,
@@ -399,16 +321,12 @@ def _stamp_literal_bindings(
 ) -> None:
     """Attach `literal_bindings = {name = i64}` to every `hc_front.kernel`.
 
-    Stamped before the front-IR snapshot so the snapshot is reproducible
-    (re-run `hc-opt` against it and the same specialized `hc_ir` falls
-    out), and so `convert-hc-front-to-hc` can carry the dict over to the
-    corresponding `hc.kernel` for `hc-specialize-literals` to consume.
-    Empty `bindings` is a no-op — leaves the IR byte-identical to the
-    unspecialized path. `hc_front.kernel` is the right anchor (not
-    `hc_front.func` / `hc_front.intrinsic`): only kernels are
-    specialization roots, so a helper that happens to reference `K`
-    sees the substitution through its kernel caller, not through its
-    own metadata.
+    Stamped pre-snapshot so the snapshot reproduces under `hc-opt`, and
+    `convert-hc-front-to-hc` can carry the dict to `hc.kernel` for
+    `hc-specialize-literals`. Empty `bindings` is a no-op. Anchor is
+    `hc_front.kernel` (not `func` / `intrinsic`): only kernels are
+    specialization roots; helpers see substitutions via their kernel
+    caller.
     """
     if not bindings:
         return
@@ -435,20 +353,12 @@ def _normalise_bindings(
     out: dict[str, int] = {}
     for key, value in symbols.items():
         name = _symbol_name(key)
-        # `$`-prefixed names are launch-context system symbols
-        # (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) that the
-        # front-to-hc handshake otherwise seeds from integer-literal
-        # `group_shape` / `work_shape` / `subgroup_size`. Letting the
-        # launcher override them — the user knows the workgroup size
-        # the host will pick at dispatch time even when the kernel
-        # decorator left those axes symbolic — bypasses the user-
-        # facing `literals=` whitelist by design; `literals` speaks
-        # for kernel-declared specialization points, not for system
-        # names. Mirrors `validateBindingsAgainstLiterals` in
-        # `HCSpecializeLiteralsPass.cpp`, which skips the same check
-        # for `$`-prefixed entries.
-        # Empty `literals` on the decorator means the kernel declared no
-        # whitelist; pass the binding through rather than rejecting it.
+        # `$`-prefixed entries (`$WGS<axis>`, `$WS<axis>`, `$WV0`,
+        # `$GSZ0`) bypass the whitelist by design — launch-context
+        # overrides, not kernel-declared specialization points. Mirrors
+        # `validateBindingsAgainstLiterals` in
+        # `HCSpecializeLiteralsPass.cpp`. Empty `literals` means no
+        # whitelist declared; accept any name.
         if allowed and name not in allowed and not name.startswith("$"):
             raise ValueError(
                 f"'{name}' is not a declared literal symbol; "
@@ -459,8 +369,8 @@ def _normalise_bindings(
                 f"literal symbol '{name}' must bind to an int, "
                 f"got {type(value).__name__}"
             )
-        # A Symbol and its string form collapse to the same key; refuse
-        # conflicting duplicates rather than silently last-write-wins.
+        # Symbol and its string form collapse to one key; reject
+        # conflicting duplicates rather than last-write-wins.
         if name in out and out[name] != value:
             raise ValueError(
                 f"literal symbol '{name}' bound twice with conflicting "
@@ -471,14 +381,10 @@ def _normalise_bindings(
 
 
 def _symbol_name(obj: Any) -> str:
-    # Plain strings resolve to themselves first so a path-like object
-    # (anything with a `.name` attribute) cannot be mistaken for a symbol
-    # key. Only real `Symbol` instances — not arbitrary duck-typed objects
-    # — are accepted via `.name`.
+    # `str` first so path-like `.name` ducks can't pose as symbol keys.
     if isinstance(obj, str):
         return obj
-    # Lazy import so `hc._compile` stays light for simulator-only callers;
-    # `hc.symbols` is deliberately lazy-loaded in `hc/__init__.py`.
+    # Lazy: `hc.symbols` stays optional for simulator-only callers.
     from .symbols import Symbol
 
     if isinstance(obj, Symbol):

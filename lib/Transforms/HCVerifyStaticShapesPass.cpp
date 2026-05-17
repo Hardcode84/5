@@ -38,8 +38,7 @@ static ShapeAttr symbolicShapeFromType(Type type) {
 
 static LogicalResult verifyResultShape(Operation *op, Type resultType,
                                        ShapeAttr shape, bool vectorResult) {
-  // Tensor and vector results have different semantics even though both carry
-  // symbolic shapes through the same type interface.
+  // Tensor and vector share the shape interface but differ in semantics.
   bool hasExpectedShell = vectorResult ? isa<mlir::hc::VectorType>(resultType)
                                        : isa<mlir::hc::TensorType>(resultType);
   if (!hasExpectedShell)
@@ -56,11 +55,7 @@ static LogicalResult verifyResultShape(Operation *op, Type resultType,
 
 static LogicalResult verifyIndexStructure(Operation *op, ValueRange indices,
                                           ShapeAttr sourceShape) {
-  // Indices bind positionally to the source's logical axes. The bind
-  // count is the rank of the shape (which `LayoutAttr`'s verifier pins
-  // to `index_syms.size()` when a layout is attached). Fewer than the
-  // full bind count is legal — the trailing axes get filled by the
-  // source/result shape.
+  // Positional bind; fewer than rank is legal (trailing axes from shape).
   size_t maxArity = sourceShape.getDims().size();
   if (indices.size() > maxArity)
     return op->emitOpError("has ")
@@ -114,5 +109,3 @@ struct HCVerifyStaticShapesPass
 };
 
 } // namespace
-
-// `createHCVerifyStaticShapesPass()` is emitted by tablegen.

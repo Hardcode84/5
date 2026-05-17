@@ -4,10 +4,9 @@
 
 """Host-side simulator for `hc` kernels.
 
-This module executes kernels directly in Python against masked host runtime
-objects, including collective workgroup, subgroup, and workitem regions. Catch
-`SimulatorError` for any simulator failure, or `LaunchError` specifically for
-pre-execution launch and binding failures.
+Executes kernels in Python against masked host objects across collective
+workgroup, subgroup, and workitem regions. `SimulatorError` covers any
+failure; `LaunchError` is the pre-execution / binding subset.
 """
 
 from __future__ import annotations
@@ -65,7 +64,7 @@ _SCOPE_WORKITEM = "workitem"
 
 @dataclass(frozen=True)
 class SimulatorTarget:
-    """Launch-policy knobs for simulator validation and default group selection."""
+    """Launch-policy knobs: validation limits + default group selection."""
 
     max_group_size: int | None = None
 
@@ -239,7 +238,7 @@ run = launch
 
 
 class SimCurrentGroup(CurrentGroup):
-    """Runtime `CurrentGroup` object passed into simulated kernels."""
+    """`CurrentGroup` passed into simulated kernels."""
 
     def __init__(
         self,
@@ -315,10 +314,8 @@ class SimCurrentGroup(CurrentGroup):
     ) -> SimTensor:
         """Load a logical tensor tile.
 
-        `shape=` requests an explicit logical tile. The simulator materializes
-        that tile in dense NumPy order and carries any `layout=` as validated
-        metadata. If the source slice is larger than that tile, the extra
-        source region is ignored.
+        `shape=` requests an explicit tile; `layout=` rides as validated
+        metadata. Source region beyond the tile is ignored.
         """
         self._require_workgroup_scope("group.load()")
         return cast(
@@ -343,7 +340,7 @@ class SimCurrentGroup(CurrentGroup):
         mask: SimTensor | SimVector | None = None,
         layout: Any = None,
     ) -> SimVector:
-        """Load a logical vector tile using the same rules as `load`."""
+        """Load a logical vector tile; same rules as `load`."""
         return cast(
             SimVector,
             _load_value(
@@ -507,8 +504,7 @@ class SimCurrentGroup(CurrentGroup):
             finally:
                 self._set_runtime_scope(_SCOPE_WORKGROUP)
             results.append(((subgroup_id,), result))
-        # SubGroup lifts use a single trailing `(num_subgroups,)` axis ordered by
-        # the linear `subgroup_id()` sequence.
+        # Subgroup lifts: trailing `(num_subgroups,)` axis in linear id order.
         return _aggregate_collective_results(results, (len(results),))
 
     def _run_workitems(self, fn: Callable[..., Any]) -> Any:
@@ -518,7 +514,7 @@ class SimCurrentGroup(CurrentGroup):
 
 
 class SimSubGroup(SubGroup):
-    """Runtime `SubGroup` object used by collective subgroup regions."""
+    """`SubGroup` used by collective subgroup regions."""
 
     def __init__(self, *, subgroup_id: int, size: int) -> None:
         self._subgroup_id = subgroup_id
@@ -532,7 +528,7 @@ class SimSubGroup(SubGroup):
 
 
 class SimWorkItem(WorkItem):
-    """Runtime `WorkItem` object used by collective workitem regions."""
+    """`WorkItem` used by collective workitem regions."""
 
     def __init__(
         self, *, local_id: tuple[int, ...], global_id: tuple[int, ...]
@@ -920,11 +916,9 @@ def _run_workgroups(
         _ceil_div(work, local)
         for work, local in zip(work_shape, group_shape, strict=True)
     )
-    # Wrap buffer args in `KernelBuffer` so the kernel's `c[a:b, c:d]`
-    # records the user's pre-clip slice extent. Layout-driven `vload`
-    # needs the *intent* shape to OOB-pad the source up to the
-    # layout's `storage_size`; NumPy's natural clipping would
-    # otherwise erase it.
+    # `KernelBuffer` records pre-clip slice extent so layout-driven
+    # `vload` can OOB-pad to `storage_size`; NumPy clipping would erase
+    # the intent.
     wrapped_args, wrapped_kwargs = _wrap_kernel_buffer_args(fn, bound)
     for group_id in _iterate_indices(group_counts):
         work_offset = tuple(
@@ -970,8 +964,8 @@ def _execution_state(group: SimCurrentGroup, target: SimulatorTarget) -> Iterato
     previous_profile = sys.getprofile()
     stack = _execution_stack()
     stack.append(_ExecutionState(group=group, target=target))
-    # `sys.setprofile()` is thread-local in CPython. Keep a separate per-thread
-    # execution stack so concurrent launches do not share simulator state.
+    # `sys.setprofile()` is thread-local; per-thread stack keeps concurrent
+    # launches from sharing simulator state.
     sys.setprofile(_profile_calls)
     try:
         yield
@@ -1330,7 +1324,7 @@ def _iterate_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
 
 
 def _iter_indices(shape: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
-    # Dimension 0 varies fastest, matching the simulator's documented launch order.
+    # Dimension 0 varies fastest — documented launch order.
     for reversed_index in np.ndindex(tuple(reversed(shape))):
         yield tuple(reversed(reversed_index))
 
@@ -1377,12 +1371,8 @@ def _copy_loaded_value(
     layout: ResolvedLayout | None,
 ) -> SimTensor | SimVector:
     if isinstance(source, LayoutBufferSlice):
-        # A layout-buffer slice already carries the per-element
-        # positions resolved through `as_layout`'s declared layout
-        # — no further layout composition is needed at the vload.
-        # Mirrors `hc.buffer_view` of a layout-bearing buffer whose
-        # subscript stream has bound enough axes to leave the
-        # gather addressing as concrete offsets.
+        # Slice carries concrete per-element positions; no further
+        # layout composition at vload.
         if tuple(shape) != tuple(source.shape):
             raise SimulatorError("vload shape does not match the layout slice's shape")
         return _gather_loaded_from_layout_slice(kind, source)
@@ -1393,13 +1383,8 @@ def _copy_loaded_value(
         )
     source_data, source_mask, source_intent = _source_arrays(source)
     if layout is not None:
-        # Layout-bearing reads interpret the source's flat storage
-        # through `layout.offset` per logical position — mirrors what
-        # `hc-flatten-with-layouts` produces post-lowering and lets
-        # non-injective layouts (broadcasts, per-lane fragments)
-        # observe the actual addressing they encode. Source rank is
-        # irrelevant in this regime; we pad to the intent shape (so
-        # OOB cells in a clipped slice mask False) and gather.
+        # Gather through `layout.offset` over flat storage. Source rank
+        # is irrelevant; pad to intent shape so OOB cells mask False.
         return _gather_loaded_value(
             kind,
             source_data,
@@ -1408,10 +1393,8 @@ def _copy_loaded_value(
             layout=layout,
             source_intent=source_intent,
         )
-    # No layout: dense logical-shape overlap copy. Layout-less loads
-    # are the simulator's identity contract — the user reads the
-    # logical tile from a matching-rank source, and any source / shape
-    # mismatch surfaces here rather than inside NumPy.
+    # No layout: dense logical-shape overlap copy. Rank must match —
+    # surface the mismatch here rather than inside NumPy.
     if source_data.ndim != len(shape):
         raise SimulatorError("load rank does not match the requested shape")
     result_data = np.zeros(shape, dtype=source_data.dtype)
@@ -1430,11 +1413,8 @@ def _gather_loaded_from_layout_slice(
 ) -> SimTensor | SimVector:
     """Gather a `LayoutBufferSlice`'s concrete positions into a value.
 
-    The slice's `positions` array carries flat indices into the
-    underlying base's *intent* shape. OOB positions (positions past
-    the clipped base) mask False rather than alias into a different
-    cell — same masking contract as the layout-aware gather over a
-    clipped slice.
+    `positions` are intent-shape flat indices; OOB positions mask
+    False rather than alias.
     """
     base = source._base
     output_shape = tuple(int(dim) for dim in source._positions.shape)
@@ -1452,12 +1432,8 @@ def _iter_layout_slice_positions(
 ) -> Iterator[tuple[tuple[int, ...], tuple[int, ...]]]:
     """Yield `(output_index, multi)` pairs for in-bounds slice cells.
 
-    `multi` is the unraveled coordinate in the underlying base's
-    actual NumPy shape; OOB cells (intent-flat out of range or
-    multi-index past the clipped base) are skipped silently so loads
-    mask False and stores drop. Centralises the clip-against-NumPy
-    bookkeeping `_gather_loaded_from_layout_slice` and
-    `_scatter_into_layout_slice` share.
+    `multi` is the unraveled coord in the base's NumPy shape; OOB
+    cells are skipped (loads mask False, stores drop).
     """
     intent_shape = source._intent_shape
     positions = source._positions
@@ -1484,24 +1460,14 @@ def _gather_loaded_value(
     layout: ResolvedLayout,
     source_intent: tuple[int, ...] | None,
 ) -> SimTensor | SimVector:
-    """Evaluate `layout.offset` per logical position and gather from flat source.
+    """Eval `layout.offset` per logical position; gather from flat source.
 
-    Minimum-viable form for non-injective layouts: the offset is a
-    pure function of `(index_syms, shape_syms[, params])`, so the
-    O(prod(shape)) Python loop is the same shape as the bounds probe
-    in `_validate_layout_offsets`. OOB offsets clip to a zero / false
-    slot — same masking contract as the contiguous overlap path on
-    the no-layout side. Free-sym layouts are rejected upstream by
-    `resolve_layout`; runtime-bound symbols are the lowering pipeline's
-    job, not the simulator's.
+    O(prod(shape)) loop; OOB offsets clip to a zero/false slot.
+    Free-sym layouts are rejected upstream by `resolve_layout`.
 
-    When `source_intent` differs from `source_data.shape`, the source
-    came from a slice that NumPy clipped (e.g. `c[16:32, 16:32]` on a
-    `(17, 19)` buffer). The layout's offset addresses the user's
-    *logical* tile, not the clipped view — so flatten the user's
-    intent shape, not the clipped one. OOB cells fall in the zero /
-    false padding region and mask False, matching what a layout-aware
-    HW load would see.
+    When `source_intent != source_data.shape` the source came from a
+    NumPy-clipped slice; flatten over the intent shape so OOB cells
+    mask False against the padding region.
     """
     flat_source, flat_mask = _flatten_for_gather(
         source_data, source_mask, source_intent
@@ -1530,15 +1496,11 @@ def _flatten_for_gather(
     np.ndarray[Any, np.dtype[Any]],
     np.ndarray[Any, np.dtype[np.bool_]],
 ]:
-    """Ravel the source for a gather, OOB-padding to the user's intent shape.
+    """Ravel the source for a gather, OOB-padding to the intent shape.
 
-    When the source's NumPy shape matches the slice's intent there is
-    nothing to pad. When the user's slice extended past the buffer's
-    bounds NumPy returned a smaller view, but the layout's offset is
-    formulated against the *intent* shape's row-major flat extent. We
-    materialize the padded logical tile (zero / False outside the
-    overlap) so per-element ravel indices line up with what the
-    layout's `offset` was authored against.
+    Layout offset is authored against intent-shape flat extent; pad
+    the clipped view (zero / False outside the overlap) so ravel
+    indices line up.
     """
     if (
         source_intent is None
@@ -1547,9 +1509,8 @@ def _flatten_for_gather(
     ):
         return np.ravel(source_data), np.ravel(source_mask)
     if len(source_intent) != source_data.ndim:
-        # Shouldn't happen — the wrapper preserves rank — but a rank
-        # mismatch would silently misread cells, so fall back to the
-        # clipped ravel rather than guess.
+        # Rank should be preserved by the wrapper; if not, clipped
+        # ravel is safer than guessing.
         return np.ravel(source_data), np.ravel(source_mask)
     padded_data = np.zeros(source_intent, dtype=source_data.dtype)
     padded_mask = np.zeros(source_intent, dtype=bool)
@@ -1586,12 +1547,8 @@ def _source_arrays(
 ]:
     """Return `(data, mask, intent_shape)` for a load source.
 
-    `intent_shape` is the user's pre-clip slice extent per axis when
-    the source is a `BufferSlice` whose NumPy view was clipped at the
-    buffer's bound. For all other sources (simulator values,
-    `KernelBuffer`s passed whole, raw arrays) it equals the data's
-    NumPy shape — no padding is needed. The gather path consumes the
-    triple; the dense overlap path ignores intent_shape.
+    `intent_shape` is the pre-clip slice extent for clipped
+    `BufferSlice`s; for all other sources it matches `data.shape`.
     """
     if isinstance(source, Poison):
         raise SimulatorError("cannot load from a poison scalar")
@@ -1625,8 +1582,6 @@ def _allocate_value(
 ) -> SimTensor | SimVector:
     resolved = _resolve_runtime_shape(shape, env, literal_names, static=static)
     resolved_layout = resolve_layout(layout, resolved)
-    # Allocations use dense logical storage and carry layout metadata alongside
-    # the host payload.
     data = np.full(resolved, fill_value, dtype=np.dtype(dtype))
     mask = np.full(resolved, active, dtype=bool)
     return kind(data, mask, layout=resolved_layout)
@@ -1671,12 +1626,8 @@ def _scatter_into_layout_slice(
 ) -> None:
     """Scatter `value` into `target`'s base at the slice's positions.
 
-    OOB positions (positions past the clipped base) drop the write
-    silently — same OOB contract as layout-aware loads, which mask
-    False rather than alias. Per-position masked writes mean a
-    `False` lane in a `SimTensor` / `SimVector` value won't overwrite
-    its base cell, mirroring the load-side masking on the symmetric
-    `vload`.
+    OOB positions drop the write; a `False` lane in a masked value
+    skips its base cell.
     """
     if isinstance(value, Poison):
         raise SimulatorError("cannot store a poison scalar")
@@ -1727,12 +1678,9 @@ def _store_from_value(
     *,
     intent_shape: tuple[int, ...],
 ) -> None:
-    # Reject shape mismatches up front. The destination's NumPy view
-    # may be a clipped slice (intent extended past the buffer's edge),
-    # but the *source* tile has to match the user's logical extent
-    # exactly — otherwise the per-element overlap below would silently
-    # fill whatever overlaps and zero-pad the rest, masking real bugs
-    # like transposed-broadcast typos behind plausible-looking output.
+    # Source tile must match the logical extent exactly. The dest view
+    # may be clipped, but silent overlap-fill would mask transposed-
+    # broadcast typos behind plausible-looking output.
     if value.shape != intent_shape:
         raise SimulatorError(
             f"store source shape {value.shape} does not match destination "

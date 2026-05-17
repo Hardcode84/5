@@ -2,16 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Implements `-hc-lower-launch-body`, the launch-body lowering pass that runs
-// after HC kernels have been wrapped in `gpu.launch`.
-//
-// Workgroup-AS storage and kernel-arg buffers are both off memref. Workgroup
-// tiles materialize as `hc.alloc` + `hc.ptr_*` against `!hc.ptr<workgroup, T>`;
-// kernel-arg buffers arrive as a `(!hc.ptr<global, T>, dim*, stride*)` UCC
-// fragment that this pass walks to recover dims/strides and to emit
-// `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`. The
-// downstream `hc-lower-to-llvm` finishes the LLVM-dialect lowering.
-// `doc/layouts.md` "hc.ptr and memory ops" holds the contract.
+// `-hc-lower-launch-body`: runs after HC kernels are in `gpu.launch`.
+// Workgroup tiles → `hc.alloc` + `!hc.ptr<workgroup, T>`. Kernel-args
+// arrive as `(ptr<global>, dim*, stride*)` UCC; walk back, emit
+// `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+// Contract: `doc/layouts.md` "hc.ptr and memory ops".
 
 #include "hc/Transforms/Passes.h"
 
@@ -110,11 +105,8 @@ staticIntegerShape(SymbolicallyShapedTypeInterface shaped) {
   return *dims;
 }
 
-// Bare tensors collapse to `!hc.ptr<workgroup, T>` — the launch-body owns
-// the workgroup tile only as opaque-flat storage; the rank and layout were
-// frontend semantics, and once memory is in hand the lowering treats every
-// LDS allocation as a flat element-typed buffer. Static dims are required
-// because `hc.alloc` workgroup needs a constant element count downstream.
+// `bare_tensor` → `!hc.ptr<workgroup, T>`; flat storage, static dims
+// required (alloc needs a constant element count).
 static Type convertBareTensorType(BareTensorType type) {
   auto shaped = cast<SymbolicallyShapedTypeInterface>(type);
   Type element = convertElementType(shaped.getSymbolicElementType());
@@ -125,7 +117,7 @@ static Type convertBareTensorType(BareTensorType type) {
   return PtrType::get(type.getContext(), AddrSpace::Workgroup, element);
 }
 
-// Total element count for the workgroup tile — product of static dims.
+// Product of static dims.
 static FailureOr<int64_t> bareTensorElementCount(BareTensorType type) {
   FailureOr<SmallVector<int64_t>> dims =
       staticIntegerShape(cast<SymbolicallyShapedTypeInterface>(type));
@@ -162,11 +154,8 @@ static Value materializeCast(OpBuilder &builder, Type type, ValueRange inputs,
                              Location loc) {
   if (inputs.size() != 1)
     return {};
-  // Conversion-driver materialization (`idx<sym>` → `index`, etc.):
-  // when the source is a post-flatten retype output that chains back
-  // to a kernel-arg bundle, prefer the bundle's `index`-typed input
-  // value over a fresh UCC. See `resolveToBundleIndex` for why we
-  // can't leave this for `reconcileUnrealizedCasts` to clean up.
+  // Short-circuit `idx<sym>` → `index` through the bundle root;
+  // bare UCC won't fold via reconcileUnrealizedCasts.
   if (type.isIndex()) {
     if (Value direct = resolveToBundleIndex(inputs.front()))
       return direct;
@@ -227,12 +216,8 @@ struct BoundValues {
   }
 };
 
-// Kernel-arg fragment: the UCC at the launch boundary expands a single
-// `!hc.buffer<T, [dims]>` into 1 + 2N values — a global pointer, then per-axis
-// dim values, then per-axis element-stride values, in that order. The host
-// wrapper builds it (`hc-lower-kernels-to-gpu-launch`); launch-body sees the
-// UCC, walks back through it, and turns the per-element load/store into
-// `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+// Launch-boundary UCC: `!hc.buffer<T, [dims]>` → `(ptr<global>,
+// dim_0..dim_{r-1}, stride_0..stride_{r-1})`.
 struct KernelArgSource {
   Value ptr;
   SmallVector<Value> dims;
@@ -243,18 +228,8 @@ struct KernelArgSource {
 
 static std::optional<KernelArgSource> resolveKernelArg(Value source);
 
-// Pure query: walks defining ops to find the underlying kernel-arg
-// `(ptr, dims..., strides...)` UCC. Handles both the pre-flatten
-// direct kernel-arg shape (one UCC carrying the bundle) and the
-// post-flatten chain (a multi-output UCC retypes the bundle to a
-// rank-1 carrier plus idx-typed aux). For the post-flatten chain we
-// return the inner rank-N source — the consumer decides whether to
-// use it directly (e.g. `AdaptGenericOp` just needs `ptr`) or to
-// collapse to a rank-1 view (`flatKernelArgView`, IR-mutating).
-// `cast` is the multi-output bare-carrier UCC that the post-flatten
-// pipeline plants over a rank-1 `BufferType` view. Caller has
-// established `cast` is a UCC; we just check the shape and recurse
-// into the original kernel-arg input.
+// Post-flatten bare-carrier UCC: rank-N bundle → rank-1 buffer view
+// + idx aux. Validate shape, recurse into inner source.
 static std::optional<KernelArgSource>
 resolveKernelArgViaBareCarrier(UnrealizedConversionCastOp cast, Value source) {
   if (cast.getInputs().size() != 1 || cast.getOutputs().size() <= 1 ||
@@ -266,9 +241,7 @@ resolveKernelArgViaBareCarrier(UnrealizedConversionCastOp cast, Value source) {
   return resolveKernelArg(cast.getInputs()[0]);
 }
 
-// Validate the canonical kernel-arg UCC shape: 1 output, and inputs
-// of the form `ptr<global, T>, dim_0..dim_{r-1}, stride_0..stride_{r-1}`.
-// Returns the `(ptr, rank)` pair on success.
+// Canonical kernel-arg UCC shape check.
 static std::optional<std::pair<Value, unsigned>>
 validateKernelArgCastShape(UnrealizedConversionCastOp cast) {
   if (cast.getOutputs().size() != 1 || cast.getInputs().size() < 1 ||
@@ -282,8 +255,7 @@ validateKernelArgCastShape(UnrealizedConversionCastOp cast) {
   return std::make_pair(ptr, rank);
 }
 
-// Extract `rank` `index`-typed values from `cast.getInputs()`
-// starting at `start`. Returns `nullopt` if any value isn't `index`.
+// `rank` `index`-typed inputs starting at `start`; fails on type mismatch.
 static std::optional<SmallVector<Value>>
 extractKernelArgIndexInputs(UnrealizedConversionCastOp cast, unsigned start,
                             unsigned rank) {
@@ -328,13 +300,8 @@ static std::optional<KernelArgSource> resolveKernelArg(Value source) {
   return info;
 }
 
-// True when `source` is the rank-1 carrier output of the post-flatten
-// retype UCC (`buffer<T, [...]> -> buffer<T, ["?"]>, idx..., idx...`).
-// Together with `resolveKernelArg` (which transparently recurses
-// through the retype to the kernel-arg bundle), this lets a consumer
-// distinguish "kernel-arg accessed via its native rank-N indexing" from
-// "kernel-arg accessed via a single composed 1D offset over the post-
-// flatten carrier".
+// Rank-1 carrier output of the post-flatten retype UCC. Lets a
+// consumer distinguish rank-N native vs single-composed-1D access.
 static bool isPostFlattenKernelArgSource(Value source) {
   auto cast = source.getDefiningOp<UnrealizedConversionCastOp>();
   if (!cast || cast.getInputs().size() != 1 || cast.getOutputs().size() <= 1 ||
@@ -344,12 +311,8 @@ static bool isPostFlattenKernelArgSource(Value source) {
   return bufOut && bufOut.getShape().getDims().size() == 1;
 }
 
-// IR-mutating helper: synthesize a rank-1 kernel-arg view (same ptr,
-// placeholder dim, unit stride). Used by consumers that need a uniform
-// rank-1 surface when the access uses a single composed offset against
-// the post-flatten carrier. The constants land at the builder's
-// insertion point; downstream canonicalize/cse folds the placeholder
-// dim's `arith.constant 0` away because nothing uses it.
+// Synthetic rank-1 view: same ptr, placeholder dim, unit stride.
+// Placeholder folds away at canonicalize.
 static KernelArgSource flatKernelArgView(OpBuilder &builder, Location loc,
                                          const KernelArgSource &inner) {
   Value zero = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
@@ -361,14 +324,8 @@ static KernelArgSource flatKernelArgView(OpBuilder &builder, Location loc,
   return flat;
 }
 
-// Resolve `source` to a kernel-arg view shaped to match how the
-// access op is using the buffer: pre-flatten rank-N access against a
-// rank-N kernel-arg → rank-N view; post-flatten rank-1 access against
-// the same kernel-arg (reached through the flatten retype UCC) →
-// rank-1 view synthesized via `flatKernelArgView`. The pre-flatten
-// shorthand (single UCC carrying a rank-1 carrier) falls through the
-// rank-N branch with rank already == 1, so consumers don't have to
-// special-case it.
+// Kernel-arg view shaped to match the access: rank-N for native,
+// synthetic rank-1 for the post-flatten retype.
 static std::optional<KernelArgSource>
 resolveAccessKernelArg(OpBuilder &builder, Location loc, Value source) {
   auto info = resolveKernelArg(source);
@@ -379,11 +336,8 @@ resolveAccessKernelArg(OpBuilder &builder, Location loc, Value source) {
   return info;
 }
 
-// Compose the linear element offset for a multi-axis access against a
-// kernel-arg buffer: `sum_axis(indices[axis] * strides[axis])`. The result
-// is in element units (matching torch/numpy `tensor.stride(i)` reporting),
-// not bytes — `hc.ptr_offset` does its own element-size scaling on the
-// way to LLVM.
+// Linear element offset: `sum_axis(indices[a] * strides[a])`. In
+// element units; `hc.ptr_offset` scales by element size downstream.
 static Value linearizeKernelArgOffset(OpBuilder &builder, Location loc,
                                       const KernelArgSource &source,
                                       ValueRange indices) {
@@ -409,9 +363,7 @@ static Value indexCast(OpBuilder &builder, Location loc, Value value) {
       .getResult(0);
 }
 
-// Bind each free shape symbol from `type` to its matching dim value pulled
-// out of the kernel-arg UCC fragment. Replaces the prior `memref.dim`
-// chain — the dims now ride as explicit UCC inputs (one per axis).
+// Bind free shape syms to per-axis dim values from the UCC fragment.
 static void bindShapeSymbols(BufferType type, const KernelArgSource &source,
                              BoundValues &boundValues) {
   for (auto [axis, attr] : llvm::enumerate(type.getShape().getDims())) {
@@ -425,12 +377,8 @@ static void bindShapeSymbols(BufferType type, const KernelArgSource &source,
   }
 }
 
-// Map a sym name produced by the frontend's default strided layout
-// (`$STRIDE_<axis>_<argname>`, per `buildDefaultStridedBufferLayout`)
-// to the corresponding kernel-arg `index`-typed stride value. Returns
-// null when `symName` doesn't match the convention or the axis is
-// out of range. Pairs with the shape-dim walk below to cover every
-// implicit sym a kernel-arg bundle carries.
+// `$STRIDE_<axis>_<argname>` → corresponding stride value, per
+// `buildDefaultStridedBufferLayout`. Null on miss.
 static Value resolveBundleStrideSym(const KernelArgSource &source,
                                     StringRef symName) {
   if (!symName.consume_front("$STRIDE_"))
@@ -445,25 +393,7 @@ static Value resolveBundleStrideSym(const KernelArgSource &source,
   return source.strides[axis];
 }
 
-// If `value` is an `!hc.idx<sym>` whose defining op is a post-flatten
-// retype UCC chaining back to a kernel-arg bundle, return the
-// bundle's corresponding `index`-typed input value (shape dim or
-// stride per the frontend's default strided layout convention).
-// Returns null when the chain doesn't reach a kernel-arg bundle, or
-// when the sym doesn't map to any kernel-ABI slot (layout-param
-// syms, opaque non-bundle indices, etc.).
-//
-// Binding to the bundle root short-circuits the post-flatten retype
-// UCC + `idx<sym>→index` cast that `reconcileUnrealizedCasts` can't
-// reduce across (the HC-typed intermediate hides the round trip from
-// MLIR's standard UCC-folding view, and the leftover UCC fails LLVM
-// translation downstream). The kernel-arg bundle's `index` inputs
-// fold through the `index → i64` block-arg materialization that
-// `convert-gpu-to-rocdl` plants, taking the offset arith all the way
-// back to the i64 kernel args.
-// Walk the bundle's per-axis shape syms looking for a dim that
-// matches `symbol`. Returns the bundle's `index`-typed dim value
-// when found.
+// Find bundle dim sym matching `symbol`; null on miss.
 static std::optional<Value> lookupBundleDim(BufferType bundleType,
                                             const KernelArgSource &info,
                                             StringRef symbol) {
@@ -497,9 +427,8 @@ static Value resolveToBundleIndex(Value value) {
   return resolveBundleStrideSym(*info, *symbol);
 }
 
-// `indexCast` with a short-circuit through the kernel-arg bundle: if
-// `value` chains back to one, use the bundle's `index`-typed input
-// directly; otherwise fall back to emitting an `idx<sym>→index` UCC.
+// Short-circuit `idx<sym>→index` through the kernel-arg bundle;
+// fresh UCC otherwise.
 static Value indexCastViaBundle(OpBuilder &builder, Location loc, Value value) {
   if (Value direct = resolveToBundleIndex(value))
     return direct;
@@ -516,16 +445,8 @@ static void bindLaunchDim3(StringRef prefix, gpu::KernelDim3 values,
   }
 }
 
-// `$WO[k] = $WG[k] * $WGS[k]`: the upper-left corner of the
-// workgroup's tile in the work grid, on axis `k`. The launch
-// already carries both factors as `index`-typed operands, so the
-// binding is one `arith.muli` per axis, planted at the rewriter's
-// current insertion point. CSE collapses the per-apply duplicates
-// downstream — keeping the materialisation here (rather than
-// substituting `$WO` -> `$WG*$WGS` symbolically before lowering)
-// matches the bind-then-lookup shape of every other launch-geometry
-// sym and leaves the symbol equivalence intact for any future
-// consumer that cares about the name.
+// `$WO[k] = $WG[k] * $WGS[k]`: workgroup-tile upper-left corner.
+// CSE folds per-apply duplicates downstream.
 static void bindWorkOffsets(gpu::LaunchOp launch, OpBuilder &builder,
                             Location loc, BoundValues &boundValues) {
   gpu::KernelDim3 blockIds = launch.getBlockIds();
@@ -540,9 +461,8 @@ static void bindWorkOffsets(gpu::LaunchOp launch, OpBuilder &builder,
   }
 }
 
-// Pre-flatten kernel-arg UCC: single multi-input bundle → single
-// buffer output. The buffer carries shape syms (M, N, ...) and the
-// inputs give us per-axis dim values.
+// Pre-flatten UCC: multi-input bundle → single buffer output. Bind
+// buffer's shape syms (M, N, ...) to per-axis dim inputs.
 static void bindPreFlattenKernelArgCast(UnrealizedConversionCastOp cast,
                                         ConversionPatternRewriter &rewriter,
                                         Location loc,
@@ -560,17 +480,9 @@ static void bindPreFlattenKernelArgCast(UnrealizedConversionCastOp cast,
     boundValues.bind(*symbol, indexCast(rewriter, loc, input));
 }
 
-// Post-flatten retype UCC: rank-N buffer input → (rank-1 buffer,
-// idx<sym>, idx<sym>, ...) outputs. Each idx-typed output exposes
-// an implicit-symbol value (kernel-arg shape dim, stride, layout
-// param, ...) that the access ops reference symbolically in their
-// composed offsets. Bind each one so the ambient lowering can
-// resolve the apply.
-//
-// `indexCastViaBundle` short-circuits to the underlying kernel-arg
-// bundle's `index`-typed input when one is reachable; otherwise it
-// emits an `idx<sym>→index` UCC on the retype output as before. See
-// `resolveToBundleIndex` for the rationale.
+// Post-flatten retype UCC: rank-N buffer → (rank-1 buffer, idx<sym>
+// aux*). Bind each idx-typed output's symbol so ambient lowering
+// can resolve applies that reference it.
 static void bindPostFlattenRetypeCast(UnrealizedConversionCastOp cast,
                                       ConversionPatternRewriter &rewriter,
                                       Location loc, BoundValues &boundValues) {
@@ -593,23 +505,9 @@ static void bindKernelArgCastSymbols(UnrealizedConversionCastOp cast,
   bindPostFlattenRetypeCast(cast, rewriter, loc, boundValues);
 }
 
-// Structured loop/region block arguments that carry a bare-sym `!hc.idx`
-// type (e.g. an `hc.for_range` induction variable typed
-// `!hc.idx<"$join0">`) are their own binding for that symbol name. The
-// pre-flatten access-offset apply leaves these as free symbols because
-// the inner expression references the bare sym directly rather than
-// taking the value as an explicit operand; we pick them up ambiently
-// here. Only ancestor blocks of `anchor` qualify — a sibling for_range's
-// induction var would shadow incorrectly and would also fail SSA
-// dominance if a UCC against it ended up outside its defining block.
-//
-// Post-`hc-flatten-with-layouts`, `hc.generic` carries its ambient sym
-// SSA edges in operand form (`ambient_idxs` / `ambient_idx_syms`) and
-// `hc-lower-generic` plants per-lane applies that bind every ambient
-// sym as an explicit operand. Those applies never reach this walker
-// because their operand list is complete; the only consumers we see
-// are pre-flatten applies whose free-sym set still rides on the
-// ancestor `!hc.idx<sym>` types we collect below.
+// Block args typed `!hc.idx<sym>` (e.g. `hc.for_range` IV) self-bind
+// for `sym`. Only ancestor blocks of `anchor` qualify: sibling
+// scopes shadow / fail dominance.
 static void bindAncestorBlockArgSymbols(Operation *anchor, gpu::LaunchOp launch,
                                         ConversionPatternRewriter &rewriter,
                                         BoundValues &boundValues) {
@@ -732,11 +630,7 @@ private:
     StringRef name(ixs_node_sym_name(node));
     if (Value value = boundValues.lookup(name))
       return value;
-    // Record the first miss so the caller can emit a diagnostic
-    // naming the unresolved symbol. We don't emit here because
-    // ExprLowerer is a per-node walker without access to the op
-    // surface that should own the diagnostic. The caller checks
-    // `lastUnresolvedSymbol()` on failure.
+    // Record first miss; caller emits the diagnostic.
     if (unresolvedSymbol.empty())
       unresolvedSymbol = name.str();
     return failure();
@@ -907,13 +801,8 @@ private:
   std::string unresolvedSymbol;
 
 public:
-  // First symbol name that lowerSymbol couldn't bind during the most
-  // recent `lower(...)` call. Empty if every reachable symbol was
-  // bound. Callers use this to plant a diagnostic that names the
-  // missing sym instead of the generic "failed to lower" message,
-  // matching the contract in `doc/layouts.md` "Free symbols in
-  // layout offsets" (validation is delayed to lowering, and the
-  // error has to identify the offending name).
+  // First unresolved sym, empty if all bound. See doc/layouts.md
+  // "Free symbols in layout offsets".
   StringRef lastUnresolvedSymbol() const { return unresolvedSymbol; }
 };
 
@@ -998,11 +887,7 @@ struct ConvertIntrinsicSignatureOp : public OpConversionPattern<HCIntrinsicOp> {
   }
 };
 
-// Build a `BoundValues` for one `hc.idx_apply` / `hc.pred_apply` op.
-// Explicit operand bindings are authoritative (direct map insert
-// rather than `bind()`, which uses `try_emplace`); the ambient walk
-// fills in everything else for free symbols left unlisted (e.g.
-// launch geometry like `$WG0`).
+// Operand bindings override ambient; ambient fills free-sym gaps.
 static BoundValues collectApplyBindings(Operation *op,
                                         ConversionPatternRewriter &rewriter,
                                         ArrayAttr symbols,
@@ -1139,12 +1024,7 @@ struct ConvertIntBinaryOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Float counterpart to `ConvertIntBinaryOp`. The per-element scalar body
-// `hc-elementwise-to-generic` plants inside `hc.generic` carries the source
-// op kind (`hc.add` / `hc.sub` / ...) regardless of element type — the int
-// pattern above bails on float-typed bodies and this one picks them up.
-// The two together cover the numeric surface; pred/index/cast handlers
-// elsewhere cover the rest.
+// Float counterpart to `ConvertIntBinaryOp`.
 template <typename OpT, typename ArithOpT>
 struct ConvertFloatBinaryOp : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
@@ -1218,23 +1098,9 @@ collectAxes(Operation *op, ValueRange indices, OpBuilder &builder,
   return axes;
 }
 
-// Post-flatten access-op shape: one scalar `index` subscript carrying the
-// already-linearised element offset, against a 1-rank kernel-arg ABI whose
-// only stride is constant 1, and a 1-rank iter shape from the result vector
-// (load/vload), source vector (store), or mask vector (load_mask). The
-// pre-flatten per-axis structure has been folded into the composed offset
-// by `hc-flatten-with-layouts`; the remaining lane walk over the flat tile
-// is a unit-stride bump over `[composed_offset, composed_offset + N)`.
-//
-// Synthesizing a single full-slice axis (`offset = composed`, `stride = 1`,
-// `isSlice = true`) lets the existing per-lane machinery in
-// `kernelArgLaneIndices` / `storeIndicesForCoordinate` /
-// `linearizeKernelArgOffset` fall through unchanged: the kernel-arg's
-// unit stride collapses through the lin formula and each lane's offset
-// reduces to `composed + lane`. Non-contiguous post-flatten tiles
-// (strided slice survivors) intentionally fail this detect and route
-// through the slice-aware path — they need the rank-N kernel-arg ABI
-// to recompute per-axis offsets and are tracked separately.
+// Post-flatten: one composed offset, rank-1 unit-stride ABI,
+// rank-1 iter. Synthesize a full-slice axis so the per-lane machinery
+// sees `composed + lane`. Strided tiles bail to the slice-aware path.
 static std::optional<SmallVector<SliceAxis>>
 synthesizePostFlattenAxes(OpBuilder &builder, Location loc,
                           const KernelArgSource &kernelArg, ValueRange indices,
@@ -1258,10 +1124,8 @@ synthesizePostFlattenAxes(OpBuilder &builder, Location loc,
   return SmallVector<SliceAxis>{axis};
 }
 
-// Allocate a flat `!hc.ptr<workgroup, T>` sized for `count` elements. The
-// downstream `hc-lower-to-llvm` rewrites the alloc into a sibling
-// addrspace(3) global; rank-erasure happens at this boundary because the
-// AMDGPU LDS surface is one-dimensional anyway.
+// Flat `!hc.ptr<workgroup, T>` alloc for `count` elements. AMDGPU
+// LDS is 1D; rank erases here.
 static Value allocateWorkgroupPtr(OpBuilder &builder, Location loc,
                                   PtrType ptrType, int64_t count) {
   Value countValue =
@@ -1269,8 +1133,7 @@ static Value allocateWorkgroupPtr(OpBuilder &builder, Location loc,
   return HCAllocOp::create(builder, loc, ptrType, countValue).getResult();
 }
 
-// Walk linear `lin` into per-axis coords for `shape` (last axis fastest).
-// Returns the constant-index `Value` per axis.
+// Linear → per-axis coords, last axis fastest. Constant-index SSAs.
 static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
                                             int64_t lin,
                                             ArrayRef<int64_t> shape) {
@@ -1286,13 +1149,8 @@ static SmallVector<Value> unlinearizeCoords(OpBuilder &builder, Location loc,
   return coords;
 }
 
-// Per-element store from a multi-dim `vector<...xT>` value into a flat
-// `!hc.ptr<workgroup, T>` buffer. Emits one `hc.ptr_offset` + `hc.ptr_store`
-// per lane in lex order (rightmost axis varies fastest). We
-// unconditionally use the per-element form
-// (rather than a single vector-typed `hc.ptr_store`) so the matching reads
-// can also be per-element scalars and the i1 byte-vs-bit discrepancy LLVM
-// has between scalar and vector i1 stores never bites.
+// Per-element store from vector → flat workgroup ptr, rightmost-
+// fastest. Scalar form dodges LLVM's i1 byte-vs-bit store mismatch.
 static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
                                                Value vector, Value ptr,
                                                ArrayRef<int64_t> shape) {
@@ -1326,11 +1184,7 @@ static LogicalResult writeVectorToWorkgroupPtr(OpBuilder &builder, Location loc,
   return success();
 }
 
-// Walk back through an `unrealized_conversion_cast` to recover a workgroup-AS
-// `!hc.ptr` value. Counterpart to `resolveKernelArg` for the launch-body's
-// LDS path; kernel-arg buffers come in as ptr+dims+strides UCC bundles
-// for now. Returns null if `value` doesn't ultimately derive from a
-// workgroup ptr.
+// Walk back through UCC to recover a workgroup-AS `!hc.ptr`. Null on miss.
 static Value sourcePtr(Value value) {
   auto cast = value.getDefiningOp<UnrealizedConversionCastOp>();
   if (cast && cast.getInputs().size() == 1 && cast.getOutputs().size() == 1) {
@@ -1345,13 +1199,8 @@ static Value sourcePtr(Value value) {
   return {};
 }
 
-// Captures the underlying `!hc.ptr<workgroup, T>` source plus an indexing
-// pattern that maps result-vector lanes back to source-tile flat offsets.
-// Materialized eagerly from a (possibly view-laden) bare-tensor SSA value;
-// see `resolvePtrViewSource`. The trivial pattern (no `hc.buffer_view` in
-// the chain) carries one full-slice `SliceAxis` per source dim — gives the
-// per-element loop a single shape to iterate without a separate "no view"
-// path.
+// Workgroup-ptr source + lane→source-offset indexing pattern. No
+// buffer_view in chain → one full-slice axis per source dim.
 struct PtrViewSource {
   Value sourcePtr;
   PtrType ptrType;
@@ -1359,9 +1208,7 @@ struct PtrViewSource {
   SmallVector<SliceAxis> axes;
 };
 
-// Pull the workgroup ptr out of a remapped source tile, checking the
-// address space matches the LDS contract (any other address space means
-// the caller has the wrong source and should fail the rewrite).
+// Workgroup ptr from remapped tile; AS-checked.
 static FailureOr<std::pair<Value, PtrType>>
 resolveWorkgroupPtr(Value remapped) {
   Value srcPtr = sourcePtr(remapped);
@@ -1373,9 +1220,7 @@ resolveWorkgroupPtr(Value remapped) {
   return std::make_pair(srcPtr, srcPtrType);
 }
 
-// Resolve the view source for a buffer-view op: remap each per-axis
-// subscript through the conversion pattern, then materialize the
-// offset/stride axes the per-element loop walks.
+// Buffer-view source: remap each subscript, materialize axes.
 static FailureOr<PtrViewSource>
 resolveBufferViewSource(HCBufferViewOp bv,
                         ConversionPatternRewriter &rewriter) {
@@ -1393,14 +1238,7 @@ resolveBufferViewSource(HCBufferViewOp bv,
   FailureOr<std::pair<Value, PtrType>> ptr = resolveWorkgroupPtr(remappedSrc);
   if (failed(ptr))
     return failure();
-  // Walk through remapped index operands so the per-axis offset/stride
-  // values come out as `index`-typed SSA the per-element loop can plug
-  // into `arith.muli`/`arith.addi` directly. The pre-conversion form
-  // here is `!hc.idx<...>` / `!hc.slice<...>` from the buffer_view's
-  // original operands, so we have to remap each index value (the slice
-  // op's `lower`/`upper`/`step` are the slice op's own operands and get
-  // remapped on its lowering, which has already happened by the time
-  // any ptr-view consumer runs).
+  // Slice operands lowered before any ptr-view consumer runs.
   SmallVector<Value> remappedIndices;
   remappedIndices.reserve(bv.getIndices().size());
   for (Value idx : bv.getIndices()) {
@@ -1409,13 +1247,8 @@ resolveBufferViewSource(HCBufferViewOp bv,
       return failure();
     remappedIndices.push_back(remapped);
   }
-  // Non-unit strides are fine here. `loadVectorFromPtrView` /
-  // `writeVectorToWorkgroupPtr` walk the result-vector lanes through
-  // `axis.stride * iter + axis.offset` (one per-element scalar
-  // load/store), so any constant or symbolic stride lowers correctly
-  // — there's no SIMD-vs-gather decision pending on this site.
-  // The wider upgrade to `vector.gather` / strided `vector.transfer_*`
-  // for performance is the separate "SIMD/gather upgrade" task.
+  // Non-unit strides ok: per-element loop scales `stride*iter +
+  // offset` per lane.
   FailureOr<SmallVector<SliceAxis>> axes =
       collectAxes(bv.getOperation(), remappedIndices, rewriter,
                   /*requireUnitStride=*/false);
@@ -1426,10 +1259,8 @@ resolveBufferViewSource(HCBufferViewOp bv,
   return PtrViewSource{ptr->first, ptr->second, *sourceShape, std::move(*axes)};
 }
 
-// Synthesize a trivial axis pattern for non-view sources: each axis is
-// a full slice (`offset = 0`, `stride = 1`) over the source's static
-// dim. The strided per-element loop with trivial axes degenerates to
-// the same flat `0..N` iteration the no-view path would emit.
+// Trivial axes: full slice `(offset=0, stride=1)` per dim; loop
+// degenerates to flat `0..N`.
 static SmallVector<SliceAxis>
 buildTrivialSliceAxes(ArrayRef<int64_t> shape,
                       ConversionPatternRewriter &rewriter, Location loc) {
@@ -1447,19 +1278,9 @@ buildTrivialSliceAxes(ArrayRef<int64_t> shape,
   return trivialAxes;
 }
 
-// Walk back through a single `hc.buffer_view` to find the underlying
-// workgroup ptr and the index pattern. The buffer_view ops sit in the
-// pre-conversion IR — `getRemappedValue` walks `replaceOp` records to
-// produce the post-conversion ptr for the source tile, which by this point
-// has been lowered (or is being lowered in this same partial-conversion
-// pass). Two-deep view chains (`view(view(...))`) are vanishingly rare in
-// the surface; if they ever show up we'd unroll the chain here.
-//
-// For non-view sources (`hc.alloc`, fresh LDS from a `select`), we
-// synthesize a trivial axis pattern (every axis a full slice over the
-// source's static dim). That keeps the loader uniform — the strided
-// per-element loop with trivial axes degenerates to the same flat
-// `0..N` iteration the no-view path would emit.
+// Walk one `hc.buffer_view` to its workgroup ptr + index pattern.
+// Non-view sources (`hc.alloc`, fresh LDS) get a trivial axis
+// pattern so the loader is uniform.
 static FailureOr<PtrViewSource>
 resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
   if (auto bv = original.getDefiningOp<HCBufferViewOp>())
@@ -1483,21 +1304,13 @@ resolvePtrViewSource(Value original, ConversionPatternRewriter &rewriter) {
   return PtrViewSource{ptr->first, ptr->second, *shape, std::move(trivialAxes)};
 }
 
-// Per-element load of a multi-dim `vector<...xT>` from a workgroup ptr,
-// honoring any `hc.buffer_view` index pattern in the source chain. Lane V
-// reads from the source's flat offset `base + sum_k(view_idx[k] *
-// source_stride[slice_axis_k])` — base is the contribution of scalar source
-// axes, the slice contribution scales the lane coord by the source's
-// identity-layout stride at that source axis. For trivial (full-slice)
-// patterns, this collapses to the contiguous `0..N-1` linear walk a no-view
-// source wants. For strided patterns (column-of-2D-tile in WMMA), it threads
-// each lane through a separate `hc.ptr_offset` + `hc.ptr_load`.
-//
-// The per-element shape preserves the byte-per-element layout the
-// cooperative store and other consumers use, sidestepping the i1
-// packed/unpacked discrepancy LLVM has between scalar and vector i1 stores.
-// Row-major stride for each axis of a static shape (last axis = 1,
-// each preceding axis multiplied by the next axis's size).
+// Per-element load from workgroup ptr through any `hc.buffer_view`
+// chain. Lane V offset: `base + sum_k(view_idx[k] *
+// source_stride[slice_axis_k])`. Trivial pattern collapses to
+// contiguous; strided threads per-lane `hc.ptr_offset`+`hc.ptr_load`.
+// Per-element form sidesteps LLVM's scalar/vector i1 discrepancy.
+
+// Row-major strides: last axis = 1, each prev = next_stride * next_dim.
 static SmallVector<int64_t> computeRowMajorStrides(ArrayRef<int64_t> shape) {
   SmallVector<int64_t> strides(shape.size(), 1);
   for (int64_t axis = static_cast<int64_t>(shape.size()) - 2; axis >= 0; --axis)
@@ -1505,7 +1318,7 @@ static SmallVector<int64_t> computeRowMajorStrides(ArrayRef<int64_t> shape) {
   return strides;
 }
 
-// Positions of slice (non-scalar) axes in `axes`, in source order.
+// Positions of slice axes in source order.
 static SmallVector<int64_t>
 collectSliceAxisPositions(ArrayRef<SliceAxis> axes) {
   SmallVector<int64_t> positions;
@@ -1515,10 +1328,7 @@ collectSliceAxisPositions(ArrayRef<SliceAxis> axes) {
   return positions;
 }
 
-// Scalar (non-slice) source axes contribute a fixed base offset: each
-// axis's `offset` value times its source-side row-major stride, summed
-// into an `index`-typed running offset that's reused across every lane
-// of the per-element load.
+// Scalar (non-slice) axes' base: `sum_k(offset_k * source_stride_k)`.
 static Value computeScalarAxesBaseOffset(OpBuilder &rewriter, Location loc,
                                          ArrayRef<SliceAxis> axes,
                                          ArrayRef<int64_t> sourceStrides) {
@@ -1537,7 +1347,7 @@ static Value computeScalarAxesBaseOffset(OpBuilder &rewriter, Location loc,
   return base;
 }
 
-// Unflatten a linear lane index into per-axis view coords (row-major).
+// Lane idx → per-axis view coords, row-major.
 static SmallVector<int64_t> unflattenLaneIndex(int64_t lin,
                                                ArrayRef<int64_t> viewShape) {
   SmallVector<int64_t> coords(viewShape.size());
@@ -1550,9 +1360,8 @@ static SmallVector<int64_t> unflattenLaneIndex(int64_t lin,
   return coords;
 }
 
-// Add per-lane slice-axis contributions to a running base offset. Each
-// view coord scales the slice's stride, gets the slice's offset added,
-// and then multiplies the source-side row-major stride at that axis.
+// Add per-lane slice-axis contributions:
+// `base += (offset + coord*stride) * source_stride`.
 static Value applyLaneSliceOffset(OpBuilder &rewriter, Location loc, Value base,
                                   ArrayRef<int64_t> coordInts,
                                   ArrayRef<int64_t> sliceAxisPositions,
@@ -1623,26 +1432,12 @@ loadVectorFromPtrView(ConversionPatternRewriter &rewriter, Location loc,
   return result;
 }
 
-// Materialize a vector value as the converter's chosen carrier:
-//   * `vector<...xT>` is the per-workitem register path — pass through.
-//   * `!hc.ptr<workgroup, T>` is the LDS-staged path — allocate the tile
-//     and write the lanes per-element.
+// Materialize vector via converter's carrier: `vector<...xT>`
+// (per-workitem register, passthrough) or `!hc.ptr<workgroup, T>`
+// (LDS, alloc + per-element write).
 //
-// Semantic `!hc.tensor` doesn't appear here by contract:
-// `hc-decompose-shaped-values` splits every tensor producer/consumer
-// into bare (data, mask) pairs upstream so launch-body only sees the
-// bare carrier. Anything else surviving to this point is a contract
-// bug in decompose.
-//
-// Allocate an LDS tile sized for `shape`'s element count and write
-// the per-lane `vector` into it.
-// Pull the scalar splat element out of a constant vector. Returns a
-// fresh scalar `arith.constant` SSA value matching the vector's element
-// type when `vector` is a splat constant, or `nullptr` otherwise. Every
-// current caller of `writeVectorToFreshLDS` (zeros / ones / full /
-// full_mask / broadcast-of-scalar fill) feeds in a splat, so this
-// captures the common case; a non-splat vector means the caller already
-// has per-slot values and falls through to the unrolled-store path.
+// Scalar splat from a constant vector for the splat fast path.
+// Non-splat → null, caller falls back to unrolled stores.
 static Value extractSplatScalar(OpBuilder &builder, Location loc,
                                 Value vector) {
   auto cst = vector.getDefiningOp<arith::ConstantOp>();
@@ -1655,21 +1450,9 @@ static Value extractSplatScalar(OpBuilder &builder, Location loc,
   return arith::ConstantOp::create(builder, loc, scalarAttr).getResult();
 }
 
-// Emit a workgroup-cooperative fill of a freshly allocated LDS tile as a
-// single `hc.generic` with one parallel iter per slot. `hc-lower-generic`
-// then routes this through `lowerCollective`, which dispatches one slot
-// per thread. Net effect:
-//
-//   * fill cost drops from `wgSize * total` per-thread stores to one
-//     pass over the slot range divided across the workgroup;
-//   * every workgroup-AS write lives inside a structured `hc.generic`,
-//     which keeps the surface uniform for `hc-insert-workgroup-barriers`
-//     — the dedicated pass that owns cross-generic synchronization on
-//     workgroup-AS storage.
-//
-// `lin` is the canonical name for the flat slot iter sym; ixsimpl
-// hash-conses the `#hc.expr<"lin">` payload across uses so the canonical
-// handle stays cheap to compare downstream.
+// Workgroup-cooperative LDS fill as `hc.generic` with one parallel
+// iter per slot. `hc-lower-generic`'s collective path dispatches one
+// slot per thread. Uniform surface for `hc-insert-workgroup-barriers`.
 static LogicalResult emitInitFillGeneric(OpBuilder &builder, Location loc,
                                          Value lds, PtrType ptrType,
                                          Value scalar, int64_t total) {
@@ -1717,20 +1500,15 @@ static FailureOr<Value> writeVectorToFreshLDS(OpBuilder &builder, Location loc,
     total *= d;
   Value lds = allocateWorkgroupPtr(builder, loc, ptrType, total);
 
-  // Splat path: lift the fill into a structured `hc.generic` so the
-  // workgroup-cooperative lowering (and the future barrier-insertion
-  // pass) sees a uniform surface. Captures every caller in tree today.
+  // Splat: route through `hc.generic` for uniform barrier-pass surface.
   if (Value scalar = extractSplatScalar(builder, loc, vector)) {
     if (failed(emitInitFillGeneric(builder, loc, lds, ptrType, scalar, total)))
       return failure();
     return lds;
   }
 
-  // Fallback for the (currently unused) non-splat path: unrolled
-  // per-element stores. Leaves the stray-store pattern outside the
-  // generic-only contract; if a real caller appears, route it through
-  // a per-slot `hc.generic` instead so the barrier pass keeps working
-  // without special-casing this site.
+  // Non-splat fallback: unrolled per-element stores. New callers
+  // should route through `hc.generic` to keep the barrier surface uniform.
   if (failed(writeVectorToWorkgroupPtr(builder, loc, vector, lds, shape)))
     return failure();
   return lds;
@@ -1752,11 +1530,8 @@ materializeShapedResult(OpBuilder &builder, Location loc, Type convertedType,
   return failure();
 }
 
-// Read a converted shaped value as a multi-dim vector. The per-lane path
-// is a no-op (the value is already a vector); the LDS path expands into
-// per-element `hc.ptr_load`s, walking back through any `hc.buffer_view`
-// chain on the original source so strided views (column-of-2D, etc.)
-// produce correctly strided per-lane offsets.
+// Read converted shaped value as multi-dim vector. Vector
+// passthrough; LDS → per-element loads via `loadVectorFromPtrView`.
 static FailureOr<Value> shapedValueAsVector(ConversionPatternRewriter &rewriter,
                                             Location loc, Value original,
                                             Value remapped, Type convertedType,
@@ -1840,12 +1615,8 @@ static SmallVector<Value> storeIndicesForCoordinate(OpBuilder &builder,
   return indices;
 }
 
-// Build the per-axis index list for one lane of the result vector. The
-// caller feeds these into `hc.ptr_offset` + `hc.ptr_load` against the
-// kernel-arg pointer. `axes` carries the slice's per-axis offsets and
-// strides (`offset + coord * stride` for slice axes; just `offset` for
-// scalar axes). The result vector's coords identify which slice axis we're
-// walking; non-slice axes get the same `axes[k].offset` for every lane.
+// Per-axis index list for one result lane. Slice: `offset +
+// coord*stride`. Scalar: `offset`.
 static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
                                                ArrayRef<SliceAxis> axes,
                                                ArrayRef<int64_t> resultCoord) {
@@ -1865,18 +1636,14 @@ static SmallVector<Value> kernelArgLaneIndices(OpBuilder &builder, Location loc,
   return indices;
 }
 
-// Result shape/type bundle for a load-like op: the converted vector
-// type, its static shape, and the element type.
+// Result bundle for a load-like op.
 struct LoadLikeResultShape {
   mlir::VectorType vectorType;
   SmallVector<int64_t> shape;
   Type elementType;
 };
 
-// Decode the load's bare-vector result into a static `(VectorType,
-// shape, elementType)` bundle. Returns failure when the converter
-// wouldn't produce a vector or the bare-vector source isn't statically
-// shaped — both indicate the pattern shouldn't fire.
+// Bare-vector result → `(VectorType, shape, elementType)`.
 static FailureOr<LoadLikeResultShape>
 unpackLoadLikeResultShape(const TypeConverter &converter, Type bareResultType) {
   Type converted = converter.convertType(bareResultType);
@@ -1894,10 +1661,8 @@ unpackLoadLikeResultShape(const TypeConverter &converter, Type bareResultType) {
                              vectorType.getElementType()};
 }
 
-// Resolve the per-axis slice/scalar axes for a kernel-arg-backed
-// access (load or store). The post-flatten synthesizer handles the
-// rank-1 carrier case; pre-flatten ops fall back to the generic axis
-// collector.
+// Per-axis axes for a kernel-arg access. Post-flatten synthesizer
+// first; falls back to generic collector.
 static FailureOr<SmallVector<SliceAxis>>
 resolveAccessAxes(Operation *op, ValueRange indices,
                   ConversionPatternRewriter &rewriter,
@@ -1908,11 +1673,8 @@ resolveAccessAxes(Operation *op, ValueRange indices,
   return collectAxes(op, indices, rewriter, /*requireUnitStride=*/false);
 }
 
-// Emit the per-lane scalar load chain for a kernel-arg-backed load:
-// one `hc.ptr_offset` + `hc.ptr_load` + `vector.insert` per result
-// coord, threaded through a running vector accumulator initialized to
-// zero of the result vector type. LLVM's SLP recombines adjacent
-// scalar loads when the slice is unit-stride.
+// Per-lane scalar load chain: `hc.ptr_offset` + `hc.ptr_load` +
+// `vector.insert` per coord. LLVM SLP recombines unit-stride.
 static Value emitLoadLikeLanes(OpBuilder &rewriter, Location loc,
                                const KernelArgSource &kernelArg,
                                PtrType sourcePtrType,
@@ -1938,18 +1700,10 @@ static Value emitLoadLikeLanes(OpBuilder &rewriter, Location loc,
   return laneVec;
 }
 
-// Per-lane vector load from a kernel-arg `!hc.ptr<global, T>`. Every lane
-// materializes its own fragment via per-element scalar `hc.ptr_offset` +
-// `hc.ptr_load` + `vector.insert`s; LLVM's SLP recombines adjacent
-// scalar loads when the slice is unit-stride. Switching to per-element
-// keeps a single shape for unit and non-unit stride and sidesteps the
-// i1 packed-vs-byte discrepancy that `vector.transfer_read` of
-// `vector<Nxi1>` triggered.
-//
-// `hc.load` / `hc.vload` reaching launch-body always have bare-vector
-// results: bare-tensor loads (workgroup-shared tiles) are funneled
-// through `hc-load-store-to-generic` + `hc-flatten-with-layouts` +
-// `hc-lower-generic` long before this pass walks them.
+// Per-lane vector load from kernel-arg `!hc.ptr<global, T>`. Per-
+// element form covers unit + non-unit stride uniformly and sidesteps
+// the `vector<Nxi1>` packed/byte mismatch. Bare-tensor loads
+// (workgroup tiles) route through the generic pipeline upstream.
 template <typename OpT>
 struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   using OpConversionPattern<OpT>::OpConversionPattern;
@@ -1995,13 +1749,8 @@ struct ConvertLoadLikeOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Static shape from any symbolically shaped result type. Drives per-element
-// materialization on every flavour the launch-body lowering sees: BareTensor
-// (LDS-staged), BareVector (per-workitem vector register), and the semantic
-// Tensor / Vector carriers that `hc-decompose-shaped-values --strict=false`
-// leaves behind on ops it doesn't decompose. The semantic types ride through
-// the converter as identity; the rewrite still needs a literal int shape to
-// build the vector init `arith.constant` carrier off of.
+// Static shape from any symbolically shaped type. Drives
+// per-element materialization across bare and semantic carriers.
 static FailureOr<SmallVector<int64_t>> shapedResultShape(Type type) {
   if (auto shaped = dyn_cast<SymbolicallyShapedTypeInterface>(type))
     return staticIntegerShape(shaped);
@@ -2149,11 +1898,8 @@ struct ConvertVecOp : public OpConversionPattern<HCVecOp> {
     if (!vectorType)
       return failure();
 
-    // bare_tensor → bare_vector: the bare_tensor source converts to a
-    // workgroup ptr; load it into the per-lane vector via per-element
-    // `hc.ptr_load`s, walking back through any `hc.buffer_view` chain so
-    // strided views (e.g. column of a 2D tile) get correctly strided
-    // per-lane offsets.
+    // `bare_tensor` (→ workgroup ptr) → `bare_vector`: per-element
+    // load through any `hc.buffer_view` chain.
     if (auto ptrType = dyn_cast<PtrType>(adaptor.getValue().getType())) {
       if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
@@ -2185,8 +1931,8 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
     if (!converted)
       return failure();
 
-    // Bare-tensor result: condition + true value are workgroup ptrs, load
-    // them as vectors, blend, store the result back to a fresh LDS tile.
+    // Bare-tensor result: load condition + true as vectors, blend,
+    // write back to fresh LDS.
     if (auto ptrType = dyn_cast<PtrType>(converted)) {
       if (ptrType.getAddrSpace() != AddrSpace::Workgroup)
         return failure();
@@ -2236,10 +1982,7 @@ struct ConvertSelectOp : public OpConversionPattern<HCSelectOp> {
   }
 };
 
-// Lower the store source into a vector value plus its static shape,
-// running through the same `shapedValueAsVector` path that load
-// patterns use. Diagnoses both the static-shape failure and the
-// non-vector lowering on `op`.
+// Store source as `(vector, type)` via `shapedValueAsVector`.
 static FailureOr<std::pair<Value, mlir::VectorType>>
 lowerStoreSource(HCStoreOp op, HCStoreOp::Adaptor adaptor,
                  ConversionPatternRewriter &rewriter,
@@ -2260,9 +2003,7 @@ lowerStoreSource(HCStoreOp op, HCStoreOp::Adaptor adaptor,
   return std::make_pair(*source, sourceType);
 }
 
-// Lower the optional store mask into an `i1` vector of the same shape
-// as `sourceType`. Returns a null Value when the op has no mask. Any
-// shape / type mismatch on the lowered mask is reported on `op`.
+// Optional store mask → `i1` vector matching `sourceType`. Null when absent.
 static FailureOr<Value> lowerStoreMask(HCStoreOp op, HCStoreOp::Adaptor adaptor,
                                        ConversionPatternRewriter &rewriter,
                                        const TypeConverter &converter,
@@ -2289,11 +2030,8 @@ static FailureOr<Value> lowerStoreMask(HCStoreOp op, HCStoreOp::Adaptor adaptor,
   return *maskVector;
 }
 
-// Emit per-lane scalar stores for `source` into the kernel-arg buffer.
-// `mask` may be null (unconditional stores via `hc.ptr_store`); when
-// present, each lane's mask bit guards a `hc.ptr_store_pred` so the
-// mask rides as a first-class operand instead of via an `scf.if`,
-// matching the symmetric `hc.ptr_load_pred` emitted for masked loads.
+// Per-lane scalar stores. Null mask → `hc.ptr_store`; non-null →
+// `hc.ptr_store_pred` (mask as first-class operand).
 static void emitStoreLanes(OpBuilder &rewriter, Location loc,
                            const KernelArgSource &kernelArg,
                            PtrType destPtrType, Value source,
@@ -2401,14 +2139,9 @@ struct ConvertCallIntrinsicOp : public OpConversionPattern<HCCallIntrinsicOp> {
   }
 };
 
-// bare_tensor → bare_tensor view: source is a workgroup ptr. The
-// strided per-element loader (`loadVectorFromPtrView`) walks back
-// through this op to reconstruct the source-axis pattern, so the
-// buffer_view itself just needs to type-resolve cleanly. We pass the
-// source ptr through unchanged; the op survives in the IR as a
-// metadata anchor for the consumer chain walk and gets DCE'd once
-// every consumer has lowered. (The result-ptr type matches the source
-// because both are workgroup-AS, same element type, rank-erased.)
+// `bare_tensor` view of workgroup ptr: pass source ptr through. Op
+// survives as metadata anchor for `loadVectorFromPtrView`'s walk;
+// DCE'd once every consumer has lowered.
 static LogicalResult
 lowerWorkgroupBufferView(HCBufferViewOp op, HCBufferViewOp::Adaptor adaptor,
                          ConversionPatternRewriter &rewriter, Type converted,
@@ -2424,10 +2157,8 @@ lowerWorkgroupBufferView(HCBufferViewOp op, HCBufferViewOp::Adaptor adaptor,
   return success();
 }
 
-// Partition `localAxes` into (a) the permutation that pulls scalar
-// (non-slice) axes to the front (in original axis order) followed by
-// the slice axes in original order, and (b) the per-scalar `offset`
-// values that the downstream `vector.extract` uses as positions.
+// Permutation pulling scalar axes front (in order), slice axes
+// after. `positions` collects the scalar `offset` values for extract.
 static void
 buildVectorViewPermutation(ArrayRef<SliceAxis> localAxes,
                            SmallVectorImpl<int64_t> &permutation,
@@ -2445,8 +2176,7 @@ buildVectorViewPermutation(ArrayRef<SliceAxis> localAxes,
   }
 }
 
-// Reshape `result` to match `converted` exactly. Both sides must be
-// vectors; otherwise the conversion isn't expressible and we bail.
+// Reshape `result` → `converted`. Both must be vectors.
 static FailureOr<Value> reshapeToConvertedVector(OpBuilder &rewriter,
                                                  Location loc, Value result,
                                                  Type converted) {
@@ -2459,10 +2189,8 @@ static FailureOr<Value> reshapeToConvertedVector(OpBuilder &rewriter,
       .getResult();
 }
 
-// Vector-shape view: lower an `hc.buffer_view` over a vector source
-// into `vector.transpose` (scalar axes to the front) + `vector.extract`
-// (drop the scalar prefix coordinates) + a final shape cast back to
-// the converter's expected result type.
+// Vector-shape view: `vector.transpose` (scalar front) +
+// `vector.extract` (drop scalar prefix) + shape cast.
 static LogicalResult lowerVectorBufferView(HCBufferViewOp op,
                                            HCBufferViewOp::Adaptor adaptor,
                                            ConversionPatternRewriter &rewriter,
@@ -2661,9 +2389,8 @@ struct AdaptRegionlessOp : public OpConversionPattern<OpT> {
   }
 };
 
-// Resolve each `!hc.buffer<T, [...]>` operand in `operands` back to
-// its underlying `!hc.ptr<global, T>` via the kernel-arg UCC chain.
-// Non-buffer operands are untouched; `changed` flips on every swap.
+// Resolve `!hc.buffer` operands to underlying `!hc.ptr<global>` via
+// the kernel-arg UCC chain. Non-buffer untouched.
 static void resolveBuffersInPlace(MutableArrayRef<Value> operands,
                                   bool &changed) {
   for (Value &v : operands) {
@@ -2677,13 +2404,8 @@ static void resolveBuffersInPlace(MutableArrayRef<Value> operands,
   }
 }
 
-// Swap LDS-backed ins of an `hc.generic` to the underlying
-// `!hc.ptr<workgroup, T>`. The launch-body converter maps
-// `!hc.bare_tensor` directly to `!hc.ptr<workgroup, T>`, so the
-// adaptor hands back the ptr SSA the producer's conversion planted.
-// Semantic `!hc.tensor` doesn't appear here by contract —
-// `hc-decompose-shaped-values` splits it into bare (data, mask)
-// pairs upstream so launch-body only sees the bare carrier.
+// LDS-backed `bare_tensor` ins → workgroup ptr SSA the adaptor hands
+// back (producer conversion already planted it).
 static void swapInsLDSCarriersToPtrs(MutableArrayRef<Value> newIns,
                                      ValueRange adaptedIns, bool &changed) {
   for (auto [idx, v] : llvm::enumerate(newIns)) {
@@ -2697,63 +2419,21 @@ static void swapInsLDSCarriersToPtrs(MutableArrayRef<Value> newIns,
   }
 }
 
-// Resolve a `hc.generic` operand from its post-flatten `!hc.buffer<T,
-// ["?"]>` carrier (or a pre-flatten kernel-arg buffer carrier) back
-// to the underlying `!hc.ptr<global, T>` produced by the kernel-arg
-// UCC chain. Leaves non-buffer operands (`!hc.bare_vector`,
-// `!hc.bare_tensor`, workgroup ptrs, ...) untouched — those route
-// through other lowering paths.
-//
-// The pass keeps the iter bounds, the offset arrays, and the body
-// verbatim; only the operand SSA values change. The composed offset
-// expression already references kernel ABI symbols (e.g.
-// `$STRIDE_0_<buf>`); binding those symbols is the responsibility
-// of whoever later materializes the offset into SSA — `hc-lower-
-// generic` v0 fills that slot via `hc.idx_apply`'s ambient walk.
+// `hc.generic` operand resolve: kernel-arg buffer carriers → ptr<global>,
+// LDS bare_tensor ins → ptr<workgroup>. Body, bounds, offsets verbatim.
+// Composed offsets keep ABI sym refs (`$STRIDE_0_<buf>`); ambient
+// resolution happens at apply-lowering time.
 struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
   using Base::Base;
 
   LogicalResult
   matchAndRewrite(HCGenericOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Two HC-to-HC retypes happen here; the verifier on the other
-    // side stays happy because `HC_GenericOperandType` admits both
-    // `!hc.ptr` (global ABI ptr, workgroup LDS ptr) and `!hc.undef`.
-    // bare_vector deliberately doesn't appear in either retype — the
-    // global converter maps it to builtin `vector<NxT>`, which the
-    // generic-op verifier rejects, so we keep bare_vector operands at
-    // the original SSA and let `hc-lower-generic` consume them with
-    // its own value-carrier path.
-    //
-    //   * Kernel-arg buffers resolve to their `!hc.ptr<global, T>` via
-    //     the bundle UCC chain `hc-lower-kernels-to-gpu-launch`
-    //     planted. The adaptor doesn't help here because the bundle is
-    //     a multi-output UCC — `resolveKernelArg` walks it explicitly.
-    //
-    //   * bare_tensor ins swap to the `!hc.ptr<workgroup, T>` SSA the
-    //     adaptor hands back. This is the boundary `hc.zeros` (and
-    //     friends) emit when their bare_tensor result gets lowered to
-    //     an LDS allocation: the global converter remembers the
-    //     replacement, so `adaptor.getIns()[k]` is the ptr directly
-    //     (no UCC to peek through). The legality predicate keys this
-    //     off `converter.convertType(operandType)` — a pure type-
-    //     level check, no SSA chain inspection.
-    //
-    // Semantic `!hc.tensor` doesn't appear at this boundary —
-    // `hc-decompose-shaped-values` splits it into bare (data, mask)
-    // pairs upstream, so launch-body only sees the bare carrier.
-    //
-    // Outs is left in `bare_tensor` form. Swapping outs
-    // would collapse the value-typed SSA result the op contracts to
-    // produce (`ptr` outs contribute no SSA result; the verifier
-    // matches result count against value-typed outs count). The
-    // outs-side LDS swap needs its own rewrite that also rewires the
-    // result chain — a separate change.
-    //
-    // Iter bounds, on the other hand, do accept the index conversion
-    // because `HC_ValueType` covers both `!hc.idx<>` and `index`; pull
-    // them from the adaptor to clean up the trailing idx-to-index cast
-    // chain in one shot.
+    // Two HC-to-HC retypes: kernel-arg buffer → ptr<global> via UCC
+    // walk; LDS bare_tensor ins → ptr<workgroup> via adaptor. Outs
+    // stays bare_tensor (swapping it would collapse the SSA result
+    // the verifier matches against value-typed outs count). Iter
+    // bounds take the index conversion to fold the trailing UCC chain.
     SmallVector<Value> newIns(op.getIns());
     SmallVector<Value> newOuts(op.getOuts());
     bool changed = false;
@@ -2776,23 +2456,9 @@ struct AdaptGenericOp : public OpConversionPattern<HCGenericOp> {
   }
 };
 
-// Clone an `hc.yield`-terminated region into the (already-created)
-// matching `scf` region. Maps block arguments 1:1, clones each
-// non-terminator op through `rewriter.clone`, and emits an `scf.yield`
-// whose operands are the values from the original `hc.yield`, each
-// cast (if needed) to the corresponding `resultTypes` entry.
-//
-// Used for both `scf.for` (passing the loop's result types) and
-// `scf.if` (passing the converted result types) — the cloning pattern
-// is identical in both cases.
-//
-// For `hc.for_range` lowering specifically, the `$joinN` symbolic name
-// binding the original induction var carried (`!hc.idx<"$joinN">`) is
-// no longer needed past this point: `hc-flatten-with-layouts` captured
-// it into every consuming `hc.generic`'s `ambient_idxs` while the
-// typed IV was still in scope, so any downstream apply that references
-// `$joinN` has the SSA edge operand-bound and survives this conversion
-// verbatim.
+// Clone `hc.yield`-terminated region into an `scf` region: map
+// block args 1:1, clone non-terminator ops, emit `scf.yield` with
+// cast-if-needed values. Used by `scf.for` and `scf.if`.
 static LogicalResult cloneHCYieldRegion(Location loc, Region &srcRegion,
                                         Region &dstRegion,
                                         TypeRange resultTypes,
@@ -2885,11 +2551,7 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
       ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
       ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
       ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
-      // `hc.and` / `hc.or` on scalar `!hc.pred` arrive here from
-      // `hc-load-store-to-generic`, which AND-s the source mask with
-      // the dst-bounds predicate inside the generic body. Other
-      // shapes flow through `hc-elementwise-to-generic` first and
-      // land here as scalar ops on i1 too.
+      // `hc.and` / `hc.or` reach here as scalar ops on i1.
       ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
       ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
       ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
@@ -2919,10 +2581,8 @@ static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
   });
 }
 
-// An `hc.generic` operand is legal at this pass's boundary unless it
-// still references a kernel-arg buffer that hasn't been resolved to a
-// `!hc.ptr<global, T>`. `AdaptGenericOp` is responsible for that
-// resolution; until it fires, the op stays illegal.
+// `hc.generic` operand legal unless still a kernel-arg buffer
+// awaiting `AdaptGenericOp` resolution.
 static bool isHCGenericOperandLegal(Value v) {
   return !isa<BufferType>(v.getType()) || !resolveKernelArg(v);
 }
@@ -2932,12 +2592,8 @@ static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
     return false;
   if (!llvm::all_of(op.getOuts(), isHCGenericOperandLegal))
     return false;
-  // bare_tensor ins lowers to `!hc.ptr<workgroup, T>` via
-  // `AdaptGenericOp`. Type-level check: the launch-body type converter
-  // maps bare_tensor unconditionally; the adaptor will hand back the
-  // matching ptr SSA the producer's conversion already planted. Outs
-  // intentionally not checked here — we don't swap outs (see the
-  // pattern comment).
+  // `bare_tensor` ins must lower via `AdaptGenericOp`. Outs skipped
+  // — not swapped (see `AdaptGenericOp`).
   for (Value v : op.getIns()) {
     if (isa<BareTensorType>(v.getType()))
       return false;
@@ -2945,11 +2601,8 @@ static bool isHCGenericLegalAtLaunchBoundary(HCGenericOp op) {
   return true;
 }
 
-// `hc.intrinsic` is legal iff its signature already matches the
-// converter's idea of its input / result types. A missing signature
-// (parse error / orphan IR) is legal so the verifier can flag it on
-// its own terms; this predicate only kicks in for well-typed
-// intrinsics whose function type is converter-stable.
+// Legal iff signature matches the converter projection. Missing
+// signature → legal (verifier flags separately).
 static bool isHCIntrinsicSignatureLegal(HCIntrinsicOp op,
                                         const TypeConverter &converter) {
   std::optional<FunctionType> fnType = op.getFunctionType();
@@ -2964,10 +2617,8 @@ static bool isHCIntrinsicSignatureLegal(HCIntrinsicOp op,
          llvm::equal(fnType->getResults(), results);
 }
 
-// `hc.call_intrinsic` is legal iff every operand and result type
-// already equals the converter's intrinsic-boundary projection. If
-// any type can't be projected (boundary returns null) the call is
-// illegal — the conversion driver should rewrite it.
+// Legal iff every operand/result type equals its boundary
+// projection. Unprojectable → illegal.
 static bool isHCCallIntrinsicLegal(HCCallIntrinsicOp op,
                                    const TypeConverter &converter) {
   for (Value arg : op.getArgs()) {
@@ -2983,22 +2634,12 @@ static bool isHCCallIntrinsicLegal(HCCallIntrinsicOp op,
   return true;
 }
 
-// HC ptr-family ops are produced by this pass (workgroup tiles) and must
-// pass through to the downstream `hc-lower-to-llvm` slot. The other
-// HC ops in the illegal set are the launch-body surface that lowers
-// here; anything from a non-`hc` dialect is unconditionally legal.
+// HC ptr-family + bodily generic ops survive for `hc-lower-to-llvm`
+// / `hc-lower-generic` downstream.
 static void registerLaunchBodyHCLegality(ConversionTarget &target) {
-  // `hc.generic` is dynamically legal: legal once `AdaptGenericOp` has
-  // resolved every kernel-arg buffer operand back to its underlying
-  // `!hc.ptr<global, T>` (the post-flatten access path expects a ptr
-  // operand + composed 1D offset for `hc-lower-generic` v0). Non-buffer
-  // operands (`!hc.bare_vector`, `!hc.bare_tensor`, workgroup ptrs)
-  // pass through unchanged. `hc.yield_predicated` is the masked-yield
-  // terminator for `hc.generic` bodies and rides the same legality
-  // slot. `hc.yield` is illegal at the launch-body root (where its
-  // historical user is `hc.for_range`, lowered to `scf.for` here) but
-  // dynamically legal inside `hc.generic` so the generic-body
-  // terminator survives the pass for `hc-lower-generic` to consume.
+  // `hc.generic` dyn-legal once `AdaptGenericOp` resolves kernel-arg
+  // buffers. `hc.yield` legal only inside `hc.generic` (root-level
+  // `hc.for_range` lowers to `scf.for` here).
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,
                     HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp, HCPtrLoadPredOp,
                     HCPtrStorePredOp, HCYieldPredicatedOp>();
@@ -3006,13 +2647,8 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
-  // `hc.load_mask` is illegal here too — `hc-load-store-to-generic`
-  // already rewrote every load_mask the front IR can produce into an
-  // `hc.generic` body whose predicate is materialised structurally.
-  // Anything that survives is a producer bug and the conversion
-  // driver fails loudly instead of falling back to the old per-axis
-  // post-flatten lowering (which used to clamp every mask to
-  // all-false against the placeholder 1D kernel-arg dim).
+  // `hc.load_mask` already lowered upstream by
+  // `hc-load-store-to-generic`; surviving op is a producer bug.
   target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
                       HCAndOp, HCOrOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp,
                       HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp,
@@ -3022,13 +2658,8 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
                       HCStoreOp, HCForRangeOp, HCIfOp>();
 }
 
-// `hc.idx_apply` / `hc.pred_apply` inside an `hc.generic` body are
-// left alone for the second invocation of this pass to consume —
-// their iter-sym free names get explicit per-lane bindings only after
-// `hc-lower-generic` unrolls the generic. The two-pass dance matches
-// `hc.yield`: bodily resident, materialised later. Outside the body
-// (kernel-scope offset emission, ambient-binding helpers from earlier
-// passes) the ops are illegal and lower here.
+// `hc.idx_apply` / `hc.pred_apply` inside `hc.generic` body deferred
+// to the post-unroll pass invocation; outside, illegal here.
 static void registerLaunchBodyApplyLegality(ConversionTarget &target) {
   auto applyLegalInsideGeneric = [](Operation *op) {
     return op->getParentOfType<HCGenericOp>() != nullptr;
@@ -3060,16 +2691,9 @@ makeLaunchBodyLoweringTarget(MLIRContext *ctx, const TypeConverter &converter) {
   return target;
 }
 
-// Contract gate for the launch-body lowering: `hc-decompose-shaped-
-// values` runs upstream and splits every semantic `!hc.tensor` /
-// `!hc.vector` producer into bare (data, mask) pairs, so by the time
-// this pass runs there's no semantic carrier left to lower. If one
-// survives — either decompose missed a producer pattern, or someone
-// re-introduced the semantic carrier downstream — fail loud with the
-// offending op rather than silently identity-converting the type and
-// having `applyPartialConversion` produce a vague "failed to legalize"
-// error two stages later. Catching it here points the finger at the
-// upstream gap, not at this pass.
+// Contract gate: `hc-decompose-shaped-values` upstream should have
+// split every semantic `!hc.tensor` / `!hc.vector` into bare pairs.
+// Surviving semantic carrier → producer-side fail-loud diagnostic.
 static bool isSemanticShapedType(Type type) {
   return isa<hc::TensorType, hc::VectorType>(type);
 }
@@ -3094,24 +2718,9 @@ static LogicalResult assertNoSemanticShapedSurvives(Operation *rootOp) {
   return success(!walk.wasInterrupted());
 }
 
-// Bare carriers (`!hc.bare_tensor` / `!hc.bare_vector`) collapse to
-// `!hc.ptr<workgroup, T>` / `!vector<...>` here, both of which need
-// the element count known at compile time — workgroup LDS is a
-// fixed per-CU resource and the AMDGPU vector type is sized at the
-// MLIR level. A bare carrier whose shape still carries a free symbol
-// after `hc-specialize-literals` would identity-convert through the
-// type converter (the converter's static-shape predicate fails) and
-// then surface as a vague "explicitly marked illegal" rejection on
-// the producer (`hc.zeros` / `hc.full` / `hc.load`). Catching it
-// here, before the partial conversion, names the offending op and
-// the unresolved sym so the user can pin it via
-// `hc.compile(symbols={...})` (or by adding it to the kernel's
-// `literals=` whitelist) instead of decoding the post-conversion
-// failure two stages later. The symbolic-dim ergonomic case is
-// tracked separately — eventually a per-thread register-tile path
-// would let those bare carriers stay symbolic — but that's a
-// distinct architectural change; this gate just keeps the failure
-// mode honest in the meantime.
+// Bare carriers need static shapes (workgroup LDS / vector type are
+// compile-time sized). Free-sym carrier surfaces vague post-
+// conversion error; catch it here and name the op + sym.
 static bool isStaticShape(ShapeAttr shape) {
   if (!shape)
     return true;
@@ -3168,5 +2777,3 @@ struct HCLowerLaunchBodyPass
 };
 
 } // namespace
-
-// `createHCLowerLaunchBodyPass()` is emitted by tablegen.

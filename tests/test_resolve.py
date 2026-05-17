@@ -39,17 +39,12 @@ def _ensure_hc_front_bindings_available() -> None:
     )
 
 
-# Module-scope fixtures for the layout-parameter / as_layout body-call
-# tests. PEP 563 stringified annotations (the file's `from __future__
-# import annotations`) need the referenced names to be resolvable from
-# the function's globals, so the kernel and its captured ``IndexMap``
-# must live at module scope — defining either inside the test body
-# hides ``Buffer`` / ``M`` / ``N`` / ``_FIXTURE_LAYOUT`` from
-# ``inspect.get_annotations(eval_str=True)``. Decorator names also have
-# to match `kernel` (or `kernel.func` / `kernel.intrinsic`) literally
-# in the parsed AST, so the imports above stay unaliased; local
-# re-imports inside other tests simply rebind these names in their own
-# scopes.
+# Module-scope fixtures for layout-param / `as_layout` body-call tests.
+# PEP 563 stringified annotations need the referenced names resolvable
+# from function globals → kernel + captured `IndexMap` must be at
+# module scope; function-local defs hide them from
+# `inspect.get_annotations(eval_str=True)`. Decorator names match
+# `kernel` literally in the AST, so unaliased imports above.
 _FIXTURE_M = sym.M
 _FIXTURE_N = sym.N
 _FIXTURE_K = sym.K
@@ -57,12 +52,11 @@ _FIXTURE_LAYOUT = index_map(
     storage_size=lambda w, h: w * h,
     offset=lambda i, j, w, h: i * h + j,
 )
-# Non-injective layout fixture: rank-3 logical shape with flat storage
-# the size of a single column — offset drops two of the three index
-# syms, so distinct logical indices land on the same storage slot.
-# `LayoutAttr` enforces `index_syms.size() == shape_syms.size()`; non-
-# injectivity is expressed through the offset formula, not by adding
-# extra index_syms.
+# Non-injective: rank-3 logical shape, flat storage = one column.
+# Offset drops two of three index syms → distinct logical indices
+# share a slot. `LayoutAttr` requires
+# `index_syms.size() == shape_syms.size()`; non-injectivity is in
+# the offset formula, not in extra index syms.
 _FIXTURE_NONINJECTIVE_LAYOUT = index_map(
     storage_size=lambda d0, d1, d2: d1,
     offset=lambda i, j, lane, d0, d1, d2: j,
@@ -101,7 +95,7 @@ def _noninjective_layout_vload_kernel(
 
 
 def _iter_ops(module: Any) -> Any:
-    """Depth-first walk over every op in ``module``; includes toplevels."""
+    """DFS over every op in `module`, toplevels included."""
     stack = [(op, False) for op in module.body.operations]
     while stack:
         op, _ = stack.pop()
@@ -124,11 +118,10 @@ def _str_attr(attrs: Any, key: str) -> str | None:
 
 
 def _ref_dict(op: Any) -> dict[str, str] | None:
-    """Read the ``ref`` DictAttr off ``op`` into a plain dict-of-strings.
+    """Read `op`'s `ref` DictAttr into a dict-of-strings.
 
-    Values are rendered via ``str`` so nested `ArrayAttr`s surface as their
-    MLIR text form; identity is good enough for substring checks in tests
-    and avoids hand-rolling a recursive decoder.
+    Nested `ArrayAttr` surface as MLIR text — fine for substring checks,
+    no recursive decoder needed.
     """
     attrs = op.operation.attributes
     if "ref" not in attrs:
@@ -141,7 +134,7 @@ def _ref_dict(op: Any) -> dict[str, str] | None:
 
 
 def _name_refs(module: Any) -> dict[str, list[dict[str, str]]]:
-    """{identifier: [ref-dict, ...]} for every load-context ``hc_front.name``."""
+    """{identifier: [ref-dict, ...]} for every load-context `hc_front.name`."""
     out: dict[str, list[dict[str, str]]] = {}
     for op in _iter_ops(module):
         if op.operation.name != "hc_front.name":
@@ -155,7 +148,7 @@ def _name_refs(module: Any) -> dict[str, list[dict[str, str]]]:
 
 
 def _attr_refs(module: Any) -> dict[str, list[dict[str, str]]]:
-    """{attr-method: [ref-dict, ...]} for every ``hc_front.attr`` with a ref."""
+    """{attr-method: [ref-dict, ...]} for every `hc_front.attr` with a ref."""
     out: dict[str, list[dict[str, str]]] = {}
     for op in _iter_ops(module):
         if op.operation.name != "hc_front.attr":
@@ -193,13 +186,11 @@ def test_resolve_wmma_collects_full_dep_set() -> None:
     resolved = resolve_front_ir(tiled_gfx11_wmma_matmul)
 
     assert isinstance(resolved, ResolvedFrontIR)
-    # Order matters: the kernel emits first, then helpers/intrinsics and
-    # undecorated inline helpers in BFS discovery order (globals +
-    # closurevars). Pin both the set and the relative kernel-first
-    # position so a regression that drops a dep is caught alongside one
-    # that reshuffles the module. `inline_names` separately pins the
-    # inline subset so the resolver stays honest about which top-levels
-    # were marked `ref.kind = "inline"`.
+    # Order matters: kernel first, then helpers/intrinsics and inline
+    # helpers in BFS discovery order (globals + closurevars). Pin the
+    # set + kernel-first position so dropped deps and module reshuffles
+    # both fail. `inline_names` separately pins which top-levels were
+    # marked `ref.kind = "inline"`.
     assert resolved.symbol_names[0] == "tiled_gfx11_wmma_matmul"
     assert set(resolved.exported_symbol_names) == {
         "tiled_gfx11_wmma_matmul",
@@ -227,8 +218,8 @@ def test_resolve_wmma_stamps_every_name_load_with_ref() -> None:
 
     resolved = resolve_front_ir(tiled_gfx11_wmma_matmul)
 
-    # Every load-context ``hc_front.name`` must carry a ref. Stores
-    # (``target_name``) are exempt.
+    # Every load-context `hc_front.name` carries a ref;
+    # `target_name` (stores) exempt.
     load_count = 0
     for op in _iter_ops(resolved.module):
         if op.operation.name != "hc_front.name":
@@ -244,14 +235,14 @@ def test_resolve_wmma_stamps_every_name_load_with_ref() -> None:
 def _wmma_refs() -> (
     tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, str]]]]
 ):
-    """Cache the resolved WMMA refs — each parametrized case reuses one build."""
+    """Cache resolved WMMA refs — parametrized cases share one build."""
     _ensure_hc_front_bindings_available()
     resolved = resolve_front_ir(tiled_gfx11_wmma_matmul)
     return _name_refs(resolved.module), _attr_refs(resolved.module)
 
 
-# One assertion per parametrize row: keeps lizard happy and makes failures
-# point at exactly one ref kind instead of a 20-clause compound predicate.
+# One assertion per parametrize row → lizard-happy, failures point at
+# one ref kind instead of a compound predicate.
 @_SKIP_HC_FRONT_DIALECT_TESTS
 @pytest.mark.parametrize(
     ("identifier", "needles"),
@@ -289,10 +280,9 @@ def test_resolve_wmma_name_ref_has_expected_kind(
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_wmma_constant_ref_is_stable() -> None:
-    # ``WMMA_K`` is loaded at multiple sites; every occurrence must resolve
-    # to the same single constant payload. A regression that emitted
-    # per-site noise (location tokens, ids) would surface as >1 distinct
-    # value here.
+    # `WMMA_K` is loaded at multiple sites; every occurrence resolves
+    # to the same constant payload. Per-site noise (locs, ids) would
+    # show as >1 distinct value here.
     name_refs, _ = _wmma_refs()
     distinct = {tuple(sorted(ref.items())) for ref in name_refs["WMMA_K"]}
     assert len(distinct) == 1, distinct
@@ -309,7 +299,7 @@ def test_resolve_wmma_constant_ref_is_stable() -> None:
         ("load", {"kind": "dsl_method"}),
         ("group_id", {"kind": "dsl_method"}),
         ("float16", {"kind": "numpy_dtype_type", "dtype": "float16"}),
-        # ``np.empty`` is a helper function, not a dtype — shouldn't mis-tag.
+        # `np.empty` is a helper, not a dtype — must not mis-tag.
         ("empty", {"kind": "numpy_attr"}),
     ],
 )
@@ -324,9 +314,9 @@ def test_resolve_wmma_attr_ref_has_expected_kind(
 def test_resolve_wmma_symbols_get_symbol_ref() -> None:
     _ensure_hc_front_bindings_available()
 
-    # Tiled WMMA doesn't load `M`/`N`/`K` directly inside its body (it reads
-    # `a.shape[1]` instead), so build a minimal kernel that does reference a
-    # `Symbol` in an expression context and check the payload shape.
+    # Tiled WMMA reads `a.shape[1]`, never `M`/`N`/`K` directly. Use
+    # a minimal kernel that references a `Symbol` in expression
+    # context to check the payload shape.
     from hc import kernel, sym
     from hc.symbols import ceil_div
 
@@ -348,10 +338,10 @@ def test_resolve_wmma_symbols_get_symbol_ref() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_recognizes_live_numpy_scalar_dtypes() -> None:
-    # ``intp`` / ``uintp`` are platform-dependent aliases that a hardcoded
-    # dtype list would miss. Check we delegate to the live numpy module so
-    # every concrete scalar type surfaces as ``numpy_dtype_type`` without
-    # per-platform edits to the resolver.
+    # `intp`/`uintp` are platform-dependent aliases — a hardcoded
+    # dtype list misses them. Resolver delegates to live numpy so
+    # every scalar type surfaces as `numpy_dtype_type` without
+    # per-platform edits.
     _ensure_hc_front_bindings_available()
 
     from hc import kernel, sym
@@ -380,8 +370,7 @@ def test_resolve_recognizes_live_numpy_scalar_dtypes() -> None:
 def test_resolve_raises_on_unresolved_capture(tmp_path: Path) -> None:
     _ensure_hc_front_bindings_available()
 
-    # Define the kernel in a real file so `inspect.getsourcelines` can see
-    # it (identical constraint to test_hc_compile.py's end-to-end smoke).
+    # Kernel needs a real file so `inspect.getsourcelines` finds it.
     import importlib.util
     import sys
 
@@ -417,10 +406,9 @@ def test_resolve_raises_on_unresolved_capture(tmp_path: Path) -> None:
 def test_resolve_raises_on_unclassifiable_capture(tmp_path: Path) -> None:
     _ensure_hc_front_bindings_available()
 
-    # Capture an unsupported Python value (a plain class instance) to exercise
-    # the "unclassifiable capture" path. The error message should name the
-    # offending identifier, its Python type, the kernel, and hint at what
-    # captures *are* supported so the user can fix their code.
+    # Unsupported capture (plain class instance) → "unclassifiable
+    # capture" diagnostic naming identifier, type, kernel, and the
+    # supported-capture hint.
     import importlib.util
     import sys
 
@@ -467,15 +455,12 @@ def test_resolve_raises_on_unclassifiable_capture(tmp_path: Path) -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_index_map_capture_serializes_layout_payload() -> None:
-    """Module-level ``IndexMap`` captures get a ``kind = "layout"`` ref
-    whose payload is built from typed MLIR attributes: ``#hc.expr`` for
-    ``storage_size`` / ``offset`` and for every ``params`` entry, plus
-    ``ArrayAttr`` of ``StringAttr`` for ``shape_syms`` / ``index_syms``.
-    No textual round-trip survives across the Python -> C++ boundary;
-    pinning the MLIR-text forms keeps slice-3 frontend output stable
-    across resolver changes (if ixsimpl normalization changes a
-    spelling, the assertion catches it and forces a documented bump
-    rather than silent drift in IR text).
+    """Module-level `IndexMap` capture → `kind = "layout"` ref payload
+    built from typed MLIR attrs: `#hc.expr` for `storage_size`/`offset`
+    and each `params` entry, `ArrayAttr` of `StringAttr` for
+    `shape_syms`/`index_syms`. No textual round-trip across Python ->
+    C++. Asserting on MLIR-text spellings catches ixsimpl
+    normalization drift.
     """
     _ensure_hc_front_bindings_available()
 
@@ -511,11 +496,10 @@ def test_resolve_index_map_capture_serializes_layout_payload() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_index_map_without_params_emits_empty_table() -> None:
-    """``IndexMap`` without a ``params`` callable: ``storage_size`` and
-    ``offset`` see only shape / index syms, and the ref carries an
-    empty ``params`` dictionary. Default-strided buffer layouts already
-    do this on the C++ side; the Python surface needs to round-trip
-    the same minimal shape.
+    """`IndexMap` without `params`: `storage_size`/`offset` see only
+    shape/index syms, ref carries empty `params` dict. Default-strided
+    layouts already do this C++-side; round-trip the same shape from
+    Python.
     """
     _ensure_hc_front_bindings_available()
 
@@ -550,12 +534,10 @@ def test_resolve_index_map_without_params_emits_empty_table() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_index_map_noninjective_layout_serializes() -> None:
-    """``IndexMap`` with a non-injective offset (multiple logical
-    indices collapsing to the same storage slot) serializes the same
-    way as any other rank-balanced layout. ``LayoutAttr`` requires
-    ``index_syms.size() == shape_syms.size()``, so the offset and
-    storage formulas just happen to drop some index axes — there's no
-    selector-specific encoding.
+    """Non-injective offset (multiple logical indices → one slot)
+    serializes like any rank-balanced layout. `LayoutAttr` requires
+    `index_syms.size() == shape_syms.size()`; offset/storage just
+    drop some index axes — no selector-specific encoding.
     """
     _ensure_hc_front_bindings_available()
 
@@ -567,10 +549,8 @@ def test_resolve_index_map_noninjective_layout_serializes() -> None:
     K = sym.K
     LANE = sym.LANE
 
-    # WMMA-A-fragment-ish layout: rank-3 logical shape (M, K, LANE)
-    # whose flat storage is the K column. Multiple (i, lane) pairs
-    # share each storage slot — fine, the layout describes a per-lane
-    # broadcast.
+    # WMMA-A-fragment-ish: rank-3 logical (M, K, LANE), flat storage =
+    # K column. Multiple (i, lane) share each slot → per-lane broadcast.
     A_FRAG = index_map(
         storage_size=lambda d0, d1, d2: d1,
         offset=lambda i, j, lane, d0, d1, d2: j,
@@ -595,11 +575,10 @@ def test_resolve_index_map_noninjective_layout_serializes() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
-    """The free ``as_layout`` function is a DSL primitive, not an
-    inlinable helper. The resolver must produce a ``layout_op`` ref so
-    ``hc-front-to-hc`` recognizes the call site as the source of an
-    ``hc.as_layout`` op — and must NOT walk it as a BFS dep (which
-    would re-parse its dispatcher body as kernel source).
+    """`as_layout` is a DSL primitive, not an inlinable helper. Resolver
+    emits `layout_op` ref so `hc-front-to-hc` recognizes the call site
+    as `hc.as_layout`. Must NOT walk it as a BFS dep — that would
+    re-parse its dispatcher body as kernel source.
     """
     _ensure_hc_front_bindings_available()
 
@@ -624,14 +603,12 @@ def test_resolve_as_layout_capture_classifies_as_layout_op() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_layout_kwarg_stamps_attr_on_producer() -> None:
-    """End-to-end Python -> hc_front -> hc handshake: a kernel calling
-    ``group.vzeros(shape=..., layout=A_LAYOUT)`` must reach
-    ``-convert-hc-front-to-hc`` with the right ref payload and surface
-    as ``hc.vzeros`` carrying a ``layout = #hc.layout<...>`` attribute
-    on the producer op (no intermediate ``hc.as_layout``). The LIT
-    side pins the C++ consumer on hand-written hc_front IR; this test
-    pins the boundary (resolver ref shape exactly matches the C++
-    reader contract).
+    """End-to-end Python → hc_front → hc: kernel calling
+    `group.vzeros(shape=..., layout=A_LAYOUT)` reaches
+    `-convert-hc-front-to-hc` and surfaces as `hc.vzeros` with
+    `layout = #hc.layout<...>` on the producer (no intermediate
+    `hc.as_layout`). LIT pins the C++ consumer on hand-written
+    hc_front IR; this test pins the Python-side boundary.
     """
     import subprocess
 
@@ -670,14 +647,12 @@ def test_layout_kwarg_stamps_attr_on_producer() -> None:
     ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     hc_text = result.stdout
     assert "hc.vzeros" in hc_text, hc_text
-    # The captured layout is stamped directly on the producer op as a
-    # `layout = #hc.layout<...>` attribute; no intermediate
-    # `hc.as_layout` is emitted for `layout=` kwargs.
+    # Layout lands as `layout = #hc.layout<...>` on the producer; no
+    # `hc.as_layout` for `layout=` kwargs.
     assert "hc.as_layout" not in hc_text, hc_text
     assert "layout = #hc.layout<" in hc_text, hc_text
-    # ixsimpl is free to reorder commuting factors (``h*w`` vs ``w*h``)
-    # so the test asserts presence-and-shape rather than a verbatim
-    # spelling.
+    # ixsimpl reorders commuting factors (`h*w` vs `w*h`); assert
+    # presence/shape, not verbatim spelling.
     assert 'index_syms = ["i", "j"]' in hc_text, hc_text
     assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
     assert "storage_size = #hc.expr<" in hc_text, hc_text
@@ -686,18 +661,12 @@ def test_layout_kwarg_stamps_attr_on_producer() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_noninjective_layout_lands_on_vload_with_full_bind() -> None:
-    """End-to-end pin: a buffer with a non-injective layout reaches
-    ``hc.vload`` through the standard subscript-then-vload pattern.
-    The kernel slices the rank-3 logical buffer via ``a[i, j, lane]``
-    and the resulting ``hc.vload`` after ``--convert-hc-front-to-hc``
-    carries one index operand per logical axis (full positional bind).
-
-    Pinning this end-to-end keeps the resolver, frontend lowering, and
-    layout serialization aligned with the uniform `index_syms.size()
-    == shape_syms.size()` invariant.
-
-    Lives at module scope alongside its kernel for the PEP 563 +
-    eval_str reason.
+    """Buffer with non-injective layout reaches `hc.vload` through
+    standard subscript-then-vload. Slicing via `a[i, j, lane]` →
+    `hc.vload` after `--convert-hc-front-to-hc` with one index
+    operand per logical axis (full positional bind). Pins resolver +
+    frontend lowering + layout serialization on the uniform
+    `index_syms.size() == shape_syms.size()` invariant.
     """
     import subprocess
 
@@ -707,8 +676,8 @@ def test_noninjective_layout_lands_on_vload_with_full_bind() -> None:
 
     resolved = resolve_front_ir(_noninjective_layout_vload_kernel)
     front_text = str(resolved.module)
-    # Resolver-side: the kernel-parameter layout carries the three
-    # logical axes; the body-call subscript stays positional.
+    # Resolver: kernel-param layout carries all three logical axes;
+    # body-call subscript stays positional.
     assert 'index_syms = ["i", "j", "lane"]' in front_text, front_text
 
     result = subprocess.run(
@@ -722,12 +691,12 @@ def test_noninjective_layout_lands_on_vload_with_full_bind() -> None:
         result.returncode == 0
     ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     hc_text = result.stdout
-    # The BufferType's LayoutAttr is the captured non-injective layout
+    # BufferType's LayoutAttr is the captured non-injective layout
     # (no default-strided fallback).
     assert "$STRIDE_" not in hc_text, hc_text
     assert 'index_syms = ["i", "j", "lane"]' in hc_text, hc_text
-    # The vload must end up with three index operands wired through —
-    # one per logical axis of the rank-3 source.
+    # vload wires three index operands — one per logical axis of the
+    # rank-3 source.
     assert "hc.vload" in hc_text, hc_text
     vload_line = next(line for line in hc_text.splitlines() if "hc.vload" in line)
     operand_block = vload_line.split("[", 1)[1].split("]", 1)[0]
@@ -735,13 +704,9 @@ def test_noninjective_layout_lands_on_vload_with_full_bind() -> None:
 
 
 def test_buffer_class_getitem_captures_trailing_index_map_as_layout() -> None:
-    """``Buffer[d1, d2, dtype, IndexMap]`` stores the ``IndexMap`` on the
-    ``BufferSpec.layout`` field; ``Buffer[d1, d2, dtype]`` leaves it
-    ``None``. Detected by ``isinstance`` against ``IndexMap`` rather
-    than by position — ``[]`` syntax can't pass real kwargs, so a
-    positional-by-type rule is the only spelling that works at the
-    annotation surface. Default-strided callers keep their old shape
-    via the ``None`` fallback.
+    """`Buffer[..., IndexMap]` → `BufferSpec.layout = IndexMap`;
+    `Buffer[..., dtype]` → `layout = None`. Position is detected by
+    `isinstance(IndexMap)` — `[]` can't pass kwargs.
     """
     from hc import Buffer, sym
     from hc.core import BufferSpec, index_map
@@ -764,19 +729,11 @@ def test_buffer_class_getitem_captures_trailing_index_map_as_layout() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_buffer_layout_lands_on_kernel_parameter_dict() -> None:
-    """End-to-end Python -> hc_front -> hc: a kernel parameter annotated
-    as ``Buffer[..., IndexMap]`` must round-trip through
-    ``-convert-hc-front-to-hc`` with the captured layout becoming the
-    ``BufferType``'s ``LayoutAttr``, replacing the default
-    ``$STRIDE_<i>_<argname>`` builder. Pins the boundary contract: the
-    resolver-side ``layout`` payload on the parameter dict matches the
-    same key set ``layoutAttrFromRef`` reads for body-level layouts.
-
-    The kernel under test lives at module scope (``_param_layout_kernel``)
-    rather than inside the test body so PEP 563 stringified annotations
-    can resolve their free names (``Buffer``, ``M``, ``N``,
-    ``A_LAYOUT``) via the module's globals — function-local frames
-    aren't visible to ``inspect.get_annotations(eval_str=True)``.
+    """Kernel param annotated `Buffer[..., IndexMap]` round-trips through
+    `-convert-hc-front-to-hc`: captured layout becomes `BufferType`'s
+    `LayoutAttr`, replacing the default `$STRIDE_<i>_<argname>`. Pins
+    the resolver-side `layout` payload key set against the C++
+    `layoutAttrFromRef` reader.
     """
     import subprocess
 
@@ -786,8 +743,8 @@ def test_buffer_layout_lands_on_kernel_parameter_dict() -> None:
 
     resolved = resolve_front_ir(_param_layout_kernel)
     front_text = str(resolved.module)
-    # Resolver-side: the parameter dict carries the structured layout
-    # sub-dict matching the body-level ref shape (kind + 5 keys).
+    # Resolver: param dict carries the structured layout sub-dict
+    # matching the body-level ref shape (kind + 5 keys).
     assert 'kind = "layout"' in front_text, front_text
     assert 'shape_syms = ["w", "h"]' in front_text, front_text
     assert 'index_syms = ["i", "j"]' in front_text, front_text
@@ -803,10 +760,9 @@ def test_buffer_layout_lands_on_kernel_parameter_dict() -> None:
         result.returncode == 0
     ), f"hc-opt failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     hc_text = result.stdout
-    # C++ side: the BufferType's LayoutAttr is the captured one, not
-    # the default-strided builder. Default-strided would emit
-    # `$STRIDE_<i>_<argname>` symbols inside the layout payload;
-    # asserting their absence pins that we took the override path.
+    # C++: `BufferType` `LayoutAttr` is the captured one, not the
+    # default. Default-strided emits `$STRIDE_<i>_<argname>`
+    # symbols; absence pins the override path.
     assert "$STRIDE_" not in hc_text, hc_text
     assert 'shape_syms = ["w", "h"]' in hc_text, hc_text
     assert 'index_syms = ["i", "j"]' in hc_text, hc_text
@@ -814,17 +770,10 @@ def test_buffer_layout_lands_on_kernel_parameter_dict() -> None:
 
 @_SKIP_HC_FRONT_DIALECT_TESTS
 def test_as_layout_body_call_emits_hc_as_layout() -> None:
-    """End-to-end body-level ``as_layout(value, A_LAYOUT)``: the AST
-    walker emits the generic ``hc_front.call``, the resolver stamps the
-    callee as ``kind = "layout_op"`` and the descriptor as
-    ``kind = "layout"``, and ``-convert-hc-front-to-hc`` recognizes the
-    pattern and produces ``hc.as_layout`` carrying the structured
-    layout attribute. Companion to the kwarg-overlay test above — they
-    cover the two surfaces a user has for attaching a captured
-    ``IndexMap`` to a body-level value.
-
-    Lives at module scope alongside its kernel for the same PEP 563 +
-    eval_str reason as the parameter-layout test.
+    """Body-level `as_layout(value, A_LAYOUT)`: AST walker emits generic
+    `hc_front.call`; resolver stamps callee `kind = "layout_op"` and
+    descriptor `kind = "layout"`; `-convert-hc-front-to-hc` produces
+    `hc.as_layout` carrying the structured layout attribute.
     """
     import subprocess
 
@@ -854,11 +803,9 @@ def test_as_layout_body_call_emits_hc_as_layout() -> None:
 
 
 def test_index_map_classifier_diagnoses_bad_signature() -> None:
-    """Lambdas with varargs / keyword-only / defaults are rejected with
-    a located error. The simulator and the symbolic evaluator both
-    bind by positional slot; anything else would make slot semantics
-    ambiguous and lower confusing diagnostics from the lambda body
-    instead of the layout descriptor.
+    """Lambdas with varargs / kw-only / defaults reject with a located
+    error. Both the simulator and the symbolic evaluator bind by
+    positional slot; anything else makes slot semantics ambiguous.
     """
     from hc._resolve import _classify_index_map
     from hc.core import index_map
@@ -874,10 +821,9 @@ def test_index_map_classifier_diagnoses_bad_signature() -> None:
 
 
 def test_index_map_classifier_diagnoses_mismatched_shape_names() -> None:
-    """offset's trailing shape slots must match params/storage_size's
-    shape slots by name. A typo in the offset signature would silently
-    rebind the layout to the wrong shape sym; the classifier rejects
-    it instead.
+    """`offset`'s trailing shape slots must name-match
+    `params`/`storage_size`. Typo would silently rebind the layout
+    to the wrong shape sym; classifier rejects.
     """
     from hc._resolve import _classify_index_map
     from hc.core import index_map
@@ -895,11 +841,9 @@ def test_index_map_classifier_diagnoses_mismatched_shape_names() -> None:
 
 
 def test_index_map_classifier_accepts_free_syms() -> None:
-    """A layout that declares ``free_syms`` keeps those names as free
-    symbols in the resulting ``offset`` / ``storage_size`` expressions
-    so the lowering pipeline can bind them from the surrounding kernel
-    scope (kernel-arg aux, ancestor block argument, ambient launch
-    geometry). See `doc/layouts.md` "Free symbols in layout offsets".
+    """`free_syms` keeps names as free symbols in `offset`/`storage_size`
+    so the lowering pipeline binds them from kernel scope (kernel-arg
+    aux, ancestor block argument, launch geometry).
     """
     from hc._resolve import _index_map_ref
     from hc.core import index_map
@@ -913,22 +857,19 @@ def test_index_map_classifier_accepts_free_syms() -> None:
     assert ref["kind"] == "layout"
     assert ref["shape_syms"] == ("M", "N")
     assert ref["index_syms"] == ("i", "j")
-    # The free sym names show up as bare symbol leaves in the offset
-    # expression. We don't assert on the full canonical form here —
-    # `ixsimpl` rearranges terms — but every free-sym name must appear
-    # somewhere in the rendered offset.
+    # Free sym names appear as bare leaves in the offset expr. `ixsimpl`
+    # rearranges terms; assert presence, not canonical form.
     offset_text = str(ref["offset"])
     assert "row0" in offset_text
     assert "col0" in offset_text
-    # storage_size doesn't reference free syms; it stays pure.
+    # `storage_size` stays pure — no free syms.
     assert str(ref["storage_size"]) == "M*N"
 
 
 def test_index_map_classifier_rejects_undeclared_kwonly() -> None:
-    """Keyword-only parameters on a layout lambda must be declared in
-    ``free_syms`` — they're the only kw-only slot a layout is allowed
-    to claim, and an undeclared name is almost always a typo for a
-    shape sym or a missed entry in ``free_syms``.
+    """Kw-only params on a layout lambda must be declared in `free_syms`
+    — that's the only kw-only slot a layout claims. Undeclared name is
+    almost always a typo for a shape sym or a missed `free_syms` entry.
     """
     from hc._resolve import _classify_index_map
     from hc.core import index_map
@@ -936,7 +877,6 @@ def test_index_map_classifier_rejects_undeclared_kwonly() -> None:
     L = index_map(
         storage_size=lambda M, N: M * N,
         offset=lambda i, j, M, N, *, row0: row0 + i * N + j,
-        # `row0` is keyword-only but `free_syms` is empty.
         free_syms=(),
     )
     with pytest.raises(FrontendError) as exc_info:
@@ -947,21 +887,19 @@ def test_index_map_classifier_rejects_undeclared_kwonly() -> None:
 
 
 def test_index_map_classifier_rejects_free_sym_collision() -> None:
-    """``free_syms`` shares the dialect-side LayoutAttr name pool with
-    ``shape_syms`` / ``index_syms`` / ``params`` keys. Catch collisions
-    Python-side so the diagnostic points at the offending classifier
-    instead of bubbling out of MLIR with a generic dup-name error.
+    """`free_syms` shares the dialect-side `LayoutAttr` name pool with
+    `shape_syms`/`index_syms`/`params`. Catch collisions Python-side
+    so the diagnostic points at the classifier, not a generic MLIR
+    dup-name error.
     """
     from hc._resolve import _classify_index_map
     from hc.core import index_map
 
     L = index_map(
         storage_size=lambda M, N: M * N,
-        # `M` is a shape sym; claiming it as a free sym would alias
-        # the slot. `M` is unreferenced on the offset's kw-only side
-        # so `_layout_invoke`'s subset filter never asks the lambda
-        # for it — the collision check has to fire before lambda
-        # inspection or the bug slides through.
+        # `M` is a shape sym. `_layout_invoke`'s subset filter never
+        # asks for it on the kw-only side, so the collision check has
+        # to fire before lambda inspection.
         offset=lambda i, j, M, N: i * N + j,
         free_syms=("M",),
     )

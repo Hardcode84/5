@@ -10,40 +10,33 @@ include "mlir/Pass/PassBase.td"
 def HCPromoteNames : Pass<"hc-promote-names"> {
   let summary = "Promote Python name-store ops to SSA values.";
   let description = [{
-    Replaces `hc.assign` / `hc.name_load` with structured SSA carriers,
-    rebuilding region-carrying ops so each Python-level name becomes a
-    real SSA value or iter_arg / result / block-arg of the enclosing
-    region op. This pass is the second half of the pipeline; the
-    pipeline contract — what the placeholders are, who is allowed to
-    look at them, what "supported invocation" means — lives on
+    Replaces `hc.assign` / `hc.name_load` with structured SSA, rebuilding
+    region-carrying ops so each Python name becomes an SSA value, an
+    iter_arg, a result, or a block arg. Pipeline contract is on
     `ConvertHCFrontToHC` in `include/hc/Conversion/HCFrontToHC/Passes.td`.
 
-    Runs bottom-up on every function region tree (`hc.kernel` / `hc.func`
-    / `hc.intrinsic`). Region ops that tag themselves with
-    `NameStoreRegionOpInterface` participate:
+    Bottom-up over every function region tree
+    (`hc.kernel` / `hc.func` / `hc.intrinsic`).
+    `NameStoreRegionOpInterface` ops participate:
 
-      - `hc.for_range`  : carried names become iter_args + yielded
-                          values. A leading `hc.assign "<n>", %iv`
-                          (the frontend's way of publishing the IV
-                          under its Python-source name) is recognized
-                          as a tautological self-bind, kept loop-local,
-                          and folded to direct uses of the block arg.
-      - `hc.if`         : carried names become op results + two-branch
+      - `hc.for_range`  : carried names → iter_args + yields. Leading
+                          `hc.assign "<n>", %iv` (frontend's way of
+                          publishing the IV under its Python name) is
+                          recognised as a tautological self-bind, kept
+                          loop-local, folded to direct block-arg uses.
+      - `hc.if`         : carried names → op results + two-branch
                           yields; branches must agree on the write set.
-      - `hc.workitem_region` / `hc.subgroup_region` : Python-style
-                          nested scopes. Reads inside capture outer
-                          bindings (lazy outer snapshot); writes
-                          shadow without leaking. Out-bound
-                          propagation is opt-in via an explicit
-                          `hc.region_return <names>` terminator: the
-                          promoter rebuilds the op with one result
-                          per returned name and pushes writebacks out
-                          to the enclosing scope's name store.
+      - `hc.{workitem,subgroup}_region` : nested Python scopes. Inner
+                          reads lazily snapshot the outer binding;
+                          inner writes shadow without leaking. Outbound
+                          leak is opt-in via `hc.region_return <names>`
+                          — the promoter adds one result per returned
+                          name and pushes writebacks into the enclosing
+                          name store.
 
-    Post-condition (on success): no `hc.assign` / `hc.name_load` survives
-    anywhere under the processed callables. Cross-kernel / cross-function
-    name capture is out of scope; each callable is its own promotion
-    root.
+    Post-condition: no `hc.assign` / `hc.name_load` under processed
+    callables. Cross-kernel / cross-function capture is out of scope;
+    each callable is its own promotion root.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -51,13 +44,12 @@ def HCPromoteNames : Pass<"hc-promote-names"> {
 def HCInferTypes : Pass<"hc-infer-types"> {
   let summary = "Infer concrete HC value types from pre-inference `!hc.undef` IR.";
   let description = [{
-    Runs a sparse forward dataflow analysis over `hc` IR and rewrites values
-    whose type can be refined without changing program structure. The first
-    slice focuses on scalar/index facts: constants, symbols, launch geometry,
-    slice construction, buffer dimensions, index arithmetic/comparisons, and
-    structured loop carriers. Inference is monotonic: `!hc.undef` refines to a
-    concrete type, and conflicting concrete facts fail the pass instead of
-    being reconciled with a guess.
+    Sparse forward dataflow over `hc` IR; rewrites values whose type can
+    refine without structural change. Covers scalar / index facts:
+    constants, symbols, launch geometry, slice construction, buffer
+    dimensions, index arith / comparisons, structured loop carriers.
+    Monotonic: `!hc.undef` refines to concrete; conflicting concrete
+    facts fail the pass instead of being reconciled by guess.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -65,41 +57,29 @@ def HCInferTypes : Pass<"hc-infer-types"> {
 def HCSpecializeLiterals : Pass<"hc-specialize-literals"> {
   let summary = "Substitute literal-bound symbols with integer constants.";
   let description = [{
-    Folds compile-time literal bindings into the IR before shape-sensitive
-    passes get a vote. Reads `literal_bindings` (a `DictionaryAttr` of
-    `name -> IntegerAttr<i64>`) from each enclosing `hc.kernel`, walks
-    every reachable `#hc.expr`, `#hc.pred`, `#hc.shape`, `#hc.layout`,
-    `!hc.idx`, `!hc.pred`, and shaped-type carrier inside the kernel
-    body, substitutes each named symbol with its bound integer via
-    ixsimpl's hash-consed substitution, and rebuilds the surrounding
-    attribute / type stack with `AttrTypeReplacer`. The consumed
-    `literal_bindings` is dropped from the kernel so a subsequent run
-    is a no-op and `hc_ir_text` snapshots are self-contained.
+    Folds compile-time literal bindings into IR before shape-sensitive
+    passes vote. Reads `literal_bindings` (`DictionaryAttr` of
+    `name -> IntegerAttr<i64>`) on each `hc.kernel`, walks every
+    `#hc.expr` / `#hc.pred` / `#hc.shape` / `#hc.layout` / `!hc.idx` /
+    `!hc.pred` / shaped-type carrier inside the kernel, substitutes via
+    ixsimpl, rebuilds the attr/type stack with `AttrTypeReplacer`.
+    Consumed `literal_bindings` drops off so reruns are no-ops and
+    `hc_ir_text` snapshots are self-contained.
 
-    Bindings live in the IR (on the kernel op) rather than on a pass
-    option so a `compile().hc_ir_text` snapshot reproduces the
-    specialized IR when fed back through `hc-opt -hc-specialize-literals`,
-    LIT cases hand-write the same shape as the launcher emits, and the
-    declaration / valuation split lives in two clearly-named slots:
-    `literals = ["K"]` declares which symbols *can* be bound;
-    `literal_bindings = {K = 4 : i64}` says what they're bound to here.
+    Bindings live on the kernel op (not on a pass option) so
+    `compile().hc_ir_text` snapshots round-trip through
+    `hc-opt -hc-specialize-literals`. Two slots:
+    `literals = ["K"]` — which symbols *may* be bound;
+    `literal_bindings = {K = 4 : i64}` — what they bind to here.
 
-    Why a separate pass instead of late-binding inside each consumer:
-    once K is folded to a literal, every downstream pass —
-    `hc-verify-static-shapes`, `hc-decompose-shaped-values`,
-    `hc-flatten-with-layouts`, `hc-lower-launch-body` — sees concrete
-    dims without any new substitution plumbing. Keeps the specialization
-    point a single explicit step in the schedule; a user-supplied
-    schedule that drops the pass keeps the unspecialized IR (matching
-    the `hc.compile` docstring claim that `front_ir`/`hc_ir` stay
-    symbolic until specialization runs).
+    Separate pass: once K is folded to a literal, every downstream pass
+    sees concrete dims with no extra substitution plumbing. Single
+    explicit specialization point in the schedule; dropping the pass
+    keeps `front_ir` / `hc_ir` symbolic.
 
-    Validation: each binding key must appear in the kernel's `literals`
-    whitelist when one is present (matches the Python-side
-    `hc.compile(symbols=...)` rejection of undeclared keys); each binding
-    value must be an `IntegerAttr`. Both failures fire as op errors and
-    fail the pass. An absent `literal_bindings` is the unspecialized
-    case — the pass walks past it without rewriting.
+    Validation: every binding key must appear in `literals` when set;
+    every value must be `IntegerAttr`. Both fail with op errors. Absent
+    `literal_bindings` is the unspecialized case.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -107,32 +87,22 @@ def HCSpecializeLiterals : Pass<"hc-specialize-literals"> {
 def HCLowerPow : Pass<"hc-lower-pow"> {
   let summary = "Rewrite hc.pow with positive integer-literal rhs to a mul chain.";
   let description = [{
-    `hc.pow lhs, rhs` is the structural carrier for Python `**`. The
-    front-to-hc rewrite emits it for every `BinOp.op == Pow` it sees
-    and leaves the codegen choice for here, so we have a stable place
-    to:
+    `hc.pow` is the carrier for Python `**`. Pass:
 
-      * Unfold supported exponents into an `hc.mul` chain via binary
-        squaring (`K = 2,3 → 1,2 mults`; `K = 4..7 → 2,3,3,4 mults`);
-        the chain is what every downstream pass already understands
-        (type inference, generic funneling, launch-body lowering).
-      * Diagnose unsupported shapes with one obvious sender. Today
-        that's everything except positive-integer-literal rhs: a
-        non-constant rhs (would need a runtime loop or a `math.pow`
-        intrinsic that the dialect doesn't have yet), a non-integer
-        constant (likewise), zero (`x**0` needs a typed `1` we can't
-        synthesize pre-inference), and negative exponents (Python
-        promotes int**negative to float, which the dialect can't
-        encode without a reciprocal op either).
+      * Unfolds supported exponents into an `hc.mul` chain via binary
+        squaring (`K = 2,3 → 1,2 mults`; `K = 4..7 → 2,3,3,4 mults`).
+        Downstream passes understand mul chains.
+      * Diagnoses unsupported shapes at one site. Today: anything
+        non-positive-integer-literal — non-constant rhs (no runtime
+        loop / `math.pow` yet), non-integer constant, zero (`x**0`
+        needs a typed `1` we can't synthesize pre-inference), negative
+        exponents (Python promotes to float, no reciprocal op).
 
-    Runs after `hc-specialize-literals` so any literal-bound symbol
-    that appears as an exponent (e.g. `x ** K` with `K` literal-bound
-    to a constant) has already become a plain `hc.const<N>`, and
-    before `hc-infer-types` so the mul chain — not the carrier op —
-    is what gets type-refined.
+    Runs after `hc-specialize-literals` (so literal-bound symbol
+    exponents have folded to `hc.const<N>`) and before `hc-infer-types`
+    (so the mul chain — not the carrier — gets refined).
 
-    No-op when no `hc.pow` survives; safe to leave wired even if a
-    user-supplied schedule drops the front-to-hc pass.
+    No-op when no `hc.pow` survives; safe to leave wired.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -140,24 +110,18 @@ def HCLowerPow : Pass<"hc-lower-pow"> {
 def HCLowerMath : Pass<"hc-lower-math"> {
   let summary = "Rewrite hc.builtin_call to the matching upstream math op.";
   let description = [{
-    Walks every `hc.builtin_call` and lowers by name:
+    Lowers `hc.builtin_call` by name:
 
       * `"numpy.sqrt"` -> `math.sqrt`
       * `"numpy.exp"`  -> `math.exp`
 
-    Today only float scalar / vector / shaped operands compatible with
-    the upstream `math` dialect are supported — HC's own shaped types
-    (`!hc.tensor`, `!hc.vector`) have to ride `hc-elementwise-to-generic`
-    first so the carrier shows up scalar inside a `hc.generic` body
-    before this pass fires. The body op accepts any
-    `math`-compatible operand type uniformly; the path that exercises
-    that is `hc-lower-generic` cloning the body — math.sqrt comes
-    along unchanged.
+    v0: float scalar / vector / shaped operands compatible with `math`
+    dialect. HC shaped types (`!hc.tensor`, `!hc.vector`) ride
+    `hc-elementwise-to-generic` first so the carrier shows up scalar
+    inside an `hc.generic` body before this pass fires.
 
-    No-op when no `hc.builtin_call` survives, so safe to leave wired
-    against user schedules that don't use the NumPy ufunc surface. An
-    unrecognised name surfaces a single-spot diagnostic here rather
-    than leaking through to LLVM lowering as an unknown op.
+    No-op when no `hc.builtin_call` survives. Unrecognised name
+    diagnoses here rather than leaking to LLVM as an unknown op.
   }];
   let dependentDialects = [
     "::mlir::hc::HCDialect",
@@ -180,46 +144,32 @@ def HCVerifyStaticShapes : Pass<"hc-verify-static-shapes"> {
 def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
   let summary = "Fold explicit identity layouts and collapse layout chains.";
   let description = [{
-    Cleanup pass for the `#hc.layout<...>` attribute introduced in
-    `doc/layouts.md`. Three rewrites, in order:
+    Cleanup pass for `#hc.layout<...>`. Three rewrites, in order:
 
-      1. Strip explicit identity layouts from shaped Values. A layout
-         is identity for an n-dim shape iff its shape_syms /
-         index_syms have rank n, params is empty, storage_size is
-         the product over shape_syms, and offset is the dot product
-         of index_syms with tail-product strides over shape_syms
-         (rightmost axis varies fastest), all under ixsimpl-canonical
-         form. Matching values get `setType` to the layout-less type
-         — the layout slot was made optional precisely so
-         "absent equals identity" is the canonical form.
+      1. Strip explicit identity layouts from shaped Values. Identity
+         for n-dim shape iff shape_syms / index_syms have rank n,
+         params empty, storage_size is product over shape_syms,
+         offset is dot product of index_syms with tail-product
+         strides (rightmost varies fastest), all ixsimpl-canonical.
+         Matching values `setType` to the layout-less type — absent
+         equals identity is the canonical form.
 
-      2. ixsimpl-normalize layout payloads. This is structurally a
-         no-op because `LayoutAttr` normalizes through the symbolic
-         store at construction; the pass exercises the contract
-         under `--debug` and serves as the documented place to
-         reconstruct stale forms once a future API allows it.
+      2. ixsimpl-normalize layout payloads. Structurally a no-op
+         (`LayoutAttr` normalizes at construction); kept as the
+         documented place to reconstruct stale forms.
 
       3. Collapse `hc.as_layout(hc.as_layout(%v, L1), L2)` to
-         `hc.as_layout(%v, L2)`. The outer choice wins regardless of
-         L1 / L2 — semantically `as_layout` overwrites the prior
-         layout, not composes with it.
+         `hc.as_layout(%v, L2)`. `as_layout` overwrites, never composes.
 
-    Runs after `hc-infer-types`; no IR-shape changes elsewhere. The
-    type-level fold also propagates to BlockArguments so function
-    signatures and region bodies stay coherent. Function-type
-    attributes (the cached signature on `hc.func` /
-    `hc.kernel` / `hc.intrinsic`) are rebuilt to match.
+    Runs after `hc-infer-types`. Type-level fold propagates to
+    BlockArguments; function-type attrs on `hc.func` / `hc.kernel` /
+    `hc.intrinsic` rebuild to match.
 
-    Implementation routes through MLIR's dialect-conversion driver so
-    the type rewrite stays consistent with how SCF / func / call
-    structural conversions are done elsewhere in the codebase. The
-    pass picks up `func` and `scf` dialect dependencies for that
-    reason — the populators they ship know how to clone-and-replace
-    `func.func` signatures, `scf.for` iter_args, etc., while keeping
-    the conversion driver's materialization tracking honest. Identity
-    materializations are registered on the converter because the
-    layout-stripped and layout-bearing forms are observationally
-    interchangeable.
+    Routes through dialect-conversion driver to stay consistent with
+    SCF / func / call structural conversions. Picks up `func` and
+    `scf` dependencies for their populators. Identity materializations
+    registered on the converter — layout-stripped and layout-bearing
+    forms are observationally interchangeable.
   }];
   let dependentDialects = [
     "::mlir::hc::HCDialect",
@@ -231,39 +181,33 @@ def HCCanonicalizeLayouts : Pass<"hc-canonicalize-layouts"> {
 def HCLowerStripLayout : Pass<"hc-lower-strip-layout"> {
   let summary = "Rewrite hc.strip_layout into hc.vzeros + hc.generic gather.";
   let description = [{
-    Materialises ``hc.strip_layout`` — the user-marked boundary that
-    drops the operand's layout — into the body-driven ``hc.generic``
-    surface the post-flatten pipeline understands. Conceptual mirror
-    of ``hc-load-store-to-generic`` and ``hc-shaped-compute-to-generic``:
-    one shape-rewriting op funnels into ``hc.generic`` + identity
-    init.
+    Materialises ``hc.strip_layout`` (user-marked boundary that drops
+    the operand's layout) into the body-driven ``hc.generic`` surface.
+    Mirror of ``hc-load-store-to-generic`` and
+    ``hc-shaped-compute-to-generic``: one shape-rewriting op funnels
+    into ``hc.generic`` + identity init.
 
-    For ``%dst = hc.strip_layout %src : T_src -> T_dst`` the rewrite
-    emits an ``hc.vzeros`` (or ``hc.zeros`` for tensor-flavoured
-    operands) sized to the result shape and an ``hc.generic`` with
-    parallel iters per result axis. The operand carries identity
-    per-axis offsets (``[i_0, i_1, ...]``); flatten substitutes those
-    into the operand's layout offset at ``index_syms[k]`` and yields
-    the gather offset post-flatten. The result carries identity
-    offsets that compose to ``i_0 + i_1 * stride + ...`` against the
-    identity (dim-product) layout. Body is the trivial element copy.
+    ``%dst = hc.strip_layout %src : T_src -> T_dst`` becomes an
+    ``hc.vzeros`` / ``hc.zeros`` sized to the result shape plus an
+    ``hc.generic`` with parallel iters per result axis. Operand carries
+    identity per-axis offsets (``[i_0, i_1, ...]``); flatten substitutes
+    those into the operand's layout offset at ``index_syms[k]`` and
+    yields the gather offset post-flatten. Result carries identity
+    offsets composing to ``i_0 + i_1 * stride + ...`` against the
+    dim-product layout. Body: trivial element copy.
 
     Layout-less operands collapse straight to the bare result without
-    emitting the generic — flatten would compose the identity layout
-    over the operand's shape and the generic would degenerate into a
-    no-op copy. Skipping it keeps the post-rewrite IR tight on the
-    common case (the user reached for ``as_layout(value, None)``
-    defensively but the producer already gave them bare).
+    emitting the generic — flatten would compose identity over the
+    operand's shape and the generic would be a no-op copy.
 
     Bails (op stays for downstream diagnostics):
       * Operand isn't an HC-shaped value (``!hc.undef``, raw pointer,
-        non-shaped scalars) — strip has no work to do on a non-shaped
-        carrier; the verifier rejects these at parse time.
-      * Operand or result shape carries non-``#hc.expr`` dim entries
+        non-shaped scalar) — verifier rejects at parse time.
+      * Operand or result shape has non-``#hc.expr`` dim entries
         (``#hc.dyn`` sentinel, builder placeholder) — no symbolic
-        bound to materialise the iter range from.
-      * Operand has a layout but it's not on a vector / tensor
-        carrier (``!hc.buffer`` is rejected by the verifier).
+        bound for the iter range.
+      * Operand has a layout but isn't a vector / tensor carrier
+        (``!hc.buffer`` rejected by verifier).
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -271,42 +215,30 @@ def HCLowerStripLayout : Pass<"hc-lower-strip-layout"> {
 def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
   let summary = "Rewrite hc.matmul / hc.reduce into hc.generic + identity fill.";
   let description = [{
-    Folds the source-level `hc.matmul` and `hc.reduce` ops into a
-    single body-driven `hc.generic` form. After this pass the
-    post-flatten compute surface is one op (`hc.generic`); the source
-    shapes (`hc.matmul`, `hc.reduce`, plus the per-element
-    decomposition that lands later) are syntactic shorthands the
-    frontend keeps for ergonomics.
+    Folds source-level `hc.matmul` / `hc.reduce` into the body-driven
+    `hc.generic` form. After this pass the post-flatten compute
+    surface is one op; source shapes are frontend ergonomics shorthand.
 
-    Each rewrite emits its iter bounds as an empty-binding
-    `hc.idx_apply` carrying `!hc.idx<dim>` sourced directly from
-    operand shapes — the rewriter has full structural knowledge of
-    the iteration space and the bounds-inference pass would be a
-    no-op if it ran after.
+    Iter bounds emit as empty-binding `hc.idx_apply` carrying
+    `!hc.idx<dim>` sourced from operand shapes.
 
-    `hc.matmul lhs, rhs : (T<M,K>, T<K,N>) -> T<M,N>` → an `hc.zeros`
-    fill on the result type plus an `hc.generic` with two parallel
-    iters (M, N) and one reduction iter (K). Inputs are addressed
-    `[i,k]` and `[k,j]`, the output `[i,j]`. Body extends the inputs
-    to the result element type via `hc.astype` when they differ, then
-    runs `arith.mulf` + `arith.addf` (or `arith.muli` + `arith.addi`
-    for integers). v0 only handles rank-2 operands and identical
-    input element types; mixed-type and batched matmul are
-    follow-ups.
+    `hc.matmul lhs, rhs : (T<M,K>, T<K,N>) -> T<M,N>` → `hc.zeros` fill
+    on the result + `hc.generic` with two parallel iters (M, N) and one
+    reduction iter (K). Inputs addressed `[i,k]` / `[k,j]`, output
+    `[i,j]`. Body extends inputs to result elt type via `hc.astype`
+    when needed, then `arith.mulf` + `arith.addf` (or `muli` + `addi`).
+    v0: rank-2 only, identical input elt types.
 
-    `hc.reduce val, kind = K, axis = a : T<...> -> T<...>` →
-    an identity fill (`hc.zeros` for sum, `hc.full` with -inf / +inf
-    for max / min on float operands) on the result shape, plus an
-    `hc.generic` with one reduction iter on `axis a` and parallel
-    iters on every other axis. Body picks the combinator: `arith.addf`
-    / `arith.maximumf` / `arith.minimumf` for floats; integer support
-    is sum-only in v0 (max / min identity for unsigned vs signed
-    needs a separate slot decision). `keepdims = true` is not yet
-    handled — the reshape it implies is a separate piece of work.
+    `hc.reduce val, kind = K, axis = a` → identity fill
+    (`hc.zeros` for sum, `hc.full` with ±inf for min/max on floats)
+    on the result + `hc.generic` with one reduction iter on `axis a`
+    and parallel iters on the rest. Combinator picks: `arith.addf` /
+    `arith.maximumf` / `arith.minimumf` for floats; integer is
+    sum-only in v0 (signed vs unsigned min/max identity TBD).
+    `keepdims = true` not yet handled.
 
-    Operands typed `!hc.undef` (pre-inference) and any case the v0
-    matcher doesn't cover are left in place — downstream passes
-    diagnose if they were the last remaining consumer.
+    `!hc.undef` operands (pre-inference) and unmatched cases stay in
+    place — downstream passes diagnose if needed.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -317,59 +249,48 @@ def HCShapedComputeToGeneric : Pass<"hc-shaped-compute-to-generic"> {
 def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
   let summary = "Rewrite hc.load / hc.vload / hc.store into hc.generic.";
   let description = [{
-    Funnels the remaining shaped memory ops into the body-driven
-    `hc.generic` surface so post-flatten codegen has a single op
-    family to lower. Counterpart to `hc-shaped-compute-to-generic` for
-    the load/store side; both run pre-flatten on semantic shaped types
-    so the per-axis offsets line up with the operand shapes before
-    `hc-flatten-with-layouts` composes them through the layout.
+    Funnels shaped memory ops into the body-driven `hc.generic` surface.
+    Counterpart to `hc-shaped-compute-to-generic` for load/store. Both
+    run pre-flatten on semantic shaped types so per-axis offsets line
+    up with operand shapes before `hc-flatten-with-layouts` composes
+    them through the layout.
 
     Rewrites:
 
-    `hc.load %buf[%i_0, ..., %i_n], shape %shape -> T<...>` → an
-    `hc.zeros` fill of the result shape plus an `hc.generic` with one
-    parallel iter per result axis. The buffer/tensor input carries
-    per-axis offsets `[i_0_expr + i_0, ..., i_n_expr + i_n]`,
-    where each `i_k_expr` is the access op's k-th index symbol. The
-    synthesised init is the `outs` operand with identity offsets. The
-    body forwards the loaded element through `hc.yield`. `hc.vload`
-    follows the same shape with a vector result.
+    `hc.load %buf[%i_0, ..., %i_n], shape %shape -> T<...>` → `hc.zeros`
+    fill of the result + `hc.generic` with one parallel iter per result
+    axis. Input carries per-axis offsets `[i_0_expr + i_0, ...]`
+    where `i_k_expr` is the access op's k-th index symbol. Init is the
+    outs operand with identity offsets. Body forwards loaded element
+    through `hc.yield`. `hc.vload` follows the same shape, vector result.
 
-    `hc.store %dst[%i_0, ..., %i_n], %src` → an `hc.generic` with
-    `%src` as a value-typed `ins` (identity offsets) and `%dst` as a
-    ptr/buffer `outs` (per-axis offsets `[i_0_expr + i_0, ...]`). The
-    body forwards the source element through `hc.yield`; downstream
-    `hc-lower-generic` materialises the implicit `hc.ptr_store` at the
-    out's offset. No SSA result.
+    `hc.store %dst[%i_0, ..., %i_n], %src` → `hc.generic` with `%src`
+    as value-typed `ins` (identity offsets), `%dst` as ptr/buffer
+    `outs` (per-axis offsets `[i_0_expr + i_0, ...]`). Body forwards
+    source through `hc.yield`; `hc-lower-generic` materialises the
+    implicit `hc.ptr_store`. No SSA result.
 
-    Empty index list (`hc.load %buf[]` / `hc.store %dst[]`) reduces
-    the per-axis offset on the memory operand to identity over the
-    iter syms — same body, no addressing addend.
+    Empty index list reduces the per-axis offset to identity over iter
+    syms — same body, no addend.
 
-    Iter bounds are emitted as empty-binding `hc.idx_apply` ops
-    carrying `!hc.idx<dim>` sourced directly from the op's tile
-    shape, so the later `hc-infer-generic-bounds` pass would be a
-    no-op if it ran after this one. Iter sym names use `i_<k>` to
-    stay distinct from the symbolic names the access op's index
-    operands carry.
+    Iter bounds emit as empty-binding `hc.idx_apply` with `!hc.idx<dim>`
+    sourced from the op's tile shape. Iter syms named `i_<k>` to stay
+    distinct from the access op's index operand syms.
 
-    Out of scope (no rewrite, op survives for downstream diagnostics):
+    Out of scope (op survives for downstream diagnostics):
 
-      * Pre-inference operands typed `!hc.undef` — no shape to source
-        bounds from.
-      * Index operands not typed `!hc.idx<expr>` — the rewriter has
-        no symbolic name to bind to the iter sym, so the offset
-        composition would lose information.
-      * `hc.store` with a `mask` operand — masked stores need an
-        scf.if-shaped body the v0 rewrite doesn't emit; deferred.
-      * `hc.buffer_view` and `hc.vec` — sub-view and broadcast
-        semantics that fall under separate slices.
+      * Pre-inference `!hc.undef` operands — no shape to source bounds.
+      * Index operands not `!hc.idx<expr>`-typed — no symbolic name to
+        bind iter sym to; offset composition would lose information.
+      * `hc.store` with `mask` operand — needs an `scf.if`-shaped body;
+        deferred.
+      * `hc.buffer_view`, `hc.vec` — sub-view / broadcast semantics in
+        separate slices.
 
-    `hc.load_mask` is rewritten too: same parallel-iters shape, but
-    the body is a single `hc.pred_apply` carrying the per-axis bounds
-    conjunction. Slice axes without a pinned `!hc.idx`-typed lower or
-    step and source dims that aren't `#hc.expr` leaves fall through
-    unchanged for the same reason data ops do.
+    `hc.load_mask` rewritten too: same parallel-iters shape, body is a
+    single `hc.pred_apply` carrying per-axis bounds conjunction. Slice
+    axes without pinned `!hc.idx` lower / step and source dims that
+    aren't `#hc.expr` leaves fall through unchanged.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -377,67 +298,54 @@ def HCLoadStoreToGeneric : Pass<"hc-load-store-to-generic"> {
 def HCDistributeWaveLayouts : Pass<"hc-distribute-wave-layouts"> {
   let summary = "Convert wave-cooperative layout-bearing carriers to per-lane.";
   let description = [{
-    Bridges between user-spelled wave-cooperative layouts (e.g. the
-    AMD gfx11 WMMA accumulator's `vector<["32", "8"], <offset = 32*fi
-    + lane, storage_size = 256, ...>>`) and the shape-suffix form the
-    rest of the substrate already understands.
+    Bridges user-spelled wave-cooperative layouts (e.g. AMD gfx11 WMMA
+    accumulator `vector<["32", "8"], <offset = 32*fi + lane,
+    storage_size = 256, ...>>`) to the shape-suffix form the rest of
+    the substrate understands.
 
-    Recognition. For every shaped Value with a `#hc.layout<...>`
-    attribute appearing inside a workitem region the pass tries to
-    factor the layout's `offset` against the first index sym:
+    Recognition. For every shaped Value with `#hc.layout<...>` inside
+    a workitem region the pass factors `offset` against the first
+    index sym:
 
       `offset = index_syms[0] * <lane_stride> + <residue>`
 
-    where the first shape dim (positionally bound to `index_syms[0]`
-    by the layout's shape_syms slot) equals the launch context's
-    `subgroup_size` and `<residue>` is independent of
-    `index_syms[0]`. When the factorisation holds and `lane_stride *
-    wave_size` divides `storage_size`, the type is *wave-distributable*
-    along that first axis: each lane owns exactly `storage_size /
-    wave_size` slots strided by `lane_stride`.
+    where the first shape dim equals `subgroup_size` and `<residue>`
+    is independent of `index_syms[0]`. When the factorisation holds
+    and `lane_stride * wave_size` divides `storage_size`, the type is
+    *wave-distributable* along that first axis: each lane owns exactly
+    `storage_size / wave_size` slots strided by `lane_stride`.
 
-    Rewrite. The pass replaces every wave-distributable carrier with
-    its per-lane peer — first shape dim dropped, layout's lane sym
-    substituted by the workitem index sym (`$WI0`) in the offset,
-    storage_size divided by wave_size — and rewrites the producers /
-    consumers that span the wave/lane boundary:
+    Rewrite. Replaces every wave-distributable carrier with its
+    per-lane peer (first shape dim dropped, lane sym substituted by
+    `$WI0`, storage_size /= wave_size). Producers / consumers spanning
+    the wave/lane boundary:
 
-      * `hc.vzeros` / `hc.vones` / `hc.vfull` / `hc.zeros` / `hc.ones`
-        / `hc.full` allocators carrying the wide type lose their
-        first shape dim and their layout attribute, dropping to the
-        per-lane bare carrier (if the substituted layout is identity)
-        or the per-lane layout-bearing carrier (otherwise).
+      * `hc.vzeros`/`hc.vones`/`hc.vfull`/`hc.zeros`/`hc.ones`/`hc.full`
+        allocators carrying the wide type drop their first shape dim
+        and layout attribute → per-lane bare (identity) or per-lane
+        layout-bearing carrier.
       * `hc.generic` ops whose outs carry a wave-distributable type
-        drop the iter axis bound to the lane index sym, substitute
-        that iter sym with `$WI0` in every ins / outs offset, and
-        retype their results in lockstep with the outs allocator
-        rewrite. Iter bounds for the dropped axis are erased; the
-        ambient idx pinning is left untouched (downstream lowerings
-        resolve `$WI0` through the workitem region's binding).
-      * `hc.buffer_view %carrier[%lane_id, ...]` projections collapse
-        to a forward when the lane axis is the only one consumed by
-        a scalar index (the lane axis is gone from the producer's
-        type, so the view's projection becomes the identity on the
-        remaining axes).
-      * `hc.strip_layout` ops whose operand is now layout-free become
-        identity forwards (no allocator, no gather generic).
+        drop the lane-bound iter axis, substitute that iter sym with
+        `$WI0` in every ins/outs offset, retype results in lockstep.
+        Iter bounds for the dropped axis erased; ambient idx pinning
+        left untouched (downstream resolves `$WI0` via workitem region).
+      * `hc.buffer_view %carrier[%lane_id, ...]` collapses to a forward
+        when the lane axis is the only one consumed by a scalar index.
+      * `hc.strip_layout` whose operand is now layout-free becomes an
+        identity forward.
 
-    Boundary. The pass only fires inside `hc.workitem_region` bodies
-    — outside the region a per-lane carrier has nowhere to live (the
-    enclosing scope is the workgroup, not the lane). Wave-cooperative
-    carriers that escape the region get the trailing-suffix shape
-    treatment via `hc-normalize-scope-regions`; the two forms are not
-    interchangeable. The lane sym is sourced from the launch geo
-    method's `LocalId` axis 0 (`$WI0` under the substrate's current
-    naming) and the wave size from the kernel's `subgroup_size`.
+    Boundary. Fires only inside `hc.workitem_region` bodies — outside
+    the region a per-lane carrier has no scope. Escaping carriers get
+    trailing-suffix treatment via `hc-normalize-scope-regions`; the
+    two forms are not interchangeable. Lane sym from launch geo
+    method's `LocalId` axis 0 (`$WI0`); wave size from kernel's
+    `subgroup_size`.
 
     Bails (op stays for downstream diagnostics):
-      * Layout's `offset` doesn't factor against `index_syms[0]`
-        (mixed cross-axis terms, non-affine in the lane sym,
-        residue still mentions the lane sym after substitution).
-      * `storage_size` isn't a constant multiple of `wave_size`, or
-        `lane_stride * wave_size > storage_size` (carrier doesn't
-        cleanly distribute).
+      * `offset` doesn't factor against `index_syms[0]` (mixed
+        cross-axis, non-affine in lane sym, residue mentions lane).
+      * `storage_size` not a const multiple of `wave_size`, or
+        `lane_stride * wave_size > storage_size`.
       * First shape dim isn't a constant equal to `wave_size`.
       * Layout-bearing carrier lives outside any workitem region.
   }];
@@ -448,45 +356,39 @@ def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
   let summary = "Rewrite per-element shaped arith / cmp / astype ops into "
                 "hc.generic.";
   let description = [{
-    Funnels the per-element decomposition family into a single
-    body-driven `hc.generic` form so the post-flatten pipeline only
-    has to lower one shaped compute op. Pure source-level rewrite —
-    no memory effects, no vectorization choices, no codegen.
+    Funnels per-element shaped ops into the body-driven `hc.generic`
+    form. Pure source-level rewrite — no memory effects, no vectorization.
 
-    v0 covers the all-shaped (no scalar broadcast) cases for:
+    v0 covers all-shaped (no scalar broadcast):
 
       * binary arith / boolean: `hc.add`, `hc.sub`, `hc.mul`,
         `hc.div`, `hc.mod`, `hc.and`, `hc.or`,
       * unary arith / boolean: `hc.neg`, `hc.not`,
-      * comparisons: `hc.cmp.lt`, `hc.cmp.le`, `hc.cmp.gt`,
-        `hc.cmp.ge`, `hc.cmp.eq`, `hc.cmp.ne`,
+      * comparisons: `hc.cmp.{lt,le,gt,ge,eq,ne}`,
       * cast: `hc.astype`.
 
-    Each rewrite emits:
+    Emits:
 
       * one parallel iter sym per result axis (`i_0`, `i_1`, ...) —
-        distinct from the source-level symbol names operands carry,
-      * `iter_bounds` as `hc.undef_value` placeholders that
-        `hc-infer-generic-bounds` resolves from the operand shapes,
+        distinct from operand source-level syms,
+      * `iter_bounds` as `hc.undef_value` placeholders;
+        `hc-infer-generic-bounds` resolves from operand shapes,
       * shaped inputs as `ins` with identity per-axis offsets,
-      * a synthesised `hc.zeros` / `hc.vzeros` init as the single
-        `outs` with identity per-axis offsets,
-      * a body whose scalar arith mirrors the source op, terminated
-        by `hc.yield`.
+      * synthesised `hc.zeros` / `hc.vzeros` init as single `outs` with
+        identity offsets,
+      * body mirroring the source op as scalar arith, terminated by
+        `hc.yield`.
 
-    Out of scope (op stays in place; downstream passes still
-    diagnose if the op is the only remaining consumer):
+    Out of scope (op stays for downstream diagnostics):
 
-      * Mixed scalar / shaped operands (broadcast). The body would
-        need a splat or a scalar capture pattern; deferred.
-      * `hc.select`. The false-value is a scalar inactive fill that
-        needs the same broadcast story.
+      * Mixed scalar/shaped operands (broadcast) — needs splat / scalar
+        capture pattern.
+      * `hc.select` — false-value is a scalar inactive fill needing the
+        same broadcast story.
       * Nullary fills (`hc.zeros`, `hc.ones`, `hc.full`, `hc.const`,
-        `hc.empty`). The init scaffolding folds back on itself
-        unless we grow a `hc.generic` form whose init is implicit.
+        `hc.empty`) — init scaffolding would fold back on itself.
       * Pre-inference `!hc.undef` operands.
-      * Operands with mismatched ranks or per-axis dim expressions
-        (no broadcast support yet).
+      * Mismatched ranks or per-axis dim exprs.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -494,40 +396,30 @@ def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
 def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
   let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
   let description = [{
-    Walks every `hc.generic` and resolves any `iter_bounds` operand
-    defined by `hc.undef_value` to a concrete `!hc.idx<...>` SSA value
-    derived from operand shapes. Inference must run before any pass that
-    composes per-axis offsets into a single linear expression — once the
-    per-axis structure is gone, recovering iter ranges from a composed
-    offset is intractable.
+    Walks every `hc.generic`, resolves `iter_bounds` defined by
+    `hc.undef_value` to concrete `!hc.idx<...>` SSA derived from
+    operand shapes. Must run before per-axis offsets compose into a
+    single linear expression — once per-axis structure is gone,
+    recovering ranges is intractable.
 
     Per iter sym `s` with a placeholder bound:
 
-      1. For every (operand, axis) pair where the per-axis offset is
-         exactly the bare symbol `s` under ixsimpl-canonical form,
-         collect the operand's shape entry at `axis` as an implied
-         bound. Non-identity offsets (`s + 1`, `2*s`, ...) are not yet
-         understood and are skipped — the operand contributes no
-         binding for `s` through this axis.
+      1. For every (operand, axis) where the per-axis offset is exactly
+         the bare symbol `s` under ixsimpl-canonical form, collect the
+         operand's shape entry at `axis` as an implied bound.
+         Non-identity offsets (`s + 1`, `2*s`, ...) skipped.
 
-      2. Multiple identity occurrences must agree on the implied bound
-         expression (hash-consed pointer equality through the dialect
-         store). Conflicts diagnose and name the offending operand
-         pair.
+      2. Multiple identity occurrences must agree (hash-consed pointer
+         equality through the dialect store). Conflicts diagnose with
+         offending operand pair.
 
-      3. The first agreed bound is materialized via an empty-binding
-         `hc.idx_apply` carrying `!hc.idx<dim>` and used to replace
-         the placeholder operand on the op. The original
-         `hc.undef_value` op is left for canonicalization / DCE if no
-         other use survives.
+      3. First agreed bound materialises via empty-binding `hc.idx_apply`
+         carrying `!hc.idx<dim>`, replaces the placeholder. Original
+         `hc.undef_value` left for canonicalization / DCE.
 
-    A placeholder for which no identity occurrence is found diagnoses:
-    the user wrote a body the pass cannot infer bounds for, and going
-    further would let the placeholder leak past flatten where the lack
-    of an answer becomes much harder to localize. The pass is a no-op
-    when every bound on every `hc.generic` is already concrete, so
-    rewrites that emit fully-resolved ops (`hc.reduce` / `hc.matmul` →
-    `hc.generic`) pay nothing.
+    Placeholder with no identity occurrence diagnoses: going further
+    would let it leak past flatten. No-op when every bound is concrete
+    — rewrites emitting fully-resolved ops pay nothing.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -536,53 +428,42 @@ def HCInsertWorkgroupBarriers : Pass<"hc-insert-workgroup-barriers"> {
   let summary = "Insert gpu.barrier between hc.generic ops on shared "
                 "workgroup-AS storage.";
   let description = [{
-    Single owner for cross-generic synchronization on workgroup-AS
-    storage (LDS). Runs after the first `hc-lower-launch-body`
-    invocation (so every fill / load of a workgroup tile is already
-    rooted at `hc.alloc workgroup` + an `hc.generic` operand on
-    `!hc.ptr<workgroup, T>`) and before `hc-lower-generic` (so the
-    structured per-axis offsets / iter syms a future precise-elision
-    pass needs are still on the op).
+    Cross-generic sync on workgroup-AS storage (LDS). Runs after the
+    first `hc-lower-launch-body` (workgroup tiles already rooted at
+    `hc.alloc workgroup` + `hc.generic` on `!hc.ptr<workgroup, T>`)
+    and before `hc-lower-generic` (per-axis offsets / iter syms still
+    on the op for any future precise-elision pass).
 
     Conservative rule:
 
       1. For every `gpu.launch` body, walk regions block by block.
-      2. Within a block, scan top-level ops in order. Track a per-block
-         `pending` set of workgroup-AS storage roots written by an
-         earlier `hc.generic` in this block since the last barrier.
+      2. Track per-block `pending` set of workgroup-AS storage roots
+         written by an earlier `hc.generic` since the last barrier.
       3. At each `hc.generic`:
-           - Collect the storage roots its `ins` / `outs` resolve to
-             (workgroup-AS pointers, or bare carriers UCC-bridged to
-             one). The root is the SSA Value reached by walking back
-             through single-input `unrealized_conversion_cast` and
-             `hc.ptr_offset` chains.
+           - Collect storage roots `ins` / `outs` resolve to. Root is
+             the SSA reached by walking back through single-input UCC
+             and `hc.ptr_offset` chains.
            - If any read or write root intersects `pending`, insert
-             `gpu.barrier` immediately before the op and clear
-             `pending`. The read-side intersect catches the
-             writer→reader race, the write-side one the
-             writer→writer race on the same slot family.
+             `gpu.barrier` immediately before and clear `pending`.
+             Read side catches writer→reader; write side catches
+             writer→writer on the same slot family.
            - Add every workgroup-AS write root to `pending`.
-      4. `gpu.barrier` in the scan path clears `pending` — an already
-         present barrier doesn't get a sibling.
+      4. `gpu.barrier` in the scan clears `pending`; already-present
+         barriers don't get a sibling.
 
-    Stray non-generic loads / stores on workgroup-AS storage are out
-    of scope by design: the contract this pass enforces is
-    "workgroup-AS writes live inside `hc.generic`". A stray writer is
-    a bug in the emitter, not something to be papered over here.
+    Stray non-generic loads / stores on workgroup-AS storage out of
+    scope by design — contract is "workgroup-AS writes live inside
+    `hc.generic`". A stray writer is an emitter bug.
 
-    Nested regions (`scf.for`, `scf.if`) get a fresh per-block scan
-    — the conservative v0 doesn't thread `pending` across the
-    structural-control-flow boundary, so a write inside one branch
-    of an `scf.if` doesn't seed a barrier in the sibling branch (it
-    can't, by construction) and a write before an `scf.for` does
-    barrier ahead of any read inside the loop (the loop op opaquely
-    consumes the read root). Precise affine elision and tighter
-    cross-region tracking are the follow-up axes.
+    Nested regions (`scf.for`, `scf.if`) get a fresh per-block scan;
+    `pending` doesn't thread across structural-control-flow. A write
+    inside one `scf.if` branch doesn't seed a barrier in the sibling
+    (can't, by construction); a write before `scf.for` barriers ahead
+    of any read inside the loop. Precise affine elision and tighter
+    cross-region tracking are follow-ups.
 
-    Pass is a no-op on payloads with no `gpu.launch` and a no-op when
-    no `hc.generic` touches workgroup-AS storage; safe to leave wired
-    even on schedules that don't reach the workgroup-staged tile
-    surface.
+    No-op on payloads without `gpu.launch` or without `hc.generic`
+    touching workgroup-AS; safe to leave wired.
   }];
   let dependentDialects = [
     "::mlir::gpu::GPUDialect",
@@ -594,73 +475,57 @@ def HCLowerGeneric : Pass<"hc-lower-generic"> {
   let summary = "Lower hc.generic to scf.parallel / scf.for + hc.ptr_offset / "
                 "hc.ptr_load / hc.ptr_store.";
   let description = [{
-    Unroll-and-merge codegen frame for `hc.generic`, documented in
-    `doc/layouts.md`. Walks every `hc.generic` and rewrites it as an
-    outer `scf.parallel` over the parallel iters plus an inner
-    `scf.for` nest over the reduction iters with `iter_args` carrying
-    the per-output accumulators. Pure-parallel ops collapse to a
-    single `scf.parallel`; pure-reduction ops collapse to a single
-    `scf.for`.
+    Unroll-and-merge codegen frame for `hc.generic`. See
+    `doc/layouts.md`. Rewrites every `hc.generic` as an outer
+    `scf.parallel` over parallel iters + inner `scf.for` nest over
+    reduction iters with `iter_args` carrying per-output accumulators.
+    Pure-parallel collapses to one `scf.parallel`; pure-reduction
+    collapses to one `scf.for`.
 
-    The pass picks an `(axis-order, partition)` pair via a
-    divisibility-pruned merge-score search: every per-axis factor
-    `p_a` must provably divide its bound (probed via
-    `ixs_check(cmp(ixs_mod(N_a, p_a), EQ, 0))`), and each surviving
-    candidate is scored by the per-operand pairwise contig probe
-    (`ixs_check(cmp(off[k+1] - off[k], EQ, 1))`). The body stays
-    elementwise scalar at every total unroll: scalar contig groups
-    lower to scalar `hc.ptr_load` / `hc.ptr_store`, contig groups of
-    size > 1 lower to vector-typed `hc.ptr_load` / `hc.ptr_store` of
-    width `G` plumbed through `vector.extract` /
-    `vector.from_elements` at the body boundary. The trivial
-    `(1, ..., 1)` partition collapses verbatim to the scalar
-    baseline emission.
+    Picks `(axis-order, partition)` via divisibility-pruned merge-score
+    search: every factor `p_a` must provably divide its bound (probed
+    via `ixs_check(cmp(ixs_mod(N_a, p_a), EQ, 0))`); survivors scored
+    by per-operand pairwise contig probe
+    (`ixs_check(cmp(off[k+1] - off[k], EQ, 1))`). Body stays elementwise
+    scalar at every total unroll: scalar contig groups lower to scalar
+    `hc.ptr_load` / `hc.ptr_store`; groups size > 1 lower to vector
+    `hc.ptr_load` / `hc.ptr_store` of width `G` plumbed through
+    `vector.extract` / `vector.from_elements` at the body boundary.
+    `(1, ..., 1)` partition collapses to scalar baseline.
 
     Per-iteration body emission (per partition lane):
 
-      * For each `ins` operand: evaluate its single composed offset
-        expression to a `Value` of `index` type, emit
-        `hc.ptr_offset` then `hc.ptr_load`. The loaded value
-        replaces the corresponding body block argument.
-      * For each `outs` operand: load the initial accumulator once
-        per parallel-loop iteration via `hc.ptr_offset` +
-        `hc.ptr_load` at the operand's parallel-only offset, thread
-        it through the inner `scf.for`'s `iter_args`, and emit
-        `hc.ptr_store` after the reduction nest with the final
-        accumulator.
-      * Body region is cloned in place with the block arguments
-        remapped to the loaded values (ins) and the running carry
-        (outs). The cloned `hc.yield` provides the per-iteration
-        update for each output's accumulator.
+      * Each `ins`: evaluate composed offset to `index` Value, emit
+        `hc.ptr_offset` + `hc.ptr_load`. Loaded value replaces the
+        body block argument.
+      * Each `outs`: load initial accumulator once per parallel-iter
+        via `hc.ptr_offset` + `hc.ptr_load` at the parallel-only
+        offset, thread through inner `scf.for`'s `iter_args`, emit
+        `hc.ptr_store` after the reduction nest with the final value.
+      * Body region cloned in place, block args remapped to loaded
+        values (ins) and running carries (outs). Cloned `hc.yield`
+        provides per-iter accumulator update.
 
-    Per-operand offsets surface as `hc.idx_apply` carrying the
-    composed `ExprAttr` (with the per-lane delta substituted into
-    each iter sym) and binding the listed iter syms to the loop
-    induction vars. The launch-body lowering downstream walks the
-    expression and substitutes the listed operands plus any ambient
-    kernel-bound symbols (shape dims, stride params).
+    Per-operand offsets surface as `hc.idx_apply` carrying composed
+    `ExprAttr` (per-lane delta substituted into each iter sym),
+    binding listed iter syms to loop induction vars. Launch-body
+    lowering walks the expression and substitutes operands plus
+    ambient kernel-bound syms (shape dims, stride params).
 
-    Pre-flight bail (the op stays in place; downstream passes still
-    diagnose if the op is the only remaining consumer):
+    Pre-flight bail (op stays for downstream diagnostics):
 
-      * Any operand is not `!hc.ptr<...>` — value-typed bare
-        carriers (`!hc.bare_tensor`, `!hc.bare_vector`),
-        `!hc.buffer`, and `!hc.undef` are out of v0 scope.
-      * Any operand has rank > 1 in its offset array — multi-axis
-        offsets need linearization through the operand's shape,
-        which in turn needs outer-scope shape-symbol bindings the
-        v0 walker doesn't reach to in every case. Handled when
-        `hc-flatten-with-layouts` lands and every op-time operand
-        is rank-1.
-      * Any iter bound is still a `hc.undef_value` placeholder.
-      * Any offset references a free symbol the outer-scope walker
-        can't resolve — the lookup walks parent ops looking for a
-        block argument or op result whose type is `!hc.idx<sym>`
-        with `sym` a bare-symbol expression matching the free name.
-      * `scf.if` anywhere in the body — residual case from the
-        predicated-bodies note in `doc/layouts.md`; rare in
-        practice once masked load/store sites route through the
-        predicated `hc.ptr_load_pred` / `hc.ptr_store_pred` ops.
+      * Operand not `!hc.ptr<...>` — value-typed bare carriers
+        (`!hc.bare_tensor`, `!hc.bare_vector`), `!hc.buffer`, and
+        `!hc.undef` out of v0 scope.
+      * Operand offset rank > 1 — multi-axis needs linearization
+        through operand shape (needs outer-scope shape-symbol
+        bindings). Handled when `hc-flatten-with-layouts` lands and
+        every operand is rank-1.
+      * Iter bound still a `hc.undef_value` placeholder.
+      * Offset references a free symbol the outer-scope walker can't
+        resolve.
+      * `scf.if` in body — residual case (rare once masked load/store
+        routes through `hc.ptr_load_pred` / `hc.ptr_store_pred`).
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -674,37 +539,31 @@ def HCFoldPredicates : Pass<"hc-fold-predicates"> {
   let summary = "Fold `hc.predicate` by hoisting the mask to its producer "
                 "or collapsing to `arith.select`.";
   let description = [{
-    Walks every `hc.predicate %v mask %m passthrough %f` op and resolves
-    it by inspecting the def of `$value`:
+    Resolves `hc.predicate %v mask %m passthrough %f` by inspecting the
+    def of `$value`:
 
-      * Trivial masks fold first — `m_One()` replaces the op with `$value`
-        (drop the predicate), `m_Zero()` replaces with `$passthrough`
-        (load elided).
+      * Trivial masks fold first — `m_One()` → `$value` (drop the
+        predicate), `m_Zero()` → `$passthrough` (load elided).
 
       * `hc.ptr_load` / `hc.vload` / `hc.load`: clone the producer at
         its def site in predicated form (`hc.ptr_load_pred` etc.) with
-        `$mask` / `$passthrough`. The predicate op's uses get
-        redirected to the new predicated load. Each `hc.predicate` use
-        of the same load creates its own clone — sharing is opt-in,
-        not default. The original load is dropped once it has no
-        remaining uses.
+        `$mask` / `$passthrough`. Predicate op's uses redirect to the
+        new predicated load. Each `hc.predicate` use of the same load
+        gets its own clone — sharing is opt-in.
 
-      * `vector.extract` of a vector value: emit `arith.select %mask,
-        %value, %passthrough` at the predicate site. The underlying
-        vector load stays unconditional; the predicate gates the lane
-        only.
+      * `vector.extract`: emit `arith.select %mask, %value, %passthrough`
+        at the predicate site. Underlying vector load stays
+        unconditional; predicate gates the lane only.
 
-      * Anything else is a hard error — the allow-list is deliberate,
-        extending it is a per-producer choice.
+      * Anything else: hard error. Allow-list is deliberate.
 
     Dominance: `$mask` and `$passthrough` must dominate the producer's
-    def site when the lowering clones / rewrites there. Violations are
-    emitted as diagnostics, the pass signals failure.
+    def site when cloning / rewriting. Violations diagnose and fail
+    the pass.
 
-    Conceptually the pass is the lowering counterpart of
-    `hc.yield_predicated`'s store-side path: both edges of an
-    `hc.generic` body decompose into predicated mem ops or
-    `arith.select` blends, depending on the producer / sink.
+    Lowering counterpart of `hc.yield_predicated`'s store-side: both
+    edges of an `hc.generic` body decompose into predicated mem ops or
+    `arith.select` blends.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -717,50 +576,39 @@ def HCFlattenWithLayouts : Pass<"hc-flatten-with-layouts"> {
   let summary = "Type-only flatten: every shaped value becomes 1D, "
                 "no #hc.layout slot survives.";
   let description = [{
-    Establishes the post-flatten *type* invariant: every
-    `SymbolicallyShapedTypeInterface` value (except buffers) is 1D
-    and carries no `#hc.layout` attribute. Op surfaces stay
-    untouched — `hc.generic` keeps its per-axis offset arrays at
-    their original logical rank, `hc.load` / `hc.store` /
-    `hc.vload` / `hc.buffer_view` keep their multi-index lists.
-    Whoever turns those nD logical accesses into concrete 1D
-    addresses owns the layout->offset materialization in a
-    follow-up slice.
+    Post-flatten *type* invariant: every `SymbolicallyShapedTypeInterface`
+    value (except buffers) is 1D and carries no `#hc.layout`. Op
+    surfaces stay untouched — `hc.generic` keeps per-axis offset
+    arrays at original logical rank; `hc.load`, `hc.store`, `hc.vload`,
+    `hc.buffer_view` keep multi-index lists. Whoever turns nD logical
+    accesses into 1D addresses owns the layout→offset materialization
+    in a follow-up slice.
 
-    What runs:
-
-      1. A `TypeConverter` whose dispatch on the shaped-type interface
+      1. `TypeConverter` dispatches on the shaped-type interface:
          computes `storage_size_expr` (`layout.storage_size` after
-         binding `layout.shape_syms` to the original shape entries,
-         or the product of the original dimensions when no layout is
-         attached) and rebuilds the type with a single-entry shape
-         and a null layout slot. Tuple and function types recurse so
-         nested carriers get the same fold without per-shell
-         hand-rolling.
+         binding `layout.shape_syms` to original shape entries, or the
+         product of original dims when no layout is attached); rebuilds
+         the type with single-entry shape and null layout. Tuple and
+         function types recurse.
 
       2. Upstream populators thread the converter through `func.func` /
-         `func.return` / `func.call` signatures and the SCF structural
-         ops (`scf.for`, `scf.if`, `scf.while`, `scf.index_switch`).
+         `func.return` / `func.call` signatures and SCF structural ops
+         (`scf.for`, `scf.if`, `scf.while`, `scf.index_switch`).
 
       3. `hc.as_layout` collapses to its operand once both endpoints
-         carry the converted form — the op was a layout-only relabel,
-         and after the type fold both sides are observationally
-         identical.
+         carry the converted form — observationally identical.
 
-    Buffer types are deliberately exempt: their default strided
-    layout's `storage_size` is the literal `0` placeholder the
-    frontend emits (the host owns the allocation), so 1D-collapsing
-    them would fold every buffer shape to `[0]`. They keep their
-    original nD shape and lose only the layout slot for now; a
-    separate slice owns the buffer-side ABI.
+    Buffer types deliberately exempt: default strided layout's
+    `storage_size` is the literal `0` placeholder the frontend emits
+    (host owns allocation), so 1D-collapsing would fold every buffer
+    shape to `[0]`. Buffers keep their nD shape, lose only the layout
+    slot; buffer-side ABI is a separate slice.
 
-    Cooperates with `hc-canonicalize-layouts`: that pass folds
-    explicit *identity* layouts back to absent; this one collapses
-    every shape (with or without an explicit layout) to its 1D
-    storage form. Not yet wired into the default `hc.compile`
-    schedule — downstream passes still expect nD operand types and
-    a layout-aware access path that the follow-up slice will
-    materialize.
+    Cooperates with `hc-canonicalize-layouts`: that folds explicit
+    *identity* layouts back to absent; this collapses every shape
+    (with or without explicit layout) to 1D storage form. Not yet in
+    default `hc.compile` schedule — downstream still expects nD
+    operand types and a layout-aware access path.
   }];
   let dependentDialects = [
     "::mlir::hc::HCDialect",
@@ -773,23 +621,21 @@ def HCDecomposeShapedValues
     : Pass<"hc-decompose-shaped-values"> {
   let summary = "Split semantic tensor/vector values into bare data and masks.";
   let description = [{
-    Rewrites every semantic `!hc.tensor` / `!hc.vector` producer and user into
-    compiler-internal `!hc.bare_tensor` / `!hc.bare_vector` data plus matching
-    bare `!hc.pred` masks. This is the contract boundary between the semantic
-    shaped surface and every downstream lowering pass: no `!hc.tensor` /
-    `!hc.vector` may survive into `hc-shaped-compute-to-generic`,
-    `hc-flatten-with-layouts`, `hc-lower-launch-body`, or any other pass below
-    `hc-decompose-shaped-values` in `hc/schedules/front_to_hc.mlir`. Surviving
-    semantic carriers are a producer bug and are diagnosed loudly — first by
-    full-conversion failure on whichever op carries the surviving type, then
-    by a post-conversion walk that fails the pass if the driver somehow
-    returned success with leftover semantic carriers.
+    Rewrites every semantic `!hc.tensor` / `!hc.vector` producer and
+    user into compiler-internal `!hc.bare_tensor` / `!hc.bare_vector`
+    data + matching bare `!hc.pred` masks. Contract boundary between
+    the semantic shaped surface and downstream lowering: no
+    `!hc.tensor` / `!hc.vector` may survive into
+    `hc-shaped-compute-to-generic`, `hc-flatten-with-layouts`,
+    `hc-lower-launch-body`, or anything below this pass. Survivors
+    diagnose loudly — first full-conversion failure on whichever op
+    carries the type, then a post-conversion walk fails the pass.
 
-    Ordering: scheduled after `hc-infer-types`, `hc-materialize-bound-exprs`,
-    and `hc-verify-static-shapes`. The decomposition reads concrete shaped
-    types (so the mask-type derivation can build matching `!hc.pred` carriers)
-    and assumes bound symbolic expressions have already been severed from
-    their producer chains, so it only sees the post-inference shape surface.
+    Ordering: scheduled after `hc-infer-types`,
+    `hc-materialize-bound-exprs`, and `hc-verify-static-shapes`.
+    Reads concrete shaped types (mask-type derivation needs matching
+    `!hc.pred` carriers); assumes bound symbolic exprs already severed
+    from producers (sees post-inference shape surface only).
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -798,13 +644,12 @@ def HCLowerBarePredicates
     : Pass<"hc-lower-bare-predicates"> {
   let summary = "Lower bare HC predicate containers to upstream i1 masks.";
   let description = [{
-    Converts concrete `!hc.pred` values to `i1` and static `!hc.bare_vector`
-    values to upstream `vector` values. Predicate vectors become
-    `vector<...xi1>` masks, and supported HC mask operations are lowered to
-    `arith`/`vector` operations. Bare tensors remain HC values for the later
-    memory/tensor lowering. Unsupported HC boundaries are preserved with
-    `builtin.unrealized_conversion_cast` so this pass can be staged before the
-    full HC-to-upstream lowering.
+    `!hc.pred` → `i1`; static `!hc.bare_vector` → upstream `vector`.
+    Predicate vectors become `vector<...xi1>`; supported HC mask ops
+    lower to `arith` / `vector`. Bare tensors stay HC for later
+    memory/tensor lowering. Unsupported HC boundaries preserved with
+    `builtin.unrealized_conversion_cast` so the pass can stage before
+    the full HC-to-upstream lowering.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -818,16 +663,13 @@ def HCMaterializeBoundExprs
     : Pass<"hc-materialize-bound-exprs"> {
   let summary = "Sever bound symbolic HC expressions from their producer chains.";
   let description = [{
-    Replaces uses of values typed as pinned `!hc.idx<expr>` or
-    `!hc.pred<pred>` with an empty-binding `hc.idx_apply` /
-    `hc.pred_apply` (no listed symbols, no operand SSA edges) when
-    every symbolic leaf is a bound symbol or the expression is
-    constant-only. The original producer is left in place for
-    canonicalization/DCE, which lets this pass break dependence on
-    launch-context query chains before scope normalization. The
-    severed apply ops resolve their pinned expressions ambiently
-    against the surrounding launch context at the launch-body
-    lowering boundary.
+    Replaces uses of pinned `!hc.idx<expr>` / `!hc.pred<pred>` with an
+    empty-binding `hc.idx_apply` / `hc.pred_apply` (no listed syms, no
+    SSA edges) when every leaf is a bound symbol or the expr is
+    constant-only. Original producer left for canon/DCE. Breaks
+    dependence on launch-context query chains before scope
+    normalization. Severed apply ops resolve pinned exprs ambiently
+    against the launch context at the launch-body lowering boundary.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -836,10 +678,11 @@ def HCInlineHelpers
     : Pass<"hc-inline-helpers"> {
   let summary = "Inline supported HC helper calls.";
   let description = [{
-    Inlines `hc.call` sites targeting `hc.func` helpers. The pass owns HC
-    helper call-graph concerns separately from scope-region normalization:
-    recursion and unsupported callee body shapes are diagnosed here, and helpers
-    that were actually inlined are erased once no `hc.call` references remain.
+    Inlines `hc.call` sites targeting `hc.func` helpers. Owns HC
+    helper call-graph concerns separately from scope-region
+    normalization: recursion and unsupported callee body shapes
+    diagnose here. Inlined helpers are erased once no `hc.call`
+    references remain.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -848,12 +691,12 @@ def HCNormalizeScopeRegions
     : Pass<"hc-normalize-scope-regions"> {
   let summary = "Flatten supported collective scope regions into SPMD HC IR.";
   let description = [{
-    Normalizes HC toward per-workitem SPMD form before upstream GPU lowering.
-    The first supported slice flattens resultless `hc.workitem_region` bodies
-    after bound expression materialization has removed live uses of the
-    workitem token. Result-producing workitem regions and subgroup regions are
-    diagnosed until distributed value projection and subgroup-local workitem
-    semantics are handled explicitly.
+    Normalizes HC toward per-workitem SPMD before upstream GPU
+    lowering. v0 flattens resultless `hc.workitem_region` bodies after
+    bound expression materialization removes live uses of the workitem
+    token. Result-producing workitem regions and subgroup regions
+    diagnose until distributed value projection and subgroup-local
+    workitem semantics land.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -862,24 +705,23 @@ def HCLowerKernelsToGPULaunch
     : Pass<"hc-lower-kernels-to-gpu-launch"> {
   let summary = "Wrap HC kernels in upstream GPU launch operations.";
   let description = [{
-    Rewrites `hc.kernel` symbols into host `func.func` entry points that launch
-    the former kernel body with `gpu.launch`. The host wrapper signature is a
-    leading `!llvm.ptr` stream pointer followed by one `!llvm.ptr`
-    (`PyObject *`) per non-`!hc.group` kernel argument; the wrapper body calls
-    the `_mlir_ciface_hc_get_*` runtime helpers (declared as `func.func
-    private` with `llvm.emit_c_interface`) to unpack each PyObject into a
-    raw pointer / dim / stride / scalar before computing launch geometry.
-    Each buffer argument materializes as an `(!hc.ptr<global, T>, dim*,
-    stride*)` tuple sourced from `hc_get_ptr` + per-axis `hc_get_dim` /
-    `hc_get_stride`; an N→1 `unrealized_conversion_cast` planted inside the
-    `gpu.launch` region bridges the tuple back to `!hc.buffer<...>` so
-    `gpu-kernel-outlining` captures the raw pointer / dim / stride values
-    the kernel ultimately consumes. The stream pointer threads through to the
-    runtime launch calls in `hc-lower-launch-func-to-runtime`; passing null
-    keeps HIP's default-stream semantics.
+    Rewrites `hc.kernel` symbols into host `func.func` entry points
+    that launch the former kernel body with `gpu.launch`. Host wrapper
+    signature: leading `!llvm.ptr` stream + one `!llvm.ptr`
+    (`PyObject *`) per non-`!hc.group` kernel arg. Body calls
+    `_mlir_ciface_hc_get_*` helpers (declared as `func.func private`
+    with `llvm.emit_c_interface`) to unpack each PyObject into raw
+    pointer / dim / stride / scalar before computing geometry. Each
+    buffer arg materialises as `(!hc.ptr<global, T>, dim*, stride*)`
+    tuple from `hc_get_ptr` + per-axis `hc_get_dim` / `hc_get_stride`;
+    an N→1 `unrealized_conversion_cast` inside `gpu.launch` bridges
+    the tuple back to `!hc.buffer<...>` so `gpu-kernel-outlining`
+    captures the raw pointer / dim / stride. Stream pointer threads
+    to runtime launch calls in `hc-lower-launch-func-to-runtime`;
+    null = HIP default stream.
 
-    The original HC kernel body is kept inside the launch behind explicit cast
-    boundaries for later memory and intrinsic lowering passes.
+    Original HC kernel body stays inside the launch behind explicit
+    cast boundaries for later memory / intrinsic lowering.
   }];
   let dependentDialects = [
     "::mlir::LLVM::LLVMDialect",
@@ -894,26 +736,23 @@ def HCInterpretIntrinsicRecipes
     : Pass<"hc-interpret-intrinsic-recipes", "::mlir::ModuleOp"> {
   let summary = "Apply embedded intrinsic transform recipes to payload IR.";
   let description = [{
-    Looks up a sibling top-level `builtin.module @__hc_intrinsic_lowerings__`
-    (carrying `transform.with_named_sequence`) and applies every
-    `transform.named_sequence` whose `hc.target` matches the requested target
-    string against the surrounding module. The recipes were planted by the
-    frontend emitter (`hc/_frontend_mlir.py`) and stick to MLIR transform IR
-    end-to-end — no string round-trip.
+    Looks up sibling top-level
+    `builtin.module @__hc_intrinsic_lowerings__` (carrying
+    `transform.with_named_sequence`) and applies every
+    `transform.named_sequence` whose `hc.target` matches the requested
+    target. Recipes are planted by the frontend emitter and stay in
+    MLIR transform IR end-to-end — no string round-trip.
 
-    Recipes are expected to follow the standard hc transform-op shape: a
-    `transform.hc.match_intrinsic_call` to find the call site, optional
-    `transform.hc.get_intrinsic_*` handle ops to thread operands, result
-    types, and attributes into a `transform.hc.create_op`, then a
-    `transform.hc.replace_intrinsic_call` that swaps the original
-    `hc.call_intrinsic` for the freshly constructed payload.
+    Recipe shape: `transform.hc.match_intrinsic_call` to find the call
+    site, optional `transform.hc.get_intrinsic_*` handle ops to thread
+    operands / result types / attrs into `transform.hc.create_op`,
+    then `transform.hc.replace_intrinsic_call` to swap the original
+    `hc.call_intrinsic` for the constructed payload.
 
-    After applying every selected sequence, the lowerings module is erased
-    and the pass walks the payload one final time. Any surviving
-    `hc.call_intrinsic` is a hard error: the user asked for target `T` but
-    nothing under `__hc_intrinsic_lowerings__` knew how to lower the call,
-    so we surface the gap here instead of letting it slip into the next
-    pass as an unrecognized op.
+    After applying selected sequences the lowerings module is erased
+    and the payload is walked once more. Any surviving
+    `hc.call_intrinsic` is a hard error — user asked for target `T`
+    but no recipe knew how to lower it.
   }];
   let options = [
     Option<"target", "target", "std::string", "\"\"",
@@ -931,41 +770,38 @@ def HCLowerGPUToBinary
     : Pass<"hc-lower-gpu-to-binary", "::mlir::ModuleOp"> {
   let summary = "Compile each gpu.module to a HSACO blob via our pinned ld.lld.";
   let description = [{
-    For every `gpu.module` carrying exactly one `#rocdl.target<...>`
-    attribute the pass:
+    For every `gpu.module` carrying exactly one `#rocdl.target<...>`:
 
-      1. translates the module to LLVM IR (`translateModuleToLLVMIR`),
-      2. builds an `llvm::TargetMachine` from the rocdl target's triple/
-         chip/features and pins the IR's data layout + triple,
-      3. runs the standard optimize-then-codegen pipeline at the target's
-         opt level (`makeOptimizingTransformer`),
-      4. translates LLVM IR to ISA text
+      1. translate to LLVM IR (`translateModuleToLLVMIR`),
+      2. build `llvm::TargetMachine` from rocdl triple/chip/features;
+         pin IR's data layout + triple,
+      3. optimize-then-codegen at the target's opt level
+         (`makeOptimizingTransformer`),
+      4. LLVM IR → ISA text
          (`LLVM::ModuleToObject::translateModuleToISA`),
-      5. assembles ISA → ELF object via `ROCDL::assembleIsa`,
-      6. links the ELF → HSACO via `ROCDL::linkObjectCode`, calling our
-         pinned `ld.lld`.
+      5. ISA → ELF object via `ROCDL::assembleIsa`,
+      6. ELF → HSACO via `ROCDL::linkObjectCode`, calling our pinned
+         `ld.lld`.
 
-    The result is attached as a `gpu::ObjectAttr` on a sibling
-    `gpu.binary` op (CompilationTarget::Binary, with the original
-    rocdl target preserved), and the source `gpu.module` is erased.
+    Result attached as `gpu::ObjectAttr` on a sibling `gpu.binary` op
+    (CompilationTarget::Binary, original rocdl target preserved);
+    source `gpu.module` erased.
 
-    `lld-path` resolves in this order:
+    `lld-path` resolution order:
 
-      1. the option's value if non-empty,
-      2. the `HC_LLD` environment variable (escape hatch for direct
-         `hc-opt` invocations against a non-default toolchain),
-      3. the first `ld.lld` on `$PATH`.
+      1. option value if non-empty,
+      2. `HC_LLD` env var (escape hatch for direct `hc-opt`),
+      3. first `ld.lld` on `$PATH`.
 
-    The Python pipeline driver (`hc.compile`) always populates option
-    1 from the bundled `hc/_native/bin/ld.lld`, so `HC_LLD` and `$PATH`
-    only matter for callers reaching the pass directly via `hc-opt`.
-    No ROCm install fallback — if none of the three succeed we error
-    out rather than silently picking up a host's distro-installed lld.
+    `hc.compile` always populates option 1 from bundled
+    `hc/_native/bin/ld.lld`; `HC_LLD` and `$PATH` only matter for
+    direct `hc-opt`. No ROCm install fallback — error rather than
+    silently picking up a distro-installed lld.
 
-    v0 deliberately does not link rocm-device-libs bitcode. The WMMA
-    example doesn't reference `__ocml_*` / `__ockl_*`; kernels that do
-    will need a follow-up pass that resolves the device-libs path and
-    feeds bitcode files into the optimization pipeline before codegen.
+    v0 doesn't link rocm-device-libs bitcode. WMMA example doesn't
+    use `__ocml_*` / `__ockl_*`; kernels that do need a follow-up
+    pass that resolves device-libs and feeds bitcode into the
+    optimization pipeline.
   }];
   let options = [
     Option<"lldPath", "lld-path", "std::string", "\"\"",
@@ -992,45 +828,39 @@ def HCLowerLaunchFuncToRuntime
   let summary = "Replace gpu.launch_func with hc_rt_* runtime calls and "
                 "embed the HSACO blob as an LLVM global.";
   let description = [{
-    Final lowering before LLJIT: each `gpu.launch_func` becomes a pair
+    Final lowering before LLJIT. Each `gpu.launch_func` becomes a pair
     of calls into `libhc_hip_runtime.so` (`hc_rt_load_kernel` +
-    `hc_rt_launch_kernel`) and the matching `gpu.binary`'s HSACO blob
-    is materialised inline as an `llvm.mlir.global` so the JIT'd host
-    wrapper carries everything it needs to launch without touching the
-    filesystem.
+    `hc_rt_launch_kernel`); matching `gpu.binary`'s HSACO blob
+    materialises inline as `llvm.mlir.global` so the JIT'd host wrapper
+    carries everything to launch without touching the filesystem.
 
-    For each `gpu.launch_func` the pass:
+    Per `gpu.launch_func`:
 
-      1. Looks up the sibling `gpu.binary` via `kernel_module_name`,
-         pulls the first `#gpu.object` (we only emit one per binary
-         today — single rocdl target), and reads its raw blob.
-      2. Emits two per-callsite globals at module scope (internal
-         linkage): a NUL-terminated string holding the HSACO blob
-         (`<kernel>_data`) and a zero-init `!llvm.ptr` slot
-         (`<kernel>_handle`) the runtime uses as a single-flight
-         `hipFunction_t` cache. Names are uniqued through `SymbolTable`
-         so multiple launches of the same kernel keep distinct slots
-         (matches wave's recipe; the cache slot is per-callsite, not
-         per-binary).
-      3. Packs kernel operands as alloca-per-arg + an array-of-pointer
-         (one `llvm.alloca` per arg storing its value, then an
+      1. Look up sibling `gpu.binary` via `kernel_module_name`, pull
+         the first `#gpu.object` (one per binary today — single rocdl
+         target), read its raw blob.
+      2. Emit two per-callsite globals at module scope (internal
+         linkage): NUL-terminated string `<kernel>_data` holding the
+         HSACO blob; zero-init `!llvm.ptr` slot `<kernel>_handle` used
+         as single-flight `hipFunction_t` cache. Names uniqued via
+         `SymbolTable` so multiple launches of the same kernel keep
+         distinct slots (cache slot is per-callsite, not per-binary).
+      3. Pack kernel operands as alloca-per-arg + array-of-pointer
+         (one `llvm.alloca` per arg storing its value; an
          `LLVM::ArrayType` of `!llvm.ptr` built via `insertvalue` and
-         spilled to a single alloca whose pointer is what the runtime
-         reads). This is the HIP `kernelParams` convention; the
-         `num_args` count is passed alongside the pointer for parity
-         with wave's signature.
-      4. Replaces the launch with `hc_rt_load_kernel(stream, &handle,
-         data, size, name)` followed by `hc_rt_launch_kernel(stream,
-         fn, smem, gx,gy,gz, bx,by,bz, cx,cy,cz, args, num_args)`.
+         spilled to a single alloca whose pointer the runtime reads).
+         HIP `kernelParams` convention; `num_args` passed alongside.
+      4. Replace launch with `hc_rt_load_kernel(stream, &handle, data,
+         size, name)` + `hc_rt_launch_kernel(stream, fn, smem,
+         gx,gy,gz, bx,by,bz, cx,cy,cz, args, num_args)`.
 
-    Stream: v0 always passes a null pointer (HIP's default stream).
-    When the host wrapper grows an explicit stream argument (the
-    upcoming Python invoke surface bead), this pass will switch to
-    sourcing the stream from the enclosing function's first argument.
+    Stream: v0 always passes null (HIP default). When the host wrapper
+    grows an explicit stream arg, this pass switches to sourcing it
+    from the enclosing function's first argument.
 
-    All consumed `gpu.binary` ops are erased after the walk completes.
-    Fails the pass if a launch's binary or selected object is missing,
-    or if the binary carries something other than a single object.
+    Consumed `gpu.binary` ops erased after the walk. Fails if a
+    launch's binary or selected object is missing, or if the binary
+    carries more than one object.
   }];
   let dependentDialects = [
     "::mlir::LLVM::LLVMDialect",
@@ -1043,38 +873,29 @@ def HCEmitBenchWrapper
   let summary = "Mint an i64-returning `wrapper_bench` sibling per host wrapper "
                 "that calls hc_rt_launch_kernel_repeat for benchmarking.";
   let description = [{
-    Runs after `-hc-lower-launch-func-to-runtime`, on the lowered LLVM
-    IR. For each `llvm.func` that calls `hc_rt_launch_kernel` exactly
-    once (the host wrapper shape `hc-lower-kernels-to-gpu-launch` /
-    `hc-lower-launch-func-to-runtime` lays down), clones the function
-    into a sibling `<name>_bench` with:
+    Runs after `-hc-lower-launch-func-to-runtime`, on lowered LLVM IR.
+    For each `llvm.func` that calls `hc_rt_launch_kernel` exactly once
+    (the host-wrapper shape), clones into a sibling `<name>_bench`:
 
-      * a trailing `i64 %n_inner` block argument appended to the
-        original parameter list,
-      * `i64` return type instead of `void`,
-      * the `hc_rt_launch_kernel` callsite rewritten to
-        `hc_rt_launch_kernel_repeat` with `%n_inner` threaded as the
-        new trailing argument,
-      * the function's `llvm.return` replaced with `llvm.return
-        %elapsed : i64` where `%elapsed` is the repeat call's result.
+      * trailing `i64 %n_inner` block arg appended,
+      * `i64` return type (was `void`),
+      * `hc_rt_launch_kernel` callsite rewritten to
+        `hc_rt_launch_kernel_repeat` with `%n_inner` as new trailing arg,
+      * `llvm.return` replaced with `llvm.return %elapsed : i64` where
+        `%elapsed` is the repeat call's result.
 
     Per-callsite `<kernel>_data` / `<kernel>_handle` / `<kernel>` name
-    globals are reused via symbol reference — the cloned `llvm.addressof`
-    ops point at the same symbols as the original wrapper's, so the
-    first `hc_rt_load_kernel` from either wrapper warms the shared
-    `hipFunction_t` cache slot for both paths.
+    globals reused via symbol reference — cloned `llvm.addressof` ops
+    point at the same symbols, so first `hc_rt_load_kernel` from either
+    wrapper warms the shared `hipFunction_t` cache slot for both.
 
-    Idempotent: functions whose symbol name already ends in `_bench`
-    are skipped, so a second invocation of the pass is a no-op. Host
-    wrappers that do not contain an `hc_rt_launch_kernel` call (the
-    runtime decl itself, the helper unpackers, externs) are likewise
-    skipped — only the launch-bearing wrappers get a bench sibling.
+    Idempotent: functions ending in `_bench` skipped. Wrappers without
+    an `hc_rt_launch_kernel` call (runtime decl, unpackers, externs)
+    skipped too — only launch-bearing wrappers get a bench sibling.
 
-    Default off; `hc.compile(bench=True)` flips the `__HC_BENCH__`
-    placeholder in `_GPU_LOWERING_PIPELINE` to splice this pass into
-    the chain right before `symbol-dce`. With `bench=False` the
-    placeholder is empty and the post-pipeline LLVM IR is
-    byte-identical to today.
+    Default off; `hc.compile(bench=True)` flips `__HC_BENCH__` in
+    `_GPU_LOWERING_PIPELINE` to splice this pass before `symbol-dce`.
+    `bench=False` leaves post-pipeline LLVM IR byte-identical.
   }];
   let dependentDialects = ["::mlir::LLVM::LLVMDialect"];
 }
@@ -1083,18 +904,18 @@ def HCLowerLaunchBody
     : Pass<"hc-lower-launch-body"> {
   let summary = "Lower HC launch-body operations to upstream dialects.";
   let description = [{
-    Converts the HC subset that remains inside `gpu.launch` after kernel
-    wrapping. Bound symbolic expressions become upstream SSA values derived
-    from launch ids and buffer dimensions, simple arithmetic lowers to `arith`,
-    `hc.for_range`/`hc.if` become `scf` control flow, static bare tensors
-    materialize as `hc.alloc` + `hc.ptr_*` against `!hc.ptr<workgroup, T>`
-    (the `hc-lower-to-llvm` slice owns the final memory lowering), and bare
-    vectors lower to upstream `vector` values. Final masked stores lower to
-    `hc.ptr_store_pred` (vector form) or guarded scalar stores. Kernel-arg
-    buffers arrive as `(!hc.ptr<global, T>, dim*, stride*)` and lower to
-    `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]` on the
-    same `!hc.ptr` family. WMMA intrinsic boundaries stay on their existing
-    `hc.call_intrinsic` path until the matching recipe runs.
+    Converts the HC subset that survives inside `gpu.launch` after
+    kernel wrapping. Bound symbolic exprs become upstream SSA from
+    launch ids and buffer dims; simple arithmetic to `arith`;
+    `hc.for_range` / `hc.if` to `scf`; static bare tensors to
+    `hc.alloc` + `hc.ptr_*` on `!hc.ptr<workgroup, T>`
+    (`hc-lower-to-llvm` owns final memory lowering); bare vectors to
+    upstream `vector`. Masked stores → `hc.ptr_store_pred` (vector) or
+    guarded scalar stores. Kernel-arg buffers arrive as
+    `(!hc.ptr<global, T>, dim*, stride*)` and lower to
+    `hc.ptr_offset` + `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
+    WMMA intrinsic boundaries stay on `hc.call_intrinsic` until the
+    matching recipe runs.
   }];
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
@@ -1111,46 +932,43 @@ def HCLowerToLLVM
   let summary = "Lower hc.ptr / hc.alloc / hc.ptr_* to LLVM dialect.";
   let description = [{
     Final lowering for the `!hc.ptr` family — see `doc/layouts.md`
-    "hc.ptr and memory ops" for the contract. Operates on whatever scope
-    it's invoked in (`builtin.module` for unit LITs, `gpu.module` inside
-    the canonical AMDGPU pipeline) and rewrites the dialect surface
-    launch-body and `hc-lower-generic` produce.
+    "hc.ptr and memory ops". Operates on whatever scope it's invoked
+    in (`builtin.module` for unit LITs, `gpu.module` in the AMDGPU
+    pipeline); rewrites the surface that launch-body and
+    `hc-lower-generic` produce.
 
     Type conversion: `!hc.ptr<addr_space, T?>` → `!llvm.ptr<addr_space>`
-    (LLVM has been opaque-pointers-only since LLVM 17; the carried element
-    type is dropped here and recovered from the access op).
+    (LLVM has been opaque-pointers-only since 17; carried elt type
+    dropped here, recovered from the access op).
 
     Op rewrites:
 
-      * `hc.alloc count = N : index -> !hc.ptr<workgroup, T>` —
-        materializes a sibling `llvm.mlir.global private`
-        `!llvm.array<N x T>` in addrspace 3 at the nearest enclosing
-        symbol-table op, then plants `llvm.mlir.addressof` at the use
-        site. `N` must be a constant integer (the doc invariant); a
-        non-constant count diagnoses.
+      * `hc.alloc count = N : index -> !hc.ptr<workgroup, T>` — sibling
+        `llvm.mlir.global private !llvm.array<N x T>` in addrspace 3
+        at the nearest enclosing symbol-table op, plus
+        `llvm.mlir.addressof` at the use site. `N` must be a constant;
+        non-constant diagnoses.
       * `hc.alloc count = N : index -> !hc.ptr<private, T>` —
         `llvm.alloca N x T` in addrspace 5 at the use site (runtime
-        count is fine; the alloca's lifetime is per-call).
-      * `hc.alloc count = N : index -> !hc.ptr<global, T>` — diagnoses;
-        global-AS allocations come from the host (kernel arg) and have
-        no in-kernel materialization.
-      * `hc.ptr_offset %p, %i` — `llvm.getelementptr` with the carried
-        element type as the GEP element. Index is `index`-cast to `i64`
-        for the GEP index list.
+        count fine; per-call lifetime).
+      * `hc.alloc count = N : index -> !hc.ptr<global, T>` — diagnoses
+        (global-AS allocations come from host kernel arg, no in-kernel
+        materialization).
+      * `hc.ptr_offset %p, %i` — `llvm.getelementptr` with carried elt
+        type. Index `index`-cast to `i64`.
       * `hc.ptr_load %p : ... -> T` — `llvm.load` of the access type
-        (scalar or `vector<NxT>`); identical surface either way.
+        (scalar or `vector<NxT>`).
       * `hc.ptr_store %v, %p` — `llvm.store` of the access type.
       * `hc.ptr_load_pred` / `hc.ptr_store_pred` — vector form lowers
         to `llvm.intr.masked.load` / `llvm.intr.masked.store`. Scalar
-        form lowers to `scf.if` + `llvm.load`/`llvm.store` + the
-        passthrough as the else-yield (load) or no-op else (store).
+        form: `scf.if` + `llvm.load` / `llvm.store` + passthrough as
+        else-yield (load) or no-op else (store).
 
-    Element type comes from the pointer for typed `!hc.ptr<AS, T>` and
-    from the access op's value type for opaque pointers — load/store
-    always know the access type at their op.
+    Elt type from the pointer for typed `!hc.ptr<AS, T>`; from the
+    access op's value type for opaque pointers.
 
-    Out of scope (kept until follow-ups): kernel-arg `!hc.ptr<global>`
-    boundary plumbing (gated on the host-wrapper migration), private-AS
+    Out of scope (follow-ups): kernel-arg `!hc.ptr<global>` boundary
+    plumbing (gated on host-wrapper migration), private-AS
     optimization, host-side stride binding fold-through.
   }];
   let dependentDialects = [

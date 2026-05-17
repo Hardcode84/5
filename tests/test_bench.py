@@ -105,10 +105,8 @@ def test_bench_result_rejects_non_positive_n_inner() -> None:
 
 
 def _result_with_known_samples() -> BenchResult:
-    # Eight samples chosen so the canonical numpy stats land on
-    # easy-to-eyeball values: median=550 (avg of 500 and 600), mean=550,
-    # min=200, max=900, p25=400 (linear interpolation between 300 and
-    # 400 lands here at idx 1.75), p75=700.
+    # Eyeballable numpy stats: median=550, mean=550, min=200, max=900,
+    # p25 in [300, 400], p75 in [700, 800].
     samples = np.array([200, 300, 400, 500, 600, 700, 800, 900], dtype=np.int64)
     return BenchResult(samples_ns=samples, n_inner=10, kernel_name="kfn")
 
@@ -125,20 +123,14 @@ def test_bench_result_median_mean_min_max() -> None:
 
 def test_bench_result_std_matches_numpy_population() -> None:
     result = _result_with_known_samples()
-    # Population std (ddof=0) on the symmetric sample set above is the
-    # sqrt of the squared deviations from 550 divided by 8.
+    # Contract is population std (ddof=0).
     expected = float(np.std(result.samples_ns))
     assert result.std_ns == pytest.approx(expected)
 
 
 def test_bench_result_percentiles() -> None:
     result = _result_with_known_samples()
-    # numpy's default percentile interp on the eight-element array
-    # lands p25 between samples[1]=300 and samples[2]=400 at the 0.75
-    # fractional offset → 375.0, and p75 between samples[5]=700 and
-    # samples[6]=800 at 0.25 → 725.0. Take whatever numpy returns and
-    # mirror it on the property side — the contract is "linear interp
-    # by default", not specific cut points.
+    # Contract is numpy linear-interp default — mirror, don't pin.
     expected_p25 = float(np.percentile(result.samples_ns, 25))
     expected_p75 = float(np.percentile(result.samples_ns, 75))
     assert result.p25_ns == pytest.approx(expected_p25)
@@ -146,8 +138,7 @@ def test_bench_result_percentiles() -> None:
 
 
 def test_bench_result_per_launch_is_sample_divided_by_n_inner() -> None:
-    # The headline number for sub-µs kernels: per-launch median is just
-    # the outer-sample median divided by n_inner, both reported in ns.
+    # per_launch = outer_sample / n_inner. Headline for sub-µs kernels.
     result = _result_with_known_samples()
     assert result.per_launch_median_ns == pytest.approx(
         result.median_ns / result.n_inner
@@ -156,10 +147,7 @@ def test_bench_result_per_launch_is_sample_divided_by_n_inner() -> None:
 
 
 def test_bench_result_single_sample_does_not_crash_std() -> None:
-    # m_outer=1 is legal — uninformative, but the BenchResult contract
-    # uses population std (ddof=0), which collapses to zero at one
-    # sample without crashing. A previous design with ddof=1 would
-    # divide by zero here.
+    # m_outer=1: ddof=0 std collapses to 0 — no divide-by-zero.
     result = BenchResult(
         samples_ns=np.array([1234], dtype=np.int64),
         n_inner=5,
@@ -176,10 +164,7 @@ def test_bench_result_single_sample_does_not_crash_std() -> None:
 def test_bench_result_summary_contains_headline_fields() -> None:
     result = _result_with_known_samples()
     text = result.summary()
-    # Don't pin exact formatting — the table layout is allowed to
-    # evolve. Pin only the load-bearing pieces: kernel name, the
-    # n_outer / n_inner counts, and the per-launch / outer-sample
-    # column headers.
+    # Pin load-bearing pieces only — table layout may evolve.
     assert "kfn" in text
     assert "m_outer=8" in text
     assert "n_inner=10" in text
@@ -190,9 +175,6 @@ def test_bench_result_summary_contains_headline_fields() -> None:
 
 
 def test_bench_result_summary_is_cached() -> None:
-    # The formatter is microseconds-cheap but `__repr__` may be hit in
-    # debugger / REPL loops; the per-instance cache keeps the second
-    # access free.
     result = _result_with_known_samples()
     first = result.summary()
     second = result.summary()
@@ -206,16 +188,12 @@ def test_bench_result_repr_is_one_line_with_headline() -> None:
     assert "kernel='kfn'" in text
     assert "n_outer=8" in text
     assert "n_inner=10" in text
-    # Per-launch median = 550 / 10 = 55ns; allow tiny formatting drift.
+    # 550 / 10 = 55ns; allow tiny formatting drift.
     assert re.search(r"per_launch_median=55\.\d+ns", text), text
 
 
 def test_bench_result_summary_handles_n_inner_one() -> None:
-    # The per-launch column collapses onto the outer-sample column when
-    # n_inner=1; the formatter must not divide by anything fancy that
-    # would change shape (it just reports identical numbers in both
-    # columns). Goes through the public `summary()` so the cached-text
-    # path is exercised too.
+    # n_inner=1: per-launch column equals outer-sample column.
     samples = np.array([10, 20, 30], dtype=np.int64)
     result = BenchResult(samples_ns=samples, n_inner=1, kernel_name="k")
     text = result.summary()
@@ -249,12 +227,8 @@ def test_compiled_kernel_bench_raises_when_pipeline_did_not_run() -> None:
 
 
 def test_compiled_kernel_bench_raises_when_compiled_without_bench_flag() -> None:
-    # The handle has `hc_ir` from a normal compile (we pass a dummy
-    # truthy stand-in here — the rejection fires before any JIT
-    # lookup) but `bench_wrapper_name` is None: the user never opted
-    # into bench=True. Surface a `RuntimeError` that names the right
-    # remediation (`bench=True`) instead of a downstream null-pointer
-    # lookup that would only mention the missing symbol.
+    # `hc_ir` set + `bench_wrapper_name=None` means no `bench=True` —
+    # diagnostic must name it.
     handle = _make_handle(hc_ir=object(), bench_wrapper_name=None)
     with pytest.raises(RuntimeError, match=r"bench=True"):
         handle.bench((), n_inner=1, m_outer=1)
@@ -274,14 +248,9 @@ def test_compiled_kernel_bench_validates_loop_counts() -> None:
 # --- compile(bench=True) end-to-end pipeline -------------------------------
 
 
-# End-to-end pipeline assertions need a kernel whose lowering lays down
-# a real `hc_rt_launch_kernel` callsite — the bench pass only mints a
-# sibling when the host wrapper actually dispatches one. Trivial
-# function-body kernels in the rest of the test suite skip the
-# launch step entirely and would produce the (correct, but
-# uninteresting) "no bench wrapper minted" outcome. Mirror
-# `test_hc_compile.py`'s WMMA smoke pattern instead so the assertion
-# fires against the real lowering path.
+# End-to-end needs a kernel whose lowering emits a real
+# `hc_rt_launch_kernel` — bench pass only mints a sibling when the
+# host wrapper dispatches one. WMMA covers it.
 _BENCH_SMOKE_SCRIPT = textwrap.dedent("""
     import hc
     from examples.amdgpu_gfx11_wmma_matmul import tiled_gfx11_wmma_matmul
@@ -296,10 +265,7 @@ _BENCH_SMOKE_SCRIPT = textwrap.dedent("""
         assert "@tiled_gfx11_wmma_matmul_bench(" in text_bench, text_bench
         assert "hc_rt_launch_kernel_repeat" in text_bench, text_bench
 
-        # Negative half of the contract: the same kernel without
-        # `bench=True` keeps the IR free of the bench sibling and the
-        # repeat-runtime symbol. Same compile invocation pair the
-        # production paths flip between.
+        # Negative: no `bench=True` -> no bench sibling, no repeat symbol.
         handle = hc.compile(tiled_gfx11_wmma_matmul)
         text = handle.hc_ir_text
         assert handle.hc_ir is not None, handle.pipeline_diagnostics
@@ -321,14 +287,8 @@ def test_compile_bench_flag_round_trips_through_pipeline(
 ) -> None:
     """`hc.compile(bench=True/False)` lands the right post-pipeline IR.
 
-    Runs the WMMA example through both code paths in the same subprocess:
-    `bench=True` produces a `<name>_bench` sibling with
-    `hc_rt_launch_kernel_repeat` calls and a populated
-    `bench_wrapper_name`; `bench=False` leaves neither in the module.
-    JITting / GPU dispatch isn't exercised here — the WMMA hardware-
-    gated bench test owns that — but every observable difference
-    introduced by the placeholder + pass plumbing lives in the IR
-    text, so this is the right gate.
+    `bench=True` -> sibling `<name>_bench`, `hc_rt_launch_kernel_repeat`,
+    populated `bench_wrapper_name`. `bench=False` -> none of those.
     """
     script = tmp_path / "compile_bench.py"
     script.write_text(

@@ -2,22 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Hand-coded subset of the HIP runtime ABI we touch from the launcher
-// shim. Mirroring wave's `wave_lang/kernel/wave/runtime/hip_types.h` —
-// the entire point is to drop the build-time dependency on ROCm so this
-// translation unit (and downstream consumers) compile on any host with
-// just a C++17 toolchain. The actual HIP entry points are dlsym'd from
-// `libamdhip64.so` at runtime by `hc_rt_init`.
+// Hand-coded subset of the HIP ABI touched by the launcher shim. Drops
+// the build-time ROCm dependency — host needs only a C++17 toolchain.
+// Entry points are dlsym'd from `libamdhip64.so` by `hc_rt_init`.
 
 #ifndef HC_RUNTIME_HIPTYPES_H
 #define HC_RUNTIME_HIPTYPES_H
 
 #include <cstddef>
 
-// Sentinel pointer values consumed by the legacy `extra` array passed to
-// `hipModuleLaunchKernel`. We never use that path (we always go through
-// `hipDrvLaunchKernelEx`'s `kernelParams` instead), but the constants are
-// part of the public ABI surface and may surface in future codepaths.
+// Sentinels for `hipModuleLaunchKernel`'s legacy `extra` array. Unused
+// today (we route through `hipDrvLaunchKernelEx`'s `kernelParams`), kept
+// for public-ABI completeness.
 #define HC_HIP_LAUNCH_PARAM_BUFFER_POINTER ((void *)0x01)
 #define HC_HIP_LAUNCH_PARAM_BUFFER_SIZE ((void *)0x02)
 #define HC_HIP_LAUNCH_PARAM_END ((void *)0x03)
@@ -38,19 +34,16 @@ enum hipLaunchAttributeID {
   hipLaunchAttributeMax,
 };
 
-// 64-byte payload — large enough to hold any of the upstream attribute
-// value structs (cluster dim is three ints, the rest are smaller). We
-// don't unpack the variants here because the only attribute we set today
-// is the cluster dimension, which we write through a `int*` reinterpret.
+// 64 bytes — fits any upstream attribute value struct. Cluster dim is the
+// only attribute we set today; written via `int*` reinterpret.
 union hipLaunchAttributeValue {
   char pad[64];
 };
 
 struct hipLaunchAttribute {
   hipLaunchAttributeID id;
-  // Padding so the union starts at offset 8, matching the upstream layout
-  // (where the enum is followed by an explicit 4-byte pad to 8-byte align
-  // the union).
+  // Union at offset 8, matching upstream's explicit 4-byte pad after the
+  // enum.
   char pad[8 - sizeof(hipLaunchAttributeID)];
   union {
     hipLaunchAttributeValue val;

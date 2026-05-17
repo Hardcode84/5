@@ -9,57 +9,41 @@ include "mlir/IR/OpBase.td"
 
 def NameStoreRegionOpInterface : OpInterface<"NameStoreRegionOpInterface"> {
   let description = [{
-    Marker for region-carrying ops that participate in Python name-store
-    promotion. `-hc-promote-names` walks a function region tree bottom-up
-    and rebuilds every op with this interface so that `hc.assign` /
-    `hc.name_load` inside its region(s) get replaced by a structured SSA
-    carrier, with semantics split along the scope-barrier axis:
+    Marker for region-carrying ops participating in name-store promotion.
+    `-hc-promote-names` walks function region trees bottom-up and rebuilds
+    each tagged op so `hc.assign` / `hc.name_load` inside collapse to
+    structured SSA. Semantics split on the scope-barrier axis:
 
-      - `hc.for_range`:       transparent. Carried names become
-                              iter_args + `hc.yield` values, threaded
-                              across iterations. A leading
-                              `hc.assign "<n>", %iv` self-bind is
-                              recognized as the IV-publishing
-                              placeholder and folded to direct uses
-                              of the block arg — see `hc.assign` in
-                              HCOps.td for the pattern rationale.
-      - `hc.if`:              transparent. Carried names become op
-                              results + yields in both branches;
-                              silent-branch fallback = outer snapshot.
-      - `hc.workitem_region`: Python-style nested scope. Reads inside
-                              capture the outer binding (lazy
-                              `hc.name_load` at the op's insertion
-                              point); writes inside shadow and don't
-                              leak out. Out-bound propagation is
-                              opt-in via an explicit
-                              `hc.region_return <names>` terminator:
-                              promotion rebuilds the op with one
-                              result per returned name and emits
-                              writebacks into the enclosing scope's
-                              name store.
-      - `hc.subgroup_region`: same rules as `hc.workitem_region` —
-                              isolated scope with lazy capture,
-                              opt-in leak via `hc.region_return`.
+      - `hc.for_range`:       transparent. Carried names → iter_args +
+                              `hc.yield`. A leading `hc.assign "<n>", %iv`
+                              self-bind is folded to direct uses of the
+                              block arg.
+      - `hc.if`:              transparent. Carried names → op results +
+                              yields; silent-branch fallback is the outer
+                              snapshot.
+      - `hc.workitem_region`: nested Python scope. Inner reads lazily
+                              capture the outer binding; inner writes
+                              shadow and don't leak. Outbound leak is
+                              opt-in via `hc.region_return <names>` — the
+                              promoter adds one result per name and emits
+                              writebacks into the enclosing scope.
+      - `hc.subgroup_region`: same rules as workitem.
 
-    The interface is a marker only — the pass dispatches on op kind
-    internally. Keeping the opt-in in ODS (rather than a hard-coded
-    `isa<...>` list inside the pass) documents the set of participating
-    ops next to the ops themselves, and lets a future dialect-extension
-    op join the promotion without touching pass code beyond a new case
-    in its switch.
+    Marker-only — the pass dispatches on op kind internally. The opt-in
+    lives in ODS so the participating set is visible alongside the ops,
+    and a dialect-extension op can join with just a new switch case.
   }];
   let cppNamespace = "::mlir::hc";
 }
 
 def HCInferTypeOpInterface : OpInterface<"HCInferTypeOpInterface"> {
   let description = [{
-    Op-local type inference hook for the HC dataflow type inference pass.
+    Op-local type inference hook for the HC dataflow pass.
 
-    This is deliberately narrower than MLIR's generic `InferTypeOpInterface`:
-    the pass supplies the operand types learned by dataflow, which may be more
-    precise than the operands' current IR types during a solver iteration. The
-    hook appends one entry per result to `$resultTypes`; a null `Type` entry
-    means "no fact for this result".
+    Narrower than MLIR's `InferTypeOpInterface`: the pass passes in
+    operand types learned by dataflow (potentially more precise than IR
+    types mid-iteration). Hook appends one `$resultTypes` entry per
+    result; null = no fact.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [
@@ -76,13 +60,12 @@ def HCInferTypeOpInterface : OpInterface<"HCInferTypeOpInterface"> {
 def HCInferRegionArgTypeOpInterface :
     OpInterface<"HCInferRegionArgTypeOpInterface"> {
   let description = [{
-    Op-local type inference hook for non-control-flow region arguments.
+    Type inference hook for non-CFG-forwarded region args.
 
-    MLIR's sparse dataflow framework forwards values through
-    RegionBranchOpInterface edges. Some region entry block arguments are not
-    forwarded from operands or terminators, such as a loop induction variable.
-    This hook lets the parent op describe those arguments without baking their
-    semantics into the pass.
+    The sparse dataflow framework forwards values along
+    `RegionBranchOpInterface` edges; some entry-block args (e.g. a loop
+    IV) aren't forwarded from operands or terminators. This hook lets the
+    parent op describe them without baking semantics into the pass.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [
@@ -99,13 +82,13 @@ def HCInferRegionArgTypeOpInterface :
 
 def HCYieldedResultsOpInterface : OpInterface<"HCYieldedResultsOpInterface"> {
   let description = [{
-    Contract for single-region ops whose `hc.yield` operands define the parent
-    op results.
+    Contract for single-region ops whose `hc.yield` operands define the
+    parent results.
 
-    This is narrower than `RegionBranchOpInterface`: it is for ops where the
-    dataflow solver does not otherwise propagate region terminator facts back
-    to parent results, but the region's sole terminator is still the semantic
-    source of those result values.
+    Narrower than `RegionBranchOpInterface`: covers ops where the
+    dataflow solver doesn't otherwise propagate terminator facts back to
+    parent results, but the region's sole terminator is still the
+    semantic source.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [
@@ -119,13 +102,12 @@ def HCYieldedResultsOpInterface : OpInterface<"HCYieldedResultsOpInterface"> {
 
 def HCStaticShapeOpInterface : OpInterface<"HCStaticShapeOpInterface"> {
   let description = [{
-    Contract for ops whose result shape is supplied by an SSA shape carrier.
+    Contract for ops whose result shape rides an SSA shape carrier.
 
-    The verifier pass owns the common policy: the carrier must resolve to a
-    tuple of pinned `!hc.idx<...>` dimensions, the shaped result must carry the
-    same static shape, and ops with an addressed source can expose that source
-    plus their index/slice operands for rank diagnostics. Individual ops only
-    describe where those pieces live.
+    Verifier owns the policy: carrier must resolve to a tuple of pinned
+    `!hc.idx<...>` dims, shaped result must carry the same static shape,
+    addressed-source ops expose the source + index/slice operands for
+    rank diagnostics. Ops only describe where those pieces live.
   }];
   let cppNamespace = "::mlir::hc";
   let methods = [

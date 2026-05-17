@@ -2,11 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Smoke tests for `libhc_rt_helpers.so`. These verify the C ABI surface end
-# to end: the test ctypes-loads the shared library, hands it tensor-like
-# Python objects, and asserts the returned descriptors and scalars match
-# what the host wrapper emitted by hc.compile will see when it calls these
-# helpers from JIT'd code.
+# Smoke tests for `libhc_rt_helpers.so`: ctypes-load, hand the lib
+# tensor-like Python objects, assert returned descriptors/scalars match
+# what `hc.compile`'s host wrapper sees from JIT'd code.
 
 from __future__ import annotations
 
@@ -30,8 +28,8 @@ _HELPER_NAMES = (
 
 
 class _NumpyTensor:
-    """Duck-typed stand-in for a torch.Tensor, just enough to drive the
-    helpers without taking on a torch dependency in the test suite."""
+    """Duck-typed torch.Tensor stand-in — drives the helpers without
+    pulling torch into the test suite."""
 
     def __init__(self, array: np.ndarray) -> None:
         self._array = array
@@ -57,9 +55,8 @@ def _resolve_helpers_path() -> Path:
         ).install_root
     ).install_root
     candidates.append(install_root / "lib" / "libhc_rt_helpers.so")
-    # Tolerant of a stale build keyed against the previous toolchain hash —
-    # if the lock changed but the LLVM rebuild hasn't run yet, the freshest
-    # install in the cache is still a useful test target.
+    # Tolerant of a stale build: if the lock changed but LLVM rebuild
+    # hasn't run, the freshest cached install is still useful.
     project_root = Path(__file__).resolve().parents[1]
     cached = sorted(
         (project_root / ".hc" / "native" / "install").glob("*/lib/libhc_rt_helpers.so"),
@@ -98,9 +95,8 @@ def test_helpers_export_expected_symbols(helpers: ctypes.CDLL) -> None:
 
 
 def test_get_ptr_returns_data_pointer(helpers: ctypes.CDLL) -> None:
-    # `hc_get_ptr` is the buffer ABI entry the `!hc.ptr<global, T?>`
-    # kernel-arg path calls into — it should return the same address as
-    # `data_ptr()`.
+    # `hc_get_ptr` is the `!hc.ptr<global, T?>` kernel-arg entry —
+    # returns the same address as `data_ptr()`.
     array = np.arange(64, dtype=np.float16)
     tensor = _NumpyTensor(array)
     expected_ptr = int(array.ctypes.data)
@@ -133,15 +129,14 @@ def test_get_dim_reads_size(helpers: ctypes.CDLL) -> None:
 def test_get_stride_reads_element_strides(helpers: ctypes.CDLL) -> None:
     array = np.zeros((4, 8), dtype=np.int64)
     tensor = _NumpyTensor(array)
-    # Contiguous: stride(0) == 8 elements, stride(1) == 1 element.
+    # Contiguous: stride(0)=8, stride(1)=1 (elements, not bytes).
     assert helpers._mlir_ciface_hc_get_stride(tensor, 0) == 8
     assert helpers._mlir_ciface_hc_get_stride(tensor, 1) == 1
 
 
-# Note: error paths are not exercised here. The helpers throw `std::runtime_error`
-# on bad input, and a C++ exception unwinding through the C ABI boundary into
-# ctypes is implementation-defined (in practice: the process aborts because
-# the JIT'd caller has no unwind tables either). Same pattern as wave's
-# `buffer_utils`. The host wrapper is responsible for never feeding invalid
-# objects in the first place; runtime tracebacks would have to come from a
-# subprocess harness, which is overkill here.
+# Error paths not exercised here: helpers throw `std::runtime_error` on
+# bad input; unwinding through the C ABI into ctypes is
+# implementation-defined (in practice: process aborts because the JIT'd
+# caller has no unwind tables). Host wrapper is responsible for never
+# feeding invalid objects; runtime tracebacks would need a subprocess
+# harness.

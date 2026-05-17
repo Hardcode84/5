@@ -96,26 +96,21 @@ def test_main_stages_package_native_artifacts(
 ) -> None:
     """`python -m build_tools.hc_native_tools` populates `hc/_native/`.
 
-    The CLI entry exists for source-tree devs who don't want to go
-    through `pip install -e .` just to refresh the cmake install.
-    Before this test landed, the entry stopped after the cmake install
-    and left the package-relative `hc/_native/` tree to whatever a
-    previous pip run had left behind — most often a half-populated
-    state missing `ld.lld`, which surfaced five passes downstream as
-    a confusing `hc-lower-gpu-to-binary` linker failure. The CLI must
-    now invoke the same staging the wheel/editable build hooks use,
-    so the source-tree workflow is self-contained.
+    CLI entry for source-tree devs to refresh the cmake install without
+    `pip install -e .`. Must invoke the same staging the wheel/editable
+    build hooks use — half-populated `hc/_native/` (e.g. missing
+    `ld.lld`) surfaces as confusing `hc-lower-gpu-to-binary` linker
+    failures five passes downstream.
     """
     llvm_install_root = tmp_path / "llvm-install" / "toolchain-key"
     native_install_root = tmp_path / "native-install"
     project_root = tmp_path / "project"
-    # Stage lld into the fake llvm install so the staging step has
-    # something to copy. The on-disk layout matches what the real
-    # llvm bootstrap produces.
+    # Stage lld into the fake llvm install — staging needs something
+    # to copy. Layout mirrors real llvm bootstrap output.
     (llvm_install_root / "bin").mkdir(parents=True)
     (llvm_install_root / "bin" / "ld.lld").write_text("lld\n", encoding="utf-8")
-    # Fake out the heavy bootstrap calls — we don't need a real LLVM
-    # toolchain or cmake invocation to exercise the staging surface.
+    # Fake out heavy bootstrap — no real LLVM toolchain or cmake
+    # needed to exercise the staging surface.
     monkeypatch.setattr(
         hc_native_tools, "ensure_llvm_toolchain", lambda: llvm_install_root
     )
@@ -126,9 +121,9 @@ def test_main_stages_package_native_artifacts(
             _build_fake_native_install(native_install_root) or native_install_root
         ),
     )
-    # `_project_root` is called inside `main` without args; redirect
-    # it at the per-test fixture root so the staging lands somewhere
-    # we can inspect without touching the real `hc/_native/`.
+    # `_project_root` runs inside `main` with no args — redirect to
+    # the per-test fixture root so staging lands somewhere
+    # inspectable, not the real `hc/_native/`.
     monkeypatch.setattr(
         hc_native_tools, "_project_root", lambda *args, **kw: project_root
     )
@@ -148,10 +143,10 @@ def test_main_stages_package_native_artifacts(
 
 
 def _build_fake_native_install(native_install_root: Path) -> None:
-    """Lay out a minimal cmake-install tree for the staging step.
+    """Minimal cmake-install tree for the staging step.
 
-    Mirrors the bits `_validate_native_install` requires: `bin/hc-opt`
-    and `python_packages/hc_front/hc_mlir/ir.py`. Everything else is
+    Has the bits `_validate_native_install` requires (`bin/hc-opt`,
+    `python_packages/hc_front/hc_mlir/ir.py`); everything else is
     optional from the staging side.
     """
     (native_install_root / "bin").mkdir(parents=True)

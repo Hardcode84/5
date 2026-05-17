@@ -2,70 +2,41 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-"""Tiled AMDGPU matmul example built around a gfx11 WMMA intrinsic.
+"""Tiled AMDGPU matmul built around a gfx11 WMMA intrinsic.
 
 Run from the repository root with:
 
     python -m examples.amdgpu_gfx11_wmma_matmul
 
-Pass ``--dump-front-ir`` to lower the kernel plus its transitive decorated
-helpers through the Python frontend and print the resulting combined
-``hc_front`` textual MLIR instead of running the simulator.
+Flags:
 
-Pass ``--dump-hc-ir`` to run the current frontend-to-``hc`` pipeline and print
-the resulting ``hc`` textual MLIR instead.
+* ``--dump-front-ir`` — print combined ``hc_front`` MLIR.
+* ``--dump-hc-ir`` — print result of front-to-``hc`` pipeline.
+* ``--run-on-hw`` — compile for ``amdgpu-gfx11``, dispatch through
+  ``hc.compile().invoke()`` on ``torch.cuda`` tensors. Needs ROCm +
+  gfx11 + torch.
+* ``--bench`` — same plus ``compiled.bench(...)`` stats. Untimed
+  correctness check runs first; mismatch warns, doesn't abort
+  (bench measures dispatch latency, valid even on miscompile).
 
-Pass ``--run-on-hw`` to compile the kernel for ``amdgpu-gfx11`` and dispatch
-it through ``hc.compile().invoke()`` against ``torch.cuda`` tensors on a
-physical gfx11 GPU, comparing the result to ``reference_blocked_matmul``.
-Requires a working ROCm install with a gfx11 device visible to HIP and the
-``torch`` package on the path.
+Models RDNA3/gfx11 ``v_wmma_f32_16x16x16_f16`` at WorkItem scope.
+Collective-return values keep the accumulator wave-distributed across
+the K loop. For wave32:
 
-Pass ``--bench`` to compile with ``bench=True``, dispatch through
-``compiled.bench(...)`` against ``torch.cuda`` tensors, and print a small
-stats table (median / mean / std + per-launch derivations). A correctness
-smoke check runs first; on a mismatch we *warn but do not abort* — the
-bench surface is for timing dispatch latency, not for verifying numerics,
-and the launch/dispatch cost is still meaningful even when the kernel
-itself is miscompiled (which is exactly when you want to triage the gap).
-Requires the same ROCm + torch setup as ``--run-on-hw``.
+* A[i, k]: lanes ``i`` and ``i + 16``, register ``floor(k / 2)``.
+* B[k, j]: lanes ``j`` and ``j + 16``, register ``floor(k / 2)``.
+* D[i, j]: register ``floor(i / 2)``, lane ``16 * (i % 2) + j``.
 
-This version models the RDNA3/gfx11 `v_wmma_f32_16x16x16_f16` layout at
-WorkItem scope. It also uses collective-return values to keep the WMMA
-accumulator distributed across workitems at the WorkGroup-level K loop
-boundary: `acc = init_wmma_acc(group)` before the loop,
-`acc = issue_wmma_tile(...)` inside it, and `acc[:, lane]` when a lane consumes
-its local fragment. For wave32, the calculator reports:
+Each lane carries duplicated A row + B column fragments and an
+8-value accumulator striped over even/odd output rows.
 
-* A[i, k] lives in lanes `i` and `i + 16`, register `floor(k / 2)`.
-* B[k, j] lives in lanes `j` and `j + 16`, register `floor(k / 2)`.
-* D[i, j] lives in register `floor(i / 2)`, lane `16 * (i % 2) + j`.
-
-That means each lane carries a duplicated A row fragment, a duplicated B column
-fragment, and an 8-value accumulator fragment striped over either even or odd
-output rows for one output column.
-
-The per-lane accumulator addressing is captured once as
-``WAVE_ACC_FRAG_LAYOUT`` — an ``index_map`` whose offset
-``(lane // 16 + fi * 2) * 16 + (lane % 16)`` maps each
-``(lane, fragment_index)`` pair to a position inside the flat 16x16
-output tile. ``init_wmma_acc`` and ``store_wmma_tile`` both attach
-this layout to the C-tile buffer through ``as_layout(c_tile,
-WAVE_ACC_FRAG_LAYOUT, shape=(WAVE_LANES, WMMA_ACC_FRAGMENT))``,
-then read / write this lane's row off the layout-bearing view with
-``group.vload(c_lane[lane, :], shape=(WMMA_ACC_FRAGMENT,))`` and
-the matching ``group.store(c_lane[lane, :], frag)``. One layout
-declaration, two call sites that share its offset formula by
-construction.
-
-The buffer-side ``as_layout`` with shape-changing reinterpretation
-threads end-to-end through the substrate: ``hc-load-store-to-
-generic`` peels the as_layout, composes the layout's offset with
-the declared ``(WAVE_LANES, WMMA_ACC_FRAGMENT)`` shape, and row-
-major-splits the flat offset against the underlying C-tile's
-``(16, 16)`` storage; ``hc-distribute-wave-layouts`` then factors
-the lane axis out of the wave-cooperative carrier before the
-``hc.generic`` decomposition.
+``WAVE_ACC_FRAG_LAYOUT`` encodes the per-lane accumulator addressing
+with offset ``(lane // 16 + fi * 2) * 16 + (lane % 16)``.
+``init_wmma_acc`` / ``store_wmma_tile`` attach it via ``as_layout`` so
+both sites share the formula by construction.
+``hc-load-store-to-generic`` peels the as_layout and composes against
+the ``(16, 16)`` tile; ``hc-distribute-wave-layouts`` factors the
+lane axis before ``hc.generic`` decomposition.
 """
 
 from __future__ import annotations
@@ -106,8 +77,7 @@ _WMMA_SIGNATURE_ARGS = (
     (4, "vector", (WMMA_K,), np.float16, "B lane fragment"),
     (5, "vector", (WMMA_ACC_FRAGMENT,), np.float32, "accumulator fragment"),
 )
-# The intrinsic returns one updated `(WMMA_ACC_FRAGMENT,)` accumulator fragment
-# per workitem.
+# Result is one updated `(WMMA_ACC_FRAGMENT,)` fragment per workitem.
 
 M = sym.M
 N = sym.N
@@ -136,20 +106,11 @@ def _tile_origin(tile_row: int, tile_col: int) -> tuple[int, int]:
     return tile_row * WMMA_M, tile_col * WMMA_N
 
 
-# Layout that captures the per-lane WMMA accumulator addressing
-# inside a 16x16 C tile: lane `L` owns the elements at
-# `(row = L // WMMA_N + fi * WMMA_ACC_ROW_STRIDE, col = L % WMMA_N)`
+# Per-lane WMMA accumulator addressing inside a 16x16 C tile: lane `L`
+# owns `(row = L // WMMA_N + fi * WMMA_ACC_ROW_STRIDE, col = L % WMMA_N)`
 # for `fi in [0, WMMA_ACC_FRAGMENT)`. `storage_size = WMMA_M * WMMA_N`
-# matches the flat 16x16 tile span; the rank-balanced `(lane, fi)`
-# logical shape satisfies `LayoutAttr`'s
+# matches the flat tile span; `(lane, fi)` rank balances `LayoutAttr`'s
 # `index_syms.size() == shape_syms.size()` contract.
-#
-# `init_wmma_acc` and `store_wmma_tile` attach this layout to the
-# C-tile buffer via `as_layout(..., shape=(WAVE_LANES,
-# WMMA_ACC_FRAGMENT))` and let the substrate peel the layout-driven
-# gather/scatter into the underlying tile's row-major storage. Single
-# declared formula, two call sites that share its decomposition by
-# construction.
 WAVE_ACC_FRAG_LAYOUT = index_map(
     storage_size=lambda lc, fc: WMMA_M * WMMA_N,
     offset=lambda lane, fi, lc, fc: (lane // WMMA_N + fi * WMMA_ACC_ROW_STRIDE) * WMMA_N
@@ -216,8 +177,8 @@ def wmma_gfx11(
 ):
     """Simulator fallback for a gfx11 WMMA lane fragment.
 
-    The simulator reconstructs each lane result from staged wave-distributed
-    LDS tiles rather than from the explicit lane operands.
+    Reconstructs each lane result from staged wave-distributed LDS
+    tiles, not the explicit lane operands.
     """
 
     _ = (a_frag, b_frag)
@@ -226,13 +187,8 @@ def wmma_gfx11(
     rows = _lane_output_rows(lane, wave_size)
     col = _lane_column(lane)
     values = np.empty((len(rows),), dtype=np.float32)
-    # `acc_frag.mask` carries the per-element output-validity bits stamped
-    # in `init_wmma_acc` (true iff the corresponding `c[row, col]` is in
-    # bounds) and forwarded through every iteration. Skip the multiply-add
-    # for masked-off lanes so the fallback does not touch the poison
-    # accumulator slots that bounds clipping leaves behind, and so the
-    # simulator path mirrors the hardware lowering where the same mask gates
-    # both the WMMA result and the eventual store.
+    # `acc_frag.mask` carries output-validity from `init_wmma_acc`. Skip
+    # multiply-add for masked-off slots — fallback never touches poison.
     acc_mask = acc_frag.mask
     for index in range(len(rows)):
         accum = np.float32(0)
@@ -243,9 +199,7 @@ def wmma_gfx11(
                     b_tile[k_idx, col]
                 )
         values[index] = accum
-    # Forward `acc_frag.mask` so the WMMA result keeps the input mask on its
-    # output channel, matching what the hardware recipe does (see
-    # `_lower_wmma`'s second return value).
+    # WMMA preserves accumulator validity — forward the mask unchanged.
     return group.vload(values, mask=acc_frag.mask)
 
 
@@ -262,14 +216,10 @@ _FRAG_ACC_TYPE = f"vector<{WMMA_ACC_FRAGMENT}xf32>"
 
 @wmma_gfx11.lower(target="amdgpu-gfx11")
 def _lower_wmma(t, call):
-    # `amdgpu.wmma` only consumes the per-lane fragment vectors and the
-    # accumulator; the staged tiles, lane index, group token, and the
-    # `arch`/`wave_size` const_kwargs ride on the call site purely to
-    # gate dispatch. We touch the unused handles to surface a recipe-time
-    # error if the intrinsic signature ever drifts under us. The `.data`
-    # / `.mask` suffixes mirror `hc-decompose-shaped-values`: by the time
-    # `-hc-interpret-intrinsic-recipes` runs, every shaped operand has been
-    # split into a data + mask pair and the call site exposes both.
+    # `.data`/`.mask` suffixes mirror `hc-decompose-shaped-values`: by
+    # recipe-run time every shaped operand has split into data + mask.
+    # Touching unused handles surfaces signature drift here, not in a
+    # downstream verifier.
     _ = (
         call.operand("group"),
         call.operand("a_tile.data"),
@@ -280,26 +230,13 @@ def _lower_wmma(t, call):
         call.attr("arch"),
         call.attr("wave_size"),
     )
-    # Pre-rewrite assertions: target-dispatch already filters by the recipe's
-    # `hc.target = "amdgpu-gfx11"`, but that says nothing about the call
-    # site's *actual* `arch`/`wave_size`. A kernel whose `GFX_ARCH` drifted
-    # to `"gfx12"` would otherwise smuggle a wrong-arch call into the
-    # `amdgpu.wmma` rewrite and surface as a far-downstream verifier crash.
-    # Match the `i64` width the frontend emits for `wave_size`; a width
-    # mismatch counts as a value mismatch.
+    # Target-dispatch filters by recipe target, not call-site attrs;
+    # assert so a drifted `GFX_ARCH` can't smuggle a wrong-arch call
+    # into the rewrite. `wave_size` is `i64` from the frontend.
     t.require_attr(call, "arch", GFX_ARCH)
     t.require_attr(call, "wave_size", t.i64(WAVE_LANES))
-    # `amdgpu.wmma` rejects HC bare types; bridge through
-    # `unrealized_conversion_cast` at every operand and at the result. The
-    # `expected_type=` shortcut on `call.operand` plants the operand-side
-    # casts; `t.create(..., result_types=[upstream_str])` plus a closing
-    # `t.cast` swap the result-side type back to the bare form the call
-    # site exposes. `hc-lower-launch-body` already plants paired UCCs
-    # around every `hc.call_intrinsic` boundary, so the recipe-inserted
-    # casts pair with those existing ones and a post-rewrite
-    # `--canonicalize` collapses the chains to identity — `amdgpu.wmma`
-    # ends up sitting between plain upstream `vector<...>` values with
-    # no leftover bridging machinery.
+    # `amdgpu.wmma` rejects HC bare types — bridge via UCC. Pre-existing
+    # paired UCCs from `hc-lower-launch-body` collapse on canonicalize.
     op = t.create(
         "amdgpu.wmma",
         result_types=[_FRAG_ACC_TYPE],
@@ -308,22 +245,15 @@ def _lower_wmma(t, call):
             call.operand("b_frag.data", expected_type=_FRAG_AB_TYPE),
             call.operand("acc_frag.data", expected_type=_FRAG_ACC_TYPE),
         ],
-        # `amdgpu.wmma` declares `m`, `n`, `k` as `i32` attributes with
-        # confined value sets; emit them at the right width so the upstream
-        # verifier doesn't reject the freshly created op for "expected
-        # 'i32' but got 'i64'".
+        # `m`/`n`/`k` are `i32` with confined value sets — wrong width
+        # is a verifier reject.
         attrs={
             "m": t.i32(WMMA_M),
             "n": t.i32(WMMA_N),
             "k": t.i32(WMMA_K),
         },
     )
-    # `amdgpu.wmma` returns a single fragment data vector. The call site
-    # post-decomposition has two results — `acc.data` (the new accumulator)
-    # and `acc.mask` (its validity bits). The mask channel is invariant
-    # across the matmul step (the per-lane accumulator stays valid wherever
-    # it was valid going in), so forward `acc_frag.mask` unchanged as the
-    # second replacement.
+    # WMMA preserves accumulator validity — forward mask unchanged.
     return (
         t.cast(op.result(0), to=call.result_type(0)),
         call.operand("acc_frag.mask"),
@@ -350,48 +280,24 @@ def load_wmma_b_fragment(wi, b_tile):
 
 @kernel.func(scope=WorkGroup)
 def init_wmma_acc(group, c, row0, col0):
-    # Stamp the per-element output-validity mask onto the accumulator
-    # fragment at construction time. WMMA's recipe forwards the input
-    # acc fragment's mask onto the result, so a bounds-aware mask stamped
-    # here propagates through every loop iteration and the final
-    # `group.store` keeps a real per-element `scf.if` guard instead of
-    # canonicalize folding it to an unconditional store that walks past
-    # `c[M, N]` for off-tile shapes.
-    #
-    # Why init and not `issue_wmma_tile`: putting the bounds-stamp inside
-    # the body of the k-tile `for` loop trips an iterative-inference
-    # fixed-point issue in `hc-infer-types`. Doing it once before the
-    # loop sidesteps that issue while still pinning the mask into every
-    # accumulator carried around the loop.
+    # Stamp the output-validity mask onto the accumulator at
+    # construction. WMMA forwards input mask to result, so bounds-aware
+    # mask rides every K iteration and the final `group.store` keeps a
+    # per-element `scf.if` guard rather than walking past `c[M, N]`.
+    # Stamping inside the k-loop trips an `hc-infer-types` fixed-point
+    # issue; once-before-the-loop sidesteps it.
     @group.workitems
     def init(wi):
         lane = wi.local_id()[0]
-        # Symmetric layout-driven init: attach the per-lane WMMA
-        # accumulator layout to the C-tile buffer once via `as_layout`
-        # with a declared `(WAVE_LANES, WMMA_ACC_FRAGMENT)` shape, then
-        # gather this lane's `(WMMA_ACC_FRAGMENT,)` row off the layout-
-        # bearing view. The matching scatter in `store_wmma_tile` reads
-        # the same view, so the lane addressing lives in one place —
-        # `WAVE_ACC_FRAG_LAYOUT` — and the two callers share its offset
-        # formula structurally instead of open-coding the inverse on
-        # the store side.
-        #
-        # Substrate guarantees:
-        #   - `hc-load-store-to-generic` peels the `hc.as_layout` and
-        #     routes the mixed pinned + slice access through the
-        #     layout-driven gather decomposition: `LAY.offset(lane,
-        #     i_0)` composed with the declared `(32, 8)` shape, then
-        #     row-major-split against the underlying `(16, 16)` tile.
-        #   - `hc-distribute-wave-layouts` factors the leading `lane`
-        #     axis out of the layout-bearing carriers before
-        #     `hc.generic` decomposition, so per-lane peers see the
-        #     `(WMMA_ACC_FRAGMENT,)` slice and not the wave-cooperative
-        #     `(WAVE_LANES, WMMA_ACC_FRAGMENT)` tile.
-        #   - The simulator's gather OOB-pads the clipped slice up to
-        #     the slice's intent shape, so partial-tile cases (M/N not
-        #     multiples of WMMA_M/WMMA_N) mask False at the right
-        #     per-element positions instead of aliasing in-bounds cells
-        #     from the clipped ravel.
+        # `as_layout` attaches `WAVE_ACC_FRAG_LAYOUT` to the C-tile
+        # once; `store_wmma_tile` reads through the same view.
+        # `hc-load-store-to-generic` peels the as_layout and routes
+        # through `LAY.offset(lane, i_0)` composed with `(32, 8)`,
+        # row-major-split against the `(16, 16)` tile.
+        # `hc-distribute-wave-layouts` then factors the lane axis.
+        # Simulator OOB-pads the clipped slice so partial tiles mask
+        # False at the right positions instead of aliasing in-bounds
+        # cells from the clipped ravel.
         c_lane = as_layout(
             c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N],
             WAVE_ACC_FRAG_LAYOUT,
@@ -409,10 +315,8 @@ def issue_wmma_tile(group, a_tile, b_tile, acc):
         lane = wi.local_id()[0]
         a_frag = load_wmma_a_fragment(wi, a_tile)
         b_frag = load_wmma_b_fragment(wi, b_tile)
-        # `acc[:, lane, 0]` indexes out the trailing singleton collective axis
-        # so the WMMA input matches its declared `(WMMA_ACC_FRAGMENT,)` vector
-        # shape; the leading `:` keeps the fragment elements (and their
-        # bounds-aware mask, see `init_wmma_acc`).
+        # Trailing singleton collective axis off so WMMA input matches
+        # `(WMMA_ACC_FRAGMENT,)`; leading `:` keeps fragment + mask.
         return wmma_gfx11(
             group,
             a_tile,
@@ -433,16 +337,9 @@ def store_wmma_tile(group, c, row0, col0, acc) -> None:
     @group.workitems
     def wave(wi):
         lane = wi.local_id()[0]
-        # Symmetric layout-driven scatter: reuse the same layout-bearing
-        # view the matching `init_wmma_acc` reads from. The
-        # `as_layout(c_tile, LAY, shape=(WAVE_LANES,
-        # WMMA_ACC_FRAGMENT))` form puts the per-lane addressing on the
-        # buffer's type; `group.store(c_lane[lane, :], ...)` lets
-        # `hc-load-store-to-generic` peel the as_layout and run the
-        # scatter through the same layout-driven decomposition the load
-        # side uses. The accumulator carries a trailing singleton
-        # collective axis from `wmma_gfx11`, so `acc[:, lane, 0]` peels
-        # it off to match the destination's `(WMMA_ACC_FRAGMENT,)` row.
+        # Same view as `init_wmma_acc` — single addressing source.
+        # `acc[:, lane, 0]` peels the singleton collective axis to match
+        # the destination's `(WMMA_ACC_FRAGMENT,)` row.
         c_lane = as_layout(
             c[row0 : row0 + WMMA_M, col0 : col0 + WMMA_N],
             WAVE_ACC_FRAG_LAYOUT,
@@ -519,10 +416,7 @@ def make_demo_inputs(
 def _require_torch_cuda(surface: str):
     """Import torch and confirm a HIP/ROCm device is visible.
 
-    Both `--run-on-hw` and `--bench` need the same precondition;
-    factoring the import + check keeps the error texts consistent
-    (`surface=` names which flag the caller passed so the message is
-    actionable instead of generic).
+    `surface=` names the caller's flag for diagnostics.
     """
     try:
         import torch
@@ -549,14 +443,9 @@ def run_on_hardware(
 ) -> np.ndarray:
     """Compile for gfx11 and invoke through the bundled HIP shim.
 
-    Mirrors `tests/test_examples.py::test_gfx11_wmma_example_invokes_on_real_hardware`,
-    which is the executable spec for the same chain. We use `torch.cuda`
-    tensors for the device buffers because `Tensor.data_ptr()` returns a
-    HIP-allocated pointer that `_mlir_ciface_hc_get_ptr` hands straight
-    to `gpu.launch_func` — the runtime helpers don't allocate or copy on
-    their own. Raises a clear `RuntimeError` (not `ImportError`)
-    when torch or torch.cuda is missing so callers see a single
-    actionable message instead of a stack trace.
+    `torch.cuda` tensors back device buffers — `Tensor.data_ptr()`
+    returns a HIP pointer that `_mlir_ciface_hc_get_ptr` hands to
+    `gpu.launch_func`.
     """
 
     torch = _require_torch_cuda("--run-on-hw")
@@ -588,14 +477,10 @@ def bench_on_hardware(
     rtol: float = 0.0,
     atol: float = 2e-3,
 ):
-    """Compile with bench=True, smoke-check the output, then bench.
+    """Compile with bench=True, smoke-check, then bench.
 
-    Same device-allocation shape as `run_on_hardware`. We sample one
-    invoke before timing and assert the output matches the numpy
-    reference so the bench numbers below come from a known-correct
-    kernel — timing a miscompile is worse than failing loudly, and the
-    asserted diff floor is exactly the same `(atol, rtol)` pair the
-    simulator and `run_on_hardware` paths use.
+    Untimed invoke checks numerics against numpy at the simulator's
+    `(atol, rtol)` floor — timing a miscompile is worse than failing loud.
     """
     torch = _require_torch_cuda("--bench")
 
@@ -608,10 +493,8 @@ def bench_on_hardware(
     c_dev = torch.zeros(m, n, dtype=torch.float32, device="cuda")
 
     compiled = hc.compile(tiled_gfx11_wmma_matmul, target="amdgpu-gfx11", bench=True)
-    # One untimed invoke to fill `c_dev`. The bench loop after this
-    # overwrites it `m_outer*n_inner` times with the same value (inputs
-    # are constant across samples), so the final readback reflects the
-    # same kernel output as the smoke check below.
+    # Untimed invoke fills `c_dev`; bench loop overwrites with the same
+    # value across samples — readback reflects the checked output.
     compiled.invoke(a_dev, b_dev, c_dev)
     out = c_dev.cpu().numpy()
     reference = reference_blocked_matmul(a, b)
@@ -627,14 +510,10 @@ def bench_on_hardware(
 
 
 def dump_front_ir() -> None:
-    """Lower the kernel + its transitive deps to ``hc_front`` and print it.
+    """Lower the kernel + transitive deps to ``hc_front`` and print.
 
-    Uses the same resolver that ``hc.compile`` does so the dumped module
-    matches what downstream lowering will see — one combined module with
-    every `hc_front.name` load carrying a ``ref`` classification.
-
-    Imports the resolver lazily so the simulator path stays independent of
-    the managed ``hc_mlir`` native bindings.
+    Same resolver as `hc.compile` — dumped module matches what
+    downstream lowering sees.
     """
 
     from hc._resolve import resolve_front_ir
@@ -727,9 +606,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_diff = float(np.max(np.abs(out - reference)))
         print("gfx11 WMMA tiled matmul example passed on real hardware.")
         print(f"shape: A={a.shape}, B={b.shape}, C={out.shape}")
-        # Round-off vs the blocked f32 reference; expected to be on the
-        # order of f16 mantissa (~1e-3) for the demo's uniform [-1, 1]
-        # inputs once we cross the f16 -> f32 accumulation boundary.
+        # f16 -> f32 round-off vs blocked f32 reference (~1e-3 on
+        # uniform [-1, 1]).
         print(f"max abs diff vs blocked fallback reference: {max_diff}")
         return
     if args.bench:

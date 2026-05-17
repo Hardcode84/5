@@ -23,10 +23,7 @@ bool mlir::hc::isHCUndefType(Type type) { return isa<UndefType>(type); }
 
 namespace {
 
-// Validate one tuple element as a pinned `!hc.idx<expr>`, push its
-// expression onto `dims`. On failure, routes through `diagOp` if
-// present (gives a per-op-error diagnostic) or returns silent
-// failure when called from the helper-style `get*` path.
+// Pinned `!hc.idx<expr>` only. diagOp non-null → emit error; null → silent.
 static LogicalResult collectTupleDim(Type dimType, size_t idx,
                                      Operation *diagOp,
                                      SmallVectorImpl<Attribute> &dims) {
@@ -86,9 +83,7 @@ mlir::hc::verifyStaticShapeFromTupleType(Type shapeType, Operation *diagOp) {
   return staticShapeFromTupleType(shapeType, diagOp);
 }
 
-// Element-wise join of two tuple types: a tuple is HC-joinable iff
-// its arity matches and every element pair joins. Result is a new
-// tuple in `lhs`'s context.
+// Result in `lhs`'s context.
 static Type joinHCTupleTypes(TupleType lhs, TupleType rhs) {
   if (lhs.size() != rhs.size())
     return {};
@@ -143,8 +138,6 @@ bool mlir::hc::areHCBranchTypesCompatible(Type source, Type dest) {
   return static_cast<bool>(joinHCTypes(source, dest));
 }
 
-// Element-wise refinement check for two tuple types: a tuple is more
-// refined iff arity matches and at least one element pair refines.
 static bool shouldRefineHCTuple(TupleType current, TupleType inferred) {
   if (current.size() != inferred.size())
     return false;
@@ -155,10 +148,7 @@ static bool shouldRefineHCTuple(TupleType current, TupleType inferred) {
       });
 }
 
-// `!hc.idx<expr>` / `!hc.pred<pred>` refinement: a pinned inferred
-// type refines a non-pinned current of the same kind. Anything else
-// is "not a refinement" — caller treats `false` as "leave the
-// current type alone".
+// Pinned inferred refines unpinned current of the same kind.
 static bool shouldRefineHCIdx(IdxType current, Type inferred) {
   auto inferredIdx = dyn_cast<IdxType>(inferred);
   return inferredIdx && !current.getExpr() && inferredIdx.getExpr();
@@ -187,19 +177,14 @@ bool mlir::hc::shouldRefineHCType(Type current, Type inferred) {
 
 namespace {
 
-// `!hc.idx` and `!hc.pred` inline their symbolic text as a quoted string.
-// Parsing routes through the dialect-owned ixsimpl symbolic expression store;
-// printing reuses the canonical ixsimpl-rendered form so the handle-backed
-// attribute stays the single source of truth.
+// `!hc.idx` / `!hc.pred` inline as quoted string via dialect-owned ixsimpl
+// store.
 
 template <typename HandleT>
 using StoreParser = FailureOr<HandleT> (*)(sym::Store &, llvm::StringRef,
                                            std::string *);
 
-// Accepts either the inline form (`"expr"`, the canonical printer output) or
-// the explicit attribute form (`#hc.expr<"expr">`). `parseOptionalString`
-// returns `success` iff the next token is a string literal, so we can branch
-// on it without lookahead hacks.
+// Accepts inline `"expr"` or attribute `#hc.expr<"expr">`.
 template <typename AttrT, typename HandleT, StoreParser<HandleT> ParseFn>
 static FailureOr<AttrT> parseInlineOrAttrForm(AsmParser &parser,
                                               llvm::StringRef what) {
@@ -361,8 +346,7 @@ mlir::hc::getLaunchContextMetadata(Type contextType) {
   if (auto group = dyn_cast_or_null<GroupType>(contextType))
     return LaunchContextMetadata{group.getWorkShape(), group.getGroupShape(),
                                  group.getSubgroupSize()};
-  // Nested launch contexts intentionally carry only workgroup-local metadata;
-  // work-grid queries must come from the enclosing group handle.
+  // Nested contexts: workgroup-local only; work-grid lives on enclosing group.
   if (auto workitem = dyn_cast_or_null<WorkitemType>(contextType))
     return LaunchContextMetadata{/*workShape=*/ShapeAttr(),
                                  workitem.getGroupShape(),
@@ -374,11 +358,8 @@ mlir::hc::getLaunchContextMetadata(Type contextType) {
   return std::nullopt;
 }
 
-// Shaped-type verifiers share one signature: shape must be non-null,
-// layout (when present) is structurally validated by LayoutAttr's own
-// verifier — we don't enforce shape-rank vs shape_syms agreement here
-// because the canonicalize / flatten passes are the natural place to
-// reject mismatches (and to fold identity layouts back to absent).
+// Shape non-null. Layout self-checks. Rank vs shape_syms parity in later
+// passes.
 static mlir::LogicalResult
 verifyShapedTypeShell(function_ref<InFlightDiagnostic()> emitError,
                       ShapeAttr shape, LayoutAttr /*layout*/) {
@@ -411,23 +392,8 @@ Type mlir::hc::BufferType::cloneWithSymbolicShape(ShapeAttr shape) const {
 
 namespace {
 
-// Same flavor + same element + same shape → join the layout slot.
-//
-// Equal layouts keep the layout. One side bare and the other
-// layout-bearing widens to the layout-bearing form: the layout
-// declares the underlying storage (its `storage_size` may differ from
-// the dim product, e.g. a 256-element backing under an 8-element
-// logical shape for per-lane WMMA fragments). The bare side, by
-// contract, describes the identity layout — strictly less specific.
-// Picking the layout-bearing side is the only join that preserves
-// storage semantics; widening to bare would silently drop the
-// non-identity backing the layout side commits to and produce IR
-// that misrepresents the actual allocation downstream of `hc-flatten-
-// with-layouts`.
-//
-// Two distinct non-null layouts are incompatible — there's no
-// principled tiebreaker, so the join fails and the caller falls back
-// to "no common type". Same goes for element / shape mismatch.
+// Same flavor/element/shape. Bare ∪ layout → layout. Two distinct layouts →
+// fail.
 template <typename ShapedT>
 static Type joinShapedSameFlavor(ShapedT lhs, Type rhsRaw) {
   auto rhs = dyn_cast<ShapedT>(rhsRaw);
@@ -568,11 +534,8 @@ Type mlir::hc::BareVectorType::joinHCType(Type other) const {
   return joinShapedSameFlavor(*this, other);
 }
 
-// `subgroup_size` is the wavefront width: always strictly positive when
-// present (32 on wave32 chips, 64 on wave64). "Unknown" is expressed by
-// the attribute being absent; storing zero would silently propagate
-// through `subgroupCollectiveSuffix` (firstDim / 0) and pin
-// `IdxType<#hc.expr<"0">>` on `hc.wave_size`. Negative is also rejected.
+// Absent = unknown. Zero pins IdxType<#hc.expr<"0">> on hc.wave_size via
+// firstDim / 0.
 static mlir::LogicalResult
 verifySubgroupSize(function_ref<InFlightDiagnostic()> emitError,
                    ExprAttr subgroupSize) {
@@ -657,8 +620,8 @@ void IdxType::print(AsmPrinter &printer) const {
 }
 
 Type IdxType::joinHCType(Type other) const {
-  // Distinct symbolic facts widen to the unpinned idx type. Keeping a concrete
-  // expression here would guess which control-flow predecessor won.
+  // Distinct symbolic facts widen to unpinned — concretizing guesses a
+  // predecessor.
   if (isa<IdxType>(other))
     return getUnpinnedIdxType(getContext());
   return {};
@@ -686,8 +649,7 @@ void PredType::print(AsmPrinter &printer) const {
 }
 
 Type PredType::joinHCType(Type other) const {
-  // Predicates use the same conservative widening as idx expressions: preserve
-  // the kind, drop the path-specific symbolic payload.
+  // Widen: keep kind, drop payload.
   if (isa<PredType>(other))
     return getUnpinnedPredType(getContext());
   return {};
@@ -705,12 +667,8 @@ static FailureOr<Type> parseSlicePartType(AsmParser &parser, StringRef key) {
   return type;
 }
 
-// Drives the `<key = value, key = value, ...>` body of an angle-
-// bracketed type literal. `handleField` parses one `key = value`
-// pair (caller is responsible for the value-side parse and for
-// emitting an "unknown parameter" diagnostic on miss). Consumes the
-// trailing `>`. Caller has already confirmed the `<` opener (or
-// skipped this call entirely when the literal omits the brackets).
+// Caller already saw `<`. Consumes trailing `>`. Unknown keys diagnosed by
+// handleField.
 template <typename FieldHandler>
 static LogicalResult parseAngleBracketedFields(AsmParser &parser,
                                                FieldHandler handleField) {
@@ -726,8 +684,6 @@ static LogicalResult parseAngleBracketedFields(AsmParser &parser,
   return parser.parseGreater();
 }
 
-// Per-key parse for `!hc.slice<...>`. Routes the parsed `Type` to the
-// matching out-parameter, or emits a diagnostic for an unknown key.
 static LogicalResult parseSliceField(AsmParser &parser, StringRef key,
                                      Type &lowerType, Type &upperType,
                                      Type &stepType) {
@@ -807,9 +763,6 @@ Type SliceType::joinHCType(Type other) const {
   return SliceType::get(getContext(), lower, upper, step);
 }
 
-// Per-key parse for `!hc.group<...>`. `work_shape` / `group_shape`
-// parse as `#hc.shape`; `subgroup_size` routes through the dedicated
-// helper.
 static LogicalResult parseGroupField(AsmParser &parser, StringRef key,
                                      ShapeAttr &workShape,
                                      ShapeAttr &groupShape,
@@ -869,9 +822,7 @@ void GroupType::print(AsmPrinter &printer) const {
   printer << ">";
 }
 
-// Per-key parse for the nested launch-context types (workgroup /
-// subgroup carriers). Shares the `group_shape` / `subgroup_size`
-// schema with `!hc.group<...>`, minus the `work_shape` member.
+// group_shape / subgroup_size only — no work_shape on nested contexts.
 static LogicalResult parseLaunchContextField(AsmParser &parser, StringRef key,
                                              ShapeAttr &groupShape,
                                              ExprAttr &subgroupSize) {

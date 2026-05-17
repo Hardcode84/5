@@ -758,6 +758,11 @@ static std::optional<std::string> diagnoseAmbientOffsetSyms(HCGenericOp op) {
                                  iterNames);
 }
 
+// Defined further down alongside the dispatcher; forward-declared here so the
+// pre-flight gate can mirror `lowerOne`'s precedence and skip value-outs-path
+// constraints for ops that would route to `lowerCollective`.
+static bool isCollectiveCandidate(HCGenericOp op, ArrayRef<IterAxis> axes);
+
 static std::optional<std::string> diagnoseUnsupported(HCGenericOp op) {
   bool hasValIn = false;
   bool hasValOut = false;
@@ -769,11 +774,26 @@ static std::optional<std::string> diagnoseUnsupported(HCGenericOp op) {
     return r;
   if (!hasValOut && !hasValIn)
     return std::nullopt;
+  // The body terminator gate applies to every cloneBody site, including
+  // the collective emitters, so keep it in front of the path split.
+  if (auto r = diagnoseGenericTerminator(op))
+    return r;
+  // The remaining three gates are value-outs-path constraints:
+  // lowerValueOuts compile-time-unrolls the parallel sweep into a
+  // single SSA register and so needs constant bounds, no reduction
+  // iter (no cross-lane carry shape), and iter-only offsets (slot
+  // eval is per-lane). lowerCollective takes the workgroup-tile path
+  // instead — runtime iter bounds, per-thread `scf.for` over the
+  // reduction iter against the LDS slot (`emitCollectiveChunkReductionNest`),
+  // ambient syms resolved through the launch scope — so these gates
+  // do not apply when the op would route to `lowerCollective`. Mirror
+  // the dispatch precedence in `lowerOne`: collective candidates skip
+  // the value-outs gates here, value-typed candidates still pay them.
+  if (isCollectiveCandidate(op, {}))
+    return std::nullopt;
   if (auto r = diagnoseConstantIterBounds(op))
     return r;
   if (auto r = diagnoseAllParallelIters(op))
-    return r;
-  if (auto r = diagnoseGenericTerminator(op))
     return r;
   return diagnoseAmbientOffsetSyms(op);
 }

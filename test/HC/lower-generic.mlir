@@ -640,6 +640,59 @@ func.func @collective_bare_tensor_ucc_lds(%src: !hc.ptr<global, f32>) {
 
 // -----
 
+// `bare_tensor` outs backed by `hc.alloc workgroup` via a UCC bridge
+// inside `gpu.launch`, with a reduction iter. The dispatcher mirrors
+// `lowerOne`'s precedence and skips the value-outs-path gates
+// (`diagnoseAllParallelIters`, etc.) when the op qualifies as a
+// collective candidate, so the reduction iter routes to
+// `emitCollectiveChunkReductionNest` instead of being rejected for
+// not being all-parallel.
+// CHECK-LABEL: func.func @collective_bare_tensor_outs_with_reduction
+// CHECK: gpu.launch
+// CHECK: %[[ALLOC:.+]] = hc.alloc count = %{{.+}} : index -> !hc.ptr<workgroup, f32>
+// CHECK: %[[TILE:.+]] = builtin.unrealized_conversion_cast %[[ALLOC]]
+// CHECK-SAME: !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["8"]>
+// CHECK: builtin.unrealized_conversion_cast %[[TILE]]
+// CHECK-SAME: !hc.bare_tensor<f32, ["8"]> to !hc.ptr<workgroup, f32>
+// CHECK: scf.for {{.*}} = %c0{{.*}} to %{{.*}} step %c1
+// CHECK: scf.if
+// CHECK: %[[INIT:.+]] = hc.ptr_load %{{.+}} : !hc.ptr<workgroup, f32> -> f32
+// CHECK: scf.for %{{.+}} = %c0{{.*}} to %{{.*}} step %c1{{.*}} iter_args(%[[ACC:.+]] = %[[INIT]]) -> (f32)
+// CHECK: hc.ptr_load %{{.+}} : !hc.ptr<global, f32> -> f32
+// CHECK: %[[SUM:.+]] = hc.add %[[ACC]], %{{.+}}
+// CHECK: scf.yield %[[SUM]] : f32
+// CHECK: hc.ptr_store %{{.+}}, %{{.+}} : f32, !hc.ptr<workgroup, f32>
+// CHECK: gpu.barrier
+// CHECK-NOT: hc.generic
+func.func @collective_bare_tensor_outs_with_reduction(
+    %src: !hc.ptr<global, f32>) {
+  %c1 = arith.constant 1 : index
+  %c32 = arith.constant 32 : index
+  %c8 = arith.constant 8 : index
+  gpu.launch blocks(%bx, %by, %bz) in (%gx = %c1, %gy = %c1, %gz = %c1)
+             threads(%tx, %ty, %tz) in (%sx = %c32, %sy = %c1, %sz = %c1) {
+    %lds = hc.alloc count = %c8 : index -> !hc.ptr<workgroup, f32>
+    %tile = builtin.unrealized_conversion_cast %lds
+        : !hc.ptr<workgroup, f32> to !hc.bare_tensor<f32, ["8"]>
+    %m = hc.idx_apply () : () -> !hc.idx<"8">
+    %n = hc.idx_apply () : () -> !hc.idx<"16">
+    %r = hc.generic
+        iter (parallel i = %m : !hc.idx<"8">,
+              reduction j = %n : !hc.idx<"16">)
+        ins (%src at [#hc.expr<"i*16 + j">] : !hc.ptr<global, f32>)
+        outs (%tile at [#hc.expr<"i">] : !hc.bare_tensor<f32, ["8"]>)
+        -> (!hc.bare_tensor<f32, ["8"]>) {
+    ^bb0(%sv: f32, %dv: f32):
+      %s = hc.add %dv, %sv : (f32, f32) -> f32
+      hc.yield %s : f32
+    }
+    gpu.terminator
+  }
+  return
+}
+
+// -----
+
 // Value-typed out: ptr ins + bare_vector out, single parallel iter
 // with a constant bound. The value-outs lowering unrolls the
 // parallel sweep at compile time (no `scf.parallel`), composes

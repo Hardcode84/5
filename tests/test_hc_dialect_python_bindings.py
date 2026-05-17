@@ -121,7 +121,6 @@ def test_pass_registry_exposes_canonical_front_to_hc_pipeline() -> None:
             "hc-materialize-bound-exprs,"
             "hc-inline-helpers,"
             "hc-normalize-scope-regions,"
-            "hc-lower-bare-predicates,"
             "hc-lower-kernels-to-gpu-launch,"
             "hc-lower-launch-body)"
         )

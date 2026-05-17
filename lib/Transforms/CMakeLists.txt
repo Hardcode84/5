@@ -10,13 +10,11 @@ add_mlir_library(MLIRHCTransforms
   HCEmitBenchWrapperPass.cpp
   HCFlattenWithLayoutsPass.cpp
   HCFoldPredicatesPass.cpp
-  HCInferGenericBoundsPass.cpp
   HCInferTypesPass.cpp
   HCInlineHelpersPass.cpp
   HCInsertWorkgroupBarriersPass.cpp
   HCInterpretIntrinsicRecipesPass.cpp
   HCLoadStoreToGenericPass.cpp
-  HCLowerBarePredicatesPass.cpp
   HCLowerGenericPass.cpp
   HCLowerGPUToBinaryPass.cpp
   HCLowerKernelsToGPULaunchPass.cpp

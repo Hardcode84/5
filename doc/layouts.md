@@ -534,17 +534,14 @@ in the pipeline:
   no layout is attached — to produce that single composed offset. The
   iter space stays nD on `iter_syms`; only the per-operand addressing
   collapses to 1D.
-* **SSA bounds with inference.** `iter_bounds` are SSA values
-  (`HC_ValueType`), so dynamic, runtime-resolved bounds drop in
-  naturally. Any subset may be a value of type `!hc.undef`; that's the
-  "infer me" sentinel. A dedicated `hc-infer-generic-bounds` pass walks
-  operand shapes and matches iter symbols in the per-axis offsets to
-  fill the placeholders. Inference runs **before** flatten — once
-  axes have been composed into a single linear expression, recovering
-  per-axis ranges is intractable. Rewrites that have full structural
-  knowledge (`hc.reduce` / `hc.matmul` → `hc.generic`) emit
-  fully-resolved bounds directly; the frontend stays simple and emits
-  `!hc.undef` placeholders for elementwise decomposition.
+* **SSA bounds.** `iter_bounds` are SSA values (`HC_ValueType`), so
+  dynamic, runtime-resolved bounds drop in naturally. Every `to-generic`
+  rewriter materialises iter bounds directly from operand shape entries
+  via empty-binding `hc.idx_apply` carrying `!hc.idx<dim>`. The
+  `!hc.undef` sentinel is reserved for hand-written `hc.generic` ops
+  that want an early placeholder; no production producer emits one and
+  the funnel passes never plant one, keeping the post-funnel IR free
+  of placeholder chasing.
 * **`iter_kinds`** lists `parallel | reduction` per iter sym. Mixing
   the two in one op is what makes it a contraction-shaped surface
   (matmul, dot, reductions over arbitrary axes) instead of a pure
@@ -684,18 +681,6 @@ and store off the mask directly — no hand-rolled OOB guard inside the
 rewriter, the predicate lives at the source-rewrite level on both
 sides.
 
-Bound inference — `hc-infer-generic-bounds`:
-
-Scans every `hc.generic` and fills any `iter_bounds` operand whose
-defining op is `hc.undef`. The procedure: for each iter sym `s`,
-collect every `(operand, axis)` pair where `s` appears in the offset
-expression at position `axis`; match the operand's shape entry at that
-axis against `[0, s)`; emit an empty-binding `hc.idx_apply` (or
-directly a shape-symbol-reference) producing the resolved bound. Conflicts (two
-operands implying different bounds for the same iter) are diagnostics,
-not silent picks. The pass is no-op if every bound is already
-concrete, so rewriters that emit fully-resolved ops pay nothing.
-
 Lowering — `hc-lower-generic`:
 
 Loop nest shape: parallel iters become an outer `scf.parallel` with
@@ -817,7 +802,6 @@ hc-infer-types                    propagate #hc.layout through the lattice
 hc-decompose-shaped-values        layout flows on data and mask halves
 hc-canonicalize-layouts           identity → absent, ixsimpl normalize, fold double as_layout
 hc-shaped-compute-to-generic      rewrite hc.matmul / hc.reduce into hc.generic + identity fill
-hc-infer-generic-bounds           fill !hc.undef iter_bounds on hc.generic from operand shapes
 hc-flatten-with-layouts           nD+layout → 1D no-layout, offsets at access sites
 hc-lower-launch-body              operate on 1D bare values; emit hc.alloc / hc.ptr_*
 hc-lower-generic                  symbolic stride analysis; scalar or vector codegen
@@ -1249,11 +1233,7 @@ on later slices.
    them through the operand's `#hc.layout` offset (or the identity
    layout) into a single entry on the post-flatten 1D operand.
    The verifier enforces rank parity in both regimes.
-10. **`hc-infer-generic-bounds`** — pre-flatten pass that walks operand
-    shapes and per-axis offsets to fill any `!hc.undef`-typed
-    `iter_bounds` on `hc.generic`. Conflicts diagnose; no-op when every
-    bound is already concrete.
-11. **`hc-shaped-compute-to-generic`** — rewrite `hc.matmul` and
+10. **`hc-shaped-compute-to-generic`** — rewrite `hc.matmul` and
     `hc.reduce` into `hc.generic` + an identity fill on the result.
     Runs pre-flatten on semantic shaped types so the per-axis offsets
     line up with the operand shapes directly; flatten then composes
@@ -1261,26 +1241,27 @@ on later slices.
     `hc.generic`. v0 supports rank-2 matmul (uniform arith family,
     `hc.astype`-promoted body), reduce sum on float / integer, and
     reduce max / min on float; integer max / min, `keepdims = true`,
-    and rank-0 result are deferred follow-ups.
-12. **`hc.generic` polymorphic outs** — extend the op so `outs` may
+    and rank-0 result are deferred follow-ups. Iter bounds are
+    materialised directly from operand shapes via empty-binding
+    `hc.idx_apply`.
+11. **`hc.generic` polymorphic outs** — extend the op so `outs` may
     mix value and ptr/buffer entries. `MemoryEffectsOpInterface`
     derives Read/Write per ptr-typed operand; result count tracks
     value-typed outs only; body block-arg element types come from the
     operand's element type or pointee type. Verifier updates and
     round-trip LIT only — no rewriters or lowering changes here.
-13. **`hc-elementwise-to-generic`** — rewrite the per-element
+12. **`hc-elementwise-to-generic`** — rewrite the per-element
     decomposed family (`hc.add`, `hc.sub`, `hc.mul`, `hc.div`,
     `hc.mod`, `hc.and`, `hc.or`, `hc.neg`, `hc.not`, `hc.cmp.*`,
     `hc.astype`) into a single `hc.generic` with all-parallel iters
     and value-typed outs. Pure source-level rewrite; runs pre-flatten
     so per-axis offsets are identity over the operand shape. Iter
-    bounds are emitted as `!hc.undef` placeholders that
-    `hc-infer-generic-bounds` later resolves from the operand shapes.
-    `hc.select`, scalar / shaped broadcast, and the nullary fills
-    (`hc.zeros`, `hc.full`, ...) are deferred — they need either an
-    init-scaffolding rework or a broadcast story this slice doesn't
-    pin down.
-14. **`hc-load-store-to-generic`** — rewrite `hc.load` / `hc.vload`
+    bounds are materialised directly from the result shape via
+    empty-binding `hc.idx_apply`. `hc.select`, scalar / shaped
+    broadcast, and the nullary fills (`hc.zeros`, `hc.full`, ...) are
+    deferred — they need either an init-scaffolding rework or a
+    broadcast story this slice doesn't pin down.
+13. **`hc-load-store-to-generic`** — rewrite `hc.load` / `hc.vload`
     into `hc.generic` with a ptr/buffer in and a value-typed out,
     `hc.store` into `hc.generic` with a value-typed in and a
     ptr/buffer out, and `hc.load_mask` into a value-typed-outs
@@ -1294,7 +1275,7 @@ on later slices.
     with `hc.yield_predicated` instead of `hc.yield`, so the
     lowering routes through `hc.ptr_store_pred` at the dst's ins-slot
     offset. Tensor-dst stores remain a deferred follow-up.
-15. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
+14. **scalar `hc-lower-generic`** — lower `hc.generic` (all three
     forms: value-out, ptr-out, mixed) to an outer `scf.parallel`
     over the parallel iters with an inner `scf.for` nest over the
     reduction iters carrying the accumulator via `iter_args`. The
@@ -1302,16 +1283,16 @@ on later slices.
     partition, no merges, all loads/stores scalar) so the vector
     slice is a delta and not a rewrite. Implicit `hc.ptr_load` for
     the ptr-out carry and implicit `hc.ptr_store` on the yield.
-16. **retire per-op lowering paths** — once every shaped op funnels
+15. **retire per-op lowering paths** — once every shaped op funnels
     into `hc.generic`, drop the dedicated lowering paths in
     `hc-lower-launch-body` and the bare-value decomposition machinery
     that fed them. Single codegen surface from this slice forward.
-17. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
+16. **switch `hc-lower-launch-body` from memref to `hc.ptr`** —
     wholesale replacement of the cooperative-load/store machinery;
     memref drops out. WMMA still on its existing intrinsic path.
-18. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
+17. **`hc-lower-to-llvm` for `hc.ptr` and `hc.alloc`** — the example
     runs end-to-end on the new stack.
-19. **symbolic stride vectorization** — same `hc-lower-generic`,
+18. **symbolic stride vectorization** — same `hc-lower-generic`,
     enables axis-order search (capped at 4) and partition
     enumeration with total unroll `prod(p_i) ≤ 32`, gated by an
     `ixs_check`-driven divisibility filter on each axis bound; runs
@@ -1323,5 +1304,5 @@ on later slices.
     when no axis divides above 1. The actual win.
 
 Slices 1–5 are pure additive (no observable behavior change beyond the
-strided buffer ABI, which preserves contiguous numerics). Slices 6–18
-are the risky middle. Slice 19 is what the design exists for.
+strided buffer ABI, which preserves contiguous numerics). Slices 6–17
+are the risky middle. Slice 18 is what the design exists for.

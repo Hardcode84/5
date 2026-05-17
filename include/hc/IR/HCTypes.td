@@ -356,8 +356,9 @@ def HC_PtrAccessValueType : AnyTypeOf<[
 // `hc.ptr_store_pred`, `hc.yield_predicated`, `hc.predicate`). Concrete
 // `i1` / `vector<Nxi1>` is the post-lowering surface; `!hc.pred` is the
 // pre-lowering body-level surface (mask element type before
-// `hc-lower-bare-predicates`). Shape parity with the value operand is on
-// the per-op verifier; this constraint only restricts the flavour.
+// launch-body lowering rewrites it to `i1`). Shape parity with the
+// value operand is on the per-op verifier; this constraint only
+// restricts the flavour.
 def HC_PtrPredicateType : AnyTypeOf<[
   HC_UndefType,
   HC_PredType,

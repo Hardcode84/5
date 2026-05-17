@@ -18,157 +18,108 @@ in what order.
 ## Default schedule
 
 `hc/schedules/front_to_hc.mlir` ships with the package and is applied
-when `hc.compile(..., schedule=None)` (the default). It runs the
-canonical `hc_front -> hc` pipeline:
+when `hc.compile(..., schedule=None)` (the default). It is the
+authoritative source for which passes run and in what order — the file
+itself, with its inline per-pass justifications, is the contract. This
+doc summarises the stages rather than pinning the pass list (a copy
+here would rot the moment a pass is added, removed, or reordered).
 
-```mlir
-module attributes {transform.with_named_sequence} {
-  transform.named_sequence @__transform_main(%m: !transform.any_op) {
-    %m1 = transform.apply_registered_pass "hc-front-fold-region-defs" to %m
-        : (!transform.any_op) -> !transform.any_op
-    %m2 = transform.apply_registered_pass "hc-front-inline" to %m1
-        : (!transform.any_op) -> !transform.any_op
-    %m3 = transform.apply_registered_pass "convert-hc-front-to-hc" to %m2
-        : (!transform.any_op) -> !transform.any_op
-    %m3a = transform.apply_registered_pass "hc-specialize-literals" to %m3
-        : (!transform.any_op) -> !transform.any_op
-    %m4 = transform.apply_registered_pass "hc-promote-names" to %m3a
-        : (!transform.any_op) -> !transform.any_op
-    %m5 = transform.apply_registered_pass "hc-infer-types" to %m4
-        : (!transform.any_op) -> !transform.any_op
-    %m6 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m5
-        : (!transform.any_op) -> !transform.any_op
-    %m7 = transform.apply_registered_pass "hc-verify-static-shapes" to %m6
-        : (!transform.any_op) -> !transform.any_op
-    %m8 = transform.apply_registered_pass "hc-decompose-shaped-values" to %m7
-        : (!transform.any_op) -> !transform.any_op
-    %m9 = transform.apply_registered_pass "hc-inline-helpers" to %m8
-        : (!transform.any_op) -> !transform.any_op
-    %m10 = transform.apply_registered_pass "hc-materialize-bound-exprs" to %m9
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_dce to %m10 : !transform.any_op
-    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m11 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m11 : !transform.any_op
-    %m12 = transform.apply_registered_pass "hc-lower-kernels-to-gpu-launch" to %m11
-        : (!transform.any_op) -> !transform.any_op
-    %m13 = transform.apply_registered_pass "hc-lower-launch-body" to %m12
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m13 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m13 : !transform.any_op
-    %m14 = transform.apply_registered_pass "hc-interpret-intrinsic-recipes"
-        with options = { "target" = "__HC_TARGET__" } to %m13
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m14 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m14 : !transform.any_op
-    %m15 = transform.apply_registered_pass "gpu-kernel-outlining" to %m14
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m15 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m15 : !transform.any_op
-    %m16 = transform.apply_registered_pass "rocdl-attach-target"
-        with options = { "chip" = "__HC_CHIP__" } to %m15
-        : (!transform.any_op) -> !transform.any_op
-    transform.apply_patterns to %m16 {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
-    transform.apply_cse to %m16 : !transform.any_op
-    transform.yield
-  }
-}
-```
+In phase order, the schedule does:
 
-The `__HC_TARGET__` and `__HC_CHIP__` tokens are substitution sentinels:
-the Python driver replaces them before parsing the schedule.
-`__HC_TARGET__` takes the value of `hc.compile(target=...)` (empty string
-for the `None` default). `__HC_CHIP__` takes the AMDGPU chip name resolved
-from the same `target=` (e.g. `amdgpu-gfx11` -> `gfx1100`); a bare
-`gfx<chip>` works verbatim; anything else falls back to the default chip.
-Custom schedules that keep the placeholders pick up the `target=` plumbing
-for free; ones that drop them own their own pass invocations.
+1. **Frontend cleanup.** Fold region scaffolding, inline undecorated
+   helpers (`hc_front.ref kind="inline"` markers), and convert
+   `hc_front` ops into `hc` via `convert-hc-front-to-hc`.
+2. **Literal specialisation + early lowerings.** Substitute
+   `hc.compile(symbols={K: 4, ...})` bindings throughout reachable
+   `#hc.expr` / `#hc.pred` / shape / layout carriers, then lower the
+   `hc.pow` integer-literal-exponent carrier into a mul chain so type
+   inference sees the muls.
+3. **Type inference + symbolic materialisation.** Promote
+   `hc.assign` / `hc.name_load` into SSA, run `hc-infer-types`,
+   sever bound symbolic expressions from their producer chains via
+   `hc-materialize-bound-exprs`, and verify static shape carriers.
+4. **Shape decomposition + helper inlining.** Split semantic
+   `!hc.tensor` / `!hc.vector` into bare data/mask pairs
+   (`hc-decompose-shaped-values`), inline `@kernel.func` helpers,
+   then re-run `hc-materialize-bound-exprs` to sever the
+   launch-geometry chains the inliner brought along.
+5. **Generic funnel.** Fold identity layouts, lower the
+   `hc.strip_layout` boundary, and funnel `hc.matmul` / `hc.reduce` /
+   per-element arith / `hc.builtin_call` / `hc.load` / `hc.store` /
+   `hc.load_mask` into `hc.generic` via the four `*-to-generic`
+   rewriters + `hc-lower-math`. Wave-cooperative layouts are then
+   distributed to per-lane peers (`hc-distribute-wave-layouts`).
+6. **Scope normalisation + launch wrap.** Fold supported `hc.func`
+   call boundaries and workitem regions, then wrap each `hc.kernel`
+   in a host `func.func` containing a `gpu.launch` with kernel-arg
+   ABI `(!hc.ptr<global, T>, dim*, stride*)`
+   (`hc-lower-kernels-to-gpu-launch`).
+7. **Flatten + body lowering.** Collapse every shaped carrier to its
+   1D storage form and compose every offset to a single 1D `#hc.expr`
+   (`hc-flatten-with-layouts`), then lower the launch body
+   (scalar / control flow, ptr family, masked stores) twice — once
+   over the flat IR, then again after `hc-lower-generic` collapses
+   `hc.generic` ops over `!hc.ptr` outs into `scf.parallel` /
+   `scf.for` nests planting fresh `hc.idx_apply` ops. The
+   `hc-insert-workgroup-barriers` pass between the launch-body and
+   `hc-lower-generic` slots plants `gpu.barrier` between
+   `hc.generic` ops that share a workgroup-AS storage root.
+8. **Recipes + outlining + target stamping.** Interpret target
+   intrinsic recipes (`hc-interpret-intrinsic-recipes` walks the
+   sibling `@__hc_intrinsic_lowerings__` module), then run upstream
+   `gpu-launch-sink-index-computations` + `gpu-kernel-outlining` to
+   produce `gpu.module @<kernel>_kernel` + `gpu.func` +
+   `gpu.launch_func`, and finally stamp every fresh `gpu.module` with
+   `#rocdl.target` via `rocdl-attach-target` (chip + features
+   resolved Python-side from `target=`).
 
-The closing trio splits each `gpu.launch` into a `gpu.module @<kernel>_kernel`
-+ `gpu.func` + `gpu.launch_func` (`gpu-kernel-outlining`) and stamps the
-module with `#rocdl.target<chip = "...">` (`rocdl-attach-target`) so the
-binary-emission pass downstream has the chip info it needs. The actual
-`gpu.module` body lowering chain (amdgpu/scf/memref/vector → llvm-dialect
-inside the module) and `hc-lower-gpu-to-binary` are not yet in the default
-schedule — they need a ROCDL-equivalent of upstream's
-`gpu-lower-to-nvvm-pipeline` (workgroup memref address-space mapping,
-kernel ABI, scf/vector lowering inside `gpu.module`) which is a
-substantively separate piece of work tracked as a follow-up.
+After the schedule, a fixed GPU-lowering chain runs as a raw pipeline
+string (appended by the Python driver — see `_GPU_LOWERING_PIPELINE`
+in `hc/_pipeline.py`). It owns `hc-lower-to-llvm`, `convert-scf-to-cf`,
+`convert-amdgpu-to-rocdl`, the `gpu.module(...)` nested pass manager,
+`gpu-to-llvm`, the outer reconcile/canon/cse trio,
+`hc-lower-gpu-to-binary` (LLVM IR → AMDGPU ISA → ELF → HSACO),
+`hc-lower-launch-func-to-runtime` (`gpu.launch_func` → `hc_rt_*` calls
++ embedded HSACO global), an optional `hc-emit-bench-wrapper`
+(`hc.compile(..., bench=True)`), and `symbol-dce`. The raw-string form
+exists because `transform.apply_registered_pass` cannot express the
+`gpu.module(...)` nest; the rest of the chain is otherwise flat and
+might migrate into the schedule in the future.
 
-Literal specialization runs immediately after the front-to-hc handshake.
-Each `hc_front.kernel` arrives carrying a `literal_bindings = {name = i64}`
-dict that the Python launcher (`hc.compile(symbols={K: 4, ...})`) stamped
-before the schedule started; `convert-hc-front-to-hc` carries the dict
-across to the resulting `hc.kernel`, and `hc-specialize-literals` walks
-every reachable `#hc.expr` / `#hc.pred` (and through them every
-`#hc.shape`, `#hc.layout`, `!hc.idx`, `!hc.pred`, and shaped-type carrier)
-inside the kernel body and substitutes the bound integer in place via
-ixsimpl's hash-consed substitution. The consumed `literal_bindings` is
-dropped from the kernel afterwards so a subsequent re-run is a no-op,
-and the `hc_ir` snapshot is self-contained — feeding it back through
-`hc-opt -hc-specialize-literals` reproduces the same IR. The `literals`
-whitelist on the kernel stays put; it's the declaration of which names
-*may* be bound, not the bound state. Once specialization has run, every
-shape-sensitive downstream pass (`hc-verify-static-shapes`,
-`hc-decompose-shaped-values`, `hc-flatten-with-layouts`,
-`hc-lower-launch-body`) sees concrete dims without any per-consumer
-substitution plumbing. A schedule that drops the pass keeps the
-unspecialized IR — partial specialization (or none) is legal, and
-the downstream passes will fail loud where they need a concrete dim
-they don't have.
-
-Bound symbolic expression materialization runs after type inference so it can
-see pinned `!hc.idx<...>` / `!hc.pred<...>` facts and before later scope
-normalization needs launch-context-independent SSA values. The static shape
-verifier then validates SSA shape operands through their inferred tuple element
-types before canonicalization and CSE can obscure the producer that carried a
-bad shape. Shaped-value decomposition runs next as the contract boundary
-between the semantic shaped surface and every downstream lowering pass: every
-semantic `!hc.tensor` / `!hc.vector` producer and user is split into bare
-data/mask pairs, and any survivor — including intrinsic boundaries that have
-no decomposition rule yet — fails the pass with the offending op named.
-Helper inlining can clone fresh launch-geometry producer chains from
-callee bodies, so bound-expression materialization runs again before
-scope-region normalization. DCE then removes now-dead scope-token geometry
-producers; live workitem/subgroup token uses still diagnose in the normalization
-pass. The final normalization removes supported `hc.func` call boundaries and
-result-producing workitem regions from the executable HC body, leaving subgroup
-and other unsupported scope cases to diagnose. Cleanup runs over that normalized
-HC body before `hc-lower-kernels-to-gpu-launch` wraps each `hc.kernel` in a host
-`func.func` containing a `gpu.launch` and exposes buffer ABI as
-`(!hc.ptr<global, T>, dim*, stride*)`. `hc-lower-launch-body` then lowers the
-scalar/index subset inside that launch to upstream `arith`/`scf` operations and
-lowers static bare tensors to workgroup-memory `!hc.ptr<workgroup, T>` (via
-`hc.alloc` + `hc.ptr_offset` + `hc.ptr_*`). Bare vectors lower to upstream
-`vector` values, and final masked stores become `hc.ptr_store_pred` (vector
-form) or guarded scalar `hc.ptr_store` inside `scf.if`.
-Intrinsic boundaries remain HC ops with explicit casts at that point; the final
-`hc-interpret-intrinsic-recipes` step then walks the sibling
-`module @__hc_intrinsic_lowerings__` the frontend emitter planted, applies
-every `transform.named_sequence` whose `hc.target` matches the requested
-target (the default empty target runs every recipe — fine while each
-intrinsic registers at most one recipe per compile), erases the spent
-lowerings module, and DCEs `hc.intrinsic` decls whose last call site was
-rewritten. The trailing canonicalize/cse pair folds the recipe-inserted
-bridging UCCs into identity (they pair with the existing UCCs the
-launch-body pass plants on either side of every call boundary), leaving the
-final IR free of HC ops and bridging machinery. See **Intrinsics** in
-`doc/lowering.md` for the recipe authoring + transform-op surface.
+The schedule's `__HC_TARGET__` and `__HC_CHIP__` tokens are substitution
+sentinels the Python driver replaces before parsing.
+`__HC_TARGET__` takes the value of `hc.compile(target=...)` (empty
+string for the `None` default). `__HC_CHIP__` takes the AMDGPU chip
+name resolved from the same `target=` (e.g. `amdgpu-gfx11` ->
+`gfx1100`); a bare `gfx<chip>` works verbatim; anything else falls
+back to the default chip. Custom schedules that keep the placeholders
+pick up the `target=` plumbing for free; ones that drop them own
+their own pass invocations.
 
 Each `apply_registered_pass` consumes its input handle and produces a
 fresh one, which is why the entry-block argument is not marked
 `{transform.readonly}` — the verifier refuses that combination.
+
+A handful of contracts ride on the schedule order; the file's inline
+comments name them at the call site. Briefly:
+
+* `hc-specialize-literals` runs immediately after `convert-hc-front-to-hc`
+  so every later pass sees concrete dims. A schedule that drops the
+  pass keeps unspecialised IR; downstream passes fail loud where they
+  need a concrete dim they don't have.
+* `hc-decompose-shaped-values` is the contract boundary between the
+  semantic shaped surface and every downstream lowering: any survivor
+  (including intrinsic boundaries that have no decomposition rule yet)
+  fails the pass with the offending op named.
+* `hc-flatten-with-layouts` runs after `hc-lower-kernels-to-gpu-launch`
+  so flatten sees the kernel-arg UCC chain the launch wrapper plants
+  and rewrites it through to the post-flatten layout retyper.
+* `hc-lower-launch-body` runs twice: once over the flat post-launch
+  IR, once after `hc-lower-generic` plants per-lane `hc.idx_apply` ops
+  that still need to lower to plain `arith.*` / `index_cast`.
+* See `doc/lowering.md`'s **Intrinsics** section for the recipe
+  authoring + `transform.hc.*` op surface that
+  `hc-interpret-intrinsic-recipes` consumes.
 
 ## Selecting a target
 

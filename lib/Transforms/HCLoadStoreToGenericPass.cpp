@@ -1615,9 +1615,9 @@ preflightStore(MLIRContext *ctx, sym::Store &store, HCStoreOp op) {
 // load side has had since day one -- the store side was missing it,
 // and OOB lanes (workgroup-tile edges where (W1, W2) isn't a
 // multiple of `group_shape`) ended up writing past the live extent
-// into the next row's address space. The downstream
-// `hc-fold-predicates` pass folds away the bounds check when ixsimpl
-// can prove the conjunction is always true.
+// into the next row's address space. ixsimpl folds the conjunction
+// to `true` on the producer-side `hc.pred_apply` when the bounds
+// hold structurally; the downstream lowering then drops the guard.
 static void populateStoreBody(HCGenericOp generic, const StorePreflight &pf,
                               Location loc, bool hasMask,
                               std::optional<sym::PredHandle> destBoundsPred) {

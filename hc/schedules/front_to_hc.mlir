@@ -4,71 +4,62 @@
 //
 // Default hc_front -> hc schedule.
 //
-// Frontend stage: fold/erase region scaffolding, inline undecorated
-// helpers, convert to `hc`, promote `hc.name_load` / `hc.assign` into
-// SSA, infer concrete HC value types, materialize bound symbolic values,
-// verify static shape carriers, split semantic shaped values into bare
-// data/masks, inline helpers, materialize bound symbolic values a
-// second time (helper inlining re-roots fresh launch-geometry chains
-// in kernel scope), fold identity layouts, funnel shaped compute /
-// per-element arith / load+store into `hc.generic`, infer placeholder
-// iter bounds, normalize supported scope regions, run the standard
-// cleanup pair, wrap kernels in upstream GPU launches, flatten every
-// shaped carrier to its 1D storage form and compose every offset to a
-// single 1D `#hc.expr`, lower launch-body scalar/control flow on the
-// now-flat IR, clean up, plant `gpu.barrier` between `hc.generic` ops
-// that share a workgroup-AS storage root, lower `hc.generic` whose
-// operands resolved to `!hc.ptr` to the `scf.parallel` / `scf.for`
-// loop nest, fold `hc.predicate` through to its producer, run
-// `hc-lower-launch-body` a second time to convert the fresh per-lane
-// `hc.idx_apply` ops the generic lowering planted, then interpret
-// target lowering recipes (which rewrites every `hc.call_intrinsic`
-// and erases the sibling `__hc_intrinsic_lowerings__` module), then a
-// canonicalize/cse pair to fold the recipe's bridging UCCs into
-// identity.
+// Inline per-pass comments are the per-call contract; this banner is
+// the phase-level outline. Eight phases:
 //
-// The generic-pipeline rewriters (`hc-shaped-compute-to-generic`,
-// `hc-elementwise-to-generic`, `hc-load-store-to-generic`,
-// `hc-infer-generic-bounds`) are conservative — they only fire on inputs
-// they can prove safe (rank-2 matmul / reduce, per-element on shaped
-// types, pinned `!hc.idx<expr>` indices on load and store). Inputs that
-// don't match (intrinsic-mediated WMMA recipes, ...) flow through
-// untouched and lower via the existing per-op handlers in
-// `hc-lower-launch-body`. `hc-flatten-with-layouts` runs after
-// `hc-lower-kernels-to-gpu-launch` and before `hc-lower-launch-body`:
-// the launch wrapper plants the buffer-from-ptr+dims UCC chain that
-// flatten's post-flatten layout retyper consumes, every shaped value
-// collapses to its 1D bare carrier, every `hc.generic` operand /
-// access op offset composes through the operand layout into a single
-// 1D `#hc.expr`, and `hc-lower-launch-body` then sees the 1D form
-// uniformly. `hc-lower-generic` follows launch-body so any `hc.generic`
-// whose operands are `!hc.ptr` collapses to the loop nest.
+//   1. Frontend cleanup. Fold region scaffolding, inline undecorated
+//      helpers, convert `hc_front` to `hc`.
+//   2. Literal specialisation + early lowerings. Substitute
+//      `hc.compile(symbols=...)` bindings throughout reachable
+//      symbolic carriers, then unfold `hc.pow` literal-int exponents
+//      to mul chains so type inference sees the muls.
+//   3. Type inference + symbolic materialisation. Promote
+//      `hc.assign` / `hc.name_load` into SSA, run `hc-infer-types`,
+//      sever bound symbolic expressions from their producer chains,
+//      verify static shape carriers.
+//   4. Shape decomposition + helper inlining. Split semantic
+//      `!hc.tensor` / `!hc.vector` into bare data/mask pairs, inline
+//      `@kernel.func` helpers, then re-sever bound expressions for the
+//      launch-geometry chains the inliner brought along.
+//   5. Generic funnel. Fold identity layouts, lower `hc.strip_layout`,
+//      funnel shaped compute / per-element arith / `hc.builtin_call` /
+//      `hc.load` / `hc.store` / `hc.load_mask` into `hc.generic`, then
+//      distribute wave-cooperative layouts to per-lane peers.
+//   6. Scope normalisation + launch wrap. Fold supported `hc.func` call
+//      boundaries + workitem regions, then wrap each `hc.kernel` in a
+//      host `func.func` containing a `gpu.launch` with kernel-arg ABI
+//      `(!hc.ptr<global, T>, dim*, stride*)`.
+//   7. Flatten + body lowering. Collapse every shaped carrier to its
+//      1D storage form and compose every offset to a single 1D
+//      `#hc.expr`. Then lower the launch body twice: once over the
+//      flat IR (scalar / control flow / ptr family / masked stores),
+//      then again after `hc-lower-generic` collapses `hc.generic` ops
+//      over `!hc.ptr` outs into `scf.parallel` / `scf.for` nests
+//      planting fresh `hc.idx_apply` ops that still need lowering. A
+//      barrier-insertion pass between the launch-body and lower-generic
+//      slots plants `gpu.barrier` between `hc.generic` ops that share
+//      a workgroup-AS storage root.
+//   8. Recipes + outlining + target stamping. Interpret target
+//      intrinsic recipes (`hc-interpret-intrinsic-recipes` walks the
+//      sibling `@__hc_intrinsic_lowerings__` module), sink constant
+//      index computations into `gpu.launch`, outline kernels into
+//      `gpu.module @<kernel>_kernel` + `gpu.func` + `gpu.launch_func`,
+//      and stamp each `gpu.module` with `#rocdl.target` (chip +
+//      features resolved Python-side from `target=`).
 //
-// The closing chunk produces the device-side artefacts the GPU lowering
-// pipeline (appended by the Python driver — see `_GPU_LOWERING_PIPELINE` in
-// `hc/_pipeline.py`) needs:
+// Conservative-funnel-with-per-op-fallback: the generic-funnel rewriters
+// only fire on inputs they can prove safe. Inputs that don't match
+// (intrinsic-mediated WMMA recipes, ...) flow through untouched and
+// lower via the existing per-op handlers in `hc-lower-launch-body`. The
+// two paths converge cleanly at `hc-lower-launch-body` / `hc-lower-generic`.
 //
-//   * `gpu-launch-sink-index-computations` rewrites every constant index
-//     consumer inside `gpu.launch` so the outliner can lift the constants into
-//     the `gpu.func` body instead of promoting them to kernel arguments.
-//     Sinking the constants is cheap insurance against any axis-indexed
-//     consumer that would otherwise force runtime-typed dim values onto the
-//     kernel-arg list — keeps the dispatch regular regardless of which
-//     specific patterns ride downstream.
-//
-//   * `gpu-kernel-outlining` splits each `gpu.launch` into a sibling
-//     `gpu.module @<kernel>_kernel` + `gpu.func` + `gpu.launch_func`.
-//
-//   * `rocdl-attach-target` stamps each `gpu.module` with `#rocdl.target` so
-//     `convert-amdgpu-to-rocdl`, `gpu-to-llvm`, and `hc-lower-gpu-to-binary`
-//     can route off it.
-//
-// `hc.compile` loads this via `-transform-preload-library` and runs it with
-// `-transform-interpreter`; callers wanting a different order can pass
-// `schedule=<path-or-text>` to override. The Python driver still appends the
-// GPU lowering chain after the schedule fires, so an override only needs to
-// produce `gpu.module` ops carrying `#rocdl.target` for the rest of the
-// pipeline to take over.
+// `hc.compile` loads this via `-transform-preload-library` and runs it
+// with `-transform-interpreter`; callers wanting a different order can
+// pass `schedule=<path-or-text>` to override. The Python driver appends
+// a fixed GPU-lowering chain (`_GPU_LOWERING_PIPELINE` in
+// `hc/_pipeline.py`) after the schedule fires, so an override only
+// needs to produce `gpu.module` ops carrying `#rocdl.target` for the
+// rest of the pipeline to take over.
 module attributes {transform.with_named_sequence} {
   // `%m` is consumed by the registered frontend/HC passes; the verifier
   // requires the entry block argument to reflect that by omitting the
@@ -143,15 +134,13 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     // Funnel the shaped op surface into `hc.generic` so the post-flatten
     // codegen has a single op family to lower. Each rewriter is
-    // conservative — `hc.matmul` / `hc.reduce` v0 wants rank-2 / single-axis
-    // shapes, the per-element family wants all-shaped operands, and
-    // load/store want pinned `!hc.idx<expr>` indices. Anything outside that
+    // conservative — `hc.reduce` v0 wants single-axis shapes, the
+    // per-element family wants all-shaped operands, and load/store
+    // want pinned `!hc.idx<expr>` indices. Anything outside that
     // surface (slice-indexed access, mixed-rank ops, masked stores, ...)
-    // stays in place and routes through the existing per-op handlers in
-    // `hc-lower-launch-body`. `hc-infer-generic-bounds` then resolves any
-    // `!hc.undef` iter bounds the per-element rewriter emitted from the
-    // operand shapes. Order: rewriters before bounds inference so the pass
-    // sees every fresh `hc.generic`.
+    // stays in place and routes through the existing per-op handlers
+    // in `hc-lower-launch-body`. The rewriters materialise iter bounds
+    // directly from operand shapes; no separate inference step.
     %m10b = transform.apply_registered_pass "hc-shaped-compute-to-generic" to %m10s
         : (!transform.any_op) -> !transform.any_op
     %m10c = transform.apply_registered_pass "hc-elementwise-to-generic" to %m10b
@@ -175,10 +164,14 @@ module attributes {transform.with_named_sequence} {
     // kernels that don't carry wave-distributable layouts.
     %m10dw = transform.apply_registered_pass "hc-distribute-wave-layouts" to %m10d
         : (!transform.any_op) -> !transform.any_op
-    %m10e = transform.apply_registered_pass "hc-infer-generic-bounds" to %m10dw
+    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10dw
         : (!transform.any_op) -> !transform.any_op
-    %m11 = transform.apply_registered_pass "hc-normalize-scope-regions" to %m10e
-        : (!transform.any_op) -> !transform.any_op
+    // Scope normalisation strips supported `hc.func` call boundaries
+    // and result-producing workitem regions, replumbing every user
+    // through to the new SSA shape. The canon/cse pair folds the
+    // freshly-exposed index chains (the binding sym chains the scope
+    // rewrite cut) and CSEs the duplicate computations the scope
+    // rewrite left behind so the next pass walks a clean IR.
     transform.apply_patterns to %m11 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
@@ -213,6 +206,14 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %m12b : !transform.any_op
     %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12b
         : (!transform.any_op) -> !transform.any_op
+    // Launch-body emitted fresh upstream `arith.constant` /
+    // `index_cast` / `arith.muli` chains via ExprLowerer for every
+    // `hc.idx_apply`, plus a sea of intermediate values on the bare
+    // side. The canon/cse pair folds the constant arithmetic and CSEs
+    // the redundant per-thread index computations before
+    // `hc-insert-workgroup-barriers` walks the IR (its alias rules
+    // key off the storage-root SSA value, so duplicate-root noise
+    // would inflate the pending set).
     transform.apply_patterns to %m13b {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
@@ -250,7 +251,7 @@ module attributes {transform.with_named_sequence} {
     %m13a = transform.apply_registered_pass "hc-lower-generic" to %m13bs
         : (!transform.any_op) -> !transform.any_op
     // `hc.predicate` ops ride through `hc-lower-generic`'s `cloneBody` as
-    // ordinary body ops — the pass doesn't touch them, the predicate
+    // ordinary body ops -- the pass doesn't touch them, the predicate
     // physically lands in the lowered `scf` body next to its (now
     // explicit) `hc.ptr_load` producer. Folding them is a separate pass
     // so the emission side stays unaware of mask shapes / producer kinds
@@ -262,7 +263,7 @@ module attributes {transform.with_named_sequence} {
     // emitted by `hc-lower-generic` surface as fresh `hc.idx_apply`
     // ops that still need to be rewritten to plain `arith.*` /
     // `index_cast` arithmetic before LLVM translation. Re-running
-    // launch-body picks them up via `ConvertIdxApplyOp` — the only
+    // launch-body picks them up via `ConvertIdxApplyOp` -- the only
     // `hc.idx_apply -> arith` path in the pipeline. Any sym the
     // per-lane emitter couldn't pre-bind (free in the planted apply)
     // still falls through to the ambient-context resolver inside
@@ -271,6 +272,11 @@ module attributes {transform.with_named_sequence} {
     // applies match here.
     %m13ar = transform.apply_registered_pass "hc-lower-launch-body" to %m13af
         : (!transform.any_op) -> !transform.any_op
+    // Same rationale as the post-first-launch-body pair: ExprLowerer
+    // planted fresh arith / index_cast chains for every per-lane
+    // `hc.idx_apply` the generic lowering minted. The canon/cse pair
+    // folds the constant fragments before recipe interpretation
+    // pattern-matches on the post-launch shape.
     transform.apply_patterns to %m13ar {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
@@ -312,6 +318,13 @@ module attributes {transform.with_named_sequence} {
     // unconditional keeps the schedule shape regular for every input.
     %m16 = transform.apply_registered_pass "gpu-kernel-outlining" to %m15
         : (!transform.any_op) -> !transform.any_op
+    // Outliner cloned every index producer used inside the launch
+    // body into the new `gpu.func` (so the kernel body is
+    // self-contained), leaving the originals as dead host-side
+    // values. The canon/cse pair drops the dead host clones and
+    // CSEs duplicate host-side dim/stride producers consumed by the
+    // freshly minted `gpu.launch_func`. Likely reducible if the
+    // outliner gains a built-in cleanup; tracked separately.
     transform.apply_patterns to %m16 {
       transform.apply_patterns.canonicalization
     } : !transform.any_op

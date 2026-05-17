@@ -58,10 +58,13 @@ static Type elementType(Type t) {
   return {};
 }
 
-// Undef placeholder -- bounds inference resolves via identity-offset matching.
-static Value emitUndefBound(OpBuilder &builder, Location loc) {
-  return HCUndefValueOp::create(builder, loc,
-                                UndefType::get(builder.getContext()));
+// Empty-binding `hc.idx_apply` carrying `!hc.idx<dim>`. Free shape names
+// stay ambient and resolve at the launch-body lowering boundary.
+static Value materializeIdxBound(OpBuilder &builder, Location loc,
+                                 ExprAttr dim) {
+  auto idxTy = IdxType::get(builder.getContext(), dim);
+  return HCIdxApplyOp::create(builder, loc, idxTy, ValueRange{},
+                              builder.getStrArrayAttr({}));
 }
 
 // `i_0`..`i_{r-1}` iter syms, all-parallel kinds.
@@ -176,18 +179,18 @@ static LogicalResult emitElementwise(Operation *op, sym::Store &store,
   Location loc = op->getLoc();
   OpBuilder builder(op);
 
-  // Undef bounds; inference resolves via identity offsets. Init's
-  // identity offsets cover broadcast-unit axes.
+  // Concrete bounds materialised straight from the result shape so the
+  // emitted `hc.generic` is fully inferred; init shape reuses them.
   size_t rank = spec.resultShape.size();
   SmallVector<Value> iterBounds;
   iterBounds.reserve(rank);
   for (size_t k = 0; k < rank; ++k)
-    iterBounds.push_back(emitUndefBound(builder, loc));
+    iterBounds.push_back(
+        materializeIdxBound(builder, loc, spec.resultShape[k]));
 
   IterMeta iter = buildIterMeta(ctx, rank);
   ArrayAttr identity = identityOffsetArray(ctx, store, iter.syms);
 
-  // Init shape reuses iter-bound undefs; inference rewrites them in place.
   Value shapeTuple = buildShapeTuple(builder, loc, iterBounds);
   Value initOut = emitInit(builder, loc, spec.resultTy, shapeTuple);
 

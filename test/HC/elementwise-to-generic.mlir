@@ -8,16 +8,16 @@
 //
 // RUN: hc-opt --hc-elementwise-to-generic %s --split-input-file | FileCheck %s
 
-// Plain rank-2 add: two parallel iters with `!hc.undef` bounds (the
-// later `hc-infer-generic-bounds` pass resolves them). All operands
+// Plain rank-2 add: two parallel iters with concrete `!hc.idx<...>`
+// bounds materialised straight from the result shape. All operands
 // carry identity per-axis offsets. Body emits `hc.add` on the per-
 // element block args.
 // CHECK-LABEL: func.func @add_rank2_f32
-// CHECK-DAG: %[[B0:.+]] = hc.undef_value : !hc.undef
-// CHECK-DAG: %[[B1:.+]] = hc.undef_value : !hc.undef
+// CHECK-DAG: %[[B0:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK-DAG: %[[B1:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
 // CHECK: %[[FILL:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_tensor<f32, ["M", "N"]>
 // CHECK: %[[OUT:.+]] = hc.generic
-// CHECK-SAME: iter (parallel i_0 = %[[B0]] : !hc.undef, parallel i_1 = %[[B1]] : !hc.undef)
+// CHECK-SAME: iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"M">, parallel i_1 = %{{[^ ]+}} : !hc.idx<"N">)
 // CHECK-SAME: ins (%{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["M", "N"]>,
 // CHECK-SAME:      %{{[^ ]+}} at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["M", "N"]>)
 // CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i_0">, #hc.expr<"i_1">] : !hc.bare_tensor<f32, ["M", "N"]>)
@@ -234,9 +234,9 @@ func.func @broadcast_falls_through(%a: f32, %b: !hc.bare_tensor<f32, ["M"]>)
 // Broadcast subtraction with leading / trailing unit-axes — the
 // pairwise-distance idiom `x1[:, None, :] - x2[None, :, :]`. Each
 // operand projects its `1`-dim axis to the literal-`0` offset and
-// the matching iter sym fills the broadcast axis on the result.
-// `hc-infer-generic-bounds` still binds the iter syms because the
-// init operand carries identity offsets on every axis.
+// the matching iter sym fills the broadcast axis on the result. Iter
+// bounds come from the result shape, not from any one operand, so the
+// broadcast projection doesn't affect their resolution.
 // CHECK-LABEL: func.func @broadcast_sub_pairwise
 // CHECK: %[[FILL:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_tensor<f32, ["A", "B", "C"]>
 // CHECK: hc.generic
@@ -304,28 +304,5 @@ func.func @mismatched_dims_falls_through(%a: !hc.bare_tensor<f32, ["M"]>,
     -> !hc.bare_tensor<f32, ["M"]> {
   %r = hc.add %a, %b
       : (!hc.bare_tensor<f32, ["M"]>, !hc.bare_tensor<f32, ["N"]>) -> !hc.bare_tensor<f32, ["M"]>
-  return %r : !hc.bare_tensor<f32, ["M"]>
-}
-
-// -----
-
-// The post-rewrite IR feeds straight into `hc-infer-generic-bounds`:
-// every `hc.undef` placeholder bound resolves through the operand
-// shapes (identity per-axis offsets), so the next pass picks up the
-// concrete `!hc.idx<dim>` form without further help. Two-pass
-// invocation here verifies the hand-off doesn't leave anything
-// stranded.
-//
-// RUN: hc-opt --hc-elementwise-to-generic --hc-infer-generic-bounds %s --split-input-file | FileCheck %s --check-prefix=INFER
-
-// CHECK-LABEL: func.func @infer_handoff
-// INFER-LABEL: func.func @infer_handoff
-// INFER: %{{[^ ]+}} = hc.idx_apply () : () -> !hc.idx<"M">
-// INFER: hc.generic iter (parallel i_0 = %{{[^ ]+}} : !hc.idx<"M">)
-// INFER-NOT: !hc.undef
-func.func @infer_handoff(%a: !hc.bare_tensor<f32, ["M"]>,
-                         %b: !hc.bare_tensor<f32, ["M"]>) -> !hc.bare_tensor<f32, ["M"]> {
-  %r = hc.add %a, %b
-      : (!hc.bare_tensor<f32, ["M"]>, !hc.bare_tensor<f32, ["M"]>) -> !hc.bare_tensor<f32, ["M"]>
   return %r : !hc.bare_tensor<f32, ["M"]>
 }

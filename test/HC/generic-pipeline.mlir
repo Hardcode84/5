@@ -9,7 +9,6 @@
 //     -> `hc-shaped-compute-to-generic`
 //     -> `hc-elementwise-to-generic`
 //     -> `hc-load-store-to-generic`
-//     -> `hc-infer-generic-bounds`
 //
 // Each rewriter is conservative on inputs it can't prove safe; this LIT
 // pins the post-chain shape on the surface it does support —
@@ -19,10 +18,12 @@
 // because the production schedule runs `hc-decompose-shaped-values`
 // before this chain. Per-pass details live in the dedicated LITs
 // (`shaped-compute-to-generic.mlir`, `elementwise-to-generic.mlir`,
-// `load-store-to-generic.mlir`, `infer-generic-bounds.mlir`); the
-// goal here is end-to-end composition.
+// `load-store-to-generic.mlir`); the goal here is end-to-end
+// composition. Each `to-generic` rewriter materialises concrete
+// `!hc.idx<dim>` iter bounds at emission, so the post-funnel IR
+// carries no `!hc.undef` placeholders.
 //
-// RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds)' --split-input-file | FileCheck %s
+// RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic)' --split-input-file | FileCheck %s
 //
 // Same chain plus `hc-flatten-with-layouts`. The generic-rewriter
 // outputs feed straight into the flatten step — every shaped
@@ -31,7 +32,7 @@
 // compose through the operand's layout (or the identity-layout
 // fallback when the operand has no layout) into a single 1D offset,
 // matching the post-flatten 1D operand rank.
-// RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-infer-generic-bounds,hc-flatten-with-layouts)' --split-input-file | FileCheck %s --check-prefix=POSTFLATTEN --implicit-check-not='#hc.layout'
+// RUN: hc-opt %s --pass-pipeline='builtin.module(hc-canonicalize-layouts,hc-shaped-compute-to-generic,hc-elementwise-to-generic,hc-load-store-to-generic,hc-flatten-with-layouts)' --split-input-file | FileCheck %s --check-prefix=POSTFLATTEN --implicit-check-not='#hc.layout'
 
 // Reduce sum along axis 1 of a rank-2 float tensor. Sum-identity
 // `hc.zeros` fill, one parallel iter (M) and one reduction iter (N).
@@ -64,12 +65,10 @@ func.func @reduce_sum_axis1(%v: !hc.bare_tensor<f32, ["M", "N"]>)
 // -----
 
 // Pure-elementwise. Two binary arith ops feed each other; both rewrite
-// into `hc.generic` with `!hc.undef` placeholder bounds, then
-// `hc-infer-generic-bounds` resolves them from the operand shapes.
-// `hc-elementwise-to-generic` keeps the `hc.zeros shape ...` tuple
-// pinned to `!hc.undef` placeholders even after bounds inference —
-// that's part of the v0 surface; the post-flatten lowering picks the
-// concrete extent off the result type, not the shape tuple.
+// into `hc.generic` with concrete `!hc.idx<dim>` iter bounds materialised
+// directly from the result shape. The `hc.zeros shape ...` tuple
+// reuses the same idx_apply values, so the post-flatten lowering picks
+// the concrete extent off the result type and the shape tuple agrees.
 // CHECK-LABEL: func.func @elementwise_chain
 // CHECK-NOT: hc.mul %{{[^ ]+}}, %{{[^ ]+}} : (!hc.bare_tensor
 // CHECK-NOT: hc.add %{{[^ ]+}}, %{{[^ ]+}} : (!hc.bare_tensor

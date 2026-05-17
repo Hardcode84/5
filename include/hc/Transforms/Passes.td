@@ -371,8 +371,8 @@ def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
 
       * one parallel iter sym per result axis (`i_0`, `i_1`, ...) —
         distinct from operand source-level syms,
-      * `iter_bounds` as `hc.undef_value` placeholders;
-        `hc-infer-generic-bounds` resolves from operand shapes,
+      * `iter_bounds` materialised directly from the result shape via
+        empty-binding `hc.idx_apply` (no placeholder + inference step),
       * shaped inputs as `ins` with identity per-axis offsets,
       * synthesised `hc.zeros` / `hc.vzeros` init as single `outs` with
         identity offsets,
@@ -389,37 +389,6 @@ def HCElementwiseToGeneric : Pass<"hc-elementwise-to-generic"> {
         `hc.empty`) — init scaffolding would fold back on itself.
       * Pre-inference `!hc.undef` operands.
       * Mismatched ranks or per-axis dim exprs.
-  }];
-  let dependentDialects = ["::mlir::hc::HCDialect"];
-}
-
-def HCInferGenericBounds : Pass<"hc-infer-generic-bounds"> {
-  let summary = "Fill placeholder iter_bounds on hc.generic from operand shapes.";
-  let description = [{
-    Walks every `hc.generic`, resolves `iter_bounds` defined by
-    `hc.undef_value` to concrete `!hc.idx<...>` SSA derived from
-    operand shapes. Must run before per-axis offsets compose into a
-    single linear expression — once per-axis structure is gone,
-    recovering ranges is intractable.
-
-    Per iter sym `s` with a placeholder bound:
-
-      1. For every (operand, axis) where the per-axis offset is exactly
-         the bare symbol `s` under ixsimpl-canonical form, collect the
-         operand's shape entry at `axis` as an implied bound.
-         Non-identity offsets (`s + 1`, `2*s`, ...) skipped.
-
-      2. Multiple identity occurrences must agree (hash-consed pointer
-         equality through the dialect store). Conflicts diagnose with
-         offending operand pair.
-
-      3. First agreed bound materialises via empty-binding `hc.idx_apply`
-         carrying `!hc.idx<dim>`, replaces the placeholder. Original
-         `hc.undef_value` left for canonicalization / DCE.
-
-    Placeholder with no identity occurrence diagnoses: going further
-    would let it leak past flatten. No-op when every bound is concrete
-    — rewrites emitting fully-resolved ops pay nothing.
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
@@ -638,25 +607,6 @@ def HCDecomposeShapedValues
     from producers (sees post-inference shape surface only).
   }];
   let dependentDialects = ["::mlir::hc::HCDialect"];
-}
-
-def HCLowerBarePredicates
-    : Pass<"hc-lower-bare-predicates"> {
-  let summary = "Lower bare HC predicate containers to upstream i1 masks.";
-  let description = [{
-    `!hc.pred` → `i1`; static `!hc.bare_vector` → upstream `vector`.
-    Predicate vectors become `vector<...xi1>`; supported HC mask ops
-    lower to `arith` / `vector`. Bare tensors stay HC for later
-    memory/tensor lowering. Unsupported HC boundaries preserved with
-    `builtin.unrealized_conversion_cast` so the pass can stage before
-    the full HC-to-upstream lowering.
-  }];
-  let dependentDialects = [
-    "::mlir::arith::ArithDialect",
-    "::mlir::func::FuncDialect",
-    "::mlir::hc::HCDialect",
-    "::mlir::vector::VectorDialect"
-  ];
 }
 
 def HCMaterializeBoundExprs

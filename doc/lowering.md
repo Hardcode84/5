@@ -937,7 +937,6 @@ resolver may have stamped folding / inline markers on, in the order
     hc-shaped-compute-to-generic
     hc-elementwise-to-generic
     hc-load-store-to-generic
-    hc-infer-generic-bounds
     hc-normalize-scope-regions
     canonicalize / cse
     hc-lower-kernels-to-gpu-launch
@@ -1006,11 +1005,14 @@ producer chains rooted in kernel scope; the following `apply_dce` removes
 the dead scope-token producers before region normalization checks for
 remaining live scope-token uses. The generic-pipeline rewriters
 (`hc-shaped-compute-to-generic`, `hc-elementwise-to-generic`,
-`hc-load-store-to-generic`, `hc-infer-generic-bounds`) are conservative
-and only fire on inputs that match their v0 surface (rank-2 matmul / reduce,
-all-shaped per-element arith, pinned `!hc.idx<expr>` indices on load and
-store) — anything outside that surface flows through untouched and reaches
-the per-op handlers in `hc-lower-launch-body`. `hc-flatten-with-layouts`
+`hc-load-store-to-generic`) are conservative and only fire on inputs
+that match their v0 surface (rank-2 matmul / reduce, all-shaped
+per-element arith, pinned `!hc.idx<expr>` indices on load and store)
+— anything outside that surface flows through untouched and reaches
+the per-op handlers in `hc-lower-launch-body`. Each rewriter emits
+fully-resolved `iter_bounds` straight from operand shapes, so the
+post-funnel IR has no `!hc.undef` placeholders to chase down.
+`hc-flatten-with-layouts`
 slots in immediately *after* `hc-lower-kernels-to-gpu-launch` and *before*
 the first `hc-lower-launch-body`: the launch wrapper plants the
 `(ptr, dim*, stride*)` UCC chain that flatten's post-flatten layout retyper

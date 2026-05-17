@@ -91,7 +91,67 @@ Cross-links belong in the PR description, the bead, or the design doc — not in
 
 ## Tone
 
-Code comments, docstrings, and commit messages share the same voice: terse, dry, informative. Wit is welcome, fluff is not. Say what the thing does, not what you wish it did. If a comment doesn't earn its line, delete it.
+Comments earn their line or get cut. The bar is: would the next reader, staring at the code, miss this? If no, the comment is fluff.
+
+Caveman style. Telegraph English. Substance > prose.
+
+- **One line is the target.** Two is a stretch. Five is a smell — rename the symbol, split the function, or add a structural assert so the comment isn't load-bearing.
+- **Say what's non-obvious**, not what the code already says. The function name carries the "what"; the comment carries the "why this shape" or "what would break otherwise".
+- **No function-header essays.** Block comments above functions are the worst offender. If you find yourself writing five lines of intent above a `static` helper, the name is wrong or the function does too much.
+- **No backstory.** "Previously / used to / old shape was / the X path now does Y" rots the moment the prior shape is forgotten. Describe the current constraint, not the rescue narrative.
+- **No restating the signature**, no narrating the body, no "this function takes X and returns Y", no "Step 1, Step 2, Step 3" play-by-play.
+- **No cross-references that go stale.** "Same as the load side", "mirrors the foo path", "see also bar()" — these snap when one side moves and the other doesn't. If the symmetry matters, factor a shared helper.
+- **No hedging.** "Essentially", "basically", "more or less", "note that", "it's worth noting", "we should probably", "kind of" — cut them.
+- **Drop articles and filler** when the meaning survives. "We", "the X path", "this approach", "in order to", "due to the fact that" — gone. `// rank parity required` beats `// We require that the ranks are parity-equal in order to ...`.
+- **Don't apologise to the future**, don't explain well-known idioms (`// clone the body`, `// build the result vector`), don't paraphrase identifiers (`// loc is the location`).
+
+Concrete contrasts, paraphrased from real diffs:
+
+Bad:
+```cpp
+// Per-slot reduction carry fold: collapses to raw `yielded[oi]` on
+// plain yield (`masks[oi]` null) and to `arith.select(mask, yielded,
+// carry)` on predicated yield, matching the carry semantics the
+// previous lowering produced inside the body.
+```
+
+Good:
+```cpp
+// Plain yield: passthrough. Predicated: select(mask, raw, carry).
+```
+
+Bad:
+```cpp
+// Reduction-iter shape for the chunk body: load each outs init at
+// the parallel-only offset (the slot every thread owns
+// post-partition), build a nested `scf.for` over reduction iters
+// with the inits as `iter_args`, clone the body once per innermost
+// iteration, propagate yielded values as carries through the nest,
+// and store the outer loop's results back at the same outs offset.
+```
+
+Good:
+```cpp
+// Reduction iter syms bind to loop IVs through the nest and restore
+// on unwind — siblings see no temp binding.
+```
+(Everything else the bad version says is plain in the code.)
+
+Bad:
+```cpp
+// Capture the destination shape for the OOB-store guard so the
+// downstream body can compose the bound conjunction. Only populate
+// when the per-axis offset shape matches the destination rank
+// because the bound zips per-axis and rank parity has to hold.
+```
+
+Good:
+```cpp
+// Rank parity required: bound zips per-axis. Empty indices skip
+// (bound vacuously true on a whole-tile write).
+```
+
+Same rule covers docstrings, commit bodies, and PR descriptions. Wit is welcome, fluff is not. Neither is acceptable.
 
 ## Language and MLIR Guidelines
 

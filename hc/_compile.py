@@ -308,6 +308,15 @@ def compile(
     partial specialization is legal and later pipeline stages refine
     what remains symbolic.
 
+    `$`-prefixed keys (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) are
+    launch-context system bindings; passing them through `symbols`
+    overrides the values the front-to-hc handshake derives from
+    integer-literal `group_shape` / `work_shape` / `subgroup_size`
+    metadata, and is the way to pin those dims for the native lowering
+    when the kernel decorator left them symbolic (the simulator picks
+    a `group_shape` at launch time; the native path needs the value
+    folded eagerly). System keys bypass the `literals=` whitelist.
+
     `schedule` overrides the default `hc/schedules/front_to_hc.mlir`
     transform-dialect schedule: a `pathlib.Path` is read from disk, a
     `str` is treated as inline MLIR text. The schedule must define a
@@ -426,9 +435,21 @@ def _normalise_bindings(
     out: dict[str, int] = {}
     for key, value in symbols.items():
         name = _symbol_name(key)
+        # `$`-prefixed names are launch-context system symbols
+        # (`$WGS<axis>`, `$WS<axis>`, `$WV0`, `$GSZ0`) that the
+        # front-to-hc handshake otherwise seeds from integer-literal
+        # `group_shape` / `work_shape` / `subgroup_size`. Letting the
+        # launcher override them — the user knows the workgroup size
+        # the host will pick at dispatch time even when the kernel
+        # decorator left those axes symbolic — bypasses the user-
+        # facing `literals=` whitelist by design; `literals` speaks
+        # for kernel-declared specialization points, not for system
+        # names. Mirrors `validateBindingsAgainstLiterals` in
+        # `HCSpecializeLiteralsPass.cpp`, which skips the same check
+        # for `$`-prefixed entries.
         # Empty `literals` on the decorator means the kernel declared no
         # whitelist; pass the binding through rather than rejecting it.
-        if allowed and name not in allowed:
+        if allowed and name not in allowed and not name.startswith("$"):
             raise ValueError(
                 f"'{name}' is not a declared literal symbol; "
                 f"kernel declares {sorted(allowed)}"

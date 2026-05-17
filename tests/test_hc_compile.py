@@ -205,6 +205,31 @@ def test_normalise_bindings_flags_conflicting_duplicate_keys() -> None:
         normalise_bindings({sym.W: 8, "W": 16}, metadata)
 
 
+def test_normalise_bindings_admits_system_keys_past_whitelist() -> None:
+    sym = _sym()
+    metadata = KernelMetadata(literals=frozenset({sym.W}))
+
+    # `$`-prefixed launch-context keys are system bindings, not
+    # user-declared specialization points; they ride alongside the
+    # declared literals and bypass the whitelist by design — the C++
+    # specializer (`HCSpecializeLiteralsPass`) applies the same skip
+    # when validating `literal_bindings` against `literals`.
+    bindings = normalise_bindings({"$WGS0": 2, "$WGS1": 2, sym.W: 8}, metadata)
+    assert bindings == {"$WGS0": 2, "$WGS1": 2, "W": 8}
+
+
+def test_normalise_bindings_admits_system_keys_with_no_declared_literals() -> None:
+    metadata = KernelMetadata()
+
+    # No `literals=` whitelist means the user-key check was already a
+    # pass-through; pin this explicitly so the system-key contract
+    # stays stable independent of the kernel's literal declarations.
+    assert normalise_bindings({"$WGS0": 8, "$WGS1": 4}, metadata) == {
+        "$WGS0": 8,
+        "$WGS1": 4,
+    }
+
+
 # --- symbol_name name resolution -------------------------------------------
 
 

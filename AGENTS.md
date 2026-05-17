@@ -128,6 +128,7 @@ Code comments, docstrings, and commit messages share the same voice: terse, dry,
 - Prefer named accessors to `getResult(0)` when possible.
 - In LIT tests, never use raw SSA names like `%0` or `%1` in `CHECK` lines. Capture them with placeholders such as `[[VAL:%.*]]` and reuse the placeholder.
 - For type-rewriting passes, drive the dialect-conversion infrastructure (`TypeConverter` + `applyPartialConversion`) instead of poking `Value::setType` from a walk; the conversion driver tracks materializations across boundaries that bare in-place mutation does not. Reuse upstream populators (`populateAnyFunctionOpInterfaceTypeConversionPattern`, `populateReturnOpTypeConversionPattern`, `populateCallOpTypeConversionPattern`, `scf::populateSCFStructuralTypeConversionsAndLegality`) rather than hand-rolling per-op clone-and-replace.
+- Don't walk `unrealized_conversion_cast`. Even one `getDefiningOp<UnrealizedConversionCastOp>()` peek leans on the conversion driver's temporary bridge — fix the producer (source/target materialization, missing pattern, legality target) so the cast collapses.
 
 ### Symbolic expressions (ixsimpl)
 

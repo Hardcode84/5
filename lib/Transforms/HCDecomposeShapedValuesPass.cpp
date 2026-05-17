@@ -1173,6 +1173,43 @@ struct ConvertReduceShapedOp : public OpConversionPattern<HCReduceOp> {
   }
 };
 
+// `hc.matmul` on semantic shaped operands. Same correctness story as
+// `hc.reduce`: the K dimension is a reduction whose summands come
+// through `hc.load_mask` zero-padding (or `hc.full`-style fills), so
+// invalid K lanes contribute the additive identity and the data half
+// of the matmul is correct regardless of per-K validity. The output
+// mask is `hc.full_mask` over the result shape — claiming "every
+// (m, n) output lane is addressable", not "every reduction summand
+// was in bounds". Per-tile-bounds validity stays a store-side
+// concern.
+struct ConvertMatmulShapedOp : public OpConversionPattern<HCMatmulOp> {
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(HCMatmulOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type originalResultType = op.getResult().getType();
+    if (!isSemanticShaped(originalResultType))
+      return failure();
+
+    FailureOr<std::pair<Value, Value>> lhs =
+        expectSplit(adaptor.getLhs(), op, "matmul lhs");
+    FailureOr<std::pair<Value, Value>> rhs =
+        expectSplit(adaptor.getRhs(), op, "matmul rhs");
+    if (failed(lhs) || failed(rhs))
+      return failure();
+
+    auto data = HCMatmulOp::create(rewriter, op.getLoc(),
+                                   bareDataType(originalResultType), lhs->first,
+                                   rhs->first);
+    auto mask = HCFullMaskOp::create(rewriter, op.getLoc(),
+                                     bareMaskType(originalResultType));
+    replaceSingleResultWithSplit(rewriter, op, data.getResult(),
+                                 mask.getMask());
+    return success();
+  }
+};
+
 static void populateShapedDecompositionPatterns(TypeConverter &converter,
                                                 MLIRContext *ctx,
                                                 RewritePatternSet &patterns) {
@@ -1199,8 +1236,8 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                ConvertElementwiseBinaryShapedOp<HCModOp>,
                ConvertElementwiseUnaryShapedOp<HCNegOp>,
                ConvertElementwiseUnaryShapedOp<HCNotOp>, ConvertAsTypeShapedOp,
-               ConvertBuiltinCallShapedOp, ConvertReduceShapedOp>(converter,
-                                                                  ctx);
+               ConvertBuiltinCallShapedOp, ConvertReduceShapedOp,
+               ConvertMatmulShapedOp>(converter, ctx);
 }
 
 static ConversionTarget
@@ -1218,7 +1255,7 @@ makeShapedDecompositionTarget(MLIRContext *ctx,
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
                                HCNegOp, HCNotOp, HCAsTypeOp, HCBuiltinCallOp,
-                               HCReduceOp>(
+                               HCReduceOp, HCMatmulOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {

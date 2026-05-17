@@ -137,3 +137,49 @@ func.func @tiled_load(%a: !hc.buffer<f32, ["M", "N"]>,
         -> !hc.bare_tensor<f32, ["16", "16"]>
   return %tile : !hc.bare_tensor<f32, ["16", "16"]>
 }
+
+// -----
+
+// Matmul on bare carriers, followed by an elementwise add of a bias
+// tensor — exercises the cross-pass handoff from
+// `hc-shaped-compute-to-generic` (matmul -> fill + reduce-generic)
+// into `hc-elementwise-to-generic` (add -> parallel generic) when
+// both source ops are already on the post-decompose bare carriers.
+// CHECK-LABEL: func.func @matmul_then_add
+// CHECK-NOT: hc.matmul
+// CHECK-NOT: hc.add %{{[^ ]+}}, %{{[^ ]+}} : (!hc.bare_tensor
+// CHECK-DAG: %[[M:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK-DAG: %[[N:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
+// CHECK-DAG: %[[K:.+]] = hc.idx_apply () : () -> !hc.idx<"K">
+// CHECK: %[[FILL:.+]] = hc.zeros shape %{{[^ ]+}} {{.*}} -> !hc.bare_tensor<f32, ["M", "N"]>
+// CHECK: %[[ACC:.+]] = hc.generic
+// CHECK-SAME: iter (parallel i = %[[M]] : !hc.idx<"M">, parallel j = %[[N]] : !hc.idx<"N">, reduction k = %[[K]] : !hc.idx<"K">)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M", "N"]>)
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">)
+// CHECK-SAME: ins (%[[ACC]] {{.*}} !hc.bare_tensor<f32, ["M", "N"]>, %{{.+}} {{.*}} !hc.bare_tensor<f32, ["M", "N"]>)
+// CHECK: ^bb0(%[[L:.+]]: f32, %[[R:.+]]: f32, %{{.+}}: f32):
+// CHECK:   %[[S:.+]] = hc.add %[[L]], %[[R]]
+// CHECK:   hc.yield %[[S]] : f32
+
+// Post-flatten the matmul-generic's `[i, k]` / `[k, j]` / `[i, j]`
+// per-axis arrays compose through identity layout to single 1D
+// offsets over `["M*K"]`, `["K*N"]`, `["M*N"]` respectively. The
+// elementwise add generic likewise collapses `[i_0, i_1]` to
+// `i_1 + N*i_0` on every operand.
+// POSTFLATTEN-LABEL: func.func @matmul_then_add
+// POSTFLATTEN-SAME: -> (!hc.bare_tensor<f32, ["M*N"]>, !hc.idx<"M">, !hc.idx<"N">)
+// POSTFLATTEN: hc.generic iter (parallel i = %{{.+}} : !hc.idx<"M">, parallel j = %{{.+}} : !hc.idx<"N">, reduction k = %{{.+}} : !hc.idx<"K">) ins (%{{.+}} at [#hc.expr<"k + K*i">] : !hc.bare_tensor<f32, ["K*M"]>, %{{.+}} at [#hc.expr<"j + N*k">] : !hc.bare_tensor<f32, ["K*N"]>) outs (%{{.+}} at [#hc.expr<"j + N*i">] : !hc.bare_tensor<f32, ["M*N"]>)
+// POSTFLATTEN: hc.generic iter (parallel i_0 = %{{.+}} : !hc.idx<"M">, parallel i_1 = %{{.+}} : !hc.idx<"N">) ins (%{{.+}} at [#hc.expr<"i_1 + N*i_0">] : !hc.bare_tensor<f32, ["M*N"]>, %{{.+}} at [#hc.expr<"i_1 + N*i_0">] : !hc.bare_tensor<f32, ["M*N"]>) outs (%{{.+}} at [#hc.expr<"i_1 + N*i_0">] : !hc.bare_tensor<f32, ["M*N"]>)
+func.func @matmul_then_add(%a: !hc.bare_tensor<f32, ["M", "K"]>,
+                           %b: !hc.bare_tensor<f32, ["K", "N"]>,
+                           %bias: !hc.bare_tensor<f32, ["M", "N"]>)
+    -> !hc.bare_tensor<f32, ["M", "N"]> {
+  %p = hc.matmul %a, %b
+      : (!hc.bare_tensor<f32, ["M", "K"]>, !hc.bare_tensor<f32, ["K", "N"]>)
+        -> !hc.bare_tensor<f32, ["M", "N"]>
+  %r = hc.add %p, %bias
+      : (!hc.bare_tensor<f32, ["M", "N"]>, !hc.bare_tensor<f32, ["M", "N"]>)
+        -> !hc.bare_tensor<f32, ["M", "N"]>
+  return %r : !hc.bare_tensor<f32, ["M", "N"]>
+}

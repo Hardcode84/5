@@ -234,12 +234,20 @@ static LogicalResult rewriteMatmul(HCMatmulOp op, sym::Store &store) {
   ExprAttr nDim = shapeDims->nDim;
   ExprAttr kDim = shapeDims->kDim;
 
-  auto lhsTy = cast<mlir::hc::TensorType>(op.getLhs().getType());
-  auto rhsTy = cast<mlir::hc::TensorType>(op.getRhs().getType());
-  auto outTy = cast<mlir::hc::TensorType>(op.getResult().getType());
-  Type lhsElem = lhsTy.getElementType();
-  Type rhsElem = rhsTy.getElementType();
-  Type outElem = outTy.getElementType();
+  // Same interface-dispatch story as `rewriteReduce`: production
+  // pipelines deliver bare `!hc.bare_tensor` carriers post
+  // `hc-decompose-shaped-values`; isolated unit-test pipelines that
+  // skip decompose still pin semantic `!hc.tensor`. Going through
+  // the interface keeps the rewrite flavour-agnostic.
+  auto lhsTy = dyn_cast<SymbolicallyShapedTypeInterface>(op.getLhs().getType());
+  auto rhsTy = dyn_cast<SymbolicallyShapedTypeInterface>(op.getRhs().getType());
+  auto outTy =
+      dyn_cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
+  if (!lhsTy || !rhsTy || !outTy)
+    return failure();
+  Type lhsElem = lhsTy.getSymbolicElementType();
+  Type rhsElem = rhsTy.getSymbolicElementType();
+  Type outElem = outTy.getSymbolicElementType();
   if (!matmulElementsSupported(lhsElem, rhsElem, outElem))
     return failure();
 

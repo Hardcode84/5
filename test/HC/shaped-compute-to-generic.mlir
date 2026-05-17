@@ -49,6 +49,38 @@ func.func @matmul_f32(%a: !hc.tensor<f32, ["M", "K"]>,
 
 // -----
 
+// Same plain f32 matmul, but operands and result are bare carriers —
+// the post-decompose shape the production pipeline feeds into this
+// pass. `rewriteMatmul` routes through `SymbolicallyShapedTypeInterface`
+// so the rewrite is identical to the semantic-carrier version above;
+// the carriers just print as `!hc.bare_tensor` instead.
+// CHECK-LABEL: func.func @matmul_f32_bare
+// CHECK-DAG: %[[M:.+]] = hc.idx_apply () : () -> !hc.idx<"M">
+// CHECK-DAG: %[[N:.+]] = hc.idx_apply () : () -> !hc.idx<"N">
+// CHECK-DAG: %[[K:.+]] = hc.idx_apply () : () -> !hc.idx<"K">
+// CHECK: %[[SHAPE:.+]] = hc.tuple(%[[M]], %[[N]])
+// CHECK: %[[FILL:.+]] = hc.zeros shape %[[SHAPE]] {{.*}} -> !hc.bare_tensor<f32, ["M", "N"]>
+// CHECK: hc.generic
+// CHECK-SAME: iter (parallel i = %[[M]] : !hc.idx<"M">, parallel j = %[[N]] : !hc.idx<"N">, reduction k = %[[K]] : !hc.idx<"K">)
+// CHECK-SAME: ins (%{{.+}} at [#hc.expr<"i">, #hc.expr<"k">] : !hc.bare_tensor<f32, ["M", "K"]>,
+// CHECK-SAME:      %{{.+}} at [#hc.expr<"k">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["K", "N"]>)
+// CHECK-SAME: outs (%[[FILL]] at [#hc.expr<"i">, #hc.expr<"j">] : !hc.bare_tensor<f32, ["M", "N"]>)
+// CHECK: ^bb0(%[[AV:.+]]: f32, %[[BV:.+]]: f32, %[[CV:.+]]: f32):
+// CHECK:   %[[P:.+]] = hc.mul %[[AV]], %[[BV]]
+// CHECK:   %[[S:.+]] = hc.add %[[CV]], %[[P]]
+// CHECK:   hc.yield %[[S]] : f32
+// CHECK-NOT: hc.matmul
+func.func @matmul_f32_bare(%a: !hc.bare_tensor<f32, ["M", "K"]>,
+                           %b: !hc.bare_tensor<f32, ["K", "N"]>)
+    -> !hc.bare_tensor<f32, ["M", "N"]> {
+  %r = hc.matmul %a, %b
+      : (!hc.bare_tensor<f32, ["M", "K"]>, !hc.bare_tensor<f32, ["K", "N"]>)
+        -> !hc.bare_tensor<f32, ["M", "N"]>
+  return %r : !hc.bare_tensor<f32, ["M", "N"]>
+}
+
+// -----
+
 // Mixed precision: f16 inputs, f32 accumulator. Body emits `hc.astype`
 // up to the result element type before the multiply.
 // CHECK-LABEL: func.func @matmul_f16_to_f32

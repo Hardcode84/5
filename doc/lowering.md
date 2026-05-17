@@ -302,10 +302,10 @@ every type listed above. Ops with clear semantic categories tighten further:
   the data half of a (data, mask) split; excludes `!hc.pred`, `!hc.slice`,
   `!hc.buffer`
 * `HC_ShapedValueType` — ops that only make sense on semantic tensors/vectors
-  (`hc.matmul`, `hc.vec`, `hc.with_inactive`, `hc.as_layout`)
+  (`hc.vec`, `hc.with_inactive`, `hc.as_layout`)
 * `HC_DecomposableShapedValueType` — semantic or bare shaped values at
-  decomposition-aware boundaries such as `hc.store`'s `$source` and
-  `hc.reduce`'s `$value`
+  decomposition-aware boundaries such as `hc.store`'s `$source`,
+  `hc.reduce`'s `$value`, and `hc.matmul`'s operands and result
 * `HC_BufferValueType` — buffer handles for `hc.buffer_dim`, `hc.load`;
   excludes everything non-buffer
 * `HC_BufferOrTensorValueType` — destinations/sources that accept either

@@ -1437,8 +1437,15 @@ def HCPredicateOp : HC_Op<"predicate",
 
 def HCMatmulOp : HC_Op<"matmul", [Pure]> {
   let summary = "Generic matmul over tensors or vectors.";
-  let arguments = (ins HC_ShapedValueType:$lhs, HC_ShapedValueType:$rhs);
-  let results = (outs HC_ShapedValueType:$result);
+  // Operand/result accept the bare carriers too so the op survives
+  // `hc-decompose-shaped-values`: the pass splits semantic operands
+  // into `(data, mask)` and re-creates a matmul on the data half
+  // (see `ConvertMatmulShapedOp`). Restricting to semantic-only here
+  // would make the strict decompose pipeline reject every program
+  // with `hc.matmul`.
+  let arguments = (ins HC_DecomposableShapedValueType:$lhs,
+                       HC_DecomposableShapedValueType:$rhs);
+  let results = (outs HC_DecomposableShapedValueType:$result);
   let assemblyFormat =
       "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }

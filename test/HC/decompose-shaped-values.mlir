@@ -399,3 +399,40 @@ func.func @astype_decomposes(%buf: !hc.buffer<f16, ["M"]>,
       : !hc.tensor<f16, ["4"]> -> !hc.tensor<f32, ["4"]>
   return
 }
+
+// -----
+
+// `hc.matmul` on semantic tensors. Decompose clones the matmul on the
+// `(data, data)` halves and seeds the result mask with `hc.full_mask`
+// of the result shape — same correctness story as `hc.reduce`:
+// invalid K lanes contributed zero from the load-mask path on the
+// way in, so the data half is correct without per-K gating.
+// CHECK-LABEL: func.func @matmul_decomposes
+// CHECK: %[[A_DATA:.+]] = hc.load {{.*}} -> !hc.bare_tensor<f32, ["M", "K"]>
+// CHECK: %[[A_MASK:.+]] = hc.load_mask {{.*}} -> !hc.bare_tensor<!hc.pred, ["M", "K"]>
+// CHECK: %[[B_DATA:.+]] = hc.load {{.*}} -> !hc.bare_tensor<f32, ["K", "N"]>
+// CHECK: %[[B_MASK:.+]] = hc.load_mask {{.*}} -> !hc.bare_tensor<!hc.pred, ["K", "N"]>
+// CHECK: %[[OUT:.+]] = hc.matmul %[[A_DATA]], %[[B_DATA]] : (!hc.bare_tensor<f32, ["M", "K"]>, !hc.bare_tensor<f32, ["K", "N"]>) -> !hc.bare_tensor<f32, ["M", "N"]>
+// CHECK: %[[OUT_MASK:.+]] = hc.full_mask : !hc.bare_tensor<!hc.pred, ["M", "N"]>
+// CHECK-NOT: !hc.tensor<
+// CHECK-NOT: !hc.vector<
+func.func @matmul_decomposes(%abuf: !hc.buffer<f32, ["M", "K"]>,
+                              %bbuf: !hc.buffer<f32, ["K", "N"]>,
+                              %i: !hc.idx<"0">,
+                              %j: !hc.idx<"0">) {
+  %m = hc.idx_apply () : () -> !hc.idx<"M">
+  %n = hc.idx_apply () : () -> !hc.idx<"N">
+  %k = hc.idx_apply () : () -> !hc.idx<"K">
+  %ashape = hc.tuple(%m, %k) : (!hc.idx<"M">, !hc.idx<"K">) -> tuple<!hc.idx<"M">, !hc.idx<"K">>
+  %bshape = hc.tuple(%k, %n) : (!hc.idx<"K">, !hc.idx<"N">) -> tuple<!hc.idx<"K">, !hc.idx<"N">>
+  %a = hc.load %abuf[%i, %j], shape %ashape
+      : (!hc.buffer<f32, ["M", "K"]>, !hc.idx<"0">, !hc.idx<"0">, tuple<!hc.idx<"M">, !hc.idx<"K">>)
+        -> !hc.tensor<f32, ["M", "K"]>
+  %b = hc.load %bbuf[%i, %j], shape %bshape
+      : (!hc.buffer<f32, ["K", "N"]>, !hc.idx<"0">, !hc.idx<"0">, tuple<!hc.idx<"K">, !hc.idx<"N">>)
+        -> !hc.tensor<f32, ["K", "N"]>
+  %r = hc.matmul %a, %b
+      : (!hc.tensor<f32, ["M", "K"]>, !hc.tensor<f32, ["K", "N"]>)
+        -> !hc.tensor<f32, ["M", "N"]>
+  return
+}

@@ -222,7 +222,13 @@ module attributes {transform.with_named_sequence} {
     // instead of HC scalar arithmetic.
     %m12s = transform.apply_registered_pass "hc-lower-launch-scalar-ops" to %m12i
         : (!transform.any_op) -> !transform.any_op
-    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12s
+    // Materialise shaped constants (zeros / ones / full / empty /
+    // full_mask) -- vector splats stay arith, workgroup-LDS variants
+    // plant hc.alloc + hc.generic fills that ride through launch-body
+    // and reach barriers / lower-generic in their post-flatten shape.
+    %m12c = transform.apply_registered_pass "hc-lower-launch-shaped-constants" to %m12s
+        : (!transform.any_op) -> !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12c
         : (!transform.any_op) -> !transform.any_op
     // Resolve `hc.generic` ins / outs to upstream-compatible carriers
     // now that launch-body has materialised the kernel-arg UCC bundle

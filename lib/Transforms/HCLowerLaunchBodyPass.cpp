@@ -1766,28 +1766,22 @@ struct ConvertFullMaskOp : public OpConversionPattern<HCFullMaskOp> {
     Type converted = typeConverter->convertType(op.getMask().getType());
     if (!converted)
       return failure();
-
     FailureOr<SmallVector<int64_t>> shape =
         shapedResultShape(op.getMask().getType());
-    if (succeeded(shape)) {
-      mlir::VectorType vectorType =
-          mlir::VectorType::get(*shape, rewriter.getI1Type());
-      FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, 1);
-      if (failed(attr))
-        return failure();
-      Value vector =
-          arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      FailureOr<Value> result = materializeShapedResult(
-          rewriter, op.getLoc(), converted, vector, *shape);
-      if (failed(result))
-        return failure();
-      rewriter.replaceOp(op, *result);
-      return success();
-    }
-    FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, 1);
+    if (failed(shape))
+      return failure();
+    mlir::VectorType vectorType =
+        mlir::VectorType::get(*shape, rewriter.getI1Type());
+    FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, 1);
     if (failed(attr))
       return failure();
-    rewriter.replaceOpWithNewOp<arith::ConstantOp>(op, converted, *attr);
+    Value vector =
+        arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
+    FailureOr<Value> result = materializeShapedResult(
+        rewriter, op.getLoc(), converted, vector, *shape);
+    if (failed(result))
+      return failure();
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -1802,34 +1796,26 @@ struct ConvertNullaryShapedConstantOp : public OpConversionPattern<OpT> {
     Type converted = this->typeConverter->convertType(op.getResult().getType());
     if (!converted)
       return failure();
-
     FailureOr<SmallVector<int64_t>> shape =
         shapedResultShape(op.getResult().getType());
-    if (succeeded(shape)) {
-      auto origShaped =
-          cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
-      Type elementType =
-          convertElementType(origShaped.getSymbolicElementType());
-      if (!elementType)
-        return failure();
-      mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
-      FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
-      if (failed(attr))
-        return failure();
-      Value vector =
-          arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
-      FailureOr<Value> result = materializeShapedResult(
-          rewriter, op.getLoc(), converted, vector, *shape);
-      if (failed(result))
-        return failure();
-      rewriter.replaceOp(op, *result);
-      return success();
-    }
-    FailureOr<TypedAttr> attr = splatAttr(rewriter, converted, FillValue);
+    if (failed(shape))
+      return failure();
+    auto origShaped =
+        cast<SymbolicallyShapedTypeInterface>(op.getResult().getType());
+    Type elementType = convertElementType(origShaped.getSymbolicElementType());
+    if (!elementType)
+      return failure();
+    mlir::VectorType vectorType = mlir::VectorType::get(*shape, elementType);
+    FailureOr<TypedAttr> attr = splatAttr(rewriter, vectorType, FillValue);
     if (failed(attr))
       return failure();
-    rewriter.template replaceOpWithNewOp<arith::ConstantOp>(op, converted,
-                                                            *attr);
+    Value vector =
+        arith::ConstantOp::create(rewriter, op.getLoc(), vectorType, *attr);
+    FailureOr<Value> result = materializeShapedResult(
+        rewriter, op.getLoc(), converted, vector, *shape);
+    if (failed(result))
+      return failure();
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -2551,18 +2537,12 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
   // shaped-compute rewriters live outside `hc.generic` and need
   // immediate lowering). The post-`hc-lower-generic` applies are
   // handled by the standalone `hc-lower-apply` pass.
-  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertCastOp,
-               ConvertBufferDimOp, ConvertLoadLikeOp<HCLoadOp>,
-               ConvertLoadLikeOp<HCVLoadOp>, ConvertFullMaskOp,
-               ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
-               ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
-               ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
-               ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
-               ConvertFillShapedConstantOp<HCVFullOp>,
-               ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp,
-               ConvertVecOp, ConvertSelectOp, ConvertStoreOp,
-               ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter,
-                                                                    ctx);
+  patterns
+      .add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertCastOp,
+           ConvertBufferDimOp, ConvertLoadLikeOp<HCLoadOp>,
+           ConvertLoadLikeOp<HCVLoadOp>, ConvertVecOp, ConvertSelectOp,
+           ConvertStoreOp, ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(
+          converter, ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
                AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
@@ -2647,11 +2627,9 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   // for_range, if) are pre-lowered by `hc-lower-launch-scalar-ops`;
   // any survivor here surfaces as a missing-pattern diagnostic on the
   // residual op.
-  target
-      .addIllegalOp<HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
-                    HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
-                    HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
-                    HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
+  target.addIllegalOp<HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp,
+                      HCLoadMaskOp, HCBufferViewOp, HCVecOp, HCSelectOp,
+                      HCStoreOp, HCForRangeOp, HCIfOp>();
 }
 
 // `hc.idx_apply` / `hc.pred_apply` / `hc.predicate` inside `hc.generic`
@@ -2787,5 +2765,22 @@ void registerLaunchScalarOpsLegality(ConversionTarget &target) {
   target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
                       HCAndOp, HCOrOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp,
                       HCCmpGeOp, HCCmpEqOp, HCCmpNeOp>();
+}
+
+void populateLaunchShapedConstantsPatterns(TypeConverter &converter,
+                                           RewritePatternSet &patterns,
+                                           MLIRContext *ctx) {
+  patterns.add<ConvertFullMaskOp, ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
+               ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
+               ConvertFillShapedConstantOp<HCVFullOp>,
+               ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp>(converter,
+                                                                      ctx);
+}
+
+void registerLaunchShapedConstantsLegality(ConversionTarget &target) {
+  target.addIllegalOp<HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp,
+                      HCOnesOp, HCFullOp, HCEmptyOp>();
 }
 } // namespace mlir::hc

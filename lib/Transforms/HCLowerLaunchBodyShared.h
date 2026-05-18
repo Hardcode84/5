@@ -67,6 +67,18 @@ void populateLaunchScalarOpsPatterns(TypeConverter &converter,
 // patterns are the only path out.
 void registerLaunchScalarOpsLegality(ConversionTarget &target);
 
+// Populate the shaped-constant family (`hc.zeros` / `hc.ones` /
+// `hc.full` / their `v` vector variants / `hc.empty` / `hc.full_mask`).
+// LDS-result variants plant `hc.alloc workgroup` + `hc.generic` fills;
+// vector-result variants stay as `arith.constant` splats.
+void populateLaunchShapedConstantsPatterns(TypeConverter &converter,
+                                           RewritePatternSet &patterns,
+                                           MLIRContext *ctx);
+
+// Mark every shaped-constant op illegal so the patterns above are
+// the only lowering path.
+void registerLaunchShapedConstantsLegality(ConversionTarget &target);
+
 } // namespace mlir::hc
 
 #endif // HC_TRANSFORMS_HC_LOWER_LAUNCH_BODY_SHARED_H

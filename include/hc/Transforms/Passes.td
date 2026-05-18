@@ -929,6 +929,34 @@ def HCReconcileGenericOperands : Pass<"hc-reconcile-generic-operands"> {
   ];
 }
 
+def HCLowerLaunchShapedConstants
+    : Pass<"hc-lower-launch-shaped-constants"> {
+  let summary = "Materialise shaped constants (`hc.zeros` / `hc.ones` / "
+                "`hc.full` / `hc.empty` / `hc.full_mask`) ahead of "
+                "`hc-lower-launch-body`.";
+  let description = [{
+    Lowers the shaped-constant family through the launch-body type
+    converter:
+
+      * Vector results (`!hc.bare_vector<T, ["N"]>` -> `vector<NxT>`)
+        become `arith.constant` splats / `vector.broadcast`.
+      * Workgroup-LDS results (`!hc.bare_tensor<T, ["N"]>` ->
+        `!hc.ptr<workgroup, T>`) become `hc.alloc` plus an `hc.generic`
+        per-element fill. Subsequent passes (`hc-reconcile-generic-operands`,
+        `hc-insert-workgroup-barriers`, `hc-lower-generic`) consume the
+        emitted carriers.
+
+    Runs before `hc-lower-launch-body` so its memory / shaped rewriters
+    see materialised carriers at the boundary instead of the shaped
+    constant carriers.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::vector::VectorDialect"
+  ];
+}
+
 def HCLowerLaunchScalarOps : Pass<"hc-lower-launch-scalar-ops"> {
   let summary = "Lower scalar / control-flow HC ops to upstream arith + scf.";
   let description = [{

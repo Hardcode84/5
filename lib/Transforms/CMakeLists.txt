@@ -37,6 +37,7 @@ add_mlir_library(MLIRHCTransforms
   HCSpecializeLiteralsPass.cpp
   HCVerifyBareCarriersPass.cpp
   HCVerifyStaticShapesPass.cpp
+  LaunchBodyUtils.cpp
   LaunchUtils.cpp
 
   ADDITIONAL_HEADER_DIRS

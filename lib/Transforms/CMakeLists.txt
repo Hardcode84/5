@@ -29,6 +29,7 @@ add_mlir_library(MLIRHCTransforms
   HCMaterializeBoundExprsPass.cpp
   HCNormalizeScopeRegionsPass.cpp
   HCPromoteNamesPass.cpp
+  HCReconcileGenericOperandsPass.cpp
   HCShapedComputeToGenericPass.cpp
   HCSpecializeLiteralsPass.cpp
   HCVerifyBareCarriersPass.cpp

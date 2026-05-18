@@ -45,6 +45,17 @@ void populateIntrinsicBridgingPatterns(TypeConverter &converter,
 void registerIntrinsicBridgingLegality(const TypeConverter &converter,
                                        ConversionTarget &target);
 
+// Populate the `hc.generic` operand reconciliation pattern.
+// Resolves kernel-arg `!hc.buffer` -> `!hc.ptr<global>` and LDS
+// `!hc.bare_tensor` ins -> `!hc.ptr<workgroup>`.
+void populateGenericReconciliationPatterns(TypeConverter &converter,
+                                           RewritePatternSet &patterns,
+                                           MLIRContext *ctx);
+
+// `hc.generic` is dyn-legal once its ins / outs no longer carry
+// unresolved kernel-arg buffers or LDS bare_tensor sources.
+void registerGenericReconciliationLegality(ConversionTarget &target);
+
 } // namespace mlir::hc
 
 #endif // HC_TRANSFORMS_HC_LOWER_LAUNCH_BODY_SHARED_H

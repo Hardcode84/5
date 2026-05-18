@@ -2573,7 +2573,7 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                                     ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
-               AdaptRegionlessOp<HCGetItemOp>, AdaptGenericOp>(converter, ctx);
+               AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
 }
 
 static bool regionsAreLegal(Operation *op, const TypeConverter &converter) {
@@ -2638,13 +2638,14 @@ static bool isHCCallIntrinsicLegal(HCCallIntrinsicOp op,
 // HC ptr-family + bodily generic ops survive for `hc-lower-to-llvm`
 // / `hc-lower-generic` downstream.
 static void registerLaunchBodyHCLegality(ConversionTarget &target) {
-  // `hc.generic` dyn-legal once `AdaptGenericOp` resolves kernel-arg
-  // buffers. `hc.yield` legal only inside `hc.generic` (root-level
-  // `hc.for_range` lowers to `scf.for` here).
+  // `hc.generic` rides through launch-body untouched -- operand
+  // reconciliation is `hc-reconcile-generic-operands`' job, runs in
+  // a follow-up pass before barriers / `hc-lower-generic`. `hc.yield`
+  // legal only inside `hc.generic` (root-level `hc.for_range` lowers
+  // to `scf.for` here).
   target.addLegalOp<HCUndefValueOp, UnrealizedConversionCastOp, HCAllocOp,
                     HCPtrOffsetOp, HCPtrLoadOp, HCPtrStoreOp, HCPtrLoadPredOp,
-                    HCPtrStorePredOp, HCYieldPredicatedOp>();
-  target.addDynamicallyLegalOp<HCGenericOp>(isHCGenericLegalAtLaunchBoundary);
+                    HCPtrStorePredOp, HCYieldPredicatedOp, HCGenericOp>();
   target.addDynamicallyLegalOp<HCYieldOp>([](HCYieldOp op) {
     return isa_and_nonnull<HCGenericOp>(op->getParentOp());
   });
@@ -2753,5 +2754,15 @@ void registerIntrinsicBridgingLegality(const TypeConverter &converter,
   target.addDynamicallyLegalOp<HCCallIntrinsicOp>([&](HCCallIntrinsicOp op) {
     return isHCCallIntrinsicLegal(op, converter);
   });
+}
+
+void populateGenericReconciliationPatterns(TypeConverter &converter,
+                                           RewritePatternSet &patterns,
+                                           MLIRContext *ctx) {
+  patterns.add<AdaptGenericOp>(converter, ctx);
+}
+
+void registerGenericReconciliationLegality(ConversionTarget &target) {
+  target.addDynamicallyLegalOp<HCGenericOp>(isHCGenericLegalAtLaunchBoundary);
 }
 } // namespace mlir::hc

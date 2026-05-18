@@ -905,6 +905,30 @@ def HCBridgeIntrinsics : Pass<"hc-bridge-intrinsics"> {
   ];
 }
 
+def HCReconcileGenericOperands : Pass<"hc-reconcile-generic-operands"> {
+  let summary = "Resolve `hc.generic` operands to upstream-compatible "
+                "carriers (ptr<global> for kernel-arg buffers, "
+                "ptr<workgroup> for LDS bare_tensor ins).";
+  let description = [{
+    Post-`hc-lower-launch-body` cleanup: every kernel-arg `!hc.buffer`
+    operand on `hc.generic` walks back through its UCC bundle to the
+    underlying `!hc.ptr<global>`; LDS-backed `!hc.bare_tensor` ins
+    swap to the producer-side `!hc.ptr<workgroup>` the shaped-constant
+    lowering planted. Outs stay as bare_tensor so the SSA-result
+    parity verifier on value-typed outs keeps holding.
+
+    Runs as its own pass so the reconciliation surface is named, and
+    so `hc-lower-launch-body` doesn't have to bundle generic-operand
+    plumbing into its broader rewrite. Must precede
+    `hc-insert-workgroup-barriers` (whose alias analysis keys on the
+    resolved ptr roots) and `hc-lower-generic`.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCLowerApply : Pass<"hc-lower-apply"> {
   let summary = "Lower `hc.idx_apply` / `hc.pred_apply` to arith / cmp.";
   let description = [{

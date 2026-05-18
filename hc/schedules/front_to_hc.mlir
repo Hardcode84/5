@@ -218,6 +218,13 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12i
         : (!transform.any_op) -> !transform.any_op
+    // Resolve `hc.generic` ins / outs to upstream-compatible carriers
+    // now that launch-body has materialised the kernel-arg UCC bundle
+    // and shaped-constant LDS allocations. Must precede the canon/cse
+    // pair so the storage-root SSA the barrier-insertion pass keys on
+    // is the resolved ptr, not a UCC bridge.
+    %m13r = transform.apply_registered_pass "hc-reconcile-generic-operands" to %m13b
+        : (!transform.any_op) -> !transform.any_op
     // Launch-body emitted fresh upstream `arith.constant` /
     // `index_cast` / `arith.muli` chains via ExprLowerer for every
     // `hc.idx_apply`, plus a sea of intermediate values on the bare
@@ -226,10 +233,10 @@ module attributes {transform.with_named_sequence} {
     // `hc-insert-workgroup-barriers` walks the IR (its alias rules
     // key off the storage-root SSA value, so duplicate-root noise
     // would inflate the pending set).
-    transform.apply_patterns to %m13b {
+    transform.apply_patterns to %m13r {
       transform.apply_patterns.canonicalization
     } : !transform.any_op
-    transform.apply_cse to %m13b : !transform.any_op
+    transform.apply_cse to %m13r : !transform.any_op
     // Centralise cross-`hc.generic` synchronization on workgroup-AS
     // storage (LDS). Runs after the first `hc-lower-launch-body` so
     // every workgroup-staged fill / load / store already lives inside
@@ -243,7 +250,7 @@ module attributes {transform.with_named_sequence} {
     // non-generic loads / stores on workgroup storage are out of
     // scope by design (the contract is "workgroup writes live in
     // `hc.generic`"). No-op on payloads with no workgroup tiles.
-    %m13bs = transform.apply_registered_pass "hc-insert-workgroup-barriers" to %m13b
+    %m13bs = transform.apply_registered_pass "hc-insert-workgroup-barriers" to %m13r
         : (!transform.any_op) -> !transform.any_op
     // Lower every `hc.generic` whose operands are `!hc.ptr<...>`
     // (resolved by the launch-body pass above off the kernel-arg

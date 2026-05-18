@@ -10,7 +10,7 @@
 // `hc.ptr_load[_pred]` / `hc.ptr_store[_pred]`.
 // See `doc/layouts.md` "hc.ptr and memory ops".
 //
-// RUN: hc-opt %s --hc-lower-launch-body | FileCheck %s
+// RUN: hc-opt %s --hc-lower-launch-body --hc-reconcile-generic-operands | FileCheck %s
 
 module {
   // CHECK-LABEL: func.func @scalar_and_loop(

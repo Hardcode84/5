@@ -48,16 +48,17 @@ module {
 // structural carrier (`hc.pow`); the unsupported-rhs diagnostics
 // (non-const, float, zero, negative) live on `-hc-lower-pow` and are
 // pinned in `test/HC/lower-pow-invalid.mlir`. The catch-all error here
-// covers everything `emitBinop` still can't map (bitwise / shift
-// family, ...).
+// covers everything `emitBinop` still can't map -- `BitXor` / `LShift`
+// / `RShift` have no HC counterpart. `BitOr` / `BitAnd` route to
+// `hc.or` / `hc.and` and are covered in `basic.mlir`.
 module {
-  hc_front.kernel "bad_binop_bitand" attributes {
+  hc_front.kernel "bad_binop_bitxor" attributes {
     parameters = [{name = "a"}, {name = "b"}]
   } {
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
-    // expected-error@+1 {{unsupported hc_front.binop kind 'BitAnd'}}
-    %c = hc_front.binop "BitAnd"(%a, %b)
+    // expected-error@+1 {{unsupported hc_front.binop kind 'BitXor'}}
+    %c = hc_front.binop "BitXor"(%a, %b)
     hc_front.return
   }
 }
@@ -1043,5 +1044,37 @@ module {
     // expected-error@+1 {{reduction method 'prod' is not supported yet}}
     %r = hc_front.call %prod_attr(%ax_kw)
     hc_front.return %r
+  }
+}
+
+// -----
+
+// `~x` (`ast.Invert`) has no HC counterpart and surfaces an error.
+module {
+  hc_front.kernel "unaryop_invert_unsupported" attributes {
+    parameters = [{name = "x"}]
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    // expected-error@+1 {{unsupported hc_front.unaryop kind 'Invert'}}
+    %r = hc_front.unaryop "Invert"(%x)
+    hc_front.return
+  }
+}
+
+// -----
+
+// Chained Python compare (`a < b < c`) lands as a multi-predicate
+// `hc_front.compare`. v0 only supports single-predicate; chained
+// diagnoses with a hint to AND pairwise compares manually.
+module {
+  hc_front.kernel "compare_chained_unsupported" attributes {
+    parameters = [{name = "a"}, {name = "b"}, {name = "c"}]
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %c = hc_front.name "c" {ctx = "load", ref = {kind = "param"}}
+    // expected-error@+1 {{chained compare (2 predicates) not supported}}
+    %r = hc_front.compare ["Lt", "Lt"](%a, %b, %c)
+    hc_front.return
   }
 }

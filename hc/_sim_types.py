@@ -892,6 +892,18 @@ class _MaskedValue:
     def __ne__(self, other: object) -> _MaskedValue:  # type: ignore[override]
         return self._binary(other, np.not_equal)
 
+    def __or__(self, other: Any) -> _MaskedValue:
+        return self._binary(other, np.bitwise_or)
+
+    def __ror__(self, other: Any) -> _MaskedValue:
+        return self._binary(other, np.bitwise_or, reverse=True)
+
+    def __and__(self, other: Any) -> _MaskedValue:
+        return self._binary(other, np.bitwise_and)
+
+    def __rand__(self, other: Any) -> _MaskedValue:
+        return self._binary(other, np.bitwise_and, reverse=True)
+
     def __matmul__(self, other: Any) -> Any:
         other_value = _require_same_kind(self, other)
         data = np.matmul(self._data, other_value._data)

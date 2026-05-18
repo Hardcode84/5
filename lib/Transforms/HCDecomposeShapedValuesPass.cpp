@@ -1172,6 +1172,8 @@ static void populateShapedDecompositionPatterns(TypeConverter &converter,
                ConvertElementwiseBinaryShapedOp<HCMulOp>,
                ConvertElementwiseBinaryShapedOp<HCDivOp>,
                ConvertElementwiseBinaryShapedOp<HCModOp>,
+               ConvertElementwiseBinaryShapedOp<HCAndOp>,
+               ConvertElementwiseBinaryShapedOp<HCOrOp>,
                ConvertElementwiseUnaryShapedOp<HCNegOp>,
                ConvertElementwiseUnaryShapedOp<HCNotOp>, ConvertAsTypeShapedOp,
                ConvertBuiltinCallShapedOp, ConvertReduceShapedOp,
@@ -1192,8 +1194,8 @@ makeShapedDecompositionTarget(MLIRContext *ctx,
                                HCReturnOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
-                               HCNegOp, HCNotOp, HCAsTypeOp, HCBuiltinCallOp,
-                               HCReduceOp, HCMatmulOp>(
+                               HCAndOp, HCOrOp, HCNegOp, HCNotOp, HCAsTypeOp,
+                               HCBuiltinCallOp, HCReduceOp, HCMatmulOp>(
       [&](Operation *op) { return converter.isLegal(op); });
   target.addDynamicallyLegalOp<HCForRangeOp, HCIfOp, HCWorkitemRegionOp,
                                HCSubgroupRegionOp>([&](Operation *op) {

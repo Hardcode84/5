@@ -481,30 +481,75 @@ static Value peelBufferView(Value handle,
 // checking happens here so the diagnostic surface is single-sourced.
 //===----------------------------------------------------------------------===//
 
+// Python `ast.BinOp.op` class name -> `hc.*` op factory.
+// `FloorDiv` / `Div` both route to `hc.div` (`//`-style floor on ints,
+// true division on floats) -- a deliberate pre-inference compromise.
+// `BitXor` / `LShift` / `RShift` have no HC counterpart.
+using BinopFactory = Value (*)(OpBuilder &, Location, Type, Value, Value);
+
+template <typename OpT>
+static Value binopCreate(OpBuilder &b, Location loc, Type result, Value lhs,
+                         Value rhs) {
+  return OpT::create(b, loc, result, lhs, rhs);
+}
+
+static BinopFactory lookupBinop(StringRef kind) {
+  return llvm::StringSwitch<BinopFactory>(kind)
+      .Case("Add", &binopCreate<HCAddOp>)
+      .Case("Sub", &binopCreate<HCSubOp>)
+      .Case("Mult", &binopCreate<HCMulOp>)
+      .Cases({"FloorDiv", "Div"}, &binopCreate<HCDivOp>)
+      .Case("Mod", &binopCreate<HCModOp>)
+      .Case("Pow", &binopCreate<HCPowOp>)
+      .Case("MatMult", &binopCreate<HCMatmulOp>)
+      .Case("BitOr", &binopCreate<HCOrOp>)
+      .Case("BitAnd", &binopCreate<HCAndOp>)
+      .Default(nullptr);
+}
+
 static Value emitBinop(OpBuilder &builder, Location loc, StringRef kind,
                        Value lhs, Value rhs, Type undef, Operation *sourceOp) {
-  if (kind == "Add")
-    return HCAddOp::create(builder, loc, undef, lhs, rhs);
-  if (kind == "Sub")
-    return HCSubOp::create(builder, loc, undef, lhs, rhs);
-  if (kind == "Mult")
-    return HCMulOp::create(builder, loc, undef, lhs, rhs);
-  // Both Python `/` (Div) and `//` (FloorDiv) route to `hc.div`, whose
-  // ODS summary is "integer/float division (Python `//` for ints)": int
-  // operands floor, float operands do true division. That collapses
-  // Python's `/`-on-ints (true division returning float) into `//`-style
-  // floor -- an intentional compromise pre-inference. If a later pass
-  // wants strict Python `/` semantics it needs a dedicated truediv op;
-  // only this branch has to change.
-  if (kind == "FloorDiv" || kind == "Div")
-    return HCDivOp::create(builder, loc, undef, lhs, rhs);
-  if (kind == "Mod")
-    return HCModOp::create(builder, loc, undef, lhs, rhs);
-  if (kind == "Pow")
-    return HCPowOp::create(builder, loc, undef, lhs, rhs);
-  if (kind == "MatMult")
-    return HCMatmulOp::create(builder, loc, undef, lhs, rhs);
+  if (BinopFactory factory = lookupBinop(kind))
+    return factory(builder, loc, undef, lhs, rhs);
   sourceOp->emitOpError("unsupported hc_front.binop kind '") << kind << "'";
+  return nullptr;
+}
+
+// Python `ast.UnaryOp.op` class name -> `hc.*` op. `UAdd` is the
+// unary plus that Python admits as a no-op; passthrough. `Invert`
+// (`~x` bitwise NOT) has no HC counterpart and diagnoses.
+static Value emitUnaryop(OpBuilder &builder, Location loc, StringRef kind,
+                         Value operand, Type undef, Operation *sourceOp) {
+  if (kind == "USub")
+    return HCNegOp::create(builder, loc, undef, operand);
+  if (kind == "Not")
+    return HCNotOp::create(builder, loc, undef, operand);
+  if (kind == "UAdd")
+    return operand;
+  sourceOp->emitOpError("unsupported hc_front.unaryop kind '") << kind << "'";
+  return nullptr;
+}
+
+// Python `ast.Compare.ops[k]` class name -> `hc.cmp.*` op. v0
+// supports single-predicate compare only; chained Python `a < b < c`
+// requires AND'ing pairwise compares and diagnoses here for now.
+static Value emitCompare(OpBuilder &builder, Location loc, StringRef predicate,
+                         Value lhs, Value rhs, Type undef,
+                         Operation *sourceOp) {
+  if (predicate == "Lt")
+    return HCCmpLtOp::create(builder, loc, undef, lhs, rhs);
+  if (predicate == "LtE")
+    return HCCmpLeOp::create(builder, loc, undef, lhs, rhs);
+  if (predicate == "Gt")
+    return HCCmpGtOp::create(builder, loc, undef, lhs, rhs);
+  if (predicate == "GtE")
+    return HCCmpGeOp::create(builder, loc, undef, lhs, rhs);
+  if (predicate == "Eq")
+    return HCCmpEqOp::create(builder, loc, undef, lhs, rhs);
+  if (predicate == "NotEq")
+    return HCCmpNeOp::create(builder, loc, undef, lhs, rhs);
+  sourceOp->emitOpError("unsupported hc_front.compare predicate '")
+      << predicate << "'";
   return nullptr;
 }
 
@@ -1611,6 +1656,8 @@ private:
   // side-effecting ops without a user-visible result.
   Value lowerConstant(hc_front::ConstantOp op);
   Value lowerBinop(hc_front::BinOp op);
+  Value lowerUnaryop(hc_front::UnaryOp op);
+  Value lowerCompare(hc_front::CompareOp op);
   Value lowerSlice(hc_front::SliceOp op);
   LogicalResult lowerReturn(hc_front::ReturnOp op);
   LogicalResult lowerAssign(hc_front::AssignOp op);
@@ -2299,6 +2346,10 @@ LogicalResult Lowerer::lowerScalarValueOp(Operation *op) {
   }
   if (auto b = dyn_cast<hc_front::BinOp>(op))
     return record(b.getResult(), lowerBinop(b));
+  if (auto u = dyn_cast<hc_front::UnaryOp>(op))
+    return record(u.getResult(), lowerUnaryop(u));
+  if (auto c = dyn_cast<hc_front::CompareOp>(op))
+    return record(c.getResult(), lowerCompare(c));
   if (auto s = dyn_cast<hc_front::SliceOp>(op))
     return record(s.getResult(), lowerSlice(s));
   if (auto s = dyn_cast<hc_front::SubscriptOp>(op))
@@ -2335,8 +2386,8 @@ LogicalResult Lowerer::lowerOp(Operation *op) {
   }
   if (isa<hc_front::NameOp, hc_front::AttrOp, hc_front::CallOp>(op))
     return lowerProducingOp(op);
-  if (isa<hc_front::ConstantOp, hc_front::BinOp, hc_front::SliceOp,
-          hc_front::SubscriptOp>(op))
+  if (isa<hc_front::ConstantOp, hc_front::BinOp, hc_front::UnaryOp,
+          hc_front::CompareOp, hc_front::SliceOp, hc_front::SubscriptOp>(op))
     return lowerScalarValueOp(op);
   if (isa<hc_front::ReturnOp, hc_front::AssignOp, hc_front::ForOp,
           hc_front::WorkitemRegionOp, hc_front::SubgroupRegionOp,
@@ -2650,6 +2701,50 @@ Value Lowerer::lowerBinop(hc_front::BinOp op) {
     return nullptr;
   }
   return emitBinop(builder, op.getLoc(), op.getKind(), lhs, rhs, undef, op);
+}
+
+Value Lowerer::lowerUnaryop(hc_front::UnaryOp op) {
+  FailureOr<Value> operandOr =
+      lowerValueOperand(op.getOperand(), op.getOperation(), "operand");
+  if (failed(operandOr))
+    return nullptr;
+  Value operand = *operandOr;
+  if (!operand) {
+    op.emitOpError("unaryop operand did not lower to an hc value; "
+                   "operand may be a callee-like ref or parent-consumed "
+                   "syntax node");
+    return nullptr;
+  }
+  return emitUnaryop(builder, op.getLoc(), op.getKind(), operand, undef, op);
+}
+
+Value Lowerer::lowerCompare(hc_front::CompareOp op) {
+  ArrayAttr predicates = op.getPredicates();
+  if (predicates.size() != 1) {
+    op.emitOpError("chained compare (")
+        << predicates.size() << " predicates) not supported; rewrite as "
+        << "explicit pairwise compares joined with `and`";
+    return nullptr;
+  }
+  if (op.getOperands().size() != 2) {
+    op.emitOpError("expected 2 compare operands for a single predicate, got ")
+        << op.getOperands().size();
+    return nullptr;
+  }
+  FailureOr<Value> lhsOr =
+      lowerValueOperand(op.getOperands()[0], op.getOperation(), "lhs");
+  FailureOr<Value> rhsOr =
+      lowerValueOperand(op.getOperands()[1], op.getOperation(), "rhs");
+  if (failed(lhsOr) || failed(rhsOr))
+    return nullptr;
+  Value lhs = *lhsOr;
+  Value rhs = *rhsOr;
+  if (!lhs || !rhs) {
+    op.emitOpError("compare operand did not lower to an hc value");
+    return nullptr;
+  }
+  StringRef predicate = cast<StringAttr>(predicates[0]).getValue();
+  return emitCompare(builder, op.getLoc(), predicate, lhs, rhs, undef, op);
 }
 
 Value Lowerer::lowerSlice(hc_front::SliceOp op) {

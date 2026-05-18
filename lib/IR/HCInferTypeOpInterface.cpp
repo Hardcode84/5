@@ -1364,6 +1364,57 @@ LogicalResult HCPowOp::inferHCTypes(ArrayRef<Type> operandTypes,
   return success();
 }
 
+// Bitwise / logical: no ixsimpl primitive, so `!hc.idx` arm bails.
+// Scalar same-type passthrough; shaped follows the broadcast rule.
+static LogicalResult inferBitwiseBinary(ArrayRef<Type> operands, Operation *op,
+                                        SmallVectorImpl<Type> &resultTypes) {
+  if (failed(requireOperandCount(op, operands, 2)))
+    return failure();
+  Type lhs = operands[0];
+  Type rhs = operands[1];
+  if (!lhs || !rhs) {
+    resultTypes.push_back({});
+    return success();
+  }
+  if (isa<IdxType>(lhs) || isa<IdxType>(rhs)) {
+    resultTypes.push_back({});
+    return success();
+  }
+  if (lhs == rhs && (lhs.isIntOrIndexOrFloat() ||
+                     isa<mlir::hc::TensorType, mlir::hc::VectorType>(lhs))) {
+    resultTypes.push_back(lhs);
+    return success();
+  }
+  FailureOr<Type> broadcasted = inferShapedBinaryResult(lhs, rhs, op);
+  if (succeeded(broadcasted)) {
+    resultTypes.push_back(*broadcasted);
+    return success();
+  }
+  resultTypes.push_back({});
+  return success();
+}
+
+LogicalResult HCAndOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                    SmallVectorImpl<Type> &resultTypes) {
+  return inferBitwiseBinary(operandTypes, *this, resultTypes);
+}
+
+LogicalResult HCOrOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                   SmallVectorImpl<Type> &resultTypes) {
+  return inferBitwiseBinary(operandTypes, *this, resultTypes);
+}
+
+LogicalResult HCNotOp::inferHCTypes(ArrayRef<Type> operandTypes,
+                                    SmallVectorImpl<Type> &resultTypes) {
+  Type value = operandTypes.empty() ? Type{} : operandTypes.front();
+  if (!value || isa<IdxType>(value)) {
+    resultTypes.push_back({});
+    return success();
+  }
+  resultTypes.push_back(value);
+  return success();
+}
+
 LogicalResult HCNegOp::inferHCTypes(ArrayRef<Type> operandTypes,
                                     SmallVectorImpl<Type> &resultTypes) {
   Type value = operandTypes.empty() ? Type{} : operandTypes.front();

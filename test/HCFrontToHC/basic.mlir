@@ -710,6 +710,38 @@ module {
     hc_front.return %r
   }
 
+  // Python `a | b` / `a & b` route to `hc.or` / `hc.and`. Bitwise
+  // family is the natural surface for combining shaped boolean masks;
+  // `BitXor` and the shifts have no HC counterpart and stay
+  // unsupported (covered in `invalid.mlir`).
+  // CHECK-LABEL: hc.func @binop_bitor
+  // CHECK: hc.or %arg0, %arg1 : (!hc.undef, !hc.undef) -> !hc.undef
+  // CHECK: hc.return
+  hc_front.func "binop_bitor" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.binop "BitOr"(%a, %b)
+    hc_front.return %r
+  }
+
+  // CHECK-LABEL: hc.func @binop_bitand
+  // CHECK: hc.and %arg0, %arg1 : (!hc.undef, !hc.undef) -> !hc.undef
+  // CHECK: hc.return
+  hc_front.func "binop_bitand" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.binop "BitAnd"(%a, %b)
+    hc_front.return %r
+  }
+
   // Python `a @ b` arrives as `ast.MatMult` and routes to `hc.matmul`.
   // CHECK-LABEL: hc.func @binop_matmul
   // CHECK: hc.matmul %arg0, %arg1 : (!hc.undef, !hc.undef) -> !hc.undef
@@ -722,6 +754,62 @@ module {
     %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
     %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
     %r = hc_front.binop "MatMult"(%a, %b)
+    hc_front.return %r
+  }
+
+  // Python `-x` arrives as `ast.UnaryOp(op=ast.USub)` and routes to `hc.neg`.
+  // CHECK-LABEL: hc.func @unaryop_neg
+  // CHECK: hc.neg %{{.+}} : !hc.undef -> !hc.undef
+  hc_front.func "unaryop_neg" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.unaryop "USub"(%x)
+    hc_front.return %r
+  }
+
+  // `not x` (`ast.Not`) routes to `hc.not`. `+x` (`UAdd`) is a no-op
+  // passthrough; `Invert` (`~x`) has no HC counterpart and would
+  // diagnose -- covered in `invalid.mlir`.
+  // CHECK-LABEL: hc.func @unaryop_not
+  // CHECK: hc.not %{{.+}} : !hc.undef -> !hc.undef
+  hc_front.func "unaryop_not" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "x"}],
+    scope = "WorkGroup"
+  } {
+    %x = hc_front.name "x" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.unaryop "Not"(%x)
+    hc_front.return %r
+  }
+
+  // Single-predicate compare. Each `ast.Compare` op-class maps to the
+  // matching `hc.cmp.*`. Chained compares (`a < b < c`) diagnose.
+  // CHECK-LABEL: hc.func @compare_lt
+  // CHECK: hc.cmp.lt %{{.+}}, %{{.+}} : (!hc.undef, !hc.undef) -> !hc.undef
+  hc_front.func "compare_lt" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.compare ["Lt"](%a, %b)
+    hc_front.return %r
+  }
+
+  // CHECK-LABEL: hc.func @compare_eq
+  // CHECK: hc.cmp.eq %{{.+}}, %{{.+}} : (!hc.undef, !hc.undef) -> !hc.undef
+  hc_front.func "compare_eq" attributes {
+    decorators = ["kernel.func"],
+    parameters = [{name = "a"}, {name = "b"}],
+    scope = "WorkGroup"
+  } {
+    %a = hc_front.name "a" {ctx = "load", ref = {kind = "param"}}
+    %b = hc_front.name "b" {ctx = "load", ref = {kind = "param"}}
+    %r = hc_front.compare ["Eq"](%a, %b)
     hc_front.return %r
   }
 

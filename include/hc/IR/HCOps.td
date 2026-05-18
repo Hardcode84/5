@@ -398,15 +398,18 @@ def HCBuiltinCallOp : HC_Op<"builtin_call", [Pure,
 // Boolean ops stay on `HC_ValueType`: `i1` falls under `AnyInteger`, and
 // a tight `HC_BooleanValueType` needs "width == 1" / "elem is i1"
 // structural constraints we don't have yet.
-def HCAndOp : HC_GenericBinaryOp<"and", [Commutative]> {
+def HCAndOp : HC_GenericBinaryOp<"and",
+    [Commutative, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Generic logical AND (Python `and`, `&` on bools).";
 }
 
-def HCOrOp : HC_GenericBinaryOp<"or", [Commutative]> {
+def HCOrOp : HC_GenericBinaryOp<"or",
+    [Commutative, DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Generic logical OR (Python `or`, `|` on bools).";
 }
 
-def HCNotOp : HC_GenericUnaryOp<"not"> {
+def HCNotOp : HC_GenericUnaryOp<"not",
+    [DeclareOpInterfaceMethods<HCInferTypeOpInterface>]> {
   let summary = "Generic logical NOT (Python `not`).";
 }
 

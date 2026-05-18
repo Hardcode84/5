@@ -929,6 +929,27 @@ def HCReconcileGenericOperands : Pass<"hc-reconcile-generic-operands"> {
   ];
 }
 
+def HCLowerLaunchScalarOps : Pass<"hc-lower-launch-scalar-ops"> {
+  let summary = "Lower scalar / control-flow HC ops to upstream arith + scf.";
+  let description = [{
+    Cleanup pass for the HC ops that don't carry shape / memory
+    state: `hc.const`, `hc.add` / `hc.sub` / `hc.mul` / `hc.div` /
+    `hc.mod` (int + float overloads), `hc.and` / `hc.or` / `hc.neg`,
+    `hc.cmp.{lt,le,gt,ge,eq,ne}`, `hc.cast`, `hc.for_range`, `hc.if`.
+
+    Runs before `hc-lower-launch-body` so its memory / shaped
+    rewriters see arith / scf ops at the boundary instead of a sea
+    of `!hc.idx<...>` / `!hc.pred<...>` typed HC arithmetic. Same
+    launch-body type converter, so `!hc.idx` -> `index`, `!hc.pred`
+    -> `i1`, with UCC bridges where consumers still expect HC types.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::scf::SCFDialect"
+  ];
+}
+
 def HCLowerApply : Pass<"hc-lower-apply"> {
   let summary = "Lower `hc.idx_apply` / `hc.pred_apply` to arith / cmp.";
   let description = [{

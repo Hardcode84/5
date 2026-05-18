@@ -2546,20 +2546,12 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
 static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                MLIRContext *ctx,
                                                RewritePatternSet &patterns) {
-  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertConstOp,
-               ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
-               ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
-               ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
-               // `hc.and` / `hc.or` reach here as scalar ops on i1.
-               ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
-               ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
-               ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
-               ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
-               ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
-               ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
-               ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>,
-               ConvertCmpOp<HCCmpGtOp>, ConvertCmpOp<HCCmpGeOp>,
-               ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>, ConvertCastOp,
+  // `ConvertIdxApplyOp` / `ConvertPredApplyOp` still register here for
+  // the first launch-body invocation (applies emitted by load_mask /
+  // shaped-compute rewriters live outside `hc.generic` and need
+  // immediate lowering). The post-`hc-lower-generic` applies are
+  // handled by the standalone `hc-lower-apply` pass.
+  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertCastOp,
                ConvertBufferDimOp, ConvertLoadLikeOp<HCLoadOp>,
                ConvertLoadLikeOp<HCVLoadOp>, ConvertFullMaskOp,
                ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
@@ -2651,13 +2643,15 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   });
   // `hc.load_mask` already lowered upstream by
   // `hc-load-store-to-generic`; surviving op is a producer bug.
-  target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
-                      HCAndOp, HCOrOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp,
-                      HCCmpGeOp, HCCmpEqOp, HCCmpNeOp, HCCastOp, HCBufferDimOp,
-                      HCLoadOp, HCVLoadOp, HCLoadMaskOp, HCBufferViewOp,
-                      HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp,
-                      HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp, HCSelectOp,
-                      HCStoreOp, HCForRangeOp, HCIfOp>();
+  // Scalar / control-flow ops (const, int/float arith, cmp, cast,
+  // for_range, if) are pre-lowered by `hc-lower-launch-scalar-ops`;
+  // any survivor here surfaces as a missing-pattern diagnostic on the
+  // residual op.
+  target
+      .addIllegalOp<HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp, HCLoadMaskOp,
+                    HCBufferViewOp, HCVecOp, HCVZerosOp, HCVOnesOp, HCVFullOp,
+                    HCFullMaskOp, HCZerosOp, HCOnesOp, HCFullOp, HCEmptyOp,
+                    HCSelectOp, HCStoreOp, HCForRangeOp, HCIfOp>();
 }
 
 // `hc.idx_apply` / `hc.pred_apply` / `hc.predicate` inside `hc.generic`
@@ -2764,5 +2758,34 @@ void populateGenericReconciliationPatterns(TypeConverter &converter,
 
 void registerGenericReconciliationLegality(ConversionTarget &target) {
   target.addDynamicallyLegalOp<HCGenericOp>(isHCGenericLegalAtLaunchBoundary);
+}
+
+void populateLaunchScalarOpsPatterns(TypeConverter &converter,
+                                     RewritePatternSet &patterns,
+                                     MLIRContext *ctx) {
+  // Pure arith: const, int/float arith, cmp, div, neg, mod. `Cast`
+  // is type-bridging over the converter (shaped flavours included)
+  // and `ForRange` / `If` clone bodies whose block args carry shaped
+  // types -- both leak cross-pass UCCs when split, so they stay in
+  // launch-body.
+  patterns.add<ConvertConstOp, ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
+               ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
+               ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
+               ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
+               ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
+               ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
+               ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
+               ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
+               ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
+               ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>,
+               ConvertCmpOp<HCCmpGtOp>, ConvertCmpOp<HCCmpGeOp>,
+               ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>>(converter,
+                                                                 ctx);
+}
+
+void registerLaunchScalarOpsLegality(ConversionTarget &target) {
+  target.addIllegalOp<HCConstOp, HCAddOp, HCSubOp, HCMulOp, HCDivOp, HCModOp,
+                      HCAndOp, HCOrOp, HCNegOp, HCCmpLtOp, HCCmpLeOp, HCCmpGtOp,
+                      HCCmpGeOp, HCCmpEqOp, HCCmpNeOp>();
 }
 } // namespace mlir::hc

@@ -56,6 +56,17 @@ void populateGenericReconciliationPatterns(TypeConverter &converter,
 // unresolved kernel-arg buffers or LDS bare_tensor sources.
 void registerGenericReconciliationLegality(ConversionTarget &target);
 
+// Populate scalar / control-flow HC ops (const, int/float arith,
+// cmp, cast, for_range, if). Each pattern lowers to its arith /
+// scf counterpart through `converter`.
+void populateLaunchScalarOpsPatterns(TypeConverter &converter,
+                                     RewritePatternSet &patterns,
+                                     MLIRContext *ctx);
+
+// Mark every scalar / control-flow HC op illegal so `populate`'s
+// patterns are the only path out.
+void registerLaunchScalarOpsLegality(ConversionTarget &target);
+
 } // namespace mlir::hc
 
 #endif // HC_TRANSFORMS_HC_LOWER_LAUNCH_BODY_SHARED_H

@@ -216,7 +216,13 @@ module attributes {transform.with_named_sequence} {
     // on intrinsics passes through on already-bridged IR.
     %m12i = transform.apply_registered_pass "hc-bridge-intrinsics" to %m12v
         : (!transform.any_op) -> !transform.any_op
-    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12i
+    // Lower the scalar / control-flow HC ops (const, int/float arith,
+    // cmp, cast, for_range, if) to arith / scf ahead of launch-body
+    // so its memory / shaped rewriters see arith at the boundary
+    // instead of HC scalar arithmetic.
+    %m12s = transform.apply_registered_pass "hc-lower-launch-scalar-ops" to %m12i
+        : (!transform.any_op) -> !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12s
         : (!transform.any_op) -> !transform.any_op
     // Resolve `hc.generic` ins / outs to upstream-compatible carriers
     // now that launch-body has materialised the kernel-arg UCC bundle

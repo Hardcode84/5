@@ -34,6 +34,17 @@ void populateLaunchBodyApplyPatterns(TypeConverter &converter,
 // body, illegal everywhere else.
 void registerLaunchBodyApplyDynamicLegality(ConversionTarget &target);
 
+// Populate `hc.intrinsic` + `hc.call_intrinsic` boundary type
+// conversion patterns. Same boundary type rules as `hc-lower-launch-body`.
+void populateIntrinsicBridgingPatterns(TypeConverter &converter,
+                                       RewritePatternSet &patterns,
+                                       MLIRContext *ctx);
+
+// Mark `hc.intrinsic` / `hc.call_intrinsic` dyn-legal once their
+// signatures / boundaries match `converter`'s projection.
+void registerIntrinsicBridgingLegality(const TypeConverter &converter,
+                                       ConversionTarget &target);
+
 } // namespace mlir::hc
 
 #endif // HC_TRANSFORMS_HC_LOWER_LAUNCH_BODY_SHARED_H

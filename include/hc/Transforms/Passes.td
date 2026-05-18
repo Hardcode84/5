@@ -881,6 +881,30 @@ def HCVerifyBareCarriers
   let dependentDialects = ["::mlir::hc::HCDialect"];
 }
 
+def HCBridgeIntrinsics : Pass<"hc-bridge-intrinsics"> {
+  let summary = "Convert `hc.intrinsic` signatures and `hc.call_intrinsic` "
+                "boundaries to upstream-compatible types.";
+  let description = [{
+    Bridges the HC intrinsic boundary before `hc-lower-launch-body` runs:
+
+      * `hc.intrinsic` signatures retype through the launch-body type
+        converter (`!hc.idx` -> `index`, `!hc.pred` -> `i1`, bare carriers
+        -> `vector` / `!hc.ptr<workgroup>`); body block args follow.
+      * `hc.call_intrinsic` operands / results cast to the matching
+        boundary types via `unrealized_conversion_cast`.
+
+    Hoisted out of `hc-lower-launch-body` so the bridging concern owns
+    its own pass and intrinsics arrive at launch-body already in their
+    final shape. Runs once, regardless of how many launch-body
+    invocations downstream consume the IR. `hc-interpret-intrinsic-recipes`
+    further down the pipeline consumes the bridged ops.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect"
+  ];
+}
+
 def HCLowerApply : Pass<"hc-lower-apply"> {
   let summary = "Lower `hc.idx_apply` / `hc.pred_apply` to arith / cmp.";
   let description = [{

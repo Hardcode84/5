@@ -210,7 +210,13 @@ module attributes {transform.with_named_sequence} {
     // instead of per launch-body invocation.
     %m12v = transform.apply_registered_pass "hc-verify-bare-carriers" to %m12b
         : (!transform.any_op) -> !transform.any_op
-    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12v
+    // Bridge `hc.intrinsic` signatures + `hc.call_intrinsic` boundaries
+    // to the launch-body type converter's projection ahead of the
+    // main lowering. Same converter, so launch-body's dyn-legal check
+    // on intrinsics passes through on already-bridged IR.
+    %m12i = transform.apply_registered_pass "hc-bridge-intrinsics" to %m12v
+        : (!transform.any_op) -> !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12i
         : (!transform.any_op) -> !transform.any_op
     // Launch-body emitted fresh upstream `arith.constant` /
     // `index_cast` / `arith.muli` chains via ExprLowerer for every

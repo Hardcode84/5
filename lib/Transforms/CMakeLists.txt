@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 add_mlir_library(MLIRHCTransforms
+  HCBridgeIntrinsicsPass.cpp
   HCCanonicalizeLayoutsPass.cpp
   HCDecomposeShapedValuesPass.cpp
   HCDistributeWaveLayoutsPass.cpp

@@ -2546,30 +2546,31 @@ struct ConvertIfOp : public OpConversionPattern<HCIfOp> {
 static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
                                                MLIRContext *ctx,
                                                RewritePatternSet &patterns) {
-  patterns.add<
-      ConvertIdxApplyOp, ConvertPredApplyOp, ConvertConstOp,
-      ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
-      ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
-      ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
-      // `hc.and` / `hc.or` reach here as scalar ops on i1.
-      ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
-      ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
-      ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
-      ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
-      ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
-      ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
-      ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>, ConvertCmpOp<HCCmpGtOp>,
-      ConvertCmpOp<HCCmpGeOp>, ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>,
-      ConvertCastOp, ConvertBufferDimOp, ConvertIntrinsicSignatureOp,
-      ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
-      ConvertFullMaskOp, ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
-      ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
-      ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
-      ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
-      ConvertFillShapedConstantOp<HCVFullOp>,
-      ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp, ConvertVecOp,
-      ConvertSelectOp, ConvertStoreOp, ConvertCallIntrinsicOp,
-      ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter, ctx);
+  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertConstOp,
+               ConvertIntBinaryOp<HCAddOp, arith::AddIOp>,
+               ConvertIntBinaryOp<HCSubOp, arith::SubIOp>,
+               ConvertIntBinaryOp<HCMulOp, arith::MulIOp>,
+               // `hc.and` / `hc.or` reach here as scalar ops on i1.
+               ConvertIntBinaryOp<HCAndOp, arith::AndIOp>,
+               ConvertIntBinaryOp<HCOrOp, arith::OrIOp>,
+               ConvertFloatBinaryOp<HCAddOp, arith::AddFOp>,
+               ConvertFloatBinaryOp<HCSubOp, arith::SubFOp>,
+               ConvertFloatBinaryOp<HCMulOp, arith::MulFOp>, ConvertDivOp,
+               ConvertIntBinaryOp<HCModOp, arith::RemUIOp>, ConvertNegOp,
+               ConvertCmpOp<HCCmpLtOp>, ConvertCmpOp<HCCmpLeOp>,
+               ConvertCmpOp<HCCmpGtOp>, ConvertCmpOp<HCCmpGeOp>,
+               ConvertCmpOp<HCCmpEqOp>, ConvertCmpOp<HCCmpNeOp>, ConvertCastOp,
+               ConvertBufferDimOp, ConvertLoadLikeOp<HCLoadOp>,
+               ConvertLoadLikeOp<HCVLoadOp>, ConvertFullMaskOp,
+               ConvertNullaryShapedConstantOp<HCVZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCVOnesOp, 1>,
+               ConvertNullaryShapedConstantOp<HCZerosOp, 0>,
+               ConvertNullaryShapedConstantOp<HCOnesOp, 1>,
+               ConvertFillShapedConstantOp<HCVFullOp>,
+               ConvertFillShapedConstantOp<HCFullOp>, ConvertEmptyOp,
+               ConvertVecOp, ConvertSelectOp, ConvertStoreOp,
+               ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(converter,
+                                                                    ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
                AdaptRegionlessOp<HCGetItemOp>, AdaptGenericOp>(converter, ctx);
@@ -2735,5 +2736,22 @@ void populateLaunchBodyApplyPatterns(TypeConverter &converter,
 // by `hc-lower-generic`); illegal everywhere else.
 void registerLaunchBodyApplyDynamicLegality(ConversionTarget &target) {
   registerLaunchBodyApplyLegality(target);
+}
+
+void populateIntrinsicBridgingPatterns(TypeConverter &converter,
+                                       RewritePatternSet &patterns,
+                                       MLIRContext *ctx) {
+  patterns.add<ConvertIntrinsicSignatureOp, ConvertCallIntrinsicOp>(converter,
+                                                                    ctx);
+}
+
+void registerIntrinsicBridgingLegality(const TypeConverter &converter,
+                                       ConversionTarget &target) {
+  target.addDynamicallyLegalOp<HCIntrinsicOp>([&](HCIntrinsicOp op) {
+    return isHCIntrinsicSignatureLegal(op, converter);
+  });
+  target.addDynamicallyLegalOp<HCCallIntrinsicOp>([&](HCCallIntrinsicOp op) {
+    return isHCCallIntrinsicLegal(op, converter);
+  });
 }
 } // namespace mlir::hc

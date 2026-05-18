@@ -929,6 +929,37 @@ def HCReconcileGenericOperands : Pass<"hc-reconcile-generic-operands"> {
   ];
 }
 
+def HCLowerLaunchMemoryAccess : Pass<"hc-lower-launch-memory-access"> {
+  let summary = "Lower `hc.load` / `hc.vload` / `hc.store` / "
+                "`hc.buffer_view` / `hc.vec` / `hc.select` to "
+                "`hc.ptr_offset` / `hc.ptr_load[_pred]` / "
+                "`hc.ptr_store[_pred]` + `vector` ops.";
+  let description = [{
+    Memory-access slice of the old `hc-lower-launch-body` rewrites.
+    Lowers per-tile access ops through the launch-body type converter:
+
+      * Loads / vector loads / stores walk back through the kernel-arg
+        UCC bundle to resolve their `!hc.buffer` operand, then emit
+        per-element `hc.ptr_offset` + `hc.ptr_load[_pred]` /
+        `hc.ptr_store[_pred]`. Masked stores emit `hc.ptr_store_pred`.
+      * `hc.buffer_view` dispatches on the converted source: workgroup
+        ptr passthrough, vector reshape + extract for vector sources.
+      * `hc.vec` materialises tile vectors; `hc.select` blends two
+        shaped sources via `arith.select`.
+
+    Runs after `hc-lower-launch-shaped-constants` so the LDS / vector
+    carriers are in place, and before `hc-lower-launch-body` so the
+    residual launch-body lowering sees materialised `vector` /
+    `!hc.ptr<*>` values across its `hc.cast` / `hc.for_range` / `hc.if`
+    consumers.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::hc::HCDialect",
+    "::mlir::vector::VectorDialect"
+  ];
+}
+
 def HCLowerLaunchShapedConstants
     : Pass<"hc-lower-launch-shaped-constants"> {
   let summary = "Materialise shaped constants (`hc.zeros` / `hc.ones` / "

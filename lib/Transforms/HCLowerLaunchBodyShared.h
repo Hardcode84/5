@@ -79,6 +79,11 @@ void populateLaunchShapedConstantsPatterns(TypeConverter &converter,
 // the only lowering path.
 void registerLaunchShapedConstantsLegality(ConversionTarget &target);
 
+void populateLaunchMemoryAccessPatterns(TypeConverter &converter,
+                                        RewritePatternSet &patterns,
+                                        MLIRContext *ctx);
+void registerLaunchMemoryAccessLegality(ConversionTarget &target);
+
 } // namespace mlir::hc
 
 #endif // HC_TRANSFORMS_HC_LOWER_LAUNCH_BODY_SHARED_H

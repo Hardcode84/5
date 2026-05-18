@@ -1061,17 +1061,23 @@ static LogicalResult collectSliceAxis(Operation *op, Value index,
   auto slice = index.getDefiningOp<HCSliceExprOp>();
   if (!slice)
     return failure();
+  // Slice fields are `!hc.idx<...>`-typed pre-`AdaptRegionlessOp`; cast
+  // through `index` here so callers can wire them straight into
+  // `arith.*` without inheriting the slice's HC types. `castIfNeeded`
+  // no-ops when the value already has the target type.
+  Type indexType = builder.getIndexType();
+  Location loc = op->getLoc();
   if (Value step = slice.getStep()) {
     APInt stepValue;
     if (requireUnitStride && (!matchPattern(step, m_ConstantInt(&stepValue)) ||
                               stepValue.getSExtValue() != 1))
       return op->emitOpError("only unit-stride slices lower to vector ops");
-    axis.stride = step;
+    axis.stride = castIfNeeded(builder, loc, step, indexType);
   } else {
-    axis.stride = oneIndex(builder, op->getLoc());
+    axis.stride = oneIndex(builder, loc);
   }
-  axis.offset =
-      slice.getLower() ? slice.getLower() : zeroIndex(builder, op->getLoc());
+  Value lower = slice.getLower() ? slice.getLower() : zeroIndex(builder, loc);
+  axis.offset = castIfNeeded(builder, loc, lower, indexType);
   axis.isSlice = true;
   return success();
 }
@@ -2537,12 +2543,9 @@ static void populateLaunchBodyLoweringPatterns(TypeConverter &converter,
   // shaped-compute rewriters live outside `hc.generic` and need
   // immediate lowering). The post-`hc-lower-generic` applies are
   // handled by the standalone `hc-lower-apply` pass.
-  patterns
-      .add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertCastOp,
-           ConvertBufferDimOp, ConvertLoadLikeOp<HCLoadOp>,
-           ConvertLoadLikeOp<HCVLoadOp>, ConvertVecOp, ConvertSelectOp,
-           ConvertStoreOp, ConvertBufferViewOp, ConvertForRangeOp, ConvertIfOp>(
-          converter, ctx);
+  patterns.add<ConvertIdxApplyOp, ConvertPredApplyOp, ConvertCastOp,
+               ConvertBufferDimOp, ConvertForRangeOp, ConvertIfOp>(converter,
+                                                                   ctx);
 
   patterns.add<AdaptRegionlessOp<HCTupleOp>, AdaptRegionlessOp<HCSliceExprOp>,
                AdaptRegionlessOp<HCGetItemOp>>(converter, ctx);
@@ -2627,9 +2630,7 @@ static void registerLaunchBodyHCLegality(ConversionTarget &target) {
   // for_range, if) are pre-lowered by `hc-lower-launch-scalar-ops`;
   // any survivor here surfaces as a missing-pattern diagnostic on the
   // residual op.
-  target.addIllegalOp<HCCastOp, HCBufferDimOp, HCLoadOp, HCVLoadOp,
-                      HCLoadMaskOp, HCBufferViewOp, HCVecOp, HCSelectOp,
-                      HCStoreOp, HCForRangeOp, HCIfOp>();
+  target.addIllegalOp<HCCastOp, HCBufferDimOp, HCForRangeOp, HCIfOp>();
 }
 
 // `hc.idx_apply` / `hc.pred_apply` / `hc.predicate` inside `hc.generic`
@@ -2782,5 +2783,19 @@ void populateLaunchShapedConstantsPatterns(TypeConverter &converter,
 void registerLaunchShapedConstantsLegality(ConversionTarget &target) {
   target.addIllegalOp<HCVZerosOp, HCVOnesOp, HCVFullOp, HCFullMaskOp, HCZerosOp,
                       HCOnesOp, HCFullOp, HCEmptyOp>();
+}
+
+void populateLaunchMemoryAccessPatterns(TypeConverter &converter,
+                                        RewritePatternSet &patterns,
+                                        MLIRContext *ctx) {
+  patterns
+      .add<ConvertLoadLikeOp<HCLoadOp>, ConvertLoadLikeOp<HCVLoadOp>,
+           ConvertVecOp, ConvertSelectOp, ConvertStoreOp, ConvertBufferViewOp>(
+          converter, ctx);
+}
+
+void registerLaunchMemoryAccessLegality(ConversionTarget &target) {
+  target.addIllegalOp<HCLoadOp, HCVLoadOp, HCLoadMaskOp, HCStoreOp,
+                      HCBufferViewOp, HCVecOp, HCSelectOp>();
 }
 } // namespace mlir::hc

@@ -228,7 +228,9 @@ module attributes {transform.with_named_sequence} {
     // and reach barriers / lower-generic in their post-flatten shape.
     %m12c = transform.apply_registered_pass "hc-lower-launch-shaped-constants" to %m12s
         : (!transform.any_op) -> !transform.any_op
-    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12c
+    %m12m = transform.apply_registered_pass "hc-lower-launch-memory-access" to %m12c
+        : (!transform.any_op) -> !transform.any_op
+    %m13b = transform.apply_registered_pass "hc-lower-launch-body" to %m12m
         : (!transform.any_op) -> !transform.any_op
     // Resolve `hc.generic` ins / outs to upstream-compatible carriers
     // now that launch-body has materialised the kernel-arg UCC bundle
